@@ -39,3 +39,15 @@ python main.py [folder-or-image]
 
 - Supported formats: PNG, JPEG, BMP, GIF, WebP, TIFF.
 - Images in other modes (RGBA, palette, 16-bit) are converted to RGB for stats; alpha is not analyzed yet.
+
+## Dear ImGui design study
+
+A modern-theme design study for a Dear ImGui version of this viewer lives in
+[docs/imgui_modern_design.md](docs/imgui_modern_design.md) — theme module
+(`imgui_theme.py`), runnable demo (`imgui_demo.py`, dark/light + live accent
+switching), and screenshots.
+
+```
+pip install -r requirements-imgui.txt
+python imgui_demo.py
+```

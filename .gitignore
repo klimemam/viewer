@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# hello_imgui window-layout settings written next to imgui_demo.py
+*.ini
