@@ -158,6 +158,7 @@ struct App {
     };
     std::vector<Ann> anns;
     int nextAnnId = 1;
+    int roiSeq = 0, poiSeq = 0;       // monotonic label counters (no dupes after deletes)
     int selectedAnn = -1;             // Ann::id, -1 = none
     uint64_t annRev = 0;              // bumped on any annotation change
     bool annBusy = false;             // true while an annotation drag is in progress
@@ -298,10 +299,8 @@ static void addAnn(int type, int x, int y, int w, int h) {
     a.id = app.nextAnnId++;
     a.type = type; a.x = x; a.y = y; a.w = w; a.h = h;
     a.color = (a.id - 1) & 7;
-    int cnt = 1;
-    for (const auto& e : app.anns)
-        if (e.type == type) cnt++;
-    a.label = (type == 0 ? "ROI " : "P") + std::to_string(cnt);
+    int seq = type == 0 ? ++app.roiSeq : ++app.poiSeq;
+    a.label = (type == 0 ? "ROI " : "P") + std::to_string(seq);
     app.anns.push_back(std::move(a));
     app.selectedAnn = app.anns.back().id;
     app.annRev++;
@@ -586,6 +585,8 @@ static void rawGuessDims(RawDialog& d) {
 static std::string loadRaw(const RawDialog& d) {
     if (d.dtype < 0 || d.dtype >= RD_COUNT || d.interp < 0 || d.interp >= RI_COUNT)
         return "invalid raw format";
+    if (d.w < 1 || d.h < 1 || d.w > 32768 || d.h > 32768)
+        return "unsupported image size";   // sessions can carry unclamped values
     std::vector<uint8_t> buf;
     if (!readFileBytes(d.path, buf)) return "cannot read file";
     const int elem = RAW_DTYPE_SIZE[d.dtype];
@@ -836,6 +837,9 @@ static std::string loadSession(const std::string& path) {
         else if (key == "ann") {
             App::Ann a; int vis = 1;
             ls >> a.type >> a.x >> a.y >> a.w >> a.h >> a.color >> vis;
+            if (a.type < 0 || a.type > 1 || a.x < 0 || a.y < 0 || a.w < 0 || a.h < 0)
+                continue;                 // reject malformed lines (would read out of bounds)
+            a.color &= 7;
             a.visible = vis != 0;
             a.label = restOfLine(ls);
             if (a.label.empty()) a.label = a.type == 0 ? "ROI" : "P";
@@ -911,7 +915,6 @@ static std::string loadSession(const std::string& path) {
 
 // ---------------------------------------------------------------- open dispatch
 static void openRawDialogFor(const std::string& path) {
-    std::vector<uint8_t> probe;   // just get size cheaply
     std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
     if (!f) { toast("cannot open: " + baseName(path), true); return; }
     rawDlg.open = true;
@@ -1156,6 +1159,7 @@ static void drawCanvas(ImVec2 avail) {
     enum { DK_NONE, DK_PAN, DK_ROI_NEW, DK_ANN_MOVE, DK_ANN_RESIZE };
     static int dk = DK_NONE;
     static bool dragMoved = false;
+    static bool clickEligible = false;   // left-button, no pan modifiers: clicks act on tools
     static ImVec2 drag0;
     static int dragAnnId = -1, dragCorner = -1;
     static int annOrig[4] = {};
@@ -1194,6 +1198,7 @@ static void drawCanvas(ImVec2 avail) {
             dragAnnId = -1; dragCorner = -1; tmpActive = false;
             bool mid = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
             bool space = ImGui::IsKeyDown(ImGuiKey_Space);
+            clickEligible = !mid && !space && ImGui::IsMouseDown(ImGuiMouseButton_Left);
             if (mid || space) dk = DK_PAN;                       // universal pan
             else if (app.tool == 0) dk = io.KeyShift ? DK_ROI_NEW : DK_PAN;
             else if (app.tool == 1) {
@@ -1257,7 +1262,7 @@ static void drawCanvas(ImVec2 avail) {
             if (dk == DK_ROI_NEW && dragMoved && tmpActive) {
                 if (tmpRect[2] >= 1 && tmpRect[3] >= 1)
                     addAnn(0, tmpRect[0], tmpRect[1], tmpRect[2], tmpRect[3]);
-            } else if (!dragMoved) {
+            } else if (!dragMoved && clickEligible) {   // middle/Space clicks never act on tools
                 if (app.tool == 2 || (app.tool == 0 && io.KeyCtrl)) {
                     if (inside) addAnn(1, px, py, 0, 0);         // add POI
                 } else {
@@ -1272,7 +1277,8 @@ static void drawCanvas(ImVec2 avail) {
         // wheel: Ctrl(/Cmd)+wheel = zoom, plain wheel = pan (View menu can invert)
         if (hovered && (io.MouseWheel != 0 || io.MouseWheelH != 0)) {
             bool zoomMod = io.KeyCtrl || io.KeySuper;
-            bool zoomGesture = app.wheelZoomPlain ? !zoomMod : zoomMod;
+            // plain-wheel-zoom mode still leaves Shift+wheel as horizontal pan
+            bool zoomGesture = app.wheelZoomPlain ? (!zoomMod && !io.KeyShift) : zoomMod;
             if (zoomGesture && io.MouseWheel != 0) {
                 float wheel = std::clamp(io.MouseWheel, -3.0f, 3.0f);   // tame trackpad inertia
                 ImVec2 mImg = scrToImg(io.MousePos);
@@ -1499,6 +1505,7 @@ static void drawInspector() {
         }
         if (im->rawDtype >= 0 && ImGui::Button("Reinterpret raw...")) {
             openRawDialogFor(im->path);                 // prefill size guesses from the file
+            if (rawDlg.open) {                          // only if the file was readable
             rawDlg.dtype = im->rawDtype;
             rawDlg.interp = im->rawInterp;
             if (RAW_INTERP_CH[rawDlg.interp] == 1)      // 1ch family: honor current interpretation
@@ -1513,6 +1520,7 @@ static void drawInspector() {
             rawDlg.cropW = im->w; rawDlg.cropH = im->h;
             rawDlg.replaceIdx = app.current;
             rawGuessDims(rawDlg);
+            }
         }
         {
             App::Ann* selAnn = findAnn(app.selectedAnn);
@@ -1608,10 +1616,10 @@ static void drawInspector() {
             char buf[128];
             snprintf(buf, sizeof buf, "%s", sel->label.c_str());
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##rename", buf, sizeof buf)) {
-                sel->label = buf;
-                app.annRev++;
-            }
+            if (ImGui::InputText("##rename", buf, sizeof buf))
+                sel->label = buf;                       // live update is cheap...
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                app.annRev++;                           // ...but re-analyze only on commit
         }
         // per-channel values of visible POIs (ch毎表記)
         bool anyPoi = false;
@@ -1633,7 +1641,7 @@ static void drawInspector() {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(a.label.c_str());
                     ImGui::TableNextColumn();
-                    bool inside = a.x < im->w && a.y < im->h;
+                    bool inside = a.x >= 0 && a.y >= 0 && a.x < im->w && a.y < im->h;
                     if (im->cfa && inside)
                         ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
                     else
@@ -1710,7 +1718,18 @@ static void drawInspector() {
                 runOne(nullptr, "whole");
             } else {
                 for (const App::Ann* a : rois) {
-                    psRect rr = { (uint32_t)a->x, (uint32_t)a->y, (uint32_t)a->w, (uint32_t)a->h };
+                    // annotations are global across images: clamp to THIS image before
+                    // handing the rect to a plugin (the ABI does not promise in-bounds)
+                    int rx = std::clamp(a->x, 0, im->w);
+                    int ry = std::clamp(a->y, 0, im->h);
+                    int rw = std::clamp(a->w, 0, im->w - rx);
+                    int rh = std::clamp(a->h, 0, im->h - ry);
+                    if (rw < 1 || rh < 1) {
+                        ana.cols.push_back(a->label + " (off)");
+                        for (auto& r : ana.vals) r.resize(ana.cols.size());
+                        continue;
+                    }
+                    psRect rr = { (uint32_t)rx, (uint32_t)ry, (uint32_t)rw, (uint32_t)rh };
                     runOne(&rr, a->label);
                 }
             }
@@ -1719,6 +1738,8 @@ static void drawInspector() {
             if (!ana.err.empty())
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
             int nCols = 1 + (int)ana.cols.size();
+            if (nCols > 16)
+                ImGui::TextDisabled("too many ROI columns (>15): hide some ROIs to see the grid");
             if (!ana.keys.empty() && nCols <= 16 &&
                 ImGui::BeginTable("anagrid", nCols,
                                   ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX)) {
@@ -1879,7 +1900,7 @@ static void printUsage() {
 
 static void parseCli(int argc, char** argv) {
     RawDialog d;                       // accumulates --raw-* options for positional raw files
-    bool rawReady = false;
+    bool rawReady = false, cliQuad = false;
     bool haveZoom = false, haveCenter = false;
     float zoom = 1, cx = 0, cy = 0;
     for (int i = 1; i < argc; i++) {
@@ -1934,7 +1955,7 @@ static void parseCli(int argc, char** argv) {
             for (int p = 0; p < 4; p++)
                 if (v == CFA_PATTERNS[p]) d.cfaPattern = p;
         } else if (a == "--quad-bayer") {
-            d.interp = RI_QUAD;
+            cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
@@ -1955,6 +1976,7 @@ static void parseCli(int argc, char** argv) {
             bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
                            (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
             if (!special && rawReady) {   // raw params given: load directly, no dialog
+                if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;
                 std::string err = loadRaw(d);
                 if (!err.empty()) toast(baseName(a) + ": " + err, true);
@@ -2052,12 +2074,15 @@ int main(int argc, char** argv) {
 #else
         const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
 #endif
-        if (!io.WantTextInput) {
+        // modals (RAW dialog etc.) own the keyboard: no global shortcuts underneath —
+        // Ctrl+W during reinterpret would shift the replaceIdx target image
+        bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        if (!io.WantTextInput && !popupOpen) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
         }
-        if (!io.WantTextInput && io.KeyMods == ImGuiMod_None) {   // plain keys, no chords
+        if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
             if (ImGui::IsKeyPressed(ImGuiKey_1, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false))
                 app.view.zoom = 1.0f;
