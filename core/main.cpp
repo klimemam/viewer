@@ -1,23 +1,34 @@
 // viewer v0.1 — native image viewer for engineering data
 // Features: .npy / .bin/.raw loading, hover pixel inspection, coordinate rulers,
 //           zoom/pan, black/white point normalization.
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <commdlg.h>
-#include <GL/gl.h>
+#if defined(__APPLE__)
+  #define GL_SILENCE_DEPRECATION
+  #include <OpenGL/gl3.h>            // 3.2+ core declarations
+#elif defined(_WIN32)
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX
+  #include <windows.h>               // GL/gl.h needs APIENTRY/WINGDIAPI
+  #include <GL/gl.h>
+#else
+  #include <GL/gl.h>
+#endif
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "portable-file-dialogs.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -31,22 +42,33 @@
 #endif
 
 // ---------------------------------------------------------------- utilities
-static std::wstring utf8ToWide(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
+static std::filesystem::path pathFromUtf8(const std::string& s) {
+    return std::filesystem::u8path(s);   // UTF-8 -> native (wide on Windows, bytes on POSIX)
 }
-static std::string wideToUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
-    return s;
+static std::string jpFontPath() {
+    static const char* candidates[] = {
+#if defined(_WIN32)
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+#else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-JP-Regular.otf",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+#endif
+    };
+    for (const char* c : candidates)
+        if (std::filesystem::exists(pathFromUtf8(c))) return c;
+    return {};
 }
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {
-    std::ifstream f(utf8ToWide(utf8Path), std::ios::binary | std::ios::ate);
+    std::ifstream f(pathFromUtf8(utf8Path), std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize sz = f.tellg();
     f.seekg(0);
@@ -89,8 +111,10 @@ struct App {
     ViewState view;
     bool showGrid = false;
     float dispGamma = 1.0f;           // 1.0 or 2.2
+    float uiScale = 1.0f;
     std::string toast; double toastUntil = 0; bool toastErr = false;
     bool fitRequested = false;
+    std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
 };
@@ -176,8 +200,12 @@ static std::string loadNpy(const std::string& path) {
         return "not a .npy file (bad magic)";
     int major = buf[6];
     size_t hlen, hoff;
-    if (major >= 2) { hlen = *(uint32_t*)&buf[8]; hoff = 12; }
-    else            { hlen = *(uint16_t*)&buf[8]; hoff = 10; }
+    if (major >= 2) {
+        if (buf.size() < 12) return "corrupt npy header";
+        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
+    } else {
+        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
+    }
     if (hoff + hlen > buf.size()) return "corrupt npy header";
     std::string hdr((char*)&buf[hoff], hlen);
 
@@ -411,7 +439,7 @@ static std::string loadRaw(const RawDialog& d) {
 // ---------------------------------------------------------------- open dispatch
 static void openRawDialogFor(const std::string& path) {
     std::vector<uint8_t> probe;   // just get size cheaply
-    std::ifstream f(utf8ToWide(path), std::ios::binary | std::ios::ate);
+    std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
     if (!f) { toast("cannot open: " + baseName(path), true); return; }
     rawDlg.open = true;
     rawDlg.path = path;
@@ -433,7 +461,8 @@ static void openRawDialogFor(const std::string& path) {
 
 static void openPath(const std::string& path) {
     std::string low = path;
-    std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
     if (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) {
         std::string err = loadNpy(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -443,18 +472,22 @@ static void openPath(const std::string& path) {
     }
 }
 
-static void openFileDialog(GLFWwindow* win) {
-    wchar_t file[2048] = L"";
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = GetActiveWindow();
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = 2048;
-    ofn.lpstrFilter = L"Images (*.npy;*.bin;*.raw;*.yuv;*.dat)\0*.npy;*.bin;*.raw;*.yuv;*.dat\0All files\0*.*\0";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&ofn))
-        openPath(wideToUtf8(file));
-    (void)win;
+static void openFileDialog() {
+    if (!pfd::settings::available()) {   // e.g. Linux without zenity/kdialog
+        toast("no file-dialog backend found (install zenity or kdialog) - drag & drop files instead", true);
+        return;
+    }
+    if (app.openDlg) return;             // one dialog at a time
+    app.openDlg = std::make_unique<pfd::open_file>("Open image", "",
+        std::vector<std::string>{ "Images (*.npy *.bin *.raw *.yuv *.dat)", "*.npy *.bin *.raw *.yuv *.dat",
+          "All files", "*" },
+        pfd::opt::multiselect);
+}
+static void pollFileDialog() {           // called once per frame from the main loop
+    if (app.openDlg && app.openDlg->ready(0)) {
+        for (const std::string& p : app.openDlg->result()) openPath(p);
+        app.openDlg.reset();
+    }
 }
 
 // ---------------------------------------------------------------- view helpers
@@ -503,6 +536,9 @@ static void drawRawModal() {
     ImGui::InputInt("width", &rawDlg.w);
     ImGui::InputInt("height", &rawDlg.h);
     ImGui::InputInt("offset (bytes)", &rawDlg.offset);
+    rawDlg.w = std::clamp(rawDlg.w, 1, 32768);
+    rawDlg.h = std::clamp(rawDlg.h, 1, 32768);
+    rawDlg.offset = std::max(0, rawDlg.offset);
     ImGui::Checkbox("little endian", &rawDlg.littleEndian);
     if (rawDlg.fmt != prevFmt || rawDlg.offset != prevOff) rawGuessDims(rawDlg);
 
@@ -515,9 +551,9 @@ static void drawRawModal() {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "size matches exactly");
 
     ImGui::Separator();
-    bool ok = ImGui::Button("Load", ImVec2(120, 0));
+    bool ok = ImGui::Button("Load", ImVec2(120 * app.uiScale, 0));
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) ImGui::CloseCurrentPopup();
     if (ok) {
         std::string err = loadRaw(rawDlg);
         if (!err.empty()) toast(err, true);
@@ -527,7 +563,11 @@ static void drawRawModal() {
 }
 
 static void drawCanvas(ImVec2 avail) {
-    const float RULER_W = 46, RULER_H = 22;
+    // DPI/font-aware ruler geometry (fixed px constants break on 150-200% Windows scaling)
+    const float s = app.uiScale;
+    const float RULER_H = ImGui::GetFontSize() + 5.0f * s;
+    const float RULER_W = ImGui::CalcTextSize("00000").x + 8.0f * s;
+    const float TICK = 7.0f * s;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImVec2 canvasP0 = ImVec2(origin.x + RULER_W, origin.y + RULER_H);
@@ -558,9 +598,13 @@ static void drawCanvas(ImVec2 avail) {
             app.view.center.x -= io.MouseDelta.x / app.view.zoom;
             app.view.center.y -= io.MouseDelta.y / app.view.zoom;
         }
+        if (hovered && io.MouseWheelH != 0)      // trackpad horizontal scroll = pan
+            app.view.center.x += io.MouseWheelH * 40.0f / app.view.zoom;
         if (hovered && io.MouseWheel != 0) {
+            // clamp: macOS trackpads deliver large fractional inertial deltas
+            float wheel = std::clamp(io.MouseWheel, -3.0f, 3.0f);
             ImVec2 mImg = scrToImg(io.MousePos);
-            float z = std::clamp(app.view.zoom * powf(1.25f, io.MouseWheel), 1.0f / 512, 256.0f);
+            float z = std::clamp(app.view.zoom * powf(1.25f, wheel), 1.0f / 512, 256.0f);
             app.view.center.x = mImg.x - (io.MousePos.x - canvasP0.x - canvasSize.x * 0.5f) / z;
             app.view.center.y = mImg.y - (io.MousePos.y - canvasP0.y - canvasSize.y * 0.5f) / z;
             app.view.zoom = z;
@@ -617,7 +661,9 @@ static void drawCanvas(ImVec2 avail) {
     dl->AddText(ImVec2(origin.x + 6, origin.y + 3), IM_COL32(100, 110, 120, 255), "px");
 
     if (im) {
-        float step = niceStep(48.0f / app.view.zoom);
+        // tick spacing derived from label width so 5-digit coords never collide
+        float minSpacing = std::max(48.0f * s, ImGui::CalcTextSize("00000").x * 1.5f);
+        float step = niceStep(minSpacing / app.view.zoom);
         if (step < 1) step = 1;
         // top ruler (X)
         dl->PushClipRect(ImVec2(canvasP0.x, origin.y), ImVec2(canvasP1.x, origin.y + RULER_H), true);
@@ -626,9 +672,9 @@ static void drawCanvas(ImVec2 avail) {
             for (float t = floorf(ix0 / step) * step; t <= ix1; t += step) {
                 if (t < 0 || t > im->w) continue;
                 float sx = imgToScr(t, 0).x;
-                dl->AddLine(ImVec2(sx, origin.y + RULER_H - 7), ImVec2(sx, origin.y + RULER_H), tickCol);
+                dl->AddLine(ImVec2(sx, origin.y + RULER_H - TICK), ImVec2(sx, origin.y + RULER_H), tickCol);
                 char lb[32]; snprintf(lb, 32, "%.0f", t);
-                dl->AddText(ImVec2(sx + 3, origin.y + 2), txtCol, lb);
+                dl->AddText(ImVec2(sx + 3 * s, origin.y + 2), txtCol, lb);
             }
             if (app.hoverX >= 0) {
                 float sx = imgToScr((float)app.hoverX + 0.5f, 0).x;
@@ -643,9 +689,9 @@ static void drawCanvas(ImVec2 avail) {
             for (float t = floorf(iy0 / step) * step; t <= iy1; t += step) {
                 if (t < 0 || t > im->h) continue;
                 float sy = imgToScr(0, t).y;
-                dl->AddLine(ImVec2(origin.x + RULER_W - 7, sy), ImVec2(origin.x + RULER_W, sy), tickCol);
+                dl->AddLine(ImVec2(origin.x + RULER_W - TICK, sy), ImVec2(origin.x + RULER_W, sy), tickCol);
                 char lb[32]; snprintf(lb, 32, "%.0f", t);
-                dl->AddText(ImVec2(origin.x + 4, sy + 2), txtCol, lb);
+                dl->AddText(ImVec2(origin.x + 4 * s, sy + 2), txtCol, lb);
             }
             if (app.hoverY >= 0) {
                 float sy = imgToScr(0, (float)app.hoverY + 0.5f).y;
@@ -663,8 +709,9 @@ static void drawInspector() {
     if (im && app.hoverX >= 0) {
         ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
         static const char* LB1[] = { "V" };
+        static const char* LB2[] = { "C0", "C1" };            // 2ch is usually UV/complex, not RG
         static const char* LB3[] = { "R", "G", "B", "A" };
-        const char** lb = im->ch == 1 ? LB1 : LB3;
+        const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
         float inv = 1.0f / std::max(im->white - im->black, 1e-20f);
         if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("ch"); ImGui::TableSetupColumn("raw"); ImGui::TableSetupColumn("norm");
@@ -715,7 +762,7 @@ static void drawInspector() {
 }
 
 static void drawFileList() {
-    if (ImGui::Button("Open (O)")) openFileDialog(nullptr);
+    if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
     ImageDoc* im = cur();
     if (ImGui::Button("Close") && im) {
@@ -730,6 +777,7 @@ static void drawFileList() {
         char lb[512];
         snprintf(lb, 512, "%s##%d", d.name.c_str(), i);
         if (ImGui::Selectable(lb, i == app.current)) { app.current = i; app.fitRequested = true; }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", d.path.c_str());
         ImGui::TextDisabled("   %d x %d  %dch  %s", d.w, d.h, d.ch, d.dtype.c_str());
     }
 }
@@ -741,6 +789,17 @@ static void dropCallback(GLFWwindow*, int count, const char** paths) {
 
 int main(int argc, char** argv) {
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    const char* glslVersion = "#version 150";
+#else
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    const char* glslVersion = "#version 130";
+#endif
     GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
     glfwMakeContextCurrent(win);
@@ -754,15 +813,31 @@ int main(int argc, char** argv) {
 
     float xs = 1, ys = 1;
     glfwGetWindowContentScale(win, &xs, &ys);
-    float scale = std::max(xs, 1.0f);
+#if defined(__APPLE__)
+    float uiScale = 1.0f;                    // Cocoa coords are points; backend handles px
+    float fontScale = std::max(xs, 1.0f);    // rasterize glyphs at retina resolution
+#else
+    float uiScale = std::max(xs, 1.0f);
+    float fontScale = uiScale;
+#endif
+    app.uiScale = uiScale;
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    ImFont* jp = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\meiryo.ttc", 17.0f * scale,
-                                              nullptr, io.Fonts->GetGlyphRangesJapanese());
-    if (!jp) io.Fonts->AddFontDefault();
+    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    std::string fontPath = jpFontPath();
+    ImFont* jp = fontPath.empty() ? nullptr
+        : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
+                                       io.Fonts->GetGlyphRangesJapanese());
+    if (!jp) {
+        ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
+        io.Fonts->AddFontDefault(&cfg);
+        toast("CJK font not found - Japanese filenames may not display correctly", true);
+    }
+#if defined(__APPLE__)
+    io.FontGlobalScale = 1.0f / fontScale;
+#endif
 
     ImGui_ImplGlfw_InitForOpenGL(win, true);
-    ImGui_ImplOpenGL3_Init("#version 130");
+    ImGui_ImplOpenGL3_Init(glslVersion);
 
     for (int i = 1; i < argc; i++) openPath(argv[i]);
 
@@ -773,11 +848,13 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
 
         // shortcuts
-        if (!io.WantTextInput) {
-            if (ImGui::IsKeyPressed(ImGuiKey_F)) app.fitRequested = true;
-            if (ImGui::IsKeyPressed(ImGuiKey_1)) app.view.zoom = 1.0f;
-            if (ImGui::IsKeyPressed(ImGuiKey_G)) app.showGrid = !app.showGrid;
-            if (ImGui::IsKeyPressed(ImGuiKey_O)) openFileDialog(win);
+        pollFileDialog();
+        if (!io.WantTextInput && io.KeyMods == ImGuiMod_None) {   // plain keys only, no Cmd/Ctrl chords
+            if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
+            if (ImGui::IsKeyPressed(ImGuiKey_1, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false))
+                app.view.zoom = 1.0f;
+            if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
+            if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
         }
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -787,14 +864,14 @@ int main(int argc, char** argv) {
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
             ImGuiWindowFlags_NoSavedSettings);
 
-        const float LEFT_W = 230 * scale, RIGHT_W = 300 * scale, STATUS_H = 26 * scale;
+        const float LEFT_W = 230 * uiScale, RIGHT_W = 300 * uiScale, STATUS_H = 26 * uiScale;
         ImVec2 total = ImGui::GetContentRegionAvail();
 
         ImGui::BeginChild("left", ImVec2(LEFT_W, total.y - STATUS_H), ImGuiChildFlags_Borders);
         drawFileList();
         ImGui::EndChild();
         ImGui::SameLine();
-        ImGui::BeginChild("view", ImVec2(total.x - LEFT_W - RIGHT_W - 16 * scale, total.y - STATUS_H));
+        ImGui::BeginChild("view", ImVec2(total.x - LEFT_W - RIGHT_W - 16 * uiScale, total.y - STATUS_H));
         drawCanvas(ImGui::GetContentRegionAvail());
         ImGui::EndChild();
         ImGui::SameLine();
@@ -813,11 +890,17 @@ int main(int argc, char** argv) {
                     for (int c = 0; c < im->ch; c++)
                         hover += " " + fmtVal(im->sample(app.hoverX, app.hoverY, c), im->dtype);
                 }
-                snprintf(st, 512, "%s   %dx%d %dch %s  |  zoom %.0f%%%s",
+                char zs[32];
+                if (app.view.zoom >= 0.095f) snprintf(zs, 32, "%.0f%%", app.view.zoom * 100);
+                else                         snprintf(zs, 32, "%.3g%%", app.view.zoom * 100);
+                snprintf(st, 512, "%s   %dx%d %dch %s  |  zoom %s%s",
                          im->name.c_str(), im->w, im->h, im->ch, im->dtype.c_str(),
-                         app.view.zoom * 100, hover.c_str());
+                         zs, hover.c_str());
             }
             ImGui::TextUnformatted(st);
+            static std::string lastTitle;
+            std::string title = im ? im->name + " - viewer" : "viewer v0.1";
+            if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
         }
 
         drawRawModal();
@@ -826,7 +909,7 @@ int main(int argc, char** argv) {
         if (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) {
             ImDrawList* fg = ImGui::GetForegroundDrawList();
             ImVec2 ts = ImGui::CalcTextSize(app.toast.c_str());
-            ImVec2 p(vp->WorkPos.x + (vp->WorkSize.x - ts.x) / 2, vp->WorkPos.y + vp->WorkSize.y - 60 * scale);
+            ImVec2 p(vp->WorkPos.x + (vp->WorkSize.x - ts.x) / 2, vp->WorkPos.y + vp->WorkSize.y - 60 * uiScale);
             fg->AddRectFilled(ImVec2(p.x - 12, p.y - 6), ImVec2(p.x + ts.x + 12, p.y + ts.y + 6),
                               app.toastErr ? IM_COL32(90, 30, 30, 235) : IM_COL32(35, 42, 48, 235), 6);
             fg->AddText(p, IM_COL32(230, 235, 240, 255), app.toast.c_str());

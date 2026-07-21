@@ -6,16 +6,37 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: viewer-win64
+            binpath: build/Release/viewer.exe
+          - os: ubuntu-latest
+            artifact: viewer-linux-x64
+            binpath: viewer.tgz
+          - os: macos-latest
+            artifact: viewer-macos-arm64
+            binpath: viewer.tgz
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux deps (GLFW X11 + Wayland)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorg-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev wayland-protocols
       - name: Configure
-        run: cmake -S . -B build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release
+      - name: Package (preserve executable bit)
+        if: runner.os != 'Windows'
+        run: tar -czf viewer.tgz -C build viewer
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: viewer-win64
-          path: build/Release/viewer.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binpath }}
