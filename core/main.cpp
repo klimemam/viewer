@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -96,9 +97,32 @@ struct ImageDoc {
     GLuint tex = 0;
     bool texDirty = true;
     bool texNearest = true;
+    // CFA (Bayer) metadata
+    int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
+    int cfaPattern = 0;               // index into CFA_PATTERNS
+    bool cfaColorize = false;
+    // raw reload parameters, kept so sessions can restore this image (-1 = not raw)
+    int rawFmt = -1, rawOffset = 0;
+    bool rawLE = true;
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
+
+// CFA pattern tables: channel of each 2x2 cell position (cy*2+cx); 0=R 1=Gr 2=Gb 3=B
+static const char* CFA_PATTERNS[] = { "RGGB", "BGGR", "GRBG", "GBRG" };
+static const char* CFA_CH_NAMES[] = { "R", "Gr", "Gb", "B" };
+static const int CFA_MAP[4][4] = {
+    { 0, 1, 2, 3 },   // RGGB
+    { 3, 2, 1, 0 },   // BGGR
+    { 1, 0, 3, 2 },   // GRBG
+    { 2, 3, 0, 1 },   // GBRG
+};
+static int cfaChannelAt(const ImageDoc& im, int x, int y) {
+    if (im.cfa == 0) return -1;
+    int cx = im.cfa == 2 ? (x >> 1) & 1 : x & 1;   // Quad Bayer: 2x2 blocks share a color
+    int cy = im.cfa == 2 ? (y >> 1) & 1 : y & 1;
+    return CFA_MAP[im.cfaPattern & 3][cy * 2 + cx];
+}
 
 struct ViewState {
     float zoom = 1.0f;
@@ -115,6 +139,7 @@ struct App {
     std::string toast; double toastUntil = 0; bool toastErr = false;
     bool fitRequested = false;
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
+    std::unique_ptr<pfd::save_file> saveDlg;
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
@@ -151,10 +176,17 @@ static void rebuildTexture(ImageDoc& im) {
     float inv = 1.0f / std::max(im.white - im.black, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
+    bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
     for (size_t p = 0; p < (size_t)im.w * im.h; p++) {
         const float* src = &im.data[p * im.ch];
         float r, g, b;
-        if (im.ch == 1)      { r = g = b = src[0]; }
+        if (cfaColor) {
+            int c = cfaChannelAt(im, (int)(p % im.w), (int)(p / im.w));
+            r = c == 0 ? src[0] : im.black;
+            g = (c == 1 || c == 2) ? src[0] : im.black;
+            b = c == 3 ? src[0] : im.black;
+        }
+        else if (im.ch == 1) { r = g = b = src[0]; }
         else if (im.ch == 2) { r = src[0]; g = src[1]; b = im.black; }
         else                 { r = src[0]; g = src[1]; b = src[2]; }
         float v[3] = { (r - im.black) * inv, (g - im.black) * inv, (b - im.black) * inv };
@@ -355,8 +387,13 @@ static const RawFormat RAW_FORMATS[] = {
     { "Gray 8bit",    1,  1 }, { "Gray 16bit", 2, 1 }, { "Gray float32", 4, 1 }, { "Gray float64", 8, 1 },
     { "RGB 8bit",     3,  3 }, { "BGR 8bit",   3, 3 }, { "RGBA 8bit",    4, 4 }, { "BGRA 8bit",    4, 4 },
     { "RGB 16bit",    6,  3 }, { "RGB float32", 12, 3 },
+    { "Bayer 8bit",   1,  1 }, { "Bayer 16bit", 2, 1 },
 };
-enum RawFmtIdx { RF_G8, RF_G16, RF_GF32, RF_GF64, RF_RGB8, RF_BGR8, RF_RGBA8, RF_BGRA8, RF_RGB16, RF_RGBF32 };
+enum RawFmtIdx { RF_G8, RF_G16, RF_GF32, RF_GF64, RF_RGB8, RF_BGR8, RF_RGBA8, RF_BGRA8, RF_RGB16, RF_RGBF32,
+                 RF_BAYER8, RF_BAYER16, RF_COUNT };
+// CLI names, aligned with RawFmtIdx
+static const char* RAW_CLI_NAMES[] = { "gray8", "gray16", "grayf32", "grayf64", "rgb8", "bgr8", "rgba8", "bgra8",
+                                       "rgb16", "rgbf32", "bayer8", "bayer16" };
 
 struct RawDialog {
     bool open = false;
@@ -364,6 +401,8 @@ struct RawDialog {
     size_t fileSize = 0;
     int w = 1920, h = 1080, offset = 0, fmt = RF_G8;
     bool littleEndian = true;
+    int cfaPattern = 0;               // RGGB/BGGR/GRBG/GBRG
+    bool quad = false;                // Quad Bayer
     std::vector<std::pair<int,int>> guesses;
 } rawDlg;
 
@@ -423,8 +462,8 @@ static std::string loadRaw(const RawDialog& d) {
     im->data.resize(px * F.ch);
     float* out = im->data.data();
     switch (d.fmt) {
-    case RF_G8:   im->dtype = "u8";  for (size_t i = 0; i < px; i++) out[i] = p[i]; break;
-    case RF_G16:  im->dtype = "u16"; for (size_t i = 0; i < px; i++) out[i] = rd16(i * 2); break;
+    case RF_G8:  case RF_BAYER8:  im->dtype = "u8";  for (size_t i = 0; i < px; i++) out[i] = p[i]; break;
+    case RF_G16: case RF_BAYER16: im->dtype = "u16"; for (size_t i = 0; i < px; i++) out[i] = rd16(i * 2); break;
     case RF_GF32: im->dtype = "f32"; for (size_t i = 0; i < px; i++) out[i] = rdf32(i * 4); break;
     case RF_GF64: im->dtype = "f64"; for (size_t i = 0; i < px; i++) out[i] = (float)rdf64(i * 8); break;
     case RF_RGB8: case RF_BGR8: {
@@ -451,7 +490,100 @@ static std::string loadRaw(const RawDialog& d) {
     case RF_RGB16:  im->dtype = "u16"; for (size_t i = 0; i < px * 3; i++) out[i] = rd16(i * 2); break;
     case RF_RGBF32: im->dtype = "f32"; for (size_t i = 0; i < px * 3; i++) out[i] = rdf32(i * 4); break;
     }
+    if (d.fmt == RF_BAYER8 || d.fmt == RF_BAYER16) {
+        im->cfa = d.quad ? 2 : 1;
+        im->cfaPattern = d.cfaPattern & 3;
+        im->note = std::string(d.quad ? "Quad Bayer " : "Bayer ") + CFA_PATTERNS[im->cfaPattern];
+    }
+    im->rawFmt = d.fmt;               // remember raw params so sessions can restore
+    im->rawOffset = d.offset;
+    im->rawLE = d.littleEndian;
     addImage(std::move(im));
+    return {};
+}
+
+// ---------------------------------------------------------------- session save/load
+// Plain line-based text format (.vsession): view state + per-image reload recipes.
+static void saveSession(std::string path) {
+    if (path.find('.') == std::string::npos) path += ".vsession";
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) { toast("cannot write session file", true); return; }
+    f << "viewer-session 1\n";
+    f << "gamma " << app.dispGamma << "\n";
+    f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+    f << "zoom " << app.view.zoom << "\n";
+    f << "center " << app.view.center.x << " " << app.view.center.y << "\n";
+    f << "current " << app.current << "\n";
+    for (auto& d : app.images) {
+        if (d->path.empty()) continue;
+        f << "image " << d->black << " " << d->white << " ";
+        if (d->rawFmt >= 0)
+            f << "raw " << d->rawFmt << " " << d->w << " " << d->h << " " << d->rawOffset << " "
+              << (d->rawLE ? 1 : 0) << " " << d->cfaPattern << " " << (d->cfa == 2 ? 1 : 0) << " "
+              << (d->cfaColorize ? 1 : 0) << " ";
+        else
+            f << "npy ";
+        f << d->path << "\n";           // path last: may contain spaces
+    }
+    toast("session saved: " + baseName(path));
+}
+
+static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
+
+static std::string loadSession(const std::string& path) {
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) return "cannot read session file";
+    std::string text((const char*)buf.data(), buf.size());
+    std::istringstream ss(text);
+    std::string line;
+    if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
+        return "not a viewer session file";
+    closeAll();
+    float zoom = 0; ImVec2 center(0, 0); int current = 0;
+    bool haveView = false;
+    auto restOfLine = [](std::istringstream& ls) {
+        std::string p; std::getline(ls, p);
+        while (!p.empty() && (p[0] == ' ' || p[0] == '\t')) p.erase(0, 1);
+        while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) p.pop_back();
+        return p;
+    };
+    while (std::getline(ss, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ls(line);
+        std::string key; ls >> key;
+        if      (key == "gamma")   ls >> app.dispGamma;
+        else if (key == "grid")  { int g = 0; ls >> g; app.showGrid = g != 0; }
+        else if (key == "zoom")  { ls >> zoom; haveView = true; }
+        else if (key == "center")  ls >> center.x >> center.y;
+        else if (key == "current") ls >> current;
+        else if (key == "image") {
+            float bk = 0, wt = 1; std::string kind;
+            ls >> bk >> wt >> kind;
+            std::string err;
+            if (kind == "raw") {
+                RawDialog d;
+                int le = 1, quad = 0, col = 0;
+                ls >> d.fmt >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> quad >> col;
+                d.littleEndian = le != 0; d.quad = quad != 0;
+                d.path = restOfLine(ls);
+                if (d.fmt < 0 || d.fmt >= RF_COUNT) { toast("session: bad raw format", true); continue; }
+                err = loadRaw(d);
+                if (err.empty()) cur()->cfaColorize = col != 0;
+            } else {
+                std::string p = restOfLine(ls);
+                err = loadNpy(p);
+            }
+            if (!err.empty()) { toast("session: " + err, true); continue; }
+            cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
+        }
+    }
+    if (current >= 0 && current < (int)app.images.size()) app.current = current;
+    if (haveView && !app.images.empty()) {
+        app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
+        app.view.center = center;
+        app.fitRequested = false;      // restored view wins over fit-on-load
+    }
+    markAllTexDirty();                 // gamma may have changed
     return {};
 }
 
@@ -463,8 +595,21 @@ static void openRawDialogFor(const std::string& path) {
     rawDlg.open = true;
     rawDlg.path = path;
     rawDlg.fileSize = (size_t)f.tellg();
-    // guess WxH from filename like foo_1920x1080.raw
+    // guess format/pattern from filename hints
     std::string n = baseName(path);
+    {
+        std::string nl = n;
+        std::transform(nl.begin(), nl.end(), nl.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        for (int i = 0; i < 4; i++) {
+            std::string pat = CFA_PATTERNS[i];
+            std::transform(pat.begin(), pat.end(), pat.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            if (nl.find(pat) != std::string::npos) { rawDlg.fmt = RF_BAYER16; rawDlg.cfaPattern = i; }
+        }
+        if (nl.find("bayer") != std::string::npos && rawDlg.fmt != RF_BAYER8) rawDlg.fmt = RF_BAYER16;
+        if (nl.find("quad") != std::string::npos) rawDlg.quad = true;
+    }
     for (size_t i = 0; i + 1 < n.size(); i++) {
         if ((n[i] == 'x' || n[i] == 'X') && isdigit((unsigned char)n[i + 1]) && i > 0 && isdigit((unsigned char)n[i - 1])) {
             size_t s = i; while (s > 0 && isdigit((unsigned char)n[s - 1])) s--;
@@ -482,10 +627,18 @@ static void openPath(const std::string& path) {
     std::string low = path;
     std::transform(low.begin(), low.end(), low.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
-    if (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) {
+    auto ends = [&](const char* suf) {
+        size_t n = strlen(suf);
+        return low.size() >= n && low.compare(low.size() - n, n, suf) == 0;
+    };
+    if (ends(".npy")) {
         std::string err = loadNpy(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else toast("loaded " + baseName(path));
+    } else if (ends(".vsession")) {
+        std::string err = loadSession(path);
+        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        else toast("session restored: " + baseName(path));
     } else {
         openRawDialogFor(path);
     }
@@ -497,15 +650,28 @@ static void openFileDialog() {
         return;
     }
     if (app.openDlg) return;             // one dialog at a time
-    app.openDlg = std::make_unique<pfd::open_file>("Open image", "",
+    app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
         std::vector<std::string>{ "Images (*.npy *.bin *.raw *.yuv *.dat)", "*.npy *.bin *.raw *.yuv *.dat",
+          "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
+}
+static void saveSessionDialog() {
+    if (app.images.empty()) { toast("nothing to save - no images loaded", true); return; }
+    if (!pfd::settings::available()) { toast("no file-dialog backend found (install zenity or kdialog)", true); return; }
+    if (app.saveDlg) return;
+    app.saveDlg = std::make_unique<pfd::save_file>("Save session", "session.vsession",
+        std::vector<std::string>{ "viewer session (*.vsession)", "*.vsession" });
 }
 static void pollFileDialog() {           // called once per frame from the main loop
     if (app.openDlg && app.openDlg->ready(0)) {
         for (const std::string& p : app.openDlg->result()) openPath(p);
         app.openDlg.reset();
+    }
+    if (app.saveDlg && app.saveDlg->ready(0)) {
+        std::string p = app.saveDlg->result();
+        if (!p.empty()) saveSession(p);
+        app.saveDlg.reset();
     }
 }
 
@@ -559,6 +725,14 @@ static void drawRawModal() {
     rawDlg.h = std::clamp(rawDlg.h, 1, 32768);
     rawDlg.offset = std::max(0, rawDlg.offset);
     ImGui::Checkbox("little endian", &rawDlg.littleEndian);
+    if (rawDlg.fmt == RF_BAYER8 || rawDlg.fmt == RF_BAYER16) {
+        if (ImGui::BeginCombo("CFA pattern", CFA_PATTERNS[rawDlg.cfaPattern])) {
+            for (int i = 0; i < 4; i++)
+                if (ImGui::Selectable(CFA_PATTERNS[i], i == rawDlg.cfaPattern)) rawDlg.cfaPattern = i;
+            ImGui::EndCombo();
+        }
+        ImGui::Checkbox("Quad Bayer (2x2 blocks share a color)", &rawDlg.quad);
+    }
     if (rawDlg.fmt != prevFmt || rawDlg.offset != prevOff) rawGuessDims(rawDlg);
 
     size_t need = (size_t)ceil((double)rawDlg.w * rawDlg.h * RAW_FORMATS[rawDlg.fmt].bpp) + rawDlg.offset;
@@ -726,7 +900,11 @@ static void drawInspector() {
     ImGui::Text("Pixel");
     ImGui::Separator();
     if (im && app.hoverX >= 0) {
-        ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
+        if (im->cfa)
+            ImGui::Text("(%d, %d)  [%s]", app.hoverX, app.hoverY,
+                        CFA_CH_NAMES[cfaChannelAt(*im, app.hoverX, app.hoverY)]);
+        else
+            ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
         static const char* LB1[] = { "V" };
         static const char* LB2[] = { "C0", "C1" };            // 2ch is usually UV/complex, not RG
         static const char* LB3[] = { "R", "G", "B", "A" };
@@ -755,6 +933,9 @@ static void drawInspector() {
         ImGui::Text("%d x %d   %dch   %s", im->w, im->h, im->ch, im->dtype.c_str());
         if (!im->note.empty()) ImGui::TextDisabled("%s", im->note.c_str());
         ImGui::Text("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(), fmtVal(im->vmax, im->dtype).c_str());
+        if (im->cfa) {
+            if (ImGui::Checkbox("Colorize CFA pattern", &im->cfaColorize)) im->texDirty = true;
+        }
 
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Range (black / white)");
@@ -812,6 +993,7 @@ static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
+        if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
         ImGui::Separator();
         if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
@@ -860,6 +1042,7 @@ static void drawHelpAbout() {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
                 };
                 row(SC_MOD "+O / O", "open files");
+                row(SC_MOD "+S",     "save session (view state + images)");
                 row(SC_MOD "+W",     "close current image");
                 row("F / double-click", "fit to window");
                 row("1",             "actual size (100%)");
@@ -886,12 +1069,104 @@ static void drawHelpAbout() {
     }
 }
 
+// ---------------------------------------------------------------- CLI
+static void printUsage() {
+    printf(
+        "usage: viewer [options] [files...]\n"
+        "  files: .npy, .vsession (saved session), or raw binaries (.bin/.raw/.yuv/...)\n"
+        "options:\n"
+        "  --session <file.vsession>   restore a saved session\n"
+        "  --raw-format <fmt>          open following raw files without the dialog:\n"
+        "                              gray8|gray16|grayf32|grayf64|rgb8|bgr8|rgba8|bgra8|\n"
+        "                              rgb16|rgbf32|bayer8|bayer16\n"
+        "  --raw-size <WxH>            raw dimensions, e.g. 1920x1080\n"
+        "  --raw-offset <bytes>        raw header offset (default 0)\n"
+        "  --big-endian                raw byte order (default little endian)\n"
+        "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
+        "  --quad-bayer                treat the CFA as Quad Bayer\n"
+        "  --zoom <z>                  initial zoom (1 = 100%%)\n"
+        "  --center <x,y>              initial view center in image pixels\n"
+        "  -h, --help                  show this help\n");
+}
+
+static void parseCli(int argc, char** argv) {
+    RawDialog d;                       // accumulates --raw-* options for positional raw files
+    bool rawReady = false;
+    bool haveZoom = false, haveCenter = false;
+    float zoom = 1, cx = 0, cy = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+        if (a == "--session") {
+            std::string p = next();
+            if (!p.empty()) openPath(p);
+        } else if (a == "--raw-format") {
+            std::string v = next();
+            for (int f = 0; f < RF_COUNT; f++)
+                if (v == RAW_CLI_NAMES[f]) { d.fmt = f; rawReady = true; }
+            if (!rawReady) fprintf(stderr, "unknown raw format: %s (see --help)\n", v.c_str());
+        } else if (a == "--raw-size") {
+            std::string v = next();
+            size_t x = v.find_first_of("xX*");
+            if (x != std::string::npos) {
+                d.w = std::clamp(atoi(v.substr(0, x).c_str()), 1, 32768);
+                d.h = std::clamp(atoi(v.substr(x + 1).c_str()), 1, 32768);
+            }
+        } else if (a == "--raw-offset") {
+            d.offset = std::max(0, atoi(next().c_str()));
+        } else if (a == "--big-endian") {
+            d.littleEndian = false;
+        } else if (a == "--bayer-pattern") {
+            std::string v = next();
+            std::transform(v.begin(), v.end(), v.begin(),
+                           [](unsigned char c) { return (char)std::toupper(c); });
+            for (int p = 0; p < 4; p++)
+                if (v == CFA_PATTERNS[p]) d.cfaPattern = p;
+        } else if (a == "--quad-bayer") {
+            d.quad = true;
+        } else if (a == "--zoom") {
+            zoom = (float)atof(next().c_str()); haveZoom = true;
+        } else if (a == "--center") {
+            std::string v = next();
+            size_t c = v.find(',');
+            if (c != std::string::npos) {
+                cx = (float)atof(v.substr(0, c).c_str());
+                cy = (float)atof(v.substr(c + 1).c_str());
+                haveCenter = true;
+            }
+        } else if (!a.empty() && a[0] == '-') {
+            fprintf(stderr, "unknown option: %s (see --help)\n", a.c_str());
+        } else {
+            std::string low = a;
+            std::transform(low.begin(), low.end(), low.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
+                           (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
+            if (!special && rawReady) {   // raw params given: load directly, no dialog
+                d.path = a;
+                std::string err = loadRaw(d);
+                if (!err.empty()) toast(baseName(a) + ": " + err, true);
+            } else {
+                openPath(a);
+            }
+        }
+    }
+    if (haveZoom || haveCenter) {
+        if (haveZoom) app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
+        if (haveCenter) app.view.center = ImVec2(cx, cy);
+        else if (cur()) app.view.center = ImVec2(cur()->w * 0.5f, cur()->h * 0.5f);
+        app.fitRequested = false;      // explicit view from CLI wins over fit-on-load
+    }
+}
+
 // ---------------------------------------------------------------- main
 static void dropCallback(GLFWwindow*, int count, const char** paths) {
     for (int i = 0; i < count; i++) openPath(paths[i]);
 }
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { printUsage(); return 0; }
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -943,7 +1218,7 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 
-    for (int i = 1; i < argc; i++) openPath(argv[i]);
+    parseCli(argc, argv);
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -961,6 +1236,7 @@ int main(int argc, char** argv) {
         if (!io.WantTextInput) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
         }
         if (!io.WantTextInput && io.KeyMods == ImGuiMod_None) {   // plain keys, no chords
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
@@ -1005,7 +1281,10 @@ int main(int argc, char** argv) {
             if (im) {
                 std::string hover;
                 if (app.hoverX >= 0) {
-                    hover = "  |  (" + std::to_string(app.hoverX) + ", " + std::to_string(app.hoverY) + ") =";
+                    hover = "  |  (" + std::to_string(app.hoverX) + ", " + std::to_string(app.hoverY) + ")";
+                    if (im->cfa)
+                        hover += std::string(" [") + CFA_CH_NAMES[cfaChannelAt(*im, app.hoverX, app.hoverY)] + "]";
+                    hover += " =";
                     for (int c = 0; c < im->ch; c++)
                         hover += " " + fmtVal(im->sample(app.hoverX, app.hoverY, c), im->dtype);
                 }

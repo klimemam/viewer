@@ -35,6 +35,23 @@ np.save(out / "zone_be_f32.npy", zone.astype(">f4"))
 # raw rgb8
 (out / f"bars_{W}x{H}_rgb8.bin").write_bytes(rgb.tobytes())
 
+# Bayer RGGB 16bit raw (pattern in filename for auto-detect)
+bay = np.zeros((H, W), np.uint16)
+bay[0::2, 0::2] = (xx[0::2, 0::2] * 65535 // (W - 1)).astype(np.uint16)   # R: ramp
+bay[0::2, 1::2] = 30000                                                    # Gr
+bay[1::2, 0::2] = 30000                                                    # Gb
+bay[1::2, 1::2] = (yy[1::2, 1::2] * 65535 // (H - 1)).astype(np.uint16)   # B: ramp
+(out / f"cfa_rggb_{W}x{H}_bayer16.raw").write_bytes(bay.astype("<u2").tobytes())
+
+# Quad Bayer RGGB 16bit raw (2x2 blocks per color)
+qb = np.zeros((H, W), np.uint16)
+qx, qy = (xx // 2) % 2, (yy // 2) % 2
+qb[(qy == 0) & (qx == 0)] = 52000   # R blocks bright
+qb[(qy == 0) & (qx == 1)] = 30000   # Gr
+qb[(qy == 1) & (qx == 0)] = 30000   # Gb
+qb[(qy == 1) & (qx == 1)] = 12000   # B blocks dark
+(out / f"cfa_quad_rggb_{W}x{H}_bayer16.raw").write_bytes(qb.astype("<u2").tobytes())
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     print(" ", p.name, p.stat().st_size, "bytes")

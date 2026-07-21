@@ -12,9 +12,12 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
   - `.npy` — u8 / i8 / u16 / i16 / u32 / i32 / f32 / f64 / bool。
     `(H,W)`・`(H,W,C)`・`(C,H,W)` 対応(CHW は自動変換)。バッチ次元は先頭 `[0]` を表示。
     ビッグエンディアン・Fortran order 対応。
-  - `.bin` / `.raw` — Gray 8/16bit・float32/64、RGB/BGR/RGBA/BGRA 8bit、RGB 16bit/float32。
+  - `.bin` / `.raw` — Gray 8/16bit・float32/64、RGB/BGR/RGBA/BGRA 8bit、RGB 16bit/float32、
+    **Bayer / Quad Bayer 8/16bit**(RGGB/BGGR/GRBG/GBRG)。
     読み込みダイアログでファイルサイズからの**サイズ候補自動推定**、
-    ファイル名の `..._640x480_...` 表記の自動認識、オフセット・エンディアン指定。
+    ファイル名の `..._640x480_...` / `rggb` / `quad` 表記の自動認識、オフセット・エンディアン指定。
+  - Bayer 画像はホバーで **画素の CFA チャンネル (R/Gr/Gb/B) を表示**、
+    「Colorize CFA pattern」でパターンを色付け表示。
   - ウィンドウへのドラッグ&ドロップ、コマンドライン引数 (`viewer.exe a.npy b.raw`) 対応。
 - **ピクセル検査** — マウスホバーで座標と画素値(raw 値と正規化値)を右パネル+ステータスバーに表示。
   ズーム 2 倍以上でホバー画素をハイライト。
@@ -40,6 +43,40 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
 | 左ドラッグ | パン |
 
 メニューバー (File / View / Help) からも同じ操作ができます。
+
+## セッション (状態の保存と復元)
+
+`File > Save Session...`(`Ctrl/Cmd+S`)で、**開いている画像・ズーム・表示位置・
+黒点/白点レンジ・ガンマ・グリッド状態**を `.vsession` ファイル(テキスト)に保存できます。
+復元は `File > Open...` / ドラッグ&ドロップ / `--session` のいずれでも可能です。
+「昨日見ていたあの座標のあの倍率」をそのまま再現できます。
+
+## コマンドライン
+
+```
+viewer [options] [files...]
+
+  --session <file.vsession>   保存したセッションを復元
+  --raw-format <fmt>          以降の raw ファイルをダイアログなしで開く
+                              (gray8|gray16|grayf32|grayf64|rgb8|bgr8|rgba8|bgra8|
+                               rgb16|rgbf32|bayer8|bayer16)
+  --raw-size <WxH>            raw のサイズ (例 1920x1080)
+  --raw-offset <bytes>        先頭オフセット
+  --big-endian                エンディアン指定 (デフォルトはリトル)
+  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG
+  --quad-bayer                Quad Bayer として解釈
+  --zoom <z>                  起動時ズーム (1 = 等倍)
+  --center <x,y>              起動時の表示中心 (画像座標)
+```
+
+例:
+```
+viewer data.npy                                          # npy を開く
+viewer --raw-format bayer16 --raw-size 1920x1080 \
+       --bayer-pattern rggb sensor_dump.raw              # Bayer raw を直接開く
+viewer --session yesterday.vsession                      # 昨日の状態を完全復元
+viewer data.npy --zoom 8 --center 512,384                # 特定座標を拡大した状態で起動
+```
 
 ## ビルド
 
