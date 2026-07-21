@@ -155,6 +155,8 @@ struct App {
         std::string label;
         int color = 0;                // palette index
         bool visible = true;
+        // pre-expansion rect memory for the X/Y band toggles (-1 = nothing saved)
+        int prevX = 0, prevW = -1, prevY = 0, prevH = -1;
     };
     std::vector<Ann> anns;
     int nextAnnId = 1;
@@ -1856,7 +1858,7 @@ static void drawHelpAbout() {
                 row("middle-drag / Space+drag", "pan (works in any tool)");
                 row("Shift+drag",    "quick ROI (Navigate tool)");
                 row("Ctrl+click",    "quick pin (Navigate tool)");
-                row("X / Y",         "expand selected ROI to full width / height");
+                row("X / Y",         "toggle selected ROI full width / height (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
@@ -2093,15 +2095,33 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_V, false)) app.tool = 0;
             if (ImGui::IsKeyPressed(ImGuiKey_R, false)) app.tool = 1;
             if (ImGui::IsKeyPressed(ImGuiKey_P, false)) app.tool = 2;
-            // X/Y: expand the selected ROI to full width / height (row/column bands
-            // without zooming out to see the whole image)
+            // X/Y: TOGGLE the selected ROI between its rect and full width / height.
+            // Press once = row/column band, press again = restore the remembered rect.
             if (ImGui::IsKeyPressed(ImGuiKey_X, false) && cur()) {
                 if (App::Ann* a = findAnn(app.selectedAnn))
-                    if (a->type == 0) { a->x = 0; a->w = cur()->w; app.annRev++; }
+                    if (a->type == 0) {
+                        bool fullW = a->x == 0 && a->w == cur()->w;
+                        if (fullW && a->prevW >= 1) {
+                            a->x = a->prevX; a->w = a->prevW; a->prevW = -1;
+                        } else if (!fullW) {
+                            a->prevX = a->x; a->prevW = a->w;
+                            a->x = 0; a->w = cur()->w;
+                        }
+                        app.annRev++;
+                    }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Y, false) && cur()) {
                 if (App::Ann* a = findAnn(app.selectedAnn))
-                    if (a->type == 0) { a->y = 0; a->h = cur()->h; app.annRev++; }
+                    if (a->type == 0) {
+                        bool fullH = a->y == 0 && a->h == cur()->h;
+                        if (fullH && a->prevH >= 1) {
+                            a->y = a->prevY; a->h = a->prevH; a->prevH = -1;
+                        } else if (!fullH) {
+                            a->prevY = a->y; a->prevH = a->h;
+                            a->y = 0; a->h = cur()->h;
+                        }
+                        app.annRev++;
+                    }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
