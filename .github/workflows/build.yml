@@ -13,7 +13,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: viewer-win64
-            binpath: build/Release/viewer.exe
+            binpath: stage
           - os: ubuntu-latest
             artifact: viewer-linux-x64
             binpath: viewer.tgz
@@ -32,9 +32,16 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release
+      - name: Package (Windows exe + plugins)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          Copy-Item build/Release/viewer.exe stage/
+          Copy-Item -Recurse build/plugins stage/plugins
       - name: Package (preserve executable bit)
         if: runner.os != 'Windows'
-        run: tar -czf viewer.tgz -C build viewer
+        run: tar -czf viewer.tgz -C build viewer plugins
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

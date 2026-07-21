@@ -19,6 +19,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "portable-file-dialogs.h"
+#include "plugin_host.h"
 
 #include <algorithm>
 #include <cctype>
@@ -104,6 +105,7 @@ struct ImageDoc {
     // raw reload parameters, kept so sessions can restore this image (-1 = not raw)
     int rawFmt = -1, rawOffset = 0;
     bool rawLE = true;
+    int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
@@ -143,6 +145,23 @@ struct App {
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
+    // pinned points of interest (image coords, shared across images)
+    struct Pin { int x, y; };
+    std::vector<Pin> pins;
+    // ROI (image coords); w==0 means no ROI. Shift+drag on the canvas.
+    int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
+    bool roiDragging = false;
+    ImVec2 roiDrag0;                  // image coords where the drag started
+    // analyzer plugin state: cached result for (image, plugin, roi)
+    struct AnalysisState {
+        const ImageDoc* img = nullptr;
+        int plugin = -1;
+        int rx = -1, ry = -1, rw = -1, rh = -1;
+        std::vector<std::pair<std::string, std::string>> rows;
+        std::string err;
+    } ana;
+    bool anaAuto = false;
+    int anaSel = 0;
 };
 static App app;
 
@@ -177,9 +196,23 @@ static void rebuildTexture(ImageDoc& im) {
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
     bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
+    const uint8_t* lut = nullptr;   // display plugin colormap (1ch only; CFA colorize wins)
+    if (im.ch == 1 && !cfaColor && im.displayLut >= 0 &&
+        im.displayLut < (int)plugin_host::displays().size())
+        lut = plugin_host::displays()[im.displayLut].lut.data();
     for (size_t p = 0; p < (size_t)im.w * im.h; p++) {
         const float* src = &im.data[p * im.ch];
         float r, g, b;
+        if (lut) {
+            float x = std::clamp((src[0] - im.black) * inv, 0.0f, 1.0f);
+            if (doGamma) x = powf(x, invGamma);
+            int idx = (int)(x * 255.0f + 0.5f);
+            rgba[p * 4 + 0] = lut[idx * 3];
+            rgba[p * 4 + 1] = lut[idx * 3 + 1];
+            rgba[p * 4 + 2] = lut[idx * 3 + 2];
+            rgba[p * 4 + 3] = 255;
+            continue;
+        }
         if (cfaColor) {
             int c = cfaChannelAt(im, (int)(p % im.w), (int)(p / im.w));
             r = c == 0 ? src[0] : im.black;
@@ -221,16 +254,42 @@ static void markAllTexDirty() {
 static void closeCurrent() {
     ImageDoc* im = cur();
     if (!im) return;
+    if (app.ana.img == im) app.ana.img = nullptr;   // drop cached analysis of a dead image
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
     app.fitRequested = true;
 }
 static void closeAll() {
+    app.ana.img = nullptr;
     for (auto& d : app.images)
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.current = -1;
+}
+
+// ---------------------------------------------------------------- plugin glue
+static psFrame makeFrame(const ImageDoc& im) {
+    psFrame f = {};
+    f.w = (uint32_t)im.w; f.h = (uint32_t)im.h; f.ch = (uint32_t)im.ch;
+    f.dtype = PS_DTYPE_F32; f.loc = PS_MEM_CPU;
+    f.data = (void*)im.data.data();
+    f.pitch_bytes = (size_t)im.w * im.ch * sizeof(float);
+    f.black = im.black; f.white = im.white;
+    f.cfa_type = im.cfa; f.cfa_pattern = im.cfaPattern;   // enums mirror psCfa* by construction
+    f.pts_us = -1;
+    f.name = im.name.c_str();                             // valid only during the call
+    f.meta_json = nullptr;
+    return f;
+}
+static void anaEmitNumber(void* ctx, const char* key, double v) {
+    auto* rows = (std::vector<std::pair<std::string, std::string>>*)ctx;
+    char b[64]; snprintf(b, 64, "%.6g", v);
+    rows->emplace_back(key ? key : "", b);
+}
+static void anaEmitText(void* ctx, const char* key, const char* v) {
+    auto* rows = (std::vector<std::pair<std::string, std::string>>*)ctx;
+    rows->emplace_back(key ? key : "", v ? v : "");
 }
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
@@ -240,6 +299,43 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
     app.images.push_back(std::move(im));
     app.current = (int)app.images.size() - 1;
     app.fitRequested = true;
+}
+
+static void runProcessor(int idx) {
+    ImageDoc* im = cur();
+    if (!im || idx < 0 || idx >= (int)plugin_host::processors().size()) return;
+    const ProcessorPluginInfo& p = plugin_host::processors()[idx];
+    psFrame in = makeFrame(*im), out = {};
+    char err[256] = { 0 };
+    if (p.v.process(&in, &out, plugin_host::hostApi(), err, sizeof err) != 0) {
+        toast(p.name + ": " + (err[0] ? err : "failed"), true);
+        return;
+    }
+    // contract validation — a misbehaving plugin must never crash the host
+    if (!out.data || out.dtype != PS_DTYPE_F32 || out.loc != PS_MEM_CPU ||
+        out.ch < 1 || out.ch > 4 || out.w < 1 || out.h < 1 || out.w > 32768 || out.h > 32768 ||
+        out.pitch_bytes < (size_t)out.w * out.ch * sizeof(float)) {
+        if (out.data) plugin_host::frameFree(out.data);
+        toast(p.name + ": plugin returned an invalid frame", true);
+        return;
+    }
+    auto doc = std::make_unique<ImageDoc>();
+    doc->name = im->name + " [" + p.name + "]";
+    doc->w = (int)out.w; doc->h = (int)out.h; doc->ch = (int)out.ch;
+    doc->dtype = "f32";
+    doc->note = "processed by " + p.name;
+    doc->cfa = out.cfa_type; doc->cfaPattern = out.cfa_pattern & 3;
+    doc->data.resize((size_t)out.w * out.h * out.ch);
+    size_t rowFloats = (size_t)out.w * out.ch;
+    for (uint32_t y = 0; y < out.h; y++)   // pitch-aware copy into the ImageDoc
+        memcpy(doc->data.data() + (size_t)y * rowFloats,
+               (const char*)out.data + (size_t)y * out.pitch_bytes, rowFloats * sizeof(float));
+    plugin_host::frameFree(out.data);      // host frees, always
+    float bk = out.black, wt = out.white;
+    // processed results have no file path: sessions skip them (v2: re-run recipe)
+    addImage(std::move(doc));
+    if (wt > bk) { cur()->black = bk; cur()->white = wt; cur()->texDirty = true; }
+    toast("processed: " + cur()->name);
 }
 
 // ---------------------------------------------------------------- npy loader
@@ -525,6 +621,10 @@ static void saveSession(std::string path) {
             f << "npy ";
         f << d->path << "\n";           // path last: may contain spaces
     }
+    for (const auto& pn : app.pins)
+        f << "pin " << pn.x << " " << pn.y << "\n";
+    if (app.roiW > 0)
+        f << "roi " << app.roiX << " " << app.roiY << " " << app.roiW << " " << app.roiH << "\n";
     toast("session saved: " + baseName(path));
 }
 
@@ -539,6 +639,8 @@ static std::string loadSession(const std::string& path) {
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
     closeAll();
+    app.pins.clear();
+    app.roiX = app.roiY = app.roiW = app.roiH = 0;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     bool haveView = false;
     auto restOfLine = [](std::istringstream& ls) {
@@ -556,6 +658,9 @@ static std::string loadSession(const std::string& path) {
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
         else if (key == "current") ls >> current;
+        else if (key == "pin")   { App::Pin pn{}; ls >> pn.x >> pn.y;
+                                   if (pn.x >= 0 && pn.y >= 0) app.pins.push_back(pn); }
+        else if (key == "roi")     ls >> app.roiX >> app.roiY >> app.roiW >> app.roiH;
         else if (key == "image") {
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
@@ -786,10 +891,42 @@ static void drawCanvas(ImVec2 avail) {
                       app.view.center.y + (s.y - canvasP0.y - canvasSize.y * 0.5f) / app.view.zoom);
     };
 
+    static bool dragRoi = false;      // Shift+drag = ROI select, plain drag = pan
+    static bool dragMoved = false;
     if (im) {
+        if (ImGui::IsItemActivated()) {
+            dragRoi = io.KeyShift;
+            dragMoved = false;
+            app.roiDrag0 = scrToImg(io.MousePos);
+        }
+        if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) dragMoved = true;
         if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0)) {
-            app.view.center.x -= io.MouseDelta.x / app.view.zoom;
-            app.view.center.y -= io.MouseDelta.y / app.view.zoom;
+            if (dragRoi) {
+                ImVec2 q = scrToImg(io.MousePos);
+                float x0 = std::clamp(std::min(app.roiDrag0.x, q.x), 0.0f, (float)im->w);
+                float x1 = std::clamp(std::max(app.roiDrag0.x, q.x), 0.0f, (float)im->w);
+                float y0 = std::clamp(std::min(app.roiDrag0.y, q.y), 0.0f, (float)im->h);
+                float y1 = std::clamp(std::max(app.roiDrag0.y, q.y), 0.0f, (float)im->h);
+                app.roiX = (int)x0; app.roiY = (int)y0;
+                app.roiW = std::max(0, (int)ceilf(x1) - app.roiX);
+                app.roiH = std::max(0, (int)ceilf(y1) - app.roiY);
+                app.roiDragging = true;
+            } else {
+                app.view.center.x -= io.MouseDelta.x / app.view.zoom;
+                app.view.center.y -= io.MouseDelta.y / app.view.zoom;
+            }
+        }
+        if (ImGui::IsItemDeactivated()) {
+            if (dragRoi && dragMoved) {
+                app.roiDragging = false;
+                if (app.roiW < 1 || app.roiH < 1) { app.roiW = app.roiH = 0; }   // too small: clear
+            } else if (!dragMoved && io.KeyCtrl && hovered) {
+                ImVec2 q = scrToImg(io.MousePos);   // Ctrl+click: pin a point of interest
+                int px = (int)floorf(q.x), py = (int)floorf(q.y);
+                if (px >= 0 && py >= 0 && px < im->w && py < im->h)
+                    app.pins.push_back({ px, py });
+            }
+            dragRoi = false;
         }
         if (hovered && io.MouseWheelH != 0)      // trackpad horizontal scroll = pan
             app.view.center.x += io.MouseWheelH * 40.0f / app.view.zoom;
@@ -837,6 +974,27 @@ static void drawCanvas(ImVec2 avail) {
             ImVec2 a = imgToScr((float)app.hoverX, (float)app.hoverY);
             ImVec2 b = imgToScr((float)app.hoverX + 1, (float)app.hoverY + 1);
             dl->AddRect(a, b, IM_COL32(255, 184, 77, 255), 0, 0, 1.5f);
+        }
+        // ROI overlay
+        if (app.roiW > 0 && app.roiH > 0) {
+            ImVec2 a = imgToScr((float)app.roiX, (float)app.roiY);
+            ImVec2 b = imgToScr((float)(app.roiX + app.roiW), (float)(app.roiY + app.roiH));
+            dl->AddRectFilled(a, b, IM_COL32(77, 163, 255, 26));
+            dl->AddRect(a, b, IM_COL32(77, 163, 255, 220), 0, 0, 1.5f);
+            char lb[64];
+            snprintf(lb, 64, "ROI %dx%d @ (%d,%d)", app.roiW, app.roiH, app.roiX, app.roiY);
+            dl->AddText(ImVec2(a.x + 3, a.y - ImGui::GetFontSize() - 2), IM_COL32(120, 190, 255, 255), lb);
+        }
+        // pinned points
+        for (int i = 0; i < (int)app.pins.size(); i++) {
+            const App::Pin& pn = app.pins[i];
+            if (pn.x >= im->w || pn.y >= im->h) continue;   // outside this image
+            ImVec2 cpt = imgToScr(pn.x + 0.5f, pn.y + 0.5f);
+            ImU32 col = IM_COL32(105, 220, 130, 255);
+            dl->AddLine(ImVec2(cpt.x - 8, cpt.y), ImVec2(cpt.x + 8, cpt.y), col, 1.5f);
+            dl->AddLine(ImVec2(cpt.x, cpt.y - 8), ImVec2(cpt.x, cpt.y + 8), col, 1.5f);
+            char lb[16]; snprintf(lb, 16, "%d", i + 1);
+            dl->AddText(ImVec2(cpt.x + 5, cpt.y + 4), col, lb);
         }
     } else {
         const char* msg = "Drop .npy / .bin / .raw files here   (O: open file)";
@@ -936,6 +1094,23 @@ static void drawInspector() {
         if (im->cfa) {
             if (ImGui::Checkbox("Colorize CFA pattern", &im->cfaColorize)) im->texDirty = true;
         }
+        if (im->ch == 1 && !plugin_host::displays().empty()) {
+            if (im->cfa && im->cfaColorize) {
+                ImGui::TextDisabled("colormap disabled while CFA colorize is on");
+            } else {
+                const char* curName = (im->displayLut >= 0 &&
+                                       im->displayLut < (int)plugin_host::displays().size())
+                    ? plugin_host::displays()[im->displayLut].name.c_str() : "Gray";
+                if (ImGui::BeginCombo("Colormap", curName)) {
+                    if (ImGui::Selectable("Gray", im->displayLut < 0)) { im->displayLut = -1; im->texDirty = true; }
+                    for (int i = 0; i < (int)plugin_host::displays().size(); i++)
+                        if (ImGui::Selectable(plugin_host::displays()[i].name.c_str(), im->displayLut == i)) {
+                            im->displayLut = i; im->texDirty = true;
+                        }
+                    ImGui::EndCombo();
+                }
+            }
+        }
 
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Range (black / white)");
@@ -964,6 +1139,108 @@ static void drawInspector() {
         ImGui::Checkbox("Pixel grid (G, zoom>=8)", &app.showGrid);
     } else {
         ImGui::TextDisabled("no image");
+    }
+
+    // ---- pinned points (Ctrl+click on the canvas) ----
+    if (im && !app.pins.empty()) {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Text("Pins (%d)", (int)app.pins.size());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##pins")) app.pins.clear();
+        ImGui::Separator();
+        int nCols = 2 + std::min(im->ch, 4);
+        if (!app.pins.empty() &&
+            ImGui::BeginTable("pins", nCols, ImGuiTableFlags_SizingStretchProp)) {
+            static const char* LB1[] = { "V" };
+            static const char* LB2[] = { "C0", "C1" };
+            static const char* LB3[] = { "R", "G", "B", "A" };
+            const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.6f);
+            ImGui::TableSetupColumn("x,y");
+            for (int c = 0; c < std::min(im->ch, 4); c++) ImGui::TableSetupColumn(lb[c]);
+            ImGui::TableHeadersRow();
+            int removeIdx = -1;
+            for (int i = 0; i < (int)app.pins.size(); i++) {
+                const App::Pin& pn = app.pins[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                char rm[16]; snprintf(rm, 16, "%d##rm%d", i + 1, i);
+                if (ImGui::SmallButton(rm)) removeIdx = i;    // click the number to remove
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("click to remove pin %d", i + 1);
+                ImGui::TableNextColumn();
+                bool inside = pn.x < im->w && pn.y < im->h;
+                if (im->cfa && inside)
+                    ImGui::Text("%d,%d [%s]", pn.x, pn.y, CFA_CH_NAMES[cfaChannelAt(*im, pn.x, pn.y)]);
+                else
+                    ImGui::Text("%d,%d", pn.x, pn.y);
+                for (int c = 0; c < std::min(im->ch, 4); c++) {
+                    ImGui::TableNextColumn();
+                    if (inside)
+                        ImGui::TextUnformatted(fmtVal(im->sample(pn.x, pn.y, c), im->dtype).c_str());
+                    else
+                        ImGui::TextDisabled("-");
+                }
+            }
+            if (removeIdx >= 0) app.pins.erase(app.pins.begin() + removeIdx);
+            ImGui::EndTable();
+        }
+    }
+
+    // ---- analysis (Analyzer plugins; ROI-aware) ----
+    if (im && !plugin_host::analyzers().empty()) {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Text("Analysis");
+        ImGui::Separator();
+        const auto& anas = plugin_host::analyzers();
+        app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+        if (ImGui::BeginCombo("##anasel", anas[app.anaSel].name.c_str())) {
+            for (int i = 0; i < (int)anas.size(); i++)
+                if (ImGui::Selectable(anas[i].name.c_str(), i == app.anaSel)) app.anaSel = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        bool runClicked = ImGui::Button("Run");
+        ImGui::SameLine();
+        ImGui::Checkbox("auto", &app.anaAuto);
+        if (app.roiW > 0) {
+            ImGui::TextDisabled("ROI %dx%d @ (%d,%d)", app.roiW, app.roiH, app.roiX, app.roiY);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear ROI")) { app.roiW = app.roiH = 0; }
+        } else {
+            ImGui::TextDisabled("whole image (Shift+drag on canvas = ROI)");
+        }
+        auto& ana = app.ana;
+        bool stale = ana.img != im || ana.plugin != app.anaSel ||
+                     ana.rx != app.roiX || ana.ry != app.roiY ||
+                     ana.rw != app.roiW || ana.rh != app.roiH;
+        if (runClicked || (app.anaAuto && stale && !app.roiDragging)) {
+            ana.rows.clear(); ana.err.clear();
+            ana.img = im; ana.plugin = app.anaSel;
+            ana.rx = app.roiX; ana.ry = app.roiY; ana.rw = app.roiW; ana.rh = app.roiH;
+            psFrame f = makeFrame(*im);
+            psRect roi = { (uint32_t)app.roiX, (uint32_t)app.roiY,
+                           (uint32_t)app.roiW, (uint32_t)app.roiH };
+            psAnalyzeSink sink = { &ana.rows, anaEmitNumber, anaEmitText };
+            char err[256] = { 0 };
+            if (anas[app.anaSel].v.analyze(&f, app.roiW > 0 ? &roi : nullptr,
+                                           &sink, err, sizeof err) != 0) {
+                ana.err = err[0] ? err : "analyzer failed";
+            }
+        }
+        if (ana.img == im) {
+            if (!ana.err.empty())
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
+            else if (!ana.rows.empty() &&
+                     ImGui::BeginTable("anarows", 2, ImGuiTableFlags_SizingStretchProp)) {
+                for (const auto& kv : ana.rows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", kv.first.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(kv.second.c_str());
+                }
+                ImGui::EndTable();
+            }
+        }
     }
 }
 
@@ -1023,6 +1300,12 @@ static void drawMenuBar(GLFWwindow* win) {
         }
         ImGui::EndMenu();
     }
+    if (!plugin_host::processors().empty() && ImGui::BeginMenu("Process")) {
+        for (int i = 0; i < (int)plugin_host::processors().size(); i++)
+            if (ImGui::MenuItem(plugin_host::processors()[i].name.c_str(), nullptr, false, cur() != nullptr))
+                runProcessor(i);
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("Help")) {
         if (ImGui::MenuItem("Keyboard Shortcuts", "H")) app.showHelp = true;
         if (ImGui::MenuItem("About viewer")) app.showAbout = true;
@@ -1049,6 +1332,8 @@ static void drawHelpAbout() {
                 row("+ / -",         "zoom in / out");
                 row("wheel",         "zoom at cursor");
                 row("drag",          "pan");
+                row("Shift+drag",    "select ROI (used by Analysis)");
+                row("Ctrl+click",    "pin a point of interest");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
                 ImGui::EndTable();
@@ -1218,6 +1503,13 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 
+    plugin_host::loadAll(
+        { plugin_host::exeDir() + "/plugins", plugin_host::exeDir() + "/../plugins" },
+        [](const std::string& m, bool err) {
+            if (err) toast(m, true);
+            fprintf(stderr, "%s\n", m.c_str());
+        });
+
     parseCli(argc, argv);
 
     while (!glfwWindowShouldClose(win)) {
@@ -1330,5 +1622,6 @@ int main(int argc, char** argv) {
     ImGui::DestroyContext();
     glfwDestroyWindow(win);
     glfwTerminate();
+    plugin_host::unloadAll();
     return 0;
 }

@@ -115,6 +115,21 @@ def sharpen(frame: np.ndarray, amount: float) -> np.ndarray:
 - 会議で画面を配る、リモートの計測マシンの結果を手元で見る、といった Web の配布力を捨てない。
 - プロトコルは Frame 記述子 JSON + バイナリペイロードのみ。UI 状態は各フロントエンドが持つ。
 
+## Plugin ABI v1 (実装済み)
+
+`include/ps/ps_plugin.h` が契約のすべて。実装済みの3種:
+
+| 種別 | 形 | 実例 |
+|---|---|---|
+| **Display (描画系)** | 256エントリ RGB LUT を登録時に1回生成 (ホットパスにプラグイン呼び出しなし。将来 GPU テクスチャに直結) | `display_falsecolor` (viridis) |
+| **Analyzer (解析系)** | `analyze(frame, roi, sink)` — key/value を emit するコールバック方式 (JSON パーサ不要)。ROI 対応 | `analyzer_stats` |
+| **Processor** | `process(in, out, host)` — 出力メモリは**必ず** `host->frame_alloc` で確保、解放はホスト (CRT 境界対策) | `proc_demosaic` (Bayer のみ、Quad は明示エラー) |
+
+- 読み込み: 起動時に `<exe_dir>/plugins/` と `<exe_dir>/../plugins/` から `*.dll` / `*.so` / `*.dylib` をスキャン。ホットリロードは v2。
+- 検証: ABI バージョン不一致・CPU 実装なし・重複名は登録拒否 (警告トースト、クラッシュさせない)。
+- Loader / Source は enum 値 4/5 を予約済み (v2)。
+- メモリ規則: **ABI を越えるピクセルメモリは frame_alloc/frame_free のみ。文字列は emit 中にホストがコピー。記述子の文字列はプロセス生存期間。**
+
 ## リポジトリ構成 (予定)
 
 ```
