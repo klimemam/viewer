@@ -1856,6 +1856,7 @@ static void drawHelpAbout() {
                 row("middle-drag / Space+drag", "pan (works in any tool)");
                 row("Shift+drag",    "quick ROI (Navigate tool)");
                 row("Ctrl+click",    "quick pin (Navigate tool)");
+                row("X / Y",         "expand selected ROI to full width / height");
                 row("Del / Esc",     "delete / deselect annotation");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
@@ -2092,6 +2093,16 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_V, false)) app.tool = 0;
             if (ImGui::IsKeyPressed(ImGuiKey_R, false)) app.tool = 1;
             if (ImGui::IsKeyPressed(ImGuiKey_P, false)) app.tool = 2;
+            // X/Y: expand the selected ROI to full width / height (row/column bands
+            // without zooming out to see the whole image)
+            if (ImGui::IsKeyPressed(ImGuiKey_X, false) && cur()) {
+                if (App::Ann* a = findAnn(app.selectedAnn))
+                    if (a->type == 0) { a->x = 0; a->w = cur()->w; app.annRev++; }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Y, false) && cur()) {
+                if (App::Ann* a = findAnn(app.selectedAnn))
+                    if (a->type == 0) { a->y = 0; a->h = cur()->h; app.annRev++; }
+            }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
             if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = -1;
