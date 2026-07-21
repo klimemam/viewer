@@ -102,8 +102,8 @@ struct ImageDoc {
     int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
     int cfaPattern = 0;               // index into CFA_PATTERNS
     bool cfaColorize = false;
-    // raw reload parameters, kept so sessions can restore this image (-1 = not raw)
-    int rawFmt = -1, rawOffset = 0;
+    // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
+    int rawDtype = -1, rawInterp = 0, rawOffset = 0;
     bool rawLE = true;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
 
@@ -145,24 +145,41 @@ struct App {
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
-    // pinned points of interest (image coords, shared across images)
-    struct Pin { int x, y; };
-    std::vector<Pin> pins;
-    // ROI (image coords); w==0 means no ROI. Shift+drag on the canvas.
-    int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
-    bool roiDragging = false;
-    ImVec2 roiDrag0;                  // image coords where the drag started
-    // analyzer plugin state: cached result for (image, plugin, roi)
+    // ---- unified annotations: ROIs (rect) and POIs (point), multiple of each ----
+    struct Ann {
+        int id = 0;
+        int type = 0;                 // 0 = rect (ROI), 1 = point (POI)
+        int x = 0, y = 0, w = 0, h = 0;
+        std::string label;
+        int color = 0;                // palette index
+        bool visible = true;
+    };
+    std::vector<Ann> anns;
+    int nextAnnId = 1;
+    int selectedAnn = -1;             // Ann::id, -1 = none
+    uint64_t annRev = 0;              // bumped on any annotation change
+    bool annBusy = false;             // true while an annotation drag is in progress
+    int tool = 0;                     // 0 Navigate (V), 1 ROI (R), 2 POI (P)
+    bool wheelZoomPlain = false;      // false: Ctrl+wheel zooms, plain wheel pans
+    // analyzer plugin state: cached result grid (rows = keys, cols = ROIs)
     struct AnalysisState {
         const ImageDoc* img = nullptr;
         int plugin = -1;
-        int rx = -1, ry = -1, rw = -1, rh = -1;
-        std::vector<std::pair<std::string, std::string>> rows;
+        uint64_t rev = (uint64_t)-1;
+        std::vector<std::string> cols;                 // "whole" or ROI labels
+        std::vector<std::string> keys;                 // row keys, first-seen order
+        std::vector<std::vector<std::string>> vals;    // [row][col]
         std::string err;
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
 };
+static const ImU32 ANN_COLORS[8] = {
+    IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
+    IM_COL32(255, 120, 120, 255), IM_COL32(200, 120, 255, 255), IM_COL32(90, 220, 220, 255),
+    IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
+};
+static const char* TOOL_NAMES[3] = { "Nav", "ROI", "Pin" };
 static App app;
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
@@ -266,6 +283,32 @@ static void closeAll() {
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.current = -1;
+}
+
+// ---------------------------------------------------------------- annotations
+static App::Ann* findAnn(int id) {
+    for (auto& a : app.anns)
+        if (a.id == id) return &a;
+    return nullptr;
+}
+static void addAnn(int type, int x, int y, int w, int h) {
+    App::Ann a;
+    a.id = app.nextAnnId++;
+    a.type = type; a.x = x; a.y = y; a.w = w; a.h = h;
+    a.color = (a.id - 1) & 7;
+    int cnt = 1;
+    for (const auto& e : app.anns)
+        if (e.type == type) cnt++;
+    a.label = (type == 0 ? "ROI " : "P") + std::to_string(cnt);
+    app.anns.push_back(std::move(a));
+    app.selectedAnn = app.anns.back().id;
+    app.annRev++;
+}
+static void deleteAnn(int id) {
+    for (size_t i = 0; i < app.anns.size(); i++)
+        if (app.anns[i].id == id) { app.anns.erase(app.anns.begin() + i); break; }
+    if (app.selectedAnn == id) app.selectedAnn = -1;
+    app.annRev++;
 }
 
 // ---------------------------------------------------------------- plugin glue
@@ -478,123 +521,133 @@ static std::string loadNpy(const std::string& path) {
 }
 
 // ---------------------------------------------------------------- raw loader
-struct RawFormat { const char* label; float bpp; int ch; };
-static const RawFormat RAW_FORMATS[] = {
-    { "Gray 8bit",    1,  1 }, { "Gray 16bit", 2, 1 }, { "Gray float32", 4, 1 }, { "Gray float64", 8, 1 },
-    { "RGB 8bit",     3,  3 }, { "BGR 8bit",   3, 3 }, { "RGBA 8bit",    4, 4 }, { "BGRA 8bit",    4, 4 },
-    { "RGB 16bit",    6,  3 }, { "RGB float32", 12, 3 },
-    { "Bayer 8bit",   1,  1 }, { "Bayer 16bit", 2, 1 },
+// Two orthogonal axes:
+//   dtype  = how ONE sample is stored in the file (u8/u16/f32/f64 + endian)
+//   interp = what the samples MEAN (gray / RGB / BGR / RGBA / BGRA / Bayer / Quad Bayer)
+// Any combination is valid (e.g. RGGB float32).
+enum RawDtype  { RD_U8, RD_U16, RD_F32, RD_F64, RD_COUNT };
+static const char* RAW_DTYPE_NAMES[] = { "u8", "u16", "f32", "f64" };
+static const int   RAW_DTYPE_SIZE[]  = { 1, 2, 4, 8 };
+enum RawInterp { RI_GRAY, RI_RGB, RI_BGR, RI_RGBA, RI_BGRA, RI_BAYER, RI_QUAD, RI_COUNT };
+static const char* RAW_INTERP_NAMES[] =
+    { "Gray (1ch)", "RGB (3ch)", "BGR (3ch)", "RGBA (4ch)", "BGRA (4ch)",
+      "Bayer (1ch CFA)", "Quad Bayer (1ch CFA)" };
+static const char* RAW_INTERP_CLI[] = { "gray", "rgb", "bgr", "rgba", "bgra", "bayer", "quad-bayer" };
+static const int   RAW_INTERP_CH[]  = { 1, 3, 3, 4, 4, 1, 1 };
+
+// legacy combined names (--raw-format, session v1 "raw" lines) -> (dtype, interp)
+static const int LEGACY_RAW_MAP[][2] = {
+    { RD_U8,  RI_GRAY }, { RD_U16, RI_GRAY }, { RD_F32, RI_GRAY }, { RD_F64, RI_GRAY },
+    { RD_U8,  RI_RGB  }, { RD_U8,  RI_BGR  }, { RD_U8,  RI_RGBA }, { RD_U8,  RI_BGRA },
+    { RD_U16, RI_RGB  }, { RD_F32, RI_RGB  }, { RD_U8,  RI_BAYER }, { RD_U16, RI_BAYER },
 };
-enum RawFmtIdx { RF_G8, RF_G16, RF_GF32, RF_GF64, RF_RGB8, RF_BGR8, RF_RGBA8, RF_BGRA8, RF_RGB16, RF_RGBF32,
-                 RF_BAYER8, RF_BAYER16, RF_COUNT };
-// CLI names, aligned with RawFmtIdx
-static const char* RAW_CLI_NAMES[] = { "gray8", "gray16", "grayf32", "grayf64", "rgb8", "bgr8", "rgba8", "bgra8",
-                                       "rgb16", "rgbf32", "bayer8", "bayer16" };
+static const char* LEGACY_RAW_NAMES[] = { "gray8", "gray16", "grayf32", "grayf64", "rgb8", "bgr8",
+                                          "rgba8", "bgra8", "rgb16", "rgbf32", "bayer8", "bayer16" };
 
 struct RawDialog {
     bool open = false;
     std::string path;
     size_t fileSize = 0;
-    int w = 1920, h = 1080, offset = 0, fmt = RF_G8;
+    int w = 1920, h = 1080, offset = 0;
+    int dtype = RD_U8, interp = RI_GRAY;
     bool littleEndian = true;
     int cfaPattern = 0;               // RGGB/BGGR/GRBG/GBRG
-    bool quad = false;                // Quad Bayer
+    int replaceIdx = -1;              // >=0: reload INTO this image slot (reinterpret)
     std::vector<std::pair<int,int>> guesses;
 } rawDlg;
 
 static void rawGuessDims(RawDialog& d) {
     d.guesses.clear();
-    float bpp = RAW_FORMATS[d.fmt].bpp;
+    size_t bpp = (size_t)RAW_DTYPE_SIZE[d.dtype] * RAW_INTERP_CH[d.interp];
     size_t nbytes = d.fileSize > (size_t)d.offset ? d.fileSize - d.offset : 0;
+    if (!bpp || nbytes % bpp != 0) return;   // no exact pixel count -> no candidates
+    int64_t n = (int64_t)(nbytes / bpp);
     static const int commons[][2] = { {3840,2160},{1920,1080},{1280,720},{640,480},{512,512},{1024,1024},
         {2048,2048},{4096,4096},{256,256},{2560,1440},{720,480},{640,360},{320,240},{128,128} };
     for (auto& c : commons)
-        if (fabs((double)c[0] * c[1] * bpp - (double)nbytes) < 0.5)
+        if ((int64_t)c[0] * c[1] == n)
             d.guesses.push_back({ c[0], c[1] });
-    double npx = nbytes / bpp;
-    if (npx == floor(npx)) {
-        int64_t n = (int64_t)npx;
-        for (int64_t w = 16; w <= 8192 && (int)d.guesses.size() < 30; w++) {
-            if (n % w == 0) {
-                int64_t h = n / w;
-                if (h >= 16 && h <= 8192 && w <= h * 8 && h <= w * 8) {
-                    bool dup = false;
-                    for (auto& g : d.guesses) if (g.first == w && g.second == h) dup = true;
-                    if (!dup) d.guesses.push_back({ (int)w, (int)h });
-                }
+    for (int64_t w = 16; w <= 8192 && (int)d.guesses.size() < 30; w++) {
+        if (n % w == 0) {
+            int64_t h = n / w;
+            if (h >= 16 && h <= 8192 && w <= h * 8 && h <= w * 8) {
+                bool dup = false;
+                for (auto& g : d.guesses) if (g.first == w && g.second == h) dup = true;
+                if (!dup) d.guesses.push_back({ (int)w, (int)h });
             }
         }
     }
 }
 
 static std::string loadRaw(const RawDialog& d) {
+    if (d.dtype < 0 || d.dtype >= RD_COUNT || d.interp < 0 || d.interp >= RI_COUNT)
+        return "invalid raw format";
     std::vector<uint8_t> buf;
     if (!readFileBytes(d.path, buf)) return "cannot read file";
-    const RawFormat& F = RAW_FORMATS[d.fmt];
+    const int elem = RAW_DTYPE_SIZE[d.dtype];
+    const int ch = RAW_INTERP_CH[d.interp];
     size_t px = (size_t)d.w * d.h;
-    size_t need = (size_t)ceil(px * F.bpp) + d.offset;
-    if (need > buf.size()) return "file too small for this size/format";
+    size_t count = px * ch;
+    if (count * elem + d.offset > buf.size()) return "file too small for this size/format";
     const uint8_t* p = buf.data() + d.offset;
     bool le = d.littleEndian;
 
-    auto rd16 = [&](size_t o) -> uint16_t {
-        return le ? (uint16_t)(p[o] | p[o + 1] << 8) : (uint16_t)(p[o] << 8 | p[o + 1]);
-    };
-    auto rdf32 = [&](size_t o) -> float {
-        uint32_t u = le ? (uint32_t)p[o] | p[o+1]<<8 | p[o+2]<<16 | (uint32_t)p[o+3]<<24
-                        : (uint32_t)p[o]<<24 | p[o+1]<<16 | p[o+2]<<8 | p[o+3];
-        float f; memcpy(&f, &u, 4); return f;
-    };
-    auto rdf64 = [&](size_t o) -> double {
-        uint64_t u = 0;
-        for (int i = 0; i < 8; i++) u |= (uint64_t)p[o + i] << (8 * (le ? i : 7 - i));
-        double f; memcpy(&f, &u, 8); return f;
+    auto rd = [&](size_t i) -> float {   // one sample, any dtype/endian -> float
+        const uint8_t* q = p + i * elem;
+        switch (d.dtype) {
+        case RD_U8:  return q[0];
+        case RD_U16: return le ? (float)(q[0] | q[1] << 8) : (float)(q[0] << 8 | q[1]);
+        case RD_F32: {
+            uint32_t u = le ? (uint32_t)q[0] | q[1] << 8 | q[2] << 16 | (uint32_t)q[3] << 24
+                            : (uint32_t)q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3];
+            float f; memcpy(&f, &u, 4); return f;
+        }
+        case RD_F64: {
+            uint64_t u = 0;
+            for (int b = 0; b < 8; b++) u |= (uint64_t)q[le ? b : 7 - b] << (8 * b);
+            double v; memcpy(&v, &u, 8); return (float)v;
+        }
+        }
+        return 0;
     };
 
     auto im = std::make_unique<ImageDoc>();
     im->name = baseName(d.path); im->path = d.path;
-    im->w = d.w; im->h = d.h; im->ch = F.ch;
-    im->note = F.label;
-    im->data.resize(px * F.ch);
+    im->w = d.w; im->h = d.h; im->ch = ch;
+    im->dtype = RAW_DTYPE_NAMES[d.dtype];
+    im->data.resize(count);
     float* out = im->data.data();
-    switch (d.fmt) {
-    case RF_G8:  case RF_BAYER8:  im->dtype = "u8";  for (size_t i = 0; i < px; i++) out[i] = p[i]; break;
-    case RF_G16: case RF_BAYER16: im->dtype = "u16"; for (size_t i = 0; i < px; i++) out[i] = rd16(i * 2); break;
-    case RF_GF32: im->dtype = "f32"; for (size_t i = 0; i < px; i++) out[i] = rdf32(i * 4); break;
-    case RF_GF64: im->dtype = "f64"; for (size_t i = 0; i < px; i++) out[i] = (float)rdf64(i * 8); break;
-    case RF_RGB8: case RF_BGR8: {
-        im->dtype = "u8";
-        bool sw = d.fmt == RF_BGR8;
-        for (size_t i = 0; i < px; i++) {
-            out[i * 3]     = p[i * 3 + (sw ? 2 : 0)];
-            out[i * 3 + 1] = p[i * 3 + 1];
-            out[i * 3 + 2] = p[i * 3 + (sw ? 0 : 2)];
+    bool sw = d.interp == RI_BGR || d.interp == RI_BGRA;   // channel 0/2 swap
+    for (size_t i = 0; i < px; i++)
+        for (int c = 0; c < ch; c++) {
+            int oc = (sw && c == 0) ? 2 : (sw && c == 2) ? 0 : c;
+            out[i * ch + oc] = rd(i * ch + c);
         }
-        break;
-    }
-    case RF_RGBA8: case RF_BGRA8: {
-        im->dtype = "u8";
-        bool sw = d.fmt == RF_BGRA8;
-        for (size_t i = 0; i < px; i++) {
-            out[i * 4]     = p[i * 4 + (sw ? 2 : 0)];
-            out[i * 4 + 1] = p[i * 4 + 1];
-            out[i * 4 + 2] = p[i * 4 + (sw ? 0 : 2)];
-            out[i * 4 + 3] = p[i * 4 + 3];
-        }
-        break;
-    }
-    case RF_RGB16:  im->dtype = "u16"; for (size_t i = 0; i < px * 3; i++) out[i] = rd16(i * 2); break;
-    case RF_RGBF32: im->dtype = "f32"; for (size_t i = 0; i < px * 3; i++) out[i] = rdf32(i * 4); break;
-    }
-    if (d.fmt == RF_BAYER8 || d.fmt == RF_BAYER16) {
-        im->cfa = d.quad ? 2 : 1;
+    im->note = std::string(RAW_INTERP_NAMES[d.interp]) + " " + RAW_DTYPE_NAMES[d.dtype];
+    if (d.interp == RI_BAYER || d.interp == RI_QUAD) {
+        im->cfa = d.interp == RI_QUAD ? 2 : 1;
         im->cfaPattern = d.cfaPattern & 3;
-        im->note = std::string(d.quad ? "Quad Bayer " : "Bayer ") + CFA_PATTERNS[im->cfaPattern];
+        im->note = std::string(d.interp == RI_QUAD ? "Quad Bayer " : "Bayer ")
+                 + CFA_PATTERNS[im->cfaPattern] + " " + RAW_DTYPE_NAMES[d.dtype];
     }
-    im->rawFmt = d.fmt;               // remember raw params so sessions can restore
+    im->rawDtype = d.dtype;           // remember raw params: sessions + reinterpret
+    im->rawInterp = d.interp;
     im->rawOffset = d.offset;
     im->rawLE = d.littleEndian;
-    addImage(std::move(im));
+
+    if (d.replaceIdx >= 0 && d.replaceIdx < (int)app.images.size()) {
+        // reinterpret in place: keep list position, selection and view
+        ImageDoc* old = app.images[d.replaceIdx].get();
+        if (app.ana.img == old) app.ana.img = nullptr;
+        if (old->tex) glDeleteTextures(1, &old->tex);
+        computeMinMax(*im);
+        defaultRange(*im);
+        im->texDirty = true;
+        app.images[d.replaceIdx] = std::move(im);
+        app.current = d.replaceIdx;
+    } else {
+        addImage(std::move(im));
+    }
     return {};
 }
 
@@ -613,18 +666,21 @@ static void saveSession(std::string path) {
     for (auto& d : app.images) {
         if (d->path.empty()) continue;
         f << "image " << d->black << " " << d->white << " ";
-        if (d->rawFmt >= 0)
-            f << "raw " << d->rawFmt << " " << d->w << " " << d->h << " " << d->rawOffset << " "
-              << (d->rawLE ? 1 : 0) << " " << d->cfaPattern << " " << (d->cfa == 2 ? 1 : 0) << " "
+        if (d->rawDtype >= 0) {
+            int interp = d->rawInterp;
+            if (RAW_INTERP_CH[interp] == 1)   // 1ch family: honor the CURRENT interpretation
+                interp = d->cfa == 2 ? RI_QUAD : d->cfa == 1 ? RI_BAYER : RI_GRAY;
+            f << "raw2 " << d->rawDtype << " " << interp << " " << d->w << " " << d->h << " "
+              << d->rawOffset << " " << (d->rawLE ? 1 : 0) << " " << d->cfaPattern << " "
               << (d->cfaColorize ? 1 : 0) << " ";
-        else
-            f << "npy ";
+        } else {
+            f << "npy2 " << d->cfa << " " << d->cfaPattern << " " << (d->cfaColorize ? 1 : 0) << " ";
+        }
         f << d->path << "\n";           // path last: may contain spaces
     }
-    for (const auto& pn : app.pins)
-        f << "pin " << pn.x << " " << pn.y << "\n";
-    if (app.roiW > 0)
-        f << "roi " << app.roiX << " " << app.roiY << " " << app.roiW << " " << app.roiH << "\n";
+    for (const auto& a : app.anns)   // label last: may contain spaces
+        f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
+          << a.color << " " << (a.visible ? 1 : 0) << " " << a.label << "\n";
     toast("session saved: " + baseName(path));
 }
 
@@ -639,8 +695,9 @@ static std::string loadSession(const std::string& path) {
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
     closeAll();
-    app.pins.clear();
-    app.roiX = app.roiY = app.roiW = app.roiH = 0;
+    app.anns.clear();
+    app.selectedAnn = -1;
+    app.annRev++;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     bool haveView = false;
     auto restOfLine = [](std::istringstream& ls) {
@@ -658,23 +715,53 @@ static std::string loadSession(const std::string& path) {
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
         else if (key == "current") ls >> current;
-        else if (key == "pin")   { App::Pin pn{}; ls >> pn.x >> pn.y;
-                                   if (pn.x >= 0 && pn.y >= 0) app.pins.push_back(pn); }
-        else if (key == "roi")     ls >> app.roiX >> app.roiY >> app.roiW >> app.roiH;
+        else if (key == "ann") {
+            App::Ann a; int vis = 1;
+            ls >> a.type >> a.x >> a.y >> a.w >> a.h >> a.color >> vis;
+            a.visible = vis != 0;
+            a.label = restOfLine(ls);
+            if (a.label.empty()) a.label = a.type == 0 ? "ROI" : "P";
+            a.id = app.nextAnnId++;
+            app.anns.push_back(std::move(a));
+            app.annRev++;
+        }
+        // legacy (pre-annotation sessions)
+        else if (key == "pin") { int x = 0, y = 0; ls >> x >> y;
+                                 if (x >= 0 && y >= 0) addAnn(1, x, y, 0, 0); }
+        else if (key == "roi") { int x = 0, y = 0, w = 0, h = 0; ls >> x >> y >> w >> h;
+                                 if (w > 0 && h > 0) addAnn(0, x, y, w, h); }
         else if (key == "image") {
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
             std::string err;
-            if (kind == "raw") {
+            if (kind == "raw2" || kind == "raw") {
                 RawDialog d;
-                int le = 1, quad = 0, col = 0;
-                ls >> d.fmt >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> quad >> col;
-                d.littleEndian = le != 0; d.quad = quad != 0;
+                int le = 1, col = 0;
+                if (kind == "raw2") {
+                    ls >> d.dtype >> d.interp >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> col;
+                } else {                     // legacy v1 line: combined format index + quad flag
+                    int fmt = 0, quad = 0;
+                    ls >> fmt >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> quad >> col;
+                    if (fmt < 0 || fmt >= 12) { toast("session: bad raw format", true); continue; }
+                    d.dtype = LEGACY_RAW_MAP[fmt][0];
+                    d.interp = LEGACY_RAW_MAP[fmt][1];
+                    if (quad && d.interp == RI_BAYER) d.interp = RI_QUAD;
+                }
+                d.littleEndian = le != 0;
                 d.path = restOfLine(ls);
-                if (d.fmt < 0 || d.fmt >= RF_COUNT) { toast("session: bad raw format", true); continue; }
                 err = loadRaw(d);
                 if (err.empty()) cur()->cfaColorize = col != 0;
-            } else {
+            } else if (kind == "npy2") {
+                int cfa = 0, pat = 0, col = 0;
+                ls >> cfa >> pat >> col;
+                std::string p = restOfLine(ls);
+                err = loadNpy(p);
+                if (err.empty()) {
+                    cur()->cfa = std::clamp(cfa, 0, 2);
+                    cur()->cfaPattern = pat & 3;
+                    cur()->cfaColorize = col != 0;
+                }
+            } else {                          // legacy "npy"
                 std::string p = restOfLine(ls);
                 err = loadNpy(p);
             }
@@ -682,6 +769,7 @@ static std::string loadSession(const std::string& path) {
             cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
         }
     }
+    app.selectedAnn = -1;
     if (current >= 0 && current < (int)app.images.size()) app.current = current;
     if (haveView && !app.images.empty()) {
         app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
@@ -700,7 +788,8 @@ static void openRawDialogFor(const std::string& path) {
     rawDlg.open = true;
     rawDlg.path = path;
     rawDlg.fileSize = (size_t)f.tellg();
-    // guess format/pattern from filename hints
+    rawDlg.replaceIdx = -1;           // fresh open (reinterpret sets this explicitly after)
+    // guess dtype/interpretation/pattern from filename hints
     std::string n = baseName(path);
     {
         std::string nl = n;
@@ -710,10 +799,22 @@ static void openRawDialogFor(const std::string& path) {
             std::string pat = CFA_PATTERNS[i];
             std::transform(pat.begin(), pat.end(), pat.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            if (nl.find(pat) != std::string::npos) { rawDlg.fmt = RF_BAYER16; rawDlg.cfaPattern = i; }
+            if (nl.find(pat) != std::string::npos) {
+                rawDlg.interp = RI_BAYER; rawDlg.cfaPattern = i;
+                if (rawDlg.dtype == RD_U8) rawDlg.dtype = RD_U16;   // bayer dumps are usually 16bit
+            }
         }
-        if (nl.find("bayer") != std::string::npos && rawDlg.fmt != RF_BAYER8) rawDlg.fmt = RF_BAYER16;
-        if (nl.find("quad") != std::string::npos) rawDlg.quad = true;
+        if (nl.find("bayer") != std::string::npos && rawDlg.interp != RI_BAYER && rawDlg.interp != RI_QUAD) {
+            rawDlg.interp = RI_BAYER;
+            if (rawDlg.dtype == RD_U8) rawDlg.dtype = RD_U16;
+        }
+        if (nl.find("quad") != std::string::npos &&
+            (rawDlg.interp == RI_BAYER || nl.find("bayer") != std::string::npos))
+            rawDlg.interp = RI_QUAD;
+        if (nl.find("f32") != std::string::npos || nl.find("float") != std::string::npos)
+            rawDlg.dtype = RD_F32;
+        else if (nl.find("f64") != std::string::npos || nl.find("double") != std::string::npos)
+            rawDlg.dtype = RD_F64;
     }
     for (size_t i = 0; i + 1 < n.size(); i++) {
         if ((n[i] == 'x' || n[i] == 'X') && isdigit((unsigned char)n[i + 1]) && i > 0 && isdigit((unsigned char)n[i - 1])) {
@@ -805,13 +906,28 @@ static void drawRawModal() {
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("RAW load settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
 
-    ImGui::Text("%s  (%zu bytes)", baseName(rawDlg.path).c_str(), rawDlg.fileSize);
+    ImGui::Text("%s  (%zu bytes)%s", baseName(rawDlg.path).c_str(), rawDlg.fileSize,
+                rawDlg.replaceIdx >= 0 ? "  -  reinterpret" : "");
     ImGui::Separator();
-    int prevFmt = rawDlg.fmt, prevOff = rawDlg.offset;
-    if (ImGui::BeginCombo("format", RAW_FORMATS[rawDlg.fmt].label)) {
-        for (int i = 0; i < (int)(sizeof(RAW_FORMATS) / sizeof(RAW_FORMATS[0])); i++)
-            if (ImGui::Selectable(RAW_FORMATS[i].label, i == rawDlg.fmt)) rawDlg.fmt = i;
+    int prevDt = rawDlg.dtype, prevIn = rawDlg.interp, prevOff = rawDlg.offset;
+    // axis 1: how one sample is stored
+    if (ImGui::BeginCombo("pixel format", RAW_DTYPE_NAMES[rawDlg.dtype])) {
+        for (int i = 0; i < RD_COUNT; i++)
+            if (ImGui::Selectable(RAW_DTYPE_NAMES[i], i == rawDlg.dtype)) rawDlg.dtype = i;
         ImGui::EndCombo();
+    }
+    // axis 2: what the samples mean
+    if (ImGui::BeginCombo("interpretation", RAW_INTERP_NAMES[rawDlg.interp])) {
+        for (int i = 0; i < RI_COUNT; i++)
+            if (ImGui::Selectable(RAW_INTERP_NAMES[i], i == rawDlg.interp)) rawDlg.interp = i;
+        ImGui::EndCombo();
+    }
+    if (rawDlg.interp == RI_BAYER || rawDlg.interp == RI_QUAD) {
+        if (ImGui::BeginCombo("CFA pattern", CFA_PATTERNS[rawDlg.cfaPattern])) {
+            for (int i = 0; i < 4; i++)
+                if (ImGui::Selectable(CFA_PATTERNS[i], i == rawDlg.cfaPattern)) rawDlg.cfaPattern = i;
+            ImGui::EndCombo();
+        }
     }
     if (!rawDlg.guesses.empty()) {
         char cursz[64]; snprintf(cursz, 64, "%d x %d", rawDlg.w, rawDlg.h);
@@ -830,17 +946,11 @@ static void drawRawModal() {
     rawDlg.h = std::clamp(rawDlg.h, 1, 32768);
     rawDlg.offset = std::max(0, rawDlg.offset);
     ImGui::Checkbox("little endian", &rawDlg.littleEndian);
-    if (rawDlg.fmt == RF_BAYER8 || rawDlg.fmt == RF_BAYER16) {
-        if (ImGui::BeginCombo("CFA pattern", CFA_PATTERNS[rawDlg.cfaPattern])) {
-            for (int i = 0; i < 4; i++)
-                if (ImGui::Selectable(CFA_PATTERNS[i], i == rawDlg.cfaPattern)) rawDlg.cfaPattern = i;
-            ImGui::EndCombo();
-        }
-        ImGui::Checkbox("Quad Bayer (2x2 blocks share a color)", &rawDlg.quad);
-    }
-    if (rawDlg.fmt != prevFmt || rawDlg.offset != prevOff) rawGuessDims(rawDlg);
+    if (rawDlg.dtype != prevDt || rawDlg.interp != prevIn || rawDlg.offset != prevOff)
+        rawGuessDims(rawDlg);
 
-    size_t need = (size_t)ceil((double)rawDlg.w * rawDlg.h * RAW_FORMATS[rawDlg.fmt].bpp) + rawDlg.offset;
+    size_t need = (size_t)rawDlg.w * rawDlg.h *
+                  RAW_DTYPE_SIZE[rawDlg.dtype] * RAW_INTERP_CH[rawDlg.interp] + rawDlg.offset;
     if (need > rawDlg.fileSize)
         ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "need %zu bytes > file %zu bytes", need, rawDlg.fileSize);
     else if (need < rawDlg.fileSize)
@@ -849,13 +959,20 @@ static void drawRawModal() {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "size matches exactly");
 
     ImGui::Separator();
-    bool ok = ImGui::Button("Load", ImVec2(120 * app.uiScale, 0));
+    bool ok = ImGui::Button(rawDlg.replaceIdx >= 0 ? "Reload" : "Load", ImVec2(120 * app.uiScale, 0));
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
+        rawDlg.replaceIdx = -1;
+        ImGui::CloseCurrentPopup();
+    }
     if (ok) {
         std::string err = loadRaw(rawDlg);
         if (!err.empty()) toast(err, true);
-        else { toast("loaded " + baseName(rawDlg.path)); ImGui::CloseCurrentPopup(); }
+        else {
+            toast((rawDlg.replaceIdx >= 0 ? "reinterpreted " : "loaded ") + baseName(rawDlg.path));
+            rawDlg.replaceIdx = -1;
+            ImGui::CloseCurrentPopup();
+        }
     }
     ImGui::EndPopup();
 }
@@ -877,7 +994,8 @@ static void drawCanvas(ImVec2 avail) {
 
     // interaction region = canvas (excluding rulers)
     ImGui::SetCursorScreenPos(canvasP0);
-    ImGui::InvisibleButton("canvas", canvasSize, ImGuiButtonFlags_MouseButtonLeft);
+    ImGui::InvisibleButton("canvas", canvasSize,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
     bool hovered = ImGui::IsItemHovered();
     bool active = ImGui::IsItemActive();
     ImGuiIO& io = ImGui::GetIO();
@@ -891,53 +1009,142 @@ static void drawCanvas(ImVec2 avail) {
                       app.view.center.y + (s.y - canvasP0.y - canvasSize.y * 0.5f) / app.view.zoom);
     };
 
-    static bool dragRoi = false;      // Shift+drag = ROI select, plain drag = pan
+    // drag state: pan / new-ROI / move / resize (tool-mode interaction model)
+    enum { DK_NONE, DK_PAN, DK_ROI_NEW, DK_ANN_MOVE, DK_ANN_RESIZE };
+    static int dk = DK_NONE;
     static bool dragMoved = false;
+    static ImVec2 drag0;
+    static int dragAnnId = -1, dragCorner = -1;
+    static int annOrig[4] = {};
+    static int tmpRect[4] = {};
+    static bool tmpActive = false;
+
+    auto hitTest = [&](ImVec2 mimg, int& cornerOut) -> int {   // returns Ann::id or -1
+        cornerOut = -1;
+        float tol = 8.0f / app.view.zoom;
+        for (int i = (int)app.anns.size() - 1; i >= 0; i--) {  // topmost first
+            const App::Ann& a = app.anns[i];
+            if (!a.visible) continue;
+            if (a.type == 1) {
+                if (fabsf(mimg.x - (a.x + 0.5f)) < tol && fabsf(mimg.y - (a.y + 0.5f)) < tol)
+                    return a.id;
+            } else {
+                float xs[2] = { (float)a.x, (float)(a.x + a.w) };
+                float ys[2] = { (float)a.y, (float)(a.y + a.h) };
+                for (int cy = 0; cy < 2; cy++)
+                    for (int cx = 0; cx < 2; cx++)
+                        if (fabsf(mimg.x - xs[cx]) < tol && fabsf(mimg.y - ys[cy]) < tol) {
+                            cornerOut = cy * 2 + cx;
+                            return a.id;
+                        }
+                if (mimg.x >= a.x && mimg.x <= a.x + a.w && mimg.y >= a.y && mimg.y <= a.y + a.h)
+                    return a.id;
+            }
+        }
+        return -1;
+    };
+
     if (im) {
         if (ImGui::IsItemActivated()) {
-            dragRoi = io.KeyShift;
+            drag0 = scrToImg(io.MousePos);
             dragMoved = false;
-            app.roiDrag0 = scrToImg(io.MousePos);
+            dragAnnId = -1; dragCorner = -1; tmpActive = false;
+            bool mid = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+            bool space = ImGui::IsKeyDown(ImGuiKey_Space);
+            if (mid || space) dk = DK_PAN;                       // universal pan
+            else if (app.tool == 0) dk = io.KeyShift ? DK_ROI_NEW : DK_PAN;
+            else if (app.tool == 1) {
+                int corner; int hit = hitTest(drag0, corner);
+                App::Ann* a = hit >= 0 ? findAnn(hit) : nullptr;
+                if (a && a->type == 0 && corner >= 0) {
+                    dk = DK_ANN_RESIZE; dragAnnId = hit; dragCorner = corner;
+                    annOrig[0] = a->x; annOrig[1] = a->y; annOrig[2] = a->w; annOrig[3] = a->h;
+                    app.selectedAnn = hit;
+                } else if (a && a->type == 0) {
+                    dk = DK_ANN_MOVE; dragAnnId = hit;
+                    annOrig[0] = a->x; annOrig[1] = a->y;
+                    app.selectedAnn = hit;
+                } else dk = DK_ROI_NEW;
+            } else dk = DK_NONE;                                 // POI tool: click on release
         }
-        if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) dragMoved = true;
-        if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0)) {
-            if (dragRoi) {
-                ImVec2 q = scrToImg(io.MousePos);
-                float x0 = std::clamp(std::min(app.roiDrag0.x, q.x), 0.0f, (float)im->w);
-                float x1 = std::clamp(std::max(app.roiDrag0.x, q.x), 0.0f, (float)im->w);
-                float y0 = std::clamp(std::min(app.roiDrag0.y, q.y), 0.0f, (float)im->h);
-                float y1 = std::clamp(std::max(app.roiDrag0.y, q.y), 0.0f, (float)im->h);
-                app.roiX = (int)x0; app.roiY = (int)y0;
-                app.roiW = std::max(0, (int)ceilf(x1) - app.roiX);
-                app.roiH = std::max(0, (int)ceilf(y1) - app.roiY);
-                app.roiDragging = true;
-            } else {
+        if (active && (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f) ||
+                       ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 2.0f)))
+            dragMoved = true;
+        bool draggingAny = ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0) ||
+                           ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0);
+        if (active && draggingAny) {
+            if (dk == DK_PAN) {
                 app.view.center.x -= io.MouseDelta.x / app.view.zoom;
                 app.view.center.y -= io.MouseDelta.y / app.view.zoom;
+            } else if (dk == DK_ROI_NEW && dragMoved) {
+                ImVec2 q = scrToImg(io.MousePos);
+                float x0 = std::clamp(std::min(drag0.x, q.x), 0.0f, (float)im->w);
+                float x1 = std::clamp(std::max(drag0.x, q.x), 0.0f, (float)im->w);
+                float y0 = std::clamp(std::min(drag0.y, q.y), 0.0f, (float)im->h);
+                float y1 = std::clamp(std::max(drag0.y, q.y), 0.0f, (float)im->h);
+                tmpRect[0] = (int)x0; tmpRect[1] = (int)y0;
+                tmpRect[2] = std::max(0, (int)ceilf(x1) - tmpRect[0]);
+                tmpRect[3] = std::max(0, (int)ceilf(y1) - tmpRect[1]);
+                tmpActive = true;
+            } else if (dk == DK_ANN_MOVE && dragMoved) {
+                if (App::Ann* a = findAnn(dragAnnId)) {
+                    ImVec2 q = scrToImg(io.MousePos);
+                    int dx = (int)roundf(q.x - drag0.x), dy = (int)roundf(q.y - drag0.y);
+                    a->x = std::clamp(annOrig[0] + dx, 0, std::max(0, im->w - std::max(a->w, 1)));
+                    a->y = std::clamp(annOrig[1] + dy, 0, std::max(0, im->h - std::max(a->h, 1)));
+                    app.annRev++;
+                }
+            } else if (dk == DK_ANN_RESIZE && dragMoved) {
+                if (App::Ann* a = findAnn(dragAnnId)) {
+                    int fx = (dragCorner % 2 == 0) ? annOrig[0] + annOrig[2] : annOrig[0];
+                    int fy = (dragCorner / 2 == 0) ? annOrig[1] + annOrig[3] : annOrig[1];
+                    ImVec2 q = scrToImg(io.MousePos);
+                    int mx = std::clamp((int)roundf(q.x), 0, im->w);
+                    int my = std::clamp((int)roundf(q.y), 0, im->h);
+                    a->x = std::min(fx, mx); a->w = std::max(1, std::abs(mx - fx));
+                    a->y = std::min(fy, my); a->h = std::max(1, std::abs(my - fy));
+                    app.annRev++;
+                }
             }
         }
         if (ImGui::IsItemDeactivated()) {
-            if (dragRoi && dragMoved) {
-                app.roiDragging = false;
-                if (app.roiW < 1 || app.roiH < 1) { app.roiW = app.roiH = 0; }   // too small: clear
-            } else if (!dragMoved && io.KeyCtrl && hovered) {
-                ImVec2 q = scrToImg(io.MousePos);   // Ctrl+click: pin a point of interest
-                int px = (int)floorf(q.x), py = (int)floorf(q.y);
-                if (px >= 0 && py >= 0 && px < im->w && py < im->h)
-                    app.pins.push_back({ px, py });
+            ImVec2 q = scrToImg(io.MousePos);
+            int px = (int)floorf(q.x), py = (int)floorf(q.y);
+            bool inside = px >= 0 && py >= 0 && px < im->w && py < im->h;
+            if (dk == DK_ROI_NEW && dragMoved && tmpActive) {
+                if (tmpRect[2] >= 1 && tmpRect[3] >= 1)
+                    addAnn(0, tmpRect[0], tmpRect[1], tmpRect[2], tmpRect[3]);
+            } else if (!dragMoved) {
+                if (app.tool == 2 || (app.tool == 0 && io.KeyCtrl)) {
+                    if (inside) addAnn(1, px, py, 0, 0);         // add POI
+                } else {
+                    int corner; app.selectedAnn = hitTest(q, corner);   // select / deselect
+                }
             }
-            dragRoi = false;
+            tmpActive = false;
+            dk = DK_NONE; dragAnnId = -1;
         }
-        if (hovered && io.MouseWheelH != 0)      // trackpad horizontal scroll = pan
-            app.view.center.x += io.MouseWheelH * 40.0f / app.view.zoom;
-        if (hovered && io.MouseWheel != 0) {
-            // clamp: macOS trackpads deliver large fractional inertial deltas
-            float wheel = std::clamp(io.MouseWheel, -3.0f, 3.0f);
-            ImVec2 mImg = scrToImg(io.MousePos);
-            float z = std::clamp(app.view.zoom * powf(1.25f, wheel), 1.0f / 512, 256.0f);
-            app.view.center.x = mImg.x - (io.MousePos.x - canvasP0.x - canvasSize.x * 0.5f) / z;
-            app.view.center.y = mImg.y - (io.MousePos.y - canvasP0.y - canvasSize.y * 0.5f) / z;
-            app.view.zoom = z;
+        app.annBusy = dk == DK_ANN_MOVE || dk == DK_ANN_RESIZE || dk == DK_ROI_NEW;
+
+        // wheel: Ctrl(/Cmd)+wheel = zoom, plain wheel = pan (View menu can invert)
+        if (hovered && (io.MouseWheel != 0 || io.MouseWheelH != 0)) {
+            bool zoomMod = io.KeyCtrl || io.KeySuper;
+            bool zoomGesture = app.wheelZoomPlain ? !zoomMod : zoomMod;
+            if (zoomGesture && io.MouseWheel != 0) {
+                float wheel = std::clamp(io.MouseWheel, -3.0f, 3.0f);   // tame trackpad inertia
+                ImVec2 mImg = scrToImg(io.MousePos);
+                float z = std::clamp(app.view.zoom * powf(1.25f, wheel), 1.0f / 512, 256.0f);
+                app.view.center.x = mImg.x - (io.MousePos.x - canvasP0.x - canvasSize.x * 0.5f) / z;
+                app.view.center.y = mImg.y - (io.MousePos.y - canvasP0.y - canvasSize.y * 0.5f) / z;
+                app.view.zoom = z;
+            } else {
+                float step = 80.0f / app.view.zoom;                     // image px per notch
+                if (io.MouseWheel != 0) {
+                    if (io.KeyShift) app.view.center.x -= io.MouseWheel * step;
+                    else app.view.center.y -= io.MouseWheel * step;
+                }
+                if (io.MouseWheelH != 0) app.view.center.x += io.MouseWheelH * step;
+            }
         }
         if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) fitToCanvas(canvasSize);
     }
@@ -975,26 +1182,40 @@ static void drawCanvas(ImVec2 avail) {
             ImVec2 b = imgToScr((float)app.hoverX + 1, (float)app.hoverY + 1);
             dl->AddRect(a, b, IM_COL32(255, 184, 77, 255), 0, 0, 1.5f);
         }
-        // ROI overlay
-        if (app.roiW > 0 && app.roiH > 0) {
-            ImVec2 a = imgToScr((float)app.roiX, (float)app.roiY);
-            ImVec2 b = imgToScr((float)(app.roiX + app.roiW), (float)(app.roiY + app.roiH));
-            dl->AddRectFilled(a, b, IM_COL32(77, 163, 255, 26));
-            dl->AddRect(a, b, IM_COL32(77, 163, 255, 220), 0, 0, 1.5f);
-            char lb[64];
-            snprintf(lb, 64, "ROI %dx%d @ (%d,%d)", app.roiW, app.roiH, app.roiX, app.roiY);
-            dl->AddText(ImVec2(a.x + 3, a.y - ImGui::GetFontSize() - 2), IM_COL32(120, 190, 255, 255), lb);
+        // annotations (ROIs + POIs)
+        for (const auto& a : app.anns) {
+            if (!a.visible) continue;
+            ImU32 col = ANN_COLORS[a.color & 7];
+            bool sel = a.id == app.selectedAnn;
+            if (a.type == 0) {
+                ImVec2 ra = imgToScr((float)a.x, (float)a.y);
+                ImVec2 rb = imgToScr((float)(a.x + a.w), (float)(a.y + a.h));
+                dl->AddRectFilled(ra, rb, (col & 0x00FFFFFF) | 0x1E000000);
+                dl->AddRect(ra, rb, col, 0, 0, sel ? 2.5f : 1.5f);
+                dl->AddText(ImVec2(ra.x + 3, ra.y - ImGui::GetFontSize() - 2), col, a.label.c_str());
+                if (sel && app.tool == 1) {                       // resize handles
+                    ImVec2 hs[4] = { ra, ImVec2(rb.x, ra.y), ImVec2(ra.x, rb.y), rb };
+                    for (const auto& hp : hs)
+                        dl->AddRectFilled(ImVec2(hp.x - 3, hp.y - 3), ImVec2(hp.x + 3, hp.y + 3), col);
+                }
+            } else {
+                if (a.x >= im->w || a.y >= im->h) continue;       // outside this image
+                ImVec2 cpt = imgToScr(a.x + 0.5f, a.y + 0.5f);
+                float r = sel ? 10.0f : 8.0f;
+                dl->AddLine(ImVec2(cpt.x - r, cpt.y), ImVec2(cpt.x + r, cpt.y), col, sel ? 2.5f : 1.5f);
+                dl->AddLine(ImVec2(cpt.x, cpt.y - r), ImVec2(cpt.x, cpt.y + r), col, sel ? 2.5f : 1.5f);
+                dl->AddText(ImVec2(cpt.x + 5, cpt.y + 4), col, a.label.c_str());
+            }
         }
-        // pinned points
-        for (int i = 0; i < (int)app.pins.size(); i++) {
-            const App::Pin& pn = app.pins[i];
-            if (pn.x >= im->w || pn.y >= im->h) continue;   // outside this image
-            ImVec2 cpt = imgToScr(pn.x + 0.5f, pn.y + 0.5f);
-            ImU32 col = IM_COL32(105, 220, 130, 255);
-            dl->AddLine(ImVec2(cpt.x - 8, cpt.y), ImVec2(cpt.x + 8, cpt.y), col, 1.5f);
-            dl->AddLine(ImVec2(cpt.x, cpt.y - 8), ImVec2(cpt.x, cpt.y + 8), col, 1.5f);
-            char lb[16]; snprintf(lb, 16, "%d", i + 1);
-            dl->AddText(ImVec2(cpt.x + 5, cpt.y + 4), col, lb);
+        // ROI being created (live preview)
+        if (tmpActive && tmpRect[2] > 0 && tmpRect[3] > 0) {
+            ImVec2 ra = imgToScr((float)tmpRect[0], (float)tmpRect[1]);
+            ImVec2 rb = imgToScr((float)(tmpRect[0] + tmpRect[2]), (float)(tmpRect[1] + tmpRect[3]));
+            dl->AddRectFilled(ra, rb, IM_COL32(77, 163, 255, 26));
+            dl->AddRect(ra, rb, IM_COL32(77, 163, 255, 220), 0, 0, 1.5f);
+            char lb[48];
+            snprintf(lb, 48, "%dx%d", tmpRect[2], tmpRect[3]);
+            dl->AddText(ImVec2(ra.x + 3, ra.y - ImGui::GetFontSize() - 2), IM_COL32(120, 190, 255, 255), lb);
         }
     } else {
         const char* msg = "Drop .npy / .bin / .raw files here   (O: open file)";
@@ -1051,6 +1272,20 @@ static void drawCanvas(ImVec2 avail) {
         }
         dl->PopClipRect();
     }
+
+    // floating tool strip (submitted after the canvas item, so it wins hover)
+    ImGui::SetCursorScreenPos(ImVec2(canvasP0.x + 8, canvasP0.y + 8));
+    {
+        const char* labels[3] = { "Nav (V)", "ROI (R)", "Pin (P)" };
+        for (int t = 0; t < 3; t++) {
+            if (t) ImGui::SameLine();
+            bool on = app.tool == t;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            if (ImGui::SmallButton(labels[t])) app.tool = t;
+            if (on) ImGui::PopStyleColor();
+        }
+    }
 }
 
 static void drawInspector() {
@@ -1091,8 +1326,46 @@ static void drawInspector() {
         ImGui::Text("%d x %d   %dch   %s", im->w, im->h, im->ch, im->dtype.c_str());
         if (!im->note.empty()) ImGui::TextDisabled("%s", im->note.c_str());
         ImGui::Text("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(), fmtVal(im->vmax, im->dtype).c_str());
+        if (im->ch == 1) {
+            // interpretation axis: change what the 1ch data means AFTER opening
+            const char* modes[3] = { "Gray", "Bayer", "Quad Bayer" };
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+            if (ImGui::BeginCombo("Interpret", modes[std::clamp(im->cfa, 0, 2)])) {
+                for (int i = 0; i < 3; i++)
+                    if (ImGui::Selectable(modes[i], i == im->cfa) && i != im->cfa) {
+                        im->cfa = i;
+                        im->texDirty = true;
+                    }
+                ImGui::EndCombo();
+            }
+            if (im->cfa) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##cfapat", CFA_PATTERNS[im->cfaPattern & 3])) {
+                    for (int i = 0; i < 4; i++)
+                        if (ImGui::Selectable(CFA_PATTERNS[i], i == im->cfaPattern)) {
+                            im->cfaPattern = i;
+                            im->texDirty = true;
+                        }
+                    ImGui::EndCombo();
+                }
+            }
+        }
         if (im->cfa) {
             if (ImGui::Checkbox("Colorize CFA pattern", &im->cfaColorize)) im->texDirty = true;
+        }
+        if (im->rawDtype >= 0 && ImGui::Button("Reinterpret raw...")) {
+            openRawDialogFor(im->path);                 // prefill size guesses from the file
+            rawDlg.dtype = im->rawDtype;
+            rawDlg.interp = im->rawInterp;
+            if (RAW_INTERP_CH[rawDlg.interp] == 1)      // 1ch family: honor current interpretation
+                rawDlg.interp = im->cfa == 2 ? RI_QUAD : im->cfa == 1 ? RI_BAYER : RI_GRAY;
+            rawDlg.w = im->w; rawDlg.h = im->h;
+            rawDlg.offset = im->rawOffset;
+            rawDlg.littleEndian = im->rawLE;
+            rawDlg.cfaPattern = im->cfaPattern & 3;
+            rawDlg.replaceIdx = app.current;
+            rawGuessDims(rawDlg);
         }
         if (im->ch == 1 && !plugin_host::displays().empty()) {
             if (im->cfa && im->cfaColorize) {
@@ -1141,52 +1414,85 @@ static void drawInspector() {
         ImGui::TextDisabled("no image");
     }
 
-    // ---- pinned points (Ctrl+click on the canvas) ----
-    if (im && !app.pins.empty()) {
+    // ---- annotations: ROIs + POIs, multiple, selectable ----
+    if (im && !app.anns.empty()) {
         ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Text("Pins (%d)", (int)app.pins.size());
+        ImGui::Text("Annotations (%d)", (int)app.anns.size());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Clear##pins")) app.pins.clear();
+        if (ImGui::SmallButton("Clear##anns")) {
+            app.anns.clear(); app.selectedAnn = -1; app.annRev++;
+        }
         ImGui::Separator();
-        int nCols = 2 + std::min(im->ch, 4);
-        if (!app.pins.empty() &&
-            ImGui::BeginTable("pins", nCols, ImGuiTableFlags_SizingStretchProp)) {
-            static const char* LB1[] = { "V" };
-            static const char* LB2[] = { "C0", "C1" };
-            static const char* LB3[] = { "R", "G", "B", "A" };
-            const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.6f);
-            ImGui::TableSetupColumn("x,y");
-            for (int c = 0; c < std::min(im->ch, 4); c++) ImGui::TableSetupColumn(lb[c]);
-            ImGui::TableHeadersRow();
-            int removeIdx = -1;
-            for (int i = 0; i < (int)app.pins.size(); i++) {
-                const App::Pin& pn = app.pins[i];
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                char rm[16]; snprintf(rm, 16, "%d##rm%d", i + 1, i);
-                if (ImGui::SmallButton(rm)) removeIdx = i;    // click the number to remove
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("click to remove pin %d", i + 1);
-                ImGui::TableNextColumn();
-                bool inside = pn.x < im->w && pn.y < im->h;
-                if (im->cfa && inside)
-                    ImGui::Text("%d,%d [%s]", pn.x, pn.y, CFA_CH_NAMES[cfaChannelAt(*im, pn.x, pn.y)]);
-                else
-                    ImGui::Text("%d,%d", pn.x, pn.y);
-                for (int c = 0; c < std::min(im->ch, 4); c++) {
-                    ImGui::TableNextColumn();
-                    if (inside)
-                        ImGui::TextUnformatted(fmtVal(im->sample(pn.x, pn.y, c), im->dtype).c_str());
-                    else
-                        ImGui::TextDisabled("-");
-                }
+        int removeId = -1;
+        for (auto& a : app.anns) {
+            ImGui::PushID(a.id);
+            if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
+            ImGui::SameLine();
+            ImVec4 c = ImGui::ColorConvertU32ToFloat4(ANN_COLORS[a.color & 7]);
+            ImGui::PushStyleColor(ImGuiCol_Text, c);
+            char row[160];
+            if (a.type == 0)
+                snprintf(row, 160, "%s  %dx%d @ (%d,%d)", a.label.c_str(), a.w, a.h, a.x, a.y);
+            else
+                snprintf(row, 160, "%s  (%d,%d)", a.label.c_str(), a.x, a.y);
+            if (ImGui::Selectable(row, app.selectedAnn == a.id,
+                                  ImGuiSelectableFlags_AllowOverlap,
+                                  ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 2, 0)))
+                app.selectedAnn = a.id;
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) removeId = a.id;
+            ImGui::PopID();
+        }
+        if (removeId >= 0) deleteAnn(removeId);
+        if (App::Ann* sel = findAnn(app.selectedAnn)) {
+            char buf[128];
+            snprintf(buf, sizeof buf, "%s", sel->label.c_str());
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##rename", buf, sizeof buf)) {
+                sel->label = buf;
+                app.annRev++;
             }
-            if (removeIdx >= 0) app.pins.erase(app.pins.begin() + removeIdx);
-            ImGui::EndTable();
+        }
+        // per-channel values of visible POIs (ch毎表記)
+        bool anyPoi = false;
+        for (const auto& a : app.anns)
+            if (a.type == 1 && a.visible) { anyPoi = true; break; }
+        if (anyPoi) {
+            int nch = std::min(im->ch, 4);
+            if (ImGui::BeginTable("poivals", 2 + nch, ImGuiTableFlags_SizingStretchProp)) {
+                static const char* LB1[] = { "V" };
+                static const char* LB2[] = { "C0", "C1" };
+                static const char* LB3[] = { "R", "G", "B", "A" };
+                const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
+                ImGui::TableSetupColumn("pt");
+                ImGui::TableSetupColumn("x,y");
+                for (int c = 0; c < nch; c++) ImGui::TableSetupColumn(lb[c]);
+                ImGui::TableHeadersRow();
+                for (const auto& a : app.anns) {
+                    if (a.type != 1 || !a.visible) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(a.label.c_str());
+                    ImGui::TableNextColumn();
+                    bool inside = a.x < im->w && a.y < im->h;
+                    if (im->cfa && inside)
+                        ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
+                    else
+                        ImGui::Text("%d,%d", a.x, a.y);
+                    for (int c = 0; c < nch; c++) {
+                        ImGui::TableNextColumn();
+                        if (inside)
+                            ImGui::TextUnformatted(fmtVal(im->sample(a.x, a.y, c), im->dtype).c_str());
+                        else
+                            ImGui::TextDisabled("-");
+                    }
+                }
+                ImGui::EndTable();
+            }
         }
     }
 
-    // ---- analysis (Analyzer plugins; ROI-aware) ----
+    // ---- analysis: analyzer plugins over ALL visible ROIs (comparison grid) ----
     if (im && !plugin_host::analyzers().empty()) {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Analysis");
@@ -1203,40 +1509,73 @@ static void drawInspector() {
         bool runClicked = ImGui::Button("Run");
         ImGui::SameLine();
         ImGui::Checkbox("auto", &app.anaAuto);
-        if (app.roiW > 0) {
-            ImGui::TextDisabled("ROI %dx%d @ (%d,%d)", app.roiW, app.roiH, app.roiX, app.roiY);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Clear ROI")) { app.roiW = app.roiH = 0; }
-        } else {
-            ImGui::TextDisabled("whole image (Shift+drag on canvas = ROI)");
-        }
+
+        std::vector<const App::Ann*> rois;
+        for (const auto& a : app.anns)
+            if (a.type == 0 && a.visible) rois.push_back(&a);
+        if (rois.empty())
+            ImGui::TextDisabled("target: whole image (R tool / Shift+drag = ROI)");
+        else
+            ImGui::TextDisabled("target: %d ROI(s), one column each", (int)rois.size());
+
         auto& ana = app.ana;
-        bool stale = ana.img != im || ana.plugin != app.anaSel ||
-                     ana.rx != app.roiX || ana.ry != app.roiY ||
-                     ana.rw != app.roiW || ana.rh != app.roiH;
-        if (runClicked || (app.anaAuto && stale && !app.roiDragging)) {
-            ana.rows.clear(); ana.err.clear();
-            ana.img = im; ana.plugin = app.anaSel;
-            ana.rx = app.roiX; ana.ry = app.roiY; ana.rw = app.roiW; ana.rh = app.roiH;
-            psFrame f = makeFrame(*im);
-            psRect roi = { (uint32_t)app.roiX, (uint32_t)app.roiY,
-                           (uint32_t)app.roiW, (uint32_t)app.roiH };
-            psAnalyzeSink sink = { &ana.rows, anaEmitNumber, anaEmitText };
-            char err[256] = { 0 };
-            if (anas[app.anaSel].v.analyze(&f, app.roiW > 0 ? &roi : nullptr,
-                                           &sink, err, sizeof err) != 0) {
-                ana.err = err[0] ? err : "analyzer failed";
+        bool stale = ana.img != im || ana.plugin != app.anaSel || ana.rev != app.annRev;
+        if (runClicked || (app.anaAuto && stale && !app.annBusy)) {
+            ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.err.clear();
+            ana.img = im; ana.plugin = app.anaSel; ana.rev = app.annRev;
+            auto runOne = [&](const psRect* roi, const std::string& colLabel) {
+                std::vector<std::pair<std::string, std::string>> rows;
+                psFrame f = makeFrame(*im);
+                psAnalyzeSink sink = { &rows, anaEmitNumber, anaEmitText };
+                char err[256] = { 0 };
+                if (anas[app.anaSel].v.analyze(&f, roi, &sink, err, sizeof err) != 0) {
+                    ana.err += colLabel + ": " + (err[0] ? err : "failed") + "\n";
+                    rows.clear();
+                }
+                ana.cols.push_back(colLabel);
+                for (auto& r : ana.vals) r.resize(ana.cols.size());
+                for (const auto& kv : rows) {
+                    if (kv.first == "roi") continue;        // grid header already says which ROI
+                    int rowIdx = -1;
+                    for (int k = 0; k < (int)ana.keys.size(); k++)
+                        if (ana.keys[k] == kv.first) { rowIdx = k; break; }
+                    if (rowIdx < 0) {
+                        ana.keys.push_back(kv.first);
+                        ana.vals.emplace_back(ana.cols.size());
+                        rowIdx = (int)ana.keys.size() - 1;
+                    }
+                    ana.vals[rowIdx][ana.cols.size() - 1] = kv.second;
+                }
+            };
+            if (rois.empty()) {
+                runOne(nullptr, "whole");
+            } else {
+                for (const App::Ann* a : rois) {
+                    psRect rr = { (uint32_t)a->x, (uint32_t)a->y, (uint32_t)a->w, (uint32_t)a->h };
+                    runOne(&rr, a->label);
+                }
             }
         }
         if (ana.img == im) {
             if (!ana.err.empty())
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
-            else if (!ana.rows.empty() &&
-                     ImGui::BeginTable("anarows", 2, ImGuiTableFlags_SizingStretchProp)) {
-                for (const auto& kv : ana.rows) {
+            int nCols = 1 + (int)ana.cols.size();
+            if (!ana.keys.empty() && nCols <= 16 &&
+                ImGui::BeginTable("anagrid", nCols,
+                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX)) {
+                ImGui::TableSetupColumn("");
+                for (const auto& cn : ana.cols) ImGui::TableSetupColumn(cn.c_str());
+                ImGui::TableHeadersRow();
+                for (int k = 0; k < (int)ana.keys.size(); k++) {
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", kv.first.c_str());
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(kv.second.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", ana.keys[k].c_str());
+                    for (int c = 0; c < (int)ana.cols.size(); c++) {
+                        ImGui::TableNextColumn();
+                        if (c < (int)ana.vals[k].size() && !ana.vals[k][c].empty())
+                            ImGui::TextUnformatted(ana.vals[k][c].c_str());
+                        else
+                            ImGui::TextDisabled("-");
+                    }
                 }
                 ImGui::EndTable();
             }
@@ -1292,6 +1631,7 @@ static void drawMenuBar(GLFWwindow* win) {
             app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
+        ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         if (ImGui::BeginMenu("Display Gamma")) {
             bool lin = app.dispGamma < 1.5f;
             if (ImGui::MenuItem("1.0 (linear)", nullptr, lin) && !lin) { app.dispGamma = 1.0f; markAllTexDirty(); }
@@ -1330,10 +1670,13 @@ static void drawHelpAbout() {
                 row("F / double-click", "fit to window");
                 row("1",             "actual size (100%)");
                 row("+ / -",         "zoom in / out");
-                row("wheel",         "zoom at cursor");
-                row("drag",          "pan");
-                row("Shift+drag",    "select ROI (used by Analysis)");
-                row("Ctrl+click",    "pin a point of interest");
+                row("V / R / P",     "tool: Navigate / ROI / Pin");
+                row("Ctrl+wheel",    "zoom at cursor (invertible in View menu)");
+                row("wheel / Shift+wheel", "pan vertical / horizontal");
+                row("middle-drag / Space+drag", "pan (works in any tool)");
+                row("Shift+drag",    "quick ROI (Navigate tool)");
+                row("Ctrl+click",    "quick pin (Navigate tool)");
+                row("Del / Esc",     "delete / deselect annotation");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
                 ImGui::EndTable();
@@ -1361,9 +1704,9 @@ static void printUsage() {
         "  files: .npy, .vsession (saved session), or raw binaries (.bin/.raw/.yuv/...)\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
-        "  --raw-format <fmt>          open following raw files without the dialog:\n"
-        "                              gray8|gray16|grayf32|grayf64|rgb8|bgr8|rgba8|bgra8|\n"
-        "                              rgb16|rgbf32|bayer8|bayer16\n"
+        "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
+        "  --raw-interp <i>            meaning of samples: gray|rgb|bgr|rgba|bgra|bayer|quad-bayer\n"
+        "  --raw-format <fmt>          legacy combined names (gray8|...|rgbf32|bayer8|bayer16)\n"
         "  --raw-size <WxH>            raw dimensions, e.g. 1920x1080\n"
         "  --raw-offset <bytes>        raw header offset (default 0)\n"
         "  --big-endian                raw byte order (default little endian)\n"
@@ -1385,11 +1728,24 @@ static void parseCli(int argc, char** argv) {
         if (a == "--session") {
             std::string p = next();
             if (!p.empty()) openPath(p);
-        } else if (a == "--raw-format") {
+        } else if (a == "--raw-format") {          // legacy combined names
             std::string v = next();
-            for (int f = 0; f < RF_COUNT; f++)
-                if (v == RAW_CLI_NAMES[f]) { d.fmt = f; rawReady = true; }
-            if (!rawReady) fprintf(stderr, "unknown raw format: %s (see --help)\n", v.c_str());
+            bool found = false;
+            for (int f = 0; f < 12; f++)
+                if (v == LEGACY_RAW_NAMES[f]) {
+                    d.dtype = LEGACY_RAW_MAP[f][0];
+                    d.interp = LEGACY_RAW_MAP[f][1];
+                    rawReady = found = true;
+                }
+            if (!found) fprintf(stderr, "unknown raw format: %s (see --help)\n", v.c_str());
+        } else if (a == "--raw-dtype") {
+            std::string v = next();
+            for (int f = 0; f < RD_COUNT; f++)
+                if (v == RAW_DTYPE_NAMES[f]) { d.dtype = f; rawReady = true; }
+        } else if (a == "--raw-interp") {
+            std::string v = next();
+            for (int f = 0; f < RI_COUNT; f++)
+                if (v == RAW_INTERP_CLI[f]) { d.interp = f; rawReady = true; }
         } else if (a == "--raw-size") {
             std::string v = next();
             size_t x = v.find_first_of("xX*");
@@ -1408,7 +1764,8 @@ static void parseCli(int argc, char** argv) {
             for (int p = 0; p < 4; p++)
                 if (v == CFA_PATTERNS[p]) d.cfaPattern = p;
         } else if (a == "--quad-bayer") {
-            d.quad = true;
+            d.interp = RI_QUAD;
+            rawReady = true;
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
         } else if (a == "--center") {
@@ -1537,6 +1894,12 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
+            if (ImGui::IsKeyPressed(ImGuiKey_V, false)) app.tool = 0;
+            if (ImGui::IsKeyPressed(ImGuiKey_R, false)) app.tool = 1;
+            if (ImGui::IsKeyPressed(ImGuiKey_P, false)) app.tool = 2;
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
+                deleteAnn(app.selectedAnn);
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = -1;
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 app.view.zoom = std::clamp(app.view.zoom * 2.0f, 1.0f / 512, 256.0f);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
@@ -1569,7 +1932,8 @@ int main(int argc, char** argv) {
         // status bar
         {
             ImageDoc* im = cur();
-            char st[512] = "no image";
+            char st[512];
+            snprintf(st, 512, "[%s]  no image", TOOL_NAMES[app.tool]);
             if (im) {
                 std::string hover;
                 if (app.hoverX >= 0) {
@@ -1583,9 +1947,9 @@ int main(int argc, char** argv) {
                 char zs[32];
                 if (app.view.zoom >= 0.095f) snprintf(zs, 32, "%.0f%%", app.view.zoom * 100);
                 else                         snprintf(zs, 32, "%.3g%%", app.view.zoom * 100);
-                snprintf(st, 512, "%s   %dx%d %dch %s  |  zoom %s%s",
-                         im->name.c_str(), im->w, im->h, im->ch, im->dtype.c_str(),
-                         zs, hover.c_str());
+                snprintf(st, 512, "[%s]  %s   %dx%d %dch %s  |  zoom %s%s",
+                         TOOL_NAMES[app.tool], im->name.c_str(), im->w, im->h, im->ch,
+                         im->dtype.c_str(), zs, hover.c_str());
             }
             ImGui::TextUnformatted(st);
             static std::string lastTitle;

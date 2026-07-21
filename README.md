@@ -12,19 +12,27 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
   - `.npy` — u8 / i8 / u16 / i16 / u32 / i32 / f32 / f64 / bool。
     `(H,W)`・`(H,W,C)`・`(C,H,W)` 対応(CHW は自動変換)。バッチ次元は先頭 `[0]` を表示。
     ビッグエンディアン・Fortran order 対応。
-  - `.bin` / `.raw` — Gray 8/16bit・float32/64、RGB/BGR/RGBA/BGRA 8bit、RGB 16bit/float32、
-    **Bayer / Quad Bayer 8/16bit**(RGGB/BGGR/GRBG/GBRG)。
-    読み込みダイアログでファイルサイズからの**サイズ候補自動推定**、
-    ファイル名の `..._640x480_...` / `rggb` / `quad` 表記の自動認識、オフセット・エンディアン指定。
+  - `.bin` / `.raw` — **2軸指定**: 画素フォーマット(u8/u16/f32/f64 × エンディアン)×
+    解釈(Gray/RGB/BGR/RGBA/BGRA/**Bayer/Quad Bayer**(RGGB/BGGR/GRBG/GBRG))。
+    任意の組み合わせが可能(例: RGGB float32)。ファイルサイズからの**サイズ候補自動推定**、
+    ファイル名の `..._640x480_...` / `rggb` / `quad` / `f32` 表記の自動認識、オフセット指定。
+  - **開いた後の解釈変更** — 1ch 画像は右パネルの Interpret で Gray ⇔ Bayer ⇔ Quad Bayer を
+    即時切替(npy でも可)。raw 由来の画像は「Reinterpret raw...」で画素フォーマットから
+    読み直し(表示位置・ズームは維持)。
   - Bayer 画像はホバーで **画素の CFA チャンネル (R/Gr/Gb/B) を表示**、
     「Colorize CFA pattern」でパターンを色付け表示。
   - ウィンドウへのドラッグ&ドロップ、コマンドライン引数 (`viewer.exe a.npy b.raw`) 対応。
 - **ピクセル検査** — マウスホバーで座標と画素値(raw 値と正規化値)を右パネル+ステータスバーに表示。
   ズーム 2 倍以上でホバー画素をハイライト。
-- **注目座標のピン留め** — `Ctrl+クリック` で複数ピン留め。右パネルに各ピンの座標と
-  **ch 毎の画素値**を一覧表示(Bayer は CFA チャンネル付き)。番号クリックで個別削除。
-  セッションにも保存される。
-- **ROI** — `Shift+ドラッグ` で矩形選択。解析プラグイン(stats 等)が ROI に対して実行される。
+- **ツールモード** — `V` Navigate(ドラッグ=パン)/ `R` ROI / `P` ピン。
+  どのツールでも **中ボタンドラッグ / Space+ドラッグ = パン**、**Ctrl+ホイール = ズーム**、
+  ホイール = 縦パン、Shift+ホイール = 横パン(View メニューでホイール直接ズームに変更可)。
+- **複数 ROI** — R ツールでドラッグ作成、掴んで移動、角ハンドルでリサイズ。
+  解析プラグインが**全 ROI を列とする比較テーブル**を出力(パッチ間比較が1画面で見える)。
+- **複数ピン (POI)** — P ツール(または Navigate で Ctrl+クリック)。右パネルに各ピンの
+  **ch 毎の画素値**を一覧表示(Bayer は CFA チャンネル付き)。
+- アノテーション(ROI/ピン)は一覧パネルで選択・改名・表示切替・削除(`Del`)、
+  **セッションにも保存**される。
 - **プラグイン** — `plugins/` の共有ライブラリを起動時に読み込み(C ABI, [include/ps/ps_plugin.h](include/ps/ps_plugin.h))。
   同梱: `viridis` カラーマップ(描画系)、`stats` ROI 対応統計(解析系)、
   `demosaic (bilinear)`(Process メニュー、Bayer→RGB)。
@@ -64,9 +72,9 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
 viewer [options] [files...]
 
   --session <file.vsession>   保存したセッションを復元
-  --raw-format <fmt>          以降の raw ファイルをダイアログなしで開く
-                              (gray8|gray16|grayf32|grayf64|rgb8|bgr8|rgba8|bgra8|
-                               rgb16|rgbf32|bayer8|bayer16)
+  --raw-dtype <t>             1サンプルの格納形式 (u8|u16|f32|f64)
+  --raw-interp <i>            サンプルの解釈 (gray|rgb|bgr|rgba|bgra|bayer|quad-bayer)
+  --raw-format <fmt>          旧式の複合名 (gray8|...|bayer16) も引き続き使用可
   --raw-size <WxH>            raw のサイズ (例 1920x1080)
   --raw-offset <bytes>        先頭オフセット
   --big-endian                エンディアン指定 (デフォルトはリトル)
