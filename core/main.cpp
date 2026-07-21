@@ -105,6 +105,8 @@ struct ImageDoc {
     // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
     int rawDtype = -1, rawInterp = 0, rawOffset = 0;
     bool rawLE = true;
+    // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
+    int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
@@ -553,6 +555,8 @@ struct RawDialog {
     bool littleEndian = true;
     int cfaPattern = 0;               // RGGB/BGGR/GRBG/GBRG
     int replaceIdx = -1;              // >=0: reload INTO this image slot (reinterpret)
+    bool cropOn = false;              // decode only a window of the source frame
+    int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
     std::vector<std::pair<int,int>> guesses;
 } rawDlg;
 
@@ -611,18 +615,35 @@ static std::string loadRaw(const RawDialog& d) {
         return 0;
     };
 
+    // optional crop window (decode only the window; source layout is full-frame)
+    int cx = 0, cy = 0, outW = d.w, outH = d.h;
+    if (d.cropOn && d.cropW > 0 && d.cropH > 0) {
+        cx = std::clamp(d.cropX, 0, d.w - 1);
+        cy = std::clamp(d.cropY, 0, d.h - 1);
+        if (d.interp == RI_BAYER) { cx &= ~1; cy &= ~1; }        // keep CFA phase
+        if (d.interp == RI_QUAD)  { cx &= ~3; cy &= ~3; }
+        outW = std::clamp(d.cropW, 1, d.w - cx);
+        outH = std::clamp(d.cropH, 1, d.h - cy);
+    }
+
     auto im = std::make_unique<ImageDoc>();
     im->name = baseName(d.path); im->path = d.path;
-    im->w = d.w; im->h = d.h; im->ch = ch;
+    im->w = outW; im->h = outH; im->ch = ch;
     im->dtype = RAW_DTYPE_NAMES[d.dtype];
-    im->data.resize(count);
+    im->data.resize((size_t)outW * outH * ch);
     float* out = im->data.data();
     bool sw = d.interp == RI_BGR || d.interp == RI_BGRA;   // channel 0/2 swap
-    for (size_t i = 0; i < px; i++)
-        for (int c = 0; c < ch; c++) {
-            int oc = (sw && c == 0) ? 2 : (sw && c == 2) ? 0 : c;
-            out[i * ch + oc] = rd(i * ch + c);
+    for (int y = 0; y < outH; y++)
+        for (int x = 0; x < outW; x++) {
+            size_t src = ((size_t)(cy + y) * d.w + (cx + x)) * ch;
+            size_t dst = ((size_t)y * outW + x) * ch;
+            for (int c = 0; c < ch; c++) {
+                int oc = (sw && c == 0) ? 2 : (sw && c == 2) ? 0 : c;
+                out[dst + oc] = rd(src + c);
+            }
         }
+    im->srcW = d.w; im->srcH = d.h;
+    im->cropX = cx; im->cropY = cy;
     im->note = std::string(RAW_INTERP_NAMES[d.interp]) + " " + RAW_DTYPE_NAMES[d.dtype];
     if (d.interp == RI_BAYER || d.interp == RI_QUAD) {
         im->cfa = d.interp == RI_QUAD ? 2 : 1;
@@ -651,6 +672,100 @@ static std::string loadRaw(const RawDialog& d) {
     return {};
 }
 
+// ---------------------------------------------------------------- dynamic crop
+// Crop the in-memory data (no file IO); origin snaps to the CFA period so the
+// pattern stays valid. appliedX/Y report the snapped origin.
+static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
+                        int* appliedX = nullptr, int* appliedY = nullptr) {
+    if (im.srcW == 0) { im.srcW = im.w; im.srcH = im.h; }
+    x = std::clamp(x, 0, im.w - 1);
+    y = std::clamp(y, 0, im.h - 1);
+    if (im.cfa == 1) { x &= ~1; y &= ~1; }
+    if (im.cfa == 2) { x &= ~3; y &= ~3; }
+    w = std::clamp(w, 1, im.w - x);
+    h = std::clamp(h, 1, im.h - y);
+    std::vector<float> nd((size_t)w * h * im.ch);
+    for (int yy = 0; yy < h; yy++)
+        memcpy(&nd[(size_t)yy * w * im.ch],
+               &im.data[((size_t)(y + yy) * im.w + x) * im.ch],
+               (size_t)w * im.ch * sizeof(float));
+    im.data = std::move(nd);
+    im.w = w; im.h = h;
+    im.cropX += x; im.cropY += y;
+    computeMinMax(im);
+    im.texDirty = true;
+    if (appliedX) *appliedX = x;
+    if (appliedY) *appliedY = y;
+}
+
+static void shiftAnnotations(int dx, int dy) {
+    if (app.anns.empty() || (dx == 0 && dy == 0)) return;
+    for (auto& a : app.anns) { a.x += dx; a.y += dy; }
+    app.annRev++;
+}
+
+static bool isCropped(const ImageDoc& im) {
+    return im.srcW > 0 && (im.w != im.srcW || im.h != im.srcH || im.cropX != 0 || im.cropY != 0);
+}
+
+static void cropCurrentToSelectedRoi() {
+    ImageDoc* im = cur();
+    App::Ann* sel = findAnn(app.selectedAnn);
+    if (!im || !sel || sel->type != 0) return;
+    int ax = 0, ay = 0;
+    cropInPlace(*im, sel->x, sel->y, sel->w, sel->h, &ax, &ay);
+    shiftAnnotations(-ax, -ay);        // annotations follow into the cropped frame
+    if (app.ana.img == im) app.ana.img = nullptr;
+    app.fitRequested = true;
+    toast("cropped to " + sel->label);
+}
+
+static void restoreFull() {
+    ImageDoc* im = cur();
+    if (!im || !isCropped(*im)) return;
+    int sx = im->cropX, sy = im->cropY;
+    int idx = app.current;
+    float ob = im->black, ow = im->white;
+    if (im->rawDtype >= 0) {
+        RawDialog d;
+        d.path = im->path;
+        d.dtype = im->rawDtype;
+        d.interp = im->rawInterp;
+        if (RAW_INTERP_CH[d.interp] == 1)
+            d.interp = im->cfa == 2 ? RI_QUAD : im->cfa == 1 ? RI_BAYER : RI_GRAY;
+        d.w = im->srcW; d.h = im->srcH;
+        d.offset = im->rawOffset; d.littleEndian = im->rawLE;
+        d.cfaPattern = im->cfaPattern & 3;
+        d.replaceIdx = idx;
+        std::string err = loadRaw(d);
+        if (!err.empty()) { toast("restore failed: " + err, true); return; }
+    } else if (!im->path.empty()) {
+        int before = (int)app.images.size();
+        std::string err = loadNpy(im->path);
+        if (!err.empty() || (int)app.images.size() == before) {
+            toast("restore failed: " + (err.empty() ? std::string("reload error") : err), true);
+            return;
+        }
+        auto doc = std::move(app.images.back());   // loadNpy appended; move into old slot
+        app.images.pop_back();
+        ImageDoc* old = app.images[idx].get();
+        doc->cfa = old->cfa; doc->cfaPattern = old->cfaPattern;
+        doc->cfaColorize = old->cfaColorize;
+        doc->texDirty = true;
+        if (app.ana.img == old) app.ana.img = nullptr;
+        if (old->tex) glDeleteTextures(1, &old->tex);
+        app.images[idx] = std::move(doc);
+        app.current = idx;
+    } else {
+        toast("no source file to restore from (processed image)", true);
+        return;
+    }
+    cur()->black = ob; cur()->white = ow; cur()->texDirty = true;   // keep user range
+    shiftAnnotations(sx, sy);
+    app.fitRequested = true;
+    toast("restored full frame");
+}
+
 // ---------------------------------------------------------------- session save/load
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 static void saveSession(std::string path) {
@@ -670,11 +785,14 @@ static void saveSession(std::string path) {
             int interp = d->rawInterp;
             if (RAW_INTERP_CH[interp] == 1)   // 1ch family: honor the CURRENT interpretation
                 interp = d->cfa == 2 ? RI_QUAD : d->cfa == 1 ? RI_BAYER : RI_GRAY;
-            f << "raw2 " << d->rawDtype << " " << interp << " " << d->w << " " << d->h << " "
+            f << "raw3 " << d->rawDtype << " " << interp << " "
+              << (d->srcW > 0 ? d->srcW : d->w) << " " << (d->srcH > 0 ? d->srcH : d->h) << " "
               << d->rawOffset << " " << (d->rawLE ? 1 : 0) << " " << d->cfaPattern << " "
-              << (d->cfaColorize ? 1 : 0) << " ";
+              << (d->cfaColorize ? 1 : 0) << " "
+              << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
         } else {
-            f << "npy2 " << d->cfa << " " << d->cfaPattern << " " << (d->cfaColorize ? 1 : 0) << " ";
+            f << "npy3 " << d->cfa << " " << d->cfaPattern << " " << (d->cfaColorize ? 1 : 0) << " "
+              << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
         }
         f << d->path << "\n";           // path last: may contain spaces
     }
@@ -734,10 +852,18 @@ static std::string loadSession(const std::string& path) {
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
             std::string err;
-            if (kind == "raw2" || kind == "raw") {
+            if (kind == "raw3" || kind == "raw2" || kind == "raw") {
                 RawDialog d;
                 int le = 1, col = 0;
-                if (kind == "raw2") {
+                if (kind == "raw3") {
+                    int ccx = 0, ccy = 0, ccw = 0, cch = 0;
+                    ls >> d.dtype >> d.interp >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> col
+                       >> ccx >> ccy >> ccw >> cch;
+                    if (ccw > 0 && cch > 0 && (ccx != 0 || ccy != 0 || ccw != d.w || cch != d.h)) {
+                        d.cropOn = true;
+                        d.cropX = ccx; d.cropY = ccy; d.cropW = ccw; d.cropH = cch;
+                    }
+                } else if (kind == "raw2") {
                     ls >> d.dtype >> d.interp >> d.w >> d.h >> d.offset >> le >> d.cfaPattern >> col;
                 } else {                     // legacy v1 line: combined format index + quad flag
                     int fmt = 0, quad = 0;
@@ -751,15 +877,18 @@ static std::string loadSession(const std::string& path) {
                 d.path = restOfLine(ls);
                 err = loadRaw(d);
                 if (err.empty()) cur()->cfaColorize = col != 0;
-            } else if (kind == "npy2") {
-                int cfa = 0, pat = 0, col = 0;
+            } else if (kind == "npy2" || kind == "npy3") {
+                int cfa = 0, pat = 0, col = 0, ccx = 0, ccy = 0, ccw = 0, cch = 0;
                 ls >> cfa >> pat >> col;
+                if (kind == "npy3") ls >> ccx >> ccy >> ccw >> cch;
                 std::string p = restOfLine(ls);
                 err = loadNpy(p);
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
                     cur()->cfaPattern = pat & 3;
                     cur()->cfaColorize = col != 0;
+                    if (ccw > 0 && cch > 0 && (ccx != 0 || ccy != 0 || ccw != cur()->w || cch != cur()->h))
+                        cropInPlace(*cur(), ccx, ccy, ccw, cch);
                 }
             } else {                          // legacy "npy"
                 std::string p = restOfLine(ls);
@@ -881,6 +1010,8 @@ static void pollFileDialog() {           // called once per frame from the main 
     }
 }
 
+// (dynamic crop helpers are defined above the session code)
+
 // ---------------------------------------------------------------- view helpers
 static void fitToCanvas(ImVec2 canvasSize) {
     ImageDoc* im = cur();
@@ -946,6 +1077,18 @@ static void drawRawModal() {
     rawDlg.h = std::clamp(rawDlg.h, 1, 32768);
     rawDlg.offset = std::max(0, rawDlg.offset);
     ImGui::Checkbox("little endian", &rawDlg.littleEndian);
+    ImGui::Checkbox("crop on load", &rawDlg.cropOn);
+    if (rawDlg.cropOn) {
+        if (rawDlg.cropW <= 0) { rawDlg.cropW = rawDlg.w; rawDlg.cropH = rawDlg.h; }
+        ImGui::InputInt("crop x", &rawDlg.cropX);
+        ImGui::InputInt("crop y", &rawDlg.cropY);
+        ImGui::InputInt("crop width", &rawDlg.cropW);
+        ImGui::InputInt("crop height", &rawDlg.cropH);
+        rawDlg.cropX = std::clamp(rawDlg.cropX, 0, rawDlg.w - 1);
+        rawDlg.cropY = std::clamp(rawDlg.cropY, 0, rawDlg.h - 1);
+        rawDlg.cropW = std::clamp(rawDlg.cropW, 1, rawDlg.w - rawDlg.cropX);
+        rawDlg.cropH = std::clamp(rawDlg.cropH, 1, rawDlg.h - rawDlg.cropY);
+    }
     if (rawDlg.dtype != prevDt || rawDlg.interp != prevIn || rawDlg.offset != prevOff)
         rawGuessDims(rawDlg);
 
@@ -1360,12 +1503,28 @@ static void drawInspector() {
             rawDlg.interp = im->rawInterp;
             if (RAW_INTERP_CH[rawDlg.interp] == 1)      // 1ch family: honor current interpretation
                 rawDlg.interp = im->cfa == 2 ? RI_QUAD : im->cfa == 1 ? RI_BAYER : RI_GRAY;
-            rawDlg.w = im->w; rawDlg.h = im->h;
+            rawDlg.w = im->srcW > 0 ? im->srcW : im->w;
+            rawDlg.h = im->srcH > 0 ? im->srcH : im->h;
             rawDlg.offset = im->rawOffset;
             rawDlg.littleEndian = im->rawLE;
             rawDlg.cfaPattern = im->cfaPattern & 3;
+            rawDlg.cropOn = isCropped(*im);
+            rawDlg.cropX = im->cropX; rawDlg.cropY = im->cropY;
+            rawDlg.cropW = im->w; rawDlg.cropH = im->h;
             rawDlg.replaceIdx = app.current;
             rawGuessDims(rawDlg);
+        }
+        {
+            App::Ann* selAnn = findAnn(app.selectedAnn);
+            bool roiSel = selAnn && selAnn->type == 0;
+            if (isCropped(*im))
+                ImGui::TextDisabled("crop %dx%d @ (%d,%d) of %dx%d",
+                                    im->w, im->h, im->cropX, im->cropY, im->srcW, im->srcH);
+            if (roiSel && ImGui::Button("Crop to selected ROI")) cropCurrentToSelectedRoi();
+            if (isCropped(*im)) {
+                if (roiSel) ImGui::SameLine();
+                if (ImGui::Button("Restore full")) restoreFull();
+            }
         }
         if (im->ch == 1 && !plugin_host::displays().empty()) {
             if (im->cfa && im->cfaColorize) {
@@ -1708,6 +1867,7 @@ static void printUsage() {
         "  --raw-interp <i>            meaning of samples: gray|rgb|bgr|rgba|bgra|bayer|quad-bayer\n"
         "  --raw-format <fmt>          legacy combined names (gray8|...|rgbf32|bayer8|bayer16)\n"
         "  --raw-size <WxH>            raw dimensions, e.g. 1920x1080\n"
+        "  --raw-crop <x,y,WxH>        decode only a window, e.g. 100,200,640x480\n"
         "  --raw-offset <bytes>        raw header offset (default 0)\n"
         "  --big-endian                raw byte order (default little endian)\n"
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
@@ -1752,6 +1912,16 @@ static void parseCli(int argc, char** argv) {
             if (x != std::string::npos) {
                 d.w = std::clamp(atoi(v.substr(0, x).c_str()), 1, 32768);
                 d.h = std::clamp(atoi(v.substr(x + 1).c_str()), 1, 32768);
+            }
+        } else if (a == "--raw-crop") {            // x,y,WxH
+            std::string v = next();
+            int x = 0, y = 0, w = 0, h = 0;
+            if (sscanf(v.c_str(), "%d,%d,%dx%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0) {
+                d.cropOn = true;
+                d.cropX = std::max(0, x); d.cropY = std::max(0, y);
+                d.cropW = w; d.cropH = h;
+            } else {
+                fprintf(stderr, "bad --raw-crop (expected x,y,WxH)\n");
             }
         } else if (a == "--raw-offset") {
             d.offset = std::max(0, atoi(next().c_str()));

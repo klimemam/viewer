@@ -19,6 +19,9 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
   - **開いた後の解釈変更** — 1ch 画像は右パネルの Interpret で Gray ⇔ Bayer ⇔ Quad Bayer を
     即時切替(npy でも可)。raw 由来の画像は「Reinterpret raw...」で画素フォーマットから
     読み直し(表示位置・ズームは維持)。
+  - **ROI 切り出し(動的)** — 読み込み時の crop 指定(`--raw-crop x,y,WxH` / ダイアログ)に加え、
+    開いた後も **選択中の ROI から「Crop to selected ROI」で即切り出し**、「Restore full」で復元。
+    ファイルメニューから開き直す必要なし。CFA 画像は crop 原点をパターン周期に自動スナップ。
   - Bayer 画像はホバーで **画素の CFA チャンネル (R/Gr/Gb/B) を表示**、
     「Colorize CFA pattern」でパターンを色付け表示。
   - ウィンドウへのドラッグ&ドロップ、コマンドライン引数 (`viewer.exe a.npy b.raw`) 対応。
