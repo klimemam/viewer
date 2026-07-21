@@ -115,6 +115,7 @@ struct App {
     std::string toast; double toastUntil = 0; bool toastErr = false;
     bool fitRequested = false;
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
+    bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
 };
@@ -180,6 +181,24 @@ static void setFilter(ImageDoc& im, bool nearest) {
     glBindTexture(GL_TEXTURE_2D, im.tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+}
+
+static void markAllTexDirty() {
+    for (auto& d : app.images) d->texDirty = true;
+}
+static void closeCurrent() {
+    ImageDoc* im = cur();
+    if (!im) return;
+    if (im->tex) glDeleteTextures(1, &im->tex);
+    app.images.erase(app.images.begin() + app.current);
+    app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
+    app.fitRequested = true;
+}
+static void closeAll() {
+    for (auto& d : app.images)
+        if (d->tex) glDeleteTextures(1, &d->tex);
+    app.images.clear();
+    app.current = -1;
 }
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
@@ -740,10 +759,16 @@ static void drawInspector() {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Range (black / white)");
         ImGui::Separator();
-        float bw[2] = { im->black, im->white };
+        // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
+        // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
+        static float bwEdit[2];
+        static bool bwEditing = false;
+        if (!bwEditing) { bwEdit[0] = im->black; bwEdit[1] = im->white; }
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputFloat2("##bw", bw, "%.5g", ImGuiInputTextFlags_EnterReturnsTrue)) {
-            if (bw[1] > bw[0]) { im->black = bw[0]; im->white = bw[1]; im->texDirty = true; }
+        ImGui::InputFloat2("##bw", bwEdit, "%.5g");
+        bwEditing = ImGui::IsItemActive();
+        if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0]) {
+            im->black = bwEdit[0]; im->white = bwEdit[1]; im->texDirty = true;
         }
         if (ImGui::Button("Auto"))  { im->black = im->vmin; im->white = im->vmax; im->texDirty = true; } ImGui::SameLine();
         if (ImGui::Button("0-1"))   { im->black = 0; im->white = 1; im->texDirty = true; } ImGui::SameLine();
@@ -753,8 +778,8 @@ static void drawInspector() {
         ImGui::Dummy(ImVec2(0, 8));
         int g = app.dispGamma > 1.5f ? 1 : 0;
         ImGui::TextUnformatted("Display gamma"); ImGui::SameLine();
-        if (ImGui::RadioButton("1.0", g == 0)) { app.dispGamma = 1.0f; im->texDirty = true; } ImGui::SameLine();
-        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; im->texDirty = true; }
+        if (ImGui::RadioButton("1.0", g == 0)) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
+        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); }
         ImGui::Checkbox("Pixel grid (G, zoom>=8)", &app.showGrid);
     } else {
         ImGui::TextDisabled("no image");
@@ -764,13 +789,7 @@ static void drawInspector() {
 static void drawFileList() {
     if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
-    ImageDoc* im = cur();
-    if (ImGui::Button("Close") && im) {
-        if (im->tex) glDeleteTextures(1, &im->tex);
-        app.images.erase(app.images.begin() + app.current);
-        app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
-        app.fitRequested = true;
-    }
+    if (ImGui::Button("Close")) closeCurrent();
     ImGui::Separator();
     for (int i = 0; i < (int)app.images.size(); i++) {
         ImageDoc& d = *app.images[i];
@@ -779,6 +798,91 @@ static void drawFileList() {
         if (ImGui::Selectable(lb, i == app.current)) { app.current = i; app.fitRequested = true; }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", d.path.c_str());
         ImGui::TextDisabled("   %d x %d  %dch  %s", d.w, d.h, d.ch, d.dtype.c_str());
+    }
+}
+
+// ---------------------------------------------------------------- menu bar / dialogs
+#if defined(__APPLE__)
+  #define SC_MOD "Cmd"
+#else
+  #define SC_MOD "Ctrl"
+#endif
+
+static void drawMenuBar(GLFWwindow* win) {
+    if (!ImGui::BeginMainMenuBar()) return;
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
+        if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
+        ImGui::Separator();
+#if defined(__APPLE__)
+        if (ImGui::MenuItem("Quit", "Cmd+Q")) glfwSetWindowShouldClose(win, 1);
+#else
+        if (ImGui::MenuItem("Exit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
+#endif
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("View")) {
+        bool has = cur() != nullptr;
+        if (ImGui::MenuItem("Fit to Window", "F", false, has)) app.fitRequested = true;
+        if (ImGui::MenuItem("Actual Size (100%)", "1", false, has)) app.view.zoom = 1.0f;
+        if (ImGui::MenuItem("Zoom In", "+", false, has))
+            app.view.zoom = std::clamp(app.view.zoom * 2.0f, 1.0f / 512, 256.0f);
+        if (ImGui::MenuItem("Zoom Out", "-", false, has))
+            app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
+        ImGui::Separator();
+        ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
+        if (ImGui::BeginMenu("Display Gamma")) {
+            bool lin = app.dispGamma < 1.5f;
+            if (ImGui::MenuItem("1.0 (linear)", nullptr, lin) && !lin) { app.dispGamma = 1.0f; markAllTexDirty(); }
+            if (ImGui::MenuItem("2.2", nullptr, !lin) && lin)         { app.dispGamma = 2.2f; markAllTexDirty(); }
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("Keyboard Shortcuts", "H")) app.showHelp = true;
+        if (ImGui::MenuItem("About viewer")) app.showAbout = true;
+        ImGui::EndMenu();
+    }
+    ImGui::EndMainMenuBar();
+}
+
+static void drawHelpAbout() {
+    if (app.showHelp) {
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("Keyboard Shortcuts", &app.showHelp, ImGuiWindowFlags_AlwaysAutoResize)) {
+            if (ImGui::BeginTable("sc", 2)) {
+                auto row = [](const char* k, const char* d) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
+                };
+                row(SC_MOD "+O / O", "open files");
+                row(SC_MOD "+W",     "close current image");
+                row("F / double-click", "fit to window");
+                row("1",             "actual size (100%)");
+                row("+ / -",         "zoom in / out");
+                row("wheel",         "zoom at cursor");
+                row("drag",          "pan");
+                row("G",             "pixel grid (zoom >= 8x)");
+                row("H",             "this help");
+                ImGui::EndTable();
+            }
+        }
+        ImGui::End();
+    }
+    if (app.showAbout) {
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("About viewer", &app.showAbout, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("viewer v0.1");
+            ImGui::TextDisabled("cross-platform image viewer for engineering data");
+            ImGui::Separator();
+            ImGui::TextDisabled("Dear ImGui %s  |  GLFW %s", IMGUI_VERSION, glfwGetVersionString());
+            ImGui::TextDisabled("npy / bin / raw loaders, pixel inspection, coordinate rulers");
+        }
+        ImGui::End();
     }
 }
 
@@ -849,13 +953,28 @@ int main(int argc, char** argv) {
 
         // shortcuts
         pollFileDialog();
-        if (!io.WantTextInput && io.KeyMods == ImGuiMod_None) {   // plain keys only, no Cmd/Ctrl chords
+#if defined(__APPLE__)
+        const ImGuiKeyChord MODK = ImGuiMod_Super;    // Cmd on macOS
+#else
+        const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
+#endif
+        if (!io.WantTextInput) {
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
+        }
+        if (!io.WantTextInput && io.KeyMods == ImGuiMod_None) {   // plain keys, no chords
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
             if (ImGui::IsKeyPressed(ImGuiKey_1, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false))
                 app.view.zoom = 1.0f;
             if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
+            if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
+            if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
+                app.view.zoom = std::clamp(app.view.zoom * 2.0f, 1.0f / 512, 256.0f);
+            if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
+                app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         }
+        drawMenuBar(win);
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -904,6 +1023,7 @@ int main(int argc, char** argv) {
         }
 
         drawRawModal();
+        drawHelpAbout();
 
         // toast
         if (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) {
