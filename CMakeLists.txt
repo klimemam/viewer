@@ -4,6 +4,10 @@ project(pixelscope_native CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)   # use extraction time for FetchContent URL downloads
+endif()
+
 find_package(OpenGL REQUIRED)
 include(FetchContent)
 
