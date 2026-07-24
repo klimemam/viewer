@@ -66,9 +66,30 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
         }
         mean = sum / (double)n;
         var = sum2 / (double)n - mean * mean;
+        if (var < 0) var = 0;
         qsort(scratch, n, sizeof(float), cmpf);
         snprintf(key, sizeof key, "ch%u.mean", c); sink->emit_number(sink->ctx, key, mean);
-        snprintf(key, sizeof key, "ch%u.std", c);  sink->emit_number(sink->ctx, key, sqrt(var > 0 ? var : 0));
+        snprintf(key, sizeof key, "ch%u.var", c);  sink->emit_number(sink->ctx, key, var);
+        snprintf(key, sizeof key, "ch%u.std", c);  sink->emit_number(sink->ctx, key, sqrt(var));
+        {   /* entropy over 256 bins across the black/white display range */
+            double lo = in->black, hi = in->white, H = 0;
+            if (hi > lo) {
+                size_t hist[256]; size_t k2;
+                memset(hist, 0, sizeof hist);
+                for (k2 = 0; k2 < n; k2++) {
+                    double t = (scratch[k2] - lo) / (hi - lo) * 255.0;
+                    int b = t < 0 ? 0 : t > 255 ? 255 : (int)t;
+                    hist[b]++;
+                }
+                for (k2 = 0; k2 < 256; k2++)
+                    if (hist[k2]) {
+                        double pr = (double)hist[k2] / (double)n;
+                        H -= pr * log(pr) / log(2.0);
+                    }
+                snprintf(key, sizeof key, "ch%u.entropy", c);
+                sink->emit_number(sink->ctx, key, H);
+            }
+        }
         snprintf(key, sizeof key, "ch%u.min", c);  sink->emit_number(sink->ctx, key, scratch[0]);
         snprintf(key, sizeof key, "ch%u.max", c);  sink->emit_number(sink->ctx, key, scratch[n - 1]);
         snprintf(key, sizeof key, "ch%u.p1", c);   sink->emit_number(sink->ctx, key, scratch[(size_t)((double)(n - 1) * 0.01)]);

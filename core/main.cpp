@@ -108,6 +108,7 @@ struct ImageDoc {
     // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
     int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
+    int dataRev = 0;                  // bumped on in-place pixel changes (crop)
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
@@ -178,6 +179,21 @@ struct App {
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
+    // host-built-in histogram cache (ROI-aware, CFA-split)
+    struct HistState {
+        const ImageDoc* img = nullptr;
+        int dataRev = -1;
+        float black = 0, white = 0;
+        uint64_t annRev = (uint64_t)-1;
+        int selAnn = -2, cfa = -1, cfaPattern = -1;
+        int nSeries = 0;
+        uint32_t bins[4][256] = {};
+        uint32_t maxBin = 1;
+        double clipLo = 0, clipHi = 0;
+        size_t sampled = 0;
+        bool roiUsed = false;
+    } hist;
+    bool histLog = true;
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -695,6 +711,7 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     im.data = std::move(nd);
     im.w = w; im.h = h;
     im.cropX += x; im.cropY += y;
+    im.dataRev++;
     computeMinMax(im);
     im.texDirty = true;
     if (appliedX) *appliedX = x;
@@ -1439,6 +1456,67 @@ static void drawCanvas(ImVec2 avail) {
     }
 }
 
+static void recomputeHistogramIfNeeded(ImageDoc* im) {
+    App::HistState& H = app.hist;
+    if (H.img == im && H.dataRev == im->dataRev && H.black == im->black && H.white == im->white &&
+        H.annRev == app.annRev && H.selAnn == app.selectedAnn &&
+        H.cfa == im->cfa && H.cfaPattern == im->cfaPattern)
+        return;
+    H.img = im; H.dataRev = im->dataRev;
+    H.black = im->black; H.white = im->white;
+    H.annRev = app.annRev; H.selAnn = app.selectedAnn;
+    H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
+    memset(H.bins, 0, sizeof H.bins);
+    H.maxBin = 1; H.clipLo = H.clipHi = 0; H.sampled = 0; H.roiUsed = false;
+
+    int rx = 0, ry = 0, rw = im->w, rh = im->h;
+    if (App::Ann* a = findAnn(app.selectedAnn)) {
+        if (a->type == 0) {           // selected ROI drives the histogram
+            int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
+            int cw = std::clamp(a->w, 0, im->w - cx), ch2 = std::clamp(a->h, 0, im->h - cy);
+            if (cw > 0 && ch2 > 0) { rx = cx; ry = cy; rw = cw; rh = ch2; H.roiUsed = true; }
+        }
+    }
+    bool cfa = im->ch == 1 && im->cfa != 0;
+    H.nSeries = cfa ? 4 : std::min(im->ch, 3);
+    float inv = 256.0f / std::max(im->white - im->black, 1e-20f);
+    size_t total = (size_t)rw * rh;
+    size_t step = std::max<size_t>(1, total / 1000000);   // sample <= ~1M px
+    size_t below = 0, above = 0, cnt = 0, values = 0;
+    for (size_t p = 0; p < total; p += step) {
+        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
+        const float* src = &im->data[((size_t)y * im->w + x) * im->ch];
+        if (cfa) {
+            float v = src[0];
+            if (std::isfinite(v)) {
+                int s = cfaChannelAt(*im, x, y);
+                float t = (v - im->black) * inv;
+                if (t < 0) { below++; H.bins[s][0]++; }
+                else if (t >= 256) { above++; H.bins[s][255]++; }
+                else H.bins[s][(int)t]++;
+                values++;
+            }
+        } else {
+            for (int c = 0; c < H.nSeries; c++) {
+                float v = src[c];
+                if (!std::isfinite(v)) continue;
+                float t = (v - im->black) * inv;
+                if (t < 0) { below++; H.bins[c][0]++; }
+                else if (t >= 256) { above++; H.bins[c][255]++; }
+                else H.bins[c][(int)t]++;
+                values++;
+            }
+        }
+        cnt++;
+    }
+    for (int s = 0; s < H.nSeries; s++)
+        for (int b = 0; b < 256; b++)
+            H.maxBin = std::max(H.maxBin, H.bins[s][b]);
+    H.sampled = cnt;
+    H.clipLo = values ? (double)below / values : 0;
+    H.clipHi = values ? (double)above / values : 0;
+}
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::Text("Pixel");
@@ -1581,6 +1659,46 @@ static void drawInspector() {
         ImGui::Checkbox("Pixel grid (G, zoom>=8)", &app.showGrid);
     } else {
         ImGui::TextDisabled("no image");
+    }
+
+    // ---- histogram (host built-in; follows selected ROI, splits CFA channels) ----
+    if (im && im->w > 0 && im->h > 0) {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Text("Histogram");
+        ImGui::SameLine();
+        ImGui::Checkbox("log##hist", &app.histLog);
+        ImGui::Separator();
+        recomputeHistogramIfNeeded(im);
+        const App::HistState& H = app.hist;
+        float wid = ImGui::GetContentRegionAvail().x;
+        float hgt = 110.0f * app.uiScale;
+        ImVec2 hp0 = ImGui::GetCursorScreenPos();
+        ImDrawList* hdl = ImGui::GetWindowDrawList();
+        hdl->AddRectFilled(hp0, ImVec2(hp0.x + wid, hp0.y + hgt), IM_COL32(12, 14, 16, 255));
+        static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 170), IM_COL32(120, 230, 120, 170),
+                                           IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
+        static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
+                                           IM_COL32(92, 155, 255, 150) };
+        bool cfaHist = im->ch == 1 && im->cfa != 0;
+        double logMax = log1p((double)H.maxBin);
+        for (int s = 0; s < H.nSeries; s++) {
+            ImU32 col = cfaHist ? CFA_COLS[s]
+                                : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
+            for (int b = 0; b < 256; b++) {
+                uint32_t v = H.bins[s][b];
+                if (!v) continue;
+                float f = app.histLog ? (float)(log1p((double)v) / logMax)
+                                      : (float)v / (float)H.maxBin;
+                float bx0 = hp0.x + (float)b / 256.0f * wid;
+                hdl->AddRectFilled(ImVec2(bx0, hp0.y + hgt - f * (hgt - 3)),
+                                   ImVec2(bx0 + wid / 256.0f + 0.5f, hp0.y + hgt), col);
+            }
+        }
+        ImGui::Dummy(ImVec2(wid, hgt));
+        ImGui::TextDisabled("%s | %zu px | <black %.2f%%  >white %.2f%%%s",
+                            H.roiUsed ? "selected ROI" : "whole image", H.sampled,
+                            H.clipLo * 100.0, H.clipHi * 100.0,
+                            cfaHist ? " | R/Gr/Gb/B" : "");
     }
 
     // ---- annotations: ROIs + POIs, multiple, selectable ----

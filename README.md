@@ -38,9 +38,16 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
   **ch 毎の画素値**を一覧表示(Bayer は CFA チャンネル付き)。
 - アノテーション(ROI/ピン)は一覧パネルで選択・改名・表示切替・削除(`Del`)、
   **セッションにも保存**される。
+- **ヒストグラム(内蔵)** — 右パネルに常設。選択中の ROI に自動追従、log 切替、
+  黒点/白点レンジ基準の 256bin、**Bayer は R/Gr/Gb/B の4系列に自動分離**、クリップ率表示。
 - **プラグイン** — `plugins/` の共有ライブラリを起動時に読み込み(C ABI, [include/ps/ps_plugin.h](include/ps/ps_plugin.h))。
-  同梱: `viridis` カラーマップ(描画系)、`stats` ROI 対応統計(解析系)、
-  `demosaic (bilinear)`(Process メニュー、Bayer→RGB)。
+  同梱の解析系(すべて ROI 対応・比較グリッド出力):
+  - `stats` — ch毎 mean/**var**/std/min/max/p1/p50/p99/**エントロピー**
+  - `noise` — **CFA チャンネル別** mean/std/**ノイズフロア(16×16タイル std の中央値、テクスチャに頑健)**/SNR(dB)
+  - `prnu / fpn` — フラットフィールド向け: **PRNU%**(ハイパス残差 σ/μ)、**行/列 FPN%(バンディング)**、
+    シェーディング p-p%。CFA チャンネル別。単一フレーム法(温度ノイズ込み)と明記
+  - `sharpness` — Laplacian 分散 / Tenengrad / 平均勾配(フォーカス・解像感の相対比較)
+  ほか `viridis` カラーマップ(描画系)、`demosaic (bilinear)`(Process メニュー、Bayer→RGB)。
 - **座標ルーラー** — 画像の上端 (X) と左端 (Y) に目盛り。ズームに応じて刻みが 1/2/5×10ⁿ で自動調整。
   ホバー位置のマーカー付き。
 - **表示** — ホイールでカーソル中心ズーム (1/512〜256 倍)、ドラッグでパン、
