@@ -54,9 +54,25 @@ CFA は Bayer=パリティ分離 / Quad=4px 周期サブサンプルで各チャ
 
 制約: CFA モザイクのままでは勾配が過大評価される(警告を emit)。demosaic 後に使うこと。
 
+## iso12233/e-sfr (ABI v2)
+
+スランテッドエッジ SFR。**傾き 5〜40° のエッジ1本を含む ROI** が前提。曲線は emit_series
+で出力され、Analysis パネル下部の折れ線プロットに表示される(複数 ROI は色分け重畳)。
+
+| 出力 | 内容 |
+|---|---|
+| series `sfr` | SFR カーブ(0〜1.0 cycles/px、0.01 刻み) |
+| `mtf50 / mtf20 (cy/px)` | 50%/20% コントラスト周波数(線形補間) |
+| `sfr@nyquist` | f=0.5 cy/px での SFR |
+| `edge_angle_deg` / `lines_used` | エッジ角と使用ライン数(妥当性確認用) |
+
+手法: ライン毎の微分重心 → エッジ直線フィット → 4x オーバーサンプリング ESF →
+中心差分 LSF → Hamming 窓 → DTFT。**簡易実装**(微分の sinc 補正なし)のため
+高周波側に僅かな負バイアスあり。画像間の相対比較には十分。
+制約: CFA モザイクは拒否(先に demosaic)。エッジ傾き <2° はビニングアーティファクト警告。
+
 ## 予定 (ABI v2 以降)
 
-- `iso12233/e-sfr` — スランテッドエッジ SFR、MTF50/MTF20(emit_series で曲線出力)
 - `iso14524/oecf` — グレーチャートのパッチ列 → OECF カーブ
 - `emva1288/*` — 複数フレームによる温度/固定パターン分離(analyze_seq 前提)
 - `iso19567/dead-leaves` — テクスチャ SFR

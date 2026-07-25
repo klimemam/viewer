@@ -175,6 +175,13 @@ struct App {
         std::vector<std::string> cols;                 // "whole" or ROI labels
         std::vector<std::string> keys;                 // row keys, first-seen order
         std::vector<std::vector<std::string>> vals;    // [row][col]
+        struct Series {                                // curves from V2 analyzers
+            std::string name, xLabel, yLabel;
+            std::vector<float> xs, ys;                 // xs empty = use index
+            int col = 0;                               // which ROI column produced it
+            int colorIdx = -1;                         // annotation palette; -1 = neutral
+        };
+        std::vector<Series> series;
         std::string err;
     } ana;
     bool anaAuto = false;
@@ -354,6 +361,35 @@ static void anaEmitText(void* ctx, const char* key, const char* v) {
     auto* rows = (std::vector<std::pair<std::string, std::string>>*)ctx;
     rows->emplace_back(key ? key : "", v ? v : "");
 }
+// V2 sink context: rows go to the grid, curves into AnalysisState::series
+struct AnaEmit2Ctx {
+    std::vector<std::pair<std::string, std::string>>* rows;
+    App::AnalysisState* ana;
+    int col;
+    int colorIdx;
+};
+static void ana2Number(void* ctx, const char* key, double v) {
+    char b[64]; snprintf(b, 64, "%.6g", v);
+    ((AnaEmit2Ctx*)ctx)->rows->emplace_back(key ? key : "", b);
+}
+static void ana2Text(void* ctx, const char* key, const char* v) {
+    ((AnaEmit2Ctx*)ctx)->rows->emplace_back(key ? key : "", v ? v : "");
+}
+static void ana2Series(void* ctx, const char* name, const char* xl, const char* yl,
+                       const float* x, const float* y, uint32_t n) {
+    auto* c = (AnaEmit2Ctx*)ctx;
+    if (!y || n == 0 || n > 1000000) return;
+    App::AnalysisState::Series s;
+    s.name = name ? name : "series";
+    s.xLabel = xl ? xl : "";
+    s.yLabel = yl ? yl : "";
+    s.ys.assign(y, y + n);
+    if (x) s.xs.assign(x, x + n);
+    s.col = c->col;
+    s.colorIdx = c->colorIdx;
+    c->ana->series.push_back(std::move(s));
+}
+
 // naming convention "category/name": drives the 2-level Analysis picker + Measure menu
 static void splitAnalyzerName(const std::string& full, std::string& cat, std::string& item) {
     size_t s = full.find('/');
@@ -1532,6 +1568,76 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
     H.clipHi = values ? (double)above / values : 0;
 }
 
+// L2 host service: line plot for analyzer curve output (the only curve UI —
+// plugins never draw; they emit_series and this renders every curve the same way)
+static void drawAnalysisPlots() {
+    const auto& S = app.ana.series;
+    if (S.empty()) return;
+    std::vector<std::string> names;
+    for (const auto& s : S) {
+        bool seen = false;
+        for (const auto& n : names) if (n == s.name) { seen = true; break; }
+        if (!seen) names.push_back(s.name);
+    }
+    for (const auto& nm : names) {
+        float xmin = FLT_MAX, xmax = -FLT_MAX, ymin = FLT_MAX, ymax = -FLT_MAX;
+        const App::AnalysisState::Series* first = nullptr;
+        for (const auto& s : S) {
+            if (s.name != nm || s.ys.empty()) continue;
+            if (!first) first = &s;
+            for (size_t i = 0; i < s.ys.size(); i++) {
+                float xv = s.xs.empty() ? (float)i : s.xs[i];
+                float yv = s.ys[i];
+                if (!std::isfinite(xv) || !std::isfinite(yv)) continue;
+                xmin = std::min(xmin, xv); xmax = std::max(xmax, xv);
+                ymin = std::min(ymin, yv); ymax = std::max(ymax, yv);
+            }
+        }
+        if (!first || xmin > xmax || ymin > ymax) continue;
+        if (xmax - xmin < 1e-20f) xmax = xmin + 1;
+        if (ymax - ymin < 1e-20f) ymax = ymin + 1;
+        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::TextDisabled("%s  (%s vs %s)", nm.c_str(),
+                            first->yLabel.empty() ? "y" : first->yLabel.c_str(),
+                            first->xLabel.empty() ? "x" : first->xLabel.c_str());
+        float wid = ImGui::GetContentRegionAvail().x;
+        float hgt = 140.0f * app.uiScale;
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, ImVec2(p0.x + wid, p0.y + hgt), IM_COL32(12, 14, 16, 255));
+        for (int g = 1; g < 4; g++) {
+            float gx = p0.x + wid * g / 4.0f, gy = p0.y + hgt * g / 4.0f;
+            dl->AddLine(ImVec2(gx, p0.y), ImVec2(gx, p0.y + hgt), IM_COL32(46, 52, 58, 255));
+            dl->AddLine(ImVec2(p0.x, gy), ImVec2(p0.x + wid, gy), IM_COL32(46, 52, 58, 255));
+        }
+        for (const auto& s : S) {
+            if (s.name != nm || s.ys.size() < 2) continue;
+            ImU32 col = s.colorIdx >= 0 ? ANN_COLORS[s.colorIdx & 7]
+                                        : IM_COL32(200, 205, 210, 255);
+            ImVec2 prev(0, 0); bool has = false;
+            for (size_t i = 0; i < s.ys.size(); i++) {
+                float xv = s.xs.empty() ? (float)i : s.xs[i];
+                float yv = s.ys[i];
+                if (!std::isfinite(xv) || !std::isfinite(yv)) { has = false; continue; }
+                ImVec2 pt(p0.x + (xv - xmin) / (xmax - xmin) * wid,
+                          p0.y + hgt - (yv - ymin) / (ymax - ymin) * (hgt - 2) - 1);
+                if (has) dl->AddLine(prev, pt, col, 1.5f);
+                prev = pt; has = true;
+            }
+        }
+        char lb[64];
+        ImU32 axCol = IM_COL32(140, 150, 160, 255);
+        snprintf(lb, 64, "%.4g", ymax);
+        dl->AddText(ImVec2(p0.x + 3, p0.y + 2), axCol, lb);
+        snprintf(lb, 64, "%.4g", ymin);
+        dl->AddText(ImVec2(p0.x + 3, p0.y + hgt - ImGui::GetFontSize() - 2), axCol, lb);
+        snprintf(lb, 64, "%.4g", xmax);
+        ImVec2 ts = ImGui::CalcTextSize(lb);
+        dl->AddText(ImVec2(p0.x + wid - ts.x - 3, p0.y + hgt - ImGui::GetFontSize() - 2), axCol, lb);
+        ImGui::Dummy(ImVec2(wid, hgt));
+    }
+}
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::Text("Pixel");
@@ -1851,14 +1957,22 @@ static void drawInspector() {
         auto& ana = app.ana;
         bool stale = ana.img != im || ana.plugin != app.anaSel || ana.rev != app.annRev;
         if (runClicked || (app.anaAuto && stale && !app.annBusy)) {
-            ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.err.clear();
+            ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
             ana.img = im; ana.plugin = app.anaSel; ana.rev = app.annRev;
-            auto runOne = [&](const psRect* roi, const std::string& colLabel) {
+            auto runOne = [&](const psRect* roi, const std::string& colLabel, int colorIdx) {
                 std::vector<std::pair<std::string, std::string>> rows;
                 psFrame f = makeFrame(*im);
-                psAnalyzeSink sink = { &rows, anaEmitNumber, anaEmitText };
                 char err[256] = { 0 };
-                if (anas[app.anaSel].v.analyze(&f, roi, &sink, err, sizeof err) != 0) {
+                int32_t rc;
+                if (anas[app.anaSel].isV2) {
+                    AnaEmit2Ctx ectx = { &rows, &ana, (int)ana.cols.size(), colorIdx };
+                    psAnalyzeSink2 sink = { &ectx, ana2Number, ana2Text, ana2Series, {} };
+                    rc = anas[app.anaSel].v2.analyze(&f, roi, &sink, err, sizeof err);
+                } else {
+                    psAnalyzeSink sink = { &rows, anaEmitNumber, anaEmitText };
+                    rc = anas[app.anaSel].v1.analyze(&f, roi, &sink, err, sizeof err);
+                }
+                if (rc != 0) {
                     ana.err += colLabel + ": " + (err[0] ? err : "failed") + "\n";
                     rows.clear();
                 }
@@ -1878,7 +1992,7 @@ static void drawInspector() {
                 }
             };
             if (rois.empty()) {
-                runOne(nullptr, "whole");
+                runOne(nullptr, "whole", -1);
             } else {
                 for (const App::Ann* a : rois) {
                     // annotations are global across images: clamp to THIS image before
@@ -1893,7 +2007,7 @@ static void drawInspector() {
                         continue;
                     }
                     psRect rr = { (uint32_t)rx, (uint32_t)ry, (uint32_t)rw, (uint32_t)rh };
-                    runOne(&rr, a->label);
+                    runOne(&rr, a->label, a->color & 7);
                 }
             }
         }
@@ -1922,6 +2036,7 @@ static void drawInspector() {
                 }
                 ImGui::EndTable();
             }
+            drawAnalysisPlots();   // curves from V2 analyzers (one plot per series name)
         }
     }
 }
@@ -1994,7 +2109,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::TextDisabled("%s", c.c_str());
                 lastCat = c;
             }
-            const char* hint = analyzerHint(anas[i].name);
+            const char* hint = !anas[i].desc.empty() ? anas[i].desc.c_str()
+                                                     : analyzerHint(anas[i].name);
             if (ImGui::MenuItem(n.c_str(), hint[0] ? hint : nullptr,
                                 app.anaSel == i, cur() != nullptr)) {
                 app.anaSel = i;

@@ -52,6 +52,12 @@ qb[(qy == 1) & (qx == 0)] = 30000   # Gb
 qb[(qy == 1) & (qx == 1)] = 12000   # B blocks dark
 (out / f"cfa_quad_rggb_{W}x{H}_bayer16.raw").write_bytes(qb.astype("<u2").tobytes())
 
+# slanted edge (~7 deg, ~1.2px gaussian-ish transition) for iso12233/e-sfr
+ang = np.deg2rad(7.0)
+dist = (xx - W / 2) - np.tan(ang) * (yy - H / 2)
+edge = (0.1 + 0.8 / (1.0 + np.exp(-dist / 1.2))).astype(np.float32)
+np.save(out / "slant_edge_f32.npy", edge)
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     print(" ", p.name, p.stat().st_size, "bytes")

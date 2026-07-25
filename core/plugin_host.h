@@ -6,7 +6,12 @@
 #include <vector>
 
 struct DisplayPluginInfo   { std::string name; std::array<uint8_t, 256 * 3> lut; };
-struct AnalyzerPluginInfo  { std::string name; psAnalyzerV1 v; };
+struct AnalyzerPluginInfo  {
+    std::string name, desc;          // desc: V2 self-declared precondition hint
+    bool isV2 = false;
+    psAnalyzerV1 v1{};
+    psAnalyzerV2 v2{};
+};
 struct ProcessorPluginInfo { std::string name; psProcessorV1 v; };
 
 namespace plugin_host {

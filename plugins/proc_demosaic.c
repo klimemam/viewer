@@ -77,9 +77,9 @@ static int32_t process(const psFrame* in, psFrame* out, const psHostApi* host,
 }
 
 static const psProcessorV1 DESC =
-    { PS_ABI_VERSION, PS_CAP_CPU, "demosaic (bilinear)", NULL, process, {0} };
+    { 1u, PS_CAP_CPU, "demosaic (bilinear)", NULL, process, {0} };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < PS_ABI_VERSION) return 1;
+    if (!host || host->abi_version < 1u) return 1;
     return host->register_processor(host->ctx, &DESC);
 }

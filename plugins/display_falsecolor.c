@@ -46,9 +46,9 @@ static void fill_lut(uint8_t* rgb, uint32_t entries) {
     }
 }
 
-static const psDisplayV1 DESC = { PS_ABI_VERSION, PS_CAP_CPU, "viridis", fill_lut, {0} };
+static const psDisplayV1 DESC = { 1u, PS_CAP_CPU, "viridis", fill_lut, {0} };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < PS_ABI_VERSION) return 1;   /* host too old */
+    if (!host || host->abi_version < 1u) return 1;   /* host too old */
     return host->register_display(host->ctx, &DESC);
 }

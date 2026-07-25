@@ -47,6 +47,8 @@ C++ / Dear ImGui / OpenGL 製。**CUDA・GPU なしでも動作します**(表�
   - `noise/floor` — CFA チャンネル別ノイズフロア(16×16タイル std 中央値)/SNR(dB)
   - `uniformity/prnu-fpn` — PRNU% / 行・列 FPN%(バンディング)/ シェーディング p-p%
   - `sharpness/gradient` — Laplacian 分散 / Tenengrad / 平均勾配
+  - `iso12233/e-sfr` — **スランテッドエッジ SFR**(MTF50/MTF20、SFR カーブを
+    パネル内プロットに表示。複数 ROI は色分け重畳)
   ほか `viridis` カラーマップ(描画系)、`demosaic (bilinear)`(Process メニュー、Bayer→RGB)。
 - **座標ルーラー** — 画像の上端 (X) と左端 (Y) に目盛り。ズームに応じて刻みが 1/2/5×10ⁿ で自動調整。
   ホバー位置のマーカー付き。

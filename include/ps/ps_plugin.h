@@ -17,7 +17,12 @@
 extern "C" {
 #endif
 
-#define PS_ABI_VERSION 1u
+#define PS_ABI_VERSION 2u
+/* Host API version history:
+ *   1 - display / analyzer / processor V1 structs
+ *   2 - adds psAnalyzerV2 (emit_series curves + description) via
+ *       psHostApi::register_analyzer2. V1 structs keep abi_version = 1
+ *       and remain loadable forever. */
 
 /* ---- enums (fixed values; never renumber) ---- */
 typedef enum psDtype {
@@ -75,7 +80,7 @@ typedef struct psAnalyzeSink {
  * Host requests 256 entries in v1, calls fill_lut ONCE at registration and
  * caches the table. The LUT buffer belongs to the host. -- */
 typedef struct psDisplayV1 {
-    uint32_t    abi_version;    /* = PS_ABI_VERSION                              */
+    uint32_t    abi_version;    /* = 1 (version of THIS struct)                  */
     uint32_t    caps;           /* must include PS_CAP_CPU                       */
     const char* name;           /* static lifetime, UTF-8                        */
     void (*fill_lut)(uint8_t* rgb, uint32_t entries);   /* entries*3 bytes RGB   */
@@ -110,8 +115,32 @@ typedef struct psProcessorV1 {
     void*       reserved[4];
 } psProcessorV1;
 
+/* -- Analyzer V2: adds curve output and a self-declared description. -- */
+typedef struct psAnalyzeSink2 {
+    void* ctx;
+    void (*emit_number)(void* ctx, const char* key, double value);
+    void (*emit_text)  (void* ctx, const char* key, const char* value);
+    /* Named curve (SFR, OECF, ...). x may be NULL (host uses 0..n-1).
+     * All data is copied by the host during the call. */
+    void (*emit_series)(void* ctx, const char* name, const char* x_label,
+                        const char* y_label, const float* x, const float* y,
+                        uint32_t n);
+    void* reserved[4];
+} psAnalyzeSink2;
+
+typedef struct psAnalyzerV2 {
+    uint32_t    abi_version;    /* = 2 (version of THIS struct)                  */
+    uint32_t    caps;           /* PS_CAP_CPU mandatory                          */
+    const char* name;           /* "category/name", static lifetime              */
+    const char* description;    /* one-line precondition hint; may be NULL       */
+    const char* params_schema;  /* reserved: pass NULL (future: JSON Schema UI)  */
+    int32_t (*analyze)(const psFrame* in, const psRect* roi,
+                       const psAnalyzeSink2* sink, char* err, size_t err_cap);
+    void*       reserved[4];
+} psAnalyzerV2;
+
 struct psHostApi {
-    uint32_t abi_version;       /* host ABI = 1                                  */
+    uint32_t abi_version;       /* host ABI = PS_ABI_VERSION                     */
     uint32_t struct_size;       /* sizeof(psHostApi); forward-compat probe       */
     void*    ctx;               /* opaque; pass back to every host function      */
     void  (*log)(void* ctx, int32_t level /*0=info 1=warn 2=error*/, const char* msg);
@@ -123,7 +152,9 @@ struct psHostApi {
     int32_t (*register_display)  (void* ctx, const psDisplayV1* d);
     int32_t (*register_analyzer) (void* ctx, const psAnalyzerV1* a);
     int32_t (*register_processor)(void* ctx, const psProcessorV1* p);
-    void*    reserved[8];
+    /* since host ABI 2 (was reserved[0]; NULL on ABI-1 hosts): */
+    int32_t (*register_analyzer2)(void* ctx, const psAnalyzerV2* a);
+    void*    reserved[7];
 };
 
 /* Every plugin exports exactly one symbol:

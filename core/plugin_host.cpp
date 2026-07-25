@@ -50,10 +50,10 @@ void hostLog(void*, int32_t level, const char* msg) {
     logMsg(g_loading.empty() ? m : g_loading + ": " + m, level >= 2);
 }
 
-bool validCommon(uint32_t abi, uint32_t caps, const char* name, const void* fn) {
-    if (abi != PS_ABI_VERSION) {
-        logMsg(g_loading + ": plugin ABI v" + std::to_string(abi) +
-               " does not match host ABI v1 - rejected", true);
+bool validCommon(uint32_t abi, uint32_t expected, uint32_t caps, const char* name, const void* fn) {
+    if (abi != expected) {
+        logMsg(g_loading + ": descriptor version v" + std::to_string(abi) +
+               " does not match expected v" + std::to_string(expected) + " - rejected", true);
         return false;
     }
     if (!(caps & PS_CAP_CPU)) {   // contract: CPU implementation is mandatory
@@ -77,7 +77,7 @@ bool dupName(const V& v, const char* name) {
 }
 
 int32_t hostRegisterDisplay(void*, const psDisplayV1* d) {
-    if (!d || !validCommon(d->abi_version, d->caps, d->name, (const void*)d->fill_lut)) return 1;
+    if (!d || !validCommon(d->abi_version, 1, d->caps, d->name, (const void*)d->fill_lut)) return 1;
     if (dupName(g_displays, d->name)) return 1;
     DisplayPluginInfo info;
     info.name = d->name;
@@ -86,13 +86,28 @@ int32_t hostRegisterDisplay(void*, const psDisplayV1* d) {
     return 0;
 }
 int32_t hostRegisterAnalyzer(void*, const psAnalyzerV1* a) {
-    if (!a || !validCommon(a->abi_version, a->caps, a->name, (const void*)a->analyze)) return 1;
+    if (!a || !validCommon(a->abi_version, 1, a->caps, a->name, (const void*)a->analyze)) return 1;
     if (dupName(g_analyzers, a->name)) return 1;
-    g_analyzers.push_back({ a->name, *a });
+    AnalyzerPluginInfo info;
+    info.name = a->name;
+    info.isV2 = false;
+    info.v1 = *a;
+    g_analyzers.push_back(std::move(info));
+    return 0;
+}
+int32_t hostRegisterAnalyzer2(void*, const psAnalyzerV2* a) {
+    if (!a || !validCommon(a->abi_version, 2, a->caps, a->name, (const void*)a->analyze)) return 1;
+    if (dupName(g_analyzers, a->name)) return 1;
+    AnalyzerPluginInfo info;
+    info.name = a->name;
+    info.desc = a->description ? a->description : "";
+    info.isV2 = true;
+    info.v2 = *a;
+    g_analyzers.push_back(std::move(info));
     return 0;
 }
 int32_t hostRegisterProcessor(void*, const psProcessorV1* p) {
-    if (!p || !validCommon(p->abi_version, p->caps, p->name, (const void*)p->process)) return 1;
+    if (!p || !validCommon(p->abi_version, 1, p->caps, p->name, (const void*)p->process)) return 1;
     if (dupName(g_processors, p->name)) return 1;
     g_processors.push_back({ p->name, *p });
     return 0;
@@ -101,7 +116,8 @@ int32_t hostRegisterProcessor(void*, const psProcessorV1* p) {
 psHostApi g_api = {
     PS_ABI_VERSION, (uint32_t)sizeof(psHostApi), nullptr,
     hostLog, hostFrameAlloc, hostFrameFree,
-    hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor, {}
+    hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor,
+    hostRegisterAnalyzer2, {}
 };
 
 } // namespace

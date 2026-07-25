@@ -152,16 +152,16 @@ def sharpen(frame: np.ndarray, amount: float) -> np.ndarray:
 - 各アナライザは `method` 行 (手法と制約の1行) を必ず emit する
 - 1プラグイン1節のドキュメントを `docs/analyzers.md` に置く
 
-### ABI v2 計画 (必要になった時に実装、v1 は永久サポート)
+### ABI v2 計画 (v1 は永久サポート)
 
-1. **emit_series(name, x[], y[], n)** — 曲線を返す口 (SFR / OECF / ヒストグラム)。
-   ホストの折れ線プロット部品が描画する
-2. **params_schema 有効化** — 測定パラメータを JSON Schema で宣言 → ホストが UI 自動生成
-3. **description フィールド** — Measure メニューの前提条件ヒント (現在はホスト側の暫定テーブル)
-4. **マルチフレーム analyze_seq** — EMVA 1288 用。フェーズ2 (連番) と同時に導入
+1. **emit_series(name, x[], y[], n)** — 曲線を返す口。ホストの折れ線プロット部品が描画 **(済)**
+2. **params_schema 有効化** — 測定パラメータを JSON Schema で宣言 → ホストが UI 自動生成 (未)
+3. **description フィールド** — Measure メニューの前提条件ヒントをプラグイン側が宣言 **(済)**
+4. **マルチフレーム analyze_seq** — EMVA 1288 用。フェーズ2 (連番) と同時に導入 (未)
 
-導入順: カテゴリ規約 (済) → プロット部品 + emit_series → params_schema →
-e-SFR を v2 最初のプラグインとして実装 (下地の実証) → 連番 + マルチフレーム → EMVA 1288。
+実装状態: ホスト ABI = 2 (`register_analyzer2`、旧 reserved スロット使用で v1 プラグインと
+バイナリ互換)。v1 構造体の abi_version は構造体自身の版 (=1) を入れる規約。
+`iso12233/e-sfr` が v2 の参照実装。
 
 ## リポジトリ構成 (予定)
 
