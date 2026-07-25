@@ -179,6 +179,7 @@ struct App {
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
+    bool anaRunRequest = false;       // set by the Measure menu; consumed by the panel
     // host-built-in histogram cache (ROI-aware, CFA-split)
     struct HistState {
         const ImageDoc* img = nullptr;
@@ -352,6 +353,20 @@ static void anaEmitNumber(void* ctx, const char* key, double v) {
 static void anaEmitText(void* ctx, const char* key, const char* v) {
     auto* rows = (std::vector<std::pair<std::string, std::string>>*)ctx;
     rows->emplace_back(key ? key : "", v ? v : "");
+}
+// naming convention "category/name": drives the 2-level Analysis picker + Measure menu
+static void splitAnalyzerName(const std::string& full, std::string& cat, std::string& item) {
+    size_t s = full.find('/');
+    if (s == std::string::npos) { cat = "misc"; item = full; }
+    else { cat = full.substr(0, s); item = full.substr(s + 1); }
+}
+// precondition hints; ABI v2 moves this into a plugin-declared description field
+static const char* analyzerHint(const std::string& name) {
+    if (name == "stats/moments")       return "any image / ROI";
+    if (name == "noise/floor")         return "flat-ish ROI";
+    if (name == "uniformity/prnu-fpn") return "bright flat field";
+    if (name == "sharpness/gradient")  return "same-scene compare";
+    return "";
 }
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
@@ -1786,14 +1801,42 @@ static void drawInspector() {
         ImGui::Separator();
         const auto& anas = plugin_host::analyzers();
         app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
-        if (ImGui::BeginCombo("##anasel", anas[app.anaSel].name.c_str())) {
-            for (int i = 0; i < (int)anas.size(); i++)
-                if (ImGui::Selectable(anas[i].name.c_str(), i == app.anaSel)) app.anaSel = i;
+        std::string curCat, curItem;
+        splitAnalyzerName(anas[app.anaSel].name, curCat, curItem);
+        float cw = ImGui::GetContentRegionAvail().x;
+        ImGui::SetNextItemWidth(cw * 0.30f);
+        if (ImGui::BeginCombo("##anacat", curCat.c_str())) {   // level 1: category
+            std::vector<std::string> seen;
+            for (int i = 0; i < (int)anas.size(); i++) {
+                std::string c, n;
+                splitAnalyzerName(anas[i].name, c, n);
+                bool dup = false;
+                for (const auto& s : seen) if (s == c) { dup = true; break; }
+                if (dup) continue;
+                seen.push_back(c);
+                if (ImGui::Selectable(c.c_str(), c == curCat) && c != curCat)
+                    for (int j = 0; j < (int)anas.size(); j++) {
+                        std::string c2, n2;
+                        splitAnalyzerName(anas[j].name, c2, n2);
+                        if (c2 == c) { app.anaSel = j; break; }
+                    }
+            }
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        bool runClicked = ImGui::Button("Run");
+        ImGui::SetNextItemWidth(cw * 0.34f);
+        if (ImGui::BeginCombo("##anaitem", curItem.c_str())) { // level 2: measurement
+            for (int i = 0; i < (int)anas.size(); i++) {
+                std::string c, n;
+                splitAnalyzerName(anas[i].name, c, n);
+                if (c != curCat) continue;
+                if (ImGui::Selectable(n.c_str(), i == app.anaSel)) app.anaSel = i;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        bool runClicked = ImGui::Button("Run") || app.anaRunRequest;
+        app.anaRunRequest = false;
         ImGui::SameLine();
         ImGui::Checkbox("auto", &app.anaAuto);
 
@@ -1937,6 +1980,26 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("1.0 (linear)", nullptr, lin) && !lin) { app.dispGamma = 1.0f; markAllTexDirty(); }
             if (ImGui::MenuItem("2.2", nullptr, !lin) && lin)         { app.dispGamma = 2.2f; markAllTexDirty(); }
             ImGui::EndMenu();
+        }
+        ImGui::EndMenu();
+    }
+    if (!plugin_host::analyzers().empty() && ImGui::BeginMenu("Measure")) {
+        const auto& anas = plugin_host::analyzers();
+        std::string lastCat;
+        for (int i = 0; i < (int)anas.size(); i++) {
+            std::string c, n;
+            splitAnalyzerName(anas[i].name, c, n);
+            if (c != lastCat) {
+                if (!lastCat.empty()) ImGui::Separator();
+                ImGui::TextDisabled("%s", c.c_str());
+                lastCat = c;
+            }
+            const char* hint = analyzerHint(anas[i].name);
+            if (ImGui::MenuItem(n.c_str(), hint[0] ? hint : nullptr,
+                                app.anaSel == i, cur() != nullptr)) {
+                app.anaSel = i;
+                app.anaRunRequest = true;   // panel runs it this frame
+            }
         }
         ImGui::EndMenu();
     }

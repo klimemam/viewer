@@ -205,7 +205,7 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-static const psAnalyzerV1 DESC = { PS_ABI_VERSION, PS_CAP_CPU, "prnu / fpn", analyze, {0} };
+static const psAnalyzerV1 DESC = { PS_ABI_VERSION, PS_CAP_CPU, "uniformity/prnu-fpn", analyze, {0} };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
     if (!host || host->abi_version < PS_ABI_VERSION) return 1;
