@@ -163,6 +163,14 @@ viewer [options] [files...]
 | 解析グリッドが出ない | ROI が16個以上 → 一部を非表示に(注記が出ます) |
 | プラグインが読み込まれない | 起動時 stderr に理由(ABI 版数不一致 / CPU 実装なし / 重複名)。`plugins/` は exe と同階層 |
 
+### ビルド環境まわり (Windows)
+
+| 症状 | 原因と対処 |
+|---|---|
+| ターミナルで `cmake` が見つからない | インストール後に開いたままのターミナル/VSCode は**古い PATH を保持**している。VSCode を完全終了して再起動(タスクバー常駐も終了) |
+| configure が `SSL peer certificate ... was not OK` (status_code 60) で失敗 | MinGW/WinLibs 同梱の CMake は CA ストアを持たず、FetchContent の GitHub ダウンロードが検証エラーになる。**CA バンドルを指定**する:<br>`cmake -S . -B build -DCMAKE_TLS_CAINFO="C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"`<br>環境変数 `CMAKE_TLS_CAINFO` に同じ値を設定すれば以後不要(`CMAKE_TLS_VERIFY=0` での回避は非推奨) |
+| MinGW でのビルド例 | `cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release` → `cmake --build build-mingw` → `.\build-mingw\viewer.exe`(MSVC は必須ではない) |
+
 ## 11. ショートカット全表
 
 | キー | 動作 |

@@ -28,12 +28,15 @@ Windows / Linux / macOS ・ C++17 + Dear ImGui ・ GPU/CUDA 不要 ・ 単体バ
 `viewer-win64` / `viewer-linux-x64` / `viewer-macos-arm64` をダウンロード
 (zip/tgz に `plugins/` 同梱。Linux/macOS は `tar xzf` → `./viewer`)。
 
-**B. ソースから** (VS2022 または gcc/clang + CMake 3.21+、依存は自動取得):
+**B. ソースから** (VS2022 / MinGW / gcc / clang + CMake 3.21+、依存は自動取得):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ./build/viewer                       # Windows: build\Release\viewer.exe
 ```
+Linux は `xorg-dev libgl1-mesa-dev` 等が必要([CI 設定](.github/workflows/build.yml)参照)。
+MinGW 同梱 CMake で SSL エラーが出る場合は
+[manual の対処](docs/manual.md#ビルド環境まわり-windows)を参照。
 
 **3分ツアー**:
 ```bash
