@@ -93,8 +93,12 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     names = cfa ? CFA_NAMES : RGB_NAMES;
 
     for (b = 0; b < nb; b++) {
-        /* ---- extract the channel plane (subsampled grid for CFA) ---- */
-        int stepX = 1, stepY = 1, firstX = (int)r.x, firstY = (int)r.y;
+        /* ---- extract the channel plane (subsampled grid for CFA) ----
+         * ROI bounds are converted to int once so the phase arithmetic below
+         * stays signed (mixing uint32_t with int promotes to unsigned). */
+        const int rx0 = (int)r.x, ry0 = (int)r.y;
+        const int rx1 = (int)(r.x + r.w), ry1 = (int)(r.y + r.h);
+        int stepX = 1, stepY = 1, firstX = rx0, firstY = ry0;
         int pw, ph, x, y;
         float *plane, *lp, *tmp;
         char key[48];
@@ -105,17 +109,17 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
             if (quad) {
                 stepX = stepY = 4;
                 for (i = 0; i < 4; i++)      /* first x with matching cell, block-aligned */
-                    if ((((r.x + i) >> 1) & 1) == bx && ((r.x + i) & 1) == 0) { firstX = (int)r.x + i; break; }
+                    if ((((rx0 + i) >> 1) & 1) == bx && ((rx0 + i) & 1) == 0) { firstX = rx0 + i; break; }
                 for (i = 0; i < 4; i++)
-                    if ((((r.y + i) >> 1) & 1) == by && ((r.y + i) & 1) == 0) { firstY = (int)r.y + i; break; }
+                    if ((((ry0 + i) >> 1) & 1) == by && ((ry0 + i) & 1) == 0) { firstY = ry0 + i; break; }
             } else {
                 stepX = stepY = 2;
-                firstX = (int)r.x + (int)((bx - (r.x & 1)) & 1);
-                firstY = (int)r.y + (int)((by - (r.y & 1)) & 1);
+                firstX = rx0 + ((bx - (rx0 & 1)) & 1);
+                firstY = ry0 + ((by - (ry0 & 1)) & 1);
             }
         }
-        pw = ((int)(r.x + r.w) - firstX + stepX - 1) / stepX;
-        ph = ((int)(r.y + r.h) - firstY + stepY - 1) / stepY;
+        pw = (rx1 - firstX + stepX - 1) / stepX;
+        ph = (ry1 - firstY + stepY - 1) / stepY;
         if (pw < 2 * RADIUS + 2 || ph < 2 * RADIUS + 2) {
             snprintf(key, sizeof key, "%s", names[b]);
             sink->emit_text(sink->ctx, key, "region too small");
