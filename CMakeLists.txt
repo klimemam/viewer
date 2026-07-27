@@ -47,7 +47,7 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
-add_executable(viewer core/main.cpp core/plugin_host.cpp)
+add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp)
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR})
 if(UNIX)

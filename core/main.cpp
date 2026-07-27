@@ -20,6 +20,7 @@
 #include "imgui_impl_opengl3.h"
 #include "portable-file-dialogs.h"
 #include "plugin_host.h"
+#include "ui_theme.h"
 
 #include <algorithm>
 #include <atomic>
@@ -146,6 +147,8 @@ struct App {
     bool showGrid = false;
     float dispGamma = 1.0f;           // 1.0 or 2.2
     float uiScale = 1.0f;
+    int themeVariant = ui_theme::VariantDark;   // View > Theme
+    int themeAccent = 0;                        // index into ui_theme::accents()
     std::string toast; double toastUntil = 0; bool toastErr = false;
     bool fitRequested = false;
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
@@ -2000,10 +2003,13 @@ static void drawCanvas(ImVec2 avail) {
         for (int t = 0; t < 3; t++) {
             if (t) ImGui::SameLine();
             bool on = app.tool == t;
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button,
-                                          ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            if (on) {   // solid accent pill: readable on the dark canvas in both themes
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+            }
             if (ImGui::SmallButton(labels[t])) app.tool = t;
-            if (on) ImGui::PopStyleColor();
+            if (on) ImGui::PopStyleColor(2);
         }
     }
 }
@@ -2849,6 +2855,20 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("2.2", nullptr, !lin) && lin)         { app.dispGamma = 2.2f; markAllTexDirty(); }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Theme")) {
+            bool changed = false;
+            if (ImGui::MenuItem("Dark", nullptr, app.themeVariant == ui_theme::VariantDark))
+                { app.themeVariant = ui_theme::VariantDark; changed = true; }
+            if (ImGui::MenuItem("Light", nullptr, app.themeVariant == ui_theme::VariantLight))
+                { app.themeVariant = ui_theme::VariantLight; changed = true; }
+            ImGui::Separator();
+            ImGui::TextDisabled("accent");
+            for (int i = 0; i < ui_theme::accentCount(); i++)
+                if (ImGui::MenuItem(ui_theme::accents()[i].name, nullptr, app.themeAccent == i))
+                    { app.themeAccent = i; changed = true; }
+            if (changed) ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale);
+            ImGui::EndMenu();
+        }
         ImGui::EndMenu();
     }
     if (!plugin_host::analyzers().empty() && ImGui::BeginMenu("Measure")) {
@@ -3100,8 +3120,7 @@ int main(int argc, char** argv) {
     float fontScale = uiScale;
 #endif
     app.uiScale = uiScale;
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    ui_theme::apply(app.themeVariant, app.themeAccent, uiScale);
     std::string fontPath = jpFontPath();
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
@@ -3219,7 +3238,8 @@ int main(int argc, char** argv) {
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
             ImGuiWindowFlags_NoSavedSettings);
 
-        const float LEFT_W = 230 * uiScale, RIGHT_W = 300 * uiScale, STATUS_H = 26 * uiScale;
+        // RIGHT_W sized for the Aurora theme's roomier FramePadding/ItemSpacing
+        const float LEFT_W = 230 * uiScale, RIGHT_W = 322 * uiScale, STATUS_H = 26 * uiScale;
         ImVec2 total = ImGui::GetContentRegionAvail();
 
         ImGui::BeginChild("left", ImVec2(LEFT_W, total.y - STATUS_H), ImGuiChildFlags_Borders);
@@ -3288,7 +3308,8 @@ int main(int argc, char** argv) {
         int dw, dh;
         glfwGetFramebufferSize(win, &dw, &dh);
         glViewport(0, 0, dw, dh);
-        glClearColor(0.06f, 0.07f, 0.08f, 1);
+        ImVec4 cc = ui_theme::clearColor(app.themeVariant);
+        glClearColor(cc.x, cc.y, cc.z, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);

@@ -1,9 +1,9 @@
 """Dear ImGui modern-design demo — a mock of the Viewer UI wearing the
 "Aurora" theme from imgui_theme.py.
 
-This is a *design study*, not a port: images, thumbnails and stats are
-procedurally generated so the demo runs anywhere with zero assets, and the
-layout mirrors main.py (gallery | viewer | stats, toolbar, status bar).
+This is a *design playground* for the C++ viewer (core/ui_theme.cpp holds
+the production port of this theme): images, thumbnails and stats are
+procedurally generated so the demo runs anywhere with zero assets.
 A "Design Lab" panel lets you switch dark/light and the accent color live.
 
 On top of the theme, this file demonstrates the "de-ImGui" techniques:
