@@ -16,6 +16,7 @@
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
+#include "imgui_internal.h"          // DockBuilder for the default layout
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "portable-file-dialogs.h"
@@ -250,6 +251,11 @@ struct App {
         bool roiUsed = false;
     } temporal;
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
+    int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
+    // panel visibility (persisted with the ImGui layout)
+    bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
+    bool showHistogram = true, showTemporal = true;
+    bool resetLayout = false;
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -2537,7 +2543,10 @@ static void drawInspector() {
         ImGui::TextDisabled("no image");
     }
 
-    // ---- statistics + histogram (always on; follow the selected ROI) ----
+}
+
+static void drawPanelHistogram() {
+    ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
         recomputeHistogramIfNeeded(im);
         const App::HistState& H = app.hist;
@@ -2604,7 +2613,10 @@ static void drawInspector() {
                             cfaHist ? " | R/Gr/Gb/B" : "");
     }
 
-    // ---- temporal (sequences only; built-in, follows the selected ROI) ----
+}
+
+static void drawPanelTemporal() {
+    ImageDoc* im = cur();
     if (im && im->seqId != 0) {
         recomputeTemporalIfNeeded();
         const App::TemporalState& T = app.temporal;
@@ -2654,85 +2666,173 @@ static void drawInspector() {
         }
     }
 
-    // ---- annotations: ROIs + POIs, multiple, selectable ----
-    if (im && !app.anns.empty()) {
-        ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Text("Annotations (%d)", (int)app.anns.size());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Clear##anns")) {
-            app.anns.clear(); app.selectedAnn = -1; app.annRev++;
-        }
-        ImGui::Separator();
-        int removeId = -1;
-        for (auto& a : app.anns) {
-            ImGui::PushID(a.id);
-            if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
-            ImGui::SameLine();
-            ImVec4 c = ImGui::ColorConvertU32ToFloat4(ANN_COLORS[a.color & 7]);
-            ImGui::PushStyleColor(ImGuiCol_Text, c);
-            char row[160];
-            if (a.type == 0)
-                snprintf(row, 160, "%s  %dx%d @ (%d,%d)", a.label.c_str(), a.w, a.h, a.x, a.y);
-            else
-                snprintf(row, 160, "%s  (%d,%d)", a.label.c_str(), a.x, a.y);
-            if (ImGui::Selectable(row, app.selectedAnn == a.id,
-                                  ImGuiSelectableFlags_AllowOverlap,
-                                  ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 2, 0)))
-                app.selectedAnn = a.id;
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x")) removeId = a.id;
-            ImGui::PopID();
-        }
-        if (removeId >= 0) deleteAnn(removeId);
-        if (App::Ann* sel = findAnn(app.selectedAnn)) {
-            char buf[128];
-            snprintf(buf, sizeof buf, "%s", sel->label.c_str());
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##rename", buf, sizeof buf))
-                sel->label = buf;                       // live update is cheap...
-            if (ImGui::IsItemDeactivatedAfterEdit())
-                app.annRev++;                           // ...but re-analyze only on commit
-        }
-        // per-channel values of visible POIs (ch毎表記)
-        bool anyPoi = false;
-        for (const auto& a : app.anns)
-            if (a.type == 1 && a.visible) { anyPoi = true; break; }
-        if (anyPoi) {
-            int nch = std::min(im->ch, 4);
-            if (ImGui::BeginTable("poivals", 2 + nch, ImGuiTableFlags_SizingStretchProp)) {
-                static const char* LB1[] = { "V" };
-                static const char* LB2[] = { "C0", "C1" };
-                static const char* LB3[] = { "R", "G", "B", "A" };
-                const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
-                ImGui::TableSetupColumn("pt");
-                ImGui::TableSetupColumn("x,y");
-                for (int c = 0; c < nch; c++) ImGui::TableSetupColumn(lb[c]);
-                ImGui::TableHeadersRow();
-                for (const auto& a : app.anns) {
-                    if (a.type != 1 || !a.visible) continue;
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(a.label.c_str());
-                    ImGui::TableNextColumn();
-                    bool inside = a.x >= 0 && a.y >= 0 && a.x < im->w && a.y < im->h;
-                    if (im->cfa && inside)
-                        ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
-                    else
-                        ImGui::Text("%d,%d", a.x, a.y);
-                    for (int c = 0; c < nch; c++) {
-                        ImGui::TableNextColumn();
-                        if (inside)
-                            ImGui::TextUnformatted(fmtVal(im->sample(a.x, a.y, c), im->dtype).c_str());
-                        else
-                            ImGui::TextDisabled("-");
-                    }
-                }
-                ImGui::EndTable();
+}
+
+// Basic per-ROI statistics (host-computed, always on). Detailed measurements
+// live in the Analysis window; this is the "at a glance" layer.
+struct RoiStat { double mean, sd, mn, mx; size_t n; bool valid; };
+static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
+    RoiStat s{ 0, 0, 0, 0, 0, false };
+    rx = std::clamp(rx, 0, im.w); ry = std::clamp(ry, 0, im.h);
+    rw = std::clamp(rw, 0, im.w - rx); rh = std::clamp(rh, 0, im.h - ry);
+    if (rw < 1 || rh < 1) return s;
+    bool cfa = im.ch == 1 && im.cfa != 0;
+    size_t total = (size_t)rw * rh;
+    size_t step = std::max<size_t>(1, total / 200000);      // cap the cost per ROI
+    double sum = 0, sum2 = 0, mn = DBL_MAX, mx = -DBL_MAX;
+    size_t n = 0;
+    for (size_t p = 0; p < total; p += step) {
+        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
+        const float* src = &im.data[((size_t)y * im.w + x) * im.ch];
+        if (cfa) {
+            if (chSel >= 0 && cfaChannelAt(im, x, y) != chSel) continue;
+            float v = src[0];
+            if (!std::isfinite(v)) continue;
+            sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+        } else if (chSel >= 0 && chSel < im.ch) {
+            float v = src[chSel];
+            if (!std::isfinite(v)) continue;
+            sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+        } else {
+            for (int c = 0; c < im.ch; c++) {
+                float v = src[c];
+                if (!std::isfinite(v)) continue;
+                sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
             }
         }
     }
+    if (!n) return s;
+    s.mean = sum / n;
+    double var = sum2 / n - s.mean * s.mean;
+    s.sd = sqrt(var > 0 ? var : 0);
+    s.mn = mn; s.mx = mx; s.n = n; s.valid = true;
+    return s;
+}
 
-    // ---- analysis: analyzer plugins over ALL visible ROIs (comparison grid) ----
+static void drawPanelRois() {
+    ImageDoc* im = cur();
+    if (!im) { ImGui::TextDisabled("no image"); return; }
+
+    // channel selector keeps the table to a fixed, readable width
+    bool cfa = im->ch == 1 && im->cfa != 0;
+    static const char* CFA_SEL[5] = { "all", "R", "Gr", "Gb", "B" };
+    static const char* CH_SEL[5] = { "all", "ch0", "ch1", "ch2", "ch3" };
+    int maxSel = cfa ? 4 : std::min(im->ch, 4);
+    app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - (cfa ? 0 : 1));
+    const char* curSel = app.roiChannel < 0 ? "all"
+                                            : (cfa ? CFA_SEL[app.roiChannel + 1] : CH_SEL[app.roiChannel + 1]);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+    if (ImGui::BeginCombo("channel", curSel)) {
+        if (ImGui::Selectable("all", app.roiChannel < 0)) app.roiChannel = -1;
+        for (int c = 0; c < maxSel; c++)
+            if (ImGui::Selectable(cfa ? CFA_SEL[c + 1] : CH_SEL[c + 1], app.roiChannel == c))
+                app.roiChannel = c;
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear all")) { app.anns.clear(); app.selectedAnn = -1; app.annRev++; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(R: drag = ROI, P: click = pin)");
+    ImGui::Separator();
+
+    const ImGuiTableFlags TF = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY;
+    float rowsH = ImGui::GetTextLineHeightWithSpacing() * 9;
+    if (ImGui::BeginTable("roitable", 8, TF, ImVec2(0, rowsH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
+        ImGui::TableSetupColumn("name");
+        ImGui::TableSetupColumn("region");
+        ImGui::TableSetupColumn("mean");
+        ImGui::TableSetupColumn("std");
+        ImGui::TableSetupColumn("min");
+        ImGui::TableSetupColumn("max");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
+        ImGui::TableHeadersRow();
+
+        // whole-image reference row
+        {
+            RoiStat s = roiBasicStats(*im, 0, 0, im->w, im->h, app.roiChannel);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("whole image");
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%dx%d", im->w, im->h);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mean);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.sd);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mn);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mx);
+            ImGui::TableNextColumn();
+        }
+        int removeId = -1;
+        for (auto& a : app.anns) {
+            ImGui::PushID(a.id);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
+            ImGui::TableNextColumn();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ANN_COLORS[a.color & 7]));
+            bool sel = app.selectedAnn == a.id;
+            if (ImGui::Selectable(a.label.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns))
+                app.selectedAnn = a.id;
+            ImGui::PopStyleColor();
+            ImGui::TableNextColumn();
+            if (a.type == 0) ImGui::Text("%dx%d @%d,%d", a.w, a.h, a.x, a.y);
+            else if (im->cfa && a.x < im->w && a.y < im->h)
+                ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
+            else ImGui::Text("%d,%d", a.x, a.y);
+            if (a.type == 0) {                          // ROI: area statistics
+                RoiStat s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
+                ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
+            } else {                                     // POI: the pixel value itself
+                bool inside = a.x >= 0 && a.y >= 0 && a.x < im->w && a.y < im->h;
+                int c0 = app.roiChannel < 0 ? 0 : std::min(app.roiChannel, im->ch - 1);
+                ImGui::TableNextColumn();
+                if (inside) ImGui::TextUnformatted(fmtVal(im->sample(a.x, a.y, c0), im->dtype).c_str());
+                else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+            }
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("x")) removeId = a.id;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (removeId >= 0) deleteAnn(removeId);
+    }
+
+    if (App::Ann* sel = findAnn(app.selectedAnn)) {
+        ImGui::Separator();
+        ImGui::TextDisabled("selected");
+        ImGui::SameLine();
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s", sel->label.c_str());
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##rename", buf, sizeof buf))
+            sel->label = buf;                       // live update is cheap...
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            app.annRev++;                           // ...but re-analyze only on commit
+        if (sel->type == 0) {
+            int v[4] = { sel->x, sel->y, sel->w, sel->h };
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputInt4("x,y,w,h", v)) {
+                sel->x = std::clamp(v[0], 0, im->w - 1);
+                sel->y = std::clamp(v[1], 0, im->h - 1);
+                sel->w = std::clamp(v[2], 1, im->w - sel->x);
+                sel->h = std::clamp(v[3], 1, im->h - sel->y);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
+        }
+    } else {
+        ImGui::TextDisabled("select a row to rename / edit its geometry");
+    }
+}
+
+static void drawPanelAnalysis() {
+    ImageDoc* im = cur();
     if (im && !plugin_host::analyzers().empty()) {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Analysis");
@@ -3011,6 +3111,22 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Panels")) {
+            ImGui::MenuItem("Files", nullptr, &app.showFiles);
+            ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
+            ImGui::MenuItem("ROIs", nullptr, &app.showRois);
+            ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
+            ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
+            ImGui::MenuItem("Temporal", nullptr, &app.showTemporal);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset layout")) {
+                app.showFiles = app.showInspector = app.showRois = true;
+                app.showAnalysis = app.showHistogram = app.showTemporal = true;
+                app.resetLayout = true;
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Display Gamma")) {
             bool lin = app.dispGamma < 1.5f;
             if (ImGui::MenuItem("1.0 (linear)", nullptr, lin) && !lin) { app.dispGamma = 1.0f; markAllTexDirty(); }
@@ -3259,7 +3375,28 @@ int main(int argc, char** argv) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // remember the panel layout between runs (user preference, not session data)
+    static std::string iniPath;
+    {
+        std::error_code ec;
+        std::filesystem::path cfg;
+#if defined(_WIN32)
+        if (const char* ad = getenv("APPDATA")) cfg = std::filesystem::u8path(ad);
+#else
+        if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
+#endif
+        if (!cfg.empty()) {
+            cfg /= "viewer";
+            std::filesystem::create_directories(cfg, ec);
+            if (!ec) {
+                iniPath = (cfg / "layout.ini").u8string();
+                io.IniFilename = iniPath.c_str();
+                app.resetLayout = !std::filesystem::exists(cfg / "layout.ini", ec);
+            }
+        }
+        if (iniPath.empty()) { io.IniFilename = nullptr; app.resetLayout = true; }
+    }
 
     float xs = 1, ys = 1;
     glfwGetWindowContentScale(win, &xs, &ys);
@@ -3387,24 +3524,67 @@ int main(int argc, char** argv) {
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::Begin("##root", nullptr,
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
-            ImGuiWindowFlags_NoSavedSettings);
+            ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::PopStyleVar(2);
 
-        const float LEFT_W = 230 * uiScale, RIGHT_W = 300 * uiScale, STATUS_H = 26 * uiScale;
-        ImVec2 total = ImGui::GetContentRegionAvail();
+        const float STATUS_H = 26 * uiScale;
+        // dock space fills everything above the status bar; panels dock into it
+        ImGuiID dockId = ImGui::GetID("MainDock");
+        ImGui::DockSpace(dockId, ImVec2(0, ImGui::GetContentRegionAvail().y - STATUS_H),
+                         ImGuiDockNodeFlags_PassthruCentralNode);
+        if (app.resetLayout) {        // first run, or View > Reset layout
+            app.resetLayout = false;
+            ImGui::DockBuilderRemoveNode(dockId);
+            ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace);
+            ImGui::DockBuilderSetNodeSize(dockId, ImVec2(vp->WorkSize.x, vp->WorkSize.y - STATUS_H));
+            ImGuiID center = dockId, left, right, bottom;
+            left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.17f, nullptr, &center);
+            right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
+            bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.28f, nullptr, &center);
+            ImGui::DockBuilderDockWindow("Files", left);
+            ImGui::DockBuilderDockWindow("Image View", center);
+            ImGui::DockBuilderDockWindow("Inspector", right);
+            ImGui::DockBuilderDockWindow("Histogram", bottom);
+            ImGui::DockBuilderDockWindow("Temporal", bottom);
+            ImGui::DockBuilderFinish(dockId);
+            // ROIs and Analysis stay floating (they follow the work, not the frame)
+            ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
+                                               vp->WorkPos.y + vp->WorkSize.y * 0.08f));
+            ImGui::SetWindowSize("ROIs", ImVec2(560 * uiScale, 260 * uiScale));
+            ImGui::SetWindowPos("Analysis", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
+                                                   vp->WorkPos.y + vp->WorkSize.y * 0.42f));
+            ImGui::SetWindowSize("Analysis", ImVec2(560 * uiScale, 420 * uiScale));
+        }
 
-        ImGui::BeginChild("left", ImVec2(LEFT_W, total.y - STATUS_H), ImGuiChildFlags_Borders);
-        drawFileList();
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("view", ImVec2(total.x - LEFT_W - RIGHT_W - 16 * uiScale, total.y - STATUS_H));
-        drawCanvas(ImGui::GetContentRegionAvail());
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("right", ImVec2(0, total.y - STATUS_H), ImGuiChildFlags_Borders);
-        drawInspector();
-        ImGui::EndChild();
+        if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
+        if (ImGui::Begin("Image View", nullptr, ImGuiWindowFlags_NoScrollbar |
+                                                ImGuiWindowFlags_NoScrollWithMouse))
+            drawCanvas(ImGui::GetContentRegionAvail());
+        ImGui::End();
+        if (app.showInspector) {
+            if (ImGui::Begin("Inspector", &app.showInspector)) drawInspector();
+            ImGui::End();
+        }
+        if (app.showHistogram) {
+            if (ImGui::Begin("Histogram", &app.showHistogram)) drawPanelHistogram();
+            ImGui::End();
+        }
+        if (app.showTemporal) {
+            if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
+            ImGui::End();
+        }
+        if (app.showRois) {
+            if (ImGui::Begin("ROIs", &app.showRois)) drawPanelRois();
+            ImGui::End();
+        }
+        if (app.showAnalysis) {
+            if (ImGui::Begin("Analysis", &app.showAnalysis)) drawPanelAnalysis();
+            ImGui::End();
+        }
 
         // status bar
         {

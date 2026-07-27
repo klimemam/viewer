@@ -21,8 +21,9 @@ FetchContent_Declare(glfw
   URL https://github.com/glfw/glfw/archive/refs/tags/3.4.zip)
 FetchContent_MakeAvailable(glfw)
 
+# docking branch: same version, adds DockSpace so panels can be arranged freely
 FetchContent_Declare(imgui
-  URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.8.zip)
+  URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.8-docking.zip)
 FetchContent_MakeAvailable(imgui)
 
 # portable-file-dialogs: header-only; post-0.1.0 snapshot needed for pfd::settings::available().
@@ -60,6 +61,11 @@ if(MSVC)
   target_compile_options(viewer PRIVATE /W3 /utf-8)
 else()
   target_compile_options(viewer PRIVATE -Wall -Wextra)
+endif()
+if(MINGW)   # self-contained exe: no libstdc++/libgcc/libwinpthread DLLs alongside
+  target_link_options(viewer PRIVATE -static-libgcc -static-libstdc++
+                                     -Wl,-Bstatic,--whole-archive -lwinpthread
+                                     -Wl,--no-whole-archive)
 endif()
 
 # ---- bundled plugins (pure C, MODULE libs into build/plugins) ----
