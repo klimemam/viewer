@@ -133,3 +133,15 @@ flowchart LR
 3. CUDA / NVDEC(ゼロコピー表示。無い環境は CPU に自動フォールバック)
 4. params_schema → 測定パラメータ UI 自動生成、pybind11 埋め込み
 5. WebSocket ブリッジ([pixelscope.html](pixelscope.html) をリモートフロントエンドに)
+
+## UI デザインスタディ(Dear ImGui モダン化)
+
+ImGui UI のモダン化検討 → **[docs/imgui_modern_design.md](docs/imgui_modern_design.md)**。
+"Aurora" テーマ(素の ImGui スタイル値なので C++ 側へ 1:1 移植可)+
+「ImGui 感を消す」テクニック集(実フォント / アイコンツールバー /
+タブバー非表示 / カード UI)を、Python 製のライブデモ付きでまとめています:
+
+```bash
+pip install -r requirements-imgui.txt
+python imgui_demo.py     # Design Lab パネルでダーク/ライト・アクセント色を実機確認
+```

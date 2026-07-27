@@ -1,0 +1,4 @@
+# Extra dependencies for the Dear ImGui design study (imgui_demo.py).
+# The main PySide6 viewer does not need these.
+imgui-bundle>=1.92
+numpy>=1.26
