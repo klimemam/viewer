@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <csignal>
 #include <fstream>
 // low-level IO for the crash handler: it must not go through iostreams
@@ -5493,6 +5494,16 @@ static void parseCli(int argc, char** argv) {
 static double g_wakeUntil = 0;
 static uint64_t g_inputSeq = 0;      // bumped by every real input: idle can tell
                                      // a genuine event from a spurious wake-up
+// Set once in main(); lets the window callbacks draw a frame themselves while the
+// OS holds the thread in a modal loop (resizing / moving the window).
+static std::function<void()> g_drawFrame;
+static bool g_inFrame = false;
+static void redrawNow() {
+    if (!g_drawFrame || g_inFrame) return;   // never reenter a frame
+    g_inFrame = true;
+    g_drawFrame();
+    g_inFrame = false;
+}
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
     g_inputSeq++;
@@ -5512,8 +5523,10 @@ static void installWakeCallbacks(GLFWwindow* win) {
     glfwSetCharCallback(win, [](GLFWwindow*, unsigned int) { wakeUi(4); });
     glfwSetCursorEnterCallback(win, [](GLFWwindow*, int) { wakeUi(); });
     glfwSetWindowFocusCallback(win, [](GLFWwindow*, int) { wakeUi(4); });
-    glfwSetWindowSizeCallback(win, [](GLFWwindow*, int, int) { wakeUi(4); });
-    glfwSetWindowRefreshCallback(win, [](GLFWwindow*) { wakeUi(2); });
+    // these two fire from inside the OS resize/move modal loop: draw right here,
+    // or the window stays frozen for as long as the user holds the edge
+    glfwSetWindowSizeCallback(win, [](GLFWwindow*, int, int) { wakeUi(4); redrawNow(); });
+    glfwSetWindowRefreshCallback(win, [](GLFWwindow*) { wakeUi(2); redrawNow(); });
 }
 
 int main(int argc, char** argv) {
@@ -5626,120 +5639,13 @@ int main(int argc, char** argv) {
         benchMs.reserve(benchFrames);
     }
     double lastFrameEnd = glfwGetTime();
-    while (!glfwWindowShouldClose(win)) {
-        double frameT0 = glfwGetTime();
-        // work that must keep animating even without input
-        bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
-                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
-        if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
-        bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
-        if (active || busy) {
-            // Frame pacing lives here, not in the swap: the driver may ignore
-            // vsync entirely (measured ~4000 fps with SwapInterval(1)), and this
-            // wait returns the instant an event arrives, so it costs no latency.
-            // (~100 fps in practice: the OS wait rounds up to its timer tick.)
-            double budget = app.lowBandwidth ? 1.0 / 30.0 : 1.0 / 120.0;
-            if (!active) budget = 0.08;        // background progress only
-            double left = budget - (frameT0 - lastFrameEnd);
-            // Never sleep on a backlog: ImGui hands out one trickled event per
-            // frame, so pacing would show a 100-event fling one notch at a time.
-            if (!ImGui::GetCurrentContext()->InputEventsQueue.empty()) left = 0;
-            if (benchFrames || left <= 0.0005) {
-                glfwPollEvents();
-            } else if (app.lowBandwidth) {
-                // remote: the budget is a real cap, so keep waiting out the rest
-                // of it even when events arrive (bandwidth beats latency here)
-                do { glfwWaitEventsTimeout(left);
-                     left = budget - (glfwGetTime() - lastFrameEnd);
-                } while (left > 0.0005);
-            } else {
-                glfwWaitEventsTimeout(left);   // returns at once on input
-            }
-            if (app.wakeFrames > 0) app.wakeFrames--;
-        } else {
-            // Idle: block until something happens. The caret does not blink
-            // (ConfigInputTextCursorBlink=false), so text fields need no heartbeat.
-            // The wait also returns on messages GLFW handles without calling any
-            // callback; drawing a frame for those (let alone arming the 250 ms
-            // wake tail) is what turned a 1 fps idle into a 40 fps one.
-            uint64_t before = g_inputSeq;
-            glfwWaitEventsTimeout(1.0);
-            // (--crash-test counts frames, so it must not be skipped)
-            if (g_inputSeq == before && !crashAfter) continue;   // nothing happened
-            app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
-        }
-        lastFrameEnd = glfwGetTime();
-        if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
-        if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
-            ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
-            app.pendingLayout.clear();
-        }
-        if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
-            glfwWaitEvents();
-            continue;
-        }
-        pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
-        // --compare, deferred until the files (and their background-loaded frames)
-        // are actually here. B is the first doc from a DIFFERENT source file, so a
-        // stack on the command line does not end up compared against itself.
-        if (app.pendingCompare >= 0 && !app.seqRunning) {
-            if (app.pendingCompare == App::CmpOff || app.images.size() < 2) {
-                if (app.images.size() < 2 && app.pendingCompare != App::CmpOff)
-                    fprintf(stderr, "--compare needs two images\n");
-            } else {
-                selectImage(0);
-                for (const auto& d : app.images)
-                    if (d->path != app.images[0]->path || d->npzMember != app.images[0]->npzMember) {
-                        setCompareB(d.get()); break;
-                    }
-                if (!resolveB()) setCompareB(app.images[1].get());   // same file twice
-                app.compareMode = app.pendingCompare;
-            }
-            app.pendingCompare = -1;
-        }
-        {   // Preferences are tiny: write them the moment they change, so a crash
-            // or a kill never costs the user their setup.
-            static uint64_t lastPrefs = 0;
-            uint64_t h = (uint64_t)app.themeVariant * 31 + (uint64_t)app.themeAccent * 131 +
-                         (app.compactUi ? 1u : 0u) * 7 + (app.dragPans ? 1u : 0u) * 13 +
-                         (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
-                         (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
-                         (app.lowBandwidth ? 1u : 0u) * 43 +
-                         (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
-            if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
-            lastPrefs = h;
-        }
-        {   // Autosave on change, debounced. A hard kill cannot run any handler,
-            // so the safety net has to be written while things still work.
-            static uint64_t lastState = 0;
-            static double dirtySince = -1, lastAutosave = 0;
-            uint64_t state = app.imagesRev * 1000003ull + app.annRev * 31ull +
-                             (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
-                             (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
-                             (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
-                             (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
-                                        app.projMode * 64 + app.projYMode * 256 +
-                                        app.roiChannel * 1024 + app.selectedAnn * 4096) +
-                             (uint64_t)(app.showFiles + app.showInspector * 2 + app.showRois * 4 +
-                                        app.showAnalysis * 8 + app.showHistogram * 16 +
-                                        app.showTemporal * 32 + app.showProjection * 64) * 131ull;
-            double nowA = glfwGetTime();
-            static double lastSnap = -1;
-            if (state != lastState) { lastState = state; dirtySince = nowA; }
-            // Re-render the crash copy far more often than the autosave debounce
-            // (a crash 100 ms after a change should lose nothing) but not every
-            // frame: dragging a ROI bumps annRev continuously.
-            if (dirtySince >= 0 && nowA - lastSnap > 0.4) {
-                lastSnap = nowA;
-                refreshCrashSnapshot();
-            }
-            bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
-            if (!benchFrames && due && !app.images.empty()) {
-                dirtySince = -1;
-                lastAutosave = nowA;
-                autosaveSession();
-            }
-        }
+    // The frame body lives in a callable so it can also run from the window
+    // refresh/size callbacks. Win32 runs a MODAL message loop while the user
+    // drags a window edge: DispatchMessage never returns until the drag ends, so
+    // a main loop that only draws between events shows a frozen window for the
+    // whole resize. GLFW 3.4 sets no timer there, so the repaint has to come from
+    // inside the callback.
+    g_drawFrame = [&]() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -5991,6 +5897,123 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
+    };
+
+    while (!glfwWindowShouldClose(win)) {
+        double frameT0 = glfwGetTime();
+        // work that must keep animating even without input
+        bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
+                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
+        if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
+        bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
+        if (active || busy) {
+            // Frame pacing lives here, not in the swap: the driver may ignore
+            // vsync entirely (measured ~4000 fps with SwapInterval(1)), and this
+            // wait returns the instant an event arrives, so it costs no latency.
+            // (~100 fps in practice: the OS wait rounds up to its timer tick.)
+            double budget = app.lowBandwidth ? 1.0 / 30.0 : 1.0 / 120.0;
+            if (!active) budget = 0.08;        // background progress only
+            double left = budget - (frameT0 - lastFrameEnd);
+            // Never sleep on a backlog: ImGui hands out one trickled event per
+            // frame, so pacing would show a 100-event fling one notch at a time.
+            if (!ImGui::GetCurrentContext()->InputEventsQueue.empty()) left = 0;
+            if (benchFrames || left <= 0.0005) {
+                glfwPollEvents();
+            } else if (app.lowBandwidth) {
+                // remote: the budget is a real cap, so keep waiting out the rest
+                // of it even when events arrive (bandwidth beats latency here)
+                do { glfwWaitEventsTimeout(left);
+                     left = budget - (glfwGetTime() - lastFrameEnd);
+                } while (left > 0.0005);
+            } else {
+                glfwWaitEventsTimeout(left);   // returns at once on input
+            }
+            if (app.wakeFrames > 0) app.wakeFrames--;
+        } else {
+            // Idle: block until something happens. The caret does not blink
+            // (ConfigInputTextCursorBlink=false), so text fields need no heartbeat.
+            // The wait also returns on messages GLFW handles without calling any
+            // callback; drawing a frame for those (let alone arming the 250 ms
+            // wake tail) is what turned a 1 fps idle into a 40 fps one.
+            uint64_t before = g_inputSeq;
+            glfwWaitEventsTimeout(1.0);
+            // (--crash-test counts frames, so it must not be skipped)
+            if (g_inputSeq == before && !crashAfter) continue;   // nothing happened
+            app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
+        }
+        lastFrameEnd = glfwGetTime();
+        if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
+        if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
+            ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
+            app.pendingLayout.clear();
+        }
+        if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
+            glfwWaitEvents();
+            continue;
+        }
+        pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
+        // --compare, deferred until the files (and their background-loaded frames)
+        // are actually here. B is the first doc from a DIFFERENT source file, so a
+        // stack on the command line does not end up compared against itself.
+        if (app.pendingCompare >= 0 && !app.seqRunning) {
+            if (app.pendingCompare == App::CmpOff || app.images.size() < 2) {
+                if (app.images.size() < 2 && app.pendingCompare != App::CmpOff)
+                    fprintf(stderr, "--compare needs two images\n");
+            } else {
+                selectImage(0);
+                for (const auto& d : app.images)
+                    if (d->path != app.images[0]->path || d->npzMember != app.images[0]->npzMember) {
+                        setCompareB(d.get()); break;
+                    }
+                if (!resolveB()) setCompareB(app.images[1].get());   // same file twice
+                app.compareMode = app.pendingCompare;
+            }
+            app.pendingCompare = -1;
+        }
+        {   // Preferences are tiny: write them the moment they change, so a crash
+            // or a kill never costs the user their setup.
+            static uint64_t lastPrefs = 0;
+            uint64_t h = (uint64_t)app.themeVariant * 31 + (uint64_t)app.themeAccent * 131 +
+                         (app.compactUi ? 1u : 0u) * 7 + (app.dragPans ? 1u : 0u) * 13 +
+                         (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
+                         (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
+                         (app.lowBandwidth ? 1u : 0u) * 43 +
+                         (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
+            if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
+            lastPrefs = h;
+        }
+        {   // Autosave on change, debounced. A hard kill cannot run any handler,
+            // so the safety net has to be written while things still work.
+            static uint64_t lastState = 0;
+            static double dirtySince = -1, lastAutosave = 0;
+            uint64_t state = app.imagesRev * 1000003ull + app.annRev * 31ull +
+                             (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
+                             (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
+                             (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
+                             (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
+                                        app.projMode * 64 + app.projYMode * 256 +
+                                        app.roiChannel * 1024 + app.selectedAnn * 4096) +
+                             (uint64_t)(app.showFiles + app.showInspector * 2 + app.showRois * 4 +
+                                        app.showAnalysis * 8 + app.showHistogram * 16 +
+                                        app.showTemporal * 32 + app.showProjection * 64) * 131ull;
+            double nowA = glfwGetTime();
+            static double lastSnap = -1;
+            if (state != lastState) { lastState = state; dirtySince = nowA; }
+            // Re-render the crash copy far more often than the autosave debounce
+            // (a crash 100 ms after a change should lose nothing) but not every
+            // frame: dragging a ROI bumps annRev continuously.
+            if (dirtySince >= 0 && nowA - lastSnap > 0.4) {
+                lastSnap = nowA;
+                refreshCrashSnapshot();
+            }
+            bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
+            if (!benchFrames && due && !app.images.empty()) {
+                dirtySince = -1;
+                lastAutosave = nowA;
+                autosaveSession();
+            }
+        }
+        g_drawFrame();
         if (benchFrames) {
             glFinish();               // include GPU work in the measurement
             benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
@@ -6008,6 +6031,8 @@ int main(int argc, char** argv) {
                 s.back(), 1000.0 / std::max(s[s.size() / 2], 1e-6));
     }
 
+    // it captures main's locals by reference, and teardown can still fire callbacks
+    g_drawFrame = nullptr;
     autosaveSession();                // also covers a normal quit
     // Only what the user changed in this run: a one-off --sequence flag or the
     // gamma inside a --session must not quietly become the default.
