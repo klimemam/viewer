@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -351,6 +352,256 @@ void ensurePlugins() {
 }
 }  // namespace
 
+// ---- aggregate ops -------------------------------------------------------
+// The statistics an IQ engineer wants from a stack, computed in ONE streaming
+// pass where the frames live: nothing but the results crosses the wire, and
+// nothing waits for a transfer. f64 accumulation; the contract is statistical,
+// not bit-exact across backends (a GPU implementation may reassociate sums).
+namespace {
+struct RoiRect { uint32_t x, y, w, h; };
+
+const int CFA_MAP_S[4][4] = { {0,1,2,3}, {3,2,1,0}, {1,0,3,2}, {2,3,0,1} };
+const char* PLANE_NAMES[4] = { "R", "Gr", "Gb", "B" };
+inline int planeOf(uint32_t cfaType, uint32_t pat, uint32_t x, uint32_t y) {
+    if (!cfaType) return 0;
+    uint32_t cx = cfaType == 2 ? (x >> 1) & 1 : x & 1;
+    uint32_t cy = cfaType == 2 ? (y >> 1) & 1 : y & 1;
+    return CFA_MAP_S[pat & 3][cy * 2 + cx];
+}
+std::string planeKey(const char* base, uint32_t cfaType, int plane) {
+    return cfaType ? std::string(base) + " " + PLANE_NAMES[plane] : std::string(base);
+}
+
+// Frames from one frame-axis file, or one file per frame; ROI rows only, so the
+// disk pays for the region, not the file.
+struct FrameSource {
+    const MeasureReqHead* head = nullptr;
+    const std::vector<std::string>* paths = nullptr;
+    NpyFile n;                        // in-file mode stays open across frames
+    bool perFile = false;
+    uint32_t count = 0;
+    std::string err;
+
+    bool init(const MeasureReqHead& h, const std::vector<std::string>& p) {
+        head = &h;
+        paths = &p;
+        perFile = p.size() > 1;
+        if (!parseNpyHeader(n, p[0], err)) return false;
+        if (perFile) {
+            count = (uint32_t)p.size();
+        } else {
+            uint32_t total = (uint32_t)n.frames;
+            uint32_t f0 = std::min(h.frame0, total ? total - 1 : 0);
+            uint32_t avail = total - f0;
+            count = h.frameCount ? std::min(h.frameCount, avail) : avail;
+        }
+        if (count == 0) { err = "no frames in range"; return false; }
+        return true;
+    }
+    bool read(uint32_t i, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh,
+              std::vector<uint8_t>& raw, uint32_t& ow, uint32_t& oh) {
+        TileReq r{};
+        r.x = rx; r.y = ry; r.w = rw; r.h = rh; r.step = 1;
+        if (perFile) {
+            NpyFile f;
+            if (!parseNpyHeader(f, (*paths)[i], err)) return false;
+            if (f.w != n.w || f.h != n.h || f.ch != n.ch || f.dtype != n.dtype) {
+                err = "frame " + std::to_string(i) + " differs in shape/dtype";
+                return false;
+            }
+            r.frame = 0;
+            return readRegion(f, r, raw, ow, oh, err);
+        }
+        r.frame = head->frame0 + i;
+        return readRegion(n, r, raw, ow, oh, err);
+    }
+};
+
+bool clampRoi(const NpyFile& n, const std::vector<RoiRect>& rois, uint32_t c,
+              uint32_t& rx, uint32_t& ry, uint32_t& rw, uint32_t& rh) {
+    rx = 0; ry = 0; rw = (uint32_t)n.w; rh = (uint32_t)n.h;
+    if (!rois.empty()) {
+        rx = std::min(rois[c].x, (uint32_t)n.w);
+        ry = std::min(rois[c].y, (uint32_t)n.h);
+        rw = std::min(rois[c].w, (uint32_t)n.w - rx);
+        rh = std::min(rois[c].h, (uint32_t)n.h - ry);
+    }
+    return rw > 0 && rh > 0;
+}
+}  // namespace
+
+static void sendMeasureReply(uint32_t framesUsed,
+                             const std::vector<std::vector<MItem>>& cols,
+                             const std::vector<MSeries>& series) {
+    Buf out;
+    out.putU32(0);                              // serverLoc: CPU (CUDA slots in here)
+    out.putU32(framesUsed);
+    out.putU32((uint32_t)cols.size());
+    for (const auto& col : cols) {
+        out.putU32((uint32_t)col.size());
+        for (const auto& it : col) {
+            out.putU32(it.kind);
+            out.putStr(it.key);
+            if (it.kind == 0) out.putF64(it.num);
+            else              out.putStr(it.text);
+        }
+    }
+    out.putU32((uint32_t)series.size());
+    for (const auto& s : series) {
+        out.putStr(s.name); out.putStr(s.xl); out.putStr(s.yl);
+        out.putU32(s.col);
+        out.putU32(s.hasX ? 1u : 0u);
+        out.putU32((uint32_t)s.ys.size());
+        if (s.hasX) out.putBlob(s.xs.data(), s.xs.size() * 4);
+        out.putBlob(s.ys.data(), s.ys.size() * 4);
+    }
+    sendMsg(MSG_OK, out);
+}
+
+// Temporal noise vs fixed pattern: per-pixel mean/var over the frame range.
+// sigma_t = sqrt(mean per-pixel temporal variance), sigma_fpn = spatial sigma of
+// the per-pixel temporal means - the split every sensor evaluation starts from.
+static void runTemporalStats(const MeasureReqHead& head,
+                             const std::vector<std::string>& paths,
+                             const std::vector<RoiRect>& rois) {
+    FrameSource src;
+    if (!src.init(head, paths)) { sendErr(src.err); return; }
+    if (src.count < 2) { sendErr("temporal stats needs at least 2 frames"); return; }
+    uint32_t nCols = rois.empty() ? 1 : (uint32_t)rois.size();
+    std::vector<std::vector<MItem>> cols(nCols);
+    std::vector<MSeries> series;
+    std::vector<uint8_t> raw;
+    std::vector<float> pix;
+    for (uint32_t c = 0; c < nCols; c++) {
+        uint32_t rx, ry, rw, rh;
+        if (!clampRoi(src.n, rois, c, rx, ry, rw, rh)) { sendErr("empty ROI"); return; }
+        size_t samples = (size_t)rw * rh * src.n.ch;
+        if (samples > (size_t)64 << 20) {
+            sendErr("ROI too large for temporal stats (max 64M samples)");
+            return;
+        }
+        std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+        MSeries fm, fs;
+        fm.name = "frame mean"; fm.xl = "frame number (index)"; fm.yl = "mean [DN]";
+        fm.col = c; fm.hasX = true;
+        fs.name = "frame std";  fs.xl = "frame number (index)"; fs.yl = "std [DN]";
+        fs.col = c; fs.hasX = true;
+        for (uint32_t f = 0; f < src.count; f++) {
+            uint32_t ow = 0, oh = 0;
+            if (!src.read(f, rx, ry, rw, rh, raw, ow, oh)) { sendErr(src.err); return; }
+            pix.resize(samples);
+            toFloatSamples(raw.data(), src.n.dtype, samples, pix.data());
+            double s1 = 0, s2 = 0;
+            for (size_t i = 0; i < samples; i++) {
+                double v = pix[i];
+                sum[i] += v; sum2[i] += v * v;
+                s1 += v; s2 += v * v;
+            }
+            double m = s1 / (double)samples;
+            fm.xs.push_back((float)f);
+            fm.ys.push_back((float)m);
+            fs.xs.push_back((float)f);
+            fs.ys.push_back((float)sqrt(std::max(0.0, s2 / (double)samples - m * m)));
+        }
+        const double N = (double)src.count;
+        const int nPl = head.cfaType ? 4 : 1;
+        double plM[4] = {}, plM2[4] = {}, plV[4] = {};
+        size_t plC[4] = {};
+        for (uint32_t y = 0; y < rh; y++)
+            for (uint32_t x = 0; x < rw; x++) {
+                int p = planeOf(head.cfaType, head.cfaPattern, rx + x, ry + y);
+                for (uint32_t k = 0; k < (uint32_t)src.n.ch; k++) {
+                    size_t i = ((size_t)y * rw + x) * src.n.ch + k;
+                    double m = sum[i] / N;
+                    double var = std::max(0.0, sum2[i] / N - m * m) * (N / (N - 1.0));
+                    plM[p] += m; plM2[p] += m * m; plV[p] += var; plC[p]++;
+                }
+            }
+        cols[c].push_back({ 0u, "frames", (double)src.count, {} });
+        for (int p = 0; p < nPl; p++) {
+            if (!plC[p]) continue;
+            double cnt = (double)plC[p];
+            double mean = plM[p] / cnt;
+            double st = sqrt(plV[p] / cnt);
+            double fpn = sqrt(std::max(0.0, plM2[p] / cnt - mean * mean));
+            cols[c].push_back({ 0u, planeKey("mean [DN]", head.cfaType, p), mean, {} });
+            cols[c].push_back({ 0u, planeKey("sigma_t [DN]", head.cfaType, p), st, {} });
+            cols[c].push_back({ 0u, planeKey("sigma_fpn [DN]", head.cfaType, p), fpn, {} });
+            cols[c].push_back({ 0u, planeKey("sigma_tot [DN]", head.cfaType, p),
+                                sqrt(st * st + fpn * fpn), {} });
+        }
+        cols[c].push_back({ 1u, "method", 0.0,
+            "per-pixel mean/var over " + std::to_string(src.count) +
+            " frames; sigma_t = sqrt(mean unbiased temporal var), "
+            "sigma_fpn = spatial sigma of temporal means" +
+            std::string(head.cfaType ? "; CFA planes" : "") + "; backend=cpu" });
+        series.push_back(std::move(fm));
+        series.push_back(std::move(fs));
+    }
+    sendMeasureReply(src.count, cols, series);
+}
+
+// Per-frame, per-ROI mean and variance: the raw material of photon-transfer and
+// linearity curves, ~50 KB for 300 frames x 5 ROIs instead of gigabytes.
+static void runFrameRoiStats(const MeasureReqHead& head,
+                             const std::vector<std::string>& paths,
+                             const std::vector<RoiRect>& rois) {
+    FrameSource src;
+    if (!src.init(head, paths)) { sendErr(src.err); return; }
+    uint32_t nCols = rois.empty() ? 1 : (uint32_t)rois.size();
+    std::vector<std::vector<MItem>> cols(nCols);
+    std::vector<MSeries> series;
+    std::vector<uint8_t> raw;
+    std::vector<float> pix;
+    const int nPl = head.cfaType ? 4 : 1;
+    for (uint32_t c = 0; c < nCols; c++) {
+        uint32_t rx, ry, rw, rh;
+        if (!clampRoi(src.n, rois, c, rx, ry, rw, rh)) { sendErr("empty ROI"); return; }
+        size_t samples = (size_t)rw * rh * src.n.ch;
+        std::vector<std::vector<float>> mnY((size_t)nPl), vrY((size_t)nPl);
+        std::vector<float> xsAll;
+        for (uint32_t f = 0; f < src.count; f++) {
+            uint32_t ow = 0, oh = 0;
+            if (!src.read(f, rx, ry, rw, rh, raw, ow, oh)) { sendErr(src.err); return; }
+            pix.resize(samples);
+            toFloatSamples(raw.data(), src.n.dtype, samples, pix.data());
+            double s1[4] = {}, s2[4] = {};
+            size_t cn[4] = {};
+            for (uint32_t y = 0; y < rh; y++)
+                for (uint32_t x = 0; x < rw; x++) {
+                    int p = planeOf(head.cfaType, head.cfaPattern, rx + x, ry + y);
+                    for (uint32_t k = 0; k < (uint32_t)src.n.ch; k++) {
+                        double v = pix[((size_t)y * rw + x) * src.n.ch + k];
+                        s1[p] += v; s2[p] += v * v; cn[p]++;
+                    }
+                }
+            xsAll.push_back((float)f);
+            for (int p = 0; p < nPl; p++) {
+                double m = cn[p] ? s1[p] / (double)cn[p] : 0.0;
+                double var = cn[p] ? std::max(0.0, s2[p] / (double)cn[p] - m * m) : 0.0;
+                mnY[p].push_back((float)m);
+                vrY[p].push_back((float)var);
+            }
+        }
+        cols[c].push_back({ 0u, "frames", (double)src.count, {} });
+        cols[c].push_back({ 1u, "method", 0.0,
+            "per-frame spatial mean/var of the ROI, f64 accum" +
+            std::string(head.cfaType ? "; CFA planes" : "") + "; backend=cpu" });
+        for (int p = 0; p < nPl; p++) {
+            MSeries sm, sv;
+            sm.name = planeKey("roi mean", head.cfaType, p);
+            sm.xl = "frame number (index)"; sm.yl = "mean [DN]";
+            sm.col = c; sm.hasX = true; sm.xs = xsAll; sm.ys = std::move(mnY[p]);
+            sv.name = planeKey("roi var", head.cfaType, p);
+            sv.xl = "frame number (index)"; sv.yl = "variance [DN^2]";
+            sv.col = c; sv.hasX = true; sv.xs = xsAll; sv.ys = std::move(vrY[p]);
+            series.push_back(std::move(sm));
+            series.push_back(std::move(sv));
+        }
+    }
+    sendMeasureReply(src.count, cols, series);
+}
+
 static void handleMeasure(Buf& in) {
     MeasureReqHead head{};
     if (in.rd + sizeof head > in.b.size()) { sendErr("bad MEASURE"); return; }
@@ -364,7 +615,6 @@ static void handleMeasure(Buf& in) {
     for (auto& p : paths) if (!in.getStr(p)) { sendErr("bad MEASURE paths"); return; }
     std::string analyzer, params;
     if (!in.getStr(analyzer) || !in.getStr(params)) { sendErr("bad MEASURE"); return; }
-    struct RoiRect { uint32_t x, y, w, h; };
     std::vector<RoiRect> rois(head.nRois);
     for (auto& r : rois) {
         uint32_t v[4];
@@ -372,7 +622,9 @@ static void handleMeasure(Buf& in) {
         r.x = v[0]; r.y = v[1]; r.w = v[2]; r.h = v[3];
     }
 
-    if (head.op != MOP_ANALYZER) { sendErr("measure op not implemented yet"); return; }
+    if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois); return; }
+    if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois); return; }
+    if (head.op != MOP_ANALYZER) { sendErr("unknown measure op"); return; }
 
     ensurePlugins();
     const AnalyzerPluginInfo* ana = nullptr;
@@ -440,29 +692,7 @@ static void handleMeasure(Buf& in) {
         }
     }
 
-    Buf out;
-    out.putU32(0);                              // serverLoc: CPU (CUDA slots in here)
-    out.putU32(1);                              // framesUsed
-    out.putU32(nCols);
-    for (const auto& col : cols) {
-        out.putU32((uint32_t)col.size());
-        for (const auto& it : col) {
-            out.putU32(it.kind);
-            out.putStr(it.key);
-            if (it.kind == 0) out.putF64(it.num);
-            else              out.putStr(it.text);
-        }
-    }
-    out.putU32((uint32_t)series.size());
-    for (const auto& s : series) {
-        out.putStr(s.name); out.putStr(s.xl); out.putStr(s.yl);
-        out.putU32(s.col);
-        out.putU32(s.hasX ? 1u : 0u);
-        out.putU32((uint32_t)s.ys.size());
-        if (s.hasX) out.putBlob(s.xs.data(), s.xs.size() * 4);
-        out.putBlob(s.ys.data(), s.ys.size() * 4);
-    }
-    sendMsg(MSG_OK, out);
+    sendMeasureReply(1, cols, series);
 }
 
 // Transport-independent: give it a request, it answers through the current sink.

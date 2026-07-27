@@ -6311,6 +6311,105 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 bad2 ? "FAIL" : "ok", local.size());
         bad += bad2 ? 1 : 0;
     }
+    // Aggregates: recompute the same statistics client-side from tiles the tile
+    // path already proved correct, and compare. Frame-axis files only.
+    if (m.frames >= 2) {
+        remote::MeasureReq q;
+        q.op = rp::MOP_TEMPORAL_STATS;
+        q.paths = { path };
+        remote::MeasureResult mr;
+        if (!s.measure(q, mr, err)) {
+            fprintf(stderr, "selftest TEMPORAL: %s\n", err.c_str());
+            return 1;
+        }
+        // reference: per-pixel sums in f64 over all frames
+        size_t samples = (size_t)m.w * m.h * m.ch;
+        std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+        for (int f = 0; f < m.frames; f++) {
+            std::vector<float> px;
+            int tw, th, tch;
+            std::string dt2;
+            if (!s.tile(path, f, 0, 0, m.w, m.h, 1, px, tw, th, tch, dt2, err)) {
+                fprintf(stderr, "selftest TEMPORAL tile: %s\n", err.c_str());
+                return 1;
+            }
+            for (size_t i = 0; i < samples; i++) {
+                double v = px[i];
+                sum[i] += v; sum2[i] += v * v;
+            }
+        }
+        double N = m.frames, aM = 0, aM2 = 0, aV = 0;
+        for (size_t i = 0; i < samples; i++) {
+            double mm = sum[i] / N;
+            aM += mm; aM2 += mm * mm;
+            aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+        }
+        double refMean = aM / samples;
+        double refSt = sqrt(aV / samples);
+        double refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+        auto findNum = [&](const char* k) {
+            for (const auto& it : mr.cols[0])
+                if (it.kind == 0 && it.key == k) return it.num;
+            return -1.0;
+        };
+        auto rel = [](double a, double b) {
+            return fabs(a - b) / std::max({ fabs(a), fabs(b), 1e-12 });
+        };
+        size_t bad3 = 0;
+        struct { const char* k; double ref; } checks[] = {
+            { "mean [DN]", refMean }, { "sigma_t [DN]", refSt }, { "sigma_fpn [DN]", refFpn },
+        };
+        for (const auto& c : checks)
+            if (rel(findNum(c.k), c.ref) > 1e-9) {
+                fprintf(stderr, "selftest TEMPORAL mismatch: %s server %.12g vs ref %.12g\n",
+                        c.k, findNum(c.k), c.ref);
+                bad3++;
+            }
+        bool seriesOk = mr.series.size() == 2 &&
+                        (int)mr.series[0].ys.size() == m.frames &&
+                        (int)mr.series[1].ys.size() == m.frames;
+        if (!seriesOk) { fprintf(stderr, "selftest TEMPORAL: bad series shape\n"); bad3++; }
+        fprintf(stderr, "selftest: TEMPORAL_STATS over %d frames: %s\n",
+                mr.framesUsed, bad3 ? "FAIL" : "ok");
+        bad += bad3 ? 1 : 0;
+
+        // FRAME_ROI_STATS on an off-center ROI
+        remote::MeasureReq q2;
+        q2.op = rp::MOP_FRAME_ROI_STATS;
+        q2.paths = { path };
+        q2.rois.push_back({ 3, 5, m.w / 2, m.h / 2 });
+        remote::MeasureResult r2;
+        if (!s.measure(q2, r2, err)) {
+            fprintf(stderr, "selftest FRAME_ROI: %s\n", err.c_str());
+            return 1;
+        }
+        size_t bad4 = 0;
+        const remote::MeasureSeries* mrs = nullptr;
+        for (const auto& se : r2.series) if (se.name == "roi mean") mrs = &se;
+        if (!mrs || (int)mrs->ys.size() != m.frames) {
+            fprintf(stderr, "selftest FRAME_ROI: bad series\n");
+            bad4++;
+        } else {
+            for (int f = 0; f < m.frames; f++) {          // reference per frame
+                std::vector<float> px;
+                int tw, th, tch;
+                std::string dt2;
+                if (!s.tile(path, f, 3, 5, m.w / 2, m.h / 2, 1, px, tw, th, tch, dt2, err))
+                    { bad4++; break; }
+                double s1 = 0;
+                for (float v : px) s1 += v;
+                double refM = s1 / (double)px.size();
+                if (rel((double)mrs->ys[f], refM) > 1e-6) {   // series is f32
+                    fprintf(stderr, "selftest FRAME_ROI mismatch at frame %d: %.9g vs %.9g\n",
+                            f, mrs->ys[f], refM);
+                    bad4++;
+                }
+            }
+        }
+        fprintf(stderr, "selftest: FRAME_ROI_STATS over %d frames: %s\n",
+                r2.framesUsed, bad4 ? "FAIL" : "ok");
+        bad += bad4 ? 1 : 0;
+    }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
     return bad ? 1 : 0;

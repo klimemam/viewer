@@ -100,10 +100,12 @@ if(MSVC)
 else()
   target_compile_options(viewer PRIVATE -Wall -Wextra)
 endif()
-if(MINGW)   # self-contained exe: no libstdc++/libgcc/libwinpthread DLLs alongside
-  target_link_options(viewer PRIVATE -static-libgcc -static-libstdc++
-                                     -Wl,-Bstatic,--whole-archive -lwinpthread
-                                     -Wl,--no-whole-archive)
+if(MINGW)   # self-contained exes: no libstdc++/libgcc/libwinpthread DLLs alongside
+  foreach(tgt viewer viewer-serve)
+    target_link_options(${tgt} PRIVATE -static-libgcc -static-libstdc++
+                                       -Wl,-Bstatic,--whole-archive -lwinpthread
+                                       -Wl,--no-whole-archive)
+  endforeach()
 endif()
 
 # ---- bundled plugins (pure C, MODULE libs into build/plugins) ----
