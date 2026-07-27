@@ -36,6 +36,14 @@
 #include <filesystem>
 #include <csignal>
 #include <fstream>
+// low-level IO for the crash handler: it must not go through iostreams
+#include <fcntl.h>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <limits>
@@ -196,6 +204,7 @@ struct App {
     int compareBSeq = -1;             // ...and its frame index, when B is in a stack
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
+    bool prefsDirty = false;          // a preference actually changed in this run
     float wipeFrac = 0.5f;            // divider position, fraction of canvas width
     float splitFrac = 0.5f;
     bool wheelZoomPlain = false;// false: Ctrl+wheel zooms, plain wheel pans
@@ -1426,10 +1435,9 @@ static std::vector<int> framesOfSeq(int seqId);
 static App::SeqInfo* seqInfo(int id);
 static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
-static void saveSession(std::string path, bool quiet = false) {
-    if (path.find('.') == std::string::npos) path += ".vsession";
-    std::ofstream f(pathFromUtf8(path), std::ios::binary);
-    if (!f) { if (!quiet) toast("cannot write session file", true); return; }
+// Rendering is separate from writing so the crash handler can keep a pre-rendered
+// copy and never has to build one while the process is already dying.
+static void writeSessionTo(std::ostream& f) {
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << app.dispGamma << "\n";
@@ -1540,6 +1548,13 @@ static void saveSession(std::string path, bool quiet = false) {
             if (app.anns[i].id == app.selectedAnn) selIdx = i;
         f << "selann " << selIdx << "\n";
     }
+}
+
+static void saveSession(std::string path, bool quiet = false) {
+    if (path.find('.') == std::string::npos) path += ".vsession";
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) { if (!quiet) toast("cannot write session file", true); return; }
+    writeSessionTo(f);
     if (!quiet) toast("session saved: " + baseName(path));
 }
 
@@ -1568,16 +1583,109 @@ static void autosaveSession() {
     if (!p.empty() && !app.images.empty()) saveSession(p, true);
 }
 
-// Last-resort handler: the process is already dying, so this only writes the
-// session file and re-raises. No allocation-heavy work, no UI.
+// ---- preferences -------------------------------------------------------------
+// How the app behaves, as opposed to what is open: it belongs to the user, not to
+// a session file, and must survive a machine that never gets a clean shutdown.
+static std::string prefsPath() {
+    std::string p = autosavePath();
+    if (p.empty()) return p;
+    size_t slash = p.find_last_of("/\\");
+    return p.substr(0, slash == std::string::npos ? 0 : slash + 1) + "prefs.txt";
+}
+
+static void savePrefs() {
+    std::string p = prefsPath();
+    if (p.empty()) return;
+    std::ofstream f(pathFromUtf8(p), std::ios::binary);
+    if (!f) return;
+    f << "viewer-prefs 1\n";
+    f << "theme " << app.themeVariant << " " << app.themeAccent << "\n";
+    f << "compact " << (app.compactUi ? 1 : 0) << "\n";
+    f << "dragpans " << (app.dragPans ? 1 : 0) << "\n";
+    f << "wheelzoom " << (app.wheelZoomPlain ? 1 : 0) << "\n";
+    f << "fitonswitch " << (app.fitOnSwitch ? 1 : 0) << "\n";
+    f << "seqload " << app.seqLoadMode << "\n";
+    f << "showfps " << (app.showFps ? 1 : 0) << "\n";
+    f << "gamma " << app.dispGamma << "\n";
+    f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+}
+
+static void loadPrefs() {
+    std::vector<uint8_t> buf;
+    std::string p = prefsPath();
+    if (p.empty() || !readFileBytes(p, buf)) return;
+    std::istringstream ss(std::string(buf.begin(), buf.end()));
+    std::string line;
+    std::getline(ss, line);                       // header
+    if (line.compare(0, 13, "viewer-prefs ") != 0) return;
+    while (std::getline(ss, line)) {
+        std::istringstream ls(line);
+        std::string key; ls >> key;
+        int v = 0;
+        if      (key == "theme")       { ls >> app.themeVariant >> app.themeAccent; }
+        else if (key == "compact")     { ls >> v; app.compactUi = v != 0; }
+        else if (key == "dragpans")    { ls >> v; app.dragPans = v != 0; }
+        else if (key == "wheelzoom")   { ls >> v; app.wheelZoomPlain = v != 0; }
+        else if (key == "fitonswitch") { ls >> v; app.fitOnSwitch = v != 0; }
+        else if (key == "seqload")     { ls >> app.seqLoadMode; }
+        else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
+        else if (key == "gamma")       { ls >> app.dispGamma; }
+        else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
+    }
+    app.themeVariant = std::clamp(app.themeVariant, 0, 1);
+    app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
+    app.seqLoadMode = std::clamp(app.seqLoadMode, 0, 2);
+    app.dispGamma = app.dispGamma > 1.5f ? 2.2f : 1.0f;
+}
+
+// Pre-rendered session text and a file already open for it. A SIGSEGV handler may
+// be running on a corrupted heap: allocating, opening files, or touching ImGui
+// there is how a crash-recovery feature turns into a hang. Everything expensive
+// happens while the process is still healthy; the handler only write()s.
+static std::string g_crashText;
+static int g_crashFd = -1;
+
+static void refreshCrashSnapshot() {
+    if (app.images.empty()) { g_crashText.clear(); return; }
+    std::ostringstream os;
+    writeSessionTo(os);
+    g_crashText = os.str();
+}
+
+static void openCrashFile() {
+    std::string p = autosavePath();
+    if (p.empty()) return;
+#if defined(_WIN32)
+    g_crashFd = _wopen(pathFromUtf8(p).wstring().c_str(),
+                       _O_CREAT | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    g_crashFd = open(pathFromUtf8(p).c_str(), O_CREAT | O_RDWR, 0644);
+#endif
+}
+
 static void crashHandler(int sig) {
-    static volatile bool inHandler = false;
+    static volatile sig_atomic_t inHandler = 0;
     if (!inHandler) {
-        inHandler = true;
-        std::string p = autosavePath();
-        if (!p.empty() && !app.images.empty()) {
-            saveSession(p, true);
-            fprintf(stderr, "\nviewer crashed (signal %d); session saved to %s\n", sig, p.c_str());
+        inHandler = 1;
+        if (g_crashFd >= 0 && !g_crashText.empty()) {
+            const char* p = g_crashText.data();
+            size_t n = g_crashText.size();
+#if defined(_WIN32)
+            _lseek(g_crashFd, 0, SEEK_SET);
+            while (n) { int w = _write(g_crashFd, p, (unsigned)n); if (w <= 0) break; p += w; n -= (size_t)w; }
+            _chsize(g_crashFd, (long)g_crashText.size());
+            _commit(g_crashFd);
+#else
+            lseek(g_crashFd, 0, SEEK_SET);
+            while (n) { ssize_t w = write(g_crashFd, p, n); if (w <= 0) break; p += w; n -= (size_t)w; }
+            if (ftruncate(g_crashFd, (off_t)g_crashText.size()) != 0) { /* best effort */ }
+#endif
+            static const char msg[] = "\nviewer crashed; session written to the autosave file\n";
+#if defined(_WIN32)
+            _write(2, msg, (unsigned)(sizeof msg - 1));
+#else
+            ssize_t ign = write(2, msg, sizeof msg - 1); (void)ign;
+#endif
         }
     }
     signal(sig, SIG_DFL);
@@ -5115,6 +5223,7 @@ int main(int argc, char** argv) {
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
     }
+    loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -5191,7 +5300,9 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 
-    // write the session on the way out of any crash, then let it crash normally
+    // write the session on the way out of any crash, then let it crash normally.
+    // The file is opened now, while opening files still works.
+    openCrashFile();
     for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
 
     plugin_host::loadAll(
@@ -5255,6 +5366,17 @@ int main(int argc, char** argv) {
             }
             app.pendingCompare = -1;
         }
+        {   // Preferences are tiny: write them the moment they change, so a crash
+            // or a kill never costs the user their setup.
+            static uint64_t lastPrefs = 0;
+            uint64_t h = (uint64_t)app.themeVariant * 31 + (uint64_t)app.themeAccent * 131 +
+                         (app.compactUi ? 1u : 0u) * 7 + (app.dragPans ? 1u : 0u) * 13 +
+                         (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
+                         (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
+                         (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
+            if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
+            lastPrefs = h;
+        }
         {   // Autosave on change, debounced. A hard kill cannot run any handler,
             // so the safety net has to be written while things still work.
             static uint64_t lastState = 0;
@@ -5270,7 +5392,15 @@ int main(int argc, char** argv) {
                                         app.showAnalysis * 8 + app.showHistogram * 16 +
                                         app.showTemporal * 32 + app.showProjection * 64) * 131ull;
             double nowA = glfwGetTime();
+            static double lastSnap = -1;
             if (state != lastState) { lastState = state; dirtySince = nowA; }
+            // Re-render the crash copy far more often than the autosave debounce
+            // (a crash 100 ms after a change should lose nothing) but not every
+            // frame: dragging a ROI bumps annRev continuously.
+            if (dirtySince >= 0 && nowA - lastSnap > 0.4) {
+                lastSnap = nowA;
+                refreshCrashSnapshot();
+            }
             bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
             if (!benchFrames && due && !app.images.empty()) {
                 dirtySince = -1;
@@ -5537,6 +5667,9 @@ int main(int argc, char** argv) {
     }
 
     autosaveSession();                // also covers a normal quit
+    // Only what the user changed in this run: a one-off --sequence flag or the
+    // gamma inside a --session must not quietly become the default.
+    if (app.prefsDirty) savePrefs();
     stopSequenceLoader();             // join the worker before tearing anything down
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
