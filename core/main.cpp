@@ -174,7 +174,8 @@ struct App {
     int selectedAnn = 0;              // Ann::id; 0 = the built-in All (whole image) entry
     uint64_t annRev = 0;              // bumped on any annotation change
     bool annBusy = false;             // true while an annotation drag is in progress
-    int tool = 0;                     // 0 Navigate (V), 1 ROI (R), 2 POI (P)
+    bool dragPans = false;            // left-drag on empty canvas: pan instead of new ROI
+    int ctxX = -1, ctxY = -1;         // image coords the context menu was opened at
     bool wheelZoomPlain = false;      // false: Ctrl+wheel zooms, plain wheel pans
     // analyzer plugin state: cached result grid (rows = keys, cols = ROIs)
     struct AnalysisState {
@@ -272,7 +273,6 @@ static const ImU32 ANN_COLORS[8] = {
     IM_COL32(255, 120, 120, 255), IM_COL32(200, 120, 255, 255), IM_COL32(90, 220, 220, 255),
     IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
 };
-static const char* TOOL_NAMES[3] = { "Nav", "ROI", "Pin" };
 static App app;
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
@@ -2114,9 +2114,12 @@ static void drawCanvas(ImVec2 avail) {
             bool mid = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
             bool space = ImGui::IsKeyDown(ImGuiKey_Space);
             clickEligible = !mid && !space && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-            if (mid || space) dk = DK_PAN;                       // universal pan
-            else if (app.tool == 0) dk = io.KeyShift ? DK_ROI_NEW : DK_PAN;
-            else if (app.tool == 1) {
+            // Modeless: middle / Space always pan. Otherwise the press position
+            // decides - on a handle = resize, inside a ROI = move, empty = new ROI
+            // (or pan, if the user prefers that; Shift inverts either way).
+            if (mid || space) {
+                dk = DK_PAN;
+            } else {
                 int corner; int hit = hitTest(drag0, corner);
                 App::Ann* a = hit >= 0 ? findAnn(hit) : nullptr;
                 if (a && a->type == 0 && corner >= 0) {
@@ -2127,8 +2130,11 @@ static void drawCanvas(ImVec2 avail) {
                     dk = DK_ANN_MOVE; dragAnnId = hit;
                     annOrig[0] = a->x; annOrig[1] = a->y;
                     app.selectedAnn = hit;
-                } else dk = DK_ROI_NEW;
-            } else dk = DK_NONE;                                 // POI tool: click on release
+                } else {
+                    bool wantPan = app.dragPans != io.KeyShift;   // Shift inverts the default
+                    dk = wantPan ? DK_PAN : DK_ROI_NEW;
+                }
+            }
         }
         if (active && (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f) ||
                        ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 2.0f)))
@@ -2172,17 +2178,13 @@ static void drawCanvas(ImVec2 avail) {
         }
         if (ImGui::IsItemDeactivated()) {
             ImVec2 q = scrToImg(io.MousePos);
-            int px = (int)floorf(q.x), py = (int)floorf(q.y);
-            bool inside = px >= 0 && py >= 0 && px < im->w && py < im->h;
             if (dk == DK_ROI_NEW && dragMoved && tmpActive) {
-                if (tmpRect[2] >= 1 && tmpRect[3] >= 1)
+                if (tmpRect[2] >= 3 && tmpRect[3] >= 3)   // ignore accidental micro-drags
                     addAnn(0, tmpRect[0], tmpRect[1], tmpRect[2], tmpRect[3]);
-            } else if (!dragMoved && clickEligible) {   // middle/Space clicks never act on tools
-                if (app.tool == 2 || (app.tool == 0 && io.KeyCtrl)) {
-                    if (inside) addAnn(1, px, py, 0, 0);         // add POI
-                } else {
-                    int corner; app.selectedAnn = hitTest(q, corner);   // select / deselect
-                }
+            } else if (!dragMoved && clickEligible) {   // middle/Space clicks never select
+                int corner;
+                int hit = hitTest(q, corner);
+                app.selectedAnn = hit >= 0 ? hit : 0;   // empty click -> back to "All"
             }
             tmpActive = false;
             dk = DK_NONE; dragAnnId = -1;
@@ -2211,6 +2213,37 @@ static void drawCanvas(ImVec2 avail) {
             }
         }
         if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) fitToCanvas(canvasSize);
+
+        // right-click: actions at this point, no modes and no modifiers needed
+        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+            !ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.0f)) {
+            ImVec2 q = scrToImg(io.MousePos);
+            app.ctxX = (int)floorf(q.x); app.ctxY = (int)floorf(q.y);
+            int corner; int hit = hitTest(q, corner);
+            if (hit >= 0) app.selectedAnn = hit;
+            ImGui::OpenPopup("canvasctx");
+        }
+        if (ImGui::BeginPopup("canvasctx")) {
+            bool inRange = app.ctxX >= 0 && app.ctxY >= 0 && app.ctxX < im->w && app.ctxY < im->h;
+            if (ImGui::MenuItem("Add pin here", "P", false, inRange))
+                addAnn(1, app.ctxX, app.ctxY, 0, 0);
+            App::Ann* sel = findAnn(app.selectedAnn);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Full width (row band)", "X", false, sel && sel->type == 0)) {
+                sel->x = 0; sel->w = im->w; app.annRev++;
+            }
+            if (ImGui::MenuItem("Full height (column band)", "Y", false, sel && sel->type == 0)) {
+                sel->y = 0; sel->h = im->h; app.annRev++;
+            }
+            if (ImGui::MenuItem("Crop image to this ROI", nullptr, false, sel && sel->type == 0))
+                cropCurrentToSelectedRoi();
+            if (ImGui::MenuItem("Delete", "Del", false, sel != nullptr))
+                deleteAnn(app.selectedAnn);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Fit to window", "F")) app.fitRequested = true;
+            if (ImGui::MenuItem("Actual size", "1")) app.view.zoom = 1.0f;
+            ImGui::EndPopup();
+        }
     }
 
     // hover position
@@ -2257,7 +2290,7 @@ static void drawCanvas(ImVec2 avail) {
                 dl->AddRectFilled(ra, rb, (col & 0x00FFFFFF) | 0x1E000000);
                 dl->AddRect(ra, rb, col, 0, 0, sel ? 2.5f : 1.5f);
                 dl->AddText(ImVec2(ra.x + 3, ra.y - ImGui::GetFontSize() - 2), col, a.label.c_str());
-                if (sel && app.tool == 1) {                       // resize handles
+                if (sel) {                                        // resize handles
                     ImVec2 hs[4] = { ra, ImVec2(rb.x, ra.y), ImVec2(ra.x, rb.y), rb };
                     for (const auto& hp : hs)
                         dl->AddRectFilled(ImVec2(hp.x - 3, hp.y - 3), ImVec2(hp.x + 3, hp.y + 3), col);
@@ -2337,22 +2370,6 @@ static void drawCanvas(ImVec2 avail) {
         dl->PopClipRect();
     }
 
-    // floating tool strip (submitted after the canvas item, so it wins hover)
-    ImGui::SetCursorScreenPos(ImVec2(canvasP0.x + 8, canvasP0.y + 8));
-    {
-        const char* labels[3] = { "Nav (V)", "ROI (R)", "Pin (P)" };
-        for (int t = 0; t < 3; t++) {
-            if (t) ImGui::SameLine();
-            bool on = app.tool == t;
-            if (on) {   // solid accent pill: readable on the dark canvas in both themes
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                                      ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-            }
-            if (ImGui::SmallButton(labels[t])) app.tool = t;
-            if (on) ImGui::PopStyleColor(2);
-        }
-    }
 }
 
 static void recomputeHistogramIfNeeded(ImageDoc* im) {
@@ -3313,6 +3330,7 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
+        ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
@@ -3407,12 +3425,13 @@ static void drawHelpAbout() {
                 row("F / double-click", "fit to window");
                 row("1",             "actual size (100%)");
                 row("+ / -",         "zoom in / out");
-                row("V / R / P",     "tool: Navigate / ROI / Pin");
+                row("drag",          "new ROI (inside a ROI = move, on a corner = resize)");
+                row("P",             "drop a pin at the cursor");
+                row("right-click",   "actions here (pin / band / crop / delete)");
                 row("Ctrl+wheel",    "zoom at cursor (invertible in View menu)");
                 row("wheel / Shift+wheel", "pan vertical / horizontal");
-                row("middle-drag / Space+drag", "pan (works in any tool)");
-                row("Shift+drag",    "quick ROI (Navigate tool)");
-                row("Ctrl+click",    "quick pin (Navigate tool)");
+                row("middle-drag / Space+drag", "pan");
+                row("Shift+drag",    "the other one of pan / new ROI");
                 row("X / Y",         "toggle selected ROI full width / height (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
                 row("G",             "pixel grid (zoom >= 8x)");
@@ -3688,9 +3707,9 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
-            if (ImGui::IsKeyPressed(ImGuiKey_V, false)) app.tool = 0;
-            if (ImGui::IsKeyPressed(ImGuiKey_R, false)) app.tool = 1;
-            if (ImGui::IsKeyPressed(ImGuiKey_P, false)) app.tool = 2;
+            // P drops a pin at the pixel under the cursor - no click, no modifier
+            if (ImGui::IsKeyPressed(ImGuiKey_P, false) && app.hoverX >= 0)
+                addAnn(1, app.hoverX, app.hoverY, 0, 0);
             // X/Y: TOGGLE the selected ROI between its rect and full width / height.
             // Press once = row/column band, press again = restore the remembered rect.
             if (ImGui::IsKeyPressed(ImGuiKey_X, false) && cur()) {
@@ -3809,7 +3828,7 @@ int main(int argc, char** argv) {
         {
             ImageDoc* im = cur();
             char st[512];
-            snprintf(st, 512, "[%s]  no image", TOOL_NAMES[app.tool]);
+            snprintf(st, 512, "no image");
             if (im) {
                 std::string hover;
                 if (app.hoverX >= 0) {
@@ -3830,8 +3849,8 @@ int main(int argc, char** argv) {
                 char zs[32];
                 if (app.view.zoom >= 0.095f) snprintf(zs, 32, "%.0f%%", app.view.zoom * 100);
                 else                         snprintf(zs, 32, "%.3g%%", app.view.zoom * 100);
-                snprintf(st, 512, "[%s]  %s%s   %dx%d %dch %s  |  zoom %s%s",
-                         TOOL_NAMES[app.tool], im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
+                snprintf(st, 512, "%s%s   %dx%d %dch %s  |  zoom %s%s",
+                         im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
                          im->dtype.c_str(), zs, hover.c_str());
             }
             ImGui::TextUnformatted(st);
