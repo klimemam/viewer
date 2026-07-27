@@ -300,6 +300,7 @@ struct App {
     bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
     bool showHistogram = true, showTemporal = true, showProjection = false;
     bool resetLayout = false;
+    std::string pendingLayout;        // dock settings from a session, applied next frame
     bool compactUi = true;            // dense spacing: this tool is table-heavy
     int wakeFrames = 3;               // frames still to draw after the last input
     bool showFps = false;
@@ -1294,6 +1295,22 @@ static void saveSession(std::string path, bool quiet = false) {
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
+    f << "panels " << (app.showFiles ? 1 : 0) << " " << (app.showInspector ? 1 : 0) << " "
+      << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
+      << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
+      << (app.showProjection ? 1 : 0) << "\n";
+    // the whole dock arrangement, so a session reopens looking like it did
+    if (const char* ini = ImGui::SaveIniSettingsToMemory()) {
+        f << "layout_begin\n";
+        for (const char* p = ini; *p; ) {          // indent so parsing stays trivial
+            const char* e = strchr(p, '\n');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            f << "|" << std::string(p, n) << "\n";
+            if (!e) break;
+            p = e + 1;
+        }
+        f << "layout_end\n";
+    }
     for (auto& d : app.images) {
         if (d->path.empty()) continue;
         // sequences: store only the frame in view + a marker to reload the stack
@@ -1403,6 +1420,25 @@ static std::string loadSession(const std::string& path) {
                                         app.showProjH = h != 0; app.showProjV = v != 0; }
         else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
+        else if (key == "panels") {
+            int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0;
+            ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2;
+            app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
+            app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
+            app.showProjection = g2 != 0;
+        }
+        else if (key == "layout_begin") {
+            std::string ini, l2;
+            while (std::getline(ss, l2)) {
+                if (l2.rfind("layout_end", 0) == 0) break;
+                if (!l2.empty() && l2[0] == '|') l2.erase(l2.begin());
+                while (!l2.empty() && (l2.back() == '\r' || l2.back() == '\n')) l2.pop_back();
+                ini += l2;
+                ini += "\n";
+            }
+            // applied between frames: loading dock settings mid-frame is not safe
+            app.pendingLayout = std::move(ini);
+        }
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "seqload") {   // applies to the image loaded just above
             int on = 0; ls >> on;
@@ -3501,9 +3537,15 @@ static void drawPanelProjection() {
     bool cfa = im->ch == 1 && im->cfa != 0;
     int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
     if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
-    float avail = ImGui::GetContentRegionAvail().y;
-    float each = std::max((avail - ImGui::GetTextLineHeightWithSpacing() * plots) / plots
-                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 70.0f * app.uiScale);
+    // reserve the statistics table first: the plots must not push it off-panel
+    int statRows = P.nSeries * plots;
+    float lineH = ImGui::GetTextLineHeightWithSpacing();
+    float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
+                 + lineH * (statRows + 1)                  // header + one row per axis/channel
+                 + lineH;                                  // footnote
+    float avail = ImGui::GetContentRegionAvail().y - statsH;
+    float each = std::max((avail - lineH * plots) / plots
+                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
     auto plotSeries = [&](bool horizontal) {
         const std::vector<float>* series = horizontal ? P.h : P.v;
@@ -4585,6 +4627,10 @@ int main(int argc, char** argv) {
             wakeUi(1);
         }
         if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
+        if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
+            ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
+            app.pendingLayout.clear();
+        }
         if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
             glfwWaitEvents();
             continue;
