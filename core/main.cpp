@@ -233,6 +233,11 @@ struct App {
     int seqAskImage = -1;
     std::vector<std::string> seqAskFiles;
     std::string seqAskPattern;
+    // queued stacks from "Open Folder" (loaded one after another)
+    struct PendingGroup { std::string name; std::vector<std::string> files; bool isRaw = false; };
+    std::vector<PendingGroup> seqQueue;
+    bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
+    std::unique_ptr<pfd::select_folder> folderDlg;
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
         int seqId = -1;
@@ -694,6 +699,8 @@ static const char* LEGACY_RAW_NAMES[] = { "gray8", "gray16", "grayf32", "grayf64
 
 struct RawDialog {
     bool open = false;
+    bool forQueue = false;            // settings will be applied to every queued stack
+    int queueCount = 0;               // stacks waiting on these settings (for the prompt)
     std::string path;
     size_t fileSize = 0;
     int w = 1920, h = 1080, offset = 0;
@@ -705,6 +712,9 @@ struct RawDialog {
     int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
     std::vector<std::pair<int,int>> guesses;
 } rawDlg;
+// raw settings captured once and reused for every stack queued by "Open Folder"
+static RawDialog g_folderRecipe;
+static void openRawDialogFor(const std::string& path);
 
 static void rawGuessDims(RawDialog& d) {
     d.guesses.clear();
@@ -1322,6 +1332,14 @@ static void pumpSequence() {
     }
 }
 
+static void startNextQueuedGroup();   // defined with the folder-open code below
+
+// called once per frame: integrate decoded frames, then chain the next stack
+static void pumpSequenceAndQueue() {
+    pumpSequence();
+    if (!app.seqRunning && !app.seqQueue.empty()) startNextQueuedGroup();
+}
+
 // ---- stacks & navigation ------------------------------------------------------
 // image indices of one sequence, ordered by frame number
 static std::vector<int> framesOfSeq(int seqId) {
@@ -1386,6 +1404,118 @@ static void gotoStack(int delta) {
             app.images[si->lastImageIdx]->seqId == app.images[target.front()]->seqId)
             pick = si->lastImageIdx;
     selectImage(pick);
+}
+
+// ---- open a whole folder tree: every numbered group becomes its own stack ----
+static const char* SEQ_EXTS[] = { ".npy", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+static bool isLoadableExt(const std::string& extLower) {
+    for (const char* e : SEQ_EXTS) if (extLower == e) return true;
+    return false;
+}
+
+// Walk root recursively; each directory yields one group per numeric pattern.
+static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) {
+    std::vector<App::PendingGroup> groups;
+    std::error_code ec;
+    std::filesystem::path rootPath = pathFromUtf8(root);
+    if (!std::filesystem::is_directory(rootPath, ec)) return groups;
+    const size_t MAX_GROUPS = 64;
+    // collect loadable files per directory (depth-limited walk)
+    std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> perDir;
+    auto addFile = [&](const std::filesystem::path& p) {
+        std::string ext = p.extension().u8string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (!isLoadableExt(ext)) return;
+        std::filesystem::path dir = p.parent_path();
+        for (auto& d : perDir)
+            if (d.first == dir) { d.second.push_back(p.u8string()); return; }
+        perDir.push_back({ dir, { p.u8string() } });
+    };
+    std::filesystem::recursive_directory_iterator it(
+        rootPath, std::filesystem::directory_options::skip_permission_denied, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        if (it.depth() > 3) { it.disable_recursion_pending(); continue; }
+        std::error_code ec2;
+        if (it->is_regular_file(ec2)) addFile(it->path());
+    }
+    std::sort(perDir.begin(), perDir.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::string rootStr = rootPath.u8string();
+    for (auto& d : perDir) {
+        std::vector<std::string> files = d.second;
+        std::sort(files.begin(), files.end());
+        std::vector<bool> used(files.size(), false);
+        for (size_t i = 0; i < files.size() && groups.size() < MAX_GROUPS; i++) {
+            if (used[i]) continue;
+            std::string pattern;
+            std::vector<std::string> sibs = findSequenceSiblings(files[i], pattern);
+            App::PendingGroup g;
+            if (sibs.size() >= 2) {
+                g.files = sibs;
+                for (const auto& s : sibs)
+                    for (size_t k = 0; k < files.size(); k++)
+                        if (files[k] == s) used[k] = true;
+            } else {
+                g.files = { files[i] };
+                pattern = baseName(files[i]);
+                used[i] = true;
+            }
+            // name the stack by its folder relative to the opened root
+            std::string rel = d.first.u8string();
+            if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
+            else rel.clear();
+            g.name = rel.empty() ? pattern : rel + "/" + pattern;
+            std::string ext = std::filesystem::u8path(g.files[0]).extension().u8string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            g.isRaw = ext != ".npy";
+            groups.push_back(std::move(g));
+        }
+    }
+    return groups;
+}
+
+// Start the next queued stack once the loader is idle. Raw stacks need format
+// settings: the dialog is shown once and the recipe is reused for the rest.
+static void startNextQueuedGroup() {
+    if (app.seqQueue.empty() || app.seqRunning || rawDlg.open || rawDlg.forQueue) return;
+    App::PendingGroup g = app.seqQueue.front();
+    if (g.isRaw && !app.folderRecipeValid) {
+        openRawDialogFor(g.files[0]);          // ask once for the whole batch
+        if (rawDlg.open) {
+            rawDlg.forQueue = true;
+            rawDlg.queueCount = (int)app.seqQueue.size();
+        } else {
+            app.seqQueue.erase(app.seqQueue.begin());   // unreadable: skip
+        }
+        return;
+    }
+    app.seqQueue.erase(app.seqQueue.begin());
+    std::string err;
+    if (g.isRaw) {
+        RawDialog d = g_folderRecipe;
+        d.path = g.files[0];
+        d.replaceIdx = -1;
+        err = loadRaw(d);
+    } else {
+        err = loadNpy(g.files[0]);
+    }
+    if (!err.empty()) { toast(baseName(g.files[0]) + ": " + err, true); return; }
+    if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
+}
+
+static void openFolder(const std::string& path) {
+    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
+    if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
+    app.folderRecipeValid = false;
+    app.seqQueue = std::move(groups);
+    int frames = 0;
+    for (const auto& g : app.seqQueue) frames += (int)g.files.size();
+    toast("opening " + std::to_string(app.seqQueue.size()) + " stack(s), " +
+          std::to_string(frames) + " files");
+    startNextQueuedGroup();
 }
 
 // After a single file is opened: offer (or silently start) loading its siblings.
@@ -1546,6 +1676,8 @@ static void openPath(const std::string& path) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else toast("session restored: " + baseName(path));
+    } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
+        openFolder(path);                     // dropping a folder loads every stack below it
     } else {
         openRawDialogFor(path);
     }
@@ -1563,6 +1695,14 @@ static void openFileDialog() {
           "All files", "*" },
         pfd::opt::multiselect);
 }
+static void openFolderDialog() {
+    if (!pfd::settings::available()) {
+        toast("no file-dialog backend found (install zenity or kdialog)", true);
+        return;
+    }
+    if (app.folderDlg) return;
+    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+}
 static void saveSessionDialog() {
     if (app.images.empty()) { toast("nothing to save - no images loaded", true); return; }
     if (!pfd::settings::available()) { toast("no file-dialog backend found (install zenity or kdialog)", true); return; }
@@ -1570,6 +1710,8 @@ static void saveSessionDialog() {
     app.saveDlg = std::make_unique<pfd::save_file>("Save session", "session.vsession",
         std::vector<std::string>{ "viewer session (*.vsession)", "*.vsession" });
 }
+static void openFolder(const std::string& path);   // defined with the sequence code
+
 static void pollFileDialog() {           // called once per frame from the main loop
     if (app.openDlg && app.openDlg->ready(0)) {
         for (const std::string& p : app.openDlg->result()) openPath(p);
@@ -1579,6 +1721,11 @@ static void pollFileDialog() {           // called once per frame from the main 
         std::string p = app.saveDlg->result();
         if (!p.empty()) saveSession(p);
         app.saveDlg.reset();
+    }
+    if (app.folderDlg && app.folderDlg->ready(0)) {
+        std::string p = app.folderDlg->result();
+        app.folderDlg.reset();
+        if (!p.empty()) openFolder(p);
     }
 }
 
@@ -1611,6 +1758,9 @@ static void drawRawModal() {
 
     ImGui::Text("%s  (%zu bytes)%s", baseName(rawDlg.path).c_str(), rawDlg.fileSize,
                 rawDlg.replaceIdx >= 0 ? "  -  reinterpret" : "");
+    if (rawDlg.forQueue)
+        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
+                           "these settings apply to all %d queued stack(s)", rawDlg.queueCount);
     ImGui::Separator();
     int prevDt = rawDlg.dtype, prevIn = rawDlg.interp, prevOff = rawDlg.offset;
     // axis 1: how one sample is stored
@@ -1678,12 +1828,24 @@ static void drawRawModal() {
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         rawDlg.replaceIdx = -1;
+        if (rawDlg.forQueue) { rawDlg.forQueue = false; app.seqQueue.clear(); }
         ImGui::CloseCurrentPopup();
     }
     if (ok) {
         std::string err = loadRaw(rawDlg);
         if (!err.empty()) toast(err, true);
-        else {
+        else if (rawDlg.forQueue) {
+            // first frame of the first queued stack: reuse these settings for the rest
+            g_folderRecipe = rawDlg;
+            g_folderRecipe.forQueue = false;
+            g_folderRecipe.replaceIdx = -1;
+            app.folderRecipeValid = true;
+            rawDlg.forQueue = false;
+            App::PendingGroup g = app.seqQueue.front();
+            app.seqQueue.erase(app.seqQueue.begin());
+            if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
+            ImGui::CloseCurrentPopup();
+        } else {
             bool fresh = rawDlg.replaceIdx < 0;
             toast((fresh ? "loaded " : "reinterpreted ") + baseName(rawDlg.path));
             rawDlg.replaceIdx = -1;
@@ -2715,11 +2877,16 @@ static void drawFileList() {
     if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
     if (ImGui::Button("Close")) closeCurrent();
-    if (app.seqRunning) {
+    if (app.seqRunning || !app.seqQueue.empty()) {
         int done = app.seqDone, total = app.seqTotal;
-        ImGui::TextDisabled("loading %d/%d", done, total);
+        if (app.seqRunning) ImGui::TextDisabled("loading %d/%d", done, total);
+        else ImGui::TextDisabled("queued");
+        if (!app.seqQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d stacks)", (int)app.seqQueue.size());
+        }
         ImGui::SameLine();
-        if (ImGui::SmallButton("Stop")) app.seqCancel = true;
+        if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
     ImGui::Separator();
     // grouped view: one node per stack (sequence), lone images stay flat
@@ -2794,6 +2961,7 @@ static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
+        if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
         ImGui::Separator();
         if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
@@ -2938,8 +3106,9 @@ static void drawHelpAbout() {
 // ---------------------------------------------------------------- CLI
 static void printUsage() {
     printf(
-        "usage: viewer [options] [files...]\n"
-        "  files: .npy, .vsession (saved session), or raw binaries (.bin/.raw/.yuv/...)\n"
+        "usage: viewer [options] [files or folders...]\n"
+        "  files:  .npy, .vsession (saved session), or raw binaries (.bin/.raw/.yuv/...)\n"
+        "  folder: loads every numbered sequence below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
         "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
@@ -3034,6 +3203,8 @@ static void parseCli(int argc, char** argv) {
             }
         } else if (!a.empty() && a[0] == '-') {
             fprintf(stderr, "unknown option: %s (see --help)\n", a.c_str());
+        } else if (std::filesystem::is_directory(pathFromUtf8(a))) {
+            openFolder(a);                     // a folder = every stack below it
         } else {
             std::string low = a;
             std::transform(low.begin(), low.end(), low.begin(),
@@ -3129,7 +3300,7 @@ int main(int argc, char** argv) {
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
-        pumpSequence();               // integrate frames decoded in the background
+        pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -3145,7 +3316,8 @@ int main(int argc, char** argv) {
         // Ctrl+W during reinterpret would shift the replaceIdx target image
         bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
         if (!io.WantTextInput && !popupOpen) {
-            if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
+            else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
