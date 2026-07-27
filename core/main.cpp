@@ -246,6 +246,8 @@ struct App {
     std::vector<FolderPick> folderPick;
     bool folderPickOpen = false;
     std::string folderPickRoot;
+    char pickInclude[128] = "";       // glob applied to "folder/pattern" (empty = all)
+    char pickExclude[128] = "";
     std::unique_ptr<pfd::select_folder> folderDlg;
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
@@ -1543,6 +1545,46 @@ static void openFolder(const std::string& path) {
     app.folderPickOpen = true;
 }
 
+// Minimal glob: * (any run), ? (one char), case-insensitive, no character classes.
+static bool globMatch(const char* pat, const char* str) {
+    const char *star = nullptr, *ss = str;
+    while (*str) {
+        char p = *pat, s = *str;
+        if (p == '?' || (p && tolower((unsigned char)p) == tolower((unsigned char)s))) { pat++; str++; continue; }
+        if (p == '*') { star = pat++; ss = str; continue; }
+        if (star) { pat = star + 1; str = ++ss; continue; }
+        return false;
+    }
+    while (*pat == '*') pat++;
+    return *pat == 0;
+}
+// Comma-separated patterns; a bare word is treated as a substring (*word*).
+static bool globListMatch(const char* list, const std::string& subject) {
+    if (!list || !*list) return false;
+    std::string cur;
+    bool any = false;
+    auto test = [&](std::string p) {
+        while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(p.begin());
+        while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
+        if (p.empty()) return;
+        if (p.find('*') == std::string::npos && p.find('?') == std::string::npos)
+            p = "*" + p + "*";
+        if (globMatch(p.c_str(), subject.c_str())) any = true;
+    };
+    for (const char* c = list; ; c++) {
+        if (*c == ',' || *c == 0) { test(cur); cur.clear(); if (!*c) break; }
+        else cur.push_back(*c);
+    }
+    return any;
+}
+static void applyPickFilters() {
+    for (auto& e : app.folderPick) {
+        bool inc = app.pickInclude[0] == 0 || globListMatch(app.pickInclude, e.g.name);
+        bool exc = globListMatch(app.pickExclude, e.g.name);
+        e.selected = inc && !exc;
+    }
+}
+
 // Tree of what the scan found, with per-folder / per-sequence checkboxes.
 static void drawFolderPickModal() {
     if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences"))
@@ -1558,11 +1600,28 @@ static void drawFolderPickModal() {
         allFiles += (int)e.g.files.size();
         if (e.selected) { selGroups++; selFiles += (int)e.g.files.size(); }
     }
-    ImGui::Text("%d sequence(s), %d files found - uncheck what you do not need",
-                (int)app.folderPick.size(), allFiles);
-    if (ImGui::SmallButton("Select all")) for (auto& e : app.folderPick) e.selected = true;
+    ImGui::Text("%d sequence(s), %d files found", (int)app.folderPick.size(), allFiles);
+    // glob filters beat clicking dozens of checkboxes
+    float half = (ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 10) * 0.5f;
+    ImGui::SetNextItemWidth(half);
+    bool ch = ImGui::InputTextWithHint("include", "* or 00/*,*_dark*", app.pickInclude,
+                                       sizeof app.pickInclude);
     ImGui::SameLine();
-    if (ImGui::SmallButton("Select none")) for (auto& e : app.folderPick) e.selected = false;
+    ImGui::SetNextItemWidth(half);
+    ch |= ImGui::InputTextWithHint("exclude", "e.g. *_ng*,02/*", app.pickExclude,
+                                   sizeof app.pickExclude);
+    if (ch) applyPickFilters();
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere\n"
+                          "matched against \"folder/pattern\"");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Apply")) applyPickFilters();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("All")) for (auto& e : app.folderPick) e.selected = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) for (auto& e : app.folderPick) e.selected = false;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Invert")) for (auto& e : app.folderPick) e.selected = !e.selected;
     ImGui::Separator();
 
     float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing();
