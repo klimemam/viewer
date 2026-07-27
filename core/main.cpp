@@ -2623,6 +2623,25 @@ static void drawAnalysisPlots() {
     }
 }
 
+// Numeric cell: fixed column width + right alignment, so digits keep their
+// position while flipping through frames (values must be comparable at a glance).
+static void textNum(const char* fmt, double v) {
+    char buf[64];
+    snprintf(buf, sizeof buf, fmt, v);
+    float w = ImGui::CalcTextSize(buf).x;
+    float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w));
+    ImGui::TextUnformatted(buf);
+}
+static void textNumStr(const std::string& s) {
+    float w = ImGui::CalcTextSize(s.c_str()).x;
+    float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w));
+    ImGui::TextUnformatted(s.c_str());
+}
+// width that fits a full-precision number like -1.23457e-05
+static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x + ImGui::GetStyle().CellPadding.x * 2; }
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::SeparatorText("Pixel");
@@ -2643,16 +2662,19 @@ static void drawInspector() {
         int nch = im ? im->ch : 1;
         const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
         float inv = im ? 1.0f / std::max(im->white - im->black, 1e-20f) : 1.0f;
-        if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("ch"); ImGui::TableSetupColumn("raw"); ImGui::TableSetupColumn("norm");
+        // fixed widths: the numbers must not shift as the cursor moves
+        if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
+            ImGui::TableSetupColumn("raw", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("norm", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
             for (int c = 0; c < nch; c++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(c < 4 ? lb[std::min(c, 3)] : "?");
                 if (live) {
                     float v = im->sample(app.hoverX, app.hoverY, c);
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(fmtVal(v, im->dtype).c_str());
-                    ImGui::TableNextColumn(); ImGui::Text("%.4f", (v - im->black) * inv);
+                    ImGui::TableNextColumn(); textNumStr(fmtVal(v, im->dtype));
+                    ImGui::TableNextColumn(); textNum("%.4f", (v - im->black) * inv);
                 } else {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
@@ -2781,18 +2803,20 @@ static void drawPanelHistogram() {
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
-        if (ImGui::BeginTable("quickstats", 4, ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("ch");
-            ImGui::TableSetupColumn("mean");
-            ImGui::TableSetupColumn("std");
-            ImGui::TableSetupColumn("var");
+        // fixed widths + right-aligned numbers: columns must not reflow while
+        // stepping through frames, otherwise values are impossible to compare
+        if (ImGui::BeginTable("quickstats", 4, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
+            ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("var", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
             for (int s = 0; s < H.nSeries; s++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", H.seriesNames[s]);
-                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.mean[s]);
-                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.sd[s]);
-                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.sd[s] * H.sd[s]);
+                ImGui::TableNextColumn(); textNum("%.6g", H.mean[s]);
+                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s]);
+                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s] * H.sd[s]);
             }
             ImGui::EndTable();
         }
@@ -2856,11 +2880,13 @@ static void drawPanelTemporal() {
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
         } else {
-            if (ImGui::BeginTable("temporalstats", 2, ImGuiTableFlags_SizingStretchProp)) {
+            if (ImGui::BeginTable("temporalstats", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
                 auto row = [](const char* k, double v) {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-                    ImGui::TableNextColumn(); ImGui::Text("%.6g", v);
+                    ImGui::TableNextColumn(); textNum("%.6g", v);
                 };
                 row("temporal noise (sigma_t)", T.tempNoise);
                 row("fixed pattern (sigma_s)", T.fixedPattern);
@@ -2978,10 +3004,10 @@ static void drawPanelRois() {
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
         ImGui::TableSetupColumn("name");
         ImGui::TableSetupColumn("region");
-        ImGui::TableSetupColumn("mean");
-        ImGui::TableSetupColumn("std");
-        ImGui::TableSetupColumn("min");
-        ImGui::TableSetupColumn("max");
+        ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
         ImGui::TableHeadersRow();
 
