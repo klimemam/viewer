@@ -241,6 +241,11 @@ struct App {
     struct PendingGroup { std::string name; std::vector<std::string> files; bool isRaw = false; };
     std::vector<PendingGroup> seqQueue;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
+    // "which sequences do you want?" picker shown after scanning a folder
+    struct FolderPick { PendingGroup g; bool selected = true; };
+    std::vector<FolderPick> folderPick;
+    bool folderPickOpen = false;
+    std::string folderPickRoot;
     std::unique_ptr<pfd::select_folder> folderDlg;
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
@@ -1489,7 +1494,8 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
 // Start the next queued stack once the loader is idle. Raw stacks need format
 // settings: the dialog is shown once and the recipe is reused for the rest.
 static void startNextQueuedGroup() {
-    if (app.seqQueue.empty() || app.seqRunning || rawDlg.open || rawDlg.forQueue) return;
+    if (app.seqQueue.empty() || app.seqRunning || rawDlg.open || rawDlg.forQueue ||
+        app.folderPickOpen) return;
     App::PendingGroup g = app.seqQueue.front();
     if (g.isRaw && !app.folderRecipeValid) {
         openRawDialogFor(g.files[0]);          // ask once for the whole batch
@@ -1515,9 +1521,8 @@ static void startNextQueuedGroup() {
     if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
 }
 
-static void openFolder(const std::string& path) {
-    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
-    if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
+static void enqueueGroups(std::vector<App::PendingGroup> groups) {
+    if (groups.empty()) return;
     app.folderRecipeValid = false;
     app.seqQueue = std::move(groups);
     int frames = 0;
@@ -1525,6 +1530,115 @@ static void openFolder(const std::string& path) {
     toast("opening " + std::to_string(app.seqQueue.size()) + " stack(s), " +
           std::to_string(frames) + " files");
     startNextQueuedGroup();
+}
+
+static void openFolder(const std::string& path) {
+    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
+    if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
+    // one group, or "always load": no point asking
+    if (groups.size() == 1 || app.seqLoadMode == 1) { enqueueGroups(std::move(groups)); return; }
+    app.folderPick.clear();
+    for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
+    app.folderPickRoot = path;
+    app.folderPickOpen = true;
+}
+
+// Tree of what the scan found, with per-folder / per-sequence checkboxes.
+static void drawFolderPickModal() {
+    if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences"))
+        ImGui::OpenPopup("Select sequences");
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
+
+    ImGui::TextDisabled("%s", app.folderPickRoot.c_str());
+    int selGroups = 0, selFiles = 0, allFiles = 0;
+    for (const auto& e : app.folderPick) {
+        allFiles += (int)e.g.files.size();
+        if (e.selected) { selGroups++; selFiles += (int)e.g.files.size(); }
+    }
+    ImGui::Text("%d sequence(s), %d files found - uncheck what you do not need",
+                (int)app.folderPick.size(), allFiles);
+    if (ImGui::SmallButton("Select all")) for (auto& e : app.folderPick) e.selected = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Select none")) for (auto& e : app.folderPick) e.selected = false;
+    ImGui::Separator();
+
+    float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing();
+    ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
+    // group the flat list by the folder part of "folder/pattern"
+    std::vector<std::string> folders;
+    for (const auto& e : app.folderPick) {
+        size_t s = e.g.name.find_last_of('/');
+        std::string f = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+        bool dup = false;
+        for (const auto& x : folders) if (x == f) { dup = true; break; }
+        if (!dup) folders.push_back(f);
+    }
+    for (const auto& f : folders) {
+        ImGui::PushID(f.c_str());
+        bool all = true, any = false;
+        int files = 0;
+        for (const auto& e : app.folderPick) {
+            size_t s = e.g.name.find_last_of('/');
+            std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+            if (ef != f) continue;
+            files += (int)e.g.files.size();
+            e.selected ? (any = true) : (all = false);
+        }
+        bool parent = all;
+        if (ImGui::Checkbox("##folder", &parent)) {
+            for (auto& e : app.folderPick) {
+                size_t s = e.g.name.find_last_of('/');
+                std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+                if (ef == f) e.selected = parent;
+            }
+        }
+        ImGui::SameLine();
+        if (!all && any) ImGui::TextDisabled("~");     // partial selection marker
+        else ImGui::TextDisabled(" ");
+        ImGui::SameLine();
+        char hdr[320];
+        snprintf(hdr, sizeof hdr, "%s   (%d files)", f.c_str(), files);
+        if (ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            for (auto& e : app.folderPick) {
+                size_t s = e.g.name.find_last_of('/');
+                std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+                if (ef != f) continue;
+                std::string leaf = s == std::string::npos ? e.g.name : e.g.name.substr(s + 1);
+                ImGui::PushID(&e);
+                char lb[320];
+                snprintf(lb, sizeof lb, "%s   %d file(s)%s", leaf.c_str(), (int)e.g.files.size(),
+                         e.g.isRaw ? "  [raw]" : "");
+                ImGui::Checkbox(lb, &e.selected);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
+    bool load = ImGui::Button("Load selected", ImVec2(150 * app.uiScale, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
+        app.folderPick.clear();
+        app.folderPickOpen = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (load) {
+        std::vector<App::PendingGroup> sel;
+        for (auto& e : app.folderPick) if (e.selected) sel.push_back(std::move(e.g));
+        app.folderPick.clear();
+        app.folderPickOpen = false;
+        ImGui::CloseCurrentPopup();
+        if (sel.empty()) toast("nothing selected", true);
+        else enqueueGroups(std::move(sel));
+    }
+    ImGui::EndPopup();
 }
 
 // After a single file is opened: offer (or silently start) loading its siblings.
@@ -2998,13 +3112,28 @@ static void drawFileList() {
     // grouped view: one node per stack (sequence), lone images stay flat
     for (const auto& stack : stacksOf()) {
         const ImageDoc& head = *app.images[stack.front()];
+        // name and format share one row: the dim/format part is right-aligned and dimmed
+        auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
+                              const char* extra = nullptr) -> bool {
+            char meta[96];
+            snprintf(meta, sizeof meta, "%dx%d %dch %s%s", d.w, d.h, d.ch, d.dtype.c_str(),
+                     extra ? extra : "");
+            float metaW = ImGui::CalcTextSize(meta).x;
+            float avail = ImGui::GetContentRegionAvail().x;
+            bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowOverlap,
+                                             ImVec2(std::max(avail - metaW - 8.0f, 40.0f), 0));
+            ImGui::SameLine(std::max(avail - metaW, 60.0f));
+            ImGui::TextDisabled("%s", meta);
+            return clicked;
+        };
         if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
             snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
-            if (ImGui::Selectable(lb, i == app.current)) { selectImage(i); app.fitRequested = true; }
+            if (rowWithMeta(head, lb, i == app.current, nullptr)) {
+                selectImage(i); app.fitRequested = true;
+            }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", head.path.c_str());
-            ImGui::TextDisabled("   %d x %d  %dch  %s", head.w, head.h, head.ch, head.dtype.c_str());
             continue;
         }
         App::SeqInfo* si = seqInfo(head.seqId);
@@ -3015,8 +3144,8 @@ static void drawFileList() {
         ImGui::PushID(head.seqId);
         char lb[512];
         snprintf(lb, 512, "%s  [%d]", si ? si->name.c_str() : "sequence", (int)stack.size());
-        if (ImGui::Selectable(lb, active)) { selectImage(stack[pos]); app.fitRequested = true; }
-        ImGui::TextDisabled("   %d x %d  %dch  %s", head.w, head.h, head.ch, head.dtype.c_str());
+        if (rowWithMeta(head, lb, active)) { selectImage(stack[pos]); app.fitRequested = true; }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", head.path.c_str());
         if (active) {
             int slider = pos;
             ImGui::SetNextItemWidth(-1);
@@ -3642,6 +3771,7 @@ int main(int argc, char** argv) {
 
         drawRawModal();
         drawSequenceModal();
+        drawFolderPickModal();
         drawHelpAbout();
 
         // toast
