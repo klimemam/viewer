@@ -58,6 +58,18 @@ dist = (xx - W / 2) - np.tan(ang) * (yy - H / 2)
 edge = (0.1 + 0.8 / (1.0 + np.exp(-dist / 1.2))).astype(np.float32)
 np.save(out / "slant_edge_f32.npy", edge)
 
+# numbered sequence: flat field + temporal noise + a fixed pattern, for the
+# sequence loader and the built-in temporal analysis
+seq = out / "seq"
+seq.mkdir(exist_ok=True)
+rng2 = np.random.default_rng(7)
+fixed = rng2.normal(0, 40, (H, W))                      # fixed pattern (same every frame)
+for k in range(24):
+    level = 8000 + 300 * np.sin(k / 24 * 2 * np.pi)     # slow drift over time
+    frame = level + fixed + rng2.normal(0, 120, (H, W))  # temporal noise
+    frame = np.clip(frame, 0, 65535).astype("<u2")
+    (seq / f"flat_{k:04d}_{W}x{H}_gray16.raw").write_bytes(frame.tobytes())
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     print(" ", p.name, p.stat().st_size, "bytes")

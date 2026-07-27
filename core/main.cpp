@@ -22,6 +22,7 @@
 #include "plugin_host.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -32,8 +33,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef GL_CLAMP_TO_EDGE
@@ -109,6 +112,8 @@ struct ImageDoc {
     int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
+    int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
+    int seqIndex = 0;                 // position within the sequence (file number order)
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
@@ -200,8 +205,46 @@ struct App {
         double clipLo = 0, clipHi = 0;
         size_t sampled = 0;
         bool roiUsed = false;
+        double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
+        const char* seriesNames[4] = {};
     } hist;
     bool histLog = true;
+
+    // ---- sequences (連番): a stack of frames that supports temporal analysis ----
+    struct SeqInfo {
+        int id = 0;
+        std::string name;             // display name (pattern)
+        int lastImageIdx = -1;        // last viewed frame, for stack switching
+    };
+    std::vector<SeqInfo> seqs;
+    int nextSeqId = 1;
+    int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
+    // background loader
+    std::thread seqThread;
+    std::atomic<bool> seqCancel{ false };
+    std::atomic<bool> seqRunning{ false };
+    std::atomic<int> seqDone{ 0 }, seqTotal{ 0 };
+    std::mutex seqMtx;
+    std::vector<std::pair<int, std::unique_ptr<ImageDoc>>> seqReady;   // (seqIndex, frame)
+    std::string seqErr;               // guarded by seqMtx
+    int seqLoadingId = 0;
+    size_t seqBytes = 0;
+    // pending "load the rest of the folder?" question
+    int seqAskImage = -1;
+    std::vector<std::string> seqAskFiles;
+    std::string seqAskPattern;
+    // temporal analysis cache (built-in, follows the selected ROI)
+    struct TemporalState {
+        int seqId = -1;
+        int frames = 0;
+        uint64_t annRev = (uint64_t)-1;
+        int selAnn = -2;
+        std::vector<float> idx, frameMean, frameStd;
+        double tempNoise = 0, fixedPattern = 0, totalNoise = 0;
+        bool valid = false;
+        bool roiUsed = false;
+    } temporal;
+    std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -276,7 +319,23 @@ static void rebuildTexture(ImageDoc& im) {
         }
         rgba[p * 4 + 3] = 255;
     }
-    if (!im.tex) glGenTextures(1, &im.tex);
+    if (!im.tex) {
+        glGenTextures(1, &im.tex);
+        // keep only the most recent textures resident: a 200-frame sequence would
+        // otherwise pin gigabytes of VRAM
+        app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), &im), app.texLru.end());
+        app.texLru.push_back(&im);
+        const size_t TEX_KEEP = 12;
+        while (app.texLru.size() > TEX_KEEP) {
+            ImageDoc* old = app.texLru.front();
+            app.texLru.erase(app.texLru.begin());
+            if (old != &im && old->tex) {
+                glDeleteTextures(1, &old->tex);
+                old->tex = 0;
+                old->texDirty = true;
+            }
+        }
+    }
     glBindTexture(GL_TEXTURE_2D, im.tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, im.w, im.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
@@ -297,10 +356,16 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
+static void forgetTexture(ImageDoc* im) {
+    app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), im), app.texLru.end());
+}
 static void closeCurrent() {
     ImageDoc* im = cur();
     if (!im) return;
     if (app.ana.img == im) app.ana.img = nullptr;   // drop cached analysis of a dead image
+    if (app.hist.img == im) app.hist.img = nullptr;
+    app.temporal.seqId = -1;
+    forgetTexture(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
@@ -308,9 +373,13 @@ static void closeCurrent() {
 }
 static void closeAll() {
     app.ana.img = nullptr;
+    app.hist.img = nullptr;
+    app.temporal.seqId = -1;
+    app.texLru.clear();
     for (auto& d : app.images)
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
+    app.seqs.clear();
     app.current = -1;
 }
 
@@ -453,20 +522,22 @@ static void runProcessor(int idx) {
 
 // ---------------------------------------------------------------- npy loader
 // returns error string, empty = ok
-static std::string loadNpy(const std::string& path) {
+// Pure decoder: no app state, no GL — safe to call from the sequence loader thread.
+static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
+    auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     std::vector<uint8_t> buf;
-    if (!readFileBytes(path, buf)) return "cannot read file";
+    if (!readFileBytes(path, buf)) return fail("cannot read file");
     if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
-        return "not a .npy file (bad magic)";
+        return fail("not a .npy file (bad magic)");
     int major = buf[6];
     size_t hlen, hoff;
     if (major >= 2) {
-        if (buf.size() < 12) return "corrupt npy header";
+        if (buf.size() < 12) return fail("corrupt npy header");
         uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
     } else {
         uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
     }
-    if (hoff + hlen > buf.size()) return "corrupt npy header";
+    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
     std::string hdr((char*)&buf[hoff], hlen);
 
     auto findQuoted = [&](const char* key) -> std::string {
@@ -478,12 +549,12 @@ static std::string loadNpy(const std::string& path) {
         return hdr.substr(q1 + 1, q2 - q1 - 1);
     };
     std::string descr = findQuoted("'descr'");
-    if (descr.empty()) return "cannot parse descr";
+    if (descr.empty()) return fail("cannot parse descr");
     bool fortran = hdr.find("'fortran_order': True") != std::string::npos;
 
     size_t sp = hdr.find("'shape'");
     size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
-    if (p1 == std::string::npos || p2 == std::string::npos) return "cannot parse shape";
+    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
     std::vector<int64_t> shape;
     {
         std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
@@ -516,11 +587,11 @@ static std::string loadNpy(const std::string& path) {
     else if (code == "i4") { esize = 4; dtypeName = "i32"; }
     else if (code == "f4") { esize = 4; dtypeName = "f32"; }
     else if (code == "f8") { esize = 8; dtypeName = "f64"; }
-    else return "unsupported dtype: " + descr;
+    else { errOut = "unsupported dtype: " + descr; return {}; }
 
     size_t count = 1;
     for (int64_t d : shape) count *= (size_t)d;
-    if (hoff + hlen + count * esize > buf.size()) return "file too small for shape";
+    if (hoff + hlen + count * esize > buf.size()) return fail("file too small for shape");
     const uint8_t* raw = &buf[hoff + hlen];
 
     auto bswap = [&](uint64_t v, int n) -> uint64_t {
@@ -572,9 +643,9 @@ static std::string loadNpy(const std::string& path) {
         if (shape[2] <= 4)      { H = shape[0]; W = shape[1]; C = shape[2]; sh = strides[0]; sw = strides[1]; sc = strides[2]; }
         else if (shape[0] <= 4) { C = shape[0]; H = shape[1]; W = shape[2]; sc = strides[0]; sh = strides[1]; sw = strides[2];
                                   note = note.empty() ? "CHW->HWC" : note + ", CHW->HWC"; }
-        else return "shape not interpretable as image";
+        else return fail("shape not interpretable as image");
     }
-    if (W < 1 || H < 1 || W > 32768 || H > 32768) return "unsupported image size";
+    if (W < 1 || H < 1 || W > 32768 || H > 32768) return fail("unsupported image size");
 
     auto im = std::make_unique<ImageDoc>();
     im->name = baseName(path); im->path = path;
@@ -586,6 +657,13 @@ static std::string loadNpy(const std::string& path) {
         for (int64_t x = 0; x < W; x++)
             for (int64_t c = 0; c < C; c++)
                 im->data[di++] = getVal((size_t)(y * sh + x * sw + c * sc));
+    return im;
+}
+
+static std::string loadNpy(const std::string& path) {
+    std::string err;
+    auto im = decodeNpy(path, err);
+    if (!im) return err.empty() ? "decode failed" : err;
     addImage(std::move(im));
     return {};
 }
@@ -651,18 +729,20 @@ static void rawGuessDims(RawDialog& d) {
     }
 }
 
-static std::string loadRaw(const RawDialog& d) {
+// Pure decoder: no app state, no GL — safe on the sequence loader thread.
+static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string& errOut) {
+    auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     if (d.dtype < 0 || d.dtype >= RD_COUNT || d.interp < 0 || d.interp >= RI_COUNT)
-        return "invalid raw format";
+        return fail("invalid raw format");
     if (d.w < 1 || d.h < 1 || d.w > 32768 || d.h > 32768)
-        return "unsupported image size";   // sessions can carry unclamped values
+        return fail("unsupported image size");   // sessions can carry unclamped values
     std::vector<uint8_t> buf;
-    if (!readFileBytes(d.path, buf)) return "cannot read file";
+    if (!readFileBytes(d.path, buf)) return fail("cannot read file");
     const int elem = RAW_DTYPE_SIZE[d.dtype];
     const int ch = RAW_INTERP_CH[d.interp];
     size_t px = (size_t)d.w * d.h;
     size_t count = px * ch;
-    if (count * elem + d.offset > buf.size()) return "file too small for this size/format";
+    if (count * elem + d.offset > buf.size()) return fail("file too small for this size/format");
     const uint8_t* p = buf.data() + d.offset;
     bool le = d.littleEndian;
 
@@ -725,6 +805,13 @@ static std::string loadRaw(const RawDialog& d) {
     im->rawInterp = d.interp;
     im->rawOffset = d.offset;
     im->rawLE = d.littleEndian;
+    return im;
+}
+
+static std::string loadRaw(const RawDialog& d) {
+    std::string err;
+    auto im = decodeRawFrame(d, err);
+    if (!im) return err.empty() ? "decode failed" : err;
 
     if (d.replaceIdx >= 0 && d.replaceIdx < (int)app.images.size()) {
         // reinterpret in place: keep list position, selection and view
@@ -838,6 +925,11 @@ static void restoreFull() {
 }
 
 // ---------------------------------------------------------------- session save/load
+// (sequence helpers are defined further down; sessions can restore a stack)
+static std::vector<std::string> findSequenceSiblings(const std::string& path,
+                                                     std::string& patternOut);
+static void startSequenceLoad(int imageIdx, const std::vector<std::string>& files,
+                              const std::string& pattern);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 static void saveSession(std::string path) {
     if (path.find('.') == std::string::npos) path += ".vsession";
@@ -851,6 +943,9 @@ static void saveSession(std::string path) {
     f << "current " << app.current << "\n";
     for (auto& d : app.images) {
         if (d->path.empty()) continue;
+        // sequences: store only the frame in view + a marker to reload the stack
+        // (writing every frame would bloat the file and slow restore)
+        if (d->seqId != 0 && d.get() != cur()) continue;
         f << "image " << d->black << " " << d->white << " ";
         if (d->rawDtype >= 0) {
             int interp = d->rawInterp;
@@ -866,6 +961,7 @@ static void saveSession(std::string path) {
               << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
         }
         f << d->path << "\n";           // path last: may contain spaces
+        if (d->seqId != 0) f << "seqload 1\n";
     }
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
@@ -904,6 +1000,14 @@ static std::string loadSession(const std::string& path) {
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
         else if (key == "current") ls >> current;
+        else if (key == "seqload") {   // applies to the image loaded just above
+            int on = 0; ls >> on;
+            if (on && cur() && !cur()->path.empty()) {
+                std::string pat;
+                std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
+                if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
+            }
+        }
         else if (key == "ann") {
             App::Ann a; int vis = 1;
             ls >> a.type >> a.x >> a.y >> a.w >> a.h >> a.color >> vis;
@@ -983,6 +1087,401 @@ static std::string loadSession(const std::string& path) {
     return {};
 }
 
+// ---------------------------------------------------------------- sequences (連番)
+// A sequence is one "stack": frames from numbered files in a folder that share a
+// decode recipe. It is the unit temporal analysis operates on.
+static const size_t SEQ_MEM_BUDGET = (size_t)6 << 30;   // stop loading past ~6 GB
+
+// split a stem into alternating text / digit segments: "flat_0007_640x480" ->
+// ["flat_"]["0007"]["_"]["640"]["x"]["480"]
+struct NameSeg { bool digit; std::string s; };
+static std::vector<NameSeg> segmentName(const std::string& stem) {
+    std::vector<NameSeg> segs;
+    size_t i = 0;
+    while (i < stem.size()) {
+        bool d = isdigit((unsigned char)stem[i]) != 0;
+        size_t j = i;
+        while (j < stem.size() && (isdigit((unsigned char)stem[j]) != 0) == d) j++;
+        segs.push_back({ d, stem.substr(i, j - i) });
+        i = j;
+    }
+    return segs;
+}
+
+// Siblings = files whose names differ ONLY in one digit field. The field is
+// chosen by which one actually varies in the folder, so "shot_0007_1920x1080.raw"
+// groups on 0007 and not on the resolution.
+static std::vector<std::string> findSequenceSiblings(const std::string& path,
+                                                     std::string& patternOut) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    std::filesystem::path p = pathFromUtf8(path);
+    std::filesystem::path dir = p.parent_path();
+    if (dir.empty() || !std::filesystem::is_directory(dir, ec)) return out;
+    const std::string stem = p.stem().u8string(), ext = p.extension().u8string();
+    std::vector<NameSeg> segs = segmentName(stem);
+
+    // candidate files: same extension, same segment structure, all text segments equal
+    struct Cand { std::vector<NameSeg> segs; std::string path; };
+    std::vector<Cand> cands;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        std::error_code ec2;
+        if (!e.is_regular_file(ec2)) continue;
+        if (e.path().extension().u8string() != ext) continue;
+        std::vector<NameSeg> s2 = segmentName(e.path().stem().u8string());
+        if (s2.size() != segs.size()) continue;
+        bool ok = true;
+        for (size_t k = 0; k < segs.size() && ok; k++) {
+            if (segs[k].digit != s2[k].digit) ok = false;
+            else if (!segs[k].digit && segs[k].s != s2[k].s) ok = false;
+        }
+        if (ok) cands.push_back({ std::move(s2), e.path().u8string() });
+    }
+    if (cands.size() < 2) return out;
+
+    // pick the digit field that varies (most distinct values); later field wins ties
+    int best = -1;
+    size_t bestCount = 0;
+    for (size_t k = 0; k < segs.size(); k++) {
+        if (!segs[k].digit) continue;
+        std::vector<std::string> vals;
+        bool othersMatch = true;
+        for (const auto& c : cands) {
+            bool same = true;
+            for (size_t m = 0; m < segs.size(); m++)
+                if (m != k && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+            if (!same) continue;
+            bool dup = false;
+            for (const auto& v : vals) if (v == c.segs[k].s) { dup = true; break; }
+            if (!dup) vals.push_back(c.segs[k].s);
+        }
+        (void)othersMatch;
+        if (vals.size() >= 2 && vals.size() >= bestCount) { bestCount = vals.size(); best = (int)k; }
+    }
+    if (best < 0) return out;
+
+    std::vector<std::pair<long long, std::string>> found;
+    for (const auto& c : cands) {
+        bool same = true;
+        for (size_t m = 0; m < segs.size(); m++)
+            if ((int)m != best && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+        if (!same) continue;
+        found.emplace_back(atoll(c.segs[best].s.c_str()), c.path);
+    }
+    if (found.size() < 2) return out;
+    std::sort(found.begin(), found.end());
+    patternOut.clear();
+    for (size_t k = 0; k < segs.size(); k++)
+        patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '#') : segs[k].s;
+    patternOut += ext;
+    for (auto& f : found) out.push_back(f.second);
+    return out;
+}
+
+static void stopSequenceLoader() {
+    app.seqCancel = true;
+    if (app.seqThread.joinable()) app.seqThread.join();
+    app.seqRunning = false;
+    app.seqCancel = false;
+    std::lock_guard<std::mutex> lk(app.seqMtx);
+    app.seqReady.clear();
+}
+
+// Spawn the worker. The thread only decodes (no app state, no GL) and pushes
+// finished frames into seqReady; the UI thread integrates them in pumpSequence().
+static void startSequenceLoad(int imageIdx, const std::vector<std::string>& files,
+                              const std::string& pattern) {
+    if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
+    stopSequenceLoader();
+    ImageDoc* ref = app.images[imageIdx].get();
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = pattern.empty() ? ref->name : pattern;
+    info.lastImageIdx = imageIdx;
+    app.seqs.push_back(info);
+    ref->seqId = info.id;
+    // position of the already-open frame inside the file list
+    int selfIdx = 0;
+    for (int i = 0; i < (int)files.size(); i++)
+        if (files[i] == ref->path) { selfIdx = i; break; }
+    ref->seqIndex = selfIdx;
+
+    // capture everything the worker needs BY VALUE
+    struct Job { std::string path; int index; };
+    std::vector<Job> jobs;
+    for (int i = 0; i < (int)files.size(); i++)
+        if (i != selfIdx) jobs.push_back({ files[i], i });
+    bool isRaw = ref->rawDtype >= 0;
+    RawDialog recipe;
+    if (isRaw) {
+        recipe.dtype = ref->rawDtype;
+        recipe.interp = ref->rawInterp;
+        if (RAW_INTERP_CH[recipe.interp] == 1)
+            recipe.interp = ref->cfa == 2 ? RI_QUAD : ref->cfa == 1 ? RI_BAYER : RI_GRAY;
+        recipe.w = ref->srcW > 0 ? ref->srcW : ref->w;
+        recipe.h = ref->srcH > 0 ? ref->srcH : ref->h;
+        recipe.offset = ref->rawOffset;
+        recipe.littleEndian = ref->rawLE;
+        recipe.cfaPattern = ref->cfaPattern & 3;
+        recipe.cropOn = isCropped(*ref);
+        recipe.cropX = ref->cropX; recipe.cropY = ref->cropY;
+        recipe.cropW = ref->w; recipe.cropH = ref->h;
+        recipe.replaceIdx = -1;
+    }
+    app.seqLoadingId = info.id;
+    app.seqBytes = ref->data.size() * sizeof(float);
+    app.seqDone = 0;
+    app.seqTotal = (int)jobs.size();
+    app.seqCancel = false;
+    app.seqRunning = true;
+    {
+        std::lock_guard<std::mutex> lk(app.seqMtx);
+        app.seqErr.clear();
+    }
+    fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
+            (int)files.size(), isRaw ? "raw recipe" : "npy");
+    app.seqThread = std::thread([jobs, isRaw, recipe]() {
+        size_t bytes = 0;
+        int failures = 0;
+        for (const auto& j : jobs) {
+            if (app.seqCancel) break;
+            std::string err;
+            std::unique_ptr<ImageDoc> doc;
+            if (isRaw) {
+                RawDialog d = recipe;
+                d.path = j.path;
+                doc = decodeRawFrame(d, err);
+            } else {
+                doc = decodeNpy(j.path, err);
+            }
+            if (!doc) {
+                if (++failures <= 3) {
+                    std::lock_guard<std::mutex> lk(app.seqMtx);
+                    app.seqErr += baseName(j.path) + ": " + err + "\n";
+                }
+                app.seqDone++;
+                continue;
+            }
+            bytes += doc->data.size() * sizeof(float);
+            {
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.emplace_back(j.index, std::move(doc));
+            }
+            app.seqDone++;
+            if (bytes > SEQ_MEM_BUDGET) {
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqErr += "memory budget reached - stopped loading\n";
+                break;
+            }
+        }
+        app.seqRunning = false;
+    });
+}
+
+// UI-thread integration of decoded frames (also owns GL/texture lifetime).
+static void pumpSequence() {
+    std::vector<std::pair<int, std::unique_ptr<ImageDoc>>> batch;
+    std::string err;
+    {
+        std::lock_guard<std::mutex> lk(app.seqMtx);
+        if (!app.seqReady.empty()) batch.swap(app.seqReady);
+        err.swap(app.seqErr);
+    }
+    if (!err.empty()) toast(err, true);
+    if (batch.empty()) {
+        if (!app.seqRunning && app.seqThread.joinable()) app.seqThread.join();
+        return;
+    }
+    // inherit display settings from the sequence reference frame so frames are
+    // directly comparable (same range, same colormap, same CFA interpretation)
+    const ImageDoc* ref = nullptr;
+    for (const auto& d : app.images)
+        if (d->seqId == app.seqLoadingId) { ref = d.get(); break; }
+    for (auto& pr : batch) {
+        auto& doc = pr.second;
+        doc->seqId = app.seqLoadingId;
+        doc->seqIndex = pr.first;
+        computeMinMax(*doc);
+        if (ref) {
+            doc->black = ref->black; doc->white = ref->white;
+            doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
+            doc->cfaColorize = ref->cfaColorize;
+            doc->displayLut = ref->displayLut;
+        } else {
+            defaultRange(*doc);
+        }
+        doc->texDirty = true;
+        app.images.push_back(std::move(doc));
+    }
+    app.temporal.seqId = -1;          // new frames invalidate temporal stats
+    if (!app.seqRunning && app.seqThread.joinable()) {
+        app.seqThread.join();
+        int n = 0;
+        for (const auto& d : app.images) if (d->seqId == app.seqLoadingId) n++;
+        fprintf(stderr, "sequence: loaded %d frames\n", n);
+    }
+}
+
+// ---- stacks & navigation ------------------------------------------------------
+// image indices of one sequence, ordered by frame number
+static std::vector<int> framesOfSeq(int seqId) {
+    std::vector<std::pair<int, int>> v;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->seqId == seqId) v.emplace_back(app.images[i]->seqIndex, i);
+    std::sort(v.begin(), v.end());
+    std::vector<int> out;
+    for (auto& p : v) out.push_back(p.second);
+    return out;
+}
+// every stack in list order: a sequence is one stack, a lone image is its own
+static std::vector<std::vector<int>> stacksOf() {
+    std::vector<std::vector<int>> out;
+    std::vector<int> seen;
+    for (int i = 0; i < (int)app.images.size(); i++) {
+        int sid = app.images[i]->seqId;
+        if (sid == 0) { out.push_back({ i }); continue; }
+        bool dup = false;
+        for (int s : seen) if (s == sid) { dup = true; break; }
+        if (dup) continue;
+        seen.push_back(sid);
+        out.push_back(framesOfSeq(sid));
+    }
+    return out;
+}
+static App::SeqInfo* seqInfo(int id) {
+    for (auto& s : app.seqs) if (s.id == id) return &s;
+    return nullptr;
+}
+static void selectImage(int idx) {
+    if (idx < 0 || idx >= (int)app.images.size()) return;
+    app.current = idx;
+    if (App::SeqInfo* si = seqInfo(app.images[idx]->seqId)) si->lastImageIdx = idx;
+}
+// time axis: previous / next frame of the current stack
+static void gotoFrame(int delta, bool absoluteEdge = false, bool toFirst = true) {
+    ImageDoc* im = cur();
+    if (!im) return;
+    if (im->seqId == 0) return;                       // lone image: no time axis
+    std::vector<int> f = framesOfSeq(im->seqId);
+    if (f.empty()) return;
+    int pos = 0;
+    for (int i = 0; i < (int)f.size(); i++) if (f[i] == app.current) pos = i;
+    int np = absoluteEdge ? (toFirst ? 0 : (int)f.size() - 1)
+                          : std::clamp(pos + delta, 0, (int)f.size() - 1);
+    selectImage(f[np]);
+}
+// stack axis: previous / next stack, resuming its last viewed frame
+static void gotoStack(int delta) {
+    auto st = stacksOf();
+    if (st.empty()) return;
+    int cs = 0;
+    for (int i = 0; i < (int)st.size(); i++)
+        for (int idx : st[i]) if (idx == app.current) cs = i;
+    int ns = std::clamp(cs + delta, 0, (int)st.size() - 1);
+    if (ns == cs) return;
+    const std::vector<int>& target = st[ns];
+    int pick = target.front();
+    if (App::SeqInfo* si = seqInfo(app.images[target.front()]->seqId))
+        if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
+            app.images[si->lastImageIdx]->seqId == app.images[target.front()]->seqId)
+            pick = si->lastImageIdx;
+    selectImage(pick);
+}
+
+// After a single file is opened: offer (or silently start) loading its siblings.
+static void maybeOfferSequence(int imageIdx) {
+    if (app.seqLoadMode == 2) return;                 // never
+    if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
+    ImageDoc* im = app.images[imageIdx].get();
+    if (im->seqId != 0 || im->path.empty()) return;
+    std::string pattern;
+    std::vector<std::string> files = findSequenceSiblings(im->path, pattern);
+    if ((int)files.size() < 2) return;
+    if (app.seqLoadMode == 1) {                       // always
+        startSequenceLoad(imageIdx, files, pattern);
+        toast("loading sequence: " + pattern + " (" + std::to_string(files.size()) + " files)");
+        return;
+    }
+    app.seqAskImage = imageIdx;                       // ask
+    app.seqAskFiles = files;
+    app.seqAskPattern = pattern;
+}
+
+// ---------------------------------------------------------------- temporal analysis
+// Built-in (L2): per-frame mean/std over the current ROI plus the temporal /
+// fixed-pattern noise split — the same decomposition EMVA 1288 is built on.
+static void recomputeTemporalIfNeeded() {
+    ImageDoc* im = cur();
+    App::TemporalState& T = app.temporal;
+    if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
+    std::vector<int> f = framesOfSeq(im->seqId);
+    if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
+    if (T.seqId == im->seqId && T.frames == (int)f.size() &&
+        T.annRev == app.annRev && T.selAnn == app.selectedAnn)
+        return;
+    T.seqId = im->seqId; T.frames = (int)f.size();
+    T.annRev = app.annRev; T.selAnn = app.selectedAnn;
+    T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
+    T.tempNoise = T.fixedPattern = T.totalNoise = 0;
+    T.valid = false; T.roiUsed = false;
+
+    int rx = 0, ry = 0, rw = im->w, rh = im->h;
+    if (App::Ann* a = findAnn(app.selectedAnn)) {
+        if (a->type == 0) {
+            int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
+            int cw = std::clamp(a->w, 0, im->w - cx), chh = std::clamp(a->h, 0, im->h - cy);
+            if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; T.roiUsed = true; }
+        }
+    }
+    // fixed sampling grid, capped so full-frame sequences stay interactive
+    const size_t MAX_SAMPLES = 40000;
+    size_t total = (size_t)rw * rh;
+    size_t step = std::max<size_t>(1, total / MAX_SAMPLES);
+    std::vector<size_t> offs;
+    for (size_t p = 0; p < total; p += step) {
+        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
+        offs.push_back(((size_t)y * im->w + x) * im->ch);   // channel 0 (or CFA sample)
+    }
+    if (offs.empty()) return;
+    std::vector<double> sum(offs.size(), 0), sum2(offs.size(), 0);
+    int used = 0;
+    for (int fi : f) {
+        const ImageDoc& fr = *app.images[fi];
+        if (fr.w != im->w || fr.h != im->h || fr.ch != im->ch) continue;   // dims changed
+        double s = 0, s2 = 0;
+        size_t n = 0;
+        for (size_t k = 0; k < offs.size(); k++) {
+            float v = fr.data[offs[k]];
+            if (!std::isfinite(v)) continue;
+            sum[k] += v; sum2[k] += (double)v * v;
+            s += v; s2 += (double)v * v; n++;
+        }
+        if (!n) continue;
+        double m = s / n, var = s2 / n - m * m;
+        T.idx.push_back((float)fr.seqIndex);
+        T.frameMean.push_back((float)m);
+        T.frameStd.push_back((float)sqrt(var > 0 ? var : 0));
+        used++;
+    }
+    if (used < 2) return;
+    // per-sample temporal variance -> temporal noise; spatial spread of the
+    // time-averaged samples -> fixed pattern (DSNU/PRNU-like)
+    double tvarSum = 0, pmSum = 0, pmSum2 = 0;
+    for (size_t k = 0; k < offs.size(); k++) {
+        double m = sum[k] / used;
+        double v = sum2[k] / used - m * m;
+        tvarSum += v > 0 ? v : 0;
+        pmSum += m; pmSum2 += m * m;
+    }
+    double tvar = tvarSum / offs.size();
+    double pmean = pmSum / offs.size();
+    double pvar = pmSum2 / offs.size() - pmean * pmean;
+    T.tempNoise = sqrt(tvar);
+    T.fixedPattern = sqrt(std::max(0.0, pvar));           // includes real scene detail
+    T.totalNoise = sqrt(tvar + std::max(0.0, pvar));
+    T.valid = true;
+}
+
 // ---------------------------------------------------------------- open dispatch
 static void openRawDialogFor(const std::string& path) {
     std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
@@ -1042,7 +1541,7 @@ static void openPath(const std::string& path) {
     if (ends(".npy")) {
         std::string err = loadNpy(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
-        else toast("loaded " + baseName(path));
+        else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -1143,9 +1642,9 @@ static void drawRawModal() {
             ImGui::EndCombo();
         }
     }
-    ImGui::InputInt("width", &rawDlg.w);
-    ImGui::InputInt("height", &rawDlg.h);
-    ImGui::InputInt("offset (bytes)", &rawDlg.offset);
+    ImGui::InputInt("width (px)", &rawDlg.w, 1, 16);          // step / fast-step: round numbers
+    ImGui::InputInt("height (px)", &rawDlg.h, 1, 16);
+    ImGui::InputInt("offset (bytes)", &rawDlg.offset, 1, 512);
     rawDlg.w = std::clamp(rawDlg.w, 1, 32768);
     rawDlg.h = std::clamp(rawDlg.h, 1, 32768);
     rawDlg.offset = std::max(0, rawDlg.offset);
@@ -1153,10 +1652,10 @@ static void drawRawModal() {
     ImGui::Checkbox("crop on load", &rawDlg.cropOn);
     if (rawDlg.cropOn) {
         if (rawDlg.cropW <= 0) { rawDlg.cropW = rawDlg.w; rawDlg.cropH = rawDlg.h; }
-        ImGui::InputInt("crop x", &rawDlg.cropX);
-        ImGui::InputInt("crop y", &rawDlg.cropY);
-        ImGui::InputInt("crop width", &rawDlg.cropW);
-        ImGui::InputInt("crop height", &rawDlg.cropH);
+        ImGui::InputInt("crop x (px)", &rawDlg.cropX, 1, 16);
+        ImGui::InputInt("crop y (px)", &rawDlg.cropY, 1, 16);
+        ImGui::InputInt("crop width (px)", &rawDlg.cropW, 1, 16);
+        ImGui::InputInt("crop height (px)", &rawDlg.cropH, 1, 16);
         rawDlg.cropX = std::clamp(rawDlg.cropX, 0, rawDlg.w - 1);
         rawDlg.cropY = std::clamp(rawDlg.cropY, 0, rawDlg.h - 1);
         rawDlg.cropW = std::clamp(rawDlg.cropW, 1, rawDlg.w - rawDlg.cropX);
@@ -1185,9 +1684,11 @@ static void drawRawModal() {
         std::string err = loadRaw(rawDlg);
         if (!err.empty()) toast(err, true);
         else {
-            toast((rawDlg.replaceIdx >= 0 ? "reinterpreted " : "loaded ") + baseName(rawDlg.path));
+            bool fresh = rawDlg.replaceIdx < 0;
+            toast((fresh ? "loaded " : "reinterpreted ") + baseName(rawDlg.path));
             rawDlg.replaceIdx = -1;
             ImGui::CloseCurrentPopup();
+            if (fresh) maybeOfferSequence(app.current);
         }
     }
     ImGui::EndPopup();
@@ -1530,10 +2031,15 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
     }
     bool cfa = im->ch == 1 && im->cfa != 0;
     H.nSeries = cfa ? 4 : std::min(im->ch, 3);
+    static const char* CFA_SERIES[4] = { "R", "Gr", "Gb", "B" };
+    static const char* CH_SERIES[4] = { "ch0", "ch1", "ch2", "ch3" };
+    for (int s = 0; s < 4; s++) H.seriesNames[s] = cfa ? CFA_SERIES[s] : CH_SERIES[s];
     float inv = 256.0f / std::max(im->white - im->black, 1e-20f);
     size_t total = (size_t)rw * rh;
     size_t step = std::max<size_t>(1, total / 1000000);   // sample <= ~1M px
     size_t below = 0, above = 0, cnt = 0, values = 0;
+    double sum[4] = {}, sum2[4] = {};
+    size_t n[4] = {};
     for (size_t p = 0; p < total; p += step) {
         int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
         const float* src = &im->data[((size_t)y * im->w + x) * im->ch];
@@ -1545,6 +2051,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
                 if (t < 0) { below++; H.bins[s][0]++; }
                 else if (t >= 256) { above++; H.bins[s][255]++; }
                 else H.bins[s][(int)t]++;
+                sum[s] += v; sum2[s] += (double)v * v; n[s]++;
                 values++;
             }
         } else {
@@ -1555,10 +2062,17 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
                 if (t < 0) { below++; H.bins[c][0]++; }
                 else if (t >= 256) { above++; H.bins[c][255]++; }
                 else H.bins[c][(int)t]++;
+                sum[c] += v; sum2[c] += (double)v * v; n[c]++;
                 values++;
             }
         }
         cnt++;
+    }
+    for (int s = 0; s < H.nSeries; s++) {          // always-on mean / std
+        if (!n[s]) { H.mean[s] = H.sd[s] = 0; continue; }
+        double m = sum[s] / n[s], var = sum2[s] / n[s] - m * m;
+        H.mean[s] = m;
+        H.sd[s] = sqrt(var > 0 ? var : 0);
     }
     for (int s = 0; s < H.nSeries; s++)
         for (int b = 0; b < 256; b++)
@@ -1566,6 +2080,90 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
     H.sampled = cnt;
     H.clipLo = values ? (double)below / values : 0;
     H.clipHi = values ? (double)above / values : 0;
+}
+
+// ---- L2 plot service ---------------------------------------------------------
+// Every plot in the app goes through this: axes are always labelled (quantity +
+// unit) and ticks land on 1/2/5*10^k values (integer axes never show fractions).
+struct PlotRect {
+    ImVec2 p0, p1;                       // inner drawing area
+    float xmin, xmax, ymin, ymax;
+    bool ok = false;
+    ImVec2 at(float x, float y) const {
+        return ImVec2(p0.x + (x - xmin) / (xmax - xmin) * (p1.x - p0.x),
+                      p1.y - (y - ymin) / (ymax - ymin) * (p1.y - p0.y));
+    }
+};
+
+static void fmtTick(char* buf, size_t n, double v, bool integer) {
+    if (integer) snprintf(buf, n, "%.0f", v);
+    else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
+    else snprintf(buf, n, "%.4g", v);
+}
+
+// xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
+static PlotRect beginPlot(const char* xLabel, const char* yLabel,
+                          float xmin, float xmax, float ymin, float ymax,
+                          bool xInt, bool yInt, float height) {
+    PlotRect pr;
+    if (!(xmax > xmin)) xmax = xmin + 1;
+    if (!(ymax > ymin)) ymax = ymin + 1;
+    if (xInt && xmax - xmin < 1) xmax = xmin + 1;
+    pr.xmin = xmin; pr.xmax = xmax; pr.ymin = ymin; pr.ymax = ymax;
+
+    const float s = app.uiScale;
+    const float fh = ImGui::GetFontSize();
+    char tb[48];
+    fmtTick(tb, sizeof tb, ymax, yInt);
+    float wy = ImGui::CalcTextSize(tb).x;
+    fmtTick(tb, sizeof tb, ymin, yInt);
+    wy = std::max(wy, ImGui::CalcTextSize(tb).x);
+    const float marginL = wy + 8 * s;
+    const float marginB = fh * 2 + 6 * s;          // x tick labels + x axis title
+    const float marginT = fh + 4 * s;              // y axis title sits on top
+
+    float wid = ImGui::GetContentRegionAvail().x;
+    ImVec2 org = ImGui::GetCursorScreenPos();
+    pr.p0 = ImVec2(org.x + marginL, org.y + marginT);
+    pr.p1 = ImVec2(org.x + wid, org.y + marginT + height);
+    if (pr.p1.x - pr.p0.x < 20 || height < 20) { ImGui::Dummy(ImVec2(wid, height)); return pr; }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg = IM_COL32(12, 14, 16, 255), grid = IM_COL32(46, 52, 58, 255),
+          txt = IM_COL32(150, 160, 170, 255), axis = IM_COL32(90, 100, 110, 255);
+    dl->AddRectFilled(pr.p0, pr.p1, bg);
+
+    // Y ticks
+    double ystep = niceStep((float)((ymax - ymin) / 4.0));
+    if (yInt && ystep < 1) ystep = 1;
+    for (double v = ceil(ymin / ystep) * ystep; v <= ymax + 1e-9; v += ystep) {
+        float y = pr.at(pr.xmin, (float)v).y;
+        dl->AddLine(ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y), grid);
+        fmtTick(tb, sizeof tb, v, yInt);
+        ImVec2 ts = ImGui::CalcTextSize(tb);
+        dl->AddText(ImVec2(pr.p0.x - 5 * s - ts.x, y - fh * 0.5f), txt, tb);
+    }
+    // X ticks
+    double xstep = niceStep((float)((xmax - xmin) / 4.0));
+    if (xInt && xstep < 1) xstep = 1;
+    for (double v = ceil(xmin / xstep) * xstep; v <= xmax + 1e-9; v += xstep) {
+        float x = pr.at((float)v, pr.ymin).x;
+        dl->AddLine(ImVec2(x, pr.p0.y), ImVec2(x, pr.p1.y), grid);
+        fmtTick(tb, sizeof tb, v, xInt);
+        ImVec2 ts = ImGui::CalcTextSize(tb);
+        dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, pr.p1.x - ts.x), pr.p1.y + 2 * s), txt, tb);
+    }
+    dl->AddRect(pr.p0, pr.p1, axis);
+    // axis titles: quantity + unit (mandatory)
+    dl->AddText(ImVec2(org.x, org.y), txt, yLabel ? yLabel : "y");
+    {
+        const char* xl = xLabel ? xLabel : "x";
+        ImVec2 ts = ImGui::CalcTextSize(xl);
+        dl->AddText(ImVec2((pr.p0.x + pr.p1.x - ts.x) * 0.5f, pr.p1.y + 2 * s + fh), txt, xl);
+    }
+    ImGui::Dummy(ImVec2(wid, height + marginT + marginB));
+    pr.ok = true;
+    return pr;
 }
 
 // L2 host service: line plot for analyzer curve output (the only curve UI —
@@ -1594,22 +2192,18 @@ static void drawAnalysisPlots() {
             }
         }
         if (!first || xmin > xmax || ymin > ymax) continue;
-        if (xmax - xmin < 1e-20f) xmax = xmin + 1;
-        if (ymax - ymin < 1e-20f) ymax = ymin + 1;
         ImGui::Dummy(ImVec2(0, 4));
-        ImGui::TextDisabled("%s  (%s vs %s)", nm.c_str(),
-                            first->yLabel.empty() ? "y" : first->yLabel.c_str(),
-                            first->xLabel.empty() ? "x" : first->xLabel.c_str());
-        float wid = ImGui::GetContentRegionAvail().x;
-        float hgt = 140.0f * app.uiScale;
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::TextDisabled("%s", nm.c_str());
+        bool xInt = true;                     // integer axis when the plugin sends no x
+        for (const auto& s : S)
+            if (s.name == nm && !s.xs.empty()) { xInt = false; break; }
+        PlotRect pr = beginPlot(first->xLabel.empty() ? (xInt ? "sample index" : "x")
+                                                     : first->xLabel.c_str(),
+                                first->yLabel.empty() ? nm.c_str() : first->yLabel.c_str(),
+                                xmin, xmax, ymin, ymax, xInt, false, 140.0f * app.uiScale);
+        if (!pr.ok) continue;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(p0, ImVec2(p0.x + wid, p0.y + hgt), IM_COL32(12, 14, 16, 255));
-        for (int g = 1; g < 4; g++) {
-            float gx = p0.x + wid * g / 4.0f, gy = p0.y + hgt * g / 4.0f;
-            dl->AddLine(ImVec2(gx, p0.y), ImVec2(gx, p0.y + hgt), IM_COL32(46, 52, 58, 255));
-            dl->AddLine(ImVec2(p0.x, gy), ImVec2(p0.x + wid, gy), IM_COL32(46, 52, 58, 255));
-        }
+        dl->PushClipRect(pr.p0, pr.p1, true);
         for (const auto& s : S) {
             if (s.name != nm || s.ys.size() < 2) continue;
             ImU32 col = s.colorIdx >= 0 ? ANN_COLORS[s.colorIdx & 7]
@@ -1619,22 +2213,12 @@ static void drawAnalysisPlots() {
                 float xv = s.xs.empty() ? (float)i : s.xs[i];
                 float yv = s.ys[i];
                 if (!std::isfinite(xv) || !std::isfinite(yv)) { has = false; continue; }
-                ImVec2 pt(p0.x + (xv - xmin) / (xmax - xmin) * wid,
-                          p0.y + hgt - (yv - ymin) / (ymax - ymin) * (hgt - 2) - 1);
+                ImVec2 pt = pr.at(xv, yv);
                 if (has) dl->AddLine(prev, pt, col, 1.5f);
                 prev = pt; has = true;
             }
         }
-        char lb[64];
-        ImU32 axCol = IM_COL32(140, 150, 160, 255);
-        snprintf(lb, 64, "%.4g", ymax);
-        dl->AddText(ImVec2(p0.x + 3, p0.y + 2), axCol, lb);
-        snprintf(lb, 64, "%.4g", ymin);
-        dl->AddText(ImVec2(p0.x + 3, p0.y + hgt - ImGui::GetFontSize() - 2), axCol, lb);
-        snprintf(lb, 64, "%.4g", xmax);
-        ImVec2 ts = ImGui::CalcTextSize(lb);
-        dl->AddText(ImVec2(p0.x + wid - ts.x - 3, p0.y + hgt - ImGui::GetFontSize() - 2), axCol, lb);
-        ImGui::Dummy(ImVec2(wid, hgt));
+        dl->PopClipRect();
     }
 }
 
@@ -1782,44 +2366,121 @@ static void drawInspector() {
         ImGui::TextDisabled("no image");
     }
 
-    // ---- histogram (host built-in; follows selected ROI, splits CFA channels) ----
+    // ---- statistics + histogram (always on; follow the selected ROI) ----
     if (im && im->w > 0 && im->h > 0) {
+        recomputeHistogramIfNeeded(im);
+        const App::HistState& H = app.hist;
         ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Text("Statistics");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
+        ImGui::Separator();
+        if (ImGui::BeginTable("quickstats", 4, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("ch");
+            ImGui::TableSetupColumn("mean");
+            ImGui::TableSetupColumn("std");
+            ImGui::TableSetupColumn("var");
+            ImGui::TableHeadersRow();
+            for (int s = 0; s < H.nSeries; s++) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", H.seriesNames[s]);
+                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.mean[s]);
+                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.sd[s]);
+                ImGui::TableNextColumn(); ImGui::Text("%.6g", H.sd[s] * H.sd[s]);
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::Dummy(ImVec2(0, 6));
         ImGui::Text("Histogram");
         ImGui::SameLine();
         ImGui::Checkbox("log##hist", &app.histLog);
         ImGui::Separator();
-        recomputeHistogramIfNeeded(im);
-        const App::HistState& H = app.hist;
-        float wid = ImGui::GetContentRegionAvail().x;
-        float hgt = 110.0f * app.uiScale;
-        ImVec2 hp0 = ImGui::GetCursorScreenPos();
-        ImDrawList* hdl = ImGui::GetWindowDrawList();
-        hdl->AddRectFilled(hp0, ImVec2(hp0.x + wid, hp0.y + hgt), IM_COL32(12, 14, 16, 255));
         static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 170), IM_COL32(120, 230, 120, 170),
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
         static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
                                            IM_COL32(92, 155, 255, 150) };
         bool cfaHist = im->ch == 1 && im->cfa != 0;
         double logMax = log1p((double)H.maxBin);
-        for (int s = 0; s < H.nSeries; s++) {
-            ImU32 col = cfaHist ? CFA_COLS[s]
-                                : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
-            for (int b = 0; b < 256; b++) {
-                uint32_t v = H.bins[s][b];
-                if (!v) continue;
-                float f = app.histLog ? (float)(log1p((double)v) / logMax)
-                                      : (float)v / (float)H.maxBin;
-                float bx0 = hp0.x + (float)b / 256.0f * wid;
-                hdl->AddRectFilled(ImVec2(bx0, hp0.y + hgt - f * (hgt - 3)),
-                                   ImVec2(bx0 + wid / 256.0f + 0.5f, hp0.y + hgt), col);
+        char yl[64];
+        snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)" : "pixel count (max %u)",
+                 H.maxBin);
+        char xl[80];
+        snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+        PlotRect hp = beginPlot(xl, yl, im->black, im->white, 0.0f, 1.0f, false, false,
+                                110.0f * app.uiScale);
+        if (hp.ok) {
+            ImDrawList* hdl = ImGui::GetWindowDrawList();
+            hdl->PushClipRect(hp.p0, hp.p1, true);
+            float pw2 = hp.p1.x - hp.p0.x;
+            for (int s = 0; s < H.nSeries; s++) {
+                ImU32 col = cfaHist ? CFA_COLS[s]
+                                    : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
+                for (int b = 0; b < 256; b++) {
+                    uint32_t v = H.bins[s][b];
+                    if (!v) continue;
+                    float f = app.histLog ? (float)(log1p((double)v) / logMax)
+                                          : (float)v / (float)H.maxBin;
+                    float bx0 = hp.p0.x + (float)b / 256.0f * pw2;
+                    hdl->AddRectFilled(ImVec2(bx0, hp.p1.y - f * (hp.p1.y - hp.p0.y)),
+                                       ImVec2(bx0 + pw2 / 256.0f + 0.5f, hp.p1.y), col);
+                }
             }
+            hdl->PopClipRect();
         }
-        ImGui::Dummy(ImVec2(wid, hgt));
-        ImGui::TextDisabled("%s | %zu px | <black %.2f%%  >white %.2f%%%s",
-                            H.roiUsed ? "selected ROI" : "whole image", H.sampled,
+        ImGui::TextDisabled("%zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
                             H.clipLo * 100.0, H.clipHi * 100.0,
                             cfaHist ? " | R/Gr/Gb/B" : "");
+    }
+
+    // ---- temporal (sequences only; built-in, follows the selected ROI) ----
+    if (im && im->seqId != 0) {
+        recomputeTemporalIfNeeded();
+        const App::TemporalState& T = app.temporal;
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Text("Temporal");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%d frames, %s)", T.frames,
+                            T.roiUsed ? "selected ROI" : "whole image");
+        ImGui::Separator();
+        if (!T.valid) {
+            ImGui::TextDisabled("need >= 2 loaded frames of equal size");
+        } else {
+            if (ImGui::BeginTable("temporalstats", 2, ImGuiTableFlags_SizingStretchProp)) {
+                auto row = [](const char* k, double v) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+                    ImGui::TableNextColumn(); ImGui::Text("%.6g", v);
+                };
+                row("temporal noise (sigma_t)", T.tempNoise);
+                row("fixed pattern (sigma_s)", T.fixedPattern);
+                row("total (quadrature)", T.totalNoise);
+                ImGui::EndTable();
+            }
+            ImGui::TextDisabled("sigma_s includes scene detail unless the ROI is flat");
+            // per-frame mean over time
+            float mn = FLT_MAX, mx = -FLT_MAX;
+            for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+            float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
+            char yl[64];
+            snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+            PlotRect tp = beginPlot("frame number (index in sequence)", yl,
+                                    fx0, fx1, mn, mx, true, false, 90.0f * app.uiScale);
+            if (tp.ok) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                for (size_t i = 1; i < T.frameMean.size(); i++)
+                    dl->AddLine(tp.at(T.idx[i - 1], T.frameMean[i - 1]),
+                                tp.at(T.idx[i], T.frameMean[i]),
+                                IM_COL32(105, 220, 130, 255), 1.5f);
+                if (ImageDoc* c2 = cur()) {   // marker for the frame on screen
+                    float mxp = tp.at((float)c2->seqIndex, tp.ymin).x;
+                    dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y),
+                                IM_COL32(255, 184, 77, 200));
+                }
+                dl->PopClipRect();
+            }
+        }
     }
 
     // ---- annotations: ROIs + POIs, multiple, selectable ----
@@ -2045,15 +2706,72 @@ static void drawFileList() {
     if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
     if (ImGui::Button("Close")) closeCurrent();
-    ImGui::Separator();
-    for (int i = 0; i < (int)app.images.size(); i++) {
-        ImageDoc& d = *app.images[i];
-        char lb[512];
-        snprintf(lb, 512, "%s##%d", d.name.c_str(), i);
-        if (ImGui::Selectable(lb, i == app.current)) { app.current = i; app.fitRequested = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", d.path.c_str());
-        ImGui::TextDisabled("   %d x %d  %dch  %s", d.w, d.h, d.ch, d.dtype.c_str());
+    if (app.seqRunning) {
+        int done = app.seqDone, total = app.seqTotal;
+        ImGui::TextDisabled("loading %d/%d", done, total);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop")) app.seqCancel = true;
     }
+    ImGui::Separator();
+    // grouped view: one node per stack (sequence), lone images stay flat
+    for (const auto& stack : stacksOf()) {
+        const ImageDoc& head = *app.images[stack.front()];
+        if (head.seqId == 0) {
+            int i = stack.front();
+            char lb[512];
+            snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
+            if (ImGui::Selectable(lb, i == app.current)) { selectImage(i); app.fitRequested = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", head.path.c_str());
+            ImGui::TextDisabled("   %d x %d  %dch  %s", head.w, head.h, head.ch, head.dtype.c_str());
+            continue;
+        }
+        App::SeqInfo* si = seqInfo(head.seqId);
+        int pos = 0;
+        bool active = false;
+        for (int k = 0; k < (int)stack.size(); k++)
+            if (stack[k] == app.current) { pos = k; active = true; }
+        ImGui::PushID(head.seqId);
+        char lb[512];
+        snprintf(lb, 512, "%s  [%d]", si ? si->name.c_str() : "sequence", (int)stack.size());
+        if (ImGui::Selectable(lb, active)) { selectImage(stack[pos]); app.fitRequested = true; }
+        ImGui::TextDisabled("   %d x %d  %dch  %s", head.w, head.h, head.ch, head.dtype.c_str());
+        if (active) {
+            int slider = pos;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##frame", &slider, 0, (int)stack.size() - 1, "frame %d")
+                && slider != pos)
+                selectImage(stack[slider]);
+        }
+        ImGui::PopID();
+    }
+}
+
+static void drawSequenceModal() {
+    if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen("Load sequence?"))
+        ImGui::OpenPopup("Load sequence?");
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(), app.seqAskPattern.c_str());
+    ImGui::TextDisabled("Loading them as one stack enables temporal analysis.");
+    ImGui::TextDisabled("Frames decode in the background; you can keep working.");
+    ImGui::Separator();
+    static bool remember = false;
+    ImGui::Checkbox("remember my choice (File > Sequence loading)", &remember);
+    if (ImGui::Button("Load sequence", ImVec2(150 * app.uiScale, 0))) {
+        startSequenceLoad(app.seqAskImage, app.seqAskFiles, app.seqAskPattern);
+        if (remember) app.seqLoadMode = 1;
+        app.seqAskImage = -1; app.seqAskFiles.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("This file only", ImVec2(150 * app.uiScale, 0))) {
+        if (remember) app.seqLoadMode = 2;
+        app.seqAskImage = -1; app.seqAskFiles.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 // ---------------------------------------------------------------- menu bar / dialogs
@@ -2072,6 +2790,23 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
+        if (ImGui::BeginMenu("Sequence loading")) {
+            if (ImGui::MenuItem("Ask each time", nullptr, app.seqLoadMode == 0)) app.seqLoadMode = 0;
+            if (ImGui::MenuItem("Always load folder", nullptr, app.seqLoadMode == 1)) app.seqLoadMode = 1;
+            if (ImGui::MenuItem("Never (single file)", nullptr, app.seqLoadMode == 2)) app.seqLoadMode = 2;
+            ImGui::Separator();
+            if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
+                                cur() && cur()->seqId == 0 && !cur()->path.empty())) {
+                std::string pat;
+                std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
+                if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
+                else toast("no numbered siblings found next to this file", true);
+            }
+            if (ImGui::MenuItem("Stop background loading", nullptr, false, app.seqRunning))
+                app.seqCancel = true;
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
 #if defined(__APPLE__)
         if (ImGui::MenuItem("Quit", "Cmd+Q")) glfwSetWindowShouldClose(win, 1);
 #else
@@ -2081,6 +2816,15 @@ static void drawMenuBar(GLFWwindow* win) {
     }
     if (ImGui::BeginMenu("View")) {
         bool has = cur() != nullptr;
+        bool inSeq = cur() && cur()->seqId != 0;
+        if (ImGui::MenuItem("Next frame", "Right / Ctrl+F", false, inSeq)) gotoFrame(1);
+        if (ImGui::MenuItem("Previous frame", "Left / Ctrl+B", false, inSeq)) gotoFrame(-1);
+        if (ImGui::MenuItem("First frame", "Home / Ctrl+A", false, inSeq)) gotoFrame(0, true, true);
+        if (ImGui::MenuItem("Last frame", "End / Ctrl+E", false, inSeq)) gotoFrame(0, true, false);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Next stack", "Down / Ctrl+N", false, app.images.size() > 1)) gotoStack(1);
+        if (ImGui::MenuItem("Previous stack", "Up / Ctrl+P", false, app.images.size() > 1)) gotoStack(-1);
+        ImGui::Separator();
         if (ImGui::MenuItem("Fit to Window", "F", false, has)) app.fitRequested = true;
         if (ImGui::MenuItem("Actual Size (100%)", "1", false, has)) app.view.zoom = 1.0f;
         if (ImGui::MenuItem("Zoom In", "+", false, has))
@@ -2143,6 +2887,11 @@ static void drawHelpAbout() {
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
                 };
+                row("Right / Left",  "next / previous frame (time axis)");
+                row("Down / Up",     "next / previous stack (sequence)");
+                row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
+                row("Ctrl+N / Ctrl+P", "next / previous stack");
+                row("Ctrl+A / Ctrl+E", "first / last frame");
                 row(SC_MOD "+O / O", "open files");
                 row(SC_MOD "+S",     "save session (view state + images)");
                 row(SC_MOD "+W",     "close current image");
@@ -2193,6 +2942,7 @@ static void printUsage() {
         "  --big-endian                raw byte order (default little endian)\n"
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
+        "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -2257,6 +3007,12 @@ static void parseCli(int argc, char** argv) {
         } else if (a == "--quad-bayer") {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
+        } else if (a == "--sequence") {            // ask | always | never
+            std::string v = next();
+            if (v == "always") app.seqLoadMode = 1;
+            else if (v == "never") app.seqLoadMode = 2;
+            else if (v == "ask") app.seqLoadMode = 0;
+            else fprintf(stderr, "--sequence expects ask|always|never\n");
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
         } else if (a == "--center") {
@@ -2280,6 +3036,7 @@ static void parseCli(int argc, char** argv) {
                 d.path = a;
                 std::string err = loadRaw(d);
                 if (!err.empty()) toast(baseName(a) + ": " + err, true);
+                else maybeOfferSequence(app.current);
             } else {
                 openPath(a);
             }
@@ -2363,6 +3120,7 @@ int main(int argc, char** argv) {
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+        pumpSequence();               // integrate frames decoded in the background
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -2381,6 +3139,14 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
+            // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
+            // sequence start/end = C-a/C-e (always Ctrl, also on macOS)
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_P)) gotoStack(-1);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) gotoFrame(0, true, true);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_E)) gotoFrame(0, true, false);
         }
         if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
@@ -2420,6 +3186,13 @@ int main(int argc, char** argv) {
                         app.annRev++;
                     }
             }
+            // arrows: horizontal = time (frames), vertical = stacks
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) gotoFrame(1);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) gotoFrame(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) gotoStack(1);
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) gotoStack(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) gotoFrame(0, true, true);
+            if (ImGui::IsKeyPressed(ImGuiKey_End, false)) gotoFrame(0, true, false);
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
             if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = -1;
@@ -2467,11 +3240,18 @@ int main(int argc, char** argv) {
                     for (int c = 0; c < im->ch; c++)
                         hover += " " + fmtVal(im->sample(app.hoverX, app.hoverY, c), im->dtype);
                 }
+                char seqInfoStr[64] = "";
+                if (im->seqId != 0) {
+                    std::vector<int> fr = framesOfSeq(im->seqId);
+                    int pos = 0;
+                    for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
+                    snprintf(seqInfoStr, sizeof seqInfoStr, "  frame %d/%d", pos + 1, (int)fr.size());
+                }
                 char zs[32];
                 if (app.view.zoom >= 0.095f) snprintf(zs, 32, "%.0f%%", app.view.zoom * 100);
                 else                         snprintf(zs, 32, "%.3g%%", app.view.zoom * 100);
-                snprintf(st, 512, "[%s]  %s   %dx%d %dch %s  |  zoom %s%s",
-                         TOOL_NAMES[app.tool], im->name.c_str(), im->w, im->h, im->ch,
+                snprintf(st, 512, "[%s]  %s%s   %dx%d %dch %s  |  zoom %s%s",
+                         TOOL_NAMES[app.tool], im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
                          im->dtype.c_str(), zs, hover.c_str());
             }
             ImGui::TextUnformatted(st);
@@ -2481,6 +3261,7 @@ int main(int argc, char** argv) {
         }
 
         drawRawModal();
+        drawSequenceModal();
         drawHelpAbout();
 
         // toast
@@ -2504,6 +3285,7 @@ int main(int argc, char** argv) {
         glfwSwapBuffers(win);
     }
 
+    stopSequenceLoader();             // join the worker before tearing anything down
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
