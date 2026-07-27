@@ -35,8 +35,11 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
 #if defined(_WIN32)
     SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
     HANDLE childIn = nullptr, childOut = nullptr;
-    if (!CreatePipe(&childIn, &p.inW, &sa, 0) || !CreatePipe(&p.outR, &childOut, &sa, 0)) {
-        err = "cannot create pipes"; return false;
+    if (!CreatePipe(&childIn, &p.inW, &sa, 0)) { err = "cannot create pipes"; return false; }
+    if (!CreatePipe(&p.outR, &childOut, &sa, 0)) {
+        CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
+        err = "cannot create pipes";
+        return false;
     }
     SetHandleInformation(p.inW, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(p.outR, HANDLE_FLAG_INHERIT, 0);
@@ -45,7 +48,12 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
         if (!cmd.empty()) cmd += ' ';
         cmd += a.find(' ') != std::string::npos ? "\"" + a + "\"" : a;
     }
-    STARTUPINFOA si{};
+    // CreateProcessW, not A: this user's profile directory is Japanese, and the
+    // ANSI entry point garbles any non-ASCII path to the binary or the data
+    int wn = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    std::vector<wchar_t> wcmd((size_t)std::max(wn, 1));
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, wcmd.data(), wn);
+    STARTUPINFOW si{};
     si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
@@ -53,21 +61,34 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     si.hStdOutput = childOut;
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
-    std::vector<char> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back('\0');
-    BOOL ok = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE,
+    BOOL ok = CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(childIn);
     CloseHandle(childOut);
-    if (!ok) { err = "cannot start: " + cmd; return false; }
+    if (!ok) {
+        CloseHandle(p.inW);  p.inW = nullptr;
+        CloseHandle(p.outR); p.outR = nullptr;
+        err = "cannot start: " + cmd;
+        return false;
+    }
     CloseHandle(pi.hThread);
     p.proc = pi.hProcess;
     return true;
 #else
     int toChild[2], fromChild[2];
-    if (pipe(toChild) != 0 || pipe(fromChild) != 0) { err = "cannot create pipes"; return false; }
+    if (pipe(toChild) != 0) { err = "cannot create pipes"; return false; }
+    if (pipe(fromChild) != 0) {
+        close(toChild[0]); close(toChild[1]);
+        err = "cannot create pipes";
+        return false;
+    }
     pid_t pid = fork();
-    if (pid < 0) { err = "cannot fork"; return false; }
+    if (pid < 0) {
+        close(toChild[0]); close(toChild[1]);
+        close(fromChild[0]); close(fromChild[1]);
+        err = "cannot fork";
+        return false;
+    }
     if (pid == 0) {
         dup2(toChild[0], STDIN_FILENO);
         dup2(fromChild[1], STDOUT_FILENO);
@@ -134,9 +155,16 @@ static void pipeClose(Pipe& p) {
     if (p.inW >= 0) { close(p.inW); p.inW = -1; }
     if (p.outR >= 0) { close(p.outR); p.outR = -1; }
     if (p.pid > 0) {
-        int st = 0;
-        waitpid(p.pid, &st, WNOHANG);
+        // terminate FIRST, then reap - the old order reaped a child that had not
+        // exited yet, leaving a zombie for the life of the viewer
         kill(p.pid, SIGTERM);
+        int st = 0;
+        for (int i = 0; i < 20 && waitpid(p.pid, &st, WNOHANG) == 0; i++)
+            usleep(50 * 1000);
+        if (waitpid(p.pid, &st, WNOHANG) == 0) {
+            kill(p.pid, SIGKILL);
+            waitpid(p.pid, &st, 0);
+        }
         p.pid = -1;
     }
 #endif
@@ -184,9 +212,12 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
     if (host.empty()) {
         argv = { exe, "--serve" };
     } else {
-        // -o BatchMode: fail fast instead of hanging on a password prompt with no
-        // terminal to type it into
-        argv = { "ssh", "-o", "BatchMode=yes", host, exe, "--serve" };
+        // BatchMode: fail fast instead of hanging on a password prompt with no
+        // terminal. ConnectTimeout/ServerAlive: a black-holed route or a dead
+        // sshd must become an error in seconds, not a UI frozen forever.
+        argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+                 host, exe, "--serve" };
     }
     if (!spawn(*p, argv, err)) { stop(); return false; }
     alive_ = true;
@@ -229,6 +260,11 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
     rp::Header h{};
     if (!pipeRead(p, &h, sizeof h) || h.magic != rp::MAGIC) {
         err = "connection lost"; alive_ = false; return false;
+    }
+    if (h.len > (512u << 20)) {   // do not allocate gigabytes on a peer's say-so
+        err = "oversized reply from the peer";
+        alive_ = false;
+        return false;
     }
     payload.resize(h.len);
     if (h.len && !pipeRead(p, payload.data(), h.len)) {
@@ -312,6 +348,16 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     if (type != rp::MSG_OK) { r.str(err); return false; }
     rp::TileRep rep{};
     if (!r.blob(&rep, sizeof rep)) { err = "bad TILE reply"; return false; }
+    // The dims and the byte count must agree BEFORE anything indexes by dims: a
+    // peer whose reply disagrees with itself (or a truncated 4 GB tile) would
+    // otherwise send toFloat reading far past the buffer. Reproduced as a crash
+    // by the verification agent; now it is an error message.
+    size_t need = (size_t)rep.w * rep.h * rep.ch * rp::dtypeSize(rep.dtype);
+    if (!rep.w || !rep.h || !rep.ch || rep.ch > 4 || rep.dtype >= rp::DT_COUNT ||
+        need != rep.rawBytes) {
+        err = "inconsistent tile from the peer";
+        return false;
+    }
     const uint8_t* blob = reply.data() + r.rd;
     size_t blobBytes = reply.size() - r.rd;
     std::vector<uint8_t> raw;

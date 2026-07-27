@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <csignal>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -153,7 +154,13 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     else if (dims.size() == 4) { n.frames = (int)dims[0]; n.h = (int)dims[1];
                                  n.w = (int)dims[2]; n.ch = (int)dims[3]; }
     else { err = "unsupported .npy shape"; return false; }
-    if (n.w <= 0 || n.h <= 0) { err = "empty .npy"; return false; }
+    // A malformed header must produce an error message, not a std::length_error
+    // that terminates the peer: negative dims flow into size arithmetic as 2^64.
+    if (n.w <= 0 || n.h <= 0 || n.w > (1 << 20) || n.h > (1 << 20) ||
+        n.ch < 1 || n.ch > 4 || n.frames < 1 || n.frames > (1 << 20)) {
+        err = "unreasonable .npy shape";
+        return false;
+    }
     n.ok = true;
     return true;
 }
@@ -164,7 +171,9 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
                        uint32_t& outW, uint32_t& outH, std::string& err) {
     uint32_t step = std::max(1u, r.step);
     uint32_t x0 = std::min(r.x, (uint32_t)n.w), y0 = std::min(r.y, (uint32_t)n.h);
-    uint32_t x1 = std::min(r.x + r.w, (uint32_t)n.w), y1 = std::min(r.y + r.h, (uint32_t)n.h);
+    // 64-bit sums: x + w wrapping at 2^32 must clamp to the edge, not go empty
+    uint32_t x1 = (uint32_t)std::min<uint64_t>((uint64_t)r.x + r.w, (uint64_t)n.w);
+    uint32_t y1 = (uint32_t)std::min<uint64_t>((uint64_t)r.y + r.h, (uint64_t)n.h);
     if (x1 <= x0 || y1 <= y0) { err = "empty region"; return false; }
     outW = (x1 - x0 + step - 1) / step;
     outH = (y1 - y0 + step - 1) / step;
@@ -265,6 +274,10 @@ static void handleTile(Buf& in) {
 
     TileRep rep{};
     rep.w = ow; rep.h = oh; rep.ch = (uint32_t)n.ch; rep.dtype = n.dtype;
+    if (pix.size() > 0xFFFFFFFFull) {   // u32 on the wire: refuse, never truncate
+        sendErr("tile exceeds 4 GB - request a decimated tile (step > 1)");
+        return;
+    }
     rep.rawBytes = (uint32_t)pix.size();
     rep.flags = 0;
     std::vector<uint8_t> packed;
@@ -391,13 +404,22 @@ struct FrameSource {
             count = (uint32_t)p.size();
         } else {
             uint32_t total = (uint32_t)n.frames;
-            uint32_t f0 = std::min(h.frame0, total ? total - 1 : 0);
-            uint32_t avail = total - f0;
+            // out of range is an ERROR: readRegion would clamp to the last frame
+            // and a statistic over the wrong frames would look perfectly normal
+            if (h.frame0 >= total) {
+                err = "frame range outside the file (frame0 " + std::to_string(h.frame0) +
+                      " of " + std::to_string(total) + ")";
+                return false;
+            }
+            uint32_t avail = total - h.frame0;
             count = h.frameCount ? std::min(h.frameCount, avail) : avail;
         }
         if (count == 0) { err = "no frames in range"; return false; }
         return true;
     }
+    // series x values are real frame numbers, not 0-based positions: two ROIs
+    // measured with different frame0 must not silently misalign on one plot
+    uint32_t xBase() const { return perFile ? 0 : head->frame0; }
     bool read(uint32_t i, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh,
               std::vector<uint8_t>& raw, uint32_t& ow, uint32_t& oh) {
         TileReq r{};
@@ -467,6 +489,10 @@ static void runTemporalStats(const MeasureReqHead& head,
     FrameSource src;
     if (!src.init(head, paths)) { sendErr(src.err); return; }
     if (src.count < 2) { sendErr("temporal stats needs at least 2 frames"); return; }
+    if (head.cfaType && src.n.ch != 1) {
+        sendErr("CFA planes need a 1-channel frame");   // planes over RGB = nonsense
+        return;
+    }
     uint32_t nCols = rois.empty() ? 1 : (uint32_t)rois.size();
     std::vector<std::vector<MItem>> cols(nCols);
     std::vector<MSeries> series;
@@ -476,15 +502,20 @@ static void runTemporalStats(const MeasureReqHead& head,
         uint32_t rx, ry, rw, rh;
         if (!clampRoi(src.n, rois, c, rx, ry, rw, rh)) { sendErr("empty ROI"); return; }
         size_t samples = (size_t)rw * rh * src.n.ch;
-        if (samples > (size_t)64 << 20) {
-            sendErr("ROI too large for temporal stats (max 64M samples)");
+        if (samples > (size_t)32 << 20) {   // 32M samples ~ 640 MB of accumulators
+            sendErr("ROI too large for temporal stats (max 32M samples)");
             return;
         }
         std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+        // Per-pixel valid counts: a NaN must be EXCLUDED, not folded in. Folding
+        // gives max(0, NaN) = 0, i.e. zero variance - an understated noise number
+        // that looks perfectly plausible. Silent optimism is the worst failure.
+        std::vector<uint32_t> cnt(samples, 0);
+        uint64_t nonFinite = 0;
         MSeries fm, fs;
-        fm.name = "frame mean"; fm.xl = "frame number (index)"; fm.yl = "mean [DN]";
+        fm.name = "frame mean"; fm.xl = "frame number"; fm.yl = "mean [DN]";
         fm.col = c; fm.hasX = true;
-        fs.name = "frame std";  fs.xl = "frame number (index)"; fs.yl = "std [DN]";
+        fs.name = "frame std";  fs.xl = "frame number"; fs.yl = "std [DN]";
         fs.col = c; fs.hasX = true;
         for (uint32_t f = 0; f < src.count; f++) {
             uint32_t ow = 0, oh = 0;
@@ -492,18 +523,19 @@ static void runTemporalStats(const MeasureReqHead& head,
             pix.resize(samples);
             toFloatSamples(raw.data(), src.n.dtype, samples, pix.data());
             double s1 = 0, s2 = 0;
+            size_t sn = 0;
             for (size_t i = 0; i < samples; i++) {
                 double v = pix[i];
-                sum[i] += v; sum2[i] += v * v;
-                s1 += v; s2 += v * v;
+                if (!std::isfinite(v)) { nonFinite++; continue; }
+                sum[i] += v; sum2[i] += v * v; cnt[i]++;
+                s1 += v; s2 += v * v; sn++;
             }
-            double m = s1 / (double)samples;
-            fm.xs.push_back((float)f);
+            double m = sn ? s1 / (double)sn : 0.0;
+            fm.xs.push_back((float)(src.xBase() + f));
             fm.ys.push_back((float)m);
-            fs.xs.push_back((float)f);
-            fs.ys.push_back((float)sqrt(std::max(0.0, s2 / (double)samples - m * m)));
+            fs.xs.push_back((float)(src.xBase() + f));
+            fs.ys.push_back((float)(sn ? sqrt(std::max(0.0, s2 / (double)sn - m * m)) : 0.0));
         }
-        const double N = (double)src.count;
         const int nPl = head.cfaType ? 4 : 1;
         double plM[4] = {}, plM2[4] = {}, plV[4] = {};
         size_t plC[4] = {};
@@ -512,12 +544,16 @@ static void runTemporalStats(const MeasureReqHead& head,
                 int p = planeOf(head.cfaType, head.cfaPattern, rx + x, ry + y);
                 for (uint32_t k = 0; k < (uint32_t)src.n.ch; k++) {
                     size_t i = ((size_t)y * rw + x) * src.n.ch + k;
-                    double m = sum[i] / N;
-                    double var = std::max(0.0, sum2[i] / N - m * m) * (N / (N - 1.0));
+                    double nI = (double)cnt[i];
+                    if (nI < 2) continue;              // not enough valid frames
+                    double m = sum[i] / nI;
+                    double var = std::max(0.0, sum2[i] / nI - m * m) * (nI / (nI - 1.0));
                     plM[p] += m; plM2[p] += m * m; plV[p] += var; plC[p]++;
                 }
             }
         cols[c].push_back({ 0u, "frames", (double)src.count, {} });
+        if (nonFinite)
+            cols[c].push_back({ 0u, "non-finite samples (excluded)", (double)nonFinite, {} });
         for (int p = 0; p < nPl; p++) {
             if (!plC[p]) continue;
             double cnt = (double)plC[p];
@@ -533,7 +569,7 @@ static void runTemporalStats(const MeasureReqHead& head,
         cols[c].push_back({ 1u, "method", 0.0,
             "per-pixel mean/var over " + std::to_string(src.count) +
             " frames; sigma_t = sqrt(mean unbiased temporal var), "
-            "sigma_fpn = spatial sigma of temporal means" +
+            "sigma_fpn = spatial sigma of temporal means; non-finite excluded" +
             std::string(head.cfaType ? "; CFA planes" : "") + "; backend=cpu" });
         series.push_back(std::move(fm));
         series.push_back(std::move(fs));
@@ -548,16 +584,25 @@ static void runFrameRoiStats(const MeasureReqHead& head,
                              const std::vector<RoiRect>& rois) {
     FrameSource src;
     if (!src.init(head, paths)) { sendErr(src.err); return; }
+    if (head.cfaType && src.n.ch != 1) {
+        sendErr("CFA planes need a 1-channel frame");
+        return;
+    }
     uint32_t nCols = rois.empty() ? 1 : (uint32_t)rois.size();
     std::vector<std::vector<MItem>> cols(nCols);
     std::vector<MSeries> series;
     std::vector<uint8_t> raw;
     std::vector<float> pix;
     const int nPl = head.cfaType ? 4 : 1;
+    uint64_t nonFinite = 0;
     for (uint32_t c = 0; c < nCols; c++) {
         uint32_t rx, ry, rw, rh;
         if (!clampRoi(src.n, rois, c, rx, ry, rw, rh)) { sendErr("empty ROI"); return; }
         size_t samples = (size_t)rw * rh * src.n.ch;
+        if (samples > (size_t)64 << 20) {   // one frame's ROI buffer, not unbounded
+            sendErr("ROI too large for frame stats (max 64M samples)");
+            return;
+        }
         std::vector<std::vector<float>> mnY((size_t)nPl), vrY((size_t)nPl);
         std::vector<float> xsAll;
         for (uint32_t f = 0; f < src.count; f++) {
@@ -572,10 +617,11 @@ static void runFrameRoiStats(const MeasureReqHead& head,
                     int p = planeOf(head.cfaType, head.cfaPattern, rx + x, ry + y);
                     for (uint32_t k = 0; k < (uint32_t)src.n.ch; k++) {
                         double v = pix[((size_t)y * rw + x) * src.n.ch + k];
+                        if (!std::isfinite(v)) { nonFinite++; continue; }
                         s1[p] += v; s2[p] += v * v; cn[p]++;
                     }
                 }
-            xsAll.push_back((float)f);
+            xsAll.push_back((float)(src.xBase() + f));
             for (int p = 0; p < nPl; p++) {
                 double m = cn[p] ? s1[p] / (double)cn[p] : 0.0;
                 double var = cn[p] ? std::max(0.0, s2[p] / (double)cn[p] - m * m) : 0.0;
@@ -584,8 +630,10 @@ static void runFrameRoiStats(const MeasureReqHead& head,
             }
         }
         cols[c].push_back({ 0u, "frames", (double)src.count, {} });
+        if (nonFinite)
+            cols[c].push_back({ 0u, "non-finite samples (excluded)", (double)nonFinite, {} });
         cols[c].push_back({ 1u, "method", 0.0,
-            "per-frame spatial mean/var of the ROI, f64 accum" +
+            "per-frame spatial mean/var of the ROI, f64 accum, non-finite excluded" +
             std::string(head.cfaType ? "; CFA planes" : "") + "; backend=cpu" });
         for (int p = 0; p < nPl; p++) {
             MSeries sm, sv;
@@ -607,7 +655,8 @@ static void handleMeasure(Buf& in) {
     if (in.rd + sizeof head > in.b.size()) { sendErr("bad MEASURE"); return; }
     memcpy(&head, in.b.data() + in.rd, sizeof head);
     in.rd += sizeof head;
-    if (head.nPaths == 0 || head.nPaths > 100000 || head.nRois > 4096) {
+    if (head.nPaths == 0 || head.nPaths > 100000 || head.nRois > 4096 ||
+        head.cfaType > 2 || head.cfaPattern > 3) {
         sendErr("bad MEASURE header");
         return;
     }
@@ -720,15 +769,30 @@ int runServeMode() {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     setvbuf(stdout, nullptr, _IOFBF, 1 << 20);
+#if !defined(_WIN32)
+    signal(SIGPIPE, SIG_IGN);   // a vanished ssh must not kill the peer mid-write
+#endif
     g_sink = sendStdio;
     for (;;) {
         Header h{};
         if (!readExact(&h, sizeof h)) return 0;       // peer closed: normal exit
         if (h.magic != MAGIC) return 1;
+        // No legitimate request is anywhere near this size: without the cap, a
+        // 12-byte message claiming a 4 GB payload allocates 4 GB before a single
+        // byte is read (reproduced by the verification agent).
+        if (h.len > (64u << 20)) return 1;
         Buf in;
         in.b.resize(h.len);
         if (h.len && !readExact(in.b.data(), h.len)) return 1;
-        handleRequest(h.type, in);
+        // A malformed request may throw (length_error, bad_alloc): answer with an
+        // error and keep serving - one bad file must not end the session.
+        try {
+            handleRequest(h.type, in);
+        } catch (const std::exception& e) {
+            sendErr(std::string("internal error: ") + e.what());
+        } catch (...) {
+            sendErr("internal error");
+        }
     }
 }
 

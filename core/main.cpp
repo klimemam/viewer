@@ -145,6 +145,7 @@ struct ImageDoc {
     int remoteFrame = 0;
     int remoteStep = 1;
     std::string remoteErr;            // background fetch failed; preview is all we have
+    float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
@@ -326,9 +327,13 @@ struct App {
     // server-side folder becomes an ordinary local stack, one frame at a time.
     struct RFetchJob {
         std::string url, name;
+        std::string exe;              // snapshot at enqueue: the UI may edit
+                                      // remoteExe while the worker connects
         int frame = 0;
         uint64_t uid = 0;
         int seqId = 0, seqIndex = 0;
+        uint32_t gen = 0;             // closeAll bumps the generation; stale
+                                      // results must not graft onto a new list
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -339,7 +344,9 @@ struct App {
         std::vector<float> data;
         std::string url, name;
         int frame = 0, seqId = 0, seqIndex = 0;
+        uint32_t gen = 0;
     };
+    std::atomic<uint32_t> rfGen{ 0 };
     std::thread rfThread;
     std::atomic<bool> rfStop{ false };
     std::atomic<int> rfPending{ 0 };
@@ -783,14 +790,13 @@ static void rfWorker() {
         d.uid = job.uid;
         d.url = job.url; d.name = job.name;
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
+        d.gen = job.gen;
         std::string host, rpath, err;
         if (!remote::parseUrl(job.url, host, rpath)) {
             d.err = "bad remote url";
         } else {
             if (!ses.alive() || sesHost != host) {
-                std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
-                                                                              : app.remoteExe;
-                if (!ses.start(host, exe, err)) d.err = err;
+                if (!ses.start(host, job.exe, err)) d.err = err;
                 else sesHost = host;
             }
             if (d.err.empty()) {
@@ -819,12 +825,20 @@ static void rfWorker() {
 }
 
 static void rfEnqueue(App::RFetchJob job) {
+    job.gen = app.rfGen;
+    // how the peer is invoked, frozen NOW: the UI thread edits remoteExe freely
+    std::string host, rpath;
+    remote::parseUrl(job.url, host, rpath);
+    job.exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath : app.remoteExe;
     {
+        // counters BEFORE the push, under the lock: the worker could finish job 1
+        // while jobs 2..N are still being enqueued, and the pending==0 reset would
+        // restart the progress display mid-stack
         std::lock_guard<std::mutex> lk(app.rfMtx);
+        app.rfPending++;
+        app.rfTotal++;
         app.rfQueue.push_back(std::move(job));
     }
-    app.rfPending++;
-    app.rfTotal++;
     if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
 }
 
@@ -847,6 +861,7 @@ static void pumpRemoteFetch() {
         batch.swap(app.rfDone);
     }
     for (auto& d : batch) {
+        if (d.gen != app.rfGen) continue;   // outlived a Close All: drop entirely
         app.rfPending--;
         app.rfFetched++;
         if (app.rfPending <= 0) {
@@ -906,12 +921,17 @@ static void pumpRemoteFetch() {
         im->vmin = d.vmin; im->vmax = d.vmax;    // measured on the worker
         im->texDirty = true;
         forgetImage(im);                         // caches hold the preview's numbers
-        if (im == cur() && stepBefore > 1) {
-            // same pixels on screen, now through finer data: rescale the shared
-            // view so nothing appears to move when the swap happens
-            app.view.zoom = std::max(app.view.zoom / stepBefore, 1.0f / 512);
-            app.view.center.x *= stepBefore;
-            app.view.center.y *= stepBefore;
+        if (stepBefore > 1) {
+            if (im == cur()) {
+                // same pixels on screen, now through finer data: rescale the
+                // shared view so nothing appears to move at the swap
+                app.view.zoom = std::max(app.view.zoom / stepBefore, 1.0f / 512);
+                app.view.center.x *= stepBefore;
+                app.view.center.y *= stepBefore;
+            } else {
+                // not on screen: remember, and rescale when it is selected
+                im->pendingViewScale = (float)stepBefore;
+            }
         }
         app.imagesRev++;
         fprintf(stderr, "remote: full resolution %dx%d %dch for %s\n",
@@ -949,6 +969,17 @@ static void closeAll() {
     // later file with the same name silently become B again
     app.compareMode = App::CmpOff;
     app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    // in-flight remote fetches belong to the OLD list: bump the generation so
+    // their results are dropped instead of grafting orphan frames onto the new one
+    app.rfGen++;
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        app.rfQueue.clear();
+        app.rfDone.clear();
+        app.rfPending = 0;
+        app.rfTotal = 0;
+        app.rfFetched = 0;
+    }
 }
 
 // ---------------------------------------------------------------- annotations
@@ -1005,6 +1036,17 @@ static void toggleBand(bool horizontal) {
         else            { n->prevY = py; n->prevH = 1; }
         n->label = (horizontal ? "row " + std::to_string(py) : "col " + std::to_string(px));
     }
+}
+
+// A ROI drawn on a 1/3 preview is in PREVIEW coordinates: after the full-res
+// swap it would silently cover 1/9 of the intended area and every panel would
+// measure the wrong region. Placing annotations waits for the real pixels.
+static bool annBlockedOnPreview() {
+    if (cur() && cur()->remoteStep > 1) {
+        toast("preview: wait for full resolution before placing ROIs/pins", true);
+        return true;
+    }
+    return false;
 }
 
 static void deleteAnn(int id) {
@@ -2683,7 +2725,14 @@ static void selectImage(int idx) {
     }
     if (cur() && app.images[idx].get() != cur()) app.prevImageUid = cur()->uid;
     app.current = idx;
-    if (App::SeqInfo* si = seqInfo(app.images[idx]->seqId)) si->lastImageIdx = idx;
+    ImageDoc* d = app.images[idx].get();
+    if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
+        app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
+        app.view.center.x *= d->pendingViewScale;
+        app.view.center.y *= d->pendingViewScale;
+        d->pendingViewScale = 1;
+    }
+    if (App::SeqInfo* si = seqInfo(d->seqId)) si->lastImageIdx = idx;
 }
 // time axis: previous / next frame of the current stack
 static void gotoFrame(int delta, bool absoluteEdge = false, bool toFirst = true) {
@@ -3210,6 +3259,10 @@ static void openRemote(const std::string& url) {
         toast("remote: " + err, true);
         return;
     }
+    if (tw < 1 || th < 1 || tch < 1 || tch > 4) {   // a 0ch doc would crash later
+        toast("remote: peer returned a degenerate frame", true);
+        return;
+    }
     auto doc = std::make_unique<ImageDoc>();
     doc->name = baseName(rpath) + (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
     doc->path = url;
@@ -3728,7 +3781,7 @@ static void drawCanvas(ImVec2 avail) {
                 // extent in EITHER axis, not both - the old "3px in both" rule
                 // made a 1px-tall band impossible to draw.
                 if (tmpRect[2] >= 1 && tmpRect[3] >= 1 &&
-                    (tmpRect[2] >= 3 || tmpRect[3] >= 3))
+                    (tmpRect[2] >= 3 || tmpRect[3] >= 3) && !annBlockedOnPreview())
                     addAnn(0, tmpRect[0], tmpRect[1], tmpRect[2], tmpRect[3]);
             } else if (!dragMoved && clickEligible) {   // middle/Space clicks never select
                 int corner;
@@ -3777,7 +3830,7 @@ static void drawCanvas(ImVec2 avail) {
         }
         if (ImGui::BeginPopup("canvasctx")) {
             bool inRange = app.ctxX >= 0 && app.ctxY >= 0 && app.ctxX < im->w && app.ctxY < im->h;
-            if (ImGui::MenuItem("Add pin here", "P", false, inRange))
+            if (ImGui::MenuItem("Add pin here", "P", false, inRange) && !annBlockedOnPreview())
                 addAnn(1, app.ctxX, app.ctxY, 0, 0);
             App::Ann* sel = findAnn(app.selectedAnn);
             ImGui::Separator();
@@ -5473,6 +5526,16 @@ static void drawFileList() {
         }
         if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
+    if (app.rfPending > 0) {
+        ImGui::SameLine();
+        // the ONLY way to cancel a remote fetch used to be quitting the app
+        if (ImGui::SmallButton("Stop##rf")) {
+            app.rfGen++;
+            std::lock_guard<std::mutex> lk(app.rfMtx);
+            app.rfQueue.clear();
+            app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0;
+        }
+    }
     if (app.rfPending > 0)
         ImGui::TextDisabled("remote: fetching %d/%d", app.rfFetched.load(), app.rfTotal.load());
     if (!app.seqNote.empty()) {          // why the stack is short, kept in view
@@ -5847,6 +5910,14 @@ static void drawMenuBar(GLFWwindow* win) {
 
 // File > Open Remote: the one dialog the OS cannot provide, because the files it
 // lists live on another machine. URL + peer path, both remembered in prefs.
+static bool isNpyName(const std::string& n) {   // FRAME_001.NPY is still a .npy
+    if (n.size() < 4) return false;
+    std::string ext = n.substr(n.size() - 4);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return ext == ".npy";
+}
+
 static void drawRemoteOpenModal() {
     if (app.remoteDlgOpen && !ImGui::IsPopupOpen("Open remote (ssh)")) {
         ImGui::OpenPopup("Open remote (ssh)");
@@ -5879,15 +5950,19 @@ static void drawRemoteOpenModal() {
 
     // Browsing THAT machine is the point - an OS dialog can only ever list this
     // one. LIST is served by the same peer that serves the pixels.
-    auto listDir = [&](const std::string& dir) {
+    auto listDir = [&](std::string dir) {
         std::string host, p, err;
         app.remoteExe = exe;                       // the connect may need it
+        // "C:" is not listable on a Windows-served peer; "C:/" is
+        if (dir.size() == 2 && dir[1] == ':') dir += '/';
         if (!remote::parseUrl(makeRemoteUrl(browseHost, dir), host, p)) return;
-        entries.clear();
+        std::vector<remote::Entry> got;
         browseErr.clear();
-        if (!ensureRemoteSession(host, err) ||
-            !app.remoteSession->list(p, entries, err))
-            browseErr = err;
+        if (!ensureRemoteSession(host, err) || !app.remoteSession->list(p, got, err)) {
+            browseErr = err;   // keep the last GOOD listing: a failed [..] must
+            return;            // not blank the pane and strand the user
+        }
+        entries = std::move(got);
         browseDir = dir;
     };
     if (ImGui::Button("Browse")) {
@@ -5909,8 +5984,7 @@ static void drawRemoteOpenModal() {
         ImGui::TextDisabled("%s", browseDir.c_str());
         int nNpy = 0;
         for (const auto& e : entries)
-            if (!e.dir && e.name.size() > 4 &&
-                e.name.compare(e.name.size() - 4, 4, ".npy") == 0) nNpy++;
+            if (!e.dir && isNpyName(e.name)) nNpy++;
         if (ImGui::BeginChild("rbrowse", ImVec2(ImGui::GetFontSize() * 32,
                                                 ImGui::GetFontSize() * 14), true)) {
             if (browseDir != "/" && ImGui::Selectable("[..]")) {
@@ -5940,11 +6014,27 @@ static void drawRemoteOpenModal() {
             if (ImGui::Button(lb)) {
                 std::vector<std::string> files;
                 for (const auto& e : entries)
-                    if (!e.dir && e.name.size() > 4 &&
-                        e.name.compare(e.name.size() - 4, 4, ".npy") == 0)
+                    if (!e.dir && isNpyName(e.name))
                         files.push_back(browseDir == "/" ? "/" + e.name
                                                          : browseDir + "/" + e.name);
-                std::sort(files.begin(), files.end());
+                // NUMERIC order, not lexicographic: frame_1, frame_10, frame_100,
+                // frame_2 ... would assign scrambled seqIndex, and every temporal
+                // statistic and frame axis would silently lie about time
+                std::sort(files.begin(), files.end(),
+                          [](const std::string& a, const std::string& b) {
+                              auto key = [](const std::string& s) {
+                                  // last run of digits before the extension
+                                  size_t end = s.rfind(".npy");
+                                  if (end == std::string::npos) end = s.size();
+                                  size_t i = end;
+                                  while (i > 0 && isdigit((unsigned char)s[i - 1])) i--;
+                                  long long v = i < end ? atoll(s.c_str() + i) : -1;
+                                  return std::make_pair(s.substr(0, i), v);
+                              };
+                              auto ka = key(a), kb = key(b);
+                              return ka.first != kb.first ? ka.first < kb.first
+                                                          : ka.second < kb.second;
+                          });
                 app.lastRemoteUrl = makeRemoteUrl(browseHost, files[0]);
                 app.prefsDirty = true;
                 savePrefs();
@@ -6124,6 +6214,10 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
+        } else if (a == "--bench" || a == "--crash-test") {
+            next();                                // consumed in main(), not an error
+        } else if (a == "--remote-selftest") {
+            next();
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
         } else if (a == "--mem-budget") {          // GB the sequence loader may use
@@ -6574,6 +6668,9 @@ int main(int argc, char** argv) {
     // The file is opened now, while opening files still works.
     openCrashFile();
     for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
+#if !defined(_WIN32)
+    signal(SIGPIPE, SIG_IGN);   // a dead ssh peer must not kill the viewer mid-write
+#endif
 
     plugin_host::loadAll(
         { plugin_host::exeDir() + "/plugins", plugin_host::exeDir() + "/../plugins" },
@@ -6665,7 +6762,8 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
             // P drops a pin at the pixel under the cursor - no click, no modifier
-            if (ImGui::IsKeyPressed(ImGuiKey_P, false) && app.hoverX >= 0)
+            if (ImGui::IsKeyPressed(ImGuiKey_P, false) && app.hoverX >= 0 &&
+                !annBlockedOnPreview())
                 addAnn(1, app.hoverX, app.hoverY, 0, 0);
             // X/Y: TOGGLE the selected ROI between its rect and full width / height.
             // Press once = row/column band, press again = restore the remembered rect.
