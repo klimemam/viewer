@@ -263,6 +263,7 @@ struct App {
     } temporal;
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
+    int npyAxis = 0;                  // ambiguous 3D npy: 0 = auto, 1 = leading axis is frames
     // panel visibility (persisted with the ImGui layout)
     bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
     bool showHistogram = true, showTemporal = true;
@@ -512,6 +513,51 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
     }
 }
 
+// Load a .npy; an array with a frame axis becomes one stack (塊), which is what
+// the temporal analysis operates on.
+static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
+                                                int frameIdx, int& framesOut,
+                                                int64_t& frameStrideOut);   // defined below
+
+static std::string loadNpy(const std::string& path) {
+    std::string err;
+    int frames = 1;
+    int64_t fstride = 0;
+    auto first = decodeNpyFrame(path, err, 0, frames, fstride);
+    if (!first) return err.empty() ? "decode failed" : err;
+    if (frames <= 1) { addImage(std::move(first)); return {}; }
+
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = baseName(path) + "  (" + std::to_string(frames) + " frames)";
+    app.seqs.push_back(info);
+    first->seqId = info.id;
+    first->seqIndex = 0;
+    int firstIdx = (int)app.images.size();
+    addImage(std::move(first));
+    info.lastImageIdx = firstIdx;
+    const ImageDoc* ref = app.images[firstIdx].get();
+    for (int f = 1; f < frames; f++) {
+        std::string e2;
+        int fr = 1; int64_t fs = 0;
+        auto doc = decodeNpyFrame(path, e2, f, fr, fs);
+        if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
+        doc->seqId = info.id;
+        doc->seqIndex = f;
+        computeMinMax(*doc);
+        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        doc->texDirty = true;
+        app.images.push_back(std::move(doc));
+    }
+    for (auto& s : app.seqs)
+        if (s.id == info.id) s.lastImageIdx = firstIdx;
+    int got = 0;
+    for (const auto& d : app.images) if (d->seqId == info.id) got++;
+    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", baseName(path).c_str(), got,
+            ref->w, ref->h, ref->ch);
+    return {};
+}
+
 static void runProcessor(int idx) {
     ImageDoc* im = cur();
     if (!im || idx < 0 || idx >= (int)plugin_host::processors().size()) return;
@@ -552,8 +598,13 @@ static void runProcessor(int idx) {
 // ---------------------------------------------------------------- npy loader
 // returns error string, empty = ok
 // Pure decoder: no app state, no GL — safe to call from the sequence loader thread.
-static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
+// framesOut/frameStrideOut report a frame axis (F,H,W[,C]); frameIdx selects one.
+static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
+                                                int frameIdx, int& framesOut,
+                                                int64_t& frameStrideOut) {
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
+    framesOut = 1;
+    frameStrideOut = 0;
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return fail("cannot read file");
     if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
@@ -659,11 +710,30 @@ static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string&
     if (fortran) { int64_t s = 1; for (size_t i = 0; i < shape.size(); i++) { strides[i] = s; s *= shape[i]; } }
     else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
 
+    // Layout decision. A leading axis that is not a plausible channel count is a
+    // FRAME axis: (F,H,W) / (F,H,W,1) / (F,H,W,C) load as a stack, not as one
+    // image. app.npyAxis can force the ambiguous small-leading-axis case.
     std::string note;
-    while (shape.size() > 3) {          // take [0] of batch dims
-        if (shape[0] != 1) note = "showing [0] of batch";
+    int64_t F = 1, sf = 0;
+    while (shape.size() > 4) {          // deeper than (F,H,W,C): take [0]
+        if (shape[0] != 1) note = "showing [0] of leading axis";
         shape.erase(shape.begin());
         strides.erase(strides.begin());
+    }
+    if (shape.size() == 4) {            // (F,H,W,C) or (F,C,H,W)
+        F = shape[0]; sf = strides[0];
+        shape.erase(shape.begin());
+        strides.erase(strides.begin());
+    } else if (shape.size() == 3) {
+        bool lastIsChannels = shape[2] <= 4;
+        bool firstIsChannels = shape[0] <= 4;
+        bool asFrames = !lastIsChannels &&
+                        (!firstIsChannels || app.npyAxis == 1);   // 1 = force frames
+        if (asFrames || (firstIsChannels && app.npyAxis == 1)) {
+            F = shape[0]; sf = strides[0];
+            shape.erase(shape.begin());
+            strides.erase(strides.begin());
+        }
     }
     int64_t H, W, C, sh, sw, sc;
     if (shape.size() == 1) { H = 1; W = shape[0]; C = 1; sh = 0; sw = strides[0]; sc = 0; }
@@ -675,6 +745,11 @@ static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string&
         else return fail("shape not interpretable as image");
     }
     if (W < 1 || H < 1 || W > 32768 || H > 32768) return fail("unsupported image size");
+    if (F > 1) {                        // multi-frame: caller turns this into a stack
+        framesOut = (int)F;
+        frameStrideOut = sf;
+        note = note.empty() ? "frame axis" : note + ", frame axis";
+    }
 
     auto im = std::make_unique<ImageDoc>();
     im->name = baseName(path); im->path = path;
@@ -685,16 +760,12 @@ static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string&
     for (int64_t y = 0; y < H; y++)
         for (int64_t x = 0; x < W; x++)
             for (int64_t c = 0; c < C; c++)
-                im->data[di++] = getVal((size_t)(y * sh + x * sw + c * sc));
+                im->data[di++] = getVal((size_t)(frameIdx * sf + y * sh + x * sw + c * sc));
     return im;
 }
-
-static std::string loadNpy(const std::string& path) {
-    std::string err;
-    auto im = decodeNpy(path, err);
-    if (!im) return err.empty() ? "decode failed" : err;
-    addImage(std::move(im));
-    return {};
+static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
+    int frames = 1; int64_t fstride = 0;
+    return decodeNpyFrame(path, errOut, 0, frames, fstride);
 }
 
 // ---------------------------------------------------------------- raw loader
@@ -2694,7 +2765,15 @@ static void drawInspector() {
     if (im) {
         // two short lines instead of one long one: the merged line was clipped in
         // a ~300px dock (Text never wraps and there is no horizontal scrollbar)
-        ImGui::Text("%dx%d  %dch  %s", im->w, im->h, im->ch, im->dtype.c_str());
+        if (im->seqId != 0) {
+            std::vector<int> fr = framesOfSeq(im->seqId);
+            int pos = 0;
+            for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
+            ImGui::Text("%dx%d  %dch  %s   frame %d/%d", im->w, im->h, im->ch, im->dtype.c_str(),
+                        pos + 1, (int)fr.size());
+        } else {
+            ImGui::Text("%dx%d  %dch  %s", im->w, im->h, im->ch, im->dtype.c_str());
+        }
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
@@ -3351,8 +3430,10 @@ static void drawFileList() {
             if (stack[k] == app.current) { pos = k; active = true; }
         ImGui::PushID(head.seqId);
         char lb[512];
-        snprintf(lb, 512, "%s  [%d]", si ? si->name.c_str() : "sequence", (int)stack.size());
-        if (rowWithMeta(head, lb, active)) { selectImage(stack[pos]); app.fitRequested = true; }
+        snprintf(lb, 512, "%s", si ? si->name.c_str() : "sequence");
+        char frames[24];
+        snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
+        if (rowWithMeta(head, lb, active, frames)) { selectImage(stack[pos]); app.fitRequested = true; }
         if (active) {
             int slider = pos;
             ImGui::SetNextItemWidth(-1);
@@ -3597,6 +3678,7 @@ static void printUsage() {
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
+        "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -3661,6 +3743,11 @@ static void parseCli(int argc, char** argv) {
         } else if (a == "--quad-bayer") {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
+        } else if (a == "--npy-axis") {
+            std::string v = next();
+            if (v == "frames") app.npyAxis = 1;
+            else if (v == "auto" || v == "channels") app.npyAxis = 0;
+            else fprintf(stderr, "--npy-axis expects auto|frames\n");
         } else if (a == "--sequence") {            // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
