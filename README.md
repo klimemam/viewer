@@ -97,7 +97,8 @@ python tools/gen_testdata.py         # テスト画像生成
 
 | 入力 | 詳細 |
 |---|---|
-| `.npy` | u8/i8/u16/i16/u32/i32/f32/f64/bool。(H,W)・(H,W,C)・(C,H,W)・バッチ先頭。BE/Fortran 対応 |
+| `.npy` | u8/i8/u16/i16/u32/i32/f32/f64/bool。(H,W)・(H,W,C)・(C,H,W)、**(F,H,W[,C]) はフレーム軸として塊に**。BE/Fortran 対応 |
+| `.npz` | `savez`(非圧縮)・`savez_compressed`(deflate)の両対応、zip64 可。全配列を読み込み |
 | `.bin` `.raw` `.yuv` ほか | 2軸指定: {u8,u16,f32,f64}×{Gray,RGB,BGR,RGBA,BGRA,Bayer,Quad Bayer}、オフセット/エンディアン/**crop** |
 | `.vsession` | セッション(画像レシピ+表示状態+アノテーション) |
 

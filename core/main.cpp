@@ -21,6 +21,7 @@
 #include "imgui_impl_opengl3.h"
 #include "portable-file-dialogs.h"
 #include "plugin_host.h"
+#include "miniz.h"                   // deflate for compressed .npz members
 #include "ui_theme.h"
 
 #include <algorithm>
@@ -513,11 +514,169 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
     }
 }
 
+// ---------------------------------------------------------------- .npz (zip)
+// Minimal zip reader for npz: central-directory walk, stored (0) and deflate (8),
+// with zip64 sizes. Inflate comes from miniz.
+static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf,
+                                                 const std::string& path,
+                                                 const std::string& displayName,
+                                                 std::string& errOut, int frameIdx,
+                                                 int& framesOut, int64_t& frameStrideOut);
+struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
+
+static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
+    auto rd16 = [&](size_t o) { return (uint16_t)(buf[o] | buf[o + 1] << 8); };
+    auto rd32 = [&](size_t o) {
+        return (uint32_t)buf[o] | (uint32_t)buf[o + 1] << 8 |
+               (uint32_t)buf[o + 2] << 16 | (uint32_t)buf[o + 3] << 24;
+    };
+    auto rd64 = [&](size_t o) {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v |= (uint64_t)buf[o + i] << (8 * i);
+        return v;
+    };
+    if (buf.size() < 22) { err = "not a zip file"; return false; }
+    size_t eocd = SIZE_MAX;
+    size_t start = buf.size() > 65557 ? buf.size() - 65557 : 0;
+    for (size_t i = buf.size() - 22 + 1; i-- > start;)
+        if (rd32(i) == 0x06054b50) { eocd = i; break; }
+    if (eocd == SIZE_MAX) { err = "not a zip file (no end record)"; return false; }
+    uint64_t count = rd16(eocd + 10);
+    uint64_t cdOff = rd32(eocd + 16);
+    if (cdOff == 0xffffffffu || count == 0xffffu) {          // zip64
+        if (eocd >= 20 && rd32(eocd - 20) == 0x07064b50) {
+            uint64_t z64 = rd64(eocd - 20 + 8);
+            if (z64 + 56 <= buf.size() && rd32((size_t)z64) == 0x06064b50) {
+                count = rd64((size_t)z64 + 32);
+                cdOff = rd64((size_t)z64 + 48);
+            }
+        }
+    }
+    size_t p = (size_t)cdOff;
+    for (uint64_t i = 0; i < count && p + 46 <= buf.size(); i++) {
+        if (rd32(p) != 0x02014b50) break;
+        NpzEntry e{};
+        e.method = rd16(p + 10);
+        e.csize = rd32(p + 20);
+        e.usize = rd32(p + 24);
+        uint16_t nlen = rd16(p + 28), elen = rd16(p + 30), clen = rd16(p + 32);
+        e.localOff = rd32(p + 42);
+        if (p + 46 + nlen > buf.size()) break;
+        e.name.assign((const char*)&buf[p + 46], nlen);
+        if (e.csize == 0xffffffffu || e.usize == 0xffffffffu || e.localOff == 0xffffffffu) {
+            size_t ep = p + 46 + nlen, eend = ep + elen;      // zip64 extra field
+            while (ep + 4 <= eend && ep + 4 <= buf.size()) {
+                uint16_t id = rd16(ep), sz = rd16(ep + 2);
+                if (id == 1) {
+                    size_t q = ep + 4;
+                    if (e.usize == 0xffffffffu) { e.usize = (size_t)rd64(q); q += 8; }
+                    if (e.csize == 0xffffffffu) { e.csize = (size_t)rd64(q); q += 8; }
+                    if (e.localOff == 0xffffffffu) { e.localOff = (size_t)rd64(q); }
+                    break;
+                }
+                ep += 4 + sz;
+            }
+        }
+        out.push_back(std::move(e));
+        p += 46 + nlen + elen + clen;
+    }
+    if (out.empty()) { err = "zip contains no entries"; return false; }
+    return true;
+}
+
+static bool npzExtract(const std::vector<uint8_t>& zip, const NpzEntry& e,
+                       std::vector<uint8_t>& out, std::string& err) {
+    if (e.localOff + 30 > zip.size()) { err = "corrupt local header"; return false; }
+    auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
+    size_t nlen = rd16(e.localOff + 26), elen = rd16(e.localOff + 28);
+    size_t data = e.localOff + 30 + nlen + elen;
+    if (data + e.csize > zip.size()) { err = "truncated zip member"; return false; }
+    if (e.method == 0) {                                     // stored
+        out.assign(zip.begin() + data, zip.begin() + data + e.csize);
+        return true;
+    }
+    if (e.method != 8) { err = "unsupported zip compression method"; return false; }
+    // zip members are RAW deflate (no zlib header), and the uncompressed size is
+    // known from the directory, so decompress straight into the output buffer
+    out.resize(e.usize);
+    size_t got = tinfl_decompress_mem_to_mem(out.data(), out.size(),
+                                             zip.data() + data, e.csize, 0);
+    if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) { err = "inflate failed"; return false; }
+    out.resize(got);
+    return true;
+}
+
 // Load a .npy; an array with a frame axis becomes one stack (塊), which is what
 // the temporal analysis operates on.
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
                                                 int64_t& frameStrideOut);   // defined below
+
+// Shared by .npy files and .npz members: build a stack when the array has a
+// frame axis, otherwise a single image.
+static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
+                                 const std::string& displayName) {
+    std::string err;
+    int frames = 1;
+    int64_t fstride = 0;
+    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride);
+    if (!first) return err.empty() ? "decode failed" : err;
+    std::string label = first->name;
+    if (frames <= 1) { addImage(std::move(first)); return {}; }
+
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = label + "  (" + std::to_string(frames) + " frames)";
+    app.seqs.push_back(info);
+    first->seqId = info.id;
+    first->seqIndex = 0;
+    int firstIdx = (int)app.images.size();
+    addImage(std::move(first));
+    const ImageDoc* ref = app.images[firstIdx].get();
+    for (int f = 1; f < frames; f++) {
+        std::string e2;
+        int fr = 1; int64_t fs = 0;
+        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs);
+        if (!doc) { toast(label + ": frame " + std::to_string(f) + ": " + e2, true); break; }
+        doc->seqId = info.id;
+        doc->seqIndex = f;
+        computeMinMax(*doc);
+        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        doc->texDirty = true;
+        app.images.push_back(std::move(doc));
+    }
+    for (auto& s : app.seqs)
+        if (s.id == info.id) s.lastImageIdx = firstIdx;
+    int got = 0;
+    for (const auto& d : app.images) if (d->seqId == info.id) got++;
+    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", label.c_str(), got,
+            ref->w, ref->h, ref->ch);
+    return {};
+}
+
+static std::string loadNpz(const std::string& path) {
+    std::vector<uint8_t> zip;
+    if (!readFileBytes(path, zip)) return "cannot read file";
+    std::vector<NpzEntry> entries;
+    std::string err;
+    if (!npzList(zip, entries, err)) return err;
+    int loaded = 0, stored = 0, deflated = 0;
+    for (const auto& e : entries) {
+        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
+        std::vector<uint8_t> member;
+        std::string mErr;
+        if (!npzExtract(zip, e, member, mErr)) { toast(e.name + ": " + mErr, true); continue; }
+        std::string label = baseName(path) + ":" + e.name.substr(0, e.name.size() - 4);
+        std::string lErr = loadNpyBuffer(member, path, label);
+        if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
+        loaded++;
+        (e.method == 0 ? stored : deflated)++;
+    }
+    if (!loaded) return "no readable arrays in npz";
+    fprintf(stderr, "npz: %s - %d array(s) (%d stored, %d deflate)\n",
+            baseName(path).c_str(), loaded, stored, deflated);
+    return {};
+}
 
 static std::string loadNpy(const std::string& path) {
     std::string err;
@@ -599,14 +758,14 @@ static void runProcessor(int idx) {
 // returns error string, empty = ok
 // Pure decoder: no app state, no GL — safe to call from the sequence loader thread.
 // framesOut/frameStrideOut report a frame axis (F,H,W[,C]); frameIdx selects one.
-static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
-                                                int frameIdx, int& framesOut,
-                                                int64_t& frameStrideOut) {
+static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf,
+                                                 const std::string& path,
+                                                 const std::string& displayName,
+                                                 std::string& errOut, int frameIdx,
+                                                 int& framesOut, int64_t& frameStrideOut) {
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     framesOut = 1;
     frameStrideOut = 0;
-    std::vector<uint8_t> buf;
-    if (!readFileBytes(path, buf)) return fail("cannot read file");
     if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
         return fail("not a .npy file (bad magic)");
     int major = buf[6];
@@ -752,7 +911,8 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
     }
 
     auto im = std::make_unique<ImageDoc>();
-    im->name = baseName(path); im->path = path;
+    im->name = displayName.empty() ? baseName(path) : displayName;
+    im->path = path;
     im->w = (int)W; im->h = (int)H; im->ch = (int)C;
     im->dtype = dtypeName; im->note = note;
     im->data.resize((size_t)W * H * C);
@@ -762,6 +922,14 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
             for (int64_t c = 0; c < C; c++)
                 im->data[di++] = getVal((size_t)(frameIdx * sf + y * sh + x * sw + c * sc));
     return im;
+}
+
+static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
+                                                int frameIdx, int& framesOut,
+                                                int64_t& frameStrideOut) {
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
+    return decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
 }
 static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
     int frames = 1; int64_t fstride = 0;
@@ -1503,7 +1671,7 @@ static void gotoStack(int delta) {
 }
 
 // ---- open a whole folder tree: every numbered group becomes its own stack ----
-static const char* SEQ_EXTS[] = { ".npy", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+static const char* SEQ_EXTS[] = { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
 static bool isLoadableExt(const std::string& extLower) {
     for (const char* e : SEQ_EXTS) if (extLower == e) return true;
     return false;
@@ -1965,6 +2133,10 @@ static void openPath(const std::string& path) {
         std::string err = loadNpy(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
+    } else if (ends(".npz")) {
+        std::string err = loadNpz(path);
+        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        else toast("loaded " + baseName(path));
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -1983,7 +2155,7 @@ static void openFileDialog() {
     }
     if (app.openDlg) return;             // one dialog at a time
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (*.npy *.bin *.raw *.yuv *.dat)", "*.npy *.bin *.raw *.yuv *.dat",
+        std::vector<std::string>{ "Images (*.npy *.npz *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.bin *.raw *.yuv *.dat",
           "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
@@ -3664,7 +3836,7 @@ static void drawHelpAbout() {
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
-        "  files:  .npy, .vsession (saved session), or raw binaries (.bin/.raw/.yuv/...)\n"
+        "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
         "  folder: loads every numbered sequence below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
@@ -3773,6 +3945,7 @@ static void parseCli(int argc, char** argv) {
             std::transform(low.begin(), low.end(), low.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
             bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
+                           (low.size() > 4 && low.compare(low.size() - 4, 4, ".npz") == 0) ||
                            (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
             if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;

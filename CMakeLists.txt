@@ -26,6 +26,12 @@ FetchContent_Declare(imgui
   URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.8-docking.zip)
 FetchContent_MakeAvailable(imgui)
 
+# miniz: single-file deflate, used to read compressed .npz members
+FetchContent_Declare(miniz
+  URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip
+  SOURCE_SUBDIR does-not-exist)
+FetchContent_MakeAvailable(miniz)
+
 # portable-file-dialogs: header-only; post-0.1.0 snapshot needed for pfd::settings::available().
 # Bogus SOURCE_SUBDIR makes MakeAvailable download without add_subdirectory.
 FetchContent_Declare(pfd
@@ -48,9 +54,13 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
-add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp)
+add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
+                      ${miniz_SOURCE_DIR}/miniz.c)
+# third-party: do not police its warnings
+set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES COMPILE_OPTIONS
+                            "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>")
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
-target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR})
+target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
 endif()
