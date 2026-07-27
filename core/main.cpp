@@ -587,6 +587,45 @@ static void addAnn(int type, int x, int y, int w, int h) {
     app.selectedAnn = app.anns.back().id;
     app.annRev++;
 }
+// X / Y: row and column selection. A band is a ROI one pixel thick, which is why
+// it cannot be drawn by dragging - so it has to come from a key:
+//   ROI selected     -> toggle band <-> the rect it had before
+//   POI selected     -> the row/column through that pin (toggle back = the pixel)
+//   nothing selected -> the row/column through the pixel under the cursor
+static void toggleBand(bool horizontal) {
+    ImageDoc* im = cur();
+    if (!im) return;
+    App::Ann* a = findAnn(app.selectedAnn);
+    if (a && a->type == 0) {                     // ROI: the existing toggle
+        if (horizontal) {
+            bool full = a->x == 0 && a->w == im->w;
+            if (full && a->prevW >= 1) { a->x = a->prevX; a->w = a->prevW; a->prevW = -1; }
+            else if (!full)            { a->prevX = a->x; a->prevW = a->w; a->x = 0; a->w = im->w; }
+        } else {
+            bool full = a->y == 0 && a->h == im->h;
+            if (full && a->prevH >= 1) { a->y = a->prevY; a->h = a->prevH; a->prevH = -1; }
+            else if (!full)            { a->prevY = a->y; a->prevH = a->h; a->y = 0; a->h = im->h; }
+        }
+        app.annRev++;
+        return;
+    }
+    int px = -1, py = -1;
+    if (a && a->type == 1) { px = a->x; py = a->y; }          // the selected pin
+    else if (app.hoverX >= 0) { px = app.hoverX; py = app.hoverY; }
+    if (px < 0 || px >= im->w || py < 0 || py >= im->h) {
+        toast("select a pin, or hover a pixel, then press X or Y");
+        return;
+    }
+    if (horizontal) addAnn(0, 0, py, im->w, 1);               // whole row
+    else            addAnn(0, px, 0, 1, im->h);               // whole column
+    App::Ann* n = findAnn(app.selectedAnn);
+    if (n) {   // pressing X/Y again collapses the band back onto that one pixel
+        if (horizontal) { n->prevX = px; n->prevW = 1; }
+        else            { n->prevY = py; n->prevH = 1; }
+        n->label = (horizontal ? "row " + std::to_string(py) : "col " + std::to_string(px));
+    }
+}
+
 static void deleteAnn(int id) {
     for (size_t i = 0; i < app.anns.size(); i++)
         if (app.anns[i].id == id) { app.anns.erase(app.anns.begin() + i); break; }
@@ -2980,7 +3019,11 @@ static void drawCanvas(ImVec2 avail) {
         if (ImGui::IsItemDeactivated()) {
             ImVec2 q = dragToImg(io.MousePos);
             if (dk == DK_ROI_NEW && dragMoved && tmpActive) {
-                if (tmpRect[2] >= 3 && tmpRect[3] >= 3)   // ignore accidental micro-drags
+                // A long thin drag is a deliberate row/column band, so require
+                // extent in EITHER axis, not both - the old "3px in both" rule
+                // made a 1px-tall band impossible to draw.
+                if (tmpRect[2] >= 1 && tmpRect[3] >= 1 &&
+                    (tmpRect[2] >= 3 || tmpRect[3] >= 3))
                     addAnn(0, tmpRect[0], tmpRect[1], tmpRect[2], tmpRect[3]);
             } else if (!dragMoved && clickEligible) {   // middle/Space clicks never select
                 int corner;
@@ -3033,11 +3076,26 @@ static void drawCanvas(ImVec2 avail) {
                 addAnn(1, app.ctxX, app.ctxY, 0, 0);
             App::Ann* sel = findAnn(app.selectedAnn);
             ImGui::Separator();
-            if (ImGui::MenuItem("Full width (row band)", "X", false, sel && sel->type == 0)) {
-                sel->x = 0; sel->w = im->w; app.annRev++;
+            // a single row / column is one pixel thick and cannot be dragged out
+            if (ImGui::MenuItem("Select this row (1 px)", "X", false, inRange)) {
+                addAnn(0, 0, app.ctxY, im->w, 1);
+                if (App::Ann* n = findAnn(app.selectedAnn)) {
+                    n->prevX = app.ctxX; n->prevW = 1;
+                    n->label = "row " + std::to_string(app.ctxY);
+                }
             }
-            if (ImGui::MenuItem("Full height (column band)", "Y", false, sel && sel->type == 0)) {
-                sel->y = 0; sel->h = im->h; app.annRev++;
+            if (ImGui::MenuItem("Select this column (1 px)", "Y", false, inRange)) {
+                addAnn(0, app.ctxX, 0, 1, im->h);
+                if (App::Ann* n = findAnn(app.selectedAnn)) {
+                    n->prevY = app.ctxY; n->prevH = 1;
+                    n->label = "col " + std::to_string(app.ctxX);
+                }
+            }
+            if (ImGui::MenuItem("Widen ROI to full width", nullptr, false, sel && sel->type == 0)) {
+                sel->prevX = sel->x; sel->prevW = sel->w; sel->x = 0; sel->w = im->w; app.annRev++;
+            }
+            if (ImGui::MenuItem("Widen ROI to full height", nullptr, false, sel && sel->type == 0)) {
+                sel->prevY = sel->y; sel->prevH = sel->h; sel->y = 0; sel->h = im->h; app.annRev++;
             }
             if (ImGui::MenuItem("Crop image to this ROI", nullptr, false, sel && sel->type == 0))
                 cropCurrentToSelectedRoi();
@@ -4349,11 +4407,18 @@ static void drawPanelRois() {
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
         } else {
-            ImGui::TextDisabled("point annotation - move it with the Pin tool");
+            int v[2] = { sel->x, sel->y };
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputInt2("##pinxy", v)) {
+                sel->x = std::clamp(v[0], 0, im->w - 1);
+                sel->y = std::clamp(v[1], 0, im->h - 1);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
+            ImGui::TextDisabled("X / Y: select this pin's row / column");
         }
     } else {
         ImGui::TextDisabled("target: whole image (%dx%d, %s)", im->w, im->h, im->dtype.c_str());
-        ImGui::TextDisabled("draw a ROI with the R tool to measure a region");
+        ImGui::TextDisabled("drag a ROI, or X / Y for the row / column under the cursor");
     }
     ImGui::EndChild();
 }
@@ -4841,7 +4906,8 @@ static void drawHelpAbout() {
                 row("wheel / Shift+wheel", "pan vertical / horizontal");
                 row("middle-drag / Space+drag", "pan");
                 row("Shift+drag",    "the other one of pan / new ROI");
-                row("X / Y",         "toggle selected ROI full width / height (press again to restore)");
+                row("X / Y",         "select the row / column: through the selected pin, the "
+                                     "cursor, or widen the selected ROI (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
                 row("\\ or C",       "A/B compare: off -> wipe -> side by side");
                 row("Shift+\\",      "swap A and B");
@@ -5264,32 +5330,8 @@ int main(int argc, char** argv) {
                 addAnn(1, app.hoverX, app.hoverY, 0, 0);
             // X/Y: TOGGLE the selected ROI between its rect and full width / height.
             // Press once = row/column band, press again = restore the remembered rect.
-            if (ImGui::IsKeyPressed(ImGuiKey_X, false) && cur()) {
-                if (App::Ann* a = findAnn(app.selectedAnn))
-                    if (a->type == 0) {
-                        bool fullW = a->x == 0 && a->w == cur()->w;
-                        if (fullW && a->prevW >= 1) {
-                            a->x = a->prevX; a->w = a->prevW; a->prevW = -1;
-                        } else if (!fullW) {
-                            a->prevX = a->x; a->prevW = a->w;
-                            a->x = 0; a->w = cur()->w;
-                        }
-                        app.annRev++;
-                    }
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Y, false) && cur()) {
-                if (App::Ann* a = findAnn(app.selectedAnn))
-                    if (a->type == 0) {
-                        bool fullH = a->y == 0 && a->h == cur()->h;
-                        if (fullH && a->prevH >= 1) {
-                            a->y = a->prevY; a->h = a->prevH; a->prevH = -1;
-                        } else if (!fullH) {
-                            a->prevY = a->y; a->prevH = a->h;
-                            a->y = 0; a->h = cur()->h;
-                        }
-                        app.annRev++;
-                    }
-            }
+            if (ImGui::IsKeyPressed(ImGuiKey_X, false)) toggleBand(true);
+            if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) toggleBand(false);
             // arrows: horizontal = time (frames), vertical = stacks
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) gotoFrame(1);
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) gotoFrame(-1);
