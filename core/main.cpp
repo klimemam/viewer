@@ -2774,8 +2774,12 @@ static void drawPanelHistogram() {
                  H.maxBin);
         char xl[80];
         snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+        // fill the rest of the panel: a fixed height overflowed the bottom dock
+        float hAvail = ImGui::GetContentRegionAvail().y
+                     - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
+                     - ImGui::GetTextLineHeightWithSpacing();
         PlotRect hp = beginPlot(xl, yl, im->black, im->white, 0.0f, 1.0f, false, false,
-                                110.0f * app.uiScale);
+                                std::max(hAvail, 70.0f * app.uiScale));
         if (hp.ok) {
             ImDrawList* hdl = ImGui::GetWindowDrawList();
             hdl->PushClipRect(hp.p0, hp.p1, true);
@@ -2835,8 +2839,11 @@ static void drawPanelTemporal() {
             float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
             char yl[64];
             snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+            float tAvail = ImGui::GetContentRegionAvail().y
+                         - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
             PlotRect tp = beginPlot("frame number (index in sequence)", yl,
-                                    fx0, fx1, mn, mx, true, false, 90.0f * app.uiScale);
+                                    fx0, fx1, mn, mx, true, false,
+                                    std::max(tAvail, 70.0f * app.uiScale));
             if (tp.ok) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 dl->PushClipRect(tp.p0, tp.p1, true);
@@ -3142,13 +3149,19 @@ static void drawPanelAnalysis() {
             if (!ana.err.empty())
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
             int nCols = 1 + (int)ana.cols.size();
-            if (nCols > 16)
-                ImGui::TextDisabled("too many ROI columns (>15): hide some ROIs to see the grid");
-            if (!ana.keys.empty() && nCols <= 16 &&
+            // SizingFixedFit + explicit inner width: with StretchProp, ScrollX never
+            // scrolled and simply clipped the numbers (hence the old 16-column cap)
+            float colW = ImGui::GetFontSize() * 7.0f;
+            if (!ana.keys.empty() &&
                 ImGui::BeginTable("anagrid", nCols,
-                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX)) {
-                ImGui::TableSetupColumn("");
-                for (const auto& cn : ana.cols) ImGui::TableSetupColumn(cn.c_str());
+                                  ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX |
+                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_BordersInnerV,
+                                  ImVec2(0, 0), nCols * colW)) {
+                ImGui::TableSetupScrollFreeze(1, 1);   // keep the metric names in view
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, colW);
+                for (const auto& cn : ana.cols)
+                    ImGui::TableSetupColumn(cn.c_str(), ImGuiTableColumnFlags_WidthFixed, colW);
                 ImGui::TableHeadersRow();
                 for (int k = 0; k < (int)ana.keys.size(); k++) {
                     ImGui::TableNextRow();
