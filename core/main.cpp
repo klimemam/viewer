@@ -4045,12 +4045,17 @@ static void drawInspector() {
                 if (ImGui::Checkbox("auto scale", &autoGain))
                     app.diffGain = autoGain ? 0 : app.diff.gain;
                 if (!autoGain) {
-                    float g = app.diffGain;
+                    // shadow buffer: each keystroke would otherwise rebuild the
+                    // whole difference image (107 ms at 12 Mpx)
+                    static float g = 0;
+                    static bool gEditing = false;
+                    if (!gEditing) g = app.diffGain > 0 ? app.diffGain : app.diff.gain;
                     ImGui::SetNextItemWidth(numColW() * 2);
                     // step on round numbers, as everywhere else
-                    if (ImGui::InputFloat(intType ? "full scale [DN]" : "full scale", &g,
-                                          niceCeil(g) * 0.1f, niceCeil(g), "%g"))
-                        app.diffGain = std::max(g, 1e-9f);
+                    ImGui::InputFloat(intType ? "full scale [DN]" : "full scale", &g,
+                                      niceCeil(g) * 0.1f, niceCeil(g), "%g");
+                    gEditing = ImGui::IsItemActive();
+                    if (ImGui::IsItemDeactivatedAfterEdit()) app.diffGain = std::max(g, 1e-9f);
                 } else {
                     ImGui::TextDisabled("full scale +-%g%s (99.9%% of |A-B|)",
                                         app.diff.gain, intType ? " DN" : "");
@@ -4446,10 +4451,16 @@ static void drawPanelProjection() {
     else { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }   // shared H/V
     if (app.projYMode == 2) {
         ImGui::SameLine();
-        float v[2] = { app.projYLo, app.projYHi };
+        // shadow buffer: committing per keystroke would re-project the image on
+        // every digit typed
+        static float pv[2] = {};
+        static bool pvEditing = false;
+        if (!pvEditing) { pv[0] = app.projYLo; pv[1] = app.projYHi; }
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
-        if (ImGui::InputFloat2("##projy", v, "%.5g") && v[1] > v[0]) {
-            app.projYLo = v[0]; app.projYHi = v[1];
+        ImGui::InputFloat2("##projy", pv, "%.5g");
+        pvEditing = ImGui::IsItemActive();
+        if (ImGui::IsItemDeactivatedAfterEdit() && pv[1] > pv[0]) {
+            app.projYLo = pv[0]; app.projYHi = pv[1];
         }
     }
 
@@ -4780,15 +4791,27 @@ static void drawPanelRois() {
         if (ImGui::IsItemDeactivatedAfterEdit())
             app.annRev++;                           // ...but re-analyze only on commit
         if (sel->type == 0) {
-            int v[4] = { sel->x, sel->y, sel->w, sel->h };
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputInt4("##xywh", v)) {   // full width: a visible label would clip
-                sel->x = std::clamp(v[0], 0, im->w - 1);
-                sel->y = std::clamp(v[1], 0, im->h - 1);
-                sel->w = std::clamp(v[2], 1, im->w - sel->x);
-                sel->h = std::clamp(v[3], 1, im->h - sel->y);
+            // Commit on Enter/focus-loss, not per keystroke. The caches key on the
+            // resolved rect, so applying "5", "51", "512" as you type would rescan
+            // the histogram, the ROI stats and every analyzer three times - that is
+            // what made typing in these fields feel like the app had died.
+            static int xywh[4] = {};
+            static bool xywhEditing = false;
+            static int xywhId = -1;
+            if (!xywhEditing || xywhId != sel->id) {   // follow the ROI until edited
+                xywh[0] = sel->x; xywh[1] = sel->y; xywh[2] = sel->w; xywh[3] = sel->h;
+                xywhId = sel->id;
             }
-            if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputInt4("##xywh", xywh);      // full width: a visible label would clip
+            xywhEditing = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                sel->x = std::clamp(xywh[0], 0, im->w - 1);
+                sel->y = std::clamp(xywh[1], 0, im->h - 1);
+                sel->w = std::clamp(xywh[2], 1, im->w - sel->x);
+                sel->h = std::clamp(xywh[3], 1, im->h - sel->y);
+                app.annRev++;
+            }
         } else {
             int v[2] = { sel->x, sel->y };
             ImGui::SetNextItemWidth(-1);
