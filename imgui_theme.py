@@ -75,6 +75,10 @@ def apply_shape_style(style=None):
     style.separator_text_border_size = 2.0
     style.separator_text_padding = imgui.ImVec2(18, 4)
 
+    # Wide splitters between docked panels read as "gutters" between cards
+    # instead of ImGui's 1px hairline splitters.
+    style.docking_separator_size = 6.0
+
     style.anti_aliased_lines = True
     style.anti_aliased_fill = True
     style.circle_tessellation_max_error = 0.1
@@ -139,7 +143,9 @@ def _apply_dark_colors(style, accent):
     c(Col.header_hovered, _with_alpha(accent, 0.32))
     c(Col.header_active, _with_alpha(accent, 0.42))
 
-    c(Col.separator, hairline)
+    # Separators/gutters darker than the panels: dividers read as grooves,
+    # and the wide docking separators look like gaps between surfaces.
+    c(Col.separator, _v4(0.055, 0.055, 0.070, 1.0))
     c(Col.separator_hovered, _with_alpha(accent, 0.60))
     c(Col.separator_active, acc)
 
@@ -236,7 +242,7 @@ def _apply_light_colors(style, accent):
     c(Col.header_hovered, _with_alpha(accent, 0.26))
     c(Col.header_active, _with_alpha(accent, 0.36))
 
-    c(Col.separator, hairline)
+    c(Col.separator, _v4(0.878, 0.878, 0.902, 1.0))
     c(Col.separator_hovered, _with_alpha(accent, 0.60))
     c(Col.separator_active, acc)
 
@@ -272,6 +278,13 @@ def _apply_light_colors(style, accent):
     c(Col.nav_windowing_highlight, _with_alpha(accent, 0.70))
     c(Col.nav_windowing_dim_bg, _v4(0.2, 0.2, 0.2, 0.35))
     c(Col.modal_window_dim_bg, _v4(0.2, 0.2, 0.2, 0.45))
+
+
+def card_colors(variant="dark"):
+    """(bg, border) for card-style child frames drawn on top of window_bg."""
+    if variant == "light":
+        return imgui.ImVec4(1.0, 1.0, 1.0, 1.0), imgui.ImVec4(0.0, 0.0, 0.1, 0.10)
+    return imgui.ImVec4(0.122, 0.122, 0.153, 1.0), imgui.ImVec4(1.0, 1.0, 1.0, 0.05)
 
 
 def apply_modern_style(variant="dark", accent=DEFAULT_ACCENT):

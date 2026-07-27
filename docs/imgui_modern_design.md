@@ -81,6 +81,40 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 (`ImGuiCol_TabSelectedOverline`)を使うのがポイントで、
 ブラウザ風の"今ここ"表示になります(ImGui 1.90.9+)。
 
+## 「ImGui 感」を消す実装テクニック
+
+テーマ(色・角丸・余白)だけでは ImGui 特有の見た目は消えません。
+デモに実装済みの手法を、原因 → 対策で整理します。
+
+| ImGui っぽさの原因 | 対策 | 実装 |
+| --- | --- | --- |
+| デフォルトフォント(ProggyClean)のドット感 | 実フォントを 16px で読み込む(ここでは Roboto、同梱アセット) | `_load_fonts()` |
+| テキストだけのボタン列 | FontAwesome をマージしてアイコンツールバー化、説明はツールチップに逃がす | `icon_button()` |
+| ドッキングのタブバー・×ボタン・▼メニュー | `DockNodeFlagsPrivate_.no_tab_bar` で全ノードのタブバーを消し、代わりに小さな大文字ヘッダを描く | `panel_header()`, `NO_TAB_BAR` |
+| メニューバー("Debug" 的な佇まい) | メニューバー自体を廃止し、操作はツールバーへ | `show_menu_bar = False` |
+| パネルがベタっと連続する | `docking_separator_size = 6` + 暗色セパレータで、パネル間に「溝」を作る | テーマ側 |
+| 情報が1枚のパネルに縦積み | 統計をカード(角丸 child + 明度+1 の背景)に分割 | `begin_card()` / `end_card()` |
+| implot の枠・背景・凡例枠 | plot_bg / frame_bg / border を透明化しチャートだけ見せる | `gui_stats()` |
+| ウィジェットが左上にへばりつく | 画像をペイン中央に配置し、ヘアライン枠 + ズーム表示ピルを重ねる | `gui_viewer()`, `_zoom_pill()` |
+
+ポイントは「**タブバーとメニューバーとデフォルトフォントの3つを消した時点で
+ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの密度調整です。
+
+## ImGui で見づらくなりがちな部分と回避策
+
+- **小さい文字・低コントラスト** → ベース 16px + `push_font(None, size)`
+  (ImGui 1.92 の動的フォント)で見出し 12px などを使い分ける。
+- **ボタンの機能が分からない** → アイコン + `set_item_tooltip()`
+  にショートカットを併記("Fit to window (F)" など)。
+- **表が詰まって読めない** → テーブルは `cell_padding (10,6)` +
+  `row_bg` の縞、数値は右揃えでなく列固定。
+- **無効状態が分かりにくい** → `begin_disabled()` を必ず使い、
+  独自のグレーアウトをしない(テーマの text_disabled が効く)。
+- **凡例やグリッドがうるさいグラフ** → 目盛りラベルは X 軸のみ、
+  Y 軸は `no_tick_labels`、凡例は水平でプロット内右上。
+- **今どのモードか分からない** → トグル系(Fit / Compare)は
+  アクティブ時にアクセント色のピル背景で状態を示す。
+
 ## 分かりやすさのための UI ルール
 
 - **選択サムネイルはアクセント枠 2.5px + ファイル名を明色に**。
@@ -106,12 +140,12 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 - スクリーンショットは headless で再生成できます:
   `xvfb-run python imgui_demo.py --screenshot docs/img/imgui_dark.png [--light|--compare]`
 
-## フォントについて(今後の課題)
+## フォントについて
 
-hello_imgui 同梱フォント(DroidSans + FontAwesome)でも十分見られますが、
-日本語 UI にするなら **Noto Sans JP** / **IBM Plex Sans JP** を
-`hello_imgui.load_font("NotoSansJP-Regular.ttf", 16, japanese_glyphs=True)`
-相当で読み込むのが次の一手です(タブ・メニューの日本語化とセット)。
+デモは同梱の **Roboto Regular 16px** + FontAwesome(アイコン)を使用しています。
+ImGui 1.92 以降はグリフを動的に読み込むため、グリフ範囲の指定は不要です。
+日本語 UI にする場合は **Noto Sans JP** / **IBM Plex Sans JP** の ttf を
+リポジトリに追加し、`_load_fonts()` の1行を差し替えるだけで済みます。
 
 ## PySide6 版との関係
 
