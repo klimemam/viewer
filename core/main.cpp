@@ -182,7 +182,15 @@ struct App {
     bool annBusy = false;             // true while an annotation drag is in progress
     bool dragPans = false;            // left-drag on empty canvas: pan instead of new ROI
     int ctxX = -1, ctxY = -1;         // image coords the context menu was opened at
-    bool wheelZoomPlain = false;      // false: Ctrl+wheel zooms, plain wheel pans
+    // A/B compare: A is always the current image; B is a second open image shown
+    // beside it (split) or under a draggable divider (wipe). Both panes use the
+    // one shared view, so a pixel is at the same place in both.
+    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2 };
+    int compareMode = CmpOff;
+    std::string compareB;             // B by name, so it survives reordering/sessions
+    float wipeFrac = 0.5f;            // divider position, fraction of canvas width
+    float splitFrac = 0.5f;
+    bool wheelZoomPlain = false;// false: Ctrl+wheel zooms, plain wheel pans
     // analyzer plugin state: cached result grid (rows = keys, cols = ROIs)
     struct AnalysisState {
         const ImageDoc* img = nullptr;
@@ -317,9 +325,51 @@ static App app;
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
 
+// The B side of an A/B compare, or null when compare is off / B is gone / B is A.
+static ImageDoc* cmpB() {
+    if (app.compareMode == App::CmpOff || app.compareB.empty()) return nullptr;
+    // "not the current one" matters: the same file opened twice has the same name,
+    // and comparing a doc against itself would show nothing.
+    for (const auto& d : app.images)
+        if (d->name == app.compareB && d.get() != cur()) return d.get();
+    return nullptr;
+}
+
 static void toast(const std::string& msg, bool err = false) {
     app.toast = msg; app.toastErr = err;
     app.toastUntil = ImGui::GetTime() + (err ? 6.0 : 2.5);
+}
+
+static void selectImage(int idx);   // fwd (defined with the sequence helpers)
+
+// Default B = the image next to A in the list: with two images open, "compare"
+// should just work without first picking a partner.
+static void ensureCompareB() {
+    for (const auto& d : app.images)
+        if (d->name == app.compareB && d.get() != cur()) return;
+    app.compareB.clear();
+    for (int i = 0; i < (int)app.images.size(); i++) {
+        int j = (app.current + 1 + i) % (int)app.images.size();
+        if (app.images[j].get() != cur()) { app.compareB = app.images[j]->name; break; }
+    }
+}
+
+static void cycleCompare() {
+    if (app.images.size() < 2) { toast("compare needs a second open image", true); return; }
+    ensureCompareB();
+    app.compareMode = (app.compareMode + 1) % 3;
+    toast(app.compareMode == App::CmpOff  ? "compare off"
+        : app.compareMode == App::CmpWipe ? "compare: wipe  (drag the divider)"
+                                          : "compare: side by side");
+}
+
+static void swapCompare() {
+    ImageDoc* b = cmpB();
+    if (!b || !cur()) return;
+    std::string a = cur()->name;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i].get() == b) { selectImage(i); break; }
+    app.compareB = a;
 }
 
 static void computeMinMax(ImageDoc& im) {
@@ -1337,6 +1387,8 @@ static void saveSession(std::string path, bool quiet = false) {
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
+    f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << "\n";
+    if (!app.compareB.empty()) f << "compareb " << app.compareB << "\n";   // by name, last
     f << "panels " << (app.showFiles ? 1 : 0) << " " << (app.showInspector ? 1 : 0) << " "
       << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
@@ -1493,6 +1545,11 @@ static std::string loadSession(const std::string& path) {
                                         app.showProjH = h != 0; app.showProjV = v != 0; }
         else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
+        else if (key == "compare") { ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
+                                     app.compareMode = std::clamp(app.compareMode, 0, 2);
+                                     app.wipeFrac = std::clamp(app.wipeFrac, 0.03f, 0.97f);
+                                     app.splitFrac = std::clamp(app.splitFrac, 0.03f, 0.97f); }
+        else if (key == "compareb") app.compareB = restOfLine(ls);
         else if (key == "panels") {
             int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0;
             ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2;
@@ -2671,17 +2728,48 @@ static void drawCanvas(ImVec2 avail) {
     bool active = ImGui::IsItemActive();
     ImGuiIO& io = ImGui::GetIO();
 
-    auto imgToScr = [&](float ix, float iy) {
-        return ImVec2(canvasP0.x + canvasSize.x * 0.5f + (ix - app.view.center.x) * app.view.zoom,
-                      canvasP0.y + canvasSize.y * 0.5f + (iy - app.view.center.y) * app.view.zoom);
+    // ---- A/B compare geometry -------------------------------------------------
+    // Split: two panes side by side, each showing the same image region, so the
+    // eye compares by saccade. Wipe: one pane, B clipped to the right of a
+    // draggable divider, so the eye compares by edge. Both share app.view.
+    ImageDoc* imB = cmpB();
+    const bool split = imB && app.compareMode == App::CmpSplit;
+    const bool wipe  = imB && app.compareMode == App::CmpWipe;
+    float splitX = canvasP0.x + canvasSize.x * app.splitFrac;   // pane boundary (split)
+    float wipeX  = canvasP0.x + canvasSize.x * app.wipeFrac;    // divider (wipe)
+    const float GUTTER = 3.0f * s;
+    ImVec2 paneAp0 = canvasP0, paneAsz = canvasSize, paneBp0 = canvasP0, paneBsz = canvasSize;
+    if (split) {
+        paneAsz.x = std::max(splitX - canvasP0.x - GUTTER, 20.0f);
+        paneBp0.x = splitX + GUTTER;
+        paneBsz.x = std::max(canvasP1.x - paneBp0.x, 20.0f);
+    }
+    // In split mode the pane under the cursor defines image coordinates; in wipe
+    // mode both images occupy the same pane, so there is nothing to switch.
+    auto paneP0 = [&](bool b) { return b ? paneBp0 : paneAp0; };
+    auto paneSz = [&](bool b) { return b ? paneBsz : paneAsz; };
+    auto mapIn = [&](bool b, float ix, float iy) {
+        ImVec2 p = paneP0(b), z = paneSz(b);
+        return ImVec2(p.x + z.x * 0.5f + (ix - app.view.center.x) * app.view.zoom,
+                      p.y + z.y * 0.5f + (iy - app.view.center.y) * app.view.zoom);
     };
-    auto scrToImg = [&](ImVec2 s) {
-        return ImVec2(app.view.center.x + (s.x - canvasP0.x - canvasSize.x * 0.5f) / app.view.zoom,
-                      app.view.center.y + (s.y - canvasP0.y - canvasSize.y * 0.5f) / app.view.zoom);
+    auto unmapIn = [&](bool b, ImVec2 sc) {
+        ImVec2 p = paneP0(b), z = paneSz(b);
+        return ImVec2(app.view.center.x + (sc.x - p.x - z.x * 0.5f) / app.view.zoom,
+                      app.view.center.y + (sc.y - p.y - z.y * 0.5f) / app.view.zoom);
     };
+    auto inBPane = [&](ImVec2 sc) { return split && sc.x >= paneBp0.x; };
+
+    auto imgToScr = [&](float ix, float iy) { return mapIn(false, ix, iy); };
+    auto scrToImg = [&](ImVec2 sc) { return unmapIn(inBPane(sc), sc); };
+
+    // the divider is grabbed anywhere along its height, not just on the handle
+    bool onDivider = imB && fabsf(io.MousePos.x - (split ? splitX : wipeX)) <= 7.0f * s &&
+                     io.MousePos.y >= canvasP0.y && io.MousePos.y <= canvasP1.y;
+    if (onDivider && (hovered || ImGui::IsItemActive())) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
     // drag state: pan / new-ROI / move / resize (tool-mode interaction model)
-    enum { DK_NONE, DK_PAN, DK_ROI_NEW, DK_ANN_MOVE, DK_ANN_RESIZE };
+    enum { DK_NONE, DK_PAN, DK_ROI_NEW, DK_ANN_MOVE, DK_ANN_RESIZE, DK_DIVIDER };
     static int dk = DK_NONE;
     static bool dragMoved = false;
     static bool clickEligible = false;   // left-button, no pan modifiers: clicks act on tools
@@ -2727,7 +2815,9 @@ static void drawCanvas(ImVec2 avail) {
             // Modeless: middle / Space always pan. Otherwise the press position
             // decides - on a handle = resize, inside a ROI = move, empty = new ROI
             // (or pan, if the user prefers that; Shift inverts either way).
-            if (mid || space) {
+            if (onDivider && !mid && !space) {
+                dk = DK_DIVIDER;
+            } else if (mid || space) {
                 dk = DK_PAN;
             } else {
                 int corner; int hit = hitTest(drag0, corner);
@@ -2752,7 +2842,11 @@ static void drawCanvas(ImVec2 avail) {
         bool draggingAny = ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0) ||
                            ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0);
         if (active && draggingAny) {
-            if (dk == DK_PAN) {
+            if (dk == DK_DIVIDER) {
+                float f = (io.MousePos.x - canvasP0.x) / std::max(canvasSize.x, 1.0f);
+                f = std::clamp(f, 0.03f, 0.97f);
+                (split ? app.splitFrac : app.wipeFrac) = f;
+            } else if (dk == DK_PAN) {
                 app.view.center.x -= io.MouseDelta.x / app.view.zoom;
                 app.view.center.y -= io.MouseDelta.y / app.view.zoom;
             } else if (dk == DK_ROI_NEW && dragMoved) {
@@ -2867,27 +2961,30 @@ static void drawCanvas(ImVec2 avail) {
     // ---- draw canvas ----
     dl->AddRectFilled(canvasP0, canvasP1, IM_COL32(12, 14, 16, 255));
     dl->PushClipRect(canvasP0, canvasP1, true);
-    if (im) {
-        if (im->texDirty) rebuildTexture(*im);
-        setFilter(*im, app.view.zoom >= 1.0f);
-        ImVec2 p0 = imgToScr(0, 0), p1 = imgToScr((float)im->w, (float)im->h);
-        dl->AddImage((ImTextureID)(intptr_t)im->tex, p0, p1);
+    // One image and its overlays, drawn through the given pane's mapping. Used
+    // once when compare is off, twice (A and B) when it is on.
+    auto drawLayer = [&](ImageDoc* d, bool b) {
+        auto map = [&](float ix, float iy) { return mapIn(b, ix, iy); };
+        if (d->texDirty) rebuildTexture(*d);
+        setFilter(*d, app.view.zoom >= 1.0f);
+        ImVec2 p0 = map(0, 0), p1 = map((float)d->w, (float)d->h);
+        dl->AddImage((ImTextureID)(intptr_t)d->tex, p0, p1);
         dl->AddRect(p0, p1, IM_COL32(90, 100, 110, 255));
 
         // pixel grid at high zoom
         if (app.showGrid && app.view.zoom >= 8.0f) {
-            ImVec2 tl = scrToImg(canvasP0), br = scrToImg(canvasP1);
-            int x0 = std::max(0, (int)floorf(tl.x)), x1 = std::min(im->w, (int)ceilf(br.x));
-            int y0 = std::max(0, (int)floorf(tl.y)), y1 = std::min(im->h, (int)ceilf(br.y));
+            ImVec2 tl = unmapIn(b, canvasP0), br = unmapIn(b, canvasP1);
+            int x0 = std::max(0, (int)floorf(tl.x)), x1 = std::min(d->w, (int)ceilf(br.x));
+            int y0 = std::max(0, (int)floorf(tl.y)), y1 = std::min(d->h, (int)ceilf(br.y));
             ImU32 gc = IM_COL32(120, 120, 120, 70);
-            for (int x = x0; x <= x1; x++) { ImVec2 a = imgToScr((float)x, (float)y0), b = imgToScr((float)x, (float)y1); dl->AddLine(a, b, gc); }
-            for (int y = y0; y <= y1; y++) { ImVec2 a = imgToScr((float)x0, (float)y), b = imgToScr((float)x1, (float)y); dl->AddLine(a, b, gc); }
+            for (int x = x0; x <= x1; x++) { ImVec2 a = map((float)x, (float)y0), b2 = map((float)x, (float)y1); dl->AddLine(a, b2, gc); }
+            for (int y = y0; y <= y1; y++) { ImVec2 a = map((float)x0, (float)y), b2 = map((float)x1, (float)y); dl->AddLine(a, b2, gc); }
         }
         // hovered pixel outline
         if (app.hoverX >= 0 && app.view.zoom >= 2.0f) {
-            ImVec2 a = imgToScr((float)app.hoverX, (float)app.hoverY);
-            ImVec2 b = imgToScr((float)app.hoverX + 1, (float)app.hoverY + 1);
-            dl->AddRect(a, b, IM_COL32(255, 184, 77, 255), 0, 0, 1.5f);
+            ImVec2 a = map((float)app.hoverX, (float)app.hoverY);
+            ImVec2 b2 = map((float)app.hoverX + 1, (float)app.hoverY + 1);
+            dl->AddRect(a, b2, IM_COL32(255, 184, 77, 255), 0, 0, 1.5f);
         }
         // annotations (ROIs + POIs)
         for (const auto& a : app.anns) {
@@ -2895,8 +2992,8 @@ static void drawCanvas(ImVec2 avail) {
             ImU32 col = ANN_COLORS[a.color & 7];
             bool sel = a.id == app.selectedAnn;
             if (a.type == 0) {
-                ImVec2 ra = imgToScr((float)a.x, (float)a.y);
-                ImVec2 rb = imgToScr((float)(a.x + a.w), (float)(a.y + a.h));
+                ImVec2 ra = map((float)a.x, (float)a.y);
+                ImVec2 rb = map((float)(a.x + a.w), (float)(a.y + a.h));
                 dl->AddRectFilled(ra, rb, (col & 0x00FFFFFF) | 0x1E000000);
                 dl->AddRect(ra, rb, col, 0, 0, sel ? 2.5f : 1.5f);
                 dl->AddText(ImVec2(ra.x + 3, ra.y - ImGui::GetFontSize() - 2), col, a.label.c_str());
@@ -2906,8 +3003,8 @@ static void drawCanvas(ImVec2 avail) {
                         dl->AddRectFilled(ImVec2(hp.x - 3, hp.y - 3), ImVec2(hp.x + 3, hp.y + 3), col);
                 }
             } else {
-                if (a.x >= im->w || a.y >= im->h) continue;       // outside this image
-                ImVec2 cpt = imgToScr(a.x + 0.5f, a.y + 0.5f);
+                if (a.x >= d->w || a.y >= d->h) continue;         // outside this image
+                ImVec2 cpt = map(a.x + 0.5f, a.y + 0.5f);
                 float r = sel ? 10.0f : 8.0f;
                 dl->AddLine(ImVec2(cpt.x - r, cpt.y), ImVec2(cpt.x + r, cpt.y), col, sel ? 2.5f : 1.5f);
                 dl->AddLine(ImVec2(cpt.x, cpt.y - r), ImVec2(cpt.x, cpt.y + r), col, sel ? 2.5f : 1.5f);
@@ -2916,13 +3013,64 @@ static void drawCanvas(ImVec2 avail) {
         }
         // ROI being created (live preview)
         if (tmpActive && tmpRect[2] > 0 && tmpRect[3] > 0) {
-            ImVec2 ra = imgToScr((float)tmpRect[0], (float)tmpRect[1]);
-            ImVec2 rb = imgToScr((float)(tmpRect[0] + tmpRect[2]), (float)(tmpRect[1] + tmpRect[3]));
+            ImVec2 ra = map((float)tmpRect[0], (float)tmpRect[1]);
+            ImVec2 rb = map((float)(tmpRect[0] + tmpRect[2]), (float)(tmpRect[1] + tmpRect[3]));
             dl->AddRectFilled(ra, rb, IM_COL32(77, 163, 255, 26));
             dl->AddRect(ra, rb, IM_COL32(77, 163, 255, 220), 0, 0, 1.5f);
             char lb[48];
             snprintf(lb, 48, "%dx%d", tmpRect[2], tmpRect[3]);
             dl->AddText(ImVec2(ra.x + 3, ra.y - ImGui::GetFontSize() - 2), IM_COL32(120, 190, 255, 255), lb);
+        }
+    };
+
+    if (im) {
+        if (split) {
+            dl->PushClipRect(paneAp0, ImVec2(paneAp0.x + paneAsz.x, canvasP1.y), true);
+            drawLayer(im, false);
+            dl->PopClipRect();
+            dl->PushClipRect(paneBp0, ImVec2(paneBp0.x + paneBsz.x, canvasP1.y), true);
+            drawLayer(imB, true);
+            dl->PopClipRect();
+        } else if (wipe) {
+            drawLayer(im, false);                       // A everywhere...
+            dl->PushClipRect(ImVec2(wipeX, canvasP0.y), canvasP1, true);
+            drawLayer(imB, false);                      // ...B over the right side
+            dl->PopClipRect();
+        } else {
+            drawLayer(im, false);
+        }
+        // ---- compare chrome: A/B badges + the divider you drag ----
+        if (imB) {
+            auto badge = [&](ImVec2 at, const char* tag, const std::string& nm, ImU32 col) {
+                std::string t = std::string(tag) + "  " + nm;
+                ImVec2 ts = ImGui::CalcTextSize(t.c_str());
+                float pad = 4.0f * s;
+                dl->AddRectFilled(ImVec2(at.x, at.y), ImVec2(at.x + ts.x + pad * 2, at.y + ts.y + pad),
+                                  IM_COL32(0, 0, 0, 170), 3.0f * s);
+                dl->AddText(ImVec2(at.x + pad, at.y + pad * 0.5f), col, t.c_str());
+            };
+            const ImU32 colA = IM_COL32(120, 200, 255, 255), colB = IM_COL32(255, 190, 120, 255);
+            float by = canvasP0.y + 6 * s;
+            if (split) {
+                badge(ImVec2(paneAp0.x + 6 * s, by), "A", im->name, colA);
+                badge(ImVec2(paneBp0.x + 6 * s, by), "B", imB->name, colB);
+                dl->AddRectFilled(ImVec2(splitX - GUTTER, canvasP0.y), ImVec2(splitX + GUTTER, canvasP1.y),
+                                  IM_COL32(60, 66, 74, 255));
+            } else {
+                badge(ImVec2(canvasP0.x + 6 * s, by), "A", im->name, colA);
+                ImVec2 ts = ImGui::CalcTextSize(("B  " + imB->name).c_str());
+                badge(ImVec2(std::min(wipeX + 8 * s, canvasP1.x - ts.x - 14 * s), by), "B", imB->name, colB);
+                dl->AddLine(ImVec2(wipeX, canvasP0.y), ImVec2(wipeX, canvasP1.y),
+                            IM_COL32(255, 255, 255, 200), 1.5f);
+                // grab handle: a stubby bar at mid-height, the thing you aim at
+                float hy = (canvasP0.y + canvasP1.y) * 0.5f, hh = 22 * s, hw = 5 * s;
+                dl->AddRectFilled(ImVec2(wipeX - hw, hy - hh), ImVec2(wipeX + hw, hy + hh),
+                                  IM_COL32(255, 255, 255, 230), 3.0f * s);
+                dl->AddLine(ImVec2(wipeX - 1.5f * s, hy - hh * 0.4f), ImVec2(wipeX - 1.5f * s, hy + hh * 0.4f),
+                            IM_COL32(40, 44, 50, 255), 1.0f);
+                dl->AddLine(ImVec2(wipeX + 1.5f * s, hy - hh * 0.4f), ImVec2(wipeX + 1.5f * s, hy + hh * 0.4f),
+                            IM_COL32(40, 44, 50, 255), 1.0f);
+            }
         }
     } else {
         const char* msg = "Drop .npy / .bin / .raw files here   (O: open file)";
@@ -3241,25 +3389,50 @@ static void drawInspector() {
         int nch = im ? im->ch : 1;
         const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
         float inv = im ? 1.0f / std::max(effWhite(*im) - effBlack(*im), 1e-20f) : 1.0f;
+        // With compare on, the same pixel in B (and A-B) is the number the eye
+        // cannot read off a wipe: two extra columns, present whenever compare is.
+        ImageDoc* b = cmpB();
+        bool bHere = b && live && app.hoverX < b->w && app.hoverY < b->h;
         // fixed widths: the numbers must not shift as the cursor moves
-        if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingFixedFit)) {
+        if (ImGui::BeginTable("px", b ? 5 : 3, ImGuiTableFlags_SizingFixedFit)) {
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-            ImGui::TableSetupColumn("raw", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn(b ? "A [DN]" : "raw", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableSetupColumn("norm", ImGuiTableColumnFlags_WidthFixed, numColW());
+            if (b) {
+                ImGui::TableSetupColumn("B [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
+                ImGui::TableSetupColumn("A-B [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
+            }
             ImGui::TableHeadersRow();
             for (int c = 0; c < nch; c++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(c < 4 ? lb[std::min(c, 3)] : "?");
+                float v = 0;
                 if (live) {
-                    float v = im->sample(app.hoverX, app.hoverY, c);
+                    v = im->sample(app.hoverX, app.hoverY, c);
                     ImGui::TableNextColumn(); textNumStr(fmtVal(v, im->dtype));
                     ImGui::TableNextColumn(); textNum("%.4f", (v - effBlack(*im)) * inv);
                 } else {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 }
+                if (b) {
+                    if (bHere && c < b->ch) {
+                        float bv = b->sample(app.hoverX, app.hoverY, c);
+                        ImGui::TableNextColumn(); textNumStr(fmtVal(bv, b->dtype));
+                        ImGui::TableNextColumn(); textNumStr(fmtVal(v - bv, im->dtype));
+                    } else {
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                    }
+                }
             }
             ImGui::EndTable();
+        }
+        if (b) {
+            ImGui::TextDisabled("B: %s", b->name.c_str());
+            if (b->w != (im ? im->w : 0) || b->h != (im ? im->h : 0))
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "size differs: B is %dx%d",
+                                   b->w, b->h);
         }
     }
 
@@ -4331,6 +4504,27 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("Next stack", "Down / Ctrl+N", false, app.images.size() > 1)) gotoStack(1);
         if (ImGui::MenuItem("Previous stack", "Up / Ctrl+P", false, app.images.size() > 1)) gotoStack(-1);
         ImGui::Separator();
+        if (ImGui::BeginMenu("Compare A/B", app.images.size() > 1)) {
+            if (ImGui::MenuItem("Off", "\\", app.compareMode == App::CmpOff))
+                app.compareMode = App::CmpOff;
+            if (ImGui::MenuItem("Wipe (drag the divider)", "\\", app.compareMode == App::CmpWipe))
+                app.compareMode = App::CmpWipe;
+            if (ImGui::MenuItem("Side by side", "\\", app.compareMode == App::CmpSplit))
+                app.compareMode = App::CmpSplit;
+            ImGui::Separator();
+            ImGui::TextDisabled("B image");
+            for (const auto& d : app.images) {
+                if (d.get() == cur()) continue;
+                if (ImGui::MenuItem(d->name.c_str(), nullptr, app.compareB == d->name)) {
+                    app.compareB = d->name;
+                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Swap A and B", "Shift+\\", false, cmpB() != nullptr)) swapCompare();
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Fit to Window", "F", false, has)) app.fitRequested = true;
         if (ImGui::MenuItem("Actual Size (100%)", "1", false, has)) app.view.zoom = 1.0f;
         if (ImGui::MenuItem("Zoom In", "+", false, has))
@@ -4450,6 +4644,7 @@ static void drawHelpAbout() {
                 row("Shift+drag",    "the other one of pan / new ROI");
                 row("X / Y",         "toggle selected ROI full width / height (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
+                row("\\ / Shift+\\",  "A/B compare: off -> wipe -> side by side / swap A and B");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
                 ImGui::EndTable();
@@ -4489,6 +4684,7 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
+        "  --compare <off|wipe|split>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
@@ -4500,6 +4696,7 @@ static void parseCli(int argc, char** argv) {
     bool rawReady = false, cliQuad = false;
     bool haveZoom = false, haveCenter = false;
     float zoom = 1, cx = 0, cy = 0;
+    int cliCompare = -1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -4565,6 +4762,12 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
+        } else if (a == "--compare") {             // off | wipe | split
+            std::string v = next();
+            if (v == "wipe") cliCompare = App::CmpWipe;
+            else if (v == "split" || v == "side") cliCompare = App::CmpSplit;
+            else if (v == "off") cliCompare = App::CmpOff;
+            else fprintf(stderr, "--compare expects off|wipe|split\n");
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
         } else if (a == "--center") {
@@ -4594,6 +4797,18 @@ static void parseCli(int argc, char** argv) {
                 else maybeOfferSequence(app.current);
             } else {
                 openPath(a);
+            }
+        }
+    }
+    if (cliCompare >= 0) {             // B defaults to the second file on the line
+        app.compareMode = cliCompare;
+        if (app.compareMode != App::CmpOff) {
+            if (app.images.size() < 2) {
+                fprintf(stderr, "--compare needs two images\n");
+                app.compareMode = App::CmpOff;
+            } else {
+                if (app.current != 0) app.current = 0;   // A = first, B = second
+                app.compareB = app.images[1]->name;
             }
         }
     }
@@ -4818,6 +5033,7 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_1, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false))
                 app.view.zoom = 1.0f;
             if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
+            if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false)) cycleCompare();
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
             // P drops a pin at the pixel under the cursor - no click, no modifier
@@ -4866,6 +5082,9 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
                 app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         }
+        if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_Shift &&
+            ImGui::IsKeyPressed(ImGuiKey_Backslash, false))
+            swapCompare();                      // Shift+\ : flip which one is on top
         drawMenuBar(win);
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
