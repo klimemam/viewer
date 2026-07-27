@@ -5197,9 +5197,10 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::MenuItem("Show frame time", nullptr, &app.showFps);
         ImGui::MenuItem("Low bandwidth (remote / ssh)", nullptr, &app.lowBandwidth);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Draw the minimum number of frames per input.\n"
-                              "Saves bandwidth over X11 forwarding; locally it makes\n"
-                              "menus and fades feel less responsive.");
+            ImGui::SetTooltip("Cap the redraw rate at ~20-30 fps and drop the\n"
+                              "post-input tail. Saves bandwidth over X11 forwarding,\n"
+                              "at ~32 ms of extra latency while dragging or scrolling\n"
+                              "(0.4 ms otherwise). Locally, leave this off.");
         ImGui::MenuItem("Fit view when switching images", nullptr, &app.fitOnSwitch);
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
@@ -5920,8 +5921,12 @@ int main(int argc, char** argv) {
             if (benchFrames || left <= 0.0005) {
                 glfwPollEvents();
             } else if (app.lowBandwidth) {
-                // remote: the budget is a real cap, so keep waiting out the rest
-                // of it even when events arrive (bandwidth beats latency here)
+                // Remote: the budget is a real cap, so keep waiting out the rest
+                // of it even when events arrive - bandwidth beats latency here,
+                // and it does cost latency: ~32 ms on a streamed drag, against
+                // 0.4 ms in the default mode. The OS wait rounds up to its timer
+                // quantum (15.6 ms on Windows), so the measured rate lands
+                // around 20-25 fps rather than exactly 30.
                 do { glfwWaitEventsTimeout(left);
                      left = budget - (glfwGetTime() - lastFrameEnd);
                 } while (left > 0.0005);
@@ -6013,7 +6018,12 @@ int main(int argc, char** argv) {
                 autosaveSession();
             }
         }
-        g_drawFrame();
+        // through the guard, never g_drawFrame() directly: the frame body pumps
+        // Win32 messages while a file dialog is open (pfd's ready() calls
+        // PeekMessage/DispatchMessage), which delivers WM_PAINT/WM_SIZE to our
+        // own callbacks and would start a second ImGui frame inside this one.
+        // IM_ASSERT is compiled out in release, so that corrupts silently.
+        redrawNow();
         if (benchFrames) {
             glFinish();               // include GPU work in the measurement
             benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
