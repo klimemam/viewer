@@ -1,4 +1,4 @@
-# Extra dependencies for the Dear ImGui design study (imgui_demo.py).
-# The main PySide6 viewer does not need these.
+# Dependencies for the Dear ImGui design study only (imgui_demo.py).
+# The viewer itself is C++ and needs none of these.
 imgui-bundle>=1.92
 numpy>=1.26

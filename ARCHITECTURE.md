@@ -163,16 +163,17 @@ def sharpen(frame: np.ndarray, amount: float) -> np.ndarray:
 バイナリ互換)。v1 構造体の abi_version は構造体自身の版 (=1) を入れる規約。
 `iso12233/e-sfr` が v2 の参照実装。
 
-## リポジトリ構成 (予定)
+## リポジトリ構成
 
 ```
 viewer/
-  core/            # C++ コア: ウィンドウ, GL 表示, パイプライン実行, プラグイン管理
-  plugins/         # 同梱プラグイン (npy, raw/yuv, ffmpeg, nvdec, metrics)
+  core/            # C++ コア: ウィンドウ, GL 表示, ツール/解析パネル, プラグイン管理
+  plugins/         # 同梱プラグイン (描画系 / 解析系 / Processor, すべて純 C)
   include/ps/      # 公開 C ABI ヘッダ (これが契約のすべて)
-  python/          # 埋め込み Python ランタイム + デコレータ API
-  web/             # pixelscope.html (リモートUI / 仕様リファレンス)
-  tools/           # 旧 PySide6 版 (オフライン解析・バッチ用に維持)
+  docs/            # マニュアル, アナライザ仕様, UI デザインスタディ
+  tools/           # テストデータ生成など補助スクリプト
+  pixelscope.html  # Web 版プロトタイプ (UI リファレンス / 将来のリモート UI)
+  (予定) python/   # 埋め込み Python ランタイム + デコレータ API
 ```
 
 ## 実装フェーズ
