@@ -78,9 +78,15 @@ endif()
 
 # The remote peer as its own binary. A compute server typically has no OpenGL and
 # no X11, so a GUI binary would fail to load there before it could reach --serve.
-# This one links nothing but miniz and the C++ runtime.
-add_executable(viewer-serve core/serve_main.cpp core/serve.cpp ${miniz_SOURCE_DIR}/miniz.c)
+# It links miniz, the C++ runtime - and plugin_host, so MEASURE runs the SAME
+# analyzer plugins the local host runs (plugin_host is verified GL-free).
+add_executable(viewer-serve core/serve_main.cpp core/serve.cpp core/plugin_host.cpp
+                            ${miniz_SOURCE_DIR}/miniz.c)
 target_include_directories(viewer-serve PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
+target_link_libraries(viewer-serve PRIVATE ps_api)
+if(UNIX)
+  target_link_libraries(viewer-serve PRIVATE ${CMAKE_DL_LIBS})   # dlopen for plugins
+endif()
 if(MSVC)
   target_compile_options(viewer-serve PRIVATE /W3 /utf-8)
 else()

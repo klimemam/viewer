@@ -6178,6 +6178,20 @@ static void parseCli(int argc, char** argv) {
     }
 }
 
+// MEASURE selftest glue: capture what an analyzer emits, formatted the same way
+// on both sides so the comparison is string-exact.
+static std::vector<std::pair<std::string, std::string>>* g_mstRows;
+static void mstNum(void*, const char* k, double v) {
+    char b[64];
+    snprintf(b, 64, "%.9g", v);
+    g_mstRows->emplace_back(k ? k : "", b);
+}
+static void mstTxt(void*, const char* k, const char* v) {
+    g_mstRows->emplace_back(k ? k : "", v ? v : "");
+}
+static void mstSer(void*, const char*, const char*, const char*,
+                   const float*, const float*, uint32_t) {}
+
 // Round-trip check for the remote path, without needing an ssh host: start a
 // local peer, ask for the same pixels two ways, and compare. A viewer that shows
 // subtly wrong pixels over a link would be worse than one that shows none.
@@ -6229,6 +6243,73 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 mismatch ? "FAIL" : "ok", mismatch,
                 wire / 1048576.0, (double)got.size() * 4 / 1048576.0);
         bad += mismatch ? 1 : 0;
+    }
+    // MEASURE: the same plugin must produce the same numbers on both sides.
+    // Same code, same f32 input - the comparison is string-exact on %.9g.
+    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins" },
+                         [](const std::string&, bool) {});
+    const auto& anas = plugin_host::analyzers();
+    int pick = -1;
+    for (int i = 0; i < (int)anas.size(); i++)
+        if (anas[i].name.find("stats") != std::string::npos) { pick = i; break; }
+    if (pick < 0 && !anas.empty()) pick = 0;
+    if (pick >= 0) {
+        const AnalyzerPluginInfo& a = anas[pick];
+        std::vector<std::pair<std::string, std::string>> local;
+        g_mstRows = &local;
+        psFrame fr = makeFrame(ref);
+        psRect roi{ (uint32_t)(ref.w / 4), (uint32_t)(ref.h / 4),
+                    (uint32_t)(ref.w / 2), (uint32_t)(ref.h / 2) };
+        char perr[256];
+        perr[0] = 0;
+        int rc;
+        if (a.isV2) {
+            psAnalyzeSink2 sk{ nullptr, mstNum, mstTxt, mstSer, {} };
+            rc = a.v2.analyze(&fr, &roi, &sk, perr, sizeof perr);
+        } else {
+            psAnalyzeSink sk{ nullptr, mstNum, mstTxt };
+            rc = a.v1.analyze(&fr, &roi, &sk, perr, sizeof perr);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "selftest MEASURE: local run failed: %s\n", perr);
+            return 1;
+        }
+        remote::MeasureReq q;
+        q.op = rp::MOP_ANALYZER;
+        q.paths = { path };
+        q.analyzer = a.name;
+        q.cfaType = ref.cfa;
+        q.cfaPattern = ref.cfaPattern;
+        q.black = effBlack(ref);
+        q.white = effWhite(ref);
+        q.rois.push_back({ ref.w / 4, ref.h / 4, ref.w / 2, ref.h / 2 });
+        remote::MeasureResult mr;
+        if (!s.measure(q, mr, err)) {
+            fprintf(stderr, "selftest MEASURE: %s\n", err.c_str());
+            return 1;
+        }
+        size_t bad2 = 0;
+        if (mr.cols.size() != 1 || mr.cols[0].size() != local.size()) {
+            fprintf(stderr, "selftest MEASURE: shape mismatch (%zu cols, %zu vs %zu items)\n",
+                    mr.cols.size(), mr.cols.empty() ? 0 : mr.cols[0].size(), local.size());
+            bad2++;
+        } else {
+            for (size_t i = 0; i < local.size(); i++) {
+                const remote::MeasureItem& it = mr.cols[0][i];
+                char b[64];
+                std::string got = it.kind == 0
+                    ? (snprintf(b, 64, "%.9g", it.num), std::string(b)) : it.text;
+                if (it.key != local[i].first || got != local[i].second) {
+                    fprintf(stderr, "selftest MEASURE mismatch: %s: '%s' vs local '%s'\n",
+                            it.key.c_str(), got.c_str(), local[i].second.c_str());
+                    bad2++;
+                }
+            }
+        }
+        fprintf(stderr, "selftest: MEASURE %s on the peer [loc=%s]: %s (%zu keys)\n",
+                a.name.c_str(), mr.serverLoc ? "gpu" : "cpu",
+                bad2 ? "FAIL" : "ok", local.size());
+        bad += bad2 ? 1 : 0;
     }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
@@ -6295,9 +6376,15 @@ int main(int argc, char** argv) {
     // handled before anything touches GLFW.
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--serve")) return rp::runServeMode();
-    for (int i = 1; i + 1 < argc; i++)
-        if (!strcmp(argv[i], "--remote-selftest"))
-            return remoteSelfTest(argv[0], argv[i + 1]);
+    {   // --remote-exe must reach the selftest too, or "test the standalone peer"
+        // silently tests this binary against itself
+        const char* rexe = nullptr;
+        for (int i = 1; i + 1 < argc; i++)
+            if (!strcmp(argv[i], "--remote-exe")) rexe = argv[i + 1];
+        for (int i = 1; i + 1 < argc; i++)
+            if (!strcmp(argv[i], "--remote-selftest"))
+                return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
+    }
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0;

@@ -19,6 +19,36 @@ struct Meta {
     std::string dtype;
 };
 
+// MEASURE: what came back is exactly what the analyzer emitted, so the caller
+// renders it through the same grid/plot code as a local run.
+struct MeasureItem {
+    int kind = 0;                 // 0 = number, 1 = text
+    std::string key;
+    double num = 0;
+    std::string text;
+};
+struct MeasureSeries {
+    std::string name, xLabel, yLabel;
+    int col = 0;
+    std::vector<float> xs, ys;    // xs empty = use 0..n-1
+};
+struct MeasureResult {
+    int serverLoc = 0;            // 0 = CPU, 1 = CUDA (provenance)
+    int framesUsed = 0;
+    std::vector<std::vector<MeasureItem>> cols;
+    std::vector<MeasureSeries> series;
+};
+struct MeasureReq {
+    int op = 0;                   // rp::MeasureOp
+    int frame0 = 0, frameCount = 0;
+    int cfaType = 0, cfaPattern = 0;
+    float black = 0, white = 1;
+    std::vector<std::string> paths;   // >1 = one file per frame, in order
+    std::string analyzer, params;     // empty for aggregate ops
+    struct Roi { int x = 0, y = 0, w = 0, h = 0; };
+    std::vector<Roi> rois;            // empty = whole frame
+};
+
 // One connection to one machine. Not thread-safe: requests are serialised by the
 // caller (the UI thread today, a prefetch thread later).
 class Session {
@@ -37,9 +67,12 @@ public:
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
               std::string& err);
+    // run analysis where the data is; only the emitted results travel
+    bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
 
     const std::string& host() const { return host_; }
     uint64_t bytesReceived() const { return rx_; }
+    int peerVersion() const { return peerVersion_; }   // from HELLO; gates MEASURE
 
 private:
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
@@ -48,6 +81,7 @@ private:
     std::string host_;
     bool alive_ = false;
     uint64_t rx_ = 0;
+    int peerVersion_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles
 };
 

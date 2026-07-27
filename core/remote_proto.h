@@ -17,17 +17,51 @@
 namespace rp {
 
 static const uint32_t MAGIC = 0x56525031;   // "VRP1"
-static const uint32_t VERSION = 1;
+static const uint32_t VERSION = 2;          // 1 = LIST/META/TILE; 2 adds MEASURE
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
     MSG_LIST       = 2,   // -> (path)                     <- entries
     MSG_META       = 3,   // -> (path)                     <- shape/dtype/frames
     MSG_TILE       = 4,   // -> (path, frame, rect, step)  <- pixels
-    MSG_MEASURE    = 5,   // reserved: run an analyzer where the data is
+    MSG_MEASURE    = 5,   // -> (op, frames, rois, name)   <- emitted results only
     MSG_OK         = 128,
     MSG_ERR        = 129,
 };
+
+// MEASURE: run analysis where the data lives. A 300-frame statistic crosses the
+// wire as a few hundred bytes of results instead of gigabytes of pixels - and
+// it runs immediately, while any pixel transfer proceeds in parallel.
+enum MeasureOp : uint32_t {
+    MOP_ANALYZER        = 0,   // run a named plugin analyzer on ONE frame
+    MOP_TEMPORAL_STATS  = 1,   // per-pixel mean/var over N frames (noise vs FPN)
+    MOP_FRAME_ROI_STATS = 2,   // per-frame per-ROI mean/var (PTC / linearity)
+};
+
+// Fixed head of the request; the variable part follows as
+//   [str path * nPaths][str analyzer][str paramsJson][{u32 x,y,w,h} * nRois]
+// nPaths > 1 means one file per frame, in sequence order. analyzer/params are
+// empty for the aggregate ops. nRois == 0 means whole frame.
+struct MeasureReqHead {
+    uint32_t op;                 // MeasureOp
+    uint32_t frame0, frameCount; // range in a frame-axis file; frameCount 0 = all
+    uint32_t cfaType, cfaPattern;// psCfaType / psCfaPattern values
+    float    black, white;       // display-range hint handed to the analyzer
+    uint32_t nPaths, nRois;
+    uint32_t flags;              // reserved, 0
+};
+
+// Reply (MSG_OK): a serialization of exactly what the plugin sink emitted, so
+// the host renders it through the same grid/plot code as a local run.
+//   [u32 serverLoc]  0 = CPU, 1 = CUDA (provenance)
+//   [u32 framesUsed]
+//   [u32 nCols] per col: [u32 nItems]
+//       per item: [u32 kind] [str key] (kind 0 ? [f64 value] : [str value])
+//   [u32 nSeries] per series: [str name][str xLabel][str yLabel]
+//       [u32 col][u32 hasX][u32 n] (hasX ? [f32*n xs]) [f32*n ys]
+
+// shared sample-to-float conversion (defined in serve.cpp, linked everywhere)
+void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out);
 
 // Every message: [magic][type][payload bytes][payload]. Payloads are packed
 // little-endian scalars followed by any blob; both ends are ours, and the format

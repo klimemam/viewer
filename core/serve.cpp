@@ -6,6 +6,7 @@
 // cost of looking at a 12 Mpx frame over a link is the cost of the pane it is
 // displayed in.
 #include "remote_proto.h"
+#include "plugin_host.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "miniz.h"
@@ -36,6 +38,7 @@ struct Buf {
     std::vector<uint8_t> b;
     size_t rd = 0;
     void putU32(uint32_t v) { b.insert(b.end(), (uint8_t*)&v, (uint8_t*)&v + 4); }
+    void putF64(double v) { b.insert(b.end(), (uint8_t*)&v, (uint8_t*)&v + 8); }
     void putStr(const std::string& s) {
         putU32((uint32_t)s.size());
         b.insert(b.end(), s.begin(), s.end());
@@ -222,7 +225,12 @@ static void handleList(Buf& in) {
         bool dir = e.is_directory(e2);
         out.putStr(e.path().filename().u8string());
         out.putU32(dir ? 1u : 0u);
-        out.putU32((uint32_t)std::min<uintmax_t>(dir ? 0 : e.file_size(e2), 0xFFFFFFFFull));
+        // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
+        // routinely, and a silently clamped size is the failure mode this tool
+        // exists to avoid
+        uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
+        out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
+        out.putU32((uint32_t)(sz >> 32));
     }
     sendMsg(MSG_OK, out);
 }
@@ -278,6 +286,185 @@ static void handleTile(Buf& in) {
     sendMsg(MSG_OK, out);
 }
 
+// ---------------------------------------------------------------- measure
+// Run analysis where the data lives. The reply carries only what was emitted:
+// the whole point is that a statistic over gigabytes of frames crosses the wire
+// as a few hundred bytes, immediately, while any pixel transfer runs in parallel.
+
+void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out) {
+    switch (dtype) {
+        case DT_U8:  for (size_t i = 0; i < n; i++) out[i] = (float)src[i]; break;
+        case DT_I8:  for (size_t i = 0; i < n; i++) out[i] = (float)((const int8_t*)src)[i]; break;
+        case DT_U16: for (size_t i = 0; i < n; i++) out[i] = (float)((const uint16_t*)src)[i]; break;
+        case DT_I16: for (size_t i = 0; i < n; i++) out[i] = (float)((const int16_t*)src)[i]; break;
+        case DT_U32: for (size_t i = 0; i < n; i++) out[i] = (float)((const uint32_t*)src)[i]; break;
+        case DT_I32: for (size_t i = 0; i < n; i++) out[i] = (float)((const int32_t*)src)[i]; break;
+        case DT_F32: memcpy(out, src, n * 4); break;
+        case DT_F64: for (size_t i = 0; i < n; i++) out[i] = (float)((const double*)src)[i]; break;
+        default:     for (size_t i = 0; i < n; i++) out[i] = 0.0f; break;
+    }
+}
+
+namespace {
+struct MItem { uint32_t kind; std::string key; double num; std::string text; };
+struct MSeries {
+    std::string name, xl, yl;
+    uint32_t col = 0;
+    bool hasX = false;
+    std::vector<float> xs, ys;
+};
+struct MSink {
+    std::vector<std::vector<MItem>>* cols;
+    std::vector<MSeries>* series;
+    uint32_t col = 0;
+};
+void mNum(void* c, const char* k, double v) {
+    auto* s = (MSink*)c;
+    (*s->cols)[s->col].push_back({ 0u, k ? k : "", v, {} });
+}
+void mTxt(void* c, const char* k, const char* v) {
+    auto* s = (MSink*)c;
+    (*s->cols)[s->col].push_back({ 1u, k ? k : "", 0.0, v ? v : "" });
+}
+void mSer(void* c, const char* name, const char* xl, const char* yl,
+          const float* x, const float* y, uint32_t n) {
+    auto* s = (MSink*)c;
+    MSeries so;
+    so.name = name ? name : "";
+    so.xl = xl ? xl : ""; so.yl = yl ? yl : "";
+    so.col = s->col;
+    so.hasX = x != nullptr;
+    if (x) so.xs.assign(x, x + n);
+    so.ys.assign(y, y + n);
+    s->series->push_back(std::move(so));
+}
+
+// Plugins load on the FIRST measure, not at startup: a session that only lists
+// and ships tiles should not pay for (or depend on) the plugin directory.
+bool g_pluginsLoaded = false;
+void ensurePlugins() {
+    if (g_pluginsLoaded) return;
+    g_pluginsLoaded = true;
+    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins",
+                           plugin_host::exeDir() + "/../plugins" },
+                         [](const std::string& m, bool) { fprintf(stderr, "%s\n", m.c_str()); });
+}
+}  // namespace
+
+static void handleMeasure(Buf& in) {
+    MeasureReqHead head{};
+    if (in.rd + sizeof head > in.b.size()) { sendErr("bad MEASURE"); return; }
+    memcpy(&head, in.b.data() + in.rd, sizeof head);
+    in.rd += sizeof head;
+    if (head.nPaths == 0 || head.nPaths > 100000 || head.nRois > 4096) {
+        sendErr("bad MEASURE header");
+        return;
+    }
+    std::vector<std::string> paths(head.nPaths);
+    for (auto& p : paths) if (!in.getStr(p)) { sendErr("bad MEASURE paths"); return; }
+    std::string analyzer, params;
+    if (!in.getStr(analyzer) || !in.getStr(params)) { sendErr("bad MEASURE"); return; }
+    struct RoiRect { uint32_t x, y, w, h; };
+    std::vector<RoiRect> rois(head.nRois);
+    for (auto& r : rois) {
+        uint32_t v[4];
+        for (uint32_t& x : v) if (!in.getU32(x)) { sendErr("bad MEASURE rois"); return; }
+        r.x = v[0]; r.y = v[1]; r.w = v[2]; r.h = v[3];
+    }
+
+    if (head.op != MOP_ANALYZER) { sendErr("measure op not implemented yet"); return; }
+
+    ensurePlugins();
+    const AnalyzerPluginInfo* ana = nullptr;
+    std::string have;
+    for (const auto& a : plugin_host::analyzers()) {
+        if (a.name == analyzer) ana = &a;
+        have += (have.empty() ? "" : ", ") + a.name;
+    }
+    if (!ana) { sendErr("analyzer not found: " + analyzer + " (server has: " + have + ")"); return; }
+
+    // materialize the frame as f32, exactly as the local host would
+    NpyFile n;
+    std::string err;
+    if (!parseNpyHeader(n, paths[0], err)) { sendErr(err); return; }
+    TileReq full{};
+    full.frame = head.frame0;
+    full.x = 0; full.y = 0; full.w = (uint32_t)n.w; full.h = (uint32_t)n.h;
+    full.step = 1;
+    std::vector<uint8_t> raw;
+    uint32_t ow = 0, oh = 0;
+    if (!readRegion(n, full, raw, ow, oh, err)) { sendErr(err); return; }
+    std::vector<float> pix((size_t)ow * oh * n.ch);
+    toFloatSamples(raw.data(), n.dtype, pix.size(), pix.data());
+    raw.clear();
+    raw.shrink_to_fit();
+
+    psFrame fr{};
+    fr.w = ow; fr.h = oh; fr.ch = (uint32_t)n.ch;
+    fr.dtype = PS_DTYPE_F32;
+    fr.loc = PS_MEM_CPU;
+    fr.data = pix.data();
+    fr.pitch_bytes = (size_t)ow * n.ch * sizeof(float);
+    fr.black = head.black; fr.white = head.white;
+    fr.cfa_type = (int32_t)head.cfaType;
+    fr.cfa_pattern = (int32_t)head.cfaPattern;
+    fr.pts_us = -1;
+    fr.name = paths[0].c_str();
+
+    uint32_t nCols = head.nRois ? head.nRois : 1;
+    std::vector<std::vector<MItem>> cols(nCols);
+    std::vector<MSeries> series;
+    MSink ctx{ &cols, &series, 0 };
+    char perr[512];
+    for (uint32_t c = 0; c < nCols; c++) {
+        ctx.col = c;
+        psRect rr{};
+        const psRect* rp = nullptr;
+        if (head.nRois) {
+            rr.x = std::min(rois[c].x, fr.w); rr.y = std::min(rois[c].y, fr.h);
+            rr.w = std::min(rois[c].w, fr.w - rr.x); rr.h = std::min(rois[c].h, fr.h - rr.y);
+            rp = &rr;
+        }
+        perr[0] = 0;
+        int32_t rc;
+        if (ana->isV2) {
+            psAnalyzeSink2 sink{ &ctx, mNum, mTxt, mSer, {} };
+            rc = ana->v2.analyze(&fr, rp, &sink, perr, sizeof perr);
+        } else {
+            psAnalyzeSink sink{ &ctx, mNum, mTxt };
+            rc = ana->v1.analyze(&fr, rp, &sink, perr, sizeof perr);
+        }
+        if (rc != 0) {
+            sendErr(analyzer + ": " + (perr[0] ? perr : "analyzer failed"));
+            return;
+        }
+    }
+
+    Buf out;
+    out.putU32(0);                              // serverLoc: CPU (CUDA slots in here)
+    out.putU32(1);                              // framesUsed
+    out.putU32(nCols);
+    for (const auto& col : cols) {
+        out.putU32((uint32_t)col.size());
+        for (const auto& it : col) {
+            out.putU32(it.kind);
+            out.putStr(it.key);
+            if (it.kind == 0) out.putF64(it.num);
+            else              out.putStr(it.text);
+        }
+    }
+    out.putU32((uint32_t)series.size());
+    for (const auto& s : series) {
+        out.putStr(s.name); out.putStr(s.xl); out.putStr(s.yl);
+        out.putU32(s.col);
+        out.putU32(s.hasX ? 1u : 0u);
+        out.putU32((uint32_t)s.ys.size());
+        if (s.hasX) out.putBlob(s.xs.data(), s.xs.size() * 4);
+        out.putBlob(s.ys.data(), s.ys.size() * 4);
+    }
+    sendMsg(MSG_OK, out);
+}
+
 // Transport-independent: give it a request, it answers through the current sink.
 void handleRequest(uint32_t type, Buf& in) {
     switch (type) {
@@ -291,6 +478,7 @@ void handleRequest(uint32_t type, Buf& in) {
         case MSG_LIST: handleList(in); break;
         case MSG_META: handleMeta(in); break;
         case MSG_TILE: handleTile(in); break;
+        case MSG_MEASURE: handleMeasure(in); break;
         default: sendErr("unknown request"); break;
     }
 }

@@ -154,6 +154,12 @@ struct R {
     size_t rd = 0;
     explicit R(const std::vector<uint8_t>& v) : b(v) {}
     bool u32(uint32_t& v) { if (rd + 4 > b.size()) return false; memcpy(&v, b.data() + rd, 4); rd += 4; return true; }
+    bool f64(double& v) { if (rd + 8 > b.size()) return false; memcpy(&v, b.data() + rd, 8); rd += 8; return true; }
+    bool f32v(std::vector<float>& v, size_t n) {
+        if (n > (b.size() - rd) / 4) return false;
+        v.resize(n);
+        memcpy(v.data(), b.data() + rd, n * 4); rd += n * 4; return true;
+    }
     bool str(std::string& s) {
         uint32_t n; if (!u32(n) || rd + n > b.size()) return false;
         s.assign((const char*)b.data() + rd, n); rd += n; return true;
@@ -198,6 +204,11 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
         stop();
         return false;
     }
+    {   // the version was always on the wire; MEASURE is gated on it
+        R r(reply);
+        uint32_t v = 0;
+        if (r.u32(v)) peerVersion_ = (int)v;
+    }
     return true;
 }
 
@@ -239,9 +250,12 @@ bool Session::list(const std::string& path, std::vector<Entry>& out, std::string
     if (!r.u32(n)) { err = "bad LIST reply"; return false; }
     out.clear();
     for (uint32_t i = 0; i < n; i++) {
-        Entry e; uint32_t d = 0, sz = 0;
-        if (!r.str(e.name) || !r.u32(d) || !r.u32(sz)) { err = "bad LIST reply"; return false; }
-        e.dir = d != 0; e.size = sz;
+        Entry e; uint32_t d = 0, lo = 0, hi = 0;
+        if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi)) {
+            err = "bad LIST reply"; return false;
+        }
+        e.dir = d != 0;
+        e.size = ((uint64_t)hi << 32) | lo;
         out.push_back(std::move(e));
     }
     return true;
@@ -316,6 +330,66 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     outW = (int)rep.w; outH = (int)rep.h; outCh = (int)rep.ch;
     dtype = rp::dtypeName(rep.dtype);
     toFloat(raw.data(), rep.dtype, (size_t)rep.w * rep.h * rep.ch, out);
+    return true;
+}
+
+bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err) {
+    if (peerVersion_ < 2) { err = "the remote peer is too old for MEASURE (update viewer-serve)"; return false; }
+    W w;
+    rp::MeasureReqHead head{};
+    head.op = (uint32_t)q.op;
+    head.frame0 = (uint32_t)std::max(0, q.frame0);
+    head.frameCount = (uint32_t)std::max(0, q.frameCount);
+    head.cfaType = (uint32_t)q.cfaType;
+    head.cfaPattern = (uint32_t)q.cfaPattern;
+    head.black = q.black; head.white = q.white;
+    head.nPaths = (uint32_t)q.paths.size();
+    head.nRois = (uint32_t)q.rois.size();
+    w.blob(&head, sizeof head);
+    for (const auto& p : q.paths) w.str(p);
+    w.str(q.analyzer);
+    w.str(q.params);
+    for (const auto& r : q.rois) {
+        w.u32((uint32_t)std::max(0, r.x)); w.u32((uint32_t)std::max(0, r.y));
+        w.u32((uint32_t)std::max(0, r.w)); w.u32((uint32_t)std::max(0, r.h));
+    }
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_MEASURE, w.b, err) || !recv(type, reply, err)) return false;
+    R r(reply);
+    if (type != rp::MSG_OK) { r.str(err); return false; }
+    uint32_t loc = 0, frames = 0, nCols = 0;
+    if (!r.u32(loc) || !r.u32(frames) || !r.u32(nCols) || nCols > 4096) {
+        err = "bad MEASURE reply"; return false;
+    }
+    out.serverLoc = (int)loc;
+    out.framesUsed = (int)frames;
+    out.cols.assign(nCols, {});
+    for (auto& col : out.cols) {
+        uint32_t nItems = 0;
+        if (!r.u32(nItems) || nItems > 100000) { err = "bad MEASURE reply"; return false; }
+        col.resize(nItems);
+        for (auto& it : col) {
+            uint32_t kind = 0;
+            if (!r.u32(kind) || !r.str(it.key)) { err = "bad MEASURE reply"; return false; }
+            it.kind = (int)kind;
+            if (kind == 0) { if (!r.f64(it.num)) { err = "bad MEASURE reply"; return false; } }
+            else           { if (!r.str(it.text)) { err = "bad MEASURE reply"; return false; } }
+        }
+    }
+    uint32_t nSeries = 0;
+    if (!r.u32(nSeries) || nSeries > 100000) { err = "bad MEASURE reply"; return false; }
+    out.series.resize(nSeries);
+    for (auto& s : out.series) {
+        uint32_t col = 0, hasX = 0, n = 0;
+        if (!r.str(s.name) || !r.str(s.xLabel) || !r.str(s.yLabel) ||
+            !r.u32(col) || !r.u32(hasX) || !r.u32(n)) {
+            err = "bad MEASURE reply"; return false;
+        }
+        s.col = (int)col;
+        if (hasX && !r.f32v(s.xs, n)) { err = "bad MEASURE reply"; return false; }
+        if (!r.f32v(s.ys, n)) { err = "bad MEASURE reply"; return false; }
+    }
     return true;
 }
 
