@@ -23,6 +23,8 @@
 #include "plugin_host.h"
 #include "miniz.h"                   // deflate for compressed .npz members
 #include "ui_theme.h"
+#include "remote.h"
+#include "remote_proto.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5655,6 +5657,63 @@ static void parseCli(int argc, char** argv) {
     }
 }
 
+// Round-trip check for the remote path, without needing an ssh host: start a
+// local peer, ask for the same pixels two ways, and compare. A viewer that shows
+// subtly wrong pixels over a link would be worse than one that shows none.
+static int remoteSelfTest(const char* exe, const char* path) {
+    remote::Session s;
+    std::string err;
+    if (!s.start("", exe, err)) { fprintf(stderr, "selftest: %s\n", err.c_str()); return 1; }
+    remote::Meta m;
+    if (!s.meta(path, m, err)) { fprintf(stderr, "selftest META: %s\n", err.c_str()); return 1; }
+    fprintf(stderr, "selftest: meta %dx%d %dch %s frames=%d\n", m.w, m.h, m.ch,
+            m.dtype.c_str(), m.frames);
+
+    std::string localErr = loadNpy(path);          // the local decoder, for reference
+    if (!localErr.empty() || !cur()) {
+        fprintf(stderr, "selftest: local load failed: %s\n", localErr.c_str());
+        return 1;
+    }
+    const ImageDoc& ref = *cur();
+    struct Case { int x, y, w, h, step; };
+    const Case cases[] = {
+        { 0, 0, ref.w, ref.h, 1 },                              // whole frame
+        { 0, 0, ref.w, ref.h, 3 },                              // decimated overview
+        { ref.w / 4, ref.h / 4, ref.w / 2, ref.h / 2, 1 },      // zoomed-in crop
+        { 1, 1, 17, 13, 2 },                                    // odd rect, odd stride
+    };
+    int bad = 0;
+    for (const Case& c : cases) {
+        std::vector<float> got;
+        int gw = 0, gh = 0, gch = 0;
+        std::string dt;
+        if (!s.tile(path, 0, c.x, c.y, c.w, c.h, c.step, got, gw, gh, gch, dt, err)) {
+            fprintf(stderr, "selftest TILE: %s\n", err.c_str());
+            return 1;
+        }
+        size_t mismatch = 0;
+        for (int y = 0; y < gh; y++)
+            for (int x = 0; x < gw; x++)
+                for (int ci = 0; ci < gch; ci++) {
+                    float a = got[((size_t)y * gw + x) * gch + ci];
+                    float b = ref.sample(c.x + x * c.step, c.y + y * c.step, ci);
+                    if (a != b && !(std::isnan(a) && std::isnan(b))) mismatch++;
+                }
+        static uint64_t prevRx = 0;
+        uint64_t wire = s.bytesReceived() - prevRx;
+        prevRx = s.bytesReceived();
+        fprintf(stderr, "selftest: rect %dx%d@%d,%d step %d -> %dx%d %dch %s : %s "
+                        "(%zu mismatches, %.2f MB on the wire for %.2f MB of samples)\n",
+                c.w, c.h, c.x, c.y, c.step, gw, gh, gch, dt.c_str(),
+                mismatch ? "FAIL" : "ok", mismatch,
+                wire / 1048576.0, (double)got.size() * 4 / 1048576.0);
+        bad += mismatch ? 1 : 0;
+    }
+    fprintf(stderr, "selftest: %llu bytes received from the peer\n",
+            (unsigned long long)s.bytesReceived());
+    return bad ? 1 : 0;
+}
+
 // ---------------------------------------------------------------- main
 // Idle throttling: an immediate-mode UI normally redraws 60x per second, which
 // over ssh X11 forwarding means pushing the whole window across the network
@@ -5710,6 +5769,14 @@ static void installWakeCallbacks(GLFWwindow* win) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { printUsage(); return 0; }
+    // Serve mode is what ssh starts on the machine holding the data: no window,
+    // no GL, no socket - it answers pixel requests on stdin/stdout. It must be
+    // handled before anything touches GLFW.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--serve")) return rp::runServeMode();
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--remote-selftest"))
+            return remoteSelfTest(argv[0], argv[i + 1]);
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0;

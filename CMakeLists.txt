@@ -65,6 +65,7 @@ add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
+                      core/serve.cpp core/remote.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # third-party: do not police its warnings
 set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES COMPILE_OPTIONS
