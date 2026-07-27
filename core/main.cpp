@@ -295,6 +295,13 @@ struct App {
         int id = 0;
         std::string name;             // display name (pattern)
         int lastImageIdx = -1;        // last viewed frame, for stack switching
+        // remote origin: lets the temporal panel measure server-side without all
+        // frames being resident. remoteUrl for a frame-axis file; remoteFiles for
+        // a folder-of-frames stack. expectedFrames = the true total from META.
+        std::string remoteUrl, remoteHost;
+        std::vector<std::string> remoteFiles;
+        int expectedFrames = 0;
+        int cfaType = 0, cfaPattern = 0;
     };
     std::vector<SeqInfo> seqs;
     int nextSeqId = 1;
@@ -308,6 +315,34 @@ struct App {
     std::string exePath;              // argv[0], for the local:// test peer
     bool remoteDlgOpen = false;       // File > Open Remote (ssh://)...
     std::string lastRemoteUrl;        // last opened, prefilled next time (prefs)
+    // where analysis runs. auto: remote data -> server, local -> local. server:
+    // even a resident frame is measured server-side (one engine for a whole
+    // batch). local-fetch: never use the server for compute (today's behavior).
+    enum { PolAuto = 0, PolServer = 1, PolLocalFetch = 2 };
+    int procPolicy = PolAuto;
+    // background MEASURE worker (own ssh connection: a 300-frame aggregate must
+    // not stall the tile fetches). Results carry provenance for the panel.
+    struct MJob { std::string url; int op; uint64_t token; std::vector<std::string> files;
+                  int cfaType = 0, cfaPattern = 0; float black = 0, white = 1;
+                  int rx = 0, ry = 0, rw = 0, rh = 0; };
+    struct MDone { uint64_t token; bool ok = false; std::string err, host;
+                   remote::MeasureResult res; };
+    std::thread mThread;
+    std::atomic<bool> mStop{ false };
+    std::atomic<int> mPending{ 0 };
+    std::mutex mMtx;
+    std::vector<MJob> mQueue;
+    std::vector<MDone> mDone;
+    // last server temporal result, keyed to the stack it describes
+    struct ServerTemporal {
+        uint64_t token = 0;           // matches the MJob that produced it
+        int seqId = -1;
+        bool valid = false, pending = false;
+        std::string host, err;
+        int frames = 0;
+        double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
+        std::vector<float> idx, frameMean, frameStd;
+    } srvTemporal;
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -942,6 +977,109 @@ static void pumpRemoteFetch() {
 static void stopRemoteFetcher() {
     app.rfStop = true;
     if (app.rfThread.joinable()) app.rfThread.join();
+}
+
+// ---- background MEASURE (server-side analysis) --------------------------------
+// Its own ssh connection: a 300-frame aggregate can hold the pipe for seconds,
+// and that must not stall the tile fetches on the other worker.
+static void mWorker() {
+    remote::Session ses;
+    std::string sesHost = "\n";
+    while (!app.mStop) {
+        App::MJob job;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(app.mMtx);
+            if (!app.mQueue.empty()) { job = std::move(app.mQueue.front());
+                                       app.mQueue.erase(app.mQueue.begin()); have = true; }
+        }
+        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+        App::MDone d;
+        d.token = job.token;
+        std::string host, rpath, err;
+        if (!remote::parseUrl(job.url, host, rpath)) { d.err = "bad remote url"; }
+        else {
+            d.host = host;
+            if (!ses.alive() || sesHost != host) {
+                std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
+                                                                              : app.remoteExe;
+                if (!ses.start(host, exe, err)) d.err = err;
+                else sesHost = host;
+            }
+            if (d.err.empty()) {
+                remote::MeasureReq q;
+                q.op = job.op;
+                q.cfaType = job.cfaType; q.cfaPattern = job.cfaPattern;
+                q.black = job.black; q.white = job.white;
+                if (job.files.empty()) q.paths = { rpath };
+                else                   q.paths = job.files;   // one file per frame
+                if (job.rw > 0 && job.rh > 0)
+                    q.rois.push_back({ job.rx, job.ry, job.rw, job.rh });
+                if (!ses.measure(q, d.res, err)) d.err = err;
+                else d.ok = true;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(app.mMtx);
+            app.mDone.push_back(std::move(d));
+        }
+        glfwPostEmptyEvent();
+    }
+}
+
+static void mEnqueue(App::MJob job) {
+    {
+        std::lock_guard<std::mutex> lk(app.mMtx);
+        app.mPending++;
+        app.mQueue.push_back(std::move(job));
+    }
+    if (!app.mThread.joinable()) app.mThread = std::thread(mWorker);
+}
+
+static void stopMeasureWorker() {
+    app.mStop = true;
+    if (app.mThread.joinable()) app.mThread.join();
+}
+
+// Pull one scalar / series out of a server MeasureResult column 0 by key.
+static double mFindNum(const remote::MeasureResult& r, const char* key, double dflt = 0) {
+    if (r.cols.empty()) return dflt;
+    for (const auto& it : r.cols[0]) if (it.kind == 0 && it.key == key) return it.num;
+    return dflt;
+}
+static const remote::MeasureSeries* mFindSeries(const remote::MeasureResult& r, const char* name) {
+    for (const auto& s : r.series) if (s.name == name) return &s;
+    return nullptr;
+}
+
+static void pumpMeasure() {
+    std::vector<App::MDone> batch;
+    {
+        std::lock_guard<std::mutex> lk(app.mMtx);
+        batch.swap(app.mDone);
+    }
+    for (auto& d : batch) {
+        app.mPending--;
+        if (d.token != app.srvTemporal.token) continue;   // superseded request
+        App::ServerTemporal& S = app.srvTemporal;
+        S.pending = false;
+        S.host = d.host;
+        if (!d.ok) { S.valid = false; S.err = d.err; continue; }
+        S.err.clear();
+        S.valid = true;
+        S.frames = d.res.framesUsed;
+        // CFA-all is column 0's un-suffixed keys; a mosaiced stack reports per
+        // plane, and the panel shows the overall figure from those when present.
+        S.mean = mFindNum(d.res, "mean [DN]", mFindNum(d.res, "mean [DN] R"));
+        S.tempNoise = mFindNum(d.res, "sigma_t [DN]", mFindNum(d.res, "sigma_t [DN] R"));
+        S.fixedPattern = mFindNum(d.res, "sigma_fpn [DN]", mFindNum(d.res, "sigma_fpn [DN] R"));
+        S.totalNoise = mFindNum(d.res, "sigma_tot [DN]", mFindNum(d.res, "sigma_tot [DN] R"));
+        if (const auto* fm = mFindSeries(d.res, "frame mean")) { S.idx = fm->xs; S.frameMean = fm->ys; }
+        if (const auto* fs = mFindSeries(d.res, "frame std"))  { S.frameStd = fs->ys; }
+        fprintf(stderr, "remote: server temporal over %d frames - sigma_t %.4g, "
+                        "sigma_fpn %.4g [%s]\n", S.frames, S.tempNoise, S.fixedPattern,
+                d.res.serverLoc ? "gpu" : "cpu");
+    }
 }
 
 static void closeCurrent() {
@@ -2028,6 +2166,7 @@ static void savePrefs() {
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
     f << "membudget " << app.memBudgetGB << "\n";
+    f << "procpolicy " << app.procPolicy << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
@@ -2058,6 +2197,8 @@ static void loadPrefs() {
         else if (key == "membudget")   { ls >> app.memBudgetGB;
                                          if (app.memBudgetGB > 0)
                                              app.memBudgetGB = std::clamp(app.memBudgetGB, 0.5f, 4096.0f); }
+        else if (key == "procpolicy")  { ls >> app.procPolicy;
+                                         app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl") {
@@ -3238,6 +3379,41 @@ static std::string makeRemoteUrl(const std::string& host, const std::string& pat
     return host.empty() ? "local://" + path : "ssh://" + host + path;
 }
 
+// Does analysis of this stack run on the server? Yes for remote data unless the
+// user chose local-fetch. (Single-frame policy nuance lives in the Analysis
+// panel; this is the stack-aggregate decision.)
+static bool serverComputes(const App::SeqInfo& si) {
+    if (si.remoteUrl.empty() && si.remoteFiles.empty()) return false;   // local data
+    return app.procPolicy != App::PolLocalFetch;
+}
+
+static uint64_t g_measureToken = 1;
+
+// Fire the server-side temporal aggregate for a remote stack, if policy allows.
+// The result feeds the Temporal panel with a [server, N frames] tag, in seconds,
+// without waiting for any frame transfer.
+static void maybeRequestServerTemporal(int seqId) {
+    App::SeqInfo* si = nullptr;
+    for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
+    if (!si || !serverComputes(*si)) return;
+    App::ServerTemporal& S = app.srvTemporal;
+    S = App::ServerTemporal{};
+    S.seqId = seqId;
+    S.token = g_measureToken++;
+    S.pending = true;
+    App::MJob j;
+    j.token = S.token;
+    j.op = rp::MOP_TEMPORAL_STATS;
+    j.cfaType = si->cfaType; j.cfaPattern = si->cfaPattern;
+    if (!si->remoteFiles.empty()) {
+        j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0]);
+        for (const auto& f : si->remoteFiles) j.files.push_back(f);
+    } else {
+        j.url = si->remoteUrl;
+    }
+    mEnqueue(std::move(j));
+}
+
 static void openRemote(const std::string& url) {
     std::string host, rpath;
     if (!remote::parseUrl(url, host, rpath)) {
@@ -3292,10 +3468,16 @@ static void openRemote(const std::string& url) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
         si.name = baseName(rpath) + " [remote]";
+        si.remoteUrl = url;           // frame-axis: one file, N frames
+        si.remoteHost = host;
+        si.expectedFrames = m.frames;
         app.seqs.push_back(si);
         ImageDoc* first = app.images.back().get();
         first->seqId = si.id;
         first->seqIndex = 0;
+        // server-side temporal stats fire NOW, regardless of transfer, when the
+        // policy allows the server to compute (auto/server for remote data)
+        maybeRequestServerTemporal(si.id);
         size_t perFrame = (size_t)m.w * m.h * m.ch * sizeof(float);
         size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
         int fit = (int)std::min<size_t>((size_t)m.frames - 1, perFrame ? room / perFrame : 0);
@@ -3332,9 +3514,13 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     App::SeqInfo si;
     si.id = app.nextSeqId++;
     si.name = baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
+    si.remoteHost = host;             // folder stack: one file per frame
+    si.expectedFrames = (int)files.size();
+    for (const auto& f : files) si.remoteFiles.push_back(f);
     app.seqs.push_back(si);
     first->seqId = si.id;
     first->seqIndex = 0;
+    maybeRequestServerTemporal(si.id);
     size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
     if (first->remoteStep > 1)                    // preview dims: scale the estimate
         perFrame *= (size_t)first->remoteStep * first->remoteStep;
@@ -5046,15 +5232,88 @@ static void drawPanelProjection() {
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
 }
 
+// Server-computed temporal stats: shown for a remote stack under a policy that
+// lets the server compute. The numbers come over the wire in seconds; they are
+// never quietly recomputed locally (that would change a displayed measurement,
+// and a partial local stack would make it WORSE). The tag says where and over
+// how many frames, always.
+static bool drawServerTemporal(const App::SeqInfo* si) {
+    App::ServerTemporal& S = app.srvTemporal;
+    if (!si || !serverComputes(*si) || S.seqId != si->id) return false;
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    if (S.pending) {
+        ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
+                           S.host.empty() ? "local peer" : S.host.c_str());
+        ImGui::Separator();
+        ImGui::TextDisabled("computing on the server over all %d frames", si->expectedFrames);
+        return true;
+    }
+    if (!S.valid) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[server failed]");
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", S.err.c_str());
+        ImGui::TextDisabled("frames arrive locally in the background; the panel will\n"
+                            "switch to local computation once enough are here.");
+        return false;                 // fall through to the local path
+    }
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames]",
+                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames);
+    ImGui::Separator();
+    if (ImGui::BeginTable("srvtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
+        auto row = [](const char* k, double v) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn(); textNum("%.6g", v);
+        };
+        row("temporal noise (sigma_t)", S.tempNoise);
+        row("fixed pattern (sigma_fpn)", S.fixedPattern);
+        row("total (quadrature)", S.totalNoise);
+        ImGui::EndTable();
+    }
+    if (!S.frameMean.empty()) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
+        float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        PlotRect tp = beginPlot("frame number", "ROI mean value [DN]",
+                                fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            for (size_t i = 1; i < S.frameMean.size(); i++)
+                dl->AddLine(tp.at(S.idx[i - 1], S.frameMean[i - 1]),
+                            tp.at(S.idx[i], S.frameMean[i]), IM_COL32(105, 180, 240, 255), 1.5f);
+            if (ImageDoc* c2 = cur()) {
+                float mxp = tp.at((float)c2->seqIndex, tp.ymin).x;
+                dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
+            }
+            dl->PopClipRect();
+        }
+    }
+    return true;
+}
+
 static void drawPanelTemporal() {
     ImageDoc* im = cur();
     if (im && im->seqId != 0) {
+        App::SeqInfo* si = seqInfo(im->seqId);
+        if (drawServerTemporal(si)) return;   // remote stack, computed on the server
         recomputeTemporalIfNeeded();
         const App::TemporalState& T = app.temporal;
         ImGui::Text("Temporal");
         ImGui::SameLine();
-        ImGui::TextDisabled("(%d frames, %s)", T.frames,
-                            T.roiUsed ? "selected ROI" : "whole image");
+        // for a remote stack whose server measure failed, be explicit that this
+        // is a PARTIAL local computation, and of how many
+        int expected = si ? si->expectedFrames : 0;
+        if (expected > T.frames)
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[local, %d of %d frames]",
+                               T.frames, expected);
+        else
+            ImGui::TextDisabled("[local, %d frames, %s]", T.frames,
+                                T.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
@@ -5733,6 +5992,19 @@ static void drawMenuBar(GLFWwindow* win) {
                                     seqMemBudget() / 1073741824.0);
                 ImGui::Separator();
             }
+            {   // where remote analysis runs
+                ImGui::TextDisabled("Remote processing");
+                if (ImGui::MenuItem("  auto (server for remote data)", nullptr,
+                                    app.procPolicy == App::PolAuto))
+                    app.procPolicy = App::PolAuto;
+                if (ImGui::MenuItem("  server (measure on the server)", nullptr,
+                                    app.procPolicy == App::PolServer))
+                    app.procPolicy = App::PolServer;
+                if (ImGui::MenuItem("  local fetch (bring frames here)", nullptr,
+                                    app.procPolicy == App::PolLocalFetch))
+                    app.procPolicy = App::PolLocalFetch;
+                ImGui::Separator();
+            }
             if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
                                 cur() && cur()->seqId == 0 && !cur()->path.empty())) {
                 std::string pat;
@@ -6218,6 +6490,12 @@ static void parseCli(int argc, char** argv) {
             next();                                // consumed in main(), not an error
         } else if (a == "--remote-selftest") {
             next();
+        } else if (a == "--remote-policy") {        // auto | server | local-fetch
+            std::string v = next();
+            if (v == "auto") app.procPolicy = App::PolAuto;
+            else if (v == "server") app.procPolicy = App::PolServer;
+            else if (v == "local-fetch" || v == "local") app.procPolicy = App::PolLocalFetch;
+            else fprintf(stderr, "--remote-policy expects auto|server|local-fetch\n");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
         } else if (a == "--mem-budget") {          // GB the sequence loader may use
@@ -7074,6 +7352,7 @@ int main(int argc, char** argv) {
         }
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
+        pumpMeasure();                // integrate server-side measurement results
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
@@ -7166,6 +7445,7 @@ int main(int argc, char** argv) {
     if (app.prefsDirty) savePrefs();
     stopSequenceLoader();             // join the workers before tearing anything down
     stopRemoteFetcher();
+    stopMeasureWorker();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
