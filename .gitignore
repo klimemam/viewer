@@ -5,3 +5,5 @@ venv/
 build/
 tools/testdata/
 build-mingw/
+# hello_imgui window-layout settings written next to imgui_demo.py
+*.ini
