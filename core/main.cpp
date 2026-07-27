@@ -1622,6 +1622,8 @@ static void drawFolderPickModal() {
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 18),
+                                        ImVec2(FLT_MAX, FLT_MAX));
     if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
 
     ImGui::TextDisabled("%s", app.folderPickRoot.c_str());
@@ -2516,11 +2518,16 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
     const float s = app.uiScale;
     const float fh = ImGui::GetFontSize();
     char tb[48];
-    fmtTick(tb, sizeof tb, ymax, yInt);
-    float wy = ImGui::CalcTextSize(tb).x;
-    fmtTick(tb, sizeof tb, ymin, yInt);
-    wy = std::max(wy, ImGui::CalcTextSize(tb).x);
-    const float marginL = wy + 8 * s;
+    // measure EVERY tick label, not just the endpoints: on a 0..1 axis the
+    // intermediate "0.25" is wider than both ends and would draw off-panel
+    double ystep = niceStep((float)((ymax - ymin) / 4.0));
+    if (yInt && ystep < 1) ystep = 1;
+    float wy = 0.0f;
+    for (double v = ceil(ymin / ystep) * ystep; v <= ymax + 1e-9; v += ystep) {
+        fmtTick(tb, sizeof tb, v, yInt);
+        wy = std::max(wy, ImGui::CalcTextSize(tb).x);
+    }
+    const float marginL = wy + 9 * s;   // 5*s tick gap + breathing room
     const float marginB = fh * 2 + 6 * s;          // x tick labels + x axis title
     const float marginT = fh + 4 * s;              // y axis title sits on top
 
@@ -2535,9 +2542,7 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
           txt = IM_COL32(150, 160, 170, 255), axis = IM_COL32(90, 100, 110, 255);
     dl->AddRectFilled(pr.p0, pr.p1, bg);
 
-    // Y ticks
-    double ystep = niceStep((float)((ymax - ymin) / 4.0));
-    if (yInt && ystep < 1) ystep = 1;
+    // Y ticks (ystep computed above, where the margin was measured)
     for (double v = ceil(ymin / ystep) * ystep; v <= ymax + 1e-9; v += ystep) {
         float y = pr.at(pr.xmin, (float)v).y;
         dl->AddLine(ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y), grid);
@@ -2553,7 +2558,8 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
         dl->AddLine(ImVec2(x, pr.p0.y), ImVec2(x, pr.p1.y), grid);
         fmtTick(tb, sizeof tb, v, xInt);
         ImVec2 ts = ImGui::CalcTextSize(tb);
-        dl->AddText(ImVec2(std::min(x - ts.x * 0.5f, pr.p1.x - ts.x), pr.p1.y + 2 * s), txt, tb);
+        dl->AddText(ImVec2(std::clamp(x - ts.x * 0.5f, pr.p0.x, pr.p1.x - ts.x),
+                           pr.p1.y + 2 * s), txt, tb);
     }
     dl->AddRect(pr.p0, pr.p1, axis);
     // axis titles: quantity + unit (mandatory)
@@ -2639,8 +2645,8 @@ static void textNumStr(const std::string& s) {
     if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w));
     ImGui::TextUnformatted(s.c_str());
 }
-// width that fits a full-precision number like -1.23457e-05
-static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x + ImGui::GetStyle().CellPadding.x * 2; }
+// content width for a full-precision number; the table adds CellPadding itself
+static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x; }
 
 static void drawInspector() {
     ImageDoc* im = cur();
@@ -2686,9 +2692,12 @@ static void drawInspector() {
 
     ImGui::SeparatorText("Image");
     if (im) {
-        ImGui::Text("%dx%d %dch %s   |   min %s / max %s", im->w, im->h, im->ch, im->dtype.c_str(),
-                    fmtVal(im->vmin, im->dtype).c_str(), fmtVal(im->vmax, im->dtype).c_str());
-        if (!im->note.empty()) ImGui::TextDisabled("%s", im->note.c_str());
+        // two short lines instead of one long one: the merged line was clipped in
+        // a ~300px dock (Text never wraps and there is no horizontal scrollbar)
+        ImGui::Text("%dx%d  %dch  %s", im->w, im->h, im->ch, im->dtype.c_str());
+        ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
+                            fmtVal(im->vmax, im->dtype).c_str());
+        if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
         if (im->ch == 1) {
             // interpretation axis: change what the 1ch data means AFTER opening
             const char* modes[3] = { "Gray", "Bayer", "Quad Bayer" };
@@ -2778,16 +2787,31 @@ static void drawInspector() {
         if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0]) {
             im->black = bwEdit[0]; im->white = bwEdit[1]; im->texDirty = true;
         }
-        if (ImGui::Button("Auto"))  { im->black = im->vmin; im->white = im->vmax; im->texDirty = true; } ImGui::SameLine();
-        if (ImGui::Button("0-1"))   { im->black = 0; im->white = 1; im->texDirty = true; } ImGui::SameLine();
-        if (ImGui::Button("0-255")) { im->black = 0; im->white = 255; im->texDirty = true; } ImGui::SameLine();
-        if (ImGui::Button("0-65535")) { im->black = 0; im->white = 65535; im->texDirty = true; }
+        {   // four equal buttons measured from the panel, never wider than it
+            float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+            bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
+            if (ImGui::Button("Auto", ImVec2(bw, 0))) { im->black = im->vmin; im->white = im->vmax; im->texDirty = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("0-1", ImVec2(bw, 0))) { im->black = 0; im->white = 1; im->texDirty = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("0-255", ImVec2(bw, 0))) { im->black = 0; im->white = 255; im->texDirty = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("0-65535", ImVec2(bw, 0))) { im->black = 0; im->white = 65535; im->texDirty = true; }
+        }
 
         int g = app.dispGamma > 1.5f ? 1 : 0;
         ImGui::TextUnformatted("gamma"); ImGui::SameLine();
         if (ImGui::RadioButton("1.0", g == 0)) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
-        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); } ImGui::SameLine();
-        ImGui::Checkbox("grid (G)", &app.showGrid);
+        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); }
+        {   // only share the row if the checkbox actually fits (fails at 200% DPI)
+            const ImGuiStyle& st = ImGui::GetStyle();
+            float need = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x +
+                         ImGui::CalcTextSize("grid (G)").x + st.ItemSpacing.x;
+            float used = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x -
+                         ImGui::GetCursorStartPos().x;
+            if (ImGui::GetContentRegionAvail().x - used >= need) ImGui::SameLine();
+            ImGui::Checkbox("grid (G)", &app.showGrid);
+        }
     } else {
         ImGui::TextDisabled("no image");
     }
@@ -2821,9 +2845,16 @@ static void drawPanelHistogram() {
             ImGui::EndTable();
         }
 
+        // SeparatorText spans to the work rect edge, so a plain SameLine() lands
+        // outside it and the widget is neither drawn nor clickable: use an
+        // absolute offset instead.
         ImGui::SeparatorText("Histogram");
-        ImGui::SameLine();
-        ImGui::Checkbox("log##hist", &app.histLog);
+        {
+            const ImGuiStyle& st = ImGui::GetStyle();
+            float cbW = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + ImGui::CalcTextSize("log").x;
+            ImGui::SameLine(std::max(ImGui::GetContentRegionMax().x - cbW, 0.0f));
+            ImGui::Checkbox("log##hist", &app.histLog);
+        }
         static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 170), IM_COL32(120, 230, 120, 170),
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
         static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
@@ -2994,21 +3025,25 @@ static void drawPanelRois() {
     ImGui::Separator();
 
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
-                               ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY;
+                               ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                               ImGuiTableFlags_Resizable;
     // fill the window instead of a fixed 9-text-line box: rows are frame-height,
     // so the old constant showed 4 ROIs no matter how large the window was
     const float editH = ImGui::GetFrameHeight() * 2 + ImGui::GetStyle().ItemSpacing.y;
     if (ImGui::BeginTable("roitable", 8, TF,
-                          ImVec2(0, -(editH + ImGui::GetStyle().ItemSpacing.y * 2)))) {
+                          ImVec2(0, -(editH + ImGui::GetStyle().ItemSpacing.y * 2 + 1.0f)))) {
+        // stretch weights, not fixed widths: four fixed numeric columns would eat
+        // the whole table and collapse name/region to a few pixels
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
-        ImGui::TableSetupColumn("name");
-        ImGui::TableSetupColumn("region");
-        ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+        ImGui::TableSetupColumn("region", ImGuiTableColumnFlags_WidthStretch, 1.7f);
+        ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::CalcTextSize("x").x + ImGui::GetStyle().FramePadding.x * 2);
         ImGui::TableHeadersRow();
 
         // "All" is a real, selectable entry so the table is never empty and the
@@ -3107,8 +3142,21 @@ static void drawPanelAnalysis() {
         app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
         std::string curCat, curItem;
         splitAnalyzerName(anas[app.anaSel].name, curCat, curItem);
-        float cw = ImGui::GetContentRegionAvail().x;
-        ImGui::SetNextItemWidth(cw * 0.30f);
+        // reserve the measured tail (Run + auto + target note) before splitting
+        // the rest between the two combos, otherwise the note is clipped away
+        std::vector<const App::Ann*> rois;
+        for (const auto& a : app.anns)
+            if (a.type == 0 && a.visible) rois.push_back(&a);
+        char tgt[48];
+        if (rois.empty()) snprintf(tgt, sizeof tgt, "| whole image");
+        else snprintf(tgt, sizeof tgt, "| %d ROI(s)", (int)rois.size());
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float tailW = ImGui::CalcTextSize("Run").x + st.FramePadding.x * 2 + st.ItemSpacing.x
+                    + ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + ImGui::CalcTextSize("auto").x
+                    + st.ItemSpacing.x + ImGui::CalcTextSize(tgt).x + st.ItemSpacing.x;
+        float comboW = std::max(ImGui::GetFontSize() * 5.0f,
+                                (ImGui::GetContentRegionAvail().x - tailW - st.ItemSpacing.x) * 0.5f);
+        ImGui::SetNextItemWidth(comboW);
         if (ImGui::BeginCombo("##anacat", curCat.c_str())) {   // level 1: category
             std::vector<std::string> seen;
             for (int i = 0; i < (int)anas.size(); i++) {
@@ -3128,7 +3176,7 @@ static void drawPanelAnalysis() {
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(cw * 0.34f);
+        ImGui::SetNextItemWidth(comboW);
         if (ImGui::BeginCombo("##anaitem", curItem.c_str())) { // level 2: measurement
             for (int i = 0; i < (int)anas.size(); i++) {
                 std::string c, n;
@@ -3143,13 +3191,8 @@ static void drawPanelAnalysis() {
         app.anaRunRequest = false;
         ImGui::SameLine();
         ImGui::Checkbox("auto", &app.anaAuto);
-
-        std::vector<const App::Ann*> rois;
-        for (const auto& a : app.anns)
-            if (a.type == 0 && a.visible) rois.push_back(&a);
         ImGui::SameLine();
-        if (rois.empty()) ImGui::TextDisabled("| whole image");
-        else ImGui::TextDisabled("| %d ROI(s)", (int)rois.size());
+        ImGui::TextDisabled("%s", tgt);
 
         auto& ana = app.ana;
         bool stale = ana.img != im || ana.plugin != app.anaSel || ana.rev != app.annRev;
@@ -3209,8 +3252,11 @@ static void drawPanelAnalysis() {
             }
         }
         if (ana.img == im) {
-            if (!ana.err.empty())
+            if (!ana.err.empty()) {
+                ImGui::PushTextWrapPos(0.0f);       // plugin errors carry paths
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
+                ImGui::PopTextWrapPos();
+            }
             int nCols = 1 + (int)ana.cols.size();
             // SizingFixedFit + explicit inner width: with StretchProp, ScrollX never
             // scrolled and simply clipped the numbers (hence the old 16-column cap)
@@ -3220,7 +3266,8 @@ static void drawPanelAnalysis() {
                                   ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_BordersInnerV,
-                                  ImVec2(0, 0), nCols * colW)) {
+                                  ImVec2(0, 0),
+                                  nCols * (colW + ImGui::GetStyle().CellPadding.x * 2) + nCols + 1)) {
                 ImGui::TableSetupScrollFreeze(1, 1);   // keep the metric names in view
                 ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, colW);
                 for (const auto& cn : ana.cols)
@@ -3256,7 +3303,13 @@ static void drawFileList() {
             ImGui::SameLine();
             ImGui::TextDisabled("(+%d stacks)", (int)app.seqQueue.size());
         }
-        ImGui::SameLine();
+        {   // keep Stop reachable: it is the only way to cancel a huge load
+            const ImGuiStyle& st = ImGui::GetStyle();
+            float stopW = ImGui::CalcTextSize("Stop").x + st.FramePadding.x * 2;
+            float used = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x -
+                         ImGui::GetCursorStartPos().x;
+            if (ImGui::GetContentRegionAvail().x - used - st.ItemSpacing.x >= stopW) ImGui::SameLine();
+        }
         if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
     ImGui::Separator();
@@ -3266,15 +3319,20 @@ static void drawFileList() {
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
                               const char* extra = nullptr) -> bool {
+            const ImGuiStyle& st = ImGui::GetStyle();
             char meta[96];
             snprintf(meta, sizeof meta, "%dx%d %dch %s%s", d.w, d.h, d.ch, d.dtype.c_str(),
                      extra ? extra : "");
-            float metaW = ImGui::CalcTextSize(meta).x;
             float avail = ImGui::GetContentRegionAvail().x;
+            float metaW = ImGui::CalcTextSize(meta).x;
+            // one source of truth for the split, so the two halves cannot overlap
+            float nameW = std::max(avail - metaW - st.ItemSpacing.x, ImGui::GetFontSize() * 4.0f);
             bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowOverlap,
-                                             ImVec2(std::max(avail - metaW - 8.0f, 40.0f), 0));
-            ImGui::SameLine(std::max(avail - metaW, 60.0f));
+                                             ImVec2(nameW, 0));
+            bool hov = ImGui::IsItemHovered();     // the NAME, not the dimmed metadata
+            ImGui::SameLine(nameW + st.ItemSpacing.x);
             ImGui::TextDisabled("%s", meta);
+            if (hov) ImGui::SetTooltip("%s", d.path.c_str());
             return clicked;
         };
         if (head.seqId == 0) {
@@ -3284,7 +3342,6 @@ static void drawFileList() {
             if (rowWithMeta(head, lb, i == app.current, nullptr)) {
                 selectImage(i); app.fitRequested = true;
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", head.path.c_str());
             continue;
         }
         App::SeqInfo* si = seqInfo(head.seqId);
@@ -3296,7 +3353,6 @@ static void drawFileList() {
         char lb[512];
         snprintf(lb, 512, "%s  [%d]", si ? si->name.c_str() : "sequence", (int)stack.size());
         if (rowWithMeta(head, lb, active)) { selectImage(stack[pos]); app.fitRequested = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", head.path.c_str());
         if (active) {
             int slider = pos;
             ImGui::SetNextItemWidth(-1);
@@ -3972,8 +4028,10 @@ int main(int argc, char** argv) {
         if (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) {
             ImDrawList* fg = ImGui::GetForegroundDrawList();
             ImVec2 ts = ImGui::CalcTextSize(app.toast.c_str());
-            ImVec2 p(vp->WorkPos.x + (vp->WorkSize.x - ts.x) / 2, vp->WorkPos.y + vp->WorkSize.y - 60 * uiScale);
-            fg->AddRectFilled(ImVec2(p.x - 12, p.y - 6), ImVec2(p.x + ts.x + 12, p.y + ts.y + 6),
+            ImVec2 p(vp->WorkPos.x + std::max((vp->WorkSize.x - ts.x) * 0.5f, 12.0f * uiScale),
+                     vp->WorkPos.y + vp->WorkSize.y - 60 * uiScale);
+            fg->AddRectFilled(ImVec2(p.x - 12 * uiScale, p.y - 6 * uiScale),
+                              ImVec2(p.x + ts.x + 12 * uiScale, p.y + ts.y + 6 * uiScale),
                               app.toastErr ? IM_COL32(90, 30, 30, 235) : IM_COL32(35, 42, 48, 235), 6);
             fg->AddText(p, IM_COL32(230, 235, 240, 255), app.toast.c_str());
         }
