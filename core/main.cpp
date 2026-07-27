@@ -321,7 +321,15 @@ struct App {
     // background full-resolution fetch for remote frames. Frame granularity on
     // purpose: once the full frame lands, a remote image IS a local image - no
     // tile bookkeeping, no partial state, no coordinate mapping to maintain.
-    struct RFetchJob { std::string url; int frame; uint64_t uid; };
+    // uid != 0: replace that doc's pixels (preview -> full swap).
+    // uid == 0: a NEW frame of stack seqId - the remote prefetch, which is how a
+    // server-side folder becomes an ordinary local stack, one frame at a time.
+    struct RFetchJob {
+        std::string url, name;
+        int frame = 0;
+        uint64_t uid = 0;
+        int seqId = 0, seqIndex = 0;
+    };
     struct RFetchDone {
         uint64_t uid = 0;
         int w = 0, h = 0, ch = 0;
@@ -329,10 +337,13 @@ struct App {
                                       // visible hitch on the UI thread
         std::string dtype, err;
         std::vector<float> data;
+        std::string url, name;
+        int frame = 0, seqId = 0, seqIndex = 0;
     };
     std::thread rfThread;
     std::atomic<bool> rfStop{ false };
     std::atomic<int> rfPending{ 0 };
+    std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
     std::mutex rfMtx;
     std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
     std::vector<RFetchDone> rfDone;   // guarded by rfMtx
@@ -770,6 +781,8 @@ static void rfWorker() {
         if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::RFetchDone d;
         d.uid = job.uid;
+        d.url = job.url; d.name = job.name;
+        d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         std::string host, rpath, err;
         if (!remote::parseUrl(job.url, host, rpath)) {
             d.err = "bad remote url";
@@ -805,15 +818,25 @@ static void rfWorker() {
     }
 }
 
+static void rfEnqueue(App::RFetchJob job) {
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        app.rfQueue.push_back(std::move(job));
+    }
+    app.rfPending++;
+    app.rfTotal++;
+    if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
+}
+
 static void requestFullRemote(const ImageDoc* d) {
     if (d->remoteUrl.empty() || d->remoteStep <= 1) return;
     {
         std::lock_guard<std::mutex> lk(app.rfMtx);
         for (const auto& j : app.rfQueue) if (j.uid == d->uid) return;   // queued already
-        app.rfQueue.push_back({ d->remoteUrl, d->remoteFrame, d->uid });
     }
-    app.rfPending++;
-    if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
+    App::RFetchJob j;
+    j.url = d->remoteUrl; j.frame = d->remoteFrame; j.uid = d->uid;
+    rfEnqueue(std::move(j));
 }
 
 // UI thread: swap arrived frames in. After this an ex-preview is a local image.
@@ -825,6 +848,44 @@ static void pumpRemoteFetch() {
     }
     for (auto& d : batch) {
         app.rfPending--;
+        app.rfFetched++;
+        if (app.rfPending <= 0) {
+            if (app.rfFetched > 1)
+                fprintf(stderr, "remote: fetch complete (%d items)\n", app.rfFetched.load());
+            app.rfTotal = 0;
+            app.rfFetched = 0;
+        }
+        if (d.uid == 0) {                        // a new frame of a remote stack
+            if (!d.err.empty()) {
+                if (app.seqNote.empty())         // first error explains the gap
+                    app.seqNote = "remote: " + d.err;
+                continue;
+            }
+            auto doc = std::make_unique<ImageDoc>();
+            doc->name = d.name;
+            doc->path = d.url;
+            doc->remoteUrl = d.url;
+            doc->remoteFrame = d.frame;
+            doc->dtype = d.dtype;
+            doc->w = d.w; doc->h = d.h; doc->ch = d.ch;
+            doc->data = std::move(d.data);
+            doc->vmin = d.vmin; doc->vmax = d.vmax;
+            doc->seqId = d.seqId; doc->seqIndex = d.seqIndex;
+            doc->uid = app.nextUid++;
+            doc->texDirty = true;
+            // frames of one stack share the display range, like the local loader
+            bool ranged = false;
+            for (const auto& q : app.images)
+                if (q->seqId == d.seqId) {
+                    doc->black = q->black; doc->white = q->white;
+                    ranged = true;
+                    break;
+                }
+            if (!ranged) defaultRange(*doc);
+            app.images.push_back(std::move(doc));  // quiet: never steals selection
+            app.imagesRev++;
+            continue;
+        }
         ImageDoc* im = nullptr;
         for (auto& q : app.images) if (q->uid == d.uid) { im = q.get(); break; }
         if (!im) continue;                       // closed while fetching
@@ -1736,6 +1797,9 @@ static void restoreFull() {
 }
 
 static void openRemote(const std::string& url);   // fwd: sessions can hold ssh:// images
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files);
+static std::string makeRemoteUrl(const std::string& host, const std::string& path);
+static bool ensureRemoteSession(const std::string& host, std::string& err);
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
@@ -3108,6 +3172,23 @@ static void openRawDialogFor(const std::string& path) {
 
 // ssh://user@host/path - the UI stays here, the pixels stay there. What arrives is
 // the region being looked at, at the resolution it is being looked at.
+static bool ensureRemoteSession(const std::string& host, std::string& err) {
+    if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
+    if (app.remoteSession->alive() && app.remoteSession->host() == host) return true;
+    // the peer is the same binary: found on the remote PATH over ssh, or this
+    // very executable when testing through local:// (--remote-exe overrides both,
+    // which is how the standalone viewer-serve peer gets exercised)
+    std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
+                                                                  : app.remoteExe;
+    if (!app.remoteSession->start(host, exe, err)) return false;
+    toast("connected to " + (host.empty() ? std::string("local peer") : host));
+    return true;
+}
+
+static std::string makeRemoteUrl(const std::string& host, const std::string& path) {
+    return host.empty() ? "local://" + path : "ssh://" + host + path;
+}
+
 static void openRemote(const std::string& url) {
     std::string host, rpath;
     if (!remote::parseUrl(url, host, rpath)) {
@@ -3115,20 +3196,7 @@ static void openRemote(const std::string& url) {
         return;
     }
     std::string err;
-    if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
-    if (!app.remoteSession->alive() || app.remoteSession->host() != host) {
-        // the peer is the same binary: found on the remote PATH over ssh, or this
-        // very executable when testing through local://
-        // local:// normally re-runs this binary; --remote-exe overrides it, which
-        // is how the standalone viewer-serve peer gets tested without a server
-        std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
-                                                                      : app.remoteExe;
-        if (!app.remoteSession->start(host, exe, err)) {
-            toast("remote: " + err, true);
-            return;
-        }
-        toast("connected to " + host);
-    }
+    if (!ensureRemoteSession(host, err)) { toast("remote: " + err, true); return; }
     remote::Meta m;
     if (!app.remoteSession->meta(rpath, m, err)) { toast("remote: " + err, true); return; }
 
@@ -3163,7 +3231,77 @@ static void openRemote(const std::string& url) {
     app.fitRequested = true;
     // the preview is for orientation; the pixels you can measure come right after
     if (step > 1) requestFullRemote(app.images.back().get());
+    // A frame axis makes this a stack: prefetch the rest in the background, and
+    // they become ordinary local frames as they land - temporal analysis, frame
+    // stepping, every analyzer, all unchanged. Processing stays local by design;
+    // the remote side only ever ships pixels.
+    if (m.frames > 1) {
+        App::SeqInfo si;
+        si.id = app.nextSeqId++;
+        si.name = baseName(rpath) + " [remote]";
+        app.seqs.push_back(si);
+        ImageDoc* first = app.images.back().get();
+        first->seqId = si.id;
+        first->seqIndex = 0;
+        size_t perFrame = (size_t)m.w * m.h * m.ch * sizeof(float);
+        size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+        int fit = (int)std::min<size_t>((size_t)m.frames - 1, perFrame ? room / perFrame : 0);
+        for (int i = 1; i <= fit; i++) {
+            App::RFetchJob j;
+            j.url = url;
+            j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.frame = i;
+            j.seqId = si.id;
+            j.seqIndex = i;
+            rfEnqueue(std::move(j));
+        }
+        if (fit < m.frames - 1) {
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "memory budget: fetching %d of %d frames\n"
+                     "(File > Sequence loading > Memory budget)", fit + 1, m.frames);
+            app.seqNote = msg;
+        }
+    }
     toast("opened " + baseName(rpath) + " from " + (host.empty() ? "local peer" : host));
+}
+
+// A remote folder of numbered .npy files, opened as one stack: the first file
+// shows immediately, the rest arrive in the background and slot in as ordinary
+// local frames. Processing never moves - the pixels do, once each.
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files) {
+    if (files.empty()) return;
+    size_t before = app.images.size();
+    openRemote(makeRemoteUrl(host, files[0]));
+    if (app.images.size() == before) return;      // first frame failed; toasted already
+    ImageDoc* first = app.images.back().get();
+    if (first->seqId != 0) return;                // it was a frame-axis file: done
+    App::SeqInfo si;
+    si.id = app.nextSeqId++;
+    si.name = baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
+    app.seqs.push_back(si);
+    first->seqId = si.id;
+    first->seqIndex = 0;
+    size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
+    if (first->remoteStep > 1)                    // preview dims: scale the estimate
+        perFrame *= (size_t)first->remoteStep * first->remoteStep;
+    size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+    int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
+    for (int i = 1; i <= fit; i++) {
+        App::RFetchJob j;
+        j.url = makeRemoteUrl(host, files[i]);
+        j.name = baseName(files[i]);
+        j.seqId = si.id;
+        j.seqIndex = i;
+        rfEnqueue(std::move(j));
+    }
+    if (fit < (int)files.size() - 1) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "memory budget: fetching %d of %d frames\n"
+                 "(File > Sequence loading > Memory budget)", fit + 1, (int)files.size());
+        app.seqNote = msg;
+    }
 }
 
 static void openPath(const std::string& path) {
@@ -5335,6 +5473,8 @@ static void drawFileList() {
         }
         if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
+    if (app.rfPending > 0)
+        ImGui::TextDisabled("remote: fetching %d/%d", app.rfFetched.load(), app.rfTotal.load());
     if (!app.seqNote.empty()) {          // why the stack is short, kept in view
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
         ImGui::PushTextWrapPos(0.0f);
@@ -5725,6 +5865,8 @@ static void drawRemoteOpenModal() {
         snprintf(exe, sizeof exe, "%s", app.remoteExe.c_str());
         ImGui::SetKeyboardFocusHere();
     }
+    static std::vector<remote::Entry> entries;
+    static std::string browseHost, browseDir, browseErr;
     ImGui::TextDisabled("The window stays here; only the pixels being looked at travel.");
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
     bool go = ImGui::InputText("url", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
@@ -5734,6 +5876,84 @@ static void drawRemoteOpenModal() {
         ImGui::SetTooltip("Path of viewer-serve (or viewer) on the remote machine.\n"
                           "Public-key ssh authentication is required - there is no\n"
                           "password prompt on this pipe.");
+
+    // Browsing THAT machine is the point - an OS dialog can only ever list this
+    // one. LIST is served by the same peer that serves the pixels.
+    auto listDir = [&](const std::string& dir) {
+        std::string host, p, err;
+        app.remoteExe = exe;                       // the connect may need it
+        if (!remote::parseUrl(makeRemoteUrl(browseHost, dir), host, p)) return;
+        entries.clear();
+        browseErr.clear();
+        if (!ensureRemoteSession(host, err) ||
+            !app.remoteSession->list(p, entries, err))
+            browseErr = err;
+        browseDir = dir;
+    };
+    if (ImGui::Button("Browse")) {
+        std::string host, p;
+        if (remote::parseUrl(url, host, p)) {
+            browseHost = host;
+            // a file path browses its folder; a folder path browses itself
+            size_t dot = p.find_last_of('.');
+            size_t slash = p.find_last_of('/');
+            listDir(dot != std::string::npos && dot > slash && slash != std::string::npos
+                        ? p.substr(0, slash) : p);
+        } else {
+            browseErr = "enter ssh://user@host/some/path first";
+        }
+    }
+    if (!browseErr.empty())
+        ImGui::TextColored(ImVec4(1, 0.55f, 0.4f, 1), "%s", browseErr.c_str());
+    if (!browseDir.empty() && browseErr.empty()) {
+        ImGui::TextDisabled("%s", browseDir.c_str());
+        int nNpy = 0;
+        for (const auto& e : entries)
+            if (!e.dir && e.name.size() > 4 &&
+                e.name.compare(e.name.size() - 4, 4, ".npy") == 0) nNpy++;
+        if (ImGui::BeginChild("rbrowse", ImVec2(ImGui::GetFontSize() * 32,
+                                                ImGui::GetFontSize() * 14), true)) {
+            if (browseDir != "/" && ImGui::Selectable("[..]")) {
+                size_t slash = browseDir.find_last_of('/');
+                listDir(slash == 0 || slash == std::string::npos ? "/" : browseDir.substr(0, slash));
+            }
+            for (const auto& e : entries) {
+                std::string label = (e.dir ? "[" + e.name + "]" : e.name);
+                if (ImGui::Selectable(label.c_str())) {
+                    std::string joined = browseDir == "/" ? "/" + e.name
+                                                          : browseDir + "/" + e.name;
+                    if (e.dir) listDir(joined);
+                    else snprintf(url, sizeof url, "%s",
+                                  makeRemoteUrl(browseHost, joined).c_str());
+                }
+                if (!e.dir && e.size) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%.1f MB", e.size / 1048576.0);
+                }
+            }
+        }
+        ImGui::EndChild();
+        // a folder of numbered .npy files IS a stack: open it as one
+        if (nNpy >= 2) {
+            char lb[64];
+            snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
+            if (ImGui::Button(lb)) {
+                std::vector<std::string> files;
+                for (const auto& e : entries)
+                    if (!e.dir && e.name.size() > 4 &&
+                        e.name.compare(e.name.size() - 4, 4, ".npy") == 0)
+                        files.push_back(browseDir == "/" ? "/" + e.name
+                                                         : browseDir + "/" + e.name);
+                std::sort(files.begin(), files.end());
+                app.lastRemoteUrl = makeRemoteUrl(browseHost, files[0]);
+                app.prefsDirty = true;
+                savePrefs();
+                ImGui::CloseCurrentPopup();
+                openRemoteStack(browseHost, files);
+            }
+        }
+    }
+    ImGui::Separator();
     if (ImGui::Button("Open") || go) {
         app.remoteExe = exe;
         app.lastRemoteUrl = url;
