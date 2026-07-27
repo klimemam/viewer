@@ -171,7 +171,7 @@ struct App {
     std::vector<Ann> anns;
     int nextAnnId = 1;
     int roiSeq = 0, poiSeq = 0;       // monotonic label counters (no dupes after deletes)
-    int selectedAnn = -1;             // Ann::id, -1 = none
+    int selectedAnn = 0;              // Ann::id; 0 = the built-in All (whole image) entry
     uint64_t annRev = 0;              // bumped on any annotation change
     bool annBusy = false;             // true while an annotation drag is in progress
     int tool = 0;                     // 0 Navigate (V), 1 ROI (R), 2 POI (P)
@@ -422,7 +422,7 @@ static void addAnn(int type, int x, int y, int w, int h) {
 static void deleteAnn(int id) {
     for (size_t i = 0; i < app.anns.size(); i++)
         if (app.anns[i].id == id) { app.anns.erase(app.anns.begin() + i); break; }
-    if (app.selectedAnn == id) app.selectedAnn = -1;
+    if (app.selectedAnn == id) app.selectedAnn = 0;
     app.annRev++;
 }
 
@@ -1005,7 +1005,7 @@ static std::string loadSession(const std::string& path) {
         return "not a viewer session file";
     closeAll();
     app.anns.clear();
-    app.selectedAnn = -1;
+    app.selectedAnn = 0;
     app.annRev++;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     bool haveView = false;
@@ -1100,7 +1100,7 @@ static std::string loadSession(const std::string& path) {
             cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
         }
     }
-    app.selectedAnn = -1;
+    app.selectedAnn = 0;
     if (current >= 0 && current < (int)app.images.size()) app.current = current;
     if (haveView && !app.images.empty()) {
         app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
@@ -2850,7 +2850,7 @@ static void drawPanelRois() {
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Clear all")) { app.anns.clear(); app.selectedAnn = -1; app.annRev++; }
+    if (ImGui::SmallButton("Clear all")) { app.anns.clear(); app.selectedAnn = 0; app.annRev++; }
     ImGui::SameLine();
     ImGui::TextDisabled("(R: drag = ROI, P: click = pin)");
     ImGui::Separator();
@@ -2870,17 +2870,21 @@ static void drawPanelRois() {
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
         ImGui::TableHeadersRow();
 
-        // whole-image reference row
+        // "All" is a real, selectable entry so the table is never empty and the
+        // measurement target is always explicit
         {
             RoiStat s = roiBasicStats(*im, 0, 0, im->w, im->h, app.roiChannel);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TableNextColumn(); ImGui::TextDisabled("whole image");
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%dx%d", im->w, im->h);
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mean);
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.sd);
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mn);
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%.6g", s.mx);
+            ImGui::TableNextColumn();
+            if (ImGui::Selectable("All (whole image)", app.selectedAnn <= 0,
+                                  ImGuiSelectableFlags_SpanAllColumns))
+                app.selectedAnn = 0;
+            ImGui::TableNextColumn(); ImGui::Text("%dx%d", im->w, im->h);
+            ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
         }
         int removeId = -1;
@@ -2924,10 +2928,10 @@ static void drawPanelRois() {
         if (removeId >= 0) deleteAnn(removeId);
     }
 
+    // editor block: fixed height so the window never shrinks with the selection
+    ImGui::Separator();
+    ImGui::BeginChild("roiedit", ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 2.4f));
     if (App::Ann* sel = findAnn(app.selectedAnn)) {
-        ImGui::Separator();
-        ImGui::TextDisabled("selected");
-        ImGui::SameLine();
         char buf[128];
         snprintf(buf, sizeof buf, "%s", sel->label.c_str());
         ImGui::SetNextItemWidth(-1);
@@ -2945,10 +2949,14 @@ static void drawPanelRois() {
                 sel->h = std::clamp(v[3], 1, im->h - sel->y);
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
+        } else {
+            ImGui::TextDisabled("point annotation - move it with the Pin tool");
         }
     } else {
-        ImGui::TextDisabled("select a row to rename / edit its geometry");
+        ImGui::TextDisabled("target: whole image (%dx%d, %s)", im->w, im->h, im->dtype.c_str());
+        ImGui::TextDisabled("draw a ROI with the R tool to measure a region");
     }
+    ImGui::EndChild();
 }
 
 static void drawPanelAnalysis() {
@@ -3661,7 +3669,7 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_End, false)) gotoFrame(0, true, false);
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = -1;
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = 0;   // back to All
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 app.view.zoom = std::clamp(app.view.zoom * 2.0f, 1.0f / 512, 256.0f);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
@@ -3702,7 +3710,7 @@ int main(int argc, char** argv) {
             // ROIs and Analysis stay floating (they follow the work, not the frame)
             ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
                                                vp->WorkPos.y + vp->WorkSize.y * 0.08f));
-            ImGui::SetWindowSize("ROIs", ImVec2(560 * uiScale, 260 * uiScale));
+            ImGui::SetWindowSize("ROIs", ImVec2(620 * uiScale, 360 * uiScale));
             ImGui::SetWindowPos("Analysis", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
                                                    vp->WorkPos.y + vp->WorkSize.y * 0.42f));
             ImGui::SetWindowSize("Analysis", ImVec2(560 * uiScale, 420 * uiScale));
@@ -3725,11 +3733,15 @@ int main(int argc, char** argv) {
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
-        if (app.showRois) {
+        if (app.showRois) {   // min size: the table stays readable even if dragged small
+            ImGui::SetNextWindowSizeConstraints(ImVec2(460 * uiScale, 300 * uiScale),
+                                                ImVec2(FLT_MAX, FLT_MAX));
             if (ImGui::Begin("ROIs", &app.showRois)) drawPanelRois();
             ImGui::End();
         }
         if (app.showAnalysis) {
+            ImGui::SetNextWindowSizeConstraints(ImVec2(420 * uiScale, 260 * uiScale),
+                                                ImVec2(FLT_MAX, FLT_MAX));
             if (ImGui::Begin("Analysis", &app.showAnalysis)) drawPanelAnalysis();
             ImGui::End();
         }
