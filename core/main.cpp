@@ -194,7 +194,22 @@ struct App {
     // A/B compare: A is always the current image; B is a second open image shown
     // beside it (split) or under a draggable divider (wipe). Both panes use the
     // one shared view, so a pixel is at the same place in both.
-    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2 };
+    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2, CmpDiff = 3 };
+    // Difference view: A-B as a signed map. Sign is hue, magnitude is brightness,
+    // and anything beyond the scale is flagged, because a difference image with a
+    // silently clipped scale is worse than no difference image.
+    struct DiffTex {
+        GLuint tex = 0;
+        uint64_t uidA = 0, uidB = 0;
+        int revA = -1, revB = -1;
+        float gain = 0;
+        bool absMode = false;
+        int w = 0, h = 0;
+        double clipped = 0;           // fraction of pixels outside +-gain
+    } diff;
+    float diffGain = 0;               // 0 = auto (99.9th percentile, rounded)
+    float diffAutoGain = 1;
+    bool diffAbs = false;
     int compareMode = CmpOff;
     // B is identified by uid: every frame of an in-file stack shares one name, so
     // a name would silently re-point B at another frame as A walks the stack.
@@ -397,10 +412,11 @@ static void ensureCompareB() {
 static void cycleCompare() {
     if (app.images.size() < 2) { toast("compare needs a second open image", true); return; }
     ensureCompareB();
-    app.compareMode = (app.compareMode + 1) % 3;
-    toast(app.compareMode == App::CmpOff  ? "compare off"
-        : app.compareMode == App::CmpWipe ? "compare: wipe  (drag the divider)"
-                                          : "compare: side by side");
+    app.compareMode = (app.compareMode + 1) % 4;
+    toast(app.compareMode == App::CmpOff   ? "compare off"
+        : app.compareMode == App::CmpWipe  ? "compare: wipe  (drag the divider)"
+        : app.compareMode == App::CmpSplit ? "compare: side by side"
+                                           : "compare: difference A-B");
 }
 
 // Pin the frame you are looking at as B, then walk A somewhere else: this is how
@@ -460,6 +476,105 @@ static void touchTex(ImageDoc& im) {
         if (old->tex) { glDeleteTextures(1, &old->tex); old->tex = 0; old->texDirty = true; }
         app.texLru.erase(app.texLru.begin() + i);
     }
+}
+
+// Round up to 1/2/5 x 10^n: a difference scale of "+-2000 DN" is readable, one of
+// "+-1873.4 DN" is not (and the axis rule applies to legends too).
+static float niceCeil(float v) {
+    if (!(v > 0) || !std::isfinite(v)) return 1.0f;
+    float e = powf(10.0f, floorf(log10f(v)));
+    float m = v / e;
+    return (m <= 1.0f ? 1.0f : m <= 2.0f ? 2.0f : m <= 5.0f ? 5.0f : 10.0f) * e;
+}
+
+// A-B as a signed image. Rebuilt only when an input, the scale or the mode
+// changes: at 12 Mpx this is a ~60 ms pass, not something to do per frame.
+static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
+    App::DiffTex& D = app.diff;
+    int w = std::min(a.w, b.w), h = std::min(a.h, b.h);
+    int ch = std::min(a.ch, b.ch);
+    if (w <= 0 || h <= 0) return;
+
+    if (app.diffGain <= 0) {   // auto scale: the 99.9th percentile of |A-B|
+        static uint64_t autoKeyA = 0, autoKeyB = 0; static int autoRevA = -1, autoRevB = -1;
+        if (autoKeyA != a.uid || autoKeyB != b.uid || autoRevA != a.dataRev || autoRevB != b.dataRev) {
+            autoKeyA = a.uid; autoKeyB = b.uid; autoRevA = a.dataRev; autoRevB = b.dataRev;
+            std::vector<float> mags;
+            size_t total = (size_t)w * h;
+            size_t step = std::max<size_t>(1, total / 200000);   // bounded sample
+            mags.reserve(total / step + 1);
+            for (size_t p = 0; p < total; p += step) {
+                int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
+                float m = 0;
+                for (int c = 0; c < ch; c++)
+                    m = std::max(m, fabsf(a.sample(x, y, c) - b.sample(x, y, c)));
+                if (std::isfinite(m)) mags.push_back(m);
+            }
+            float g = 1.0f;
+            if (!mags.empty()) {
+                size_t k = (size_t)(mags.size() * 0.999);
+                if (k >= mags.size()) k = mags.size() - 1;
+                std::nth_element(mags.begin(), mags.begin() + k, mags.end());
+                g = mags[k];
+            }
+            app.diffAutoGain = niceCeil(g > 0 ? g : 1.0f);
+        }
+    }
+    float gain = app.diffGain > 0 ? app.diffGain : app.diffAutoGain;
+
+    if (D.tex && D.uidA == a.uid && D.uidB == b.uid && D.revA == a.dataRev &&
+        D.revB == b.dataRev && D.gain == gain && D.absMode == app.diffAbs &&
+        D.w == w && D.h == h)
+        return;                                     // cache hit: nothing changed
+
+    double t0 = glfwGetTime();
+    static std::vector<uint8_t> rgba;
+    rgba.resize((size_t)w * h * 4);
+    const float inv = 1.0f / std::max(gain, 1e-20f);
+    size_t clipped = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float d = 0;
+            for (int c = 0; c < ch; c++) {          // the channel that differs most
+                float v = a.sample(x, y, c) - b.sample(x, y, c);
+                if (fabsf(v) > fabsf(d)) d = v;
+            }
+            if (!std::isfinite(d)) d = 0;
+            float t = d * inv;
+            size_t o = ((size_t)y * w + x) * 4;
+            float r, g2, bl;
+            if (fabsf(t) > 1.0f) {                  // out of scale: unmistakable
+                clipped++;
+                r = 1.0f; g2 = 1.0f; bl = 0.2f;     // yellow
+            } else if (app.diffAbs) {
+                float m = fabsf(t);
+                r = m; g2 = m; bl = m;
+            } else if (t >= 0) {                    // A brighter: warm
+                r = t; g2 = 0.35f * t; bl = 0.10f * t;
+            } else {                                // B brighter: cool
+                float m = -t;
+                r = 0.10f * m; g2 = 0.45f * m; bl = m;
+            }
+            rgba[o + 0] = (uint8_t)(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+            rgba[o + 1] = (uint8_t)(std::clamp(g2, 0.0f, 1.0f) * 255.0f + 0.5f);
+            rgba[o + 2] = (uint8_t)(std::clamp(bl, 0.0f, 1.0f) * 255.0f + 0.5f);
+            rgba[o + 3] = 255;
+        }
+    }
+    if (!D.tex) glGenTextures(1, &D.tex);
+    glBindTexture(GL_TEXTURE_2D, D.tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    D.uidA = a.uid; D.uidB = b.uid; D.revA = a.dataRev; D.revB = b.dataRev;
+    D.gain = gain; D.absMode = app.diffAbs; D.w = w; D.h = h;
+    D.clipped = (double)clipped / ((double)w * h);
+    fprintf(stderr, "diff: %s - %s  full scale +-%g  (%.3f%% off scale, %.0f ms)\n",
+            a.name.c_str(), b.name.c_str(), gain, D.clipped * 100,
+            (glfwGetTime() - t0) * 1000);
 }
 
 // upload/normalize into RGBA8 texture
@@ -1507,7 +1622,8 @@ static void writeSessionTo(std::ostream& f) {
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
     // must precede the image lines: it decides whether (F,H,W) reloads as a stack
     f << "npyaxis " << app.npyAxis << "\n";
-    f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << "\n";
+    f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << " "
+      << app.diffGain << " " << (app.diffAbs ? 1 : 0) << "\n";
     // uids are per-run, so the file carries name + frame index; the name is last
     // because it may contain spaces
     if (ImageDoc* b = resolveB())
@@ -1769,8 +1885,10 @@ static std::string loadSession(const std::string& path) {
         else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
         else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
-        else if (key == "compare") { ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
-                                     app.compareMode = std::clamp(app.compareMode, 0, 2);
+        else if (key == "compare") { int ab = 0;
+                                     ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
+                                     if (ls >> app.diffGain >> ab) app.diffAbs = ab != 0;  // v2
+                                     app.compareMode = std::clamp(app.compareMode, 0, 3);
                                      app.wipeFrac = std::clamp(app.wipeFrac, 0.03f, 0.97f);
                                      app.splitFrac = std::clamp(app.splitFrac, 0.03f, 0.97f); }
         else if (key == "compareb") {   // "<frameIndex|-1> <name>"; v1 files: just a name
@@ -2974,6 +3092,8 @@ static void drawCanvas(ImVec2 avail) {
     ImageDoc* imB = cmpB();
     const bool split = imB && app.compareMode == App::CmpSplit;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
+    const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
+                          imB->w == im->w && imB->h == im->h;
     // split panes are clamped harder than the wipe divider: a 3%-wide pane is a
     // useless pane, and "fit" into it would shrink the image to nothing
     if (split) app.splitFrac = std::clamp(app.splitFrac, 0.12f, 0.88f);
@@ -3017,7 +3137,8 @@ static void drawCanvas(ImVec2 avail) {
     auto dragToImg = [&](ImVec2 sc) { return unmapIn(dragPaneB, sc); };
 
     // the divider is grabbed anywhere along its height, not just on the handle
-    bool onDivider = imB && fabsf(io.MousePos.x - (split ? splitX : wipeX)) <= 7.0f * s &&
+    bool onDivider = imB && app.compareMode != App::CmpDiff &&
+                     fabsf(io.MousePos.x - (split ? splitX : wipeX)) <= 7.0f * s &&
                      io.MousePos.y >= canvasP0.y && io.MousePos.y <= canvasP1.y;
     if (onDivider && (hovered || ImGui::IsItemActive())) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
@@ -3332,6 +3453,15 @@ static void drawCanvas(ImVec2 avail) {
         if (flashB) {
             drawImageOnly(imB, false);
             drawOverlays(imB, false);
+        } else if (diffMode) {
+            ensureDiffTexture(*im, *imB);
+            if (app.diff.tex) {
+                ImVec2 p0 = mapIn(false, 0, 0);
+                ImVec2 p1 = mapIn(false, (float)app.diff.w, (float)app.diff.h);
+                dl->AddImage((ImTextureID)(intptr_t)app.diff.tex, p0, p1);
+                dl->AddRect(p0, p1, IM_COL32(90, 100, 110, 255));
+            }
+            drawOverlays(im, false);
         } else if (split) {
             dl->PushClipRect(paneAp0, ImVec2(paneAp0.x + paneAsz.x, canvasP1.y), true);
             drawImageOnly(im, false); drawOverlays(im, false);
@@ -3377,8 +3507,58 @@ static void drawCanvas(ImVec2 avail) {
                 dl->AddText(ImVec2(bx + pad, by + pad * 0.5f), col, t.c_str());
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
-            if (flashB) {
-                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", imB->name + "   (hold B)", colB);
+            if (app.compareMode == App::CmpDiff) {
+                badge(canvasP0.x + 6 * s, canvasP1.x, false,
+                      app.diffAbs ? "|A-B|" : "A-B", im->name + "  -  " + imB->name,
+                      IM_COL32(220, 225, 235, 255));
+                if (!diffMode) {
+                    const char* msg = "difference needs A and B to be the same size";
+                    ImVec2 ts = ImGui::CalcTextSize(msg);
+                    dl->AddRectFilled(ImVec2(canvasP0.x + 6 * s, canvasP0.y + 30 * s),
+                                      ImVec2(canvasP0.x + 18 * s + ts.x, canvasP0.y + 30 * s + ts.y + 6 * s),
+                                      IM_COL32(90, 60, 20, 210), 3.0f * s);
+                    dl->AddText(ImVec2(canvasP0.x + 12 * s, canvasP0.y + 33 * s),
+                                IM_COL32(255, 200, 120, 255), msg);
+                } else {
+                    // Colour bar with the scale spelled out: a difference image
+                    // without its scale is a picture, not a measurement.
+                    float gain = app.diff.gain;
+                    bool intType = !im->dtype.empty() && (im->dtype[0] == 'u' || im->dtype[0] == 'i');
+                    char loS[48], hiS[48];
+                    snprintf(hiS, sizeof hiS, "+%g%s", gain, intType ? " DN" : "");
+                    snprintf(loS, sizeof loS, app.diffAbs ? "0" : "-%g%s", gain, intType ? " DN" : "");
+                    float barW = 180 * s, barH = 10 * s;
+                    float bx = canvasP0.x + 10 * s;
+                    float by = canvasP1.y - barH - ImGui::GetFontSize() - 12 * s;
+                    dl->AddRectFilled(ImVec2(bx - 6 * s, by - 6 * s),
+                                      ImVec2(bx + barW + 6 * s, by + barH + ImGui::GetFontSize() + 8 * s),
+                                      IM_COL32(0, 0, 0, 180), 3.0f * s);
+                    for (int i = 0; i < (int)barW; i++) {   // same ramp as the pixels
+                        float t = app.diffAbs ? (float)i / barW : (float)i / barW * 2.0f - 1.0f;
+                        float r, g2, bl;
+                        if (app.diffAbs)   { float m = t; r = g2 = bl = m; }
+                        else if (t >= 0)   { r = t; g2 = 0.35f * t; bl = 0.10f * t; }
+                        else               { float m = -t; r = 0.10f * m; g2 = 0.45f * m; bl = m; }
+                        ImU32 c = IM_COL32((int)(std::clamp(r, 0.f, 1.f) * 255),
+                                           (int)(std::clamp(g2, 0.f, 1.f) * 255),
+                                           (int)(std::clamp(bl, 0.f, 1.f) * 255), 255);
+                        dl->AddLine(ImVec2(bx + i, by), ImVec2(bx + i, by + barH), c);
+                    }
+                    dl->AddRect(ImVec2(bx, by), ImVec2(bx + barW, by + barH), IM_COL32(90, 100, 110, 255));
+                    ImU32 tc = IM_COL32(210, 216, 226, 255);
+                    dl->AddText(ImVec2(bx, by + barH + 2 * s), tc, loS);
+                    ImVec2 hs = ImGui::CalcTextSize(hiS);
+                    dl->AddText(ImVec2(bx + barW - hs.x, by + barH + 2 * s), tc, hiS);
+                    if (app.diff.clipped > 0) {
+                        char cs[64];
+                        snprintf(cs, sizeof cs, "%.2f%% off scale", app.diff.clipped * 100);
+                        ImVec2 cts = ImGui::CalcTextSize(cs);
+                        dl->AddText(ImVec2(bx + (barW - cts.x) * 0.5f, by - cts.y - 2 * s),
+                                    IM_COL32(255, 235, 120, 255), cs);
+                    }
+                }
+            } else if (flashB) {
+                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", imB->name + "  (hold B)", colB);
             } else if (split) {
                 badge(paneAp0.x + 6 * s, paneAp0.x + paneAsz.x, false, "A", im->name, colA);
                 badge(paneBp0.x + 6 * s, paneBp0.x + paneBsz.x, false, "B", imB->name, colB);
@@ -3391,7 +3571,7 @@ static void drawCanvas(ImVec2 avail) {
                             IM_COL32(255, 255, 255, hot ? 255 : 200), 1.5f * s);
             }
             // grab handle: a stubby bar at mid-height, the thing you aim at
-            if (!flashB) {
+            if (!flashB && app.compareMode != App::CmpDiff) {
                 float dx = split ? splitX : wipeX;
                 float hy = (canvasP0.y + canvasP1.y) * 0.5f, hh = 22 * s, hw = 5 * s;
                 dl->AddRectFilled(ImVec2(dx - hw, hy - hh), ImVec2(dx + hw, hy + hh),
@@ -3805,6 +3985,24 @@ static void drawInspector() {
             }
             if (b->dtype != im->dtype)
                 ImGui::TextDisabled("dtype differs: A %s / B %s", im->dtype.c_str(), b->dtype.c_str());
+            if (app.compareMode == App::CmpDiff) {
+                bool intType = !im->dtype.empty() && (im->dtype[0] == 'u' || im->dtype[0] == 'i');
+                bool autoGain = app.diffGain <= 0;
+                if (ImGui::Checkbox("auto scale", &autoGain))
+                    app.diffGain = autoGain ? 0 : app.diff.gain;
+                if (!autoGain) {
+                    float g = app.diffGain;
+                    ImGui::SetNextItemWidth(numColW() * 2);
+                    // step on round numbers, as everywhere else
+                    if (ImGui::InputFloat(intType ? "full scale [DN]" : "full scale", &g,
+                                          niceCeil(g) * 0.1f, niceCeil(g), "%g"))
+                        app.diffGain = std::max(g, 1e-9f);
+                } else {
+                    ImGui::TextDisabled("full scale +-%g%s (99.9%% of |A-B|)",
+                                        app.diff.gain, intType ? " DN" : "");
+                }
+                ImGui::Checkbox("magnitude only |A-B|", &app.diffAbs);
+            }
         }
     }
 
@@ -4946,6 +5144,12 @@ static void drawMenuBar(GLFWwindow* win) {
                 { app.compareMode = App::CmpWipe; ensureCompareB(); }
             if (ImGui::MenuItem("Side by side", nullptr, app.compareMode == App::CmpSplit))
                 { app.compareMode = App::CmpSplit; ensureCompareB(); }
+            if (ImGui::MenuItem("Difference (A-B)", nullptr, app.compareMode == App::CmpDiff))
+                { app.compareMode = App::CmpDiff; ensureCompareB(); }
+            if (app.compareMode == App::CmpDiff) {
+                if (ImGui::MenuItem("  magnitude only |A-B|", nullptr, app.diffAbs))
+                    app.diffAbs = !app.diffAbs;
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Pin this frame as B", "Shift+B", false, cur() != nullptr)) pinCurrentAsB();
             if (ImGui::MenuItem("Swap A and B", "Shift+\\", false, cmpB() != nullptr)) swapCompare();
@@ -5138,7 +5342,7 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
-        "  --compare <off|wipe|split>  A/B compare the first two images given\n"
+        "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
@@ -5220,8 +5424,9 @@ static void parseCli(int argc, char** argv) {
             std::string v = next();
             if (v == "wipe") cliCompare = App::CmpWipe;
             else if (v == "split" || v == "side") cliCompare = App::CmpSplit;
+            else if (v == "diff") cliCompare = App::CmpDiff;
             else if (v == "off") cliCompare = App::CmpOff;
-            else fprintf(stderr, "--compare expects off|wipe|split\n");
+            else fprintf(stderr, "--compare expects off|wipe|split|diff\n");
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
         } else if (a == "--center") {
@@ -5683,6 +5888,9 @@ int main(int argc, char** argv) {
                 ImGui::SameLine();
                 if (!b) {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "   |  A/B: no B image");
+                } else if (app.compareMode == App::CmpDiff) {
+                    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  %s +-%g  B: %s",
+                                       app.diffAbs ? "|A-B|" : "A-B", app.diff.gain, b->name.c_str());
                 } else {
                     float fr = app.compareMode == App::CmpSplit ? app.splitFrac : app.wipeFrac;
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  A/B %s %.0f%%  B: %s",
