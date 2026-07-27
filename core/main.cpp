@@ -54,6 +54,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -134,6 +135,13 @@ struct ImageDoc {
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
+    // remote frames: opened as a decimated preview, replaced in place by the full
+    // frame when the background fetch lands - after that, indistinguishable from
+    // a local image. remoteStep > 1 means "still the preview".
+    std::string remoteUrl;
+    int remoteFrame = 0;
+    int remoteStep = 1;
+    std::string remoteErr;            // background fetch failed; preview is all we have
 
     float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
 };
@@ -305,6 +313,24 @@ struct App {
     std::string seqNote;              // last loader message, kept on screen (UI thread)
     int seqLoadingId = 0;
     size_t seqBytes = 0;
+    // background full-resolution fetch for remote frames. Frame granularity on
+    // purpose: once the full frame lands, a remote image IS a local image - no
+    // tile bookkeeping, no partial state, no coordinate mapping to maintain.
+    struct RFetchJob { std::string url; int frame; uint64_t uid; };
+    struct RFetchDone {
+        uint64_t uid = 0;
+        int w = 0, h = 0, ch = 0;
+        float vmin = 0, vmax = 1;     // computed on the worker: 12M floats is a
+                                      // visible hitch on the UI thread
+        std::string dtype, err;
+        std::vector<float> data;
+    };
+    std::thread rfThread;
+    std::atomic<bool> rfStop{ false };
+    std::atomic<int> rfPending{ 0 };
+    std::mutex rfMtx;
+    std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
+    std::vector<RFetchDone> rfDone;   // guarded by rfMtx
     // pending "load the rest of the folder?" question
     int seqAskImage = -1;
     std::vector<std::string> seqAskFiles;
@@ -719,6 +745,119 @@ static void forgetImage(ImageDoc* im) {
     forgetTexture(im);
     app.imagesRev++;
 }
+// ---- background full-resolution fetch (remote frames) -------------------------
+// The preview is already on screen; the real pixels arrive here on their own ssh
+// connection and are swapped in by the UI thread.
+static void rfWorker() {
+    remote::Session ses;
+    std::string sesHost = "\n";                  // impossible: force first connect
+    while (!app.rfStop) {
+        App::RFetchJob job;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(app.rfMtx);
+            if (!app.rfQueue.empty()) {
+                job = std::move(app.rfQueue.front());
+                app.rfQueue.erase(app.rfQueue.begin());
+                have = true;
+            }
+        }
+        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+        App::RFetchDone d;
+        d.uid = job.uid;
+        std::string host, rpath, err;
+        if (!remote::parseUrl(job.url, host, rpath)) {
+            d.err = "bad remote url";
+        } else {
+            if (!ses.alive() || sesHost != host) {
+                std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
+                                                                              : app.remoteExe;
+                if (!ses.start(host, exe, err)) d.err = err;
+                else sesHost = host;
+            }
+            if (d.err.empty()) {
+                int w = 0, h = 0, ch = 0;
+                // the server clamps the rect, so "huge" means "the whole frame"
+                if (!ses.tile(rpath, job.frame, 0, 0, 1 << 30, 1 << 30, 1,
+                              d.data, w, h, ch, d.dtype, err)) {
+                    d.err = err;
+                } else {
+                    d.w = w; d.h = h; d.ch = ch;
+                    float mn = FLT_MAX, mx = -FLT_MAX;
+                    for (float v : d.data)
+                        if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
+                    if (mn > mx) { mn = 0; mx = 1; }
+                    if (mn == mx) mx = mn + 1;
+                    d.vmin = mn; d.vmax = mx;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(app.rfMtx);
+            app.rfDone.push_back(std::move(d));
+        }
+        glfwPostEmptyEvent();                    // wake the UI to swap it in
+    }
+}
+
+static void requestFullRemote(const ImageDoc* d) {
+    if (d->remoteUrl.empty() || d->remoteStep <= 1) return;
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        for (const auto& j : app.rfQueue) if (j.uid == d->uid) return;   // queued already
+        app.rfQueue.push_back({ d->remoteUrl, d->remoteFrame, d->uid });
+    }
+    app.rfPending++;
+    if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
+}
+
+// UI thread: swap arrived frames in. After this an ex-preview is a local image.
+static void pumpRemoteFetch() {
+    std::vector<App::RFetchDone> batch;
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        batch.swap(app.rfDone);
+    }
+    for (auto& d : batch) {
+        app.rfPending--;
+        ImageDoc* im = nullptr;
+        for (auto& q : app.images) if (q->uid == d.uid) { im = q.get(); break; }
+        if (!im) continue;                       // closed while fetching
+        if (!d.err.empty()) {
+            im->remoteErr = d.err;
+            toast("remote: " + d.err, true);
+            continue;
+        }
+        int stepBefore = im->remoteStep;
+        im->data = std::move(d.data);
+        im->w = d.w; im->h = d.h; im->ch = d.ch;
+        im->dtype = d.dtype;
+        im->remoteStep = 1;
+        im->remoteErr.clear();
+        size_t p = im->name.find("  (1/");       // drop the preview marker
+        if (p != std::string::npos) im->name.erase(p);
+        im->dataRev++;
+        im->vmin = d.vmin; im->vmax = d.vmax;    // measured on the worker
+        im->texDirty = true;
+        forgetImage(im);                         // caches hold the preview's numbers
+        if (im == cur() && stepBefore > 1) {
+            // same pixels on screen, now through finer data: rescale the shared
+            // view so nothing appears to move when the swap happens
+            app.view.zoom = std::max(app.view.zoom / stepBefore, 1.0f / 512);
+            app.view.center.x *= stepBefore;
+            app.view.center.y *= stepBefore;
+        }
+        app.imagesRev++;
+        fprintf(stderr, "remote: full resolution %dx%d %dch for %s\n",
+                d.w, d.h, d.ch, im->name.c_str());
+    }
+}
+
+static void stopRemoteFetcher() {
+    app.rfStop = true;
+    if (app.rfThread.joinable()) app.rfThread.join();
+}
+
 static void closeCurrent() {
     ImageDoc* im = cur();
     if (!im) return;
@@ -2997,6 +3136,9 @@ static void openRemote(const std::string& url) {
     doc->note = "remote " + host + "  -  " + std::to_string(m.w) + "x" + std::to_string(m.h) +
                 (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
     doc->uid = app.nextUid++;
+    doc->remoteUrl = url;
+    doc->remoteFrame = 0;
+    doc->remoteStep = step;
     computeMinMax(*doc);
     defaultRange(*doc);
     doc->texDirty = true;
@@ -3004,7 +3146,9 @@ static void openRemote(const std::string& url) {
     app.imagesRev++;
     selectImage((int)app.images.size() - 1);
     app.fitRequested = true;
-    toast("opened " + baseName(rpath) + " from " + host);
+    // the preview is for orientation; the pixels you can measure come right after
+    if (step > 1) requestFullRemote(app.images.back().get());
+    toast("opened " + baseName(rpath) + " from " + (host.empty() ? "local peer" : host));
 }
 
 static void openPath(const std::string& path) {
@@ -3760,6 +3904,24 @@ static void drawCanvas(ImVec2 avail) {
                               ImVec2(canvasP0.x + 6 * s + ts.x + 12 * s, y + ts.y + 6 * s),
                               IM_COL32(90, 60, 20, 210), 3.0f * s);
             dl->AddText(ImVec2(canvasP0.x + 12 * s, y + 3 * s), IM_COL32(255, 200, 120, 255), msg);
+        }
+        // Remote preview: say so ON the image. Measuring a 1/3-sampled preview
+        // without knowing it is how a wrong number gets written down.
+        if (im->remoteStep > 1) {
+            char msg[160];
+            if (im->remoteErr.empty())
+                snprintf(msg, sizeof msg, "PREVIEW 1/%d - fetching full resolution...",
+                         im->remoteStep);
+            else
+                snprintf(msg, sizeof msg, "PREVIEW 1/%d - fetch failed: %s",
+                         im->remoteStep, im->remoteErr.c_str());
+            ImVec2 ts = ImGui::CalcTextSize(msg);
+            float bx = std::max(canvasP0.x + 6 * s, (canvasP0.x + canvasP1.x - ts.x) * 0.5f);
+            float by = canvasP0.y + 8 * s;
+            ImU32 bg = im->remoteErr.empty() ? IM_COL32(120, 80, 20, 225) : IM_COL32(120, 30, 30, 225);
+            dl->AddRectFilled(ImVec2(bx - 8 * s, by - 4 * s),
+                              ImVec2(bx + ts.x + 8 * s, by + ts.y + 4 * s), bg, 4.0f * s);
+            dl->AddText(ImVec2(bx, by), IM_COL32(255, 215, 140, 255), msg);
         }
     } else {
         const char* msg = "Drop .npy / .bin / .raw files here   (O: open file)";
@@ -6275,7 +6437,8 @@ int main(int argc, char** argv) {
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = glfwGetTime();
         // work that must keep animating even without input
-        bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
+        bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
+                    app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // auto blink alternates on a timer, so it needs frames with
                     // no input at all - same case as a background load
@@ -6344,6 +6507,7 @@ int main(int argc, char** argv) {
             continue;
         }
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
+        pumpRemoteFetch();            // swap in full-resolution remote frames
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
@@ -6434,7 +6598,8 @@ int main(int argc, char** argv) {
     // Only what the user changed in this run: a one-off --sequence flag or the
     // gamma inside a --session must not quietly become the default.
     if (app.prefsDirty) savePrefs();
-    stopSequenceLoader();             // join the worker before tearing anything down
+    stopSequenceLoader();             // join the workers before tearing anything down
+    stopRemoteFetcher();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
