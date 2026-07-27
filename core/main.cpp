@@ -37,6 +37,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -262,15 +263,35 @@ struct App {
         bool valid = false;
         bool roiUsed = false;
     } temporal;
+    // H/V projections (line profiles) of the selected ROI / whole image
+    struct ProjState {
+        const ImageDoc* img = nullptr;
+        int dataRev = -1;
+        uint64_t annRev = (uint64_t)-1;
+        int selAnn = -2, mode = -1, cfa = -1;
+        int rx = 0, ry = 0, rw = 0, rh = 0;
+        int nSeries = 0;
+        const char* seriesNames[4] = {};
+        std::vector<float> h[4], v[4];    // per series: mean along columns / rows
+        float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
+        bool roiUsed = false;
+    } proj;
+    int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
+    bool showProjH = true, showProjV = true;
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
     int npyAxis = 0;                  // ambiguous 3D npy: 0 = auto, 1 = leading axis is frames
+    // shared display range: every open image (and every newly loaded one) uses it
+    bool linkRange = false;
+    float linkBlack = 0, linkWhite = 1;
     // panel visibility (persisted with the ImGui layout)
     bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
-    bool showHistogram = true, showTemporal = true;
+    bool showHistogram = true, showTemporal = true, showProjection = false;
     bool resetLayout = false;
     bool compactUi = true;            // dense spacing: this tool is table-heavy
     int wakeFrames = 3;               // frames still to draw after the last input
+    bool showFps = false;
+    bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -380,6 +401,15 @@ static void setFilter(ImageDoc& im, bool nearest) {
 
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
+}
+// Single entry point for range edits: honours the "link across images" mode.
+static void setRange(ImageDoc& im, float black, float white) {
+    if (!(white > black)) return;
+    im.black = black; im.white = white; im.texDirty = true;
+    if (app.linkRange) {
+        app.linkBlack = black; app.linkWhite = white;
+        for (auto& d : app.images) { d->black = black; d->white = white; d->texDirty = true; }
+    }
 }
 static void forgetTexture(ImageDoc* im) {
     app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), im), app.texLru.end());
@@ -505,12 +535,18 @@ static bool g_quietLoad = false;
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
     computeMinMax(*im);
-    defaultRange(*im);
+    if (app.linkRange && app.linkWhite > app.linkBlack) {   // adopt the shared range
+        im->black = app.linkBlack;
+        im->white = app.linkWhite;
+    } else {
+        defaultRange(*im);
+    }
     im->texDirty = true;
     app.images.push_back(std::move(im));
     if (!g_quietLoad || app.current < 0) {      // first image still gets shown
         app.current = (int)app.images.size() - 1;
-        app.fitRequested = true;
+        // the view is shared: only frame the very first image, keep it afterwards
+        if (app.images.size() == 1 || app.fitOnSwitch) app.fitRequested = true;
     }
 }
 
@@ -3027,6 +3063,13 @@ static void drawInspector() {
         }
 
         ImGui::SeparatorText("Range (black / white)");
+        {   // link: one range for every open image, so frames/files stay comparable
+            bool wasLinked = app.linkRange;
+            if (ImGui::Checkbox("link across all images", &app.linkRange) && app.linkRange && !wasLinked) {
+                app.linkBlack = im->black; app.linkWhite = im->white;
+                for (auto& d : app.images) { d->black = im->black; d->white = im->white; d->texDirty = true; }
+            }
+        }
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
         static float bwEdit[2];
@@ -3035,19 +3078,25 @@ static void drawInspector() {
         ImGui::SetNextItemWidth(-1);
         ImGui::InputFloat2("##bw", bwEdit, "%.5g");
         bwEditing = ImGui::IsItemActive();
-        if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0]) {
-            im->black = bwEdit[0]; im->white = bwEdit[1]; im->texDirty = true;
-        }
+        if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0])
+            setRange(*im, bwEdit[0], bwEdit[1]);
         {   // four equal buttons measured from the panel, never wider than it
             float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
             bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
-            if (ImGui::Button("Auto", ImVec2(bw, 0))) { im->black = im->vmin; im->white = im->vmax; im->texDirty = true; }
+            if (ImGui::Button("Auto", ImVec2(bw, 0))) {
+                float lo = im->vmin, hi = im->vmax;
+                if (app.linkRange)                       // fit every image, not just this one
+                    for (const auto& d : app.images) { lo = std::min(lo, d->vmin); hi = std::max(hi, d->vmax); }
+                setRange(*im, lo, hi);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(app.linkRange ? "min/max over all open images" : "min/max of this image");
             ImGui::SameLine();
-            if (ImGui::Button("0-1", ImVec2(bw, 0))) { im->black = 0; im->white = 1; im->texDirty = true; }
+            if (ImGui::Button("0-1", ImVec2(bw, 0))) setRange(*im, 0, 1);
             ImGui::SameLine();
-            if (ImGui::Button("0-255", ImVec2(bw, 0))) { im->black = 0; im->white = 255; im->texDirty = true; }
+            if (ImGui::Button("0-255", ImVec2(bw, 0))) setRange(*im, 0, 255);
             ImGui::SameLine();
-            if (ImGui::Button("0-65535", ImVec2(bw, 0))) { im->black = 0; im->white = 65535; im->texDirty = true; }
+            if (ImGui::Button("0-65535", ImVec2(bw, 0))) setRange(*im, 0, 65535);
         }
 
         int g = app.dispGamma > 1.5f ? 1 : 0;
@@ -3149,6 +3198,138 @@ static void drawPanelHistogram() {
 
 }
 
+// H/V projections: column means (horizontal profile) and row means (vertical
+// profile) over the selected ROI. Column FPN, banding and shading show up here
+// far more clearly than in the image itself.
+static void recomputeProjectionIfNeeded(ImageDoc* im) {
+    App::ProjState& P = app.proj;
+    int rx = 0, ry = 0, rw = im->w, rh = im->h;
+    bool roiUsed = false;
+    if (App::Ann* a = findAnn(app.selectedAnn)) {
+        if (a->type == 0) {
+            int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
+            int cw = std::clamp(a->w, 0, im->w - cx), chh = std::clamp(a->h, 0, im->h - cy);
+            if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; roiUsed = true; }
+        }
+    }
+    if (P.img == im && P.dataRev == im->dataRev && P.annRev == app.annRev &&
+        P.selAnn == app.selectedAnn && P.mode == app.projMode && P.cfa == im->cfa &&
+        P.rx == rx && P.ry == ry && P.rw == rw && P.rh == rh)
+        return;
+    P.img = im; P.dataRev = im->dataRev; P.annRev = app.annRev; P.selAnn = app.selectedAnn;
+    P.mode = app.projMode; P.cfa = im->cfa;
+    P.rx = rx; P.ry = ry; P.rw = rw; P.rh = rh; P.roiUsed = roiUsed;
+
+    bool cfa = im->ch == 1 && im->cfa != 0;
+    static const char* CFA_N[4] = { "R", "Gr", "Gb", "B" };
+    static const char* CH_N[4] = { "ch0", "ch1", "ch2", "ch3" };
+    P.nSeries = cfa ? 4 : std::min(im->ch, 3);
+    for (int s = 0; s < 4; s++) P.seriesNames[s] = cfa ? CFA_N[s] : CH_N[s];
+
+    for (int s = 0; s < P.nSeries; s++) {
+        P.h[s].assign(rw, 0.0f);
+        P.v[s].assign(rh, 0.0f);
+    }
+    std::vector<std::vector<int>> hN(P.nSeries, std::vector<int>(rw, 0));
+    std::vector<std::vector<int>> vN(P.nSeries, std::vector<int>(rh, 0));
+    bool useMax = app.projMode == 1, useMin = app.projMode == 2;
+    if (useMax || useMin)
+        for (int s = 0; s < P.nSeries; s++) {
+            std::fill(P.h[s].begin(), P.h[s].end(), useMax ? -FLT_MAX : FLT_MAX);
+            std::fill(P.v[s].begin(), P.v[s].end(), useMax ? -FLT_MAX : FLT_MAX);
+        }
+    for (int y = 0; y < rh; y++) {
+        for (int x = 0; x < rw; x++) {
+            const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
+            int lo = 0, hi = P.nSeries;
+            if (cfa) { lo = cfaChannelAt(*im, rx + x, ry + y); hi = lo + 1; }
+            for (int s = lo; s < hi; s++) {
+                float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
+                if (!std::isfinite(val)) continue;
+                if (useMax) { P.h[s][x] = std::max(P.h[s][x], val); P.v[s][y] = std::max(P.v[s][y], val); }
+                else if (useMin) { P.h[s][x] = std::min(P.h[s][x], val); P.v[s][y] = std::min(P.v[s][y], val); }
+                else { P.h[s][x] += val; P.v[s][y] += val; }
+                hN[s][x]++; vN[s][y]++;
+            }
+        }
+    }
+    P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
+    for (int s = 0; s < P.nSeries; s++) {
+        for (int x = 0; x < rw; x++) {
+            if (!hN[s][x]) { P.h[s][x] = std::numeric_limits<float>::quiet_NaN(); continue; }
+            if (!useMax && !useMin) P.h[s][x] /= hN[s][x];
+            P.hMin = std::min(P.hMin, P.h[s][x]); P.hMax = std::max(P.hMax, P.h[s][x]);
+        }
+        for (int y = 0; y < rh; y++) {
+            if (!vN[s][y]) { P.v[s][y] = std::numeric_limits<float>::quiet_NaN(); continue; }
+            if (!useMax && !useMin) P.v[s][y] /= vN[s][y];
+            P.vMin = std::min(P.vMin, P.v[s][y]); P.vMax = std::max(P.vMax, P.v[s][y]);
+        }
+    }
+    if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
+    if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
+}
+
+static void drawPanelProjection() {
+    ImageDoc* im = cur();
+    if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
+    const char* modes[3] = { "mean", "max", "min" };
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    if (ImGui::BeginCombo("reduce", modes[std::clamp(app.projMode, 0, 2)])) {
+        for (int i = 0; i < 3; i++)
+            if (ImGui::Selectable(modes[i], app.projMode == i)) app.projMode = i;
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::Checkbox("H", &app.showProjH);
+    ImGui::SameLine(); ImGui::Checkbox("V", &app.showProjV);
+    recomputeProjectionIfNeeded(im);
+    const App::ProjState& P = app.proj;
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
+
+    static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 220), IM_COL32(120, 230, 120, 220),
+                                       IM_COL32(60, 180, 140, 220), IM_COL32(92, 155, 255, 220) };
+    static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 210), IM_COL32(79, 221, 107, 210),
+                                       IM_COL32(92, 155, 255, 210) };
+    bool cfa = im->ch == 1 && im->cfa != 0;
+    int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
+    if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
+    float avail = ImGui::GetContentRegionAvail().y;
+    float each = std::max((avail - ImGui::GetTextLineHeightWithSpacing() * plots) / plots
+                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 70.0f * app.uiScale);
+
+    auto plotSeries = [&](bool horizontal) {
+        const std::vector<float>* series = horizontal ? P.h : P.v;
+        float lo = horizontal ? P.hMin : P.vMin, hi = horizontal ? P.hMax : P.vMax;
+        int n = horizontal ? P.rw : P.rh;
+        int origin = horizontal ? P.rx : P.ry;
+        char yl[80];
+        snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
+                 im->dtype.c_str());
+        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
+                                (float)origin, (float)(origin + std::max(n - 1, 1)),
+                                lo, hi, true, false, each);
+        if (!pr.ok) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pr.p0, pr.p1, true);
+        for (int s = 0; s < P.nSeries; s++) {
+            ImU32 col = cfa ? CFA_COLS[s]
+                            : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[s]);
+            const std::vector<float>& d = series[s];
+            ImVec2 prev(0, 0); bool has = false;
+            for (int i = 0; i < (int)d.size(); i++) {
+                if (!std::isfinite(d[i])) { has = false; continue; }
+                ImVec2 pt = pr.at((float)(origin + i), d[i]);
+                if (has) dl->AddLine(prev, pt, col, 1.2f);
+                prev = pt; has = true;
+            }
+        }
+        dl->PopClipRect();
+    };
+    if (app.showProjH) plotSeries(true);
+    if (app.showProjV) plotSeries(false);
+}
+
 static void drawPanelTemporal() {
     ImageDoc* im = cur();
     if (im && im->seqId != 0) {
@@ -3211,7 +3392,7 @@ static void drawPanelTemporal() {
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
 // live in the Analysis window; this is the "at a glance" layer.
 struct RoiStat { double mean, sd, mn, mx; size_t n; bool valid; };
-static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
+static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
     RoiStat s{ 0, 0, 0, 0, 0, false };
     rx = std::clamp(rx, 0, im.w); ry = std::clamp(ry, 0, im.h);
     rw = std::clamp(rw, 0, im.w - rx); rh = std::clamp(rh, 0, im.h - ry);
@@ -3246,6 +3427,24 @@ static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh,
     double var = sum2 / n - s.mean * s.mean;
     s.sd = sqrt(var > 0 ? var : 0);
     s.mn = mn; s.mx = mx; s.n = n; s.valid = true;
+    return s;
+}
+
+// The ROI table is drawn every frame; recomputing hundreds of thousands of
+// samples per row each time made the whole UI (typing included) crawl.
+struct RoiStatCacheEntry {
+    const ImageDoc* img; int dataRev, x, y, w, h, ch, cfa, cfaPat;
+    RoiStat s;
+};
+static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
+    static std::vector<RoiStatCacheEntry> cache;
+    for (auto& e : cache)
+        if (e.img == &im && e.dataRev == im.dataRev && e.x == rx && e.y == ry &&
+            e.w == rw && e.h == rh && e.ch == chSel && e.cfa == im.cfa && e.cfaPat == im.cfaPattern)
+            return e.s;
+    RoiStat s = roiBasicStatsUncached(im, rx, ry, rw, rh, chSel);
+    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    cache.push_back({ &im, im.dataRev, rx, ry, rw, rh, chSel, im.cfa, im.cfaPattern, s });
     return s;
 }
 
@@ -3591,7 +3790,8 @@ static void drawFileList() {
             char lb[512];
             snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
             if (rowWithMeta(head, lb, i == app.current, nullptr)) {
-                selectImage(i); app.fitRequested = true;
+                selectImage(i);
+                if (app.fitOnSwitch) app.fitRequested = true;
             }
             continue;
         }
@@ -3605,7 +3805,10 @@ static void drawFileList() {
         snprintf(lb, 512, "%s", si ? si->name.c_str() : "sequence");
         char frames[24];
         snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
-        if (rowWithMeta(head, lb, active, frames)) { selectImage(stack[pos]); app.fitRequested = true; }
+        if (rowWithMeta(head, lb, active, frames)) {
+            selectImage(stack[pos]);
+            if (app.fitOnSwitch) app.fitRequested = true;
+        }
         if (active) {
             int slider = pos;
             ImGui::SetNextItemWidth(-1);
@@ -3709,6 +3912,8 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
             ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
+        ImGui::MenuItem("Show frame time", nullptr, &app.showFps);
+        ImGui::MenuItem("Fit view when switching images", nullptr, &app.fitOnSwitch);
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
@@ -3717,10 +3922,12 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
             ImGui::MenuItem("Temporal", nullptr, &app.showTemporal);
+            ImGui::MenuItem("Projection (H/V)", nullptr, &app.showProjection);
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) {
                 app.showFiles = app.showInspector = app.showRois = true;
                 app.showAnalysis = app.showHistogram = app.showTemporal = true;
+                app.showProjection = false;
                 app.resetLayout = true;
             }
             ImGui::EndMenu();
@@ -4016,6 +4223,9 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // a blinking caret would force a redraw several times per second, which over
+    // ssh X11 means retransmitting the window just to animate a cursor
+    io.ConfigInputTextCursorBlink = false;
     // remember the panel layout between runs (user preference, not session data)
     static std::string iniPath;
     {
@@ -4082,9 +4292,9 @@ int main(int argc, char** argv) {
             glfwPollEvents();
             if (app.wakeFrames > 0) app.wakeFrames--;
         } else {
-            // idle: block until something happens (a caret blink needs a short
-            // heartbeat, everything else can sleep a full second)
-            glfwWaitEventsTimeout(ImGui::GetIO().WantTextInput ? 0.1 : 1.0);
+            // idle: block until something happens. The caret does not blink
+            // (ConfigInputTextCursorBlink=false), so text fields need no heartbeat.
+            glfwWaitEventsTimeout(1.0);
             wakeUi(1);
         }
         if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
@@ -4204,6 +4414,7 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
             ImGui::DockBuilderDockWindow("Temporal", bottom);
+            ImGui::DockBuilderDockWindow("Projection", bottom);
             ImGui::DockBuilderFinish(dockId);
             // ROIs and Analysis stay floating (they follow the work, not the frame)
             ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
@@ -4229,6 +4440,10 @@ int main(int argc, char** argv) {
         }
         if (app.showTemporal) {
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
+            ImGui::End();
+        }
+        if (app.showProjection) {
+            if (ImGui::Begin("Projection", &app.showProjection)) drawPanelProjection();
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small
@@ -4274,6 +4489,10 @@ int main(int argc, char** argv) {
                          im->dtype.c_str(), zs, hover.c_str());
             }
             ImGui::TextUnformatted(st);
+            if (app.showFps) {   // View > Show frame time: is the UI or the link slow?
+                ImGui::SameLine();
+                ImGui::TextDisabled("   %.1f ms/frame", 1000.0f / ImGui::GetIO().Framerate);
+            }
             static std::string lastTitle;
             std::string title = im ? im->name + " - viewer" : "viewer v0.1";
             if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
