@@ -345,6 +345,7 @@ struct App {
     std::string pendingLayout;        // dock settings from a session, applied next frame
     bool compactUi = true;            // dense spacing: this tool is table-heavy
     int wakeFrames = 3;               // frames still to draw after the last input
+    bool lowBandwidth = false;        // remote/ssh: draw the minimum, not a tail
     bool showFps = false;
     bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
 };
@@ -1745,6 +1746,7 @@ static void savePrefs() {
     f << "fitonswitch " << (app.fitOnSwitch ? 1 : 0) << "\n";
     f << "seqload " << app.seqLoadMode << "\n";
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
+    f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
 }
@@ -1768,6 +1770,7 @@ static void loadPrefs() {
         else if (key == "fitonswitch") { ls >> v; app.fitOnSwitch = v != 0; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
+        else if (key == "lowbandwidth"){ ls >> v; app.lowBandwidth = v != 0; }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
     }
@@ -5191,6 +5194,11 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
             ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
         ImGui::MenuItem("Show frame time", nullptr, &app.showFps);
+        ImGui::MenuItem("Low bandwidth (remote / ssh)", nullptr, &app.lowBandwidth);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Draw the minimum number of frames per input.\n"
+                              "Saves bandwidth over X11 forwarding; locally it makes\n"
+                              "menus and fades feel less responsive.");
         ImGui::MenuItem("Fit view when switching images", nullptr, &app.fitOnSwitch);
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
@@ -5475,7 +5483,18 @@ static void parseCli(int argc, char** argv) {
 // over ssh X11 forwarding means pushing the whole window across the network
 // continuously. Input wakes the loop; when nothing happens we block in
 // glfwWaitEventsTimeout and draw nothing at all.
-static void wakeUi(int frames = 3) { app.wakeFrames = std::max(app.wakeFrames, frames); }
+//
+// The wake budget is a DEADLINE, not a frame count. ImGui's own timers run on
+// io.DeltaTime - a submenu needs 300 ms of hovering, a modal backdrop 167 ms to
+// fade - and three frames after an input is ~1 ms of wall clock on a fast
+// machine, so those timers used to advance by almost nothing and fire only on
+// the next idle timeout. Low-bandwidth mode restores the old frame-count
+// behaviour for remote sessions.
+static double g_wakeUntil = 0;
+static void wakeUi(int frames = 3) {
+    app.wakeFrames = std::max(app.wakeFrames, frames);
+    if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
+}
 
 static void dropCallback(GLFWwindow*, int count, const char** paths) {
     wakeUi(4);
@@ -5603,16 +5622,23 @@ int main(int argc, char** argv) {
         app.showHistogram = app.showTemporal = app.showProjection = true;
         benchMs.reserve(benchFrames);
     }
+    double lastFrameEnd = glfwGetTime();
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = glfwGetTime();
         // work that must keep animating even without input
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
         if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
-        if (app.wakeFrames > 0 || busy) {
-            // a background load must show progress, but not at full frame rate\r
-            if (busy && app.wakeFrames <= 0) glfwWaitEventsTimeout(0.08);
-            else glfwPollEvents();
+        bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
+        if (active || busy) {
+            // Frame pacing lives here, not in the swap: the driver may ignore
+            // vsync entirely (measured ~4000 fps with SwapInterval(1)), and this
+            // wait returns the instant an event arrives, so it costs no latency.
+            double budget = app.lowBandwidth ? 1.0 / 30.0 : 1.0 / 120.0;
+            if (!active) budget = 0.08;        // background progress only
+            double left = budget - (frameT0 - lastFrameEnd);
+            if (benchFrames || left <= 0.0005) glfwPollEvents();
+            else glfwWaitEventsTimeout(left);
             if (app.wakeFrames > 0) app.wakeFrames--;
         } else {
             // idle: block until something happens. The caret does not blink
@@ -5620,6 +5646,7 @@ int main(int argc, char** argv) {
             glfwWaitEventsTimeout(1.0);
             wakeUi(1);
         }
+        lastFrameEnd = glfwGetTime();
         if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
         if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
             ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
@@ -5655,6 +5682,7 @@ int main(int argc, char** argv) {
                          (app.compactUi ? 1u : 0u) * 7 + (app.dragPans ? 1u : 0u) * 13 +
                          (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
                          (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
+                         (app.lowBandwidth ? 1u : 0u) * 43 +
                          (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
             if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
             lastPrefs = h;
@@ -5693,6 +5721,13 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        // ImGui hands input out over several frames (ConfigInputTrickleEventQueue):
+        // NewFrame stops mid-queue on a wheel-after-move or a second action on one
+        // button and KEEPS the rest for later. An event-driven loop that sleeps
+        // there replays stale input at the idle timeout instead - one wheel notch
+        // every 250 ms, for seconds, after the user has stopped. Measured: a
+        // 30-event burst took ~15 s to drain; with this line, ~7 ms.
+        if (!ImGui::GetCurrentContext()->InputEventsQueue.empty()) wakeUi(1);
 
         // shortcuts
         pollFileDialog();
