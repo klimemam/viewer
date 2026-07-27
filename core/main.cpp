@@ -286,6 +286,7 @@ struct App {
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
+    float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -294,6 +295,7 @@ struct App {
     std::mutex seqMtx;
     std::vector<std::pair<int, std::unique_ptr<ImageDoc>>> seqReady;   // (seqIndex, frame)
     std::string seqErr;               // guarded by seqMtx
+    std::string seqNote;              // last loader message, kept on screen (UI thread)
     int seqLoadingId = 0;
     size_t seqBytes = 0;
     // pending "load the rest of the folder?" question
@@ -1767,6 +1769,7 @@ static void savePrefs() {
     f << "seqload " << app.seqLoadMode << "\n";
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
+    f << "membudget " << app.memBudgetGB << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
 }
@@ -1791,6 +1794,9 @@ static void loadPrefs() {
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
         else if (key == "lowbandwidth"){ ls >> v; app.lowBandwidth = v != 0; }
+        else if (key == "membudget")   { ls >> app.memBudgetGB;
+                                         if (app.memBudgetGB > 0)
+                                             app.memBudgetGB = std::clamp(app.memBudgetGB, 0.5f, 4096.0f); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
     }
@@ -2088,7 +2094,35 @@ static std::string loadSession(const std::string& path) {
 // ---------------------------------------------------------------- sequences (連番)
 // A sequence is one "stack": frames from numbered files in a folder that share a
 // decode recipe. It is the unit temporal analysis operates on.
-static const size_t SEQ_MEM_BUDGET = (size_t)6 << 30;   // stop loading past ~6 GB
+// How much RAM the loader may fill with frames. A hardcoded 6 GB meant a machine
+// with 128 GB stopped 300-frame folders at 60 frames, with no way to say "use the
+// memory I have" - and 6 GB is at the same time too much for a small laptop.
+static size_t physicalMemoryBytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) return (size_t)ms.ullTotalPhys;
+#elif defined(__APPLE__)
+    uint64_t v = 0; size_t len = sizeof v;
+    if (sysctlbyname("hw.memsize", &v, &len, nullptr, 0) == 0) return (size_t)v;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0) return (size_t)pages * (size_t)page;
+#endif
+    return (size_t)8 << 30;                       // unknown: assume a modest box
+}
+static size_t seqMemBudget() {
+    if (app.memBudgetGB > 0) return (size_t)(app.memBudgetGB * 1073741824.0);
+    // default: most of the machine, but never the whole of it
+    size_t phys = physicalMemoryBytes();
+    return std::max((size_t)2 << 30, (size_t)(phys * 0.6));
+}
+// frames already resident, so the budget covers everything open and not just the
+// stack being loaded right now
+static size_t residentImageBytes() {
+    size_t n = 0;
+    for (const auto& d : app.images) n += d->data.size() * sizeof(float);
+    return n;
+}
 
 // split a stem into alternating text / digit segments: "flat_0007_640x480" ->
 // ["flat_"]["0007"]["_"]["640"]["x"]["480"]
@@ -2236,10 +2270,13 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
         std::lock_guard<std::mutex> lk(app.seqMtx);
         app.seqErr.clear();
     }
+    app.seqNote.clear();
     fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
             (int)files.size(), isRaw ? "raw recipe" : "npy");
-    app.seqThread = std::thread([jobs, isRaw, recipe]() {
-        size_t bytes = 0;
+    const size_t startBytes = residentImageBytes();
+    const size_t budget = seqMemBudget();
+    app.seqThread = std::thread([jobs, isRaw, recipe, startBytes, budget]() {
+        size_t bytes = startBytes;
         int failures = 0;
         double lastPost = 0;
         for (const auto& j : jobs) {
@@ -2272,9 +2309,17 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             // the idle throttle on a fast disk
             double now = glfwGetTime();
             if (now - lastPost > 0.1) { lastPost = now; glfwPostEmptyEvent(); }
-            if (bytes > SEQ_MEM_BUDGET) {
+            if (bytes > budget) {
+                // say what stopped it, with the numbers: silently loading 60 of
+                // 300 frames is how a measurement quietly becomes wrong
+                char m[192];
+                snprintf(m, sizeof m,
+                         "memory budget %.1f GB reached - stopped after %d of %d frames\n"
+                         "(File > Sequence loading > Memory budget)\n",
+                         budget / 1073741824.0, app.seqDone.load(), (int)jobs.size());
+                fputs(m, stderr);
                 std::lock_guard<std::mutex> lk(app.seqMtx);
-                app.seqErr += "memory budget reached - stopped loading\n";
+                app.seqErr += m;
                 break;
             }
         }
@@ -2300,7 +2345,10 @@ static void pumpSequence() {
         }
         err.swap(app.seqErr);
     }
-    if (!err.empty()) toast(err, true);
+    // A toast expires; "60 of 300 frames" must not. Keep it in the Files panel
+    // until the next load, because a partially loaded stack silently produces
+    // wrong temporal statistics.
+    if (!err.empty()) { toast(err, true); app.seqNote = err; }
     if (batch.empty()) {
         if (!app.seqRunning && app.seqThread.joinable()) app.seqThread.join();
         return;
@@ -5035,6 +5083,14 @@ static void drawFileList() {
         }
         if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
+    if (!app.seqNote.empty()) {          // why the stack is short, kept in view
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(app.seqNote.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("dismiss##seqnote")) app.seqNote.clear();
+    }
     ImGui::Separator();
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
@@ -5204,6 +5260,20 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("Always load folder", nullptr, app.seqLoadMode == 1)) app.seqLoadMode = 1;
             if (ImGui::MenuItem("Never (single file)", nullptr, app.seqLoadMode == 2)) app.seqLoadMode = 2;
             ImGui::Separator();
+            {   // how many frames fit is a memory question, so say it in memory terms
+                ImGui::TextDisabled("Memory budget");
+                float gb = app.memBudgetGB > 0 ? app.memBudgetGB
+                                               : (float)(seqMemBudget() / 1073741824.0);
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+                if (ImGui::InputFloat("GB##membudget", &gb, 1.0f, 8.0f, "%.1f"))
+                    app.memBudgetGB = std::clamp(gb, 0.5f, 4096.0f);
+                if (ImGui::MenuItem("auto (60% of RAM)", nullptr, app.memBudgetGB <= 0))
+                    app.memBudgetGB = 0;
+                ImGui::TextDisabled("  in use: %.1f GB of %.1f GB",
+                                    residentImageBytes() / 1073741824.0,
+                                    seqMemBudget() / 1073741824.0);
+                ImGui::Separator();
+            }
             if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
                                 cur() && cur()->seqId == 0 && !cur()->path.empty())) {
                 std::string pat;
@@ -5532,6 +5602,8 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
+        } else if (a == "--mem-budget") {          // GB the sequence loader may use
+            app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {             // off | wipe | split
             std::string v = next();
             if (v == "wipe") cliCompare = App::CmpWipe;
