@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <limits>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -116,6 +117,7 @@ struct ImageDoc {
     // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
     int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
+    std::string npzMember;            // array name when this came from a .npz
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
@@ -721,7 +723,8 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     return {};
 }
 
-static std::string loadNpz(const std::string& path) {
+// onlyMember != "" restores a single array (sessions record which one).
+static std::string loadNpz(const std::string& path, const std::string& onlyMember = "") {
     std::vector<uint8_t> zip;
     if (!readFileBytes(path, zip)) return "cannot read file";
     std::vector<NpzEntry> entries;
@@ -730,12 +733,17 @@ static std::string loadNpz(const std::string& path) {
     int loaded = 0, stored = 0, deflated = 0;
     for (const auto& e : entries) {
         if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
+        std::string arrayName = e.name.substr(0, e.name.size() - 4);
+        if (!onlyMember.empty() && arrayName != onlyMember) continue;
         std::vector<uint8_t> member;
         std::string mErr;
         if (!npzExtract(zip, e, member, mErr)) { toast(e.name + ": " + mErr, true); continue; }
-        std::string label = baseName(path) + ":" + e.name.substr(0, e.name.size() - 4);
+        std::string label = baseName(path) + ":" + arrayName;
+        size_t before = app.images.size();
         std::string lErr = loadNpyBuffer(member, path, label);
         if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
+        for (size_t k = before; k < app.images.size(); k++)
+            app.images[k]->npzMember = arrayName;    // identity for session restore
         loaded++;
         (e.method == 0 ? stored : deflated)++;
     }
@@ -1276,17 +1284,51 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
                                                      std::string& patternOut);
 static void startSequenceLoad(int imageIdx, const std::vector<std::string>& files,
                               const std::string& pattern);
+static void stopSequenceLoader();
+static std::vector<int> framesOfSeq(int seqId);
+static App::SeqInfo* seqInfo(int id);
+static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 static void saveSession(std::string path, bool quiet = false) {
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
     f << "viewer-session 1\n";
+    f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "zoom " << app.view.zoom << "\n";
     f << "center " << app.view.center.x << " " << app.view.center.y << "\n";
-    f << "current " << app.current << "\n";
+    // One image line per stack means saved-line order != app.images order, and a
+    // restored stack expands to N frames, so a raw index cannot survive. Save the
+    // ordinal of the line that carries the current image instead.
+    // A stack contributes exactly one line: the frame it was left on.
+    auto isSavedLine = [&](const ImageDoc* d) {
+        if (d->path.empty()) return false;
+        if (d->seqId == 0) return true;
+        int rep = -1;
+        if (App::SeqInfo* si = seqInfo(d->seqId))
+            if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
+                app.images[si->lastImageIdx]->seqId == d->seqId)
+                rep = si->lastImageIdx;
+        if (rep < 0) {                              // never navigated: first frame
+            std::vector<int> fr = framesOfSeq(d->seqId);
+            if (!fr.empty()) rep = fr.front();
+        }
+        return rep >= 0 && app.images[rep].get() == d;
+    };
+    auto savedLineOf = [&](const ImageDoc* d) {
+        int ord = 0;
+        for (const auto& o : app.images) {
+            if (!isSavedLine(o.get())) continue;
+            // the current image may not be its stack's saved frame, but it lands
+            // on that stack's line either way
+            if (o.get() == d || (d->seqId != 0 && o->seqId == d->seqId)) return ord;
+            ord++;
+        }
+        return 0;
+    };
+    f << "current " << (cur() ? savedLineOf(cur()) : 0) << "\n";
     // display state that lives outside the per-image range
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
@@ -1312,10 +1354,10 @@ static void saveSession(std::string path, bool quiet = false) {
         f << "layout_end\n";
     }
     for (auto& d : app.images) {
-        if (d->path.empty()) continue;
-        // sequences: store only the frame in view + a marker to reload the stack
-        // (writing every frame would bloat the file and slow restore)
-        if (d->seqId != 0 && d.get() != cur()) continue;
+        // Sequences: one line per STACK (the frame that stack was left on), not
+        // one per frame - and not only the stack that happens to be on screen.
+        if (!isSavedLine(d.get())) continue;
+        if (!d->npzMember.empty()) f << "member " << d->npzMember << "\n";
         f << "lut " << d->displayLut << "\n";
         f << "image " << d->black << " " << d->white << " ";
         if (d->rawDtype >= 0) {
@@ -1332,11 +1374,28 @@ static void saveSession(std::string path, bool quiet = false) {
               << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
         }
         f << d->path << "\n";           // path last: may contain spaces
-        if (d->seqId != 0) f << "seqload 1\n";
+        if (d->seqId != 0) {
+            f << "seqframe " << d->seqIndex << "\n";   // come back to the same frame
+            // A folder sequence must rescan its siblings; an in-file frame axis
+            // rebuilds the whole stack from the file itself, so asking for a
+            // sibling scan there would split the stack in two.
+            bool inFile = true;
+            for (const auto& o : app.images)
+                if (o->seqId == d->seqId && o->path != d->path) { inFile = false; break; }
+            if (!inFile) f << "seqload 1\n";
+        }
     }
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
-          << a.color << " " << (a.visible ? 1 : 0) << " " << a.label << "\n";
+          << a.color << " " << (a.visible ? 1 : 0) << " "
+          << a.prevX << " " << a.prevW << " " << a.prevY << " " << a.prevH << " "
+          << a.label << "\n";     // label last: it may contain spaces
+    {   // which annotation was selected, by position in the list above
+        int selIdx = -1;
+        for (int i = 0; i < (int)app.anns.size(); i++)
+            if (app.anns[i].id == app.selectedAnn) selIdx = i;
+        f << "selann " << selIdx << "\n";
+    }
     if (!quiet) toast("session saved: " + baseName(path));
 }
 
@@ -1389,13 +1448,27 @@ static std::string loadSession(const std::string& path) {
     std::string line;
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
+    stopSequenceLoader();          // orphan frames from a previous load must not
+    app.seqQueue.clear();          // graft themselves onto the restored list
     closeAll();
     app.anns.clear();
     app.selectedAnn = 0;
     app.annRev++;
+    std::vector<std::string> failures;   // reported as one summary, not one toast each
+    int selAnnIndex = -1;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     int pendingLut = -1;
+    std::string pendingMember;         // .npz array name for the next image line
+    bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
+    // "current" is an ordinal over saved image lines; a line can expand into a
+    // whole stack, so resolve it to a real index once that line is fully applied
+    // (seqframe, which picks the frame, comes after the image line).
+    int lineOrd = -1, wantCurrent = -1, resolvedCurrent = -1;
+    bool capturing = false;
+    auto settleCurrent = [&]() {
+        if (capturing) { resolvedCurrent = app.current; capturing = false; }
+    };
     auto restOfLine = [](std::istringstream& ls) {
         std::string p; std::getline(ls, p);
         while (!p.empty() && (p[0] == ' ' || p[0] == '\t')) p.erase(0, 1);
@@ -1410,7 +1483,7 @@ static std::string loadSession(const std::string& path) {
         else if (key == "grid")  { int g = 0; ls >> g; app.showGrid = g != 0; }
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
-        else if (key == "current") ls >> current;
+        else if (key == "current") ls >> wantCurrent;
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
         else if (key == "roichannel") ls >> app.roiChannel;
@@ -1438,11 +1511,23 @@ static std::string loadSession(const std::string& path) {
             }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);
+            app.resetLayout = false;   // otherwise the default rebuild wipes it
         }
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
+        else if (key == "member") pendingMember = restOfLine(ls);
+        else if (key == "selann") ls >> selAnnIndex;
+        else if (key == "seqframe") {   // select the frame this stack was left on
+            int want = 0; ls >> want;
+            if (lastImageOk && cur() && cur()->seqId != 0) {
+                for (int idx : framesOfSeq(cur()->seqId))
+                    if (app.images[idx]->seqIndex == want) { selectImage(idx); break; }
+            }
+        }
         else if (key == "seqload") {   // applies to the image loaded just above
             int on = 0; ls >> on;
-            if (on && cur() && !cur()->path.empty()) {
+            // only if that image actually loaded, and not when it is already a
+            // stack (an in-file frame axis) - that would split it in two
+            if (on && lastImageOk && cur() && !cur()->path.empty() && cur()->seqId == 0) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
                 if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
@@ -1451,6 +1536,12 @@ static std::string loadSession(const std::string& path) {
         else if (key == "ann") {
             App::Ann a; int vis = 1;
             ls >> a.type >> a.x >> a.y >> a.w >> a.h >> a.color >> vis;
+            // v1 files stop here; v2 adds the band-toggle memory before the label
+            std::streampos save = ls.tellg();
+            if (!(ls >> a.prevX >> a.prevW >> a.prevY >> a.prevH)) {
+                ls.clear(); ls.seekg(save);
+                a.prevW = a.prevH = -1;
+            }
             if (a.type < 0 || a.type > 1 || a.x < 0 || a.y < 0 || a.w < 0 || a.h < 0)
                 continue;                 // reject malformed lines (would read out of bounds)
             a.color &= 7;
@@ -1467,6 +1558,8 @@ static std::string loadSession(const std::string& path) {
         else if (key == "roi") { int x = 0, y = 0, w = 0, h = 0; ls >> x >> y >> w >> h;
                                  if (w > 0 && h > 0) addAnn(0, x, y, w, h); }
         else if (key == "image") {
+            settleCurrent();              // the previous image line is done
+            lineOrd++;
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
             std::string err;
@@ -1500,7 +1593,13 @@ static std::string loadSession(const std::string& path) {
                 ls >> cfa >> pat >> col;
                 if (kind == "npy3") ls >> ccx >> ccy >> ccw >> cch;
                 std::string p = restOfLine(ls);
-                err = loadNpy(p);
+                // an .npz member must go back through the zip reader; loadNpy
+                // would fail the magic check and the array would silently vanish
+                std::string lowp = p;
+                std::transform(lowp.begin(), lowp.end(), lowp.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
+                err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
                     cur()->cfaPattern = pat & 3;
@@ -1512,17 +1611,44 @@ static std::string loadSession(const std::string& path) {
                 std::string p = restOfLine(ls);
                 err = loadNpy(p);
             }
-            if (!err.empty()) { toast("session: " + err, true); continue; }
+            pendingMember.clear();
+            if (!err.empty()) {
+                failures.push_back(err);
+                lastImageOk = false;
+                pendingLut = -1;          // must not leak onto the next image
+                continue;
+            }
+            lastImageOk = true;
             cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
             cur()->displayLut = pendingLut; pendingLut = -1;
+            if (lineOrd == wantCurrent) capturing = true;
         }
     }
-    app.selectedAnn = 0;
+    settleCurrent();                      // last image line in the file
+    if (resolvedCurrent >= 0) current = resolvedCurrent;
     if (current >= 0 && current < (int)app.images.size()) app.current = current;
     if (haveView && !app.images.empty()) {
         app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
         app.view.center = center;
         app.fitRequested = false;      // restored view wins over fit-on-load
+    }
+    // label counters must continue past the restored names, or the next ROI
+    // collides and the analysis grid gets two identical column headers
+    for (const auto& a : app.anns) {
+        int n = atoi(a.label.c_str() + (a.type == 0 ? std::min<size_t>(4, a.label.size())
+                                                    : std::min<size_t>(1, a.label.size())));
+        if (a.type == 0) app.roiSeq = std::max(app.roiSeq, n);
+        else app.poiSeq = std::max(app.poiSeq, n);
+    }
+    if (selAnnIndex >= 0 && selAnnIndex < (int)app.anns.size())
+        app.selectedAnn = app.anns[selAnnIndex].id;
+    else
+        app.selectedAnn = 0;
+    if (!failures.empty()) {
+        std::string msg = std::to_string(failures.size()) + " image(s) could not be restored:\n";
+        for (size_t i = 0; i < failures.size() && i < 5; i++) msg += "  " + failures[i] + "\n";
+        if (failures.size() > 5) msg += "  ...";
+        toast(msg, true);
     }
     markAllTexDirty();                 // gamma may have changed
     return {};
@@ -4641,7 +4767,15 @@ int main(int argc, char** argv) {
             static uint64_t lastState = 0;
             static double dirtySince = -1, lastAutosave = 0;
             uint64_t state = app.imagesRev * 1000003ull + app.annRev * 31ull +
-                             (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0);
+                             (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
+                             (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
+                             (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
+                             (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
+                                        app.projMode * 64 + app.projYMode * 256 +
+                                        app.roiChannel * 1024 + app.selectedAnn * 4096) +
+                             (uint64_t)(app.showFiles + app.showInspector * 2 + app.showRois * 4 +
+                                        app.showAnalysis * 8 + app.showHistogram * 16 +
+                                        app.showTemporal * 32 + app.showProjection * 64) * 131ull;
             double nowA = glfwGetTime();
             if (state != lastState) { lastState = state; dirtySince = nowA; }
             bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
