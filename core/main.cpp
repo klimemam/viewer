@@ -195,7 +195,14 @@ struct App {
     // A/B compare: A is always the current image; B is a second open image shown
     // beside it (split) or under a draggable divider (wipe). Both panes use the
     // one shared view, so a pixel is at the same place in both.
-    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2, CmpDiff = 3 };
+    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2, CmpDiff = 3, CmpFlip = 4 };
+    // Blink comparator: same view, whole frame, alternating between A and B. The
+    // eye finds a small difference far better from a flicker in place than from a
+    // seam or from two images side by side.
+    bool flipShowB = false;
+    bool flipAuto = false;
+    float flipPeriod = 0.5f;          // seconds per side
+    double flipNext = 0;
     // Difference view: A-B as a signed map. Sign is hue, magnitude is brightness,
     // and anything beyond the scale is flagged, because a difference image with a
     // silently clipped scale is worse than no difference image.
@@ -414,11 +421,13 @@ static void ensureCompareB() {
 static void cycleCompare() {
     if (app.images.size() < 2) { toast("compare needs a second open image", true); return; }
     ensureCompareB();
-    app.compareMode = (app.compareMode + 1) % 4;
+    app.compareMode = (app.compareMode + 1) % 5;
     toast(app.compareMode == App::CmpOff   ? "compare off"
         : app.compareMode == App::CmpWipe  ? "compare: wipe  (drag the divider)"
         : app.compareMode == App::CmpSplit ? "compare: side by side"
-                                           : "compare: difference A-B");
+        : app.compareMode == App::CmpDiff  ? "compare: difference A-B"
+                                           : "compare: blink  (B or Space toggles, "
+                                             "'auto blink' in Inspector)");
 }
 
 // Pin the frame you are looking at as B, then walk A somewhere else: this is how
@@ -1632,7 +1641,8 @@ static void writeSessionTo(std::ostream& f) {
     // must precede the image lines: it decides whether (F,H,W) reloads as a stack
     f << "npyaxis " << app.npyAxis << "\n";
     f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << " "
-      << app.diffGain << " " << (app.diffAbs ? 1 : 0) << "\n";
+      << app.diffGain << " " << (app.diffAbs ? 1 : 0) << " "
+      << (app.flipAuto ? 1 : 0) << " " << app.flipPeriod << "\n";
     // uids are per-run, so the file carries name + frame index; the name is last
     // because it may contain spaces
     if (ImageDoc* b = resolveB())
@@ -1896,10 +1906,12 @@ static std::string loadSession(const std::string& path) {
         else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
         else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
-        else if (key == "compare") { int ab = 0;
+        else if (key == "compare") { int ab = 0, fa = 0;
                                      ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
                                      if (ls >> app.diffGain >> ab) app.diffAbs = ab != 0;  // v2
-                                     app.compareMode = std::clamp(app.compareMode, 0, 3);
+                                     if (ls >> fa >> app.flipPeriod) app.flipAuto = fa != 0;  // v3
+                                     app.compareMode = std::clamp(app.compareMode, 0, 4);
+                                     app.flipPeriod = std::clamp(app.flipPeriod, 0.05f, 10.0f);
                                      app.wipeFrac = std::clamp(app.wipeFrac, 0.03f, 0.97f);
                                      app.splitFrac = std::clamp(app.splitFrac, 0.03f, 0.97f); }
         else if (key == "compareb") {   // "<frameIndex|-1> <name>"; v1 files: just a name
@@ -3105,6 +3117,14 @@ static void drawCanvas(ImVec2 avail) {
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
     const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
                           imB->w == im->w && imB->h == im->h;
+    const bool flipMode = imB && app.compareMode == App::CmpFlip;
+    if (flipMode && app.flipAuto) {          // alternate on its own
+        double now = ImGui::GetTime();
+        if (now >= app.flipNext) {
+            app.flipShowB = !app.flipShowB;
+            app.flipNext = now + std::max(app.flipPeriod, 0.05f);
+        }
+    }
     // split panes are clamped harder than the wipe divider: a 3%-wide pane is a
     // useless pane, and "fit" into it would shrink the image to nothing
     if (split) app.splitFrac = std::clamp(app.splitFrac, 0.12f, 0.88f);
@@ -3458,10 +3478,14 @@ static void drawCanvas(ImVec2 avail) {
 
     // Hold B to see B full-frame: flicking between two full images is how small
     // differences become visible - a fixed divider cannot show them.
-    bool flashB = imB && !ImGui::GetIO().WantTextInput && ImGui::IsKeyDown(ImGuiKey_B) &&
+    bool flashB = imB && !flipMode && !ImGui::GetIO().WantTextInput && ImGui::IsKeyDown(ImGuiKey_B) &&
                   !ImGui::IsKeyDown(ImGuiKey_LeftShift) && !ImGui::IsKeyDown(ImGuiKey_RightShift);
     if (im) {
-        if (flashB) {
+        if (flipMode) {
+            ImageDoc* d = app.flipShowB ? imB : im;
+            drawImageOnly(d, false);
+            drawOverlays(d, false);
+        } else if (flashB) {
             drawImageOnly(imB, false);
             drawOverlays(imB, false);
         } else if (diffMode) {
@@ -3518,7 +3542,17 @@ static void drawCanvas(ImVec2 avail) {
                 dl->AddText(ImVec2(bx + pad, by + pad * 0.5f), col, t.c_str());
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
-            if (app.compareMode == App::CmpDiff) {
+            if (flipMode) {
+                // which side is on screen has to be readable at a glance, or a
+                // blink comparison tells you nothing about WHICH one differs
+                ImageDoc* d = app.flipShowB ? imB : im;
+                badge(canvasP0.x + 6 * s, canvasP1.x, false,
+                      app.flipShowB ? "B" : "A",
+                      d->name + (app.flipAuto ? "   (auto)" : "   (B / Space to toggle)"),
+                      app.flipShowB ? colB : colA);
+                // a coloured edge so peripheral vision registers the switch too
+                dl->AddRect(canvasP0, canvasP1, app.flipShowB ? colB : colA, 0, 0, 3.0f * s);
+            } else if (app.compareMode == App::CmpDiff) {
                 badge(canvasP0.x + 6 * s, canvasP1.x, false,
                       app.diffAbs ? "|A-B|" : "A-B", im->name + "  -  " + imB->name,
                       IM_COL32(220, 225, 235, 255));
@@ -3582,7 +3616,7 @@ static void drawCanvas(ImVec2 avail) {
                             IM_COL32(255, 255, 255, hot ? 255 : 200), 1.5f * s);
             }
             // grab handle: a stubby bar at mid-height, the thing you aim at
-            if (!flashB && app.compareMode != App::CmpDiff) {
+            if (!flashB && !flipMode && app.compareMode != App::CmpDiff) {
                 float dx = split ? splitX : wipeX;
                 float hy = (canvasP0.y + canvasP1.y) * 0.5f, hh = 22 * s, hw = 5 * s;
                 dl->AddRectFilled(ImVec2(dx - hw, hy - hh), ImVec2(dx + hw, hy + hh),
@@ -3996,6 +4030,15 @@ static void drawInspector() {
             }
             if (b->dtype != im->dtype)
                 ImGui::TextDisabled("dtype differs: A %s / B %s", im->dtype.c_str(), b->dtype.c_str());
+            if (app.compareMode == App::CmpFlip) {
+                ImGui::Checkbox("auto blink", &app.flipAuto);
+                ImGui::SetNextItemWidth(numColW() * 2);
+                // round numbers: 0.5 s per side, not 0.4736
+                if (ImGui::InputFloat("seconds per side", &app.flipPeriod, 0.1f, 0.5f, "%.2f"))
+                    app.flipPeriod = std::clamp(app.flipPeriod, 0.05f, 10.0f);
+                ImGui::TextDisabled("showing %s   (Space or B toggles)",
+                                    app.flipShowB ? "B" : "A");
+            }
             if (app.compareMode == App::CmpDiff) {
                 bool intType = !im->dtype.empty() && (im->dtype[0] == 'u' || im->dtype[0] == 'i');
                 bool autoGain = app.diffGain <= 0;
@@ -5157,6 +5200,12 @@ static void drawMenuBar(GLFWwindow* win) {
                 { app.compareMode = App::CmpSplit; ensureCompareB(); }
             if (ImGui::MenuItem("Difference (A-B)", nullptr, app.compareMode == App::CmpDiff))
                 { app.compareMode = App::CmpDiff; ensureCompareB(); }
+            if (ImGui::MenuItem("Blink (flip A/B in place)", nullptr, app.compareMode == App::CmpFlip))
+                { app.compareMode = App::CmpFlip; ensureCompareB(); }
+            if (app.compareMode == App::CmpFlip) {
+                if (ImGui::MenuItem("  auto blink", "Space / B toggles", app.flipAuto))
+                    app.flipAuto = !app.flipAuto;
+            }
             if (app.compareMode == App::CmpDiff) {
                 if (ImGui::MenuItem("  magnitude only |A-B|", nullptr, app.diffAbs))
                     app.diffAbs = !app.diffAbs;
@@ -5699,7 +5748,17 @@ int main(int argc, char** argv) {
             // not where "\" sits on a JIS keyboard
             if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false) ||
                 ImGui::IsKeyPressed(ImGuiKey_C, false)) cycleCompare();
-            // B is hold-to-see-B (handled in drawCanvas); Shift+B pins A as B
+            // B is hold-to-see-B (handled in drawCanvas); Shift+B pins A as B.
+            // In blink mode it is a toggle instead - "ぱちぱち" needs a tap, not
+            // a held key. Space doubles as the toggle there (it only pans while
+            // a drag is in progress, which a blink comparison never is).
+            if (app.compareMode == App::CmpFlip && cmpB()) {
+                if (ImGui::IsKeyPressed(ImGuiKey_B, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                    app.flipShowB = !app.flipShowB;
+                    app.flipNext = ImGui::GetTime() + std::max(app.flipPeriod, 0.05f);
+                }
+            }
             // nudge the divider: small differences show up when you step it, not
             // when you sweep it with the mouse
             if (app.compareMode != App::CmpOff) {
@@ -5922,7 +5981,10 @@ int main(int argc, char** argv) {
         double frameT0 = glfwGetTime();
         // work that must keep animating even without input
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
-                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
+                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
+                    // auto blink alternates on a timer, so it needs frames with
+                    // no input at all - same case as a background load
+                    (app.compareMode == App::CmpFlip && app.flipAuto);
         if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
         bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
         if (active || busy) {
