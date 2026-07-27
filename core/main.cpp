@@ -4843,7 +4843,11 @@ static void drawHelpAbout() {
                 row("Shift+drag",    "the other one of pan / new ROI");
                 row("X / Y",         "toggle selected ROI full width / height (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
-                row("\\ / Shift+\\",  "A/B compare: off -> wipe -> side by side / swap A and B");
+                row("\\ or C",       "A/B compare: off -> wipe -> side by side");
+                row("Shift+\\",      "swap A and B");
+                row("B (hold)",      "show B full-frame while held");
+                row("Shift+B",       "pin this frame as B (then move A: frame vs frame)");
+                row("[ / ]",         "move the divider 1% (Shift: 10%)");
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("H",             "this help");
                 ImGui::EndTable();
