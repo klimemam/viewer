@@ -86,14 +86,29 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 
 | パラメータ | 値 | メモ |
 | --- | --- | --- |
-| WindowRounding / PopupRounding | 8 px | パネルは大きめの角丸 |
-| FrameRounding / GrabRounding | 5 px | 部品は控えめ |
-| TabRounding | 6 px | |
-| FramePadding | 10 × 6 | デフォルト(4×3)の約2倍 |
-| ItemSpacing | 10 × 8 | |
-| WindowPadding | 14 × 12 | |
-| ScrollbarSize | 12 px | 背景透過 + 丸グラブで存在感を消す |
-| Border 全般 | 1 px ヘアライン | 色側で薄くする(形状は 1px のまま) |
+**2系統あります**: 既定は **Compact**(データ表が主役の本体向け)、`View > Compact UI` を
+外すと Roomy(ショーケース向けの余裕ある値)になります。実装は
+[core/ui_theme.cpp](../core/ui_theme.cpp) の `applyShapes(style, compact)`。
+
+| パラメータ | **Compact(既定)** | Roomy | メモ |
+| --- | --- | --- | --- |
+| WindowRounding / PopupRounding | 8 px | 8 px | パネルは大きめの角丸 |
+| FrameRounding / GrabRounding | 4 px | 5 px | 低い部品が丸すぎないように |
+| TabRounding | 6 px | 6 px | |
+| **FramePadding** | **7 × 3** | 9 × 5 | 行高の主要因。y=3 が下限(枠線が文字に触れる) |
+| **ItemSpacing** | **8 × 3** | 9 × 7 | 行ピッチの主要因 |
+| **CellPadding** | **6 × 2** | 8 × 4 | 表の行高。y=2 が下限(罫線が潰れる) |
+| ItemInnerSpacing | 6 × 3 | 8 × 6 | |
+| WindowPadding | 10 × 6 | 12 × 10 | |
+| IndentSpacing | 16 | 20 | ツリー(フォルダ選択) |
+| ScrollbarSize / GrabMinSize | 10 px | 12 px | 背景透過 + 丸グラブで存在感を消す |
+| SeparatorText Padding / Border | 12×2 / 1 | 18×4 / 2 | |
+| Border 全般 | 1 px ヘアライン | 同左 | 色側で薄くする(形状は 1px のまま) |
+
+17px フォントでの実効値: フレーム高 **23px**(Roomy 27)、フレーム行ピッチ **26px**(34)、
+表の行(チェックボックス入り)**27px**(35)。データ表で約 **+24% の行数**が入ります。
+**フォントサイズ(17px)とグラフの軸マージンは削らない**——情報そのものを削ると
+別のもっと悪い問題になります。
 
 タブは「選択タブの上辺にアクセントのオーバーライン」
 (`ImGuiCol_TabSelectedOverline`)を使うのがポイントで、

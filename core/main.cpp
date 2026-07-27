@@ -267,6 +267,7 @@ struct App {
     bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
     bool showHistogram = true, showTemporal = true;
     bool resetLayout = false;
+    bool compactUi = true;            // dense spacing: this tool is table-heavy
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -2556,7 +2557,6 @@ static void drawAnalysisPlots() {
             }
         }
         if (!first || xmin > xmax || ymin > ymax) continue;
-        ImGui::Dummy(ImVec2(0, 4));
         ImGui::TextDisabled("%s", nm.c_str());
         bool xInt = true;                     // integer axis when the plugin sends no x
         for (const auto& s : S)
@@ -2588,8 +2588,7 @@ static void drawAnalysisPlots() {
 
 static void drawInspector() {
     ImageDoc* im = cur();
-    ImGui::Text("Pixel");
-    ImGui::Separator();
+    ImGui::SeparatorText("Pixel");
     // Layout must not depend on hover state: the section always occupies the same
     // number of rows, otherwise everything below jumps as the cursor enters/leaves.
     {
@@ -2626,13 +2625,11 @@ static void drawInspector() {
         }
     }
 
-    ImGui::Dummy(ImVec2(0, 8));
-    ImGui::Text("Image");
-    ImGui::Separator();
+    ImGui::SeparatorText("Image");
     if (im) {
-        ImGui::Text("%d x %d   %dch   %s", im->w, im->h, im->ch, im->dtype.c_str());
+        ImGui::Text("%dx%d %dch %s   |   min %s / max %s", im->w, im->h, im->ch, im->dtype.c_str(),
+                    fmtVal(im->vmin, im->dtype).c_str(), fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextDisabled("%s", im->note.c_str());
-        ImGui::Text("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(), fmtVal(im->vmax, im->dtype).c_str());
         if (im->ch == 1) {
             // interpretation axis: change what the 1ch data means AFTER opening
             const char* modes[3] = { "Gray", "Bayer", "Quad Bayer" };
@@ -2710,9 +2707,7 @@ static void drawInspector() {
             }
         }
 
-        ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Text("Range (black / white)");
-        ImGui::Separator();
+        ImGui::SeparatorText("Range (black / white)");
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
         static float bwEdit[2];
@@ -2729,12 +2724,11 @@ static void drawInspector() {
         if (ImGui::Button("0-255")) { im->black = 0; im->white = 255; im->texDirty = true; } ImGui::SameLine();
         if (ImGui::Button("0-65535")) { im->black = 0; im->white = 65535; im->texDirty = true; }
 
-        ImGui::Dummy(ImVec2(0, 8));
         int g = app.dispGamma > 1.5f ? 1 : 0;
-        ImGui::TextUnformatted("Display gamma"); ImGui::SameLine();
+        ImGui::TextUnformatted("gamma"); ImGui::SameLine();
         if (ImGui::RadioButton("1.0", g == 0)) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
-        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); }
-        ImGui::Checkbox("Pixel grid (G, zoom>=8)", &app.showGrid);
+        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); } ImGui::SameLine();
+        ImGui::Checkbox("grid (G)", &app.showGrid);
     } else {
         ImGui::TextDisabled("no image");
     }
@@ -2746,7 +2740,6 @@ static void drawPanelHistogram() {
     if (im && im->w > 0 && im->h > 0) {
         recomputeHistogramIfNeeded(im);
         const App::HistState& H = app.hist;
-        ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Statistics");
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
@@ -2767,11 +2760,9 @@ static void drawPanelHistogram() {
             ImGui::EndTable();
         }
 
-        ImGui::Dummy(ImVec2(0, 6));
-        ImGui::Text("Histogram");
+        ImGui::SeparatorText("Histogram");
         ImGui::SameLine();
         ImGui::Checkbox("log##hist", &app.histLog);
-        ImGui::Separator();
         static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 170), IM_COL32(120, 230, 120, 170),
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
         static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
@@ -2816,7 +2807,6 @@ static void drawPanelTemporal() {
     if (im && im->seqId != 0) {
         recomputeTemporalIfNeeded();
         const App::TemporalState& T = app.temporal;
-        ImGui::Dummy(ImVec2(0, 8));
         ImGui::Text("Temporal");
         ImGui::SameLine();
         ImGui::TextDisabled("(%d frames, %s)", T.frames,
@@ -2833,10 +2823,12 @@ static void drawPanelTemporal() {
                 };
                 row("temporal noise (sigma_t)", T.tempNoise);
                 row("fixed pattern (sigma_s)", T.fixedPattern);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
+                                      "includes scene detail unless the ROI is flat");
                 row("total (quadrature)", T.totalNoise);
                 ImGui::EndTable();
             }
-            ImGui::TextDisabled("sigma_s includes scene detail unless the ROI is flat");
             // per-frame mean over time
             float mn = FLT_MAX, mx = -FLT_MAX;
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
@@ -2933,8 +2925,11 @@ static void drawPanelRois() {
 
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY;
-    float rowsH = ImGui::GetTextLineHeightWithSpacing() * 9;
-    if (ImGui::BeginTable("roitable", 8, TF, ImVec2(0, rowsH))) {
+    // fill the window instead of a fixed 9-text-line box: rows are frame-height,
+    // so the old constant showed 4 ROIs no matter how large the window was
+    const float editH = ImGui::GetFrameHeight() * 2 + ImGui::GetStyle().ItemSpacing.y;
+    if (ImGui::BeginTable("roitable", 8, TF,
+                          ImVec2(0, -(editH + ImGui::GetStyle().ItemSpacing.y * 2)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 1.4f);
         ImGui::TableSetupColumn("name");
@@ -3006,7 +3001,7 @@ static void drawPanelRois() {
 
     // editor block: fixed height so the window never shrinks with the selection
     ImGui::Separator();
-    ImGui::BeginChild("roiedit", ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 2.4f));
+    ImGui::BeginChild("roiedit", ImVec2(0, editH));
     if (App::Ann* sel = findAnn(app.selectedAnn)) {
         char buf[128];
         snprintf(buf, sizeof buf, "%s", sel->label.c_str());
@@ -3018,7 +3013,7 @@ static void drawPanelRois() {
         if (sel->type == 0) {
             int v[4] = { sel->x, sel->y, sel->w, sel->h };
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputInt4("x,y,w,h", v)) {
+            if (ImGui::InputInt4("##xywh", v)) {   // full width: a visible label would clip
                 sel->x = std::clamp(v[0], 0, im->w - 1);
                 sel->y = std::clamp(v[1], 0, im->h - 1);
                 sel->w = std::clamp(v[2], 1, im->w - sel->x);
@@ -3038,9 +3033,6 @@ static void drawPanelRois() {
 static void drawPanelAnalysis() {
     ImageDoc* im = cur();
     if (im && !plugin_host::analyzers().empty()) {
-        ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Text("Analysis");
-        ImGui::Separator();
         const auto& anas = plugin_host::analyzers();
         app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
         std::string curCat, curItem;
@@ -3085,10 +3077,9 @@ static void drawPanelAnalysis() {
         std::vector<const App::Ann*> rois;
         for (const auto& a : app.anns)
             if (a.type == 0 && a.visible) rois.push_back(&a);
-        if (rois.empty())
-            ImGui::TextDisabled("target: whole image (R tool / Shift+drag = ROI)");
-        else
-            ImGui::TextDisabled("target: %d ROI(s), one column each", (int)rois.size());
+        ImGui::SameLine();
+        if (rois.empty()) ImGui::TextDisabled("| whole image");
+        else ImGui::TextDisabled("| %d ROI(s)", (int)rois.size());
 
         auto& ana = app.ana;
         bool stale = ana.img != im || ana.plugin != app.anaSel || ana.rev != app.annRev;
@@ -3331,6 +3322,8 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
+        if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
+            ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
@@ -3364,7 +3357,7 @@ static void drawMenuBar(GLFWwindow* win) {
             for (int i = 0; i < ui_theme::accentCount(); i++)
                 if (ImGui::MenuItem(ui_theme::accents()[i].name, nullptr, app.themeAccent == i))
                     { app.themeAccent = i; changed = true; }
-            if (changed) ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale);
+            if (changed) ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
             ImGui::EndMenu();
         }
         ImGui::EndMenu();
@@ -3643,7 +3636,7 @@ int main(int argc, char** argv) {
     float fontScale = uiScale;
 #endif
     app.uiScale = uiScale;
-    ui_theme::apply(app.themeVariant, app.themeAccent, uiScale);
+    ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
     std::string fontPath = jpFontPath();
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,

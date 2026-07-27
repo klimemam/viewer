@@ -32,13 +32,15 @@ static ImVec4 scaleRgb(ImVec4 c, float k) {
 
 // Geometry: rounding, padding, spacing (shared by both variants).
 // Values are unscaled; apply() calls ScaleAllSizes(uiScale) afterwards.
-static void applyShapes(ImGuiStyle& s) {
+// compact = dense variant for data tables (row pitch -24%); the roomy values are
+// the showcase defaults, which cost ~3 visible rows per panel in this tool.
+static void applyShapes(ImGuiStyle& s, bool compact) {
     s.WindowRounding    = 8.0f;
-    s.ChildRounding     = 8.0f;
-    s.FrameRounding     = 5.0f;
+    s.ChildRounding     = compact ? 6.0f : 8.0f;
+    s.FrameRounding     = compact ? 4.0f : 5.0f;
     s.PopupRounding     = 8.0f;
     s.ScrollbarRounding = 9.0f;
-    s.GrabRounding      = 5.0f;
+    s.GrabRounding      = compact ? 4.0f : 5.0f;
     s.TabRounding       = 6.0f;
 
     s.WindowBorderSize = 1.0f;
@@ -47,18 +49,20 @@ static void applyShapes(ImGuiStyle& s) {
     s.FrameBorderSize  = 1.0f;
     s.TabBorderSize    = 0.0f;
 
-    s.WindowPadding    = ImVec2(12, 10);
-    s.FramePadding     = ImVec2(9, 5);
-    s.CellPadding      = ImVec2(8, 4);
-    s.ItemSpacing      = ImVec2(9, 7);
-    s.ItemInnerSpacing = ImVec2(8, 6);
-    s.IndentSpacing    = 20.0f;
-    s.ScrollbarSize    = 12.0f;
-    s.GrabMinSize      = 12.0f;
+    // FramePadding.y >= 3 and CellPadding.y >= 2: below that the 1px frame border
+    // touches the glyphs and table row separators visually merge.
+    s.WindowPadding    = compact ? ImVec2(10, 6) : ImVec2(12, 10);
+    s.FramePadding     = compact ? ImVec2(7, 3)  : ImVec2(9, 5);
+    s.CellPadding      = compact ? ImVec2(6, 2)  : ImVec2(8, 4);
+    s.ItemSpacing      = compact ? ImVec2(8, 3)  : ImVec2(9, 7);
+    s.ItemInnerSpacing = compact ? ImVec2(6, 3)  : ImVec2(8, 6);
+    s.IndentSpacing    = compact ? 16.0f : 20.0f;
+    s.ScrollbarSize    = compact ? 10.0f : 12.0f;
+    s.GrabMinSize      = compact ? 10.0f : 12.0f;
 
     s.WindowTitleAlign        = ImVec2(0.5f, 0.5f);
-    s.SeparatorTextBorderSize = 2.0f;
-    s.SeparatorTextPadding    = ImVec2(18, 4);
+    s.SeparatorTextBorderSize = compact ? 1.0f : 2.0f;
+    s.SeparatorTextPadding    = compact ? ImVec2(12, 2) : ImVec2(18, 4);
 
     s.AntiAliasedLines = true;
     s.AntiAliasedFill  = true;
@@ -242,10 +246,10 @@ static void applyLight(ImGuiStyle& s, ImVec4 accent) {
     c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.2f, 0.2f, 0.2f, 0.45f);
 }
 
-void apply(int variant, int accentIdx, float uiScale) {
+void apply(int variant, int accentIdx, float uiScale, bool compact) {
     ImGuiStyle& s = ImGui::GetStyle();
     s = ImGuiStyle();                 // reset: safe to re-apply at runtime
-    applyShapes(s);
+    applyShapes(s, compact);
     ImVec4 accent = ACCENTS[std::clamp(accentIdx, 0, accentCount() - 1)].color;
     if (variant == VariantLight) applyLight(s, accent);
     else                         applyDark(s, accent);

@@ -17,7 +17,7 @@ int accentCount();
 // Apply the full theme (shapes + colors) to the current ImGui context.
 // Resets the style first, so it is safe to call again at runtime
 // (e.g. from the View > Theme menu); uiScale is re-applied each time.
-void apply(int variant, int accentIdx, float uiScale);
+void apply(int variant, int accentIdx, float uiScale, bool compact = true);
 
 // Background behind everything (use for glClearColor) — matches the theme's
 // darkest layer so letterboxing around the canvas looks intentional.
