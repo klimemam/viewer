@@ -305,6 +305,8 @@ struct App {
     std::unique_ptr<remote::Session> remoteSession;
     std::string remoteExe = "viewer";  // how the peer is invoked on the far side
     std::string exePath;              // argv[0], for the local:// test peer
+    bool remoteDlgOpen = false;       // File > Open Remote (ssh://)...
+    std::string lastRemoteUrl;        // last opened, prefilled next time (prefs)
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -1922,6 +1924,9 @@ static void savePrefs() {
     f << "membudget " << app.memBudgetGB << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+    // paths may contain spaces: value is the rest of the line
+    if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
+    if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
 }
 
 static void loadPrefs() {
@@ -1949,6 +1954,13 @@ static void loadPrefs() {
                                              app.memBudgetGB = std::clamp(app.memBudgetGB, 0.5f, 4096.0f); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
+        else if (key == "remoteexe" || key == "remoteurl") {
+            std::string s;
+            std::getline(ls, s);
+            while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
+            while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+            if (!s.empty()) (key == "remoteexe" ? app.remoteExe : app.lastRemoteUrl) = s;
+        }
     }
     app.themeVariant = std::clamp(app.themeVariant, 0, 1);
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
@@ -5483,6 +5495,10 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // The OS dialog can only show THIS machine's disks (the NAS included,
+        // since it is mounted). Files on a server need the ssh:// path, so they
+        // need a place to type it.
+        if (ImGui::MenuItem("Open Remote (ssh://)...")) app.remoteDlgOpen = true;
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
         {   // recovery: the autosave is written on exit, on crash and every 60 s
             std::string ap = autosavePath();
@@ -5687,6 +5703,48 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
+}
+
+// File > Open Remote: the one dialog the OS cannot provide, because the files it
+// lists live on another machine. URL + peer path, both remembered in prefs.
+static void drawRemoteOpenModal() {
+    if (app.remoteDlgOpen && !ImGui::IsPopupOpen("Open remote (ssh)")) {
+        ImGui::OpenPopup("Open remote (ssh)");
+        app.remoteDlgOpen = false;
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Open remote (ssh)", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    static char url[512];
+    static char exe[256];
+    if (ImGui::IsWindowAppearing()) {
+        snprintf(url, sizeof url, "%s",
+                 app.lastRemoteUrl.empty() ? "ssh://user@host/path/to/file.npy"
+                                           : app.lastRemoteUrl.c_str());
+        snprintf(exe, sizeof exe, "%s", app.remoteExe.c_str());
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::TextDisabled("The window stays here; only the pixels being looked at travel.");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
+    bool go = ImGui::InputText("url", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
+    ImGui::InputText("peer on that machine", exe, sizeof exe);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Path of viewer-serve (or viewer) on the remote machine.\n"
+                          "Public-key ssh authentication is required - there is no\n"
+                          "password prompt on this pipe.");
+    if (ImGui::Button("Open") || go) {
+        app.remoteExe = exe;
+        app.lastRemoteUrl = url;
+        app.prefsDirty = true;
+        savePrefs();
+        ImGui::CloseCurrentPopup();
+        openRemote(url);              // errors arrive as toasts
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
 }
 
 static void drawHelpAbout() {
@@ -6399,6 +6457,7 @@ int main(int argc, char** argv) {
         drawRawModal();
         drawSequenceModal();
         drawFolderPickModal();
+        drawRemoteOpenModal();
         drawHelpAbout();
 
         // toast

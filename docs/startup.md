@@ -63,6 +63,9 @@ ssh user@host '~/bin/viewer-serve --help'           # 動くことの確認
 
 ### 2-2. 手元から開く
 
+GUI からは **File > Open Remote (ssh://)...** で URL とリモート側バイナリのパスを
+入力できます(どちらも記憶され、次回はプリフィルされます)。CLI なら:
+
 ```bash
 .\build-mingw\viewer.exe ssh://user@host/data/run42/frame_000.npy --remote-exe ~/bin/viewer-serve
 ```
