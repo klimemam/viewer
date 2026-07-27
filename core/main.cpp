@@ -464,22 +464,43 @@ static void touchTex(ImageDoc& im) {
 
 // upload/normalize into RGBA8 texture
 static void rebuildTexture(ImageDoc& im) {
-    std::vector<uint8_t> rgba((size_t)im.w * im.h * 4);
+    // One scratch buffer for the whole app: a 12 Mpx image is a 48 MB allocation,
+    // and this runs on every range/gamma/LUT change.
+    static std::vector<uint8_t> rgba;
+    rgba.resize((size_t)im.w * im.h * 4);
     const float ib = effBlack(im), iw = effWhite(im);
     float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
+    // Gamma through a table instead of 36 million powf() calls at 12 Mpx (235 ms
+    // -> 76 ms measured), which is what makes dragging the range slider usable at
+    // gamma 2.2. The table is in the SQRT domain: x^(1/g) is vertical at x=0, so
+    // interpolating it there is worth 3 output codes of error, while the same
+    // table over sqrt(x) is nearly straight and lands within 0.001 of exact.
+    static float gammaLut[1025];
+    static float gammaLutFor = -1;
+    if (doGamma && gammaLutFor != app.dispGamma) {
+        for (int i = 0; i <= 1024; i++) gammaLut[i] = powf(i / 1024.0f, 2.0f * invGamma);
+        gammaLutFor = app.dispGamma;
+    }
+    auto applyGamma = [&](float x) {
+        float f = sqrtf(x) * 1024.0f;
+        int i = std::min((int)f, 1023);
+        return gammaLut[i] + (gammaLut[i + 1] - gammaLut[i]) * (f - i);
+    };
     bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
     const uint8_t* lut = nullptr;   // display plugin colormap (1ch only; CFA colorize wins)
     if (im.ch == 1 && !cfaColor && im.displayLut >= 0 &&
         im.displayLut < (int)plugin_host::displays().size())
         lut = plugin_host::displays()[im.displayLut].lut.data();
-    for (size_t p = 0; p < (size_t)im.w * im.h; p++) {
+    int px = 0, py = 0;
+    for (size_t p = 0; p < (size_t)im.w * im.h; p++, px++) {
+        if (px == im.w) { px = 0; py++; }
         const float* src = &im.data[p * im.ch];
         float r, g, b;
         if (lut) {
             float x = std::clamp((src[0] - ib) * inv, 0.0f, 1.0f);
-            if (doGamma) x = powf(x, invGamma);
+            if (doGamma) x = applyGamma(x);
             int idx = (int)(x * 255.0f + 0.5f);
             rgba[p * 4 + 0] = lut[idx * 3];
             rgba[p * 4 + 1] = lut[idx * 3 + 1];
@@ -488,7 +509,9 @@ static void rebuildTexture(ImageDoc& im) {
             continue;
         }
         if (cfaColor) {
-            int c = cfaChannelAt(im, (int)(p % im.w), (int)(p / im.w));
+            // running x/y instead of p%w and p/w: a 64-bit div+mod per pixel is
+            // ~40% of this loop at 12 Mpx
+            int c = cfaChannelAt(im, px, py);
             r = c == 0 ? src[0] : ib;
             g = (c == 1 || c == 2) ? src[0] : ib;
             b = c == 3 ? src[0] : ib;
@@ -499,7 +522,7 @@ static void rebuildTexture(ImageDoc& im) {
         float v[3] = { (r - ib) * inv, (g - ib) * inv, (b - ib) * inv };
         for (int c = 0; c < 3; c++) {
             float x = std::clamp(v[c], 0.0f, 1.0f);
-            if (doGamma) x = powf(x, invGamma);
+            if (doGamma) x = applyGamma(x);
             rgba[p * 4 + c] = (uint8_t)(x * 255.0f + 0.5f);
         }
         rgba[p * 4 + 3] = 255;
@@ -4716,8 +4739,59 @@ static void drawFileList() {
         if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
     }
     ImGui::Separator();
-    // grouped view: one node per stack (sequence), lone images stay flat
-    for (const auto& stack : stacksCached()) {
+    // Group by source folder. Opening a folder of folders gives one stack per
+    // subfolder, which reads fine - but opening several leaf folders in a row
+    // produced a flat list of bare filenames with nothing saying where each came
+    // from. The folder is the only thing that distinguishes them.
+    const auto& stacks = stacksCached();
+    struct FileGroup { std::string dir, label; std::vector<const std::vector<int>*> stacks; };
+    static std::vector<FileGroup> groups;
+    static uint64_t groupsRev = 0;
+    if (groupsRev != app.imagesRev) {
+        groupsRev = app.imagesRev;
+        groups.clear();
+        for (const auto& stack : stacks) {
+            const std::string& p = app.images[stack.front()]->path;
+            size_t slash = p.find_last_of("/\\");
+            std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
+            FileGroup* g = nullptr;
+            for (auto& q : groups) if (q.dir == dir) { g = &q; break; }
+            if (!g) { groups.push_back({ dir, {}, {} }); g = &groups.back(); }
+            g->stacks.push_back(&stack);
+        }
+        // label = folder name; if two folders share it (A/00 and B/00), keep the
+        // parent too, which is exactly the case the user hits with per-condition
+        // subfolders
+        for (auto& g : groups) {
+            size_t slash = g.dir.find_last_of("/\\");
+            g.label = slash == std::string::npos ? g.dir : g.dir.substr(slash + 1);
+            if (g.label.empty()) g.label = g.dir.empty() ? "generated" : g.dir;
+        }
+        for (auto& g : groups)
+            for (auto& h : groups)
+                if (&g != &h && g.label == h.label && !g.dir.empty()) {
+                    size_t s1 = g.dir.find_last_of("/\\");
+                    std::string up = s1 == std::string::npos ? std::string() : g.dir.substr(0, s1);
+                    size_t s2 = up.find_last_of("/\\");
+                    std::string parent = s2 == std::string::npos ? up : up.substr(s2 + 1);
+                    if (!parent.empty()) g.label = parent + "/" + g.label;
+                    break;
+                }
+    }
+    // one file open needs no header
+    bool showHeaders = groups.size() > 1 || (groups.size() == 1 && stacks.size() > 1);
+    for (const auto& group : groups) {
+      ImGui::PushID(group.dir.c_str());
+      bool open = true;
+      if (showHeaders) {
+          open = ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                            ImGuiTreeNodeFlags_SpanAvailWidth,
+                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+          if (ImGui::IsItemHovered() && !group.dir.empty()) ImGui::SetTooltip("%s", group.dir.c_str());
+      }
+      if (open)
+      for (const auto& stackPtr : group.stacks) {
+        const auto& stack = *stackPtr;
         const ImageDoc& head = *app.images[stack.front()];
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
@@ -4770,6 +4844,9 @@ static void drawFileList() {
                 selectImage(stack[slider]);
         }
         ImGui::PopID();
+      }
+      if (showHeaders && open) ImGui::TreePop();
+      ImGui::PopID();
     }
 }
 
