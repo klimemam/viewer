@@ -39,8 +39,9 @@ struct Header {
 };
 
 // TILE request. The client asks for the region it is about to draw, decimated to
-// roughly the pixels it can actually show: `step` is the sample stride, so a
-// 4000x3000 image shown in a 1000px pane travels as 1000x750, not 12 Mpx.
+// roughly the pixels it can actually show: `step` is the sample stride, chosen so
+// that one returned sample is about one screen pixel (step ~ 1/zoom). A 4000x3000
+// frame fitted into a 1000px-tall pane travels as 1334x1000, not as 12 Mpx.
 struct TileReq {
     uint32_t frame;             // frame index within the file (0 for a plain image)
     uint32_t x, y, w, h;        // region in source pixels

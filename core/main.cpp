@@ -290,6 +290,10 @@ struct App {
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
+    // remote viewing: one peer process per host, reached over ssh
+    std::unique_ptr<remote::Session> remoteSession;
+    std::string remoteExe = "viewer";  // how the peer is invoked on the far side
+    std::string exePath;              // argv[0], for the local:// test peer
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -1587,6 +1591,7 @@ static void restoreFull() {
     toast("restored full frame");
 }
 
+static void openRemote(const std::string& url);   // fwd: sessions can hold ssh:// images
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
@@ -2039,7 +2044,15 @@ static std::string loadSession(const std::string& path) {
                 std::transform(lowp.begin(), lowp.end(), lowp.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
-                err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
+                bool isRemote = p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
+                if (isRemote) {
+                    // a remote image has no local file to decode: reconnect instead
+                    size_t before = app.images.size();
+                    openRemote(p);
+                    err = app.images.size() > before ? "" : "cannot reopen " + p;
+                } else {
+                    err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
+                }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
                     cur()->cfaPattern = pat & 3;
@@ -2939,7 +2952,63 @@ static void openRawDialogFor(const std::string& path) {
     rawGuessDims(rawDlg);
 }
 
+// ssh://user@host/path - the UI stays here, the pixels stay there. What arrives is
+// the region being looked at, at the resolution it is being looked at.
+static void openRemote(const std::string& url) {
+    std::string host, rpath;
+    if (!remote::parseUrl(url, host, rpath)) {
+        toast("expected ssh://user@host/path/to/file.npy", true);
+        return;
+    }
+    std::string err;
+    if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
+    if (!app.remoteSession->alive() || app.remoteSession->host() != host) {
+        // the peer is the same binary: found on the remote PATH over ssh, or this
+        // very executable when testing through local://
+        std::string exe = host.empty() ? app.exePath : app.remoteExe;
+        if (!app.remoteSession->start(host, exe, err)) {
+            toast("remote: " + err, true);
+            return;
+        }
+        toast("connected to " + host);
+    }
+    remote::Meta m;
+    if (!app.remoteSession->meta(rpath, m, err)) { toast("remote: " + err, true); return; }
+
+    // First view: the whole frame decimated to something a screen can show. A
+    // zoom or a pan asks for a better tile; nothing else on screen costs a byte.
+    int step = std::max(1, (int)ceilf(std::max(m.w, m.h) / 1600.0f));
+    std::vector<float> px;
+    int tw = 0, th = 0, tch = 0;
+    std::string dt;
+    if (!app.remoteSession->tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
+        toast("remote: " + err, true);
+        return;
+    }
+    auto doc = std::make_unique<ImageDoc>();
+    doc->name = baseName(rpath) + (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
+    doc->path = url;
+    doc->dtype = dt;
+    doc->w = tw; doc->h = th; doc->ch = tch;
+    doc->data = std::move(px);
+    doc->note = "remote " + host + "  -  " + std::to_string(m.w) + "x" + std::to_string(m.h) +
+                (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
+    doc->uid = app.nextUid++;
+    computeMinMax(*doc);
+    defaultRange(*doc);
+    doc->texDirty = true;
+    app.images.push_back(std::move(doc));
+    app.imagesRev++;
+    selectImage((int)app.images.size() - 1);
+    app.fitRequested = true;
+    toast("opened " + baseName(rpath) + " from " + host);
+}
+
 static void openPath(const std::string& path) {
+    if (path.compare(0, 6, "ssh://") == 0 || path.compare(0, 8, "local://") == 0) {
+        openRemote(path);
+        return;
+    }
     std::string low = path;
     std::transform(low.begin(), low.end(), low.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
@@ -5527,6 +5596,10 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
+        "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
+        "                              here, only the visible region is fetched\n"
+        "  --remote-exe <path>         how to start the peer there (default: viewer)\n"
+        "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
@@ -5605,6 +5678,8 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
+        } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
+            app.remoteExe = next();
         } else if (a == "--mem-budget") {          // GB the sequence loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {             // off | wipe | split
@@ -5785,6 +5860,7 @@ int main(int argc, char** argv) {
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
     }
+    app.exePath = argv[0];
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)

@@ -1,0 +1,81 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cmake --build build-mingw",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$gcc",
+      "detail": "Incremental build. Run 'configure' first in a fresh clone."
+    },
+    {
+      "label": "configure",
+      "type": "shell",
+      "command": "cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release",
+      "problemMatcher": [],
+      "detail": "One-off: fetches dependencies and generates the build."
+    },
+    {
+      "label": "run",
+      "type": "shell",
+      "command": "./build-mingw/viewer",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "Open the viewer on this machine."
+    },
+    {
+      "label": "run: open remote (ssh)",
+      "type": "shell",
+      "command": "./build-mingw/viewer ssh://${input:remoteHost}${input:remotePath} --remote-exe ${input:remoteExe}",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "The window opens HERE; the pixels stay on the remote machine.",
+      "presentation": { "reveal": "silent", "panel": "dedicated" }
+    },
+    {
+      "label": "remote: deploy this build to the host",
+      "type": "shell",
+      "command": "scp build-mingw/viewer ${input:remoteHost}:${input:remoteExe} && ssh ${input:remoteHost} ${input:remoteExe} --help | head -3",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "Copies the binary the remote side needs and proves it runs there."
+    },
+    {
+      "label": "test: remote protocol self-check",
+      "type": "shell",
+      "command": "./build-mingw/viewer --remote-selftest tools/testdata/grad_u16.npy",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "Starts a local peer and compares every fetched sample against the local decoder."
+    },
+    {
+      "label": "test: frame-time benchmark",
+      "type": "shell",
+      "command": "./build-mingw/viewer --bench 200 --sequence never tools/testdata/grad_u16.npy",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "Offscreen render with every panel visible; prints frame-time statistics."
+    }
+  ],
+  "inputs": [
+    {
+      "id": "remoteHost",
+      "type": "promptString",
+      "description": "ssh host (user@host, or a Host alias from ~/.ssh/config)",
+      "default": "user@host"
+    },
+    {
+      "id": "remotePath",
+      "type": "promptString",
+      "description": "absolute path to the file on that machine",
+      "default": "/data/run42/frame_000.npy"
+    },
+    {
+      "id": "remoteExe",
+      "type": "promptString",
+      "description": "path of the viewer binary on the remote machine",
+      "default": "~/bin/viewer"
+    }
+  ]
+}

@@ -317,6 +317,15 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
 }
 
 bool parseUrl(const std::string& url, std::string& host, std::string& path) {
+    // local://<path> runs the peer on this machine: the whole remote path exercised
+    // end to end, minus ssh. That is how it is tested, and how someone can check
+    // the protocol without a second machine.
+    const std::string loc = "local://";
+    if (url.compare(0, loc.size(), loc) == 0) {
+        host.clear();
+        path = url.substr(loc.size());
+        return !path.empty();
+    }
     const std::string pre = "ssh://";
     if (url.compare(0, pre.size(), pre) != 0) return false;
     size_t slash = url.find('/', pre.size());
