@@ -2226,31 +2226,40 @@ static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::Text("Pixel");
     ImGui::Separator();
-    if (im && app.hoverX >= 0) {
-        if (im->cfa)
+    // Layout must not depend on hover state: the section always occupies the same
+    // number of rows, otherwise everything below jumps as the cursor enters/leaves.
+    {
+        bool live = im && app.hoverX >= 0;
+        if (live && im->cfa)
             ImGui::Text("(%d, %d)  [%s]", app.hoverX, app.hoverY,
                         CFA_CH_NAMES[cfaChannelAt(*im, app.hoverX, app.hoverY)]);
-        else
+        else if (live)
             ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
+        else
+            ImGui::TextDisabled("(-, -)  hover the image");
         static const char* LB1[] = { "V" };
         static const char* LB2[] = { "C0", "C1" };            // 2ch is usually UV/complex, not RG
         static const char* LB3[] = { "R", "G", "B", "A" };
-        const char** lb = im->ch == 1 ? LB1 : im->ch == 2 ? LB2 : LB3;
-        float inv = 1.0f / std::max(im->white - im->black, 1e-20f);
+        int nch = im ? im->ch : 1;
+        const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
+        float inv = im ? 1.0f / std::max(im->white - im->black, 1e-20f) : 1.0f;
         if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("ch"); ImGui::TableSetupColumn("raw"); ImGui::TableSetupColumn("norm");
             ImGui::TableHeadersRow();
-            for (int c = 0; c < im->ch; c++) {
-                float v = im->sample(app.hoverX, app.hoverY, c);
+            for (int c = 0; c < nch; c++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(c < 4 ? lb[std::min(c, 3)] : "?");
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(fmtVal(v, im->dtype).c_str());
-                ImGui::TableNextColumn(); ImGui::Text("%.4f", (v - im->black) * inv);
+                if (live) {
+                    float v = im->sample(app.hoverX, app.hoverY, c);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(fmtVal(v, im->dtype).c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%.4f", (v - im->black) * inv);
+                } else {
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                }
             }
             ImGui::EndTable();
         }
-    } else {
-        ImGui::TextDisabled("hover the image");
     }
 
     ImGui::Dummy(ImVec2(0, 8));
