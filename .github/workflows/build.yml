@@ -37,8 +37,15 @@ jobs:
         run: |
           sudo apt-get install -y xvfb libgl1-mesa-dri
           python3 tools/gen_testdata.py
+          # bench at scale: a small image with no ROIs proves nothing
+          python3 - <<'PY'
+          import numpy as np, pathlib
+          d = pathlib.Path('tools/testdata'); d.mkdir(exist_ok=True)
+          np.save(d/'bench_big.npy', (np.random.default_rng(0).random((3000,4000))*4095).astype(np.float32))
+          np.save(d/'bench_stack.npy', (np.random.default_rng(1).random((120,256,320))*4095).astype(np.float32))
+          PY
           xvfb-run -a ./build/viewer --bench 120 --sequence never \
-                   tools/testdata/zone_f32.npy 2>&1 | tee bench.log
+                   tools/testdata/bench_big.npy tools/testdata/bench_stack.npy 2>&1 | tee bench.log
           grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
           # catastrophic-regression gate only: CI runners use software GL and are
           # noisy, so this is not a micro-benchmark

@@ -116,6 +116,7 @@ struct ImageDoc {
     int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
+    uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
 
@@ -182,7 +183,10 @@ struct App {
     // analyzer plugin state: cached result grid (rows = keys, cols = ROIs)
     struct AnalysisState {
         const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
         int plugin = -1;
+        int dataRev = -1, cfa = -1, cfaPattern = -1;
+        float black = 0, white = 0;      // effective range is a plugin input
         uint64_t rev = (uint64_t)-1;
         std::vector<std::string> cols;                 // "whole" or ROI labels
         std::vector<std::string> keys;                 // row keys, first-seen order
@@ -202,10 +206,11 @@ struct App {
     // host-built-in histogram cache (ROI-aware, CFA-split)
     struct HistState {
         const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
         int dataRev = -1;
         float black = 0, white = 0;
-        uint64_t annRev = (uint64_t)-1;
-        int selAnn = -2, cfa = -1, cfaPattern = -1;
+        int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
+        int cfa = -1, cfaPattern = -1;
         int nSeries = 0;
         uint32_t bins[4][256] = {};
         uint32_t maxBin = 1;
@@ -225,6 +230,8 @@ struct App {
     };
     std::vector<SeqInfo> seqs;
     int nextSeqId = 1;
+    uint64_t nextUid = 1;
+    uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
     // background loader
     std::thread seqThread;
@@ -256,8 +263,7 @@ struct App {
     struct TemporalState {
         int seqId = -1;
         int frames = 0;
-        uint64_t annRev = (uint64_t)-1;
-        int selAnn = -2;
+        int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
         std::vector<float> idx, frameMean, frameStd;
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0;
         bool valid = false;
@@ -266,9 +272,9 @@ struct App {
     // H/V projections (line profiles) of the selected ROI / whole image
     struct ProjState {
         const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
         int dataRev = -1;
-        uint64_t annRev = (uint64_t)-1;
-        int selAnn = -2, mode = -1, cfa = -1;
+        int mode = -1, cfa = -1, cfaPattern = -1;
         int rx = 0, ry = 0, rw = 0, rh = 0;
         int nSeries = 0;
         const char* seriesNames[4] = {};
@@ -427,13 +433,19 @@ static void setRange(ImageDoc& im, float black, float white) {
 static void forgetTexture(ImageDoc* im) {
     app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), im), app.texLru.end());
 }
+// One place that drops an image from every cache that can name it.
+static void forgetImage(ImageDoc* im) {
+    if (app.ana.img == im) app.ana.img = nullptr;
+    if (app.hist.img == im) app.hist.img = nullptr;
+    if (app.proj.img == im) app.proj.img = nullptr;
+    app.temporal.seqId = -1;
+    forgetTexture(im);
+    app.imagesRev++;
+}
 static void closeCurrent() {
     ImageDoc* im = cur();
     if (!im) return;
-    if (app.ana.img == im) app.ana.img = nullptr;   // drop cached analysis of a dead image
-    if (app.hist.img == im) app.hist.img = nullptr;
-    app.temporal.seqId = -1;
-    forgetTexture(im);
+    forgetImage(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
@@ -442,8 +454,10 @@ static void closeCurrent() {
 static void closeAll() {
     app.ana.img = nullptr;
     app.hist.img = nullptr;
+    app.proj.img = nullptr;
     app.temporal.seqId = -1;
     app.texLru.clear();
+    app.imagesRev++;
     for (auto& d : app.images)
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
@@ -547,6 +561,8 @@ static const char* analyzerHint(const std::string& name) {
 static bool g_quietLoad = false;
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
+    im->uid = app.nextUid++;
+    app.imagesRev++;
     computeMinMax(*im);
     defaultRange(*im);            // own range is always meaningful; link only overlays it
     im->texDirty = true;
@@ -687,6 +703,8 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
         computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
         doc->texDirty = true;
+        doc->uid = app.nextUid++;
+        app.imagesRev++;
         app.images.push_back(std::move(doc));
     }
     for (auto& s : app.seqs)
@@ -750,6 +768,8 @@ static std::string loadNpy(const std::string& path) {
         computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
         doc->texDirty = true;
+        doc->uid = app.nextUid++;
+        app.imagesRev++;
         app.images.push_back(std::move(doc));
     }
     for (auto& s : app.seqs)
@@ -1138,6 +1158,8 @@ static std::string loadRaw(const RawDialog& d) {
         computeMinMax(*im);
         defaultRange(*im);
         im->texDirty = true;
+        forgetImage(old);
+        im->uid = app.nextUid++;
         app.images[d.replaceIdx] = std::move(im);
         app.current = d.replaceIdx;
     } else {
@@ -1229,6 +1251,8 @@ static void restoreFull() {
         doc->texDirty = true;
         if (app.ana.img == old) app.ana.img = nullptr;
         if (old->tex) glDeleteTextures(1, &old->tex);
+        forgetImage(old);
+        doc->uid = app.nextUid++;
         app.images[idx] = std::move(doc);
         app.current = idx;
     } else {
@@ -1560,6 +1584,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     app.seqThread = std::thread([jobs, isRaw, recipe]() {
         size_t bytes = 0;
         int failures = 0;
+        double lastPost = 0;
         for (const auto& j : jobs) {
             if (app.seqCancel) break;
             std::string err;
@@ -1579,13 +1604,17 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 app.seqDone++;
                 continue;
             }
+            computeMinMax(*doc);      // pure: keep this off the UI thread
             bytes += doc->data.size() * sizeof(float);
             {
                 std::lock_guard<std::mutex> lk(app.seqMtx);
                 app.seqReady.emplace_back(j.index, std::move(doc));
             }
             app.seqDone++;
-            glfwPostEmptyEvent();     // wake the UI thread if it is idling
+            // wake the UI at most ~10 Hz: one post per decoded frame would defeat
+            // the idle throttle on a fast disk
+            double now = glfwGetTime();
+            if (now - lastPost > 0.1) { lastPost = now; glfwPostEmptyEvent(); }
             if (bytes > SEQ_MEM_BUDGET) {
                 std::lock_guard<std::mutex> lk(app.seqMtx);
                 app.seqErr += "memory budget reached - stopped loading\n";
@@ -1602,7 +1631,16 @@ static void pumpSequence() {
     std::string err;
     {
         std::lock_guard<std::mutex> lk(app.seqMtx);
-        if (!app.seqReady.empty()) batch.swap(app.seqReady);
+        // cap per UI frame: a fast decoder could otherwise hand us dozens of
+        // 48 MB frames at once and stall the frame
+        const size_t MAX_PER_FRAME = 4;
+        if (app.seqReady.size() <= MAX_PER_FRAME) {
+            batch.swap(app.seqReady);
+        } else {
+            batch.insert(batch.end(), std::make_move_iterator(app.seqReady.begin()),
+                         std::make_move_iterator(app.seqReady.begin() + MAX_PER_FRAME));
+            app.seqReady.erase(app.seqReady.begin(), app.seqReady.begin() + MAX_PER_FRAME);
+        }
         err.swap(app.seqErr);
     }
     if (!err.empty()) toast(err, true);
@@ -1619,7 +1657,7 @@ static void pumpSequence() {
         auto& doc = pr.second;
         doc->seqId = app.seqLoadingId;
         doc->seqIndex = pr.first;
-        computeMinMax(*doc);
+        if (doc->vmax <= doc->vmin) computeMinMax(*doc);   // worker normally did this
         if (ref) {
             doc->black = ref->black; doc->white = ref->white;
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
@@ -1629,9 +1667,17 @@ static void pumpSequence() {
             defaultRange(*doc);
         }
         doc->texDirty = true;
+        doc->uid = app.nextUid++;
+        app.imagesRev++;
         app.images.push_back(std::move(doc));
     }
-    app.temporal.seqId = -1;          // new frames invalidate temporal stats
+    // invalidating per pump made this O(frames^2) over a load; refresh at ~2 Hz
+    static double lastTemporalInvalidate = 0;
+    double nowT = glfwGetTime();
+    if (!app.seqRunning || nowT - lastTemporalInvalidate > 0.5) {
+        lastTemporalInvalidate = nowT;
+        app.temporal.seqId = -1;
+    }
     if (!app.seqRunning && app.seqThread.joinable()) {
         app.seqThread.join();
         int n = 0;
@@ -1674,6 +1720,14 @@ static std::vector<std::vector<int>> stacksOf() {
     }
     return out;
 }
+// Cached view of the above: rebuilding it per frame cost one allocation per
+// image plus a sort per sequence, just to draw a handful of rows.
+static const std::vector<std::vector<int>>& stacksCached() {
+    static std::vector<std::vector<int>> cache;
+    static uint64_t rev = 0;
+    if (rev != app.imagesRev) { rev = app.imagesRev; cache = stacksOf(); }
+    return cache;
+}
 static App::SeqInfo* seqInfo(int id) {
     for (auto& s : app.seqs) if (s.id == id) return &s;
     return nullptr;
@@ -1698,7 +1752,7 @@ static void gotoFrame(int delta, bool absoluteEdge = false, bool toFirst = true)
 }
 // stack axis: previous / next stack, resuming its last viewed frame
 static void gotoStack(int delta) {
-    auto st = stacksOf();
+    const auto& st = stacksCached();
     if (st.empty()) return;
     int cs = 0;
     for (int i = 0; i < (int)st.size(); i++)
@@ -2051,23 +2105,26 @@ static void recomputeTemporalIfNeeded() {
     if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
     std::vector<int> f = framesOfSeq(im->seqId);
     if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
-    if (T.seqId == im->seqId && T.frames == (int)f.size() &&
-        T.annRev == app.annRev && T.selAnn == app.selectedAnn)
-        return;
-    T.seqId = im->seqId; T.frames = (int)f.size();
-    T.annRev = app.annRev; T.selAnn = app.selectedAnn;
-    T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
-    T.tempNoise = T.fixedPattern = T.totalNoise = 0;
-    T.valid = false; T.roiUsed = false;
-
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
+    bool roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) {
             int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
             int cw = std::clamp(a->w, 0, im->w - cx), chh = std::clamp(a->h, 0, im->h - cy);
-            if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; T.roiUsed = true; }
+            if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; roiUsed = true; }
         }
     }
+    // keyed on the resolved rect; this pass costs samples x frames, so it must
+    // not run for annotation churn or mid-drag
+    if (T.seqId == im->seqId && T.frames == (int)f.size() &&
+        T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh)
+        return;
+    if (app.annBusy && T.seqId == im->seqId) return;
+    T.seqId = im->seqId; T.frames = (int)f.size();
+    T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed;
+    T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
+    T.tempNoise = T.fixedPattern = T.totalNoise = 0;
+    T.valid = false;
     // fixed sampling grid, capped so full-frame sequences stay interactive
     const size_t MAX_SAMPLES = 40000;
     size_t total = (size_t)rw * rh;
@@ -2701,25 +2758,28 @@ static void drawCanvas(ImVec2 avail) {
 
 static void recomputeHistogramIfNeeded(ImageDoc* im) {
     App::HistState& H = app.hist;
-    if (H.img == im && H.dataRev == im->dataRev && H.black == effBlack(*im) && H.white == effWhite(*im) &&
-        H.annRev == app.annRev && H.selAnn == app.selectedAnn &&
-        H.cfa == im->cfa && H.cfaPattern == im->cfaPattern)
-        return;
-    H.img = im; H.dataRev = im->dataRev;
-    H.black = effBlack(*im); H.white = effWhite(*im);
-    H.annRev = app.annRev; H.selAnn = app.selectedAnn;
-    H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
-    memset(H.bins, 0, sizeof H.bins);
-    H.maxBin = 1; H.clipLo = H.clipHi = 0; H.sampled = 0; H.roiUsed = false;
-
+    // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
+    // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
+    bool roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) {           // selected ROI drives the histogram
             int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
             int cw = std::clamp(a->w, 0, im->w - cx), ch2 = std::clamp(a->h, 0, im->h - cy);
-            if (cw > 0 && ch2 > 0) { rx = cx; ry = cy; rw = cw; rh = ch2; H.roiUsed = true; }
+            if (cw > 0 && ch2 > 0) { rx = cx; ry = cy; rw = cw; rh = ch2; roiUsed = true; }
         }
     }
+    if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == effBlack(*im) &&
+        H.white == effWhite(*im) && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
+        H.rx == rx && H.ry == ry && H.rw == rw && H.rh == rh)
+        return;
+    if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
+    H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
+    H.black = effBlack(*im); H.white = effWhite(*im);
+    H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
+    H.rx = rx; H.ry = ry; H.rw = rw; H.rh = rh; H.roiUsed = roiUsed;
+    memset(H.bins, 0, sizeof H.bins);
+    H.maxBin = 1; H.clipLo = H.clipHi = 0; H.sampled = 0;
     bool cfa = im->ch == 1 && im->cfa != 0;
     H.nSeries = cfa ? 4 : std::min(im->ch, 3);
     static const char* CFA_SERIES[4] = { "R", "Gr", "Gb", "B" };
@@ -3225,12 +3285,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im) {
             if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; roiUsed = true; }
         }
     }
-    if (P.img == im && P.dataRev == im->dataRev && P.annRev == app.annRev &&
-        P.selAnn == app.selectedAnn && P.mode == app.projMode && P.cfa == im->cfa &&
+    if (P.uid == im->uid && P.dataRev == im->dataRev && P.mode == app.projMode &&
+        P.cfa == im->cfa && P.cfaPattern == im->cfaPattern &&
         P.rx == rx && P.ry == ry && P.rw == rw && P.rh == rh)
         return;
-    P.img = im; P.dataRev = im->dataRev; P.annRev = app.annRev; P.selAnn = app.selectedAnn;
-    P.mode = app.projMode; P.cfa = im->cfa;
+    if (app.annBusy && P.uid == im->uid) return;   // mid-drag: keep the last profile
+    P.img = im; P.uid = im->uid; P.dataRev = im->dataRev;
+    P.mode = app.projMode; P.cfa = im->cfa; P.cfaPattern = im->cfaPattern;
     P.rx = rx; P.ry = ry; P.rw = rw; P.rh = rh; P.roiUsed = roiUsed;
 
     bool cfa = im->ch == 1 && im->cfa != 0;
@@ -3251,21 +3312,30 @@ static void recomputeProjectionIfNeeded(ImageDoc* im) {
             std::fill(P.h[s].begin(), P.h[s].end(), useMax ? -FLT_MAX : FLT_MAX);
             std::fill(P.v[s].begin(), P.v[s].end(), useMax ? -FLT_MAX : FLT_MAX);
         }
-    for (int y = 0; y < rh; y++) {
-        for (int x = 0; x < rw; x++) {
-            const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
-            int lo = 0, hi = P.nSeries;
-            if (cfa) { lo = cfaChannelAt(*im, rx + x, ry + y); hi = lo + 1; }
-            for (int s = lo; s < hi; s++) {
-                float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
-                if (!std::isfinite(val)) continue;
-                if (useMax) { P.h[s][x] = std::max(P.h[s][x], val); P.v[s][y] = std::max(P.v[s][y], val); }
-                else if (useMin) { P.h[s][x] = std::min(P.h[s][x], val); P.v[s][y] = std::min(P.v[s][y], val); }
-                else { P.h[s][x] += val; P.v[s][y] += val; }
-                hN[s][x]++; vN[s][y]++;
-            }
+    // Sample cap (this was the only uncapped full-image pass). Each profile keeps
+    // full resolution along its OWN axis and strides the orthogonal one, so no
+    // column or row is ever left without data.
+    const size_t PROJ_MAX_SAMPLES = 2000000;
+    int step = (int)std::max<size_t>(1, ((size_t)rw * rh) / PROJ_MAX_SAMPLES);
+    if (im->cfa) step = ((step + 1) / 2) * 2;   // keep the CFA phase intact
+    auto accumulate = [&](int x, int y, bool toH) {
+        const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
+        int lo = 0, hi = P.nSeries;
+        if (cfa) { lo = cfaChannelAt(*im, rx + x, ry + y); hi = lo + 1; }
+        for (int s = lo; s < hi; s++) {
+            float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
+            if (!std::isfinite(val)) continue;
+            float& acc = toH ? P.h[s][x] : P.v[s][y];
+            if (useMax) acc = std::max(acc, val);
+            else if (useMin) acc = std::min(acc, val);
+            else acc += val;
+            (toH ? hN[s][x] : vN[s][y])++;
         }
-    }
+    };
+    for (int y = 0; y < rh; y += step)          // H profile: every column
+        for (int x = 0; x < rw; x++) accumulate(x, y, true);
+    for (int y = 0; y < rh; y++)                // V profile: every row
+        for (int x = 0; x < rw; x += step) accumulate(x, y, false);
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
     for (int s = 0; s < P.nSeries; s++) {
         for (int x = 0; x < rw; x++) {
@@ -3361,10 +3431,19 @@ static void drawPanelProjection() {
             ImU32 col = cfa ? CFA_COLS[s]
                             : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[s]);
             const std::vector<float>& d = series[s];
+            // decimate to the plot's pixel width: 4000 samples into 400 px was
+            // 4000 line segments per series per frame
+            int px = std::max(1, (int)(pr.p1.x - pr.p0.x));
+            int stride = std::max(1, (int)d.size() / px);
             ImVec2 prev(0, 0); bool has = false;
-            for (int i = 0; i < (int)d.size(); i++) {
-                if (!std::isfinite(d[i])) { has = false; continue; }
-                ImVec2 pt = pr.at((float)(origin + i), d[i]);
+            for (int i = 0; i < (int)d.size(); i += stride) {
+                float lo = FLT_MAX, hi = -FLT_MAX;
+                for (int k = i; k < std::min(i + stride, (int)d.size()); k++)
+                    if (std::isfinite(d[k])) { lo = std::min(lo, d[k]); hi = std::max(hi, d[k]); }
+                if (lo > hi) { has = false; continue; }
+                ImVec2 a = pr.at((float)(origin + i), lo), b = pr.at((float)(origin + i), hi);
+                if (stride > 1 && b.y != a.y) dl->AddLine(a, b, col, 1.2f);   // min-max bar
+                ImVec2 pt = pr.at((float)(origin + i), (lo + hi) * 0.5f);
                 if (has) dl->AddLine(prev, pt, col, 1.2f);
                 prev = pt; has = true;
             }
@@ -3478,18 +3557,20 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
 // The ROI table is drawn every frame; recomputing hundreds of thousands of
 // samples per row each time made the whole UI (typing included) crawl.
 struct RoiStatCacheEntry {
-    const ImageDoc* img; int dataRev, x, y, w, h, ch, cfa, cfaPat;
+    uint64_t uid; int dataRev, x, y, w, h, ch, cfa, cfaPat;
     RoiStat s;
 };
 static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
     static std::vector<RoiStatCacheEntry> cache;
     for (auto& e : cache)
-        if (e.img == &im && e.dataRev == im.dataRev && e.x == rx && e.y == ry &&
+        if (e.uid == im.uid && e.dataRev == im.dataRev && e.x == rx && e.y == ry &&
             e.w == rw && e.h == rh && e.ch == chSel && e.cfa == im.cfa && e.cfaPat == im.cfaPattern)
             return e.s;
     RoiStat s = roiBasicStatsUncached(im, rx, ry, rw, rh, chSel);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
-    cache.push_back({ &im, im.dataRev, rx, ry, rw, rh, chSel, im.cfa, im.cfaPattern, s });
+    // room for every ROI of a few frames, so scrubbing does not thrash
+    size_t cap = std::max<size_t>(64, (app.anns.size() + 1) * 8);
+    if (cache.size() > cap) cache.erase(cache.begin(), cache.begin() + cap / 2);
+    cache.push_back({ im.uid, im.dataRev, rx, ry, rw, rh, chSel, im.cfa, im.cfaPattern, s });
     return s;
 }
 
@@ -3690,10 +3771,17 @@ static void drawPanelAnalysis() {
         ImGui::TextDisabled("%s", tgt);
 
         auto& ana = app.ana;
-        bool stale = ana.img != im || ana.plugin != app.anaSel || ana.rev != app.annRev;
+        // every input makeFrame() hands the plugin belongs in the key, or the
+        // grid silently keeps showing numbers from the previous settings
+        bool stale = ana.uid != im->uid || ana.plugin != app.anaSel || ana.rev != app.annRev ||
+                     ana.dataRev != im->dataRev || ana.black != effBlack(*im) ||
+                     ana.white != effWhite(*im) || ana.cfa != im->cfa ||
+                     ana.cfaPattern != im->cfaPattern;
         if (runClicked || (app.anaAuto && stale && !app.annBusy)) {
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
-            ana.img = im; ana.plugin = app.anaSel; ana.rev = app.annRev;
+            ana.img = im; ana.uid = im->uid; ana.plugin = app.anaSel; ana.rev = app.annRev;
+            ana.dataRev = im->dataRev; ana.black = effBlack(*im); ana.white = effWhite(*im);
+            ana.cfa = im->cfa; ana.cfaPattern = im->cfaPattern;
             auto runOne = [&](const psRect* roi, const std::string& colLabel, int colorIdx) {
                 std::vector<std::pair<std::string, std::string>> rows;
                 psFrame f = makeFrame(*im);
@@ -3809,7 +3897,7 @@ static void drawFileList() {
     }
     ImGui::Separator();
     // grouped view: one node per stack (sequence), lone images stay flat
-    for (const auto& stack : stacksOf()) {
+    for (const auto& stack : stacksCached()) {
         const ImageDoc& head = *app.images[stack.front()];
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
@@ -4350,7 +4438,9 @@ int main(int argc, char** argv) {
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
         if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
         if (app.wakeFrames > 0 || busy) {
-            glfwPollEvents();
+            // a background load must show progress, but not at full frame rate\r
+            if (busy && app.wakeFrames <= 0) glfwWaitEventsTimeout(0.08);
+            else glfwPollEvents();
             if (app.wakeFrames > 0) app.wakeFrames--;
         } else {
             // idle: block until something happens. The caret does not blink
