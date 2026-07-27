@@ -278,6 +278,8 @@ struct App {
     } proj;
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
+    int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
+    float projYLo = 0, projYHi = 1;   // used by mode 2
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
     int npyAxis = 0;                  // ambiguous 3D npy: 0 = auto, 1 = leading axis is frames
@@ -3298,6 +3300,38 @@ static void drawPanelProjection() {
     ImGui::SameLine();
     ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
 
+    // value axis: a rescaling y axis makes profiles impossible to compare
+    const char* ymodes[3] = { "auto", "display range", "fixed" };
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+    if (ImGui::BeginCombo("value axis", ymodes[std::clamp(app.projYMode, 0, 2)])) {
+        for (int i = 0; i < 3; i++)
+            if (ImGui::Selectable(ymodes[i], app.projYMode == i)) {
+                if (i == 2 && app.projYMode != 2) {   // seed 'fixed' from what is shown
+                    app.projYLo = std::min(P.hMin, P.vMin);
+                    app.projYHi = std::max(P.hMax, P.vMax);
+                }
+                app.projYMode = i;
+            }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("auto: fits the data (H and V share one scale)\n"
+                          "display range: the black/white points - link those across images\n"
+                          "and every image's profile lands on the same axis\n"
+                          "fixed: whatever you type below");
+    float yLo, yHi;
+    if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
+    else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
+    else { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }   // shared H/V
+    if (app.projYMode == 2) {
+        ImGui::SameLine();
+        float v[2] = { app.projYLo, app.projYHi };
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        if (ImGui::InputFloat2("##projy", v, "%.5g") && v[1] > v[0]) {
+            app.projYLo = v[0]; app.projYHi = v[1];
+        }
+    }
+
     static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 220), IM_COL32(120, 230, 120, 220),
                                        IM_COL32(60, 180, 140, 220), IM_COL32(92, 155, 255, 220) };
     static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 210), IM_COL32(79, 221, 107, 210),
@@ -3311,7 +3345,7 @@ static void drawPanelProjection() {
 
     auto plotSeries = [&](bool horizontal) {
         const std::vector<float>* series = horizontal ? P.h : P.v;
-        float lo = horizontal ? P.hMin : P.vMin, hi = horizontal ? P.hMax : P.vMax;
+        float lo = yLo, hi = yHi;      // one value axis for H, V and every image
         int n = horizontal ? P.rw : P.rh;
         int origin = horizontal ? P.rx : P.ry;
         char yl[80];
