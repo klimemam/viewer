@@ -433,12 +433,19 @@ static void pinCurrentAsB() {
 
 static void swapCompare() {
     ImageDoc* b = cmpB();
-    if (!b || !cur()) return;
+    if (!cur()) return;
+    if (!b) {   // silence here reads as "the feature does not exist"
+        toast(app.compareMode == App::CmpOff ? "compare is off  (\\ or C turns it on)"
+                                             : "no B image  -  View > Compare A/B > B image", true);
+        return;
+    }
     const ImageDoc* a = cur();
+    std::string an = a->name, bn = b->name;
     uint64_t bUid = b->uid;
     setCompareB(a);                       // set B before moving A: cur() changes
     for (int i = 0; i < (int)app.images.size(); i++)
         if (app.images[i]->uid == bUid) { selectImage(i); break; }
+    toast("A / B swapped:  A = " + bn + "   B = " + an);
 }
 
 static void computeMinMax(ImageDoc& im) {
@@ -5156,7 +5163,8 @@ static void drawMenuBar(GLFWwindow* win) {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Pin this frame as B", "Shift+B", false, cur() != nullptr)) pinCurrentAsB();
-            if (ImGui::MenuItem("Swap A and B", "Shift+\\", false, cmpB() != nullptr)) swapCompare();
+            if (ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C", false, cmpB() != nullptr))
+                swapCompare();
             ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a
@@ -5309,7 +5317,7 @@ static void drawHelpAbout() {
                                      "cursor, or widen the selected ROI (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
                 row("\\ or C",       "A/B compare: off -> wipe -> side by side");
-                row("Shift+\\",      "swap A and B");
+                row("Shift+\\ or Shift+C", "swap A and B (also the status bar button)");
                 row("B (hold)",      "show B full-frame while held");
                 row("Shift+B",       "pin this frame as B (then move A: frame vs frame)");
                 row("[ / ]",         "move the divider 1% (Shift: 10%)");
@@ -5860,6 +5868,16 @@ int main(int argc, char** argv) {
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  A/B %s %.0f%%  B: %s",
                                        app.compareMode == App::CmpSplit ? "split" : "wipe",
                                        fr * 100, b->name.c_str());
+                }
+                // swapping A and B is a thing you reach for constantly, so it needs
+                // a visible control and not only a keyboard shortcut
+                if (b) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("swap A/B")) swapCompare();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Put %s on the A side and %s on the B side"
+                                          "   (Shift+\\ or Shift+C)",
+                                          b->name.c_str(), cur() ? cur()->name.c_str() : "");
                 }
             }
             if (app.showFps) {   // View > Show frame time: is the UI or the link slow?
