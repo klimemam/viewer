@@ -46,6 +46,7 @@
 #include <unistd.h>
 #endif
 #include <memory>
+#include <unordered_map>
 #include <mutex>
 #include <limits>
 #include <iomanip>
@@ -228,6 +229,7 @@ struct App {
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
+    float inputLagMs = 0, inputLagMaxMs = 0;   // input event -> the frame answering it
     float wipeFrac = 0.5f;            // divider position, fraction of canvas width
     float splitFrac = 0.5f;
     bool wheelZoomPlain = false;// false: Ctrl+wheel zooms, plain wheel pans
@@ -4660,16 +4662,29 @@ struct RoiStatCacheEntry {
     RoiStat s;
 };
 static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
-    static std::vector<RoiStatCacheEntry> cache;
-    for (auto& e : cache)
+    // Hashed, not scanned: the table asks once per row, so a linear cache made the
+    // whole panel O(ROIs^2) - measured 1.37 ms/frame at 400 ROIs against 0.34 ms
+    // at none. The key still carries every input that changes the numbers.
+    static std::unordered_map<uint64_t, RoiStatCacheEntry> cache;
+    uint64_t k = im.uid * 1000003ull;
+    k = k * 31 + (uint64_t)(uint32_t)im.dataRev;
+    k = k * 31 + (uint64_t)(uint32_t)rx;   k = k * 31 + (uint64_t)(uint32_t)ry;
+    k = k * 31 + (uint64_t)(uint32_t)rw;   k = k * 31 + (uint64_t)(uint32_t)rh;
+    k = k * 31 + (uint64_t)(uint32_t)chSel;
+    k = k * 31 + (uint64_t)(uint32_t)im.cfa;
+    k = k * 31 + (uint64_t)(uint32_t)im.cfaPattern;
+    auto it = cache.find(k);
+    if (it != cache.end()) {
+        const RoiStatCacheEntry& e = it->second;
         if (e.uid == im.uid && e.dataRev == im.dataRev && e.x == rx && e.y == ry &&
             e.w == rw && e.h == rh && e.ch == chSel && e.cfa == im.cfa && e.cfaPat == im.cfaPattern)
-            return e.s;
+            return e.s;                    // hash collisions must not return wrong numbers
+    }
     RoiStat s = roiBasicStatsUncached(im, rx, ry, rw, rh, chSel);
     // room for every ROI of a few frames, so scrubbing does not thrash
     size_t cap = std::max<size_t>(64, (app.anns.size() + 1) * 8);
-    if (cache.size() > cap) cache.erase(cache.begin(), cache.begin() + cap / 2);
-    cache.push_back({ im.uid, im.dataRev, rx, ry, rw, rh, chSel, im.cfa, im.cfaPattern, s });
+    if (cache.size() > cap) cache.clear();
+    cache[k] = { im.uid, im.dataRev, rx, ry, rw, rh, chSel, im.cfa, im.cfaPattern, s };
     return s;
 }
 
@@ -4739,7 +4754,14 @@ static void drawPanelRois() {
             ImGui::TableNextColumn();
         }
         int removeId = -1;
-        for (auto& a : app.anns) {
+        // Only the rows you can see. Submitting all of them cost 1.35 ms/frame at
+        // 400 ROIs (0.33 ms at none) - and each row also asked for its statistics,
+        // so scrolled-away ROIs were being measured for nobody.
+        ImGuiListClipper clipper;
+        clipper.Begin((int)app.anns.size());
+        while (clipper.Step())
+        for (int ai = clipper.DisplayStart; ai < clipper.DisplayEnd; ai++) {
+            App::Ann& a = app.anns[ai];
             ImGui::PushID(a.id);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
@@ -5585,9 +5607,11 @@ static void redrawNow() {
     g_drawFrame();
     g_inFrame = false;
 }
+static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
     g_inputSeq++;
+    if (g_lastInputAt == 0) g_lastInputAt = glfwGetTime();   // first of a burst
     if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
 }
 
@@ -5962,9 +5986,21 @@ int main(int argc, char** argv) {
                                           b->name.c_str(), cur() ? cur()->name.c_str() : "");
                 }
             }
-            if (app.showFps) {   // View > Show frame time: is the UI or the link slow?
+            if (app.showFps) {
+                // Frame time alone cannot tell you why the UI feels slow: this app
+                // is event-driven, so the interesting number is how long an input
+                // waited for its frame. Both are shown, plus the redraw mode,
+                // because "low bandwidth" is the one setting that makes typing
+                // feel like a teletype.
                 ImGui::SameLine();
-                ImGui::TextDisabled("   %.1f ms/frame", 1000.0f / ImGui::GetIO().Framerate);
+                ImGui::TextDisabled("   %.1f ms/frame   input %.1f ms (max %.0f)%s",
+                                    1000.0f / ImGui::GetIO().Framerate,
+                                    app.inputLagMs, app.inputLagMaxMs,
+                                    app.lowBandwidth ? "   [low bandwidth]" : "");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("input = time from an input event to the frame that\n"
+                                      "answered it. Click to reset the maximum.");
+                if (ImGui::IsItemClicked()) app.inputLagMaxMs = 0;
             }
             static std::string lastTitle;
             std::string title = im ? im->name + " - viewer" : "viewer v0.1";
@@ -5998,6 +6034,12 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
+        if (g_lastInputAt != 0) {      // this frame answered an input: how late was it?
+            float ms = (float)((glfwGetTime() - g_lastInputAt) * 1000.0);
+            app.inputLagMs = ms;
+            app.inputLagMaxMs = std::max(app.inputLagMaxMs, ms);
+            g_lastInputAt = 0;
+        }
     };
 
     while (!glfwWindowShouldClose(win)) {
@@ -6023,13 +6065,18 @@ int main(int argc, char** argv) {
             if (!ImGui::GetCurrentContext()->InputEventsQueue.empty()) left = 0;
             if (benchFrames || left <= 0.0005) {
                 glfwPollEvents();
-            } else if (app.lowBandwidth) {
+            } else if (app.lowBandwidth && !ImGui::GetIO().WantTextInput) {
                 // Remote: the budget is a real cap, so keep waiting out the rest
                 // of it even when events arrive - bandwidth beats latency here,
-                // and it does cost latency: ~32 ms on a streamed drag, against
-                // 0.4 ms in the default mode. The OS wait rounds up to its timer
-                // quantum (15.6 ms on Windows), so the measured rate lands
-                // around 20-25 fps rather than exactly 30.
+                // and it costs latency: ~32 ms on a streamed drag against 0.4 ms
+                // in the default mode. The OS wait rounds up to its timer quantum
+                // (15.6 ms on Windows), so the rate lands near 20-25 fps.
+                //
+                // TYPING IS EXEMPT. The bandwidth argument is about redraw floods
+                // from mouse drags, not about 20 characters a second - and with
+                // the cap applied, typing measured 32 ms per character (49 ms
+                // p90) against 1.7 ms without it. That is the difference between
+                // a text field and a teletype.
                 do { glfwWaitEventsTimeout(left);
                      left = budget - (glfwGetTime() - lastFrameEnd);
                 } while (left > 0.0005);
@@ -6044,9 +6091,16 @@ int main(int argc, char** argv) {
             // callback; drawing a frame for those (let alone arming the 250 ms
             // wake tail) is what turned a 1 fps idle into a 40 fps one.
             uint64_t before = g_inputSeq;
+            // While a text field owns the keyboard, a wake-up with no callback is
+            // not proof that nothing happened: GLFW 3.4 has no IME support, so an
+            // entire Japanese composition arrives as WM_IME_* and VK_PROCESSKEY
+            // messages that it swallows without calling anything (win32_window.c
+            // returns early on VK_PROCESSKEY). Skipping the frame there means the
+            // window does not repaint for as long as the user is composing.
+            bool typing = ImGui::GetIO().WantTextInput;
             glfwWaitEventsTimeout(1.0);
             // (--crash-test counts frames, so it must not be skipped)
-            if (g_inputSeq == before && !crashAfter) continue;   // nothing happened
+            if (g_inputSeq == before && !typing && !crashAfter) continue;   // nothing happened
             app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
         }
         lastFrameEnd = glfwGetTime();

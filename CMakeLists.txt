@@ -49,6 +49,16 @@ add_library(imgui_lib STATIC
 target_include_directories(imgui_lib PUBLIC
   ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+if(WIN32)
+  # Without this, ImGui compiles its Win32 IME support OUT on non-MSVC compilers
+  # (imgui.cpp: "MinGW users should either link with -limm32, or define
+  # IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS"). The result is a MinGW build with
+  # no ImmSetCompositionWindow/ImmSetCandidateWindow at all, so the Japanese IME
+  # candidate window is never placed at the caret - it appears detached from the
+  # field being typed into. Verified absent from the shipped binary's imports.
+  target_compile_definitions(imgui_lib PUBLIC IMGUI_ENABLE_WIN32_DEFAULT_IME_FUNCTIONS)
+  target_link_libraries(imgui_lib PUBLIC imm32)
+endif()
 
 # public plugin ABI header (include/ps/ps_plugin.h)
 add_library(ps_api INTERFACE)
