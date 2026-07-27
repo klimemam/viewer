@@ -47,6 +47,9 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>           // sysctlbyname for the physical-memory budget
+#endif
 #include <memory>
 #include <unordered_map>
 #include <mutex>
