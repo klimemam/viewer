@@ -268,6 +268,7 @@ struct App {
     bool showHistogram = true, showTemporal = true;
     bool resetLayout = false;
     bool compactUi = true;            // dense spacing: this tool is table-heavy
+    int wakeFrames = 3;               // frames still to draw after the last input
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -496,13 +497,19 @@ static const char* analyzerHint(const std::string& name) {
     return "";
 }
 
+// Set while the background queue loads: newly arrived images must never steal
+// the selection (or the zoom) from what the user is working on.
+static bool g_quietLoad = false;
+
 static void addImage(std::unique_ptr<ImageDoc> im) {
     computeMinMax(*im);
     defaultRange(*im);
     im->texDirty = true;
     app.images.push_back(std::move(im));
-    app.current = (int)app.images.size() - 1;
-    app.fitRequested = true;
+    if (!g_quietLoad || app.current < 0) {      // first image still gets shown
+        app.current = (int)app.images.size() - 1;
+        app.fitRequested = true;
+    }
 }
 
 static void runProcessor(int idx) {
@@ -1295,6 +1302,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 app.seqReady.emplace_back(j.index, std::move(doc));
             }
             app.seqDone++;
+            glfwPostEmptyEvent();     // wake the UI thread if it is idling
             if (bytes > SEQ_MEM_BUDGET) {
                 std::lock_guard<std::mutex> lk(app.seqMtx);
                 app.seqErr += "memory budget reached - stopped loading\n";
@@ -1436,7 +1444,7 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
     std::error_code ec;
     std::filesystem::path rootPath = pathFromUtf8(root);
     if (!std::filesystem::is_directory(rootPath, ec)) return groups;
-    const size_t MAX_GROUPS = 64;
+    const size_t MAX_GROUPS = 256;    // a truncated scan is reported, never silent
     // collect loadable files per directory (depth-limited walk)
     std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> perDir;
     auto addFile = [&](const std::filesystem::path& p) {
@@ -1449,12 +1457,27 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             if (d.first == dir) { d.second.push_back(p.u8string()); return; }
         perDir.push_back({ dir, { p.u8string() } });
     };
-    std::filesystem::recursive_directory_iterator it(
-        rootPath, std::filesystem::directory_options::skip_permission_denied, ec), end;
-    for (; !ec && it != end; it.increment(ec)) {
-        if (it.depth() > 3) { it.disable_recursion_pending(); continue; }
-        std::error_code ec2;
-        if (it->is_regular_file(ec2)) addFile(it->path());
+    // Manual breadth-first walk: recursive_directory_iterator aborts the whole
+    // scan when a single entry cannot be read (a permission error or a dangling
+    // link would silently truncate the folder list).
+    {
+        std::vector<std::pair<std::filesystem::path, int>> todo{ { rootPath, 0 } };
+        while (!todo.empty()) {
+            auto [dir, depth] = todo.back();
+            todo.pop_back();
+            std::error_code dec;
+            std::filesystem::directory_iterator dit(dir, dec), dend;
+            if (dec) continue;                       // unreadable dir: skip just this one
+            for (; dit != dend; dit.increment(dec)) {
+                if (dec) { dec.clear(); break; }
+                std::error_code fec;
+                if (dit->is_directory(fec)) {
+                    if (depth < 3) todo.push_back({ dit->path(), depth + 1 });
+                } else if (dit->is_regular_file(fec)) {
+                    addFile(dit->path());
+                }
+            }
+        }
     }
     std::sort(perDir.begin(), perDir.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -1512,6 +1535,7 @@ static void startNextQueuedGroup() {
     }
     app.seqQueue.erase(app.seqQueue.begin());
     std::string err;
+    g_quietLoad = true;               // keep the user's current image selected
     if (g.isRaw) {
         RawDialog d = g_folderRecipe;
         d.path = g.files[0];
@@ -1520,8 +1544,11 @@ static void startNextQueuedGroup() {
     } else {
         err = loadNpy(g.files[0]);
     }
+    g_quietLoad = false;
     if (!err.empty()) { toast(baseName(g.files[0]) + ": " + err, true); return; }
-    if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
+    // reference the image we just appended, not app.current (which may be elsewhere)
+    int idx = (int)app.images.size() - 1;
+    if (g.files.size() >= 2) startSequenceLoad(idx, g.files, g.name);
 }
 
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
@@ -1538,6 +1565,8 @@ static void enqueueGroups(std::vector<App::PendingGroup> groups) {
 static void openFolder(const std::string& path) {
     std::vector<App::PendingGroup> groups = scanFolderGroups(path);
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
+    if (groups.size() >= 256)
+        toast("scan stopped at 256 sequences - narrow the folder or use the filters", true);
     // one group, or "always load": no point asking
     if (groups.size() == 1 || app.seqLoadMode == 1) { enqueueGroups(std::move(groups)); return; }
     app.folderPick.clear();
@@ -1602,21 +1631,29 @@ static void drawFolderPickModal() {
         if (e.selected) { selGroups++; selFiles += (int)e.g.files.size(); }
     }
     ImGui::Text("%d sequence(s), %d files found", (int)app.folderPick.size(), allFiles);
-    // glob filters beat clicking dozens of checkboxes
-    float half = (ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 10) * 0.5f;
-    ImGui::SetNextItemWidth(half);
-    bool ch = ImGui::InputTextWithHint("include", "* or 00/*,*_dark*", app.pickInclude,
-                                       sizeof app.pickInclude);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(half);
-    ch |= ImGui::InputTextWithHint("exclude", "e.g. *_ng*,02/*", app.pickExclude,
-                                   sizeof app.pickExclude);
-    if (ch) applyPickFilters();
-    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
-        ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere\n"
-                          "matched against \"folder/pattern\"");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Apply")) applyPickFilters();
+    // glob filters beat clicking dozens of checkboxes.
+    // Widths are measured, not guessed: the fields share the row, the buttons
+    // get their own row so nothing is pushed off the right edge.
+    {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float labelW = ImGui::CalcTextSize("exclude").x + st.ItemInnerSpacing.x;
+        float fieldW = (ImGui::GetContentRegionAvail().x - 2 * labelW - st.ItemSpacing.x) * 0.5f;
+        fieldW = std::max(fieldW, ImGui::GetFontSize() * 6);
+        ImGui::SetNextItemWidth(fieldW);
+        bool ch = ImGui::InputTextWithHint("include", "* or 00/*,*_dark*", app.pickInclude,
+                                           sizeof app.pickInclude);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere\n"
+                              "matched against \"folder/pattern\", e.g. 01/frame_###.npy");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(fieldW);
+        ch |= ImGui::InputTextWithHint("exclude", "e.g. *_ng*,02/*", app.pickExclude,
+                                       sizeof app.pickExclude);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere");
+        if (ch) applyPickFilters();
+    }
+    if (ImGui::SmallButton("Apply filters")) applyPickFilters();
     ImGui::SameLine();
     if (ImGui::SmallButton("All")) for (auto& e : app.folderPick) e.selected = true;
     ImGui::SameLine();
@@ -3588,8 +3625,27 @@ static void parseCli(int argc, char** argv) {
 }
 
 // ---------------------------------------------------------------- main
+// Idle throttling: an immediate-mode UI normally redraws 60x per second, which
+// over ssh X11 forwarding means pushing the whole window across the network
+// continuously. Input wakes the loop; when nothing happens we block in
+// glfwWaitEventsTimeout and draw nothing at all.
+static void wakeUi(int frames = 3) { app.wakeFrames = std::max(app.wakeFrames, frames); }
+
 static void dropCallback(GLFWwindow*, int count, const char** paths) {
+    wakeUi(4);
     for (int i = 0; i < count; i++) openPath(paths[i]);
+}
+static void installWakeCallbacks(GLFWwindow* win) {
+    // installed BEFORE ImGui's backend, which chains to these
+    glfwSetCursorPosCallback(win, [](GLFWwindow*, double, double) { wakeUi(); });
+    glfwSetMouseButtonCallback(win, [](GLFWwindow*, int, int, int) { wakeUi(4); });
+    glfwSetScrollCallback(win, [](GLFWwindow*, double, double) { wakeUi(4); });
+    glfwSetKeyCallback(win, [](GLFWwindow*, int, int, int, int) { wakeUi(4); });
+    glfwSetCharCallback(win, [](GLFWwindow*, unsigned int) { wakeUi(4); });
+    glfwSetCursorEnterCallback(win, [](GLFWwindow*, int) { wakeUi(); });
+    glfwSetWindowFocusCallback(win, [](GLFWwindow*, int) { wakeUi(4); });
+    glfwSetWindowSizeCallback(win, [](GLFWwindow*, int, int) { wakeUi(4); });
+    glfwSetWindowRefreshCallback(win, [](GLFWwindow*) { wakeUi(2); });
 }
 
 int main(int argc, char** argv) {
@@ -3611,6 +3667,7 @@ int main(int argc, char** argv) {
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
+    installWakeCallbacks(win);        // before ImGui's backend: it chains to these
     glfwSetDropCallback(win, dropCallback);
 
     IMGUI_CHECKVERSION();
@@ -3676,7 +3733,22 @@ int main(int argc, char** argv) {
     parseCli(argc, argv);
 
     while (!glfwWindowShouldClose(win)) {
-        glfwPollEvents();
+        // work that must keep animating even without input
+        bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
+                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
+        if (app.wakeFrames > 0 || busy) {
+            glfwPollEvents();
+            if (app.wakeFrames > 0) app.wakeFrames--;
+        } else {
+            // idle: block until something happens (a caret blink needs a short
+            // heartbeat, everything else can sleep a full second)
+            glfwWaitEventsTimeout(ImGui::GetIO().WantTextInput ? 0.1 : 1.0);
+            wakeUi(1);
+        }
+        if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
+            glfwWaitEvents();
+            continue;
+        }
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
