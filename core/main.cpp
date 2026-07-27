@@ -230,6 +230,7 @@ struct App {
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
     float inputLagMs = 0, inputLagMaxMs = 0;   // input event -> the frame answering it
+    float cpuMs = 0, swapMs = 0;               // our drawing vs presenting it
     float wipeFrac = 0.5f;            // divider position, fraction of canvas width
     float splitFrac = 0.5f;
     bool wheelZoomPlain = false;// false: Ctrl+wheel zooms, plain wheel pans
@@ -5823,6 +5824,7 @@ int main(int argc, char** argv) {
     // whole resize. GLFW 3.4 sets no timer there, so the repaint has to come from
     // inside the callback.
     g_drawFrame = [&]() {
+        double frameBodyT0 = glfwGetTime();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -6065,13 +6067,17 @@ int main(int argc, char** argv) {
                 // because "low bandwidth" is the one setting that makes typing
                 // feel like a teletype.
                 ImGui::SameLine();
-                ImGui::TextDisabled("   %.1f ms/frame   input %.1f ms (max %.0f)%s",
-                                    1000.0f / ImGui::GetIO().Framerate,
+                ImGui::TextDisabled("   %.1f ms/frame (draw %.1f + present %.1f)   input %.1f ms (max %.0f)%s",
+                                    1000.0f / ImGui::GetIO().Framerate, app.cpuMs, app.swapMs,
                                     app.inputLagMs, app.inputLagMaxMs,
                                     app.lowBandwidth ? "   [low bandwidth]" : "");
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("input = time from an input event to the frame that\n"
-                                      "answered it. Click to reset the maximum.");
+                    ImGui::SetTooltip("draw = building and rendering the frame here.\n"
+                                      "present = handing it to the display (SwapBuffers):\n"
+                                      "  large = the display path, not this app - a remote\n"
+                                      "  X11 link ships the whole window every frame.\n"
+                                      "input = event -> the frame answering it.\n"
+                                      "Click to reset the maximum.");
                 if (ImGui::IsItemClicked()) app.inputLagMaxMs = 0;
             }
             static std::string lastTitle;
@@ -6105,7 +6111,13 @@ int main(int argc, char** argv) {
         glClearColor(cc.x, cc.y, cc.z, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        // Split the frame: our drawing versus getting it onto the screen. Over a
+        // remote display the second number is the whole story (a full window per
+        // frame across the link), and no amount of work on our side moves it.
+        double swapT0 = glfwGetTime();
         glfwSwapBuffers(win);
+        app.swapMs = (float)((glfwGetTime() - swapT0) * 1000.0);
+        app.cpuMs = (float)((swapT0 - frameBodyT0) * 1000.0);
         if (g_lastInputAt != 0) {      // this frame answered an input: how late was it?
             float ms = (float)((glfwGetTime() - g_lastInputAt) * 1000.0);
             app.inputLagMs = ms;
