@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <csignal>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -280,6 +281,9 @@ struct App {
         const char* seriesNames[4] = {};
         std::vector<float> h[4], v[4];    // per series: mean along columns / rows
         float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
+        // statistics of the profiles themselves (sigma of column means = column FPN)
+        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
+        Stats hStat[4], vStat[4];
         bool roiUsed = false;
     } proj;
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
@@ -1272,21 +1276,30 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
 static void startSequenceLoad(int imageIdx, const std::vector<std::string>& files,
                               const std::string& pattern);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
-static void saveSession(std::string path) {
+static void saveSession(std::string path, bool quiet = false) {
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
-    if (!f) { toast("cannot write session file", true); return; }
+    if (!f) { if (!quiet) toast("cannot write session file", true); return; }
     f << "viewer-session 1\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "zoom " << app.view.zoom << "\n";
     f << "center " << app.view.center.x << " " << app.view.center.y << "\n";
     f << "current " << app.current << "\n";
+    // display state that lives outside the per-image range
+    f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
+      << app.linkWhite << "\n";
+    f << "roichannel " << app.roiChannel << "\n";
+    f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
+      << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
+    f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << "\n";
+    f << "histlog " << (app.histLog ? 1 : 0) << "\n";
     for (auto& d : app.images) {
         if (d->path.empty()) continue;
         // sequences: store only the frame in view + a marker to reload the stack
         // (writing every frame would bloat the file and slow restore)
         if (d->seqId != 0 && d.get() != cur()) continue;
+        f << "lut " << d->displayLut << "\n";
         f << "image " << d->black << " " << d->white << " ";
         if (d->rawDtype >= 0) {
             int interp = d->rawInterp;
@@ -1307,10 +1320,49 @@ static void saveSession(std::string path) {
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " " << a.label << "\n";
-    toast("session saved: " + baseName(path));
+    if (!quiet) toast("session saved: " + baseName(path));
 }
 
 static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
+
+// ---- crash / exit safety net -------------------------------------------------
+// The work that is expensive to redo is the arrangement (which files, which
+// ROIs, which range), not the pixels: autosave it so a crash costs nothing.
+static std::string autosavePath() {
+    std::error_code ec;
+    std::filesystem::path cfg;
+#if defined(_WIN32)
+    if (const char* ad = getenv("APPDATA")) cfg = std::filesystem::u8path(ad);
+#else
+    if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
+#endif
+    if (cfg.empty()) return {};
+    cfg /= "viewer";
+    std::filesystem::create_directories(cfg, ec);
+    if (ec) return {};
+    return (cfg / "autosave.vsession").u8string();
+}
+
+static void autosaveSession() {
+    std::string p = autosavePath();
+    if (!p.empty() && !app.images.empty()) saveSession(p, true);
+}
+
+// Last-resort handler: the process is already dying, so this only writes the
+// session file and re-raises. No allocation-heavy work, no UI.
+static void crashHandler(int sig) {
+    static volatile bool inHandler = false;
+    if (!inHandler) {
+        inHandler = true;
+        std::string p = autosavePath();
+        if (!p.empty() && !app.images.empty()) {
+            saveSession(p, true);
+            fprintf(stderr, "\nviewer crashed (signal %d); session saved to %s\n", sig, p.c_str());
+        }
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 static std::string loadSession(const std::string& path) {
     std::vector<uint8_t> buf;
@@ -1325,6 +1377,7 @@ static std::string loadSession(const std::string& path) {
     app.selectedAnn = 0;
     app.annRev++;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
+    int pendingLut = -1;
     bool haveView = false;
     auto restOfLine = [](std::istringstream& ls) {
         std::string p; std::getline(ls, p);
@@ -1341,6 +1394,16 @@ static std::string loadSession(const std::string& path) {
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
         else if (key == "current") ls >> current;
+        else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
+                                       app.linkRange = on != 0; }
+        else if (key == "roichannel") ls >> app.roiChannel;
+        else if (key == "projection") { int h = 1, v = 1;
+                                        ls >> app.projMode >> app.projYMode >> app.projYLo
+                                           >> app.projYHi >> h >> v;
+                                        app.showProjH = h != 0; app.showProjV = v != 0; }
+        else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
+        else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
+        else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "seqload") {   // applies to the image loaded just above
             int on = 0; ls >> on;
             if (on && cur() && !cur()->path.empty()) {
@@ -1415,6 +1478,7 @@ static std::string loadSession(const std::string& path) {
             }
             if (!err.empty()) { toast("session: " + err, true); continue; }
             cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
+            cur()->displayLut = pendingLut; pendingLut = -1;
         }
     }
     app.selectedAnn = 0;
@@ -3351,6 +3415,34 @@ static void recomputeProjectionIfNeeded(ImageDoc* im) {
     }
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
+
+    // statistics OF THE PROFILE itself: the spread of column means is column FPN,
+    // the spread of row means is row FPN / banding - that is the number people
+    // actually want out of a projection, and eyeballing a curve cannot give it.
+    for (int s = 0; s < P.nSeries; s++) {
+        for (int axis = 0; axis < 2; axis++) {
+            const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
+            App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
+            st = {};
+            double sum = 0, sum2 = 0;
+            double mn = DBL_MAX, mx = -DBL_MAX;
+            size_t n = 0;
+            for (float v : d) {
+                if (!std::isfinite(v)) continue;
+                sum += v; sum2 += (double)v * v;
+                mn = std::min(mn, (double)v); mx = std::max(mx, (double)v);
+                n++;
+            }
+            if (!n) continue;
+            st.mean = sum / n;
+            double var = sum2 / n - st.mean * st.mean;
+            st.sd = sqrt(var > 0 ? var : 0);
+            st.mn = mn; st.mx = mx;
+            st.pp = mx - mn;
+            st.pct = st.mean != 0 ? st.sd / fabs(st.mean) * 100.0 : 0.0;
+            st.valid = true;
+        }
+    }
 }
 
 static void drawPanelProjection() {
@@ -3452,6 +3544,37 @@ static void drawPanelProjection() {
     };
     if (app.showProjH) plotSeries(true);
     if (app.showProjV) plotSeries(false);
+
+    // numbers to go with the curves
+    ImGui::SeparatorText("profile statistics");
+    int nCols = 2 + 4;
+    if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
+                                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+        ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
+        ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
+        ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("sigma", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("sigma %", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableHeadersRow();
+        auto rows = [&](bool horizontal) {
+            for (int s = 0; s < P.nSeries; s++) {
+                const App::ProjState::Stats& st = horizontal ? P.hStat[s] : P.vStat[s];
+                if (!st.valid) continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", P.seriesNames[s]);
+                ImGui::TableNextColumn(); textNum("%.6g", st.mean);
+                ImGui::TableNextColumn(); textNum("%.6g", st.sd);
+                ImGui::TableNextColumn(); textNum("%.3f", st.pct);
+                ImGui::TableNextColumn(); textNum("%.6g", st.pp);
+            }
+        };
+        if (app.showProjH) rows(true);
+        if (app.showProjV) rows(false);
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
 }
 
 static void drawPanelTemporal() {
@@ -3994,6 +4117,13 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
+        {   // recovery: the autosave is written on exit, on crash and every 60 s
+            std::string ap = autosavePath();
+            std::error_code aec;
+            bool has = !ap.empty() && std::filesystem::exists(std::filesystem::u8path(ap), aec);
+            if (ImGui::MenuItem("Restore last session", nullptr, false, has)) openPath(ap);
+            if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
@@ -4336,9 +4466,12 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { printUsage(); return 0; }
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
-    int benchFrames = 0;
-    for (int i = 1; i + 1 < argc; i++)
+    int benchFrames = 0, crashAfter = 0;
+    for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--bench")) benchFrames = std::max(1, atoi(argv[i + 1]));
+        // developer flag: verify the crash safety net actually writes a session
+        if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
+    }
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -4415,6 +4548,9 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 
+    // write the session on the way out of any crash, then let it crash normally
+    for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
+
     plugin_host::loadAll(
         { plugin_host::exeDir() + "/plugins", plugin_host::exeDir() + "/../plugins" },
         [](const std::string& m, bool err) {
@@ -4448,11 +4584,27 @@ int main(int argc, char** argv) {
             glfwWaitEventsTimeout(1.0);
             wakeUi(1);
         }
+        if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
         if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
             glfwWaitEvents();
             continue;
         }
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
+        {   // Autosave on change, debounced. A hard kill cannot run any handler,
+            // so the safety net has to be written while things still work.
+            static uint64_t lastState = 0;
+            static double dirtySince = -1, lastAutosave = 0;
+            uint64_t state = app.imagesRev * 1000003ull + app.annRev * 31ull +
+                             (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0);
+            double nowA = glfwGetTime();
+            if (state != lastState) { lastState = state; dirtySince = nowA; }
+            bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
+            if (!benchFrames && due && !app.images.empty()) {
+                dirtySince = -1;
+                lastAutosave = nowA;
+                autosaveSession();
+            }
+        }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -4693,6 +4845,7 @@ int main(int argc, char** argv) {
                 s.back(), 1000.0 / std::max(s[s.size() / 2], 1e-6));
     }
 
+    autosaveSession();                // also covers a normal quit
     stopSequenceLoader();             // join the worker before tearing anything down
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
