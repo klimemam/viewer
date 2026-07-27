@@ -61,12 +61,84 @@ jobs:
         run: |
           New-Item -ItemType Directory stage | Out-Null
           Copy-Item build/Release/viewer.exe stage/
+          Copy-Item build/Release/viewer-serve.exe stage/
           Copy-Item -Recurse build/plugins stage/plugins
+      # viewer-serve is what you copy to a compute server: it links no GL and no
+      # X11, so it starts on a headless box where the GUI binary would not load.
       - name: Package (preserve executable bit)
         if: runner.os != 'Windows'
-        run: tar -czf viewer.tgz -C build viewer plugins
+        run: tar -czf viewer.tgz -C build viewer viewer-serve plugins
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binpath }}
+
+  # A machine with no build tools stays current with nothing but git:
+  #     git clone -b binaries --single-branch <repo> viewer-bin
+  #     cd viewer-bin && git pull        # done: viewer.exe is the latest main
+  # The branch holds ONLY the built binaries (orphan history, force-pushed), so
+  # pulls are small and the source history never carries exe blobs.
+  publish-binaries:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Assemble the binaries branch
+        run: |
+          mkdir -p out/win64 out/linux-x64 out/macos-arm64
+          cp -r dist/viewer-win64/* out/win64/
+          tar xzf dist/viewer-linux-x64/viewer.tgz -C out/linux-x64
+          tar xzf dist/viewer-macos-arm64/viewer.tgz -C out/macos-arm64
+          echo "built from ${GITHUB_SHA} on $(date -u +%Y-%m-%dT%H:%M:%SZ)" > out/VERSION.txt
+          # The branch history is REPLACED on every publish (so the repo never
+          # accumulates old exe blobs) - which means a plain `git pull` refuses
+          # with "divergent histories". Ship the correct update command as a
+          # script so nobody has to know that.
+          cat > out/update.cmd <<'EOF'
+          @echo off
+          git fetch origin binaries && git reset --hard origin/binaries
+          EOF
+          cat > out/update.sh <<'EOF'
+          #!/bin/sh
+          git fetch origin binaries && git reset --hard origin/binaries
+          EOF
+          chmod +x out/update.sh
+          cat > out/README.md <<'EOF'
+          # Prebuilt binaries (branch: binaries)
+
+          Updated automatically from every push to main. To stay current on a
+          machine with no build environment:
+
+              git clone -b binaries --single-branch <this repo> viewer-bin
+
+          and from then on just run `update.cmd` (Windows) / `./update.sh`.
+          (Plain `git pull` will NOT work: this branch's history is replaced on
+          every publish so the repository never grows with old binaries.)
+
+          - win64/viewer.exe            - the GUI (Windows)
+          - win64/viewer-serve.exe      - the headless peer (Windows)
+          - win64/plugins/              - analyzers (keep next to the exe)
+          - linux-x64/viewer            - the GUI (Linux)
+          - linux-x64/viewer-serve      - the headless peer for a compute server
+          - macos-arm64/                - the same pair for macOS
+
+          See docs/startup.md on main for how ssh:// viewing fits together.
+          EOF
+      - name: Force-push as the binaries branch
+        run: |
+          cd out
+          git init -b binaries
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "binaries for ${GITHUB_SHA}"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

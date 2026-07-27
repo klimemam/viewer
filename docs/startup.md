@@ -5,12 +5,29 @@
 | 構成 | ウィンドウ | 画素の場所 | 準備 |
 |---|---|---|---|
 | ローカル | 手元 | 手元 | なし |
-| **リモート(推奨)** | **手元** | サーバ | サーバに同じバイナリを1つ置く |
+| **リモート(推奨)** | **手元** | サーバ | サーバに `viewer-serve` を1つ置く |
 | ローカル(テスト用ピア) | 手元 | 手元(別プロセス経由) | なし |
 
 ---
 
-## 1. ローカル
+## 0. ビルド環境の無い Windows PC で使う(推奨: 作業用 PC はこれ)
+
+main に push されるたびに、CI がビルド済みバイナリを **`binaries` ブランチ**へ発行します。
+作業用 PC に必要なのは git だけです:
+
+```bat
+git clone -b binaries --single-branch <このリポジトリのURL> viewer-bin
+cd viewer-bin
+win64\viewer.exe
+```
+
+**更新は `update.cmd` を実行するだけ**(Linux/macOS は `./update.sh`)。
+素の `git pull` は使えません — このブランチは古い exe をリポジトリに溜めないよう
+毎回履歴を置き換えるためで、正しい取得手順をスクリプトにしてあります。
+
+中身: `win64/viewer.exe`(GUI)+ `win64/plugins/`、`linux-x64/viewer-serve`(サーバに置く方)ほか。
+
+## 1. ローカル(ビルド環境のある開発機)
 
 ```bash
 cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release   # 初回のみ
@@ -23,33 +40,44 @@ cmake --build build-mingw
 
 ### 2-1. サーバ側にバイナリを置く(初回だけ)
 
-サーバ用にビルドしたバイナリを1つ置くだけです。**デーモンは起動しません。ポートも開けません。**
+**手元とサーバで OS が違う場合、バイナリは2つ必要です**(例: 手元 Windows / サーバ Linux)。
+
+| 置く場所 | 使うバイナリ | 役割 |
+|---|---|---|
+| 手元(Windows) | **`viewer.exe`**(Windows 版) | GUI。ウィンドウを出す側 |
+| サーバ(Linux) | **`viewer-serve`**(Linux 版) | 画素を返す側。ウィンドウは出さない |
+
+**サーバには `viewer` ではなく `viewer-serve` を置いてください。** GUI 版は OpenGL と X11 にリンクしているため、それらが入っていない計算機では**起動すらできません**(`--serve` に到達する前に動的リンカが失敗します)。`viewer-serve` は miniz と C++ ランタイム以外に何もリンクしていない 0.3 MB の実行ファイルで、素のサーバでそのまま動きます。
 
 ```bash
-scp build-mingw/viewer user@host:~/bin/viewer
-ssh user@host '~/bin/viewer --help | head -3'      # 動くことの確認
+# サーバに開発環境があるなら、サーバ上でビルドするのが一番簡単です。
+# viewer-serve ターゲットは GUI 依存(GLFW/OpenGL/X11)を一切持ちません:
+ssh user@host 'git clone <repo> viewer && cmake -S viewer -B viewer/b -DCMAKE_BUILD_TYPE=Release && cmake --build viewer/b --target viewer-serve'
+ssh user@host 'install -D viewer/b/viewer-serve ~/bin/viewer-serve'
+
+# ビルドしない場合は binaries ブランチの linux-x64/viewer-serve を scp でも可
+ssh user@host '~/bin/viewer-serve --help'           # 動くことの確認
 ```
 
-> サーバが Linux なら Linux 用にビルドしたものを置いてください。
-> 依存は自己完結しているので、置くのは実行ファイル1つで済みます。
+プロトコルは全メッセージが 32bit 整数の並びなので、**Windows ↔ Linux でそのまま通ります**(x86-64 はどちらもリトルエンディアン、構造体にパディングも入りません)。
 
 ### 2-2. 手元から開く
 
 ```bash
-./build-mingw/viewer ssh://user@host/data/run42/frame_000.npy --remote-exe ~/bin/viewer
+.\build-mingw\viewer.exe ssh://user@host/data/run42/frame_000.npy --remote-exe ~/bin/viewer-serve
 ```
 
 これだけです。内部で次が起きます:
 
 ```
-手元の viewer ──ssh user@host ~/bin/viewer --serve──> サーバ側のピア
+手元の viewer.exe ──ssh user@host ~/bin/viewer-serve──> サーバ側のピア
               <── 見えている領域の画素 / 測定した数値 だけ ──
 ```
 
 - **`~/.ssh/config` にエイリアス**を書いておくと短くなります(`Host lab1` → `ssh://lab1/data/...`)
 - 認証は ssh に任せています。パスワード対話はできないので、**公開鍵認証を設定してください**
   (`-o BatchMode=yes` で起動するため、鍵がないと即座に失敗します)
-- リモート側のバイナリが PATH にあるなら `--remote-exe` は省略できます
+- `--remote-exe` は省略すると `viewer` を探します。`viewer-serve` を置く運用では常に指定してください
 
 ### 2-3. 何が速くなるのか
 

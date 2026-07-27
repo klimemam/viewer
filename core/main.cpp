@@ -2965,7 +2965,10 @@ static void openRemote(const std::string& url) {
     if (!app.remoteSession->alive() || app.remoteSession->host() != host) {
         // the peer is the same binary: found on the remote PATH over ssh, or this
         // very executable when testing through local://
-        std::string exe = host.empty() ? app.exePath : app.remoteExe;
+        // local:// normally re-runs this binary; --remote-exe overrides it, which
+        // is how the standalone viewer-serve peer gets tested without a server
+        std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
+                                                                      : app.remoteExe;
         if (!app.remoteSession->start(host, exe, err)) {
             toast("remote: " + err, true);
             return;

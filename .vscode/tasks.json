@@ -36,7 +36,7 @@
     {
       "label": "remote: deploy this build to the host",
       "type": "shell",
-      "command": "scp build-mingw/viewer ${input:remoteHost}:${input:remoteExe} && ssh ${input:remoteHost} ${input:remoteExe} --help | head -3",
+      "command": "scp build-mingw/viewer-serve ${input:remoteHost}:${input:remoteExe} && ssh ${input:remoteHost} ${input:remoteExe} --help",
       "dependsOn": "build",
       "problemMatcher": [],
       "detail": "Copies the binary the remote side needs and proves it runs there."
@@ -74,8 +74,8 @@
     {
       "id": "remoteExe",
       "type": "promptString",
-      "description": "path of the viewer binary on the remote machine",
-      "default": "~/bin/viewer"
+      "description": "path of viewer-serve on the remote machine (NOT the GUI binary)",
+      "default": "~/bin/viewer-serve"
     }
   ]
 }
