@@ -67,9 +67,12 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
-# third-party: do not police its warnings
-set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES COMPILE_OPTIONS
-                            "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>")
+# third-party: do not police its warnings. MINIZ_NO_STDIO drops the archive
+# file-I/O layer we never use (only the in-memory codec is called), which also
+# silences its large-file #pragma message on MinGW.
+set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
+                            COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>"
+                            COMPILE_DEFINITIONS "MINIZ_NO_STDIO")
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
 if(UNIX)
