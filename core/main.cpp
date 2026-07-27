@@ -5491,8 +5491,11 @@ static void parseCli(int argc, char** argv) {
 // the next idle timeout. Low-bandwidth mode restores the old frame-count
 // behaviour for remote sessions.
 static double g_wakeUntil = 0;
+static uint64_t g_inputSeq = 0;      // bumped by every real input: idle can tell
+                                     // a genuine event from a spurious wake-up
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
+    g_inputSeq++;
     if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
 }
 
@@ -5634,17 +5637,36 @@ int main(int argc, char** argv) {
             // Frame pacing lives here, not in the swap: the driver may ignore
             // vsync entirely (measured ~4000 fps with SwapInterval(1)), and this
             // wait returns the instant an event arrives, so it costs no latency.
+            // (~100 fps in practice: the OS wait rounds up to its timer tick.)
             double budget = app.lowBandwidth ? 1.0 / 30.0 : 1.0 / 120.0;
             if (!active) budget = 0.08;        // background progress only
             double left = budget - (frameT0 - lastFrameEnd);
-            if (benchFrames || left <= 0.0005) glfwPollEvents();
-            else glfwWaitEventsTimeout(left);
+            // Never sleep on a backlog: ImGui hands out one trickled event per
+            // frame, so pacing would show a 100-event fling one notch at a time.
+            if (!ImGui::GetCurrentContext()->InputEventsQueue.empty()) left = 0;
+            if (benchFrames || left <= 0.0005) {
+                glfwPollEvents();
+            } else if (app.lowBandwidth) {
+                // remote: the budget is a real cap, so keep waiting out the rest
+                // of it even when events arrive (bandwidth beats latency here)
+                do { glfwWaitEventsTimeout(left);
+                     left = budget - (glfwGetTime() - lastFrameEnd);
+                } while (left > 0.0005);
+            } else {
+                glfwWaitEventsTimeout(left);   // returns at once on input
+            }
             if (app.wakeFrames > 0) app.wakeFrames--;
         } else {
-            // idle: block until something happens. The caret does not blink
+            // Idle: block until something happens. The caret does not blink
             // (ConfigInputTextCursorBlink=false), so text fields need no heartbeat.
+            // The wait also returns on messages GLFW handles without calling any
+            // callback; drawing a frame for those (let alone arming the 250 ms
+            // wake tail) is what turned a 1 fps idle into a 40 fps one.
+            uint64_t before = g_inputSeq;
             glfwWaitEventsTimeout(1.0);
-            wakeUi(1);
+            // (--crash-test counts frames, so it must not be skipped)
+            if (g_inputSeq == before && !crashAfter) continue;   // nothing happened
+            app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
         }
         lastFrameEnd = glfwGetTime();
         if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
