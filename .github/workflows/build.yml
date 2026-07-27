@@ -32,6 +32,21 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release
+      - name: Headless render + frame-time check
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb libgl1-mesa-dri
+          python3 tools/gen_testdata.py
+          xvfb-run -a ./build/viewer --bench 120 --sequence never \
+                   tools/testdata/zone_f32.npy 2>&1 | tee bench.log
+          grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
+          # catastrophic-regression gate only: CI runners use software GL and are
+          # noisy, so this is not a micro-benchmark
+          med=$(sed -n 's/.*median=\([0-9.]*\)ms.*/\1/p' bench.log)
+          echo "median frame time: ${med} ms"
+          awk -v m="$med" 'BEGIN { exit (m > 50 ? 1 : 0) }' \
+            || { echo "frame time regressed badly (>50 ms)"; exit 1; }
+
       - name: Package (Windows exe + plugins)
         if: runner.os == 'Windows'
         shell: pwsh

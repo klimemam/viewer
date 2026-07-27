@@ -316,6 +316,11 @@ static void computeMinMax(ImageDoc& im) {
     if (mn == mx) mx = mn + 1;
     im.vmin = mn; im.vmax = mx;
 }
+// Effective display range: the shared value when linking is on, the image's own
+// otherwise. Linking never overwrites an image's range (defined below with App).
+static float effBlack(const ImageDoc& im);
+static float effWhite(const ImageDoc& im);
+
 static void defaultRange(ImageDoc& im) {
     if (im.dtype == "u8" || im.dtype == "i8")       { im.black = 0; im.white = 255; }
     else if (im.dtype == "u16")                     { im.black = 0; im.white = 65535; }
@@ -327,7 +332,8 @@ static void defaultRange(ImageDoc& im) {
 // upload/normalize into RGBA8 texture
 static void rebuildTexture(ImageDoc& im) {
     std::vector<uint8_t> rgba((size_t)im.w * im.h * 4);
-    float inv = 1.0f / std::max(im.white - im.black, 1e-20f);
+    const float ib = effBlack(im), iw = effWhite(im);
+    float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
     bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
@@ -339,7 +345,7 @@ static void rebuildTexture(ImageDoc& im) {
         const float* src = &im.data[p * im.ch];
         float r, g, b;
         if (lut) {
-            float x = std::clamp((src[0] - im.black) * inv, 0.0f, 1.0f);
+            float x = std::clamp((src[0] - ib) * inv, 0.0f, 1.0f);
             if (doGamma) x = powf(x, invGamma);
             int idx = (int)(x * 255.0f + 0.5f);
             rgba[p * 4 + 0] = lut[idx * 3];
@@ -350,14 +356,14 @@ static void rebuildTexture(ImageDoc& im) {
         }
         if (cfaColor) {
             int c = cfaChannelAt(im, (int)(p % im.w), (int)(p / im.w));
-            r = c == 0 ? src[0] : im.black;
-            g = (c == 1 || c == 2) ? src[0] : im.black;
-            b = c == 3 ? src[0] : im.black;
+            r = c == 0 ? src[0] : ib;
+            g = (c == 1 || c == 2) ? src[0] : ib;
+            b = c == 3 ? src[0] : ib;
         }
         else if (im.ch == 1) { r = g = b = src[0]; }
-        else if (im.ch == 2) { r = src[0]; g = src[1]; b = im.black; }
+        else if (im.ch == 2) { r = src[0]; g = src[1]; b = ib; }
         else                 { r = src[0]; g = src[1]; b = src[2]; }
-        float v[3] = { (r - im.black) * inv, (g - im.black) * inv, (b - im.black) * inv };
+        float v[3] = { (r - ib) * inv, (g - ib) * inv, (b - ib) * inv };
         for (int c = 0; c < 3; c++) {
             float x = std::clamp(v[c], 0.0f, 1.0f);
             if (doGamma) x = powf(x, invGamma);
@@ -402,13 +408,18 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
-// Single entry point for range edits: honours the "link across images" mode.
+// Linking is an overlay, never a rewrite: each image keeps its own range, so
+// unlinking restores exactly what every image had before.
+static float effBlack(const ImageDoc& im) { return app.linkRange ? app.linkBlack : im.black; }
+static float effWhite(const ImageDoc& im) { return app.linkRange ? app.linkWhite : im.white; }
+
 static void setRange(ImageDoc& im, float black, float white) {
     if (!(white > black)) return;
-    im.black = black; im.white = white; im.texDirty = true;
     if (app.linkRange) {
         app.linkBlack = black; app.linkWhite = white;
-        for (auto& d : app.images) { d->black = black; d->white = white; d->texDirty = true; }
+        markAllTexDirty();            // shared value changed: every image re-renders
+    } else {
+        im.black = black; im.white = white; im.texDirty = true;
     }
 }
 static void forgetTexture(ImageDoc* im) {
@@ -469,7 +480,7 @@ static psFrame makeFrame(const ImageDoc& im) {
     f.dtype = PS_DTYPE_F32; f.loc = PS_MEM_CPU;
     f.data = (void*)im.data.data();
     f.pitch_bytes = (size_t)im.w * im.ch * sizeof(float);
-    f.black = im.black; f.white = im.white;
+    f.black = effBlack(im); f.white = effWhite(im);
     f.cfa_type = im.cfa; f.cfa_pattern = im.cfaPattern;   // enums mirror psCfa* by construction
     f.pts_us = -1;
     f.name = im.name.c_str();                             // valid only during the call
@@ -535,12 +546,7 @@ static bool g_quietLoad = false;
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
     computeMinMax(*im);
-    if (app.linkRange && app.linkWhite > app.linkBlack) {   // adopt the shared range
-        im->black = app.linkBlack;
-        im->white = app.linkWhite;
-    } else {
-        defaultRange(*im);
-    }
+    defaultRange(*im);            // own range is always meaningful; link only overlays it
     im->texDirty = true;
     app.images.push_back(std::move(im));
     if (!g_quietLoad || app.current < 0) {      // first image still gets shown
@@ -2693,12 +2699,12 @@ static void drawCanvas(ImVec2 avail) {
 
 static void recomputeHistogramIfNeeded(ImageDoc* im) {
     App::HistState& H = app.hist;
-    if (H.img == im && H.dataRev == im->dataRev && H.black == im->black && H.white == im->white &&
+    if (H.img == im && H.dataRev == im->dataRev && H.black == effBlack(*im) && H.white == effWhite(*im) &&
         H.annRev == app.annRev && H.selAnn == app.selectedAnn &&
         H.cfa == im->cfa && H.cfaPattern == im->cfaPattern)
         return;
     H.img = im; H.dataRev = im->dataRev;
-    H.black = im->black; H.white = im->white;
+    H.black = effBlack(*im); H.white = effWhite(*im);
     H.annRev = app.annRev; H.selAnn = app.selectedAnn;
     H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
     memset(H.bins, 0, sizeof H.bins);
@@ -2717,7 +2723,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
     static const char* CFA_SERIES[4] = { "R", "Gr", "Gb", "B" };
     static const char* CH_SERIES[4] = { "ch0", "ch1", "ch2", "ch3" };
     for (int s = 0; s < 4; s++) H.seriesNames[s] = cfa ? CFA_SERIES[s] : CH_SERIES[s];
-    float inv = 256.0f / std::max(im->white - im->black, 1e-20f);
+    float inv = 256.0f / std::max(H.white - H.black, 1e-20f);
     size_t total = (size_t)rw * rh;
     size_t step = std::max<size_t>(1, total / 1000000);   // sample <= ~1M px
     size_t below = 0, above = 0, cnt = 0, values = 0;
@@ -2730,7 +2736,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
             float v = src[0];
             if (std::isfinite(v)) {
                 int s = cfaChannelAt(*im, x, y);
-                float t = (v - im->black) * inv;
+                float t = (v - H.black) * inv;
                 if (t < 0) { below++; H.bins[s][0]++; }
                 else if (t >= 256) { above++; H.bins[s][255]++; }
                 else H.bins[s][(int)t]++;
@@ -2741,7 +2747,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
             for (int c = 0; c < H.nSeries; c++) {
                 float v = src[c];
                 if (!std::isfinite(v)) continue;
-                float t = (v - im->black) * inv;
+                float t = (v - H.black) * inv;
                 if (t < 0) { below++; H.bins[c][0]++; }
                 else if (t >= 256) { above++; H.bins[c][255]++; }
                 else H.bins[c][(int)t]++;
@@ -2946,7 +2952,7 @@ static void drawInspector() {
         static const char* LB3[] = { "R", "G", "B", "A" };
         int nch = im ? im->ch : 1;
         const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
-        float inv = im ? 1.0f / std::max(im->white - im->black, 1e-20f) : 1.0f;
+        float inv = im ? 1.0f / std::max(effWhite(*im) - effBlack(*im), 1e-20f) : 1.0f;
         // fixed widths: the numbers must not shift as the cursor moves
         if (ImGui::BeginTable("px", 3, ImGuiTableFlags_SizingFixedFit)) {
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
@@ -2959,7 +2965,7 @@ static void drawInspector() {
                 if (live) {
                     float v = im->sample(app.hoverX, app.hoverY, c);
                     ImGui::TableNextColumn(); textNumStr(fmtVal(v, im->dtype));
-                    ImGui::TableNextColumn(); textNum("%.4f", (v - im->black) * inv);
+                    ImGui::TableNextColumn(); textNum("%.4f", (v - effBlack(*im)) * inv);
                 } else {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
@@ -3065,16 +3071,21 @@ static void drawInspector() {
         ImGui::SeparatorText("Range (black / white)");
         {   // link: one range for every open image, so frames/files stay comparable
             bool wasLinked = app.linkRange;
-            if (ImGui::Checkbox("link across all images", &app.linkRange) && app.linkRange && !wasLinked) {
-                app.linkBlack = im->black; app.linkWhite = im->white;
-                for (auto& d : app.images) { d->black = im->black; d->white = im->white; d->texDirty = true; }
+            if (ImGui::Checkbox("link across all images", &app.linkRange)) {
+                if (app.linkRange && !wasLinked) {      // seed from what is on screen
+                    app.linkBlack = im->black; app.linkWhite = im->white;
+                }
+                markAllTexDirty();                      // unlink -> each image returns to its own
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("shared range for display only - each image keeps its own,\n"
+                                  "unlink to get them back");
         }
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
         static float bwEdit[2];
         static bool bwEditing = false;
-        if (!bwEditing) { bwEdit[0] = im->black; bwEdit[1] = im->white; }
+        if (!bwEditing) { bwEdit[0] = effBlack(*im); bwEdit[1] = effWhite(*im); }
         ImGui::SetNextItemWidth(-1);
         ImGui::InputFloat2("##bw", bwEdit, "%.5g");
         bwEditing = ImGui::IsItemActive();
@@ -3170,7 +3181,7 @@ static void drawPanelHistogram() {
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
                      - ImGui::GetTextLineHeightWithSpacing();
-        PlotRect hp = beginPlot(xl, yl, im->black, im->white, 0.0f, 1.0f, false, false,
+        PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f, false, false,
                                 std::max(hAvail, 70.0f * app.uiScale));
         if (hp.ok) {
             ImDrawList* hdl = ImGui::GetWindowDrawList();
@@ -4058,6 +4069,7 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
+        "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -4200,6 +4212,11 @@ static void installWakeCallbacks(GLFWwindow* win) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { printUsage(); return 0; }
+    // --bench N: render N frames in a hidden window and report frame times, so
+    // performance can be measured (and regressions caught) instead of guessed.
+    int benchFrames = 0;
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--bench")) benchFrames = std::max(1, atoi(argv[i + 1]));
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -4212,10 +4229,11 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     const char* glslVersion = "#version 130";
 #endif
+    if (benchFrames) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
     glfwMakeContextCurrent(win);
-    glfwSwapInterval(1);
+    glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
     installWakeCallbacks(win);        // before ImGui's backend: it chains to these
     glfwSetDropCallback(win, dropCallback);
 
@@ -4284,10 +4302,19 @@ int main(int argc, char** argv) {
 
     parseCli(argc, argv);
 
+    std::vector<double> benchMs;
+    int benchLeft = benchFrames;
+    if (benchFrames) {                 // exercise every panel, not just the defaults
+        app.showFiles = app.showInspector = app.showRois = app.showAnalysis = true;
+        app.showHistogram = app.showTemporal = app.showProjection = true;
+        benchMs.reserve(benchFrames);
+    }
     while (!glfwWindowShouldClose(win)) {
+        double frameT0 = glfwGetTime();
         // work that must keep animating even without input
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil);
+        if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
         if (app.wakeFrames > 0 || busy) {
             glfwPollEvents();
             if (app.wakeFrames > 0) app.wakeFrames--;
@@ -4525,6 +4552,21 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
+        if (benchFrames) {
+            glFinish();               // include GPU work in the measurement
+            benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
+            if (--benchLeft <= 0) break;
+        }
+    }
+    if (benchFrames && !benchMs.empty()) {
+        std::vector<double> s(benchMs.begin() + std::min<size_t>(5, benchMs.size() - 1), benchMs.end());
+        std::sort(s.begin(), s.end());
+        double sum = 0;
+        for (double v : s) sum += v;
+        fprintf(stderr,
+                "bench: frames=%zu mean=%.2fms median=%.2fms p95=%.2fms max=%.2fms (%.0f fps median)\n",
+                s.size(), sum / s.size(), s[s.size() / 2], s[(size_t)(s.size() * 0.95)],
+                s.back(), 1000.0 / std::max(s[s.size() / 2], 1e-6));
     }
 
     stopSequenceLoader();             // join the worker before tearing anything down
