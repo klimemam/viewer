@@ -1,22 +1,40 @@
 # Dear ImGui モダンデザイン検討 — "Aurora" テーマ
 
 Dear ImGui を「開発のテンションが上がる & 情報が分かりやすい」見た目にするための
-デザイン検討です。**動くコード**(`imgui_theme.py` + `imgui_demo.py`)と、
-このドキュメントの2点セットで構成しています。
+デザイン検討です。構成は3点セット:
+
+1. **C++ 本体への適用済みテーマ** — [core/ui_theme.cpp](../core/ui_theme.cpp)。
+   viewer 起動時に適用され、**View > Theme** でダーク/ライトとアクセント5色を
+   実行中に切り替えられます。
+2. **Python ライブデモ** — `imgui_theme.py` + `imgui_demo.py`(デザイン実験場)。
+3. このドキュメント(設計値と根拠)。
+
+## スクリーンショット(C++ 本体)
+
+**ダーク(既定)**
+
+![viewer dark](img/viewer_dark.png)
+
+**ライト(View > Theme > Light、実行中に切替)**
+
+![viewer light](img/viewer_light.png)
+
+画像キャンバスとルーラーはどちらのテーマでも暗色のまま——計測対象の画像が
+常に主役で、周辺 UI だけが着替える設計です。
+
+## Python デモ(デザイン実験場)
 
 ```
 pip install -r requirements-imgui.txt
 python imgui_demo.py
 ```
 
-デモは本リポジトリの Viewer と同じ画面構成
-(ギャラリー | ビューア | 統計、ツールバー、ステータスバー)を
-Dear ImGui + docking で再現したモックです。画像・サムネイル・ヒストグラムは
+ギャラリー | ビューア | 統計というレイアウトのモックで、Design Lab パネルから
+ダーク/ライト・アクセント色・角丸を**その場で**動かせます。C++ に反映する前の
+色検討はここでやるのが最速です。画像・サムネイル・ヒストグラムは
 すべて手続き生成なので、アセットなしでどこでも起動します。
 
-## スクリーンショット
-
-**ダーク(基本形)**
+**ダーク**
 
 ![dark](img/imgui_dark.png)
 
@@ -127,8 +145,9 @@ ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの
 
 ## 実装メモ
 
-- `imgui_theme.py` は**素の ImGui スタイル値を設定するだけ**なので、
-  pyimgui / imgui-bundle / C++ 本家のどれにも同じ数値で移植できます。
+- テーマは**素の ImGui スタイル値を設定するだけ**です。C++ 版は
+  [core/ui_theme.cpp](../core/ui_theme.cpp)、Python 版は `imgui_theme.py` で、
+  両者は同じ数値を共有しています(片方を変えたらもう片方へ同期)。
 - デモは [imgui-bundle](https://github.com/pthom/imgui_bundle) の
   hello_imgui(docking レイアウト)+ immvision(numpy 画像表示)+
   implot(ヒストグラム)を使用。
@@ -147,14 +166,19 @@ ImGui 1.92 以降はグリフを動的に読み込むため、グリフ範囲の
 日本語 UI にする場合は **Noto Sans JP** / **IBM Plex Sans JP** の ttf を
 リポジトリに追加し、`_load_fonts()` の1行を差し替えるだけで済みます。
 
-## 本体 (C++ 版) との関係
+## C++ 本体への適用状況
 
-このスタディは Python + imgui-bundle で書かれた**見た目の実験場**で、
-本体([core/main.cpp](../core/main.cpp), C++ + Dear ImGui)とは独立しています。
-Aurora テーマは素の ImGui スタイル値だけで構成されているため、
-採用する場合は `ImGui::StyleColorsDark()` を呼んでいる箇所を差し替えるだけで
-本体へ 1:1 移植できます(フォント読み込みも同様)。
-まずはデモを触って方向性を確かめてください。
+| 項目 | 状態 |
+| --- | --- |
+| Aurora テーマ(色・角丸・余白) | ✅ `core/ui_theme.cpp` — 起動時に適用 |
+| ダーク/ライト + アクセント5色の実行時切替 | ✅ View > Theme メニュー |
+| 選択状態のアクセント表示(ツールピル等) | ✅ ツールストリップは選択中=アクセント塗り+白文字 |
+| クリアカラーのテーマ連動 | ✅ `ui_theme::clearColor()` |
+| 実フォント | ✅ 既存実装(Meiryo / ヒラギノ / Noto CJK を 17px で自動検出) |
+| セパレータの「溝」/ タブのオーバーライン | ✅ テーマに内包(該当ウィジェット使用時に有効) |
+| テーマ設定のセッション保存 | ⬜ 未対応(.vsession に `theme`/`accent` を足すだけ) |
 
-なお、かつて存在した PySide6 版ビューワ (`main.py` ほか) は C++ 版に
-置き換えられ、リポジトリからは削除されています。
+C++ 側は vanilla ImGui 1.91 の範囲だけで実装しています(docking 専用色や
+1.92 の新色は不使用)。Python デモにある `no_tab_bar` やカード UI は
+docking/hello_imgui 前提のテクニックなので、固定3ペイン構成の本体には
+そのまま該当しません——本体は元からタブバーレスなので既に達成済みです。

@@ -135,12 +135,13 @@ flowchart LR
 4. params_schema → 測定パラメータ UI 自動生成、pybind11 埋め込み
 5. WebSocket ブリッジ([pixelscope.html](pixelscope.html) をリモートフロントエンドに)
 
-## UI デザインスタディ(Dear ImGui モダン化)
+## UI テーマ("Aurora")
 
-ImGui UI のモダン化検討 → **[docs/imgui_modern_design.md](docs/imgui_modern_design.md)**。
-"Aurora" テーマ(素の ImGui スタイル値なので C++ 側へ 1:1 移植可)+
-「ImGui 感を消す」テクニック集(実フォント / アイコンツールバー /
-タブバー非表示 / カード UI)を、Python 製のライブデモ付きでまとめています:
+本体には [core/ui_theme.cpp](core/ui_theme.cpp) の "Aurora" テーマが組み込まれており、
+**View > Theme** からダーク/ライトとアクセント5色を実行中に切り替えられます。
+設計値と根拠、「ImGui 感を消す」テクニック集は
+**[docs/imgui_modern_design.md](docs/imgui_modern_design.md)** に。
+色の試行錯誤用に Python 製ライブデモも同梱しています:
 
 ```bash
 pip install -r requirements-imgui.txt
