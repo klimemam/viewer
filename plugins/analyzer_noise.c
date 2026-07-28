@@ -28,7 +28,7 @@ static int cmpf(const void* a, const void* b) {
 }
 
 static int32_t analyze(const psFrame* in, const psRect* roi,
-                       const psAnalyzeSink* sink, char* err, size_t err_cap) {
+                       const psAnalyzeSink2* sink, char* err, size_t err_cap) {
     psRect r;
     int cfa, nb, b;
     uint32_t tilesX, tilesY;
@@ -135,9 +135,14 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-static const psAnalyzerV1 DESC = { 1u, PS_CAP_CPU, "noise/floor", analyze, {0} };
+/* V2 registration for the description alone: the menu shows the precondition
+ * where the user picks the tool, instead of a host-side lookup table. */
+static const psAnalyzerV2 DESC = {
+    2u, PS_CAP_CPU, "noise/floor",
+    "flat-ish ROI; tile-median floor tolerates some texture", NULL, analyze, {0}
+};
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < 1u) return 1;
-    return host->register_analyzer(host->ctx, &DESC);
+    if (!host || host->abi_version < 2u || !host->register_analyzer2) return 1;
+    return host->register_analyzer2(host->ctx, &DESC);
 }
