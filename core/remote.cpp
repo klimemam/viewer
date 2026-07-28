@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <poll.h>      // the timed pipe reads in runSshCommand
+#include <time.h>      // clock_gettime for their deadline
 #endif
 
 namespace remote {
