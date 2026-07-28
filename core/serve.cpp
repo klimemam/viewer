@@ -9,6 +9,7 @@
 #include "plugin_host.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <csignal>
 #include <cmath>
@@ -98,6 +99,10 @@ struct NpyFile {
     uint32_t dtype = DT_COUNT;
     bool bigEndian = false, fortran = false;
     int w = 0, h = 0, ch = 1, frames = 1;
+    // shape as declared in the file, before the w/h/ch/frames interpretation:
+    // the LIST metadata shows what the file says, not what the viewer made of it
+    int ndim = 0;
+    uint32_t odims[4] = { 0, 0, 0, 0 };
     uint64_t dataOffset = 0;
     size_t elemSize = 0;
     bool ok = false;
@@ -149,6 +154,8 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
         dims.push_back(atoll(hdr.c_str() + i));
         while (i < close && hdr[i] != ',') i++;
     }
+    n.ndim = (int)dims.size();
+    for (size_t i = 0; i < dims.size() && i < 4; i++) n.odims[i] = (uint32_t)dims[i];
     if (dims.size() == 2)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = 1; }
     else if (dims.size() == 3) {
         if (dims[2] <= 4)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = (int)dims[2]; }
@@ -278,6 +285,59 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
 // bottom of this file is one transport, and a WebSocket front end (the browser
 // client this project has always wanted) is another - same requests, same
 // replies, same code here. Only the framing differs.
+// Version the CLIENT announced in HELLO. A v2 viewer talking to this server
+// must get the LIST shape it knows how to parse; defaulting to 2 keeps a client
+// that never said hello (none of ours) on the safe format.
+static uint32_t g_clientVersion = 2;
+
+static bool isNpySuffix(const std::string& name) {
+    if (name.size() < 4) return false;
+    std::string ext = name.substr(name.size() - 4);
+    for (char& c : ext) c = (char)tolower((unsigned char)c);
+    return ext == ".npy";
+}
+
+// C++17 has no portable file_clock -> system_clock conversion (that is C++20);
+// anchoring the difference against "now" on both clocks is exact to well under
+// a second, which a directory listing does not care about.
+static int64_t unixMtime(const std::filesystem::path& p) {
+    std::error_code ec;
+    auto ft = std::filesystem::last_write_time(p, ec);
+    if (ec) return 0;
+    auto sys = std::chrono::system_clock::now() +
+               std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                   ft - std::filesystem::file_time_type::clock::now());
+    return (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+               sys.time_since_epoch()).count();
+}
+
+// One v3 listing entry. `peekBudget` bounds how many .npy headers one LIST may
+// open: a directory of thousands of files must not turn a listing into
+// thousands of file opens (the header itself is a few hundred bytes to read).
+static void putListEntryV3(Buf& out, const std::filesystem::path& full,
+                           const std::string& name, bool dir, uint64_t size,
+                           int64_t mtime, int& peekBudget) {
+    NpyFile n;
+    bool meta = false;
+    if (!dir && isNpySuffix(name) && peekBudget > 0) {
+        peekBudget--;
+        std::string e2;
+        meta = parseNpyHeader(n, full.u8string(), e2);   // reads only the header
+    }
+    out.putStr(name);
+    out.putU32((dir ? LE_DIR : 0u) | (meta ? LE_META : 0u));
+    out.putU32((uint32_t)(size & 0xFFFFFFFFu));
+    out.putU32((uint32_t)(size >> 32));
+    out.putU32((uint32_t)((uint64_t)mtime & 0xFFFFFFFFu));
+    out.putU32((uint32_t)((uint64_t)mtime >> 32));
+    if (meta) {
+        out.putU32(n.dtype);
+        out.putU32((uint32_t)n.ndim);
+        for (int i = 0; i < 4; i++) out.putU32(n.odims[i]);
+        out.putU32(n.fortran ? 1u : 0u);
+    }
+}
+
 static void handleList(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad LIST"); return; }
@@ -295,18 +355,31 @@ static void handleList(Buf& in) {
               [](const std::filesystem::directory_entry& a, const std::filesystem::directory_entry& b) {
                   return a.path().filename().u8string() < b.path().filename().u8string();
               });
+    if (g_clientVersion < 3) {
+        out.putU32((uint32_t)entries.size());
+        for (auto& e : entries) {
+            std::error_code e2;
+            bool dir = e.is_directory(e2);
+            out.putStr(e.path().filename().u8string());
+            out.putU32(dir ? 1u : 0u);
+            // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
+            // routinely, and a silently clamped size is the failure mode this tool
+            // exists to avoid
+            uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
+            out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
+            out.putU32((uint32_t)(sz >> 32));
+        }
+        sendMsg(MSG_OK, out);
+        return;
+    }
+    int peekBudget = 256;
     out.putU32((uint32_t)entries.size());
     for (auto& e : entries) {
         std::error_code e2;
         bool dir = e.is_directory(e2);
-        out.putStr(e.path().filename().u8string());
-        out.putU32(dir ? 1u : 0u);
-        // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
-        // routinely, and a silently clamped size is the failure mode this tool
-        // exists to avoid
         uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
-        out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
-        out.putU32((uint32_t)(sz >> 32));
+        putListEntryV3(out, e.path(), e.path().filename().u8string(), dir, sz,
+                       unixMtime(e.path()), peekBudget);
     }
     sendMsg(MSG_OK, out);
 }
@@ -814,6 +887,8 @@ static void handleMeasure(Buf& in) {
 void handleRequest(uint32_t type, Buf& in) {
     switch (type) {
         case MSG_HELLO: {
+            uint32_t cv = 0;
+            if (in.getU32(cv) && cv) g_clientVersion = cv;   // gates the LIST shape
             Buf out;
             out.putU32(VERSION);
             out.putStr("viewer --serve");

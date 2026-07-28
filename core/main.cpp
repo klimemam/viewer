@@ -7056,6 +7056,40 @@ static void drawPanelAnalysis() {
 // Files, but the two do different jobs: Files lists what is already OPEN (and
 // closes it), this one BROWSES a machine and decides what to open next. Sharing
 // a window made both harder to read once a server had more than a few folders.
+// ---- remote listing row formatting ----
+static std::string fmtBytesHuman(uint64_t n) {
+    char b[32];
+    if (n >= (1ull << 30))      snprintf(b, sizeof b, "%.1f GB", n / 1073741824.0);
+    else if (n >= (1ull << 20)) snprintf(b, sizeof b, "%.1f MB", n / 1048576.0);
+    else if (n >= 1024)         snprintf(b, sizeof b, "%.1f KB", n / 1024.0);
+    else                        snprintf(b, sizeof b, "%llu B", (unsigned long long)n);
+    return b;
+}
+static std::string fmtUnixTime(int64_t t) {
+    if (t <= 0) return "-";                    // v2 peer / unreadable: unknown
+    time_t tt = (time_t)t;
+    struct tm tmv {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char b[32];
+    strftime(b, sizeof b, "%Y-%m-%d %H:%M", &tmv);
+    return b;
+}
+// "(3000,4000) u16" - the file's declared shape, so what the browser promises is
+// what META will later confirm.
+static std::string fmtEntryShape(const remote::Entry& e) {
+    if (!e.hasMeta) return "-";
+    std::string s = "(";
+    for (int i = 0; i < e.ndim; i++)
+        s += (i ? "," : "") + std::to_string(e.dims[i]);
+    s += ") " + e.dtype;
+    if (e.fortran) s += " F";                  // Fortran order: rare enough to flag
+    return s;
+}
+
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     ImGui::PushID("remotetree");
@@ -7139,14 +7173,63 @@ static void drawPanelRemote() {
         ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
     }
+    // The metadata columns exist from protocol 3 on. Say so once, up here - a
+    // "-" in every row of every column explains nothing.
+    {
+        int pv = 0;
+        {
+            std::lock_guard<std::mutex> lk(app.sesMtx);
+            if (app.remoteSession) pv = app.remoteSession->peerVersion();
+        }
+        if (pv > 0 && pv < 3)
+            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
+                               "peer is protocol %d - File > Update remote peer "
+                               "enables shape / date columns", pv);
+    }
     ImGui::Separator();
+    if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
+        std::string d = B.dir;
+        size_t s = d.find_last_of('/');
+        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                        : d.substr(0, s));
+    }
     // The listing scrolls on its own so the header above never leaves the view.
-    if (ImGui::BeginChild("entries", ImVec2(0, 0), ImGuiChildFlags_None)) {
-        if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
-            std::string d = B.dir;
-            size_t s = d.find_last_of('/');
-            remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                            : d.substr(0, s));
+    enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+    if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
+                                       ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                                       ImGuiTableFlags_SortTristate)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
+                                        ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
+        ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
+                                                 ImGuiTableColumnFlags_NoSort, 0.0f, RB_COL_SHAPE);
+        ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed |
+                                        ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_SIZE);
+        ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
+                                            ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
+        ImGui::TableHeadersRow();
+        // `shown` is rebuilt every frame, so sorting it here honors a changed
+        // sort spec, a fresh listing and the filter in one place. Directories
+        // sort before files no matter the key - this is a browser, not a table
+        // of numbers.
+        if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
+            std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+                const remote::Entry& a = B.entries[ia];
+                const remote::Entry& b = B.entries[ib];
+                if (a.dir != b.dir) return a.dir;
+                for (int s = 0; s < sp->SpecsCount; s++) {
+                    const ImGuiTableColumnSortSpecs& c = sp->Specs[s];
+                    int cmp = 0;
+                    switch (c.ColumnUserID) {
+                        case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
+                        case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
+                        default:           cmp = a.name.compare(b.name); break;
+                    }
+                    if (cmp) return c.SortDirection == ImGuiSortDirection_Descending ? cmp > 0
+                                                                                     : cmp < 0;
+                }
+                return false;
+            });
         }
         ImGuiListClipper clip;
         clip.Begin((int)shown.size());
@@ -7154,10 +7237,12 @@ static void drawPanelRemote() {
         for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
             const remote::Entry& e = B.entries[shown[row]];
             ImGui::PushID(shown[row]);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            if (ImGui::Selectable(lb.c_str()) && servable) {
+            if (ImGui::Selectable(lb.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && servable) {
                 std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
                 if (e.dir) remoteBrowseTo(joined);
                 else       openRemote(makeRemoteUrl(B.host, joined));
@@ -7166,16 +7251,17 @@ static void drawPanelRemote() {
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("only .npy is served remotely");
             }
-            if (!e.dir && e.size) {
-                ImGui::SameLine();
-                ImGui::TextDisabled(e.size >= (1u << 30) ? "%.1f GB" : "%.1f MB",
-                                    e.size >= (1u << 30) ? e.size / 1073741824.0
-                                                         : e.size / 1048576.0);
-            }
+            ImGui::TableNextColumn();
+            if (!e.dir && isNpyName(e.name)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
+            ImGui::TableNextColumn();
+            if (!e.dir) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
+            ImGui::TableNextColumn();
+            if (e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            else if (!e.dir) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
+        ImGui::EndTable();
     }
-    ImGui::EndChild();
     ImGui::PopID();
 }
 
@@ -8051,6 +8137,68 @@ static int remoteSelfTest(const char* exe, const char* path) {
         return 1;
     }
     const ImageDoc& ref = *cur();
+    int bad = 0;
+    {   // LIST v3: the listing's metadata must agree with the local loader
+        std::string dir = path, base = path;
+        size_t sl = dir.find_last_of("/\\");
+        if (sl == std::string::npos) dir = ".";
+        else { dir = dir.substr(0, sl); base = base.substr(sl + 1); }
+        std::vector<remote::Entry> ents;
+        if (!s.list(dir, ents, err)) {
+            fprintf(stderr, "selftest LIST: %s\n", err.c_str());
+            return 1;
+        }
+        const remote::Entry* me = nullptr;
+        for (const auto& e : ents) if (e.name == base) me = &e;
+        for (const auto& e : ents)                 // grouping may have folded it
+            if (!me && e.group)
+                for (const auto& mm : e.members) if (mm == base) me = &e;
+        size_t bad0 = 0;
+        if (!me) {
+            fprintf(stderr, "selftest LIST: %s not in the listing of %s\n",
+                    base.c_str(), dir.c_str());
+            bad0++;
+        } else {
+            uint64_t px = 1;
+            for (int i = 0; i < me->ndim; i++) px *= me->dims[i];
+            uint64_t refPx = (uint64_t)m.frames * ref.w * ref.h * ref.ch;
+            if (!me->hasMeta || me->dtype != m.dtype || px != refPx) {
+                fprintf(stderr, "selftest LIST: meta mismatch (dtype %s vs %s, "
+                                "%llu vs %llu samples)\n",
+                        me->dtype.c_str(), m.dtype.c_str(),
+                        (unsigned long long)px, (unsigned long long)refPx);
+                bad0++;
+            }
+            if (me->mtime <= 0) {
+                fprintf(stderr, "selftest LIST: mtime missing (%lld unix s)\n",
+                        (long long)me->mtime);
+                bad0++;
+            }
+        }
+        fprintf(stderr, "selftest: LIST v3 %s: %s  %s  mtime %lld unix s : %s\n",
+                base.c_str(), me ? fmtEntryShape(*me).c_str() : "?",
+                me ? fmtBytesHuman(me->size).c_str() : "?",
+                me ? (long long)me->mtime : 0, bad0 ? "FAIL" : "ok");
+        bad += bad0 ? 1 : 0;
+    }
+    {   // A v2 peer's LIST reply must parse into "unknown" metadata, not into an
+        // error - this is the compatibility contract, tested without a v2 binary.
+        std::vector<uint8_t> pl;
+        auto pu32 = [&](uint32_t v) { pl.insert(pl.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
+        auto pstr = [&](const std::string& t) { pu32((uint32_t)t.size());
+                                                pl.insert(pl.end(), t.begin(), t.end()); };
+        pu32(2);
+        pstr("a.npy"); pu32(0); pu32(5); pu32(0);      // file, 5 bytes
+        pstr("sub");   pu32(1); pu32(0); pu32(0);      // directory
+        std::vector<remote::Entry> v2;
+        std::string perr;
+        bool ok = remote::parseListPayload(pl, 2, v2, perr) && v2.size() == 2 &&
+                  !v2[0].dir && v2[0].size == 5 && !v2[0].hasMeta &&
+                  v2[0].mtime == 0 && !v2[0].group && v2[1].dir;
+        fprintf(stderr, "selftest: LIST v2-compat parse (missing fields -> unknown): %s\n",
+                ok ? "ok" : "FAIL");
+        bad += ok ? 0 : 1;
+    }
     struct Case { int x, y, w, h, step; };
     const Case cases[] = {
         { 0, 0, ref.w, ref.h, 1 },                              // whole frame
@@ -8058,7 +8206,6 @@ static int remoteSelfTest(const char* exe, const char* path) {
         { ref.w / 4, ref.h / 4, ref.w / 2, ref.h / 2, 1 },      // zoomed-in crop
         { 1, 1, 17, 13, 2 },                                    // odd rect, odd stride
     };
-    int bad = 0;
     for (const Case& c : cases) {
         std::vector<float> got;
         int gw = 0, gh = 0, gch = 0;

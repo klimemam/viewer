@@ -12,7 +12,27 @@
 
 namespace remote {
 
-struct Entry { std::string name; bool dir = false; uint64_t size = 0; };
+struct Entry {
+    std::string name;
+    bool dir = false;
+    uint64_t size = 0;
+    // Protocol v3 listing extras. A v2 peer never sends them, so the defaults
+    // double as the "unknown" values the UI renders as "-".
+    int64_t mtime = 0;                 // unix seconds; 0 = unknown
+    bool hasMeta = false;              // the server peeked this .npy's header
+    std::string dtype;                 // "u16", "f32", ...; empty = unknown
+    int ndim = 0;
+    uint32_t dims[4] = { 0, 0, 0, 0 }; // numpy declaration order, 0-padded
+    bool fortran = false;
+    bool group = false;                // synthetic row for a numbered sequence
+    uint32_t frames = 0;               // member count when group
+    std::vector<std::string> members;  // member file names (no directory part)
+};
+
+// LIST reply payload -> entries, in the shape `peerVersion` promises. Split out
+// of Session so the v2-compat path stays testable without a live v2 peer.
+bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
+                      std::vector<Entry>& out, std::string& err);
 
 struct Meta {
     int w = 0, h = 0, ch = 1, frames = 1;

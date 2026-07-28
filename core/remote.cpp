@@ -377,26 +377,59 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
     return true;
 }
 
+bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
+                      std::vector<Entry>& out, std::string& err) {
+    R r(payload);
+    uint32_t n = 0;
+    if (!r.u32(n)) { err = "bad LIST reply"; return false; }
+    out.clear();
+    for (uint32_t i = 0; i < n; i++) {
+        Entry e;
+        uint32_t d = 0, lo = 0, hi = 0;
+        if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi)) {
+            err = "bad LIST reply"; return false;
+        }
+        e.size = ((uint64_t)hi << 32) | lo;
+        if (peerVersion < 3) {              // v2: name/dir/size was the whole row
+            e.dir = d != 0;
+            out.push_back(std::move(e));
+            continue;
+        }
+        e.dir = (d & rp::LE_DIR) != 0;
+        uint32_t mlo = 0, mhi = 0;
+        if (!r.u32(mlo) || !r.u32(mhi)) { err = "bad LIST reply"; return false; }
+        e.mtime = (int64_t)(((uint64_t)mhi << 32) | mlo);
+        if (d & rp::LE_META) {
+            uint32_t dt = 0, nd = 0, fo = 0;
+            if (!r.u32(dt) || !r.u32(nd)) { err = "bad LIST reply"; return false; }
+            for (uint32_t& v : e.dims) if (!r.u32(v)) { err = "bad LIST reply"; return false; }
+            if (!r.u32(fo)) { err = "bad LIST reply"; return false; }
+            e.hasMeta = true;
+            e.dtype = rp::dtypeName(dt);
+            e.ndim = (int)std::min(nd, 4u);
+            e.fortran = fo != 0;
+        }
+        if (d & rp::LE_GROUP) {
+            uint32_t cnt = 0;
+            if (!r.u32(cnt) || cnt > 1000000) { err = "bad LIST reply"; return false; }
+            e.group = true;
+            e.frames = cnt;
+            e.members.resize(cnt);
+            for (auto& m : e.members)
+                if (!r.str(m)) { err = "bad LIST reply"; return false; }
+        }
+        out.push_back(std::move(e));
+    }
+    return true;
+}
+
 bool Session::list(const std::string& path, std::vector<Entry>& out, std::string& err) {
     W w; w.str(serverPath(path));
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_LIST, w.b, err) || !recv(type, reply, err)) return false;
-    R r(reply);
-    if (type != rp::MSG_OK) { r.str(err); return false; }
-    uint32_t n = 0;
-    if (!r.u32(n)) { err = "bad LIST reply"; return false; }
-    out.clear();
-    for (uint32_t i = 0; i < n; i++) {
-        Entry e; uint32_t d = 0, lo = 0, hi = 0;
-        if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi)) {
-            err = "bad LIST reply"; return false;
-        }
-        e.dir = d != 0;
-        e.size = ((uint64_t)hi << 32) | lo;
-        out.push_back(std::move(e));
-    }
-    return true;
+    if (type != rp::MSG_OK) { R r(reply); r.str(err); return false; }
+    return parseListPayload(reply, peerVersion_, out, err);
 }
 
 bool Session::meta(const std::string& path, Meta& out, std::string& err) {
