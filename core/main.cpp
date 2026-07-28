@@ -7258,6 +7258,34 @@ static std::string abValueUnit(const std::string&) {
     return "DN";
 }
 
+// ...and WHOSE range that value is plotted against. It has to name the range
+// actually in force: with the union default the x axis spans A and B together,
+// and an axis that still says "A's black-white range" is simply telling the
+// reader something untrue about the picture in front of them.
+// Mode 0 is not an exception. Each side keeps its own STRETCH, but the two
+// histograms are still binned on A's black/white - one bin grid, or the curves
+// are not comparable at all (see recomputeHistogramIfNeeded) - so naming A's
+// range there stays true.
+static const char* abRangeSaid(bool haveB) {
+    if (!haveB) return "black-white range";
+    return app.compareRangeMode == 2 ? "A and B combined range" : "A's black-white range";
+}
+
+// The histogram's x axis label, built in one place so --range-selftest can
+// print the exact string the panel draws.
+static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
+    char xl[192];
+    const std::string xu = abValueUnit(a->dtype);
+    const char* xr = abRangeSaid(b != nullptr);
+    if (b && b->dtype != a->dtype)
+        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins both sides)"
+                                "  -  A %s / B %s, DTYPE MISMATCH",
+                 xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str());
+    else
+        snprintf(xl, sizeof xl, "pixel value (%s, %s)", xu.c_str(), xr);
+    return xl;
+}
+
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
@@ -7365,16 +7393,8 @@ static void drawPanelHistogram() {
         else
             snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)"
                                                 : "pixel count (max %u)", H.maxBin);
-        char xl[176];
-        const std::string xu = abValueUnit(im->dtype);
-        if (Bim && Bim->dtype != im->dtype)
-            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range bins both) "
-                                    " -  A %s / B %s, DTYPE MISMATCH",
-                     xu.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
-        else if (Bim)
-            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range)", xu.c_str());
-        else
-            snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", xu.c_str());
+        const std::string xlBuf = abHistXLabel(im, Bim);
+        const char* xl = xlBuf.c_str();
 
         // one curve, one way to draw it: filled bars, solid outline, dashed
         // outline. The staircase is built once and reused by all three.
@@ -7806,14 +7826,19 @@ static void drawPanelProjection() {
     auto onePlot = [&](bool horizontal, bool wantA, bool wantB) {
         float x0, x1;
         xRange(horizontal, x0, x1);
-        char yl[128];
+        char yl[176];
+        // "display range" is effBlack/effWhite, which with compare on is the A/B
+        // range - so say which one, exactly as the histogram's x axis does
+        char yr[80] = "";
+        if (app.projYMode == 1)
+            snprintf(yr, sizeof yr, ", %s", abRangeSaid(Bim != nullptr));
         if (Bim && Bim->dtype != im->dtype)
-            snprintf(yl, sizeof yl, "%s value (%s)  -  A %s / B %s, DTYPE MISMATCH",
+            snprintf(yl, sizeof yl, "%s value (%s%s)  -  A %s / B %s, DTYPE MISMATCH",
                      modes[std::clamp(app.projMode, 0, 2)], abValueUnit(im->dtype).c_str(),
-                     im->dtype.c_str(), Bim->dtype.c_str());
+                     yr, im->dtype.c_str(), Bim->dtype.c_str());
         else
-            snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
-                     abValueUnit(im->dtype).c_str());
+            snprintf(yl, sizeof yl, "%s value (%s%s)", modes[std::clamp(app.projMode, 0, 2)],
+                     abValueUnit(im->dtype).c_str(), yr);
         PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
                                 x0, x1, yLo, yHi, true, false, each);
         if (!pr.ok) return;
@@ -14178,6 +14203,22 @@ int main(int argc, char** argv) {
                     g_abRangeDefault >= 0 && g_abRangeDefault < 3 ? SHARE[g_abRangeDefault] : "?",
                     g_abRangeDefault == 2 ? "" : "  <- EXPECTED 2 (union-auto)");
             if (g_abRangeDefault != 2) bad++;
+        }
+        {   // The axis label has to name the range ACTUALLY in force. It read
+            // "A's black-white range" in every mode, including the union - a
+            // claim about the picture that the picture does not support.
+            int save = app.compareRangeMode;
+            for (int sh = 0; sh < 3; sh++) {
+                app.compareRangeMode = sh;
+                std::string lab = abHistXLabel(cur(), cmpB());
+                bool named = sh == 2 ? lab.find("A and B combined") != std::string::npos
+                                     : lab.find("A\'s black-white") != std::string::npos;
+                fprintf(stderr, "rangeselftest: hist x axis | %-11s | %s | %s\n",
+                        SHARE[sh], lab.c_str(),
+                        named ? "names the range in force" : "WRONG");
+                if (!named) bad++;
+            }
+            app.compareRangeMode = save;
         }
         for (int m = 0; m < 3; m++) {
             app.rangeScope = m == 0 ? 0 : 1;
