@@ -9883,6 +9883,7 @@ static std::string g_closeSelftest;     // --close-selftest <dir>: close per sta
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
+static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 
 static void printUsage() {
     printf(
@@ -10013,6 +10014,8 @@ static void parseCli(int argc, char** argv) {
             g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--localbrowse-selftest") {
             g_localbrowseSelftest = next();        // handled in main()
+        } else if (a == "--verify-selftest") {
+            g_verifySelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -11241,6 +11244,326 @@ int main(int argc, char** argv) {
             }
         }
         fprintf(stderr, "closeselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // VERIFICATION ADDITION (functional-verification agent, not part of the
+    // feature work): the corners of the close / batch rules that the six
+    // feature selftests do not reach - non-contiguous stacks, the Ctrl+Alt+W
+    // escape hatch, compare-B left dangling, prune's reference set, a move
+    // issued mid-load, closeBatch against a queued remote open, and the
+    // remote in-flight drop actually being the path that catches a fetch.
+    if (!g_verifySelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        auto reload = [&]() {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            loadAll();
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "verifyselftest: %-46s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+
+        // ---- V1: a stack whose frames are NOT contiguous in app.images ----
+        reload();
+        if (app.seqs.size() < 3) {
+            fprintf(stderr, "verifyselftest: need 3 stacks under %s\n", g_verifySelftest.c_str());
+            return 1;
+        }
+        {   // interleave: round-robin the three stacks so no stack is a run
+            std::vector<std::unique_ptr<ImageDoc>> mixed;
+            for (size_t k = 0; mixed.size() < app.images.size(); k++)
+                for (auto& d : app.images)
+                    if (d && (size_t)d->seqIndex == k) mixed.push_back(std::move(d));
+            for (auto& d : app.images) if (d) mixed.push_back(std::move(d));
+            app.images.swap(mixed);
+            app.current = 0;
+        }
+        {
+            int a0 = app.seqs[0].id, a1 = app.seqs[1].id, a2 = app.seqs[2].id;
+            std::vector<int> f1 = framesOfSeq(a1);
+            bool contiguous = true;                 // prove the fixture is nasty
+            for (size_t i = 1; i < f1.size(); i++)
+                if (f1[i] != f1[i - 1] + 1) contiguous = false;
+            int before = (int)app.images.size(), n1 = (int)f1.size();
+            closeStack(a1);
+            fprintf(stderr, "verifyselftest: V1 interleaved(contig=%d) closeStack(%d): "
+                            "images %d->%d (-%d), survivors %zu/%zu frames\n",
+                    contiguous ? 1 : 0, a1, before, (int)app.images.size(), n1,
+                    framesOfSeq(a0).size(), framesOfSeq(a2).size());
+            check(!contiguous, "V1 fixture really is non-contiguous");
+            check((int)app.images.size() == before - n1 && framesOfSeq(a1).empty() &&
+                  framesOfSeq(a0).size() == 5 && framesOfSeq(a2).size() == 5,
+                  "V1 non-contiguous closeStack keeps neighbours");
+        }
+
+        // ---- V2: Ctrl+Alt+W on a middle frame leaves a coherent stack ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            std::vector<int> fr = framesOfSeq(sid);
+            int want = (int)fr.size() - 1;
+            uint64_t revBefore = app.imagesRev;
+            selectImage(fr[fr.size() / 2]);
+            int goneIndex = cur()->seqIndex;
+            closeCurrent(true);                     // Ctrl+Alt+W
+            std::vector<int> after = framesOfSeq(sid);
+            bool gap = false;                       // the removed seqIndex is absent
+            for (int idx : after) if (app.images[idx]->seqIndex == goneIndex) gap = true;
+            fprintf(stderr, "verifyselftest: V2 Ctrl+Alt+W frame %d of stack %d: "
+                            "%zu frames left, seqs=%zu, imagesRev %llu->%llu\n",
+                    goneIndex, sid, after.size(), app.seqs.size(),
+                    (unsigned long long)revBefore, (unsigned long long)app.imagesRev);
+            check((int)after.size() == want && !gap, "V2 single-frame close leaves N-1 frames");
+            check(seqInfo(sid) != nullptr, "V2 stack survives a single-frame close");
+            check(app.imagesRev != revBefore, "V2 imagesRev bumped (Files cache)");
+        }
+
+        // ---- V3: closing the LAST frame of a stack drops the SeqInfo ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            while (framesOfSeq(sid).size() > 1) {
+                selectImage(framesOfSeq(sid).front());
+                closeCurrent(true);
+            }
+            selectImage(framesOfSeq(sid).front());
+            closeCurrent(true);                     // the last one
+            fprintf(stderr, "verifyselftest: V3 emptied stack %d one frame at a time: "
+                            "seqInfo=%s, frames=%zu\n",
+                    sid, seqInfo(sid) ? "STILL THERE" : "gone", framesOfSeq(sid).size());
+            check(seqInfo(sid) == nullptr && framesOfSeq(sid).empty(),
+                  "V3 last-frame close drops the SeqInfo");
+        }
+
+        // ---- V4: compare-B pointing into a closed stack ----
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(app.seqs[0].id).front());
+            setCompareB(app.images[framesOfSeq(sid)[1]].get());
+            app.compareMode = App::CmpWipe;
+            bool had = resolveB() != nullptr;
+            closeStack(sid);
+            fprintf(stderr, "verifyselftest: V4 closeStack(%d) with B inside: "
+                            "hadB=%d uid=%llu name='%s' seq=%d resolveB=%p\n",
+                    sid, had ? 1 : 0, (unsigned long long)app.compareBUid,
+                    app.compareB.c_str(), app.compareBSeq, (void*)resolveB());
+            check(had, "V4 B really pointed into the stack");
+            check(app.compareBUid == 0 && app.compareB.empty() && !resolveB(),
+                  "V4 closeStack clears a dangling compare-B");
+        }
+        // ---- V4b: the Ctrl+Alt+W escape hatch and a dangling compare-B.
+        // ensureCompareB() re-points B away from cur(), so "close the frame that
+        // IS B" cannot be reached from the UI; this pins B by hand to probe
+        // whether closeCurrent(frameOnly) does the closeImages() cleanup at all.
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(sid)[1]);
+            app.compareBUid = cur()->uid;           // white-box: B == the current frame
+            app.compareB = cur()->name;
+            app.compareBSeq = cur()->seqIndex;
+            app.compareMode = App::CmpWipe;
+            std::string bname = app.compareB;
+            closeCurrent(true);                     // close exactly the B frame
+            std::string leftName = app.compareB;
+            // first resolveB() only drops the stale uid and returns null; the
+            // SECOND one falls through to the name path, which is why
+            // closeImages() clears the name and this path must too
+            ImageDoc* b1 = resolveB();
+            ImageDoc* b2 = resolveB();
+            fprintf(stderr, "verifyselftest: V4b Ctrl+Alt+W on the B frame (B pinned by "
+                            "hand): saved '%s', name left behind '%s', "
+                            "resolveB #1 -> %s, resolveB #2 -> %s\n",
+                    bname.c_str(), leftName.c_str(),
+                    b1 ? b1->name.c_str() : "(null)",
+                    b2 ? (b2->path + " seq " + std::to_string(b2->seqId)).c_str() : "(null)");
+            check(leftName.empty(), "V4b frameOnly close clears the compare-B name");
+            check(b2 == nullptr, "V4b closed B does not re-latch onto a same-named frame");
+        }
+
+        // ---- V5: prune must keep batches referenced only by a queue ----
+        reload();
+        {
+            int b1 = newBatch(uniqueBatchName("qseq"));
+            int b2 = newBatch(uniqueBatchName("qrb"));
+            int b3 = newBatch(uniqueBatchName("qload"));
+            int b4 = newBatch(uniqueBatchName("qnone"));
+            App::PendingGroup pg; pg.name = "x"; pg.files.push_back("x.npy"); pg.batchId = b1;
+            app.seqQueue.push_back(pg);
+            app.rbOpenQueue.push_back({ "", { "y.npy" }, "y", b2 });
+            app.loadBatchId = b3;
+            pruneEmptyBatches();
+            auto live = [&](int id) {
+                for (const auto& b : app.batches) if (b.id == id) return true;
+                return false;
+            };
+            fprintf(stderr, "verifyselftest: V5 prune with refs: seqQueue=%d rbOpen=%d "
+                            "loadBatchId=%d unreferenced=%d\n",
+                    live(b1) ? 1 : 0, live(b2) ? 1 : 0, live(b3) ? 1 : 0, live(b4) ? 1 : 0);
+            check(live(b1) && live(b2) && live(b3), "V5 prune keeps queue-referenced batches");
+            check(!live(b4), "V5 prune drops the unreferenced batch");
+            // ---- V5b: closeBatch removes the queued remote open too ----
+            size_t rbBefore = app.rbOpenQueue.size();
+            closeBatch(b2);
+            fprintf(stderr, "verifyselftest: V5b closeBatch(qrb): rbOpenQueue %zu->%zu, "
+                            "batch %s\n", rbBefore, app.rbOpenQueue.size(),
+                    live(b2) ? "STILL THERE" : "gone");
+            check(app.rbOpenQueue.size() == rbBefore - 1 && !live(b2),
+                  "V5b closeBatch purges its rbOpenQueue entry");
+            app.seqQueue.clear();
+            app.rbOpenQueue.clear();
+            app.loadBatchId = 0;
+        }
+
+        // ---- V6: move a stack that is still loading ----
+        {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            int movedSeq = 0, target = 0;
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {    // catch it mid-load
+                pumpSequenceAndQueue();
+                if (!movedSeq && app.seqRunning && app.seqLoadingId &&
+                    framesOfSeq(app.seqLoadingId).size() >= 1 &&
+                    framesOfSeq(app.seqLoadingId).size() < 5) {
+                    movedSeq = app.seqLoadingId;
+                    target = newBatch(uniqueBatchName("midload"));
+                    moveStackToBatch(movedSeq, target);
+                }
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            int off = 0;
+            std::vector<int> fr = movedSeq ? framesOfSeq(movedSeq) : std::vector<int>();
+            for (int idx : fr) if (app.images[idx]->batchId != target) off++;
+            fprintf(stderr, "verifyselftest: V6 move-mid-load stack %d: %zu frames, "
+                            "%d off-batch\n", movedSeq, fr.size(), off);
+            check(movedSeq != 0, "V6 caught a stack mid-load");
+            check(fr.size() == 5 && off == 0, "V6 late frames follow the moved stack");
+        }
+
+        // ---- V7: two same-named batches survive a session round trip apart ----
+        reload();
+        {
+            // create-then-move one at a time: moveStackToBatch prunes, and an
+            // empty second batch would be pruned before it could be filled
+            int b1 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[0].id, b1);
+            int b2 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[1].id, b2);
+            std::string n1, n2;
+            for (const auto& b : app.batches) {
+                if (b.id == b1) n1 = b.name;
+                if (b.id == b2) n2 = b.name;
+            }
+            std::error_code vec;
+            std::string sess = (std::filesystem::temp_directory_path(vec) /
+                                "viewer_verifyselftest.vsession").u8string();
+            saveSession(sess, true);
+            loadSession(sess);
+            loadAll();
+            int f1 = 0, f2 = 0, id1 = 0, id2 = 0;
+            for (const auto& b : app.batches) {
+                if (b.name == n1) id1 = b.id;
+                if (b.name == n2) id2 = b.id;
+            }
+            for (const auto& d : app.images) {
+                if (d->batchId == id1) f1++;
+                if (d->batchId == id2) f2++;
+            }
+            fprintf(stderr, "verifyselftest: V7 '%s' + '%s' round trip: both present=%d, "
+                            "frames %d / %d, merged=%d\n",
+                    n1.c_str(), n2.c_str(), (id1 && id2) ? 1 : 0, f1, f2,
+                    (id1 && id1 == id2) ? 1 : 0);
+            check(n1 != n2, "V7 uniqueBatchName disambiguates the collision");
+            check(id1 && id2 && id1 != id2, "V7 both batches survive the round trip apart");
+            std::filesystem::remove(std::filesystem::u8path(sess), vec);
+        }
+
+        // ---- V8: the remote IN-FLIGHT drop, not just the queue sweep ----
+        {
+            closeAll();
+            std::string scanroot = g_verifySelftest;
+            std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+            startRemote("local://" + scanroot);
+            double t0 = glfwGetTime();
+            bool scanSent = false, closed = false;
+            int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                if (app.rbrowse.connected && !scanSent) {
+                    App::RbJob j;
+                    j.kind = App::RbScan;
+                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                    rbEnqueue(std::move(j));
+                    scanSent = true;
+                }
+                if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+                // Wait for a moment when the WORKER holds a job: rfPending counts
+                // queued + in-flight, so rfPending > (jobs still in rfQueue) means
+                // exactly one is out of the queue's reach. That is the only state
+                // in which the pumpRemoteFetch drop is load-bearing.
+                if (!closed && !app.seqs.empty() && app.rfPending > 0) {
+                    int sid2 = app.seqs.back().id, q = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(app.rfMtx);
+                        for (const auto& jj : app.rfQueue) if (jj.seqId == sid2) q++;
+                    }
+                    if (app.rfPending > q) {        // a job is IN FLIGHT right now
+                        rsid = sid2; queuedForSeq = q;
+                        closeStack(rsid);
+                        pendingAfter = app.rfPending;
+                        closed = true;
+                        break;
+                    }
+                }
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 3.0) {
+                pumpRemoteBrowse(); pumpRemoteFetch();
+                pumpRemoteOpenQueue(); pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "verifyselftest: V8 closeStack(%d): %d job(s) swept from the "
+                            "queue, rfPending after = %d (in flight), %d frame(s) regrew\n",
+                    rsid, queuedForSeq, pendingAfter, orphans);
+            check(closed, "V8 caught a remote stack with a fetch outstanding");
+            check(orphans == 0, "V8 nothing of the closed stack regrew");
+            fprintf(stderr, "verifyselftest: V8 note: the in-flight drop path was%s "
+                            "the one that had to catch it\n",
+                    pendingAfter > 0 ? "" : " NOT");
+        }
+
+        fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
         stopRemoteFetcher();
