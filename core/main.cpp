@@ -10752,18 +10752,21 @@ static void drawPanelRois() {
 
 // Unit resolution for grid rows: every numeric row gets a unit column entry.
 // Keys that can know their unit carry it in the name ("snr_db", "*_pct",
-// "mtf50 (cy/px)" - the documented plugin convention); image-value rows are in
-// the FILE's units, which only integer dtypes let us name honestly (DN). For
-// float data the dtype itself is shown instead of a unit we would be inventing
-// - a float .npy may hold reflectance, electrons, or anything (same rule the
-// Inspector applies to its value columns).
+// "mtf50 (cy/px)" - the documented plugin convention); image-value rows go
+// through abValueUnit, which is the ONE rule for what a pixel value is
+// measured in. This function used to print the storage dtype instead ("f32",
+// "f32^2") on the argument that a float .npy might hold anything - the
+// position c418e31 retired for the histogram, projection and temporal axes.
+// It is settled elsewhere too: serve.cpp emits "mean [DN]" / "sigma_t [DN]"
+// regardless of source dtype, as does the per-frame TSV. And this one is not
+// cosmetic - the unit rides into the clipboard through "Copy table (TSV)", so
+// an exported measurement table carried "ch0.var  f32^2".
 static std::string unitForAnalysisKey(const std::string& key, const std::string& dtype) {
     auto ends = [&](const char* s) {
         size_t n = strlen(s);
         return key.size() >= n && key.compare(key.size() - n, n, s) == 0;
     };
-    bool isInt = !dtype.empty() && (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
-    std::string img = isInt ? "DN" : dtype;            // the file's own value unit
+    std::string img = abValueUnit(dtype);              // the file's own value unit
     if (ends("snr_db"))                              return "dB";
     if (ends("_pct"))                                return "%";
     if (key.find("(cy/px)") != std::string::npos)    return "cy/px";
@@ -16654,6 +16657,30 @@ int main(int argc, char** argv) {
             check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
                   "V10 the mosaic is part of the cache key");
             closeAll();
+        }
+
+        {   // ---- V11: a pixel value is [DN] whatever its storage dtype -----
+            // c418e31 settled this for the histogram, projection and temporal
+            // axes; the Analysis grid's unit column was the site it did not
+            // reach, and it exports through "Copy table (TSV)".
+            struct { const char* key; const char* dt; const char* want; } U[] = {
+                { "ch0.mean", "f32", "DN" }, { "ch0.std", "f32", "DN" },
+                { "ch0.var",  "f32", "DN^2" }, { "R.p99", "f64", "DN" },
+                { "ch0.mean", "u16", "DN" }, { "ch0.var", "u16", "DN^2" },
+                { "noise/floor.snr_db", "f32", "dB" },      // named units still win
+                { "prnu_pct", "f32", "%" }, { "pixels", "f32", "px" },
+                { "ch0.entropy", "f32", "bit" },
+            };
+            bool uOk = true;
+            std::string got;
+            for (const auto& u : U) {
+                std::string g = unitForAnalysisKey(u.key, u.dt);
+                got += (got.empty() ? "" : ", ") + std::string(u.key) + "/" + u.dt +
+                       "=" + g;
+                if (g != u.want) uOk = false;
+            }
+            fprintf(stderr, "verifyselftest: V11 analysis units: %s\n", got.c_str());
+            check(uOk, "V11 the Analysis grid quotes pixel values in DN");
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
