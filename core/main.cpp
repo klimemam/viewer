@@ -342,6 +342,7 @@ struct App {
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
+    int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
     // remote viewing: one peer process per host, reached over ssh
     std::unique_ptr<remote::Session> remoteSession;
@@ -3185,9 +3186,21 @@ static void selectImage(int idx) {
         setCompareB(cur());
         toast("A / B swapped");
     }
-    if (cur() && app.images[idx].get() != cur()) app.prevImageUid = cur()->uid;
+    ImageDoc* prev = cur();
+    if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
     app.current = idx;
     ImageDoc* d = app.images[idx].get();
+    // Value-range scope. The stack default (frames inherit the reference
+    // frame's range so they compare directly) is only ONE of three sensible
+    // policies, and it silently defeated Auto while stepping frames:
+    //   0 per frame  - every frame shows its own min..max
+    //   1 per stack  - the inherited behavior (default, unchanged)
+    //   2 everything - the range follows you across stacks too
+    if (prev && d != prev) {
+        if (app.rangeScope == 0) defaultRange(*d);
+        else if (app.rangeScope == 2) { d->black = prev->black; d->white = prev->white; }
+        if (app.rangeScope != 1) d->texDirty = true;
+    }
     if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
         app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
         app.view.center.x *= d->pendingViewScale;
@@ -8726,6 +8739,18 @@ static void drawMenuBar(GLFWwindow* win) {
             app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
+        if (ImGui::BeginMenu("Value range scope")) {
+            if (ImGui::MenuItem("Auto per frame", nullptr, app.rangeScope == 0)) app.rangeScope = 0;
+            if (ImGui::MenuItem("Shared within a stack", nullptr, app.rangeScope == 1)) app.rangeScope = 1;
+            if (ImGui::MenuItem("Shared across everything", nullptr, app.rangeScope == 2)) app.rangeScope = 2;
+            ImGui::EndMenu();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("What happens to black/white when you switch images:%s"
+                              "per frame = every frame auto-ranges to its own min..max%s"
+                              "per stack = frames of a stack share the reference range (default)%s"
+                              "everything = the current range follows you everywhere",
+                              "\n", "\n", "\n");
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
