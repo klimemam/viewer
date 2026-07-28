@@ -759,6 +759,10 @@ static ImageDoc* resolveB() {
 }
 static ImageDoc* cmpB() { return app.compareMode == App::CmpOff ? nullptr : resolveB(); }
 
+// fwd: A and B are named by their STACK wherever the two are set against each
+// other - two stacks of a series hold identically named frames
+static std::string abDocLabel(const ImageDoc* d);
+
 // remember B as an identity, not as a name
 static void setCompareB(const ImageDoc* d) {
     // making a preview the B side IS using it: promote before it can vanish
@@ -897,7 +901,7 @@ static void pinCurrentAsB() {
     if (!cur()) return;
     setCompareB(cur());
     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-    toast("B = " + app.compareB + "  (move A somewhere else)");
+    toast("B = " + abDocLabel(cur()) + "  (move A somewhere else)");
 }
 
 static void swapCompare() {
@@ -909,7 +913,7 @@ static void swapCompare() {
         return;
     }
     const ImageDoc* a = cur();
-    std::string an = a->name, bn = b->name;
+    std::string an = abDocLabel(a), bn = abDocLabel(b);
     uint64_t bUid = b->uid;
     setCompareB(a);                       // set B before moving A: cur() changes
     for (int i = 0; i < (int)app.images.size(); i++)
@@ -6578,6 +6582,23 @@ static std::string elideFront(const std::string& s, size_t keep) {
     return s.size() <= keep ? s : ("..." + s.substr(s.size() - keep));
 }
 
+// What A or B is CALLED, everywhere the two are set against each other.
+// A capture series names every stack's frames identically - 00/frame_000.npy
+// and 01/frame_000.npy are both "frame_000.npy" - so the FILE name identifies
+// neither side, and the legend, the side-by-side bands, the status bar, the
+// Inspector and the B-image menu all read "frame_000.npy" twice. The STACK is
+// what tells them apart, and SeqInfo::name already carries the folder the
+// Files panel disambiguates with ("00/frame_000..004.npy"). A loose frame
+// belongs to no stack and keeps its own name, which is unambiguous by
+// definition - there is only one of it.
+static std::string abDocLabel(const ImageDoc* d) {
+    if (!d) return std::string();
+    if (d->seqId != 0)
+        if (const App::SeqInfo* si = seqInfo(d->seqId))
+            if (!si->name.empty()) return si->name;
+    return d->name;
+}
+
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
     if (integer) snprintf(buf, n, "%.0f", v);
     else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
@@ -6921,7 +6942,8 @@ static void drawInspector() {
             ImGui::EndTable();
         }
         if (b && im) {
-            ImGui::TextDisabled("B: %s", b->name.c_str());
+            ImGui::TextDisabled("A: %s", abDocLabel(im).c_str());
+            ImGui::TextDisabled("B: %s", abDocLabel(b).c_str());
             if (b->w != im->w || b->h != im->h)
                 ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "size differs: B is %dx%d",
                                    b->w, b->h);
@@ -7191,12 +7213,13 @@ static void drawPanelHistogram() {
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         const bool bStale = Bim && HB.uid != Bim->uid;
-        const std::string bLabel = Bim ? Bim->name + (bStale ? "   [stale]" : "") : std::string();
+        const std::string bLabel = Bim ? abDocLabel(Bim) + (bStale ? "   [stale]" : "")
+                                   : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
         // with a B on screen, an unlabelled table of numbers is ambiguous:
         // say whose numbers these are
-        if (Bim) ImGui::TextDisabled("A: %s   (%s)", elideFront(im->name, 26).c_str(),
+        if (Bim) ImGui::TextDisabled("A: %s   (%s)", elideFront(abDocLabel(im), 26).c_str(),
                                      H.roiUsed ? "selected ROI" : "whole image");
         else     ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
@@ -7379,7 +7402,7 @@ static void drawPanelHistogram() {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegend(hp, im->name, bLabel);
+            if (Bim) drawABLegend(hp, abDocLabel(im), bLabel);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -7390,7 +7413,7 @@ static void drawPanelHistogram() {
                          + ImGui::GetTextLineHeight() + 8 * app.uiScale;
             ImGui::BeginChild("##histA", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand("A", im->name);
+            drawABBand("A", abDocLabel(im));
             drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                               false, false, plotH), true, false);
             ImGui::EndChild();
@@ -7550,7 +7573,8 @@ static void drawPanelProjection() {
     const App::ProjState& P = app.proj[0];
     const App::ProjState& PB = app.proj[1];
     const bool bStale = Bim && PB.uid != Bim->uid;
-    const std::string bLabel = Bim ? Bim->name + (bStale ? "   [stale]" : "") : std::string();
+    const std::string bLabel = Bim ? abDocLabel(Bim) + (bStale ? "   [stale]" : "")
+                                   : std::string();
     ImGui::SameLine();
     if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
                                  P.roiUsed ? "ROI" : "whole image");
@@ -7738,7 +7762,7 @@ static void drawPanelProjection() {
         if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
         if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
         dl->PopClipRect();
-        if (wantA && wantB && Bim) drawABLegend(pr, im->name, bLabel);
+        if (wantA && wantB && Bim) drawABLegend(pr, abDocLabel(im), bLabel);
         hoverReadout(pr, horizontal, wantA, wantB);
     };
 
@@ -7753,7 +7777,7 @@ static void drawPanelProjection() {
                      + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
         ImGui::BeginChild("##projA", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("A", im->name);
+        drawABBand("A", abDocLabel(im));
         if (app.showProjH) onePlot(true, true, false);
         if (app.showProjV) onePlot(false, true, false);
         ImGui::EndChild();
@@ -8668,7 +8692,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             marker(tp, im);
             dl->PopClipRect();
         }
-        drawABLegend(tp, im->name, Bim->name);
+        drawABLegend(tp, abDocLabel(im), abDocLabel(Bim));
     } else {
         const ImGuiStyle& st = ImGui::GetStyle();
         float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
@@ -8676,7 +8700,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                      + ImGui::GetTextLineHeight() + 8 * app.uiScale;
         ImGui::BeginChild("##tempA", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("A", im->name);
+        drawABBand("A", abDocLabel(im));
         {
             PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
             if (tp.ok) {
@@ -8690,7 +8714,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::SameLine();
         ImGui::BeginChild("##tempB", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("B", Bim->name);
+        drawABBand("B", abDocLabel(Bim));
         {   // same limits as A's plot, by construction
             PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
             if (tp.ok) {
@@ -11120,8 +11144,15 @@ static void drawMenuBar(GLFWwindow* win) {
                 }
                 if (++shown > 40) { ImGui::TextDisabled("... %d more (use Files)",
                                                         (int)app.images.size() - shown); break; }
-                std::string lbl = d->name + (d->seqId != 0 ? "   [stack]" : "");
-                if (ImGui::MenuItem(lbl.c_str(), nullptr, app.compareBUid == d->uid)) {
+                // by STACK name, and with the uid as the ImGui id: two stacks of
+                // one series list identically named frames, so "frame_000.npy"
+                // twice was the whole menu's content (### also keeps a name
+                // containing ## from eating its own label)
+                char lbl[320];
+                snprintf(lbl, sizeof lbl, "%s%s###b%llu", abDocLabel(d).c_str(),
+                         d->seqId != 0 ? "   [stack]" : "",
+                         (unsigned long long)d->uid);
+                if (ImGui::MenuItem(lbl, nullptr, app.compareBUid == d->uid)) {
                     setCompareB(d);
                     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
                 }
@@ -14069,6 +14100,16 @@ int main(int argc, char** argv) {
         static const char* MODE[3] = { "auto-per-frame", "per-stack", "linked" };
         static const char* SHARE[3] = { "each-own", "B-uses-A", "union-auto" };
         int bad = 0;
+        {   // The two stacks of a capture series hold identically NAMED frames
+            // (00/frame_000.npy and 01/frame_000.npy are both frame_000.npy),
+            // so this is also the check that the compare UI can tell them apart
+            // at all: every label there goes through abDocLabel.
+            std::string la = abDocLabel(cur()), lb = abDocLabel(cmpB());
+            fprintf(stderr, "rangeselftest: labels | A = %s | B = %s | files %s / %s | %s\n",
+                    la.c_str(), lb.c_str(), cur()->name.c_str(), cmpB()->name.c_str(),
+                    la != lb ? "DISTINCT" : "AMBIGUOUS");
+            if (la == lb) bad++;
+        }
         for (int m = 0; m < 3; m++) {
             app.rangeScope = m == 0 ? 0 : 1;
             app.linkRange = m == 2;
@@ -14503,12 +14544,13 @@ int main(int argc, char** argv) {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "   |  A/B: no B image");
                 } else if (app.compareMode == App::CmpDiff) {
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  %s +-%g  B: %s",
-                                       app.diffAbs ? "|A-B|" : "A-B", app.diff.gain, b->name.c_str());
+                                       app.diffAbs ? "|A-B|" : "A-B", app.diff.gain,
+                                       abDocLabel(b).c_str());
                 } else {
                     float fr = app.compareMode == App::CmpSplit ? app.splitFrac : app.wipeFrac;
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  A/B %s %.0f%%  B: %s",
                                        app.compareMode == App::CmpSplit ? "split" : "wipe",
-                                       fr * 100, b->name.c_str());
+                                       fr * 100, abDocLabel(b).c_str());
                 }
                 // swapping A and B is a thing you reach for constantly, so it needs
                 // a visible control and not only a keyboard shortcut
