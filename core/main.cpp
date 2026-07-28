@@ -466,14 +466,19 @@ struct App {
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
     bool focusRemote = false;         // bring it forward when a menu item asks
+    bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
-        int seqId = -1;
+        int seqId = -1;               // owning stack; -2 = detached (browser-fired
+                                      // aggregate over files nobody opened)
         bool valid = false, pending = false;
+        bool detached = false;        // browser origin: no SeqInfo backs this
         std::string host, err;
+        std::string label;            // what was measured ("10lx/frame_???.npy")
+        std::vector<std::string> files;   // detached only: for "Open as stack"
         int frames = 0;
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
         std::vector<float> idx, frameMean, frameStd;
@@ -4535,6 +4540,38 @@ static void maybeRequestServerTemporal(int seqId) {
     mEnqueue(std::move(j));
 }
 
+// Temporal stats for a stack that is NOT opened: fired from the browser's group
+// row / multi-selection, so the answer to "is this set worth transferring?"
+// costs zero pixels. Runs on the MEASURE worker - the browse worker serializes
+// behind LIST/SCAN and shares the browsing ssh session, so a 300-frame
+// aggregate there would freeze navigation. cfaType stays 0 on purpose:
+// guessing a mosaic for a file nobody opened would silently split the planes
+// wrong - the panel tag says plane=all instead.
+static void requestBrowseTemporal(const std::string& host,
+                                  std::vector<std::string> files,
+                                  const std::string& label) {
+    if (files.empty()) return;
+    sortFramesNumerically(files);
+    App::ServerTemporal& S = app.srvTemporal;
+    S = App::ServerTemporal{};
+    S.seqId = -2;                     // sentinel: no SeqInfo backs this result
+    S.detached = true;
+    S.label = label;
+    S.host = host;
+    S.files = files;
+    S.token = g_measureToken++;
+    S.pending = true;
+    App::MJob j;
+    j.token = S.token;
+    j.op = rp::MOP_TEMPORAL_STATS;
+    j.url = makeRemoteUrl(host, files[0]);
+    if (files.size() > 1)
+        for (const auto& f : files) j.files.push_back(f);
+    mEnqueue(std::move(j));
+    app.showTemporal = true;          // the result lands in the Temporal panel
+    app.focusTemporal = true;
+}
+
 // ---- the connect/browse worker -------------------------------------------------
 static void rbSetPhase(const std::string& p) {
     std::lock_guard<std::mutex> lk(app.rbMtx);
@@ -7441,6 +7478,86 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     return true;
 }
 
+// Server temporal for a stack that is NOT opened (fired from the browser's
+// group row or multi-selection). Takes over the panel until dismissed (x) or
+// superseded: the user just asked for it, and it has no current-image to hang
+// off. "Open as stack" turns the measurement into a real open in one click -
+// whose own server temporal then replaces this one.
+static void drawBrowseTemporal() {
+    App::ServerTemporal& S = app.srvTemporal;
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    if (S.pending) {
+        ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
+                           S.host.empty() ? "local peer" : S.host.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        return;
+    }
+    if (!S.valid) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[server failed]");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", S.err.c_str());
+        return;
+    }
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames - not opened: %s]",
+                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open as stack")) {
+        // copy first: openRemoteStack fires its own server temporal, which
+        // resets S while we are still reading it
+        std::string host = S.host, label = S.label;
+        std::vector<std::string> files = S.files;
+        openRemoteStack(host, files, label);
+        return;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("open %s for real (frames transfer in the background)",
+                          S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+    ImGui::Separator();
+    // cfaType was 0 by design (no open file to read a mosaic from): say so,
+    // or a Bayer stack's plane-blind sigma reads as a wrong number
+    ImGui::TextDisabled("plane=all (file not opened - no CFA split)");
+    if (ImGui::BeginTable("srvbtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
+        auto row = [](const char* k, double v) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn(); textNum("%.6g", v);
+        };
+        row("mean [DN]", S.mean);
+        row("temporal noise (sigma_t)", S.tempNoise);
+        row("fixed pattern (sigma_fpn)", S.fixedPattern);
+        row("total (quadrature)", S.totalNoise);
+        ImGui::EndTable();
+    }
+    if (!S.frameMean.empty()) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
+        float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        PlotRect tp = beginPlot("frame number", "frame mean value [DN]",
+                                fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            for (size_t i = 1; i < S.frameMean.size(); i++)
+                dl->AddLine(tp.at(S.idx[i - 1], S.frameMean[i - 1]),
+                            tp.at(S.idx[i], S.frameMean[i]), IM_COL32(105, 180, 240, 255), 1.5f);
+            dl->PopClipRect();
+        }
+    }
+}
+
 // Per-frame S1 stats of a stack as TSV on the clipboard, one row per frame:
 // file, path, per-plane spatial mean/sigma, and the H/V projection non-
 // uniformity (sigma of the column-mean / row-mean profile, as % of the plane
@@ -7533,6 +7650,10 @@ static void copyPerFrameStats(int seqId) {
 }
 
 static void drawPanelTemporal() {
+    // a browser-fired aggregate (files nobody opened) owns the panel until
+    // dismissed - it is the freshest thing the user asked for and has no
+    // current image to attach to
+    if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
     if (im && im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
@@ -8505,6 +8626,44 @@ static void drawPanelRemote() {
                 ImGui::SetTooltip("%s", reason.empty()
                     ? "frames stack in numeric name order" : reason.c_str());
             ImGui::SameLine();
+            {   // the server aggregate for the selection, without opening it.
+                // MEASURE exists from protocol 2, but v2 has no hasMeta to
+                // pre-validate shapes - a mismatch falls to [server failed].
+                int pv2 = 0;
+                {
+                    std::lock_guard<std::mutex> lk(app.sesMtx);
+                    if (app.remoteSession) pv2 = app.remoteSession->peerVersion();
+                }
+                bool tempOk = pv2 >= 2;
+                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++)
+                    if (rbSel[i] && !isNpyName(B.entries[i].name)) tempOk = false;
+                ImGui::BeginDisabled(!tempOk);
+                if (ImGui::Button("Temporal stats (server)")) {
+                    std::vector<std::string> files;
+                    for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                        if (!rbSel[i]) continue;
+                        const remote::Entry& e = B.entries[i];
+                        if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
+                        else files.push_back(joined(e.name));
+                    }
+                    std::string leaf = B.dir;
+                    size_t sl2 = leaf.find_last_of('/');
+                    if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                        leaf = leaf.substr(sl2 + 1);
+                    requestBrowseTemporal(B.host, files,
+                                          leaf + " (" + std::to_string(files.size()) +
+                                          " selected)");
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(tempOk
+                        ? "sigma_t / sigma_fpn computed on the server over the\n"
+                          "selected files, shown in the Temporal panel - nothing\n"
+                          "opens, no pixel transfers. plane=all (no CFA split)."
+                        : pv2 < 2 ? "needs a protocol 2+ peer (File > Update remote peer)"
+                                  : "only .npy files can form a stack");
+            }
+            ImGui::SameLine();
             if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
         }
     }
@@ -8804,6 +8963,22 @@ static void drawPanelRemote() {
                         for (const auto& m : e.members) files.push_back(joined(m));
                         openRemoteStack(B.host, files);
                     }
+                    // the server aggregates WITHOUT opening: "is this set even
+                    // worth transferring?" costs zero pixels this way. Group
+                    // rows only exist from protocol 3 on, so no version gate.
+                    if (ImGui::MenuItem("Temporal stats (server)")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(joined(m));
+                        std::string leaf = B.dir;
+                        size_t sl2 = leaf.find_last_of('/');
+                        if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                            leaf = leaf.substr(sl2 + 1);
+                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
+                                          "shown in the Temporal panel - nothing opens,\n"
+                                          "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
                 } else if (isNpyName(e.name)) {
                     if (ImGui::MenuItem("Open"))
@@ -9660,6 +9835,7 @@ static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Fo
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
+static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 
 static void printUsage() {
     printf(
@@ -9786,6 +9962,8 @@ static void parseCli(int argc, char** argv) {
             g_closeSelftest = next();              // handled in main()
         } else if (a == "--batch-selftest") {
             g_batchSelftest = next();              // handled in main()
+        } else if (a == "--rtemporal-selftest") {
+            g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -10621,6 +10799,115 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // Browser-fired temporal, verifiable without a human (docs/terminology.md):
+    // the server aggregate for a stack NOBODY OPENED must land in the Temporal
+    // panel as a detached [not opened] result and match an independent local
+    // computation to full float64 precision.
+    if (!g_rtemporalSelftest.empty()) {
+        std::string dir = g_rtemporalSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        std::vector<std::string> files;
+        {
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec)) {
+                std::string n = e.path().filename().u8string();
+                if (isNpyName(n)) files.push_back(dir + "/" + n);
+            }
+        }
+        sortFramesNumerically(files);
+        if (files.size() < 2) {
+            fprintf(stderr, "rtemporalselftest: need >= 2 npy under %s\n", dir.c_str());
+            return 1;
+        }
+        // independent reference: per-pixel f64 accumulation over the local files
+        double refMean = 0, refSt = 0, refFpn = 0;
+        {
+            std::vector<double> sum, sum2;
+            size_t samples = 0;
+            int N = 0;
+            for (const auto& f : files) {
+                std::string err;
+                std::unique_ptr<ImageDoc> d = decodeNpy(f, err);
+                if (!d) {
+                    fprintf(stderr, "rtemporalselftest: %s: %s\n", f.c_str(), err.c_str());
+                    return 1;
+                }
+                if (!samples) {
+                    samples = d->data.size();
+                    sum.assign(samples, 0.0);
+                    sum2.assign(samples, 0.0);
+                }
+                if (d->data.size() != samples) {
+                    fprintf(stderr, "rtemporalselftest: shape mismatch in fixture\n");
+                    return 1;
+                }
+                for (size_t i = 0; i < samples; i++) {
+                    double v = d->data[i];
+                    sum[i] += v; sum2[i] += v * v;
+                }
+                N++;
+            }
+            double aM = 0, aM2 = 0, aV = 0;
+            for (size_t i = 0; i < samples; i++) {
+                double mm = sum[i] / N;
+                aM += mm; aM2 += mm * mm;
+                aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+            }
+            refMean = aM / samples;
+            refSt = sqrt(aV / samples);
+            refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+        }
+        // connect the browser, then fire the SAME call the group row's menu makes
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        bool fired = false, ok = true;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpMeasure();
+            if (app.rbrowse.connected && !fired) {
+                std::string leaf = dir.substr(dir.find_last_of('/') + 1);
+                requestBrowseTemporal(app.rbrowse.host, files, leaf + "/frame_???.npy");
+                fired = true;
+            }
+            if (fired && !app.srvTemporal.pending) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        App::ServerTemporal& S = app.srvTemporal;
+        auto rel = [](double a, double b) {
+            return fabs(a - b) / std::max({ fabs(a), fabs(b), 1e-12 });
+        };
+        fprintf(stderr, "rtemporalselftest: [server %s, %d frames - not opened: %s] "
+                        "valid=%d seqId=%d, %d image(s) open\n",
+                S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                S.label.c_str(), S.valid ? 1 : 0, S.seqId, (int)app.images.size());
+        if (!fired || !S.valid || S.seqId != -2 || S.frames != (int)files.size() ||
+            !app.images.empty()) {
+            fprintf(stderr, "rtemporalselftest: FAILED - no valid detached result (%s)\n",
+                    S.err.c_str());
+            ok = false;
+        } else {
+            fprintf(stderr, "rtemporalselftest: sigma_t server %.12g vs ref %.12g "
+                            "(rel %.3g), sigma_fpn %.12g vs %.12g (rel %.3g), "
+                            "mean rel %.3g\n",
+                    S.tempNoise, refSt, rel(S.tempNoise, refSt),
+                    S.fixedPattern, refFpn, rel(S.fixedPattern, refFpn),
+                    rel(S.mean, refMean));
+            if (rel(S.tempNoise, refSt) > 1e-9 || rel(S.fixedPattern, refFpn) > 1e-9 ||
+                rel(S.mean, refMean) > 1e-9) {
+                fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "rtemporalselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopMeasureWorker();
+        stopRemoteFetcher();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
     // Move-to-batch, verifiable without a human (docs/terminology.md): stacks
     // move between batches WHOLE, emptied batches are pruned, and the batch
     // name survives a session save/load round-trip (imgbatch travels by name).
@@ -11104,6 +11391,7 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
         if (app.showTemporal) {
+            if (app.focusTemporal) { ImGui::SetNextWindowFocus(); app.focusTemporal = false; }
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
