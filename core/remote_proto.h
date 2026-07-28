@@ -22,7 +22,15 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // header peek, synthetic stack-group entries) and adds GLOB/SCAN. The server
 // answers LIST in the v2 shape when the client's HELLO said 2, so either end
 // may lag the other by one protocol without breaking the session.
-static const uint32_t VERSION = 3;
+//
+// 4 changes no wire format at all: the sequence-GROUPING rules changed ('?'
+// only on the varying digit runs; the frame axis is the LAST varying run).
+// The number is what makes an already-installed peer update itself on connect
+// - versioning the MEANING, not just the framing. The user hit the gap this
+// closes: a peer updated mid-way through those changes grouped a linearity
+// folder differently than the same folder opened locally, with nothing
+// anywhere saying why. If the answers can differ, the versions must.
+static const uint32_t VERSION = 4;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
