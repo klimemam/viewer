@@ -56,6 +56,17 @@
       "dependsOn": "build",
       "problemMatcher": [],
       "detail": "Offscreen render with every panel visible; prints frame-time statistics."
+    },
+    {
+      "label": "install: desktop / Start menu shortcut",
+      "type": "shell",
+      "command": "tools/install_shortcut.cmd -Exe build-mingw/viewer.exe",
+      "windows": { "command": "tools\\install_shortcut.cmd -Exe build-mingw\\viewer.exe" },
+      "linux": { "command": "tools/install_shortcut.sh --bin build-mingw/viewer" },
+      "osx": { "command": "tools/install_shortcut.sh --bin build-mingw/viewer" },
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "detail": "Points a desktop icon at THIS build. Add -RemoteHost/--host for one that connects to a server."
     }
   ],
   "inputs": [

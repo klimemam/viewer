@@ -30,6 +30,8 @@ Windows / Linux / macOS ・ C++17 + Dear ImGui ・ GPU/CUDA 不要 ・ 単体バ
 **A. ビルド済みバイナリ**: [Actions](../../actions) の最新 run → Artifacts →
 `viewer-win64` / `viewer-linux-x64` / `viewer-macos-arm64` をダウンロード
 (zip/tgz に `plugins/` 同梱。Linux/macOS は `tar xzf` → `./viewer`)。
+デスクトップ/スタートメニューから起動したい場合は同梱の `install_shortcut.cmd`
+(Linux/macOS は `install_shortcut.sh`)—— [startup.md](docs/startup.md#0-2-デスクトップ--スタートメニューから起動する)。
 
 **B. ソースから** (VS2022 / MinGW / gcc / clang + CMake 3.21+、依存は自動取得):
 ```bash

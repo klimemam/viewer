@@ -27,6 +27,50 @@ win64\viewer.exe
 
 中身: `win64/viewer.exe`(GUI)+ `win64/plugins/`、`linux-x64/viewer-serve`(サーバに置く方)ほか。
 
+**毎回コマンドラインを開くのが面倒なら、次節でショートカットを作ってください**
+(`win64\install_shortcut.cmd` をダブルクリックするだけ)。
+
+## 0-2. デスクトップ / スタートメニューから起動する
+
+```bat
+win64\install_shortcut.cmd                                    :: Windows
+```
+```bash
+./linux-x64/install_shortcut.sh                               # Linux / macOS
+```
+
+デスクトップとスタートメニュー(Linux はアプリ一覧、macOS は `~/Applications`)に
+**exe をその場で指す**ショートカットができます。**コピーはしません** —— だから
+`update.cmd` でバイナリを更新してもショートカットはそのまま最新版を起動します。
+消すときは `-Uninstall` / `--uninstall`。
+
+| やりたいこと | やり方 |
+|---|---|
+| タスクバーに常駐 | 一度起動 → タスクバーのボタンを右クリック → **ピン留め** |
+| ファイルを開く | `.npy` / `.raw` を**ショートカットにドロップ**(起動後のウィンドウへの D&D も可) |
+| **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、Files パネルにそのフォルダが出ます |
+
+パスを省くとホーム(`~`)を開きます。`.npy` を指定すればその画像を直接開きます。
+
+**アイコン**: ウィンドウ/タスクバーのアイコンは **CFA の 2x2(R/Gr/Gb/B)を枠で囲んだ印**で、
+枠の色が状態を表します —— **青 = ローカル、緑 = リモート接続中**(ステータスバーの
+リンク表示と同じ緑)。タイトルバーにも `frame_000.npy - viewer [user@server]` のように
+接続先が出るので、ローカルとリモートのウィンドウを並べても取り違えません。
+アイコンは実行時に描いているので、接続/切断した瞬間にタスクバーの色が変わります。
+
+<details><summary>なぜコンソール窓が一瞬出る(ことがある)のか</summary>
+
+`viewer.exe` は**コンソールアプリのまま**にしてあります。GUI サブシステムにすると
+`viewer --help` や `--bench`、`--remote-selftest` を打ったときに cmd が終了を待たず、
+出力も終了コードも取れなくなるためです(VSCode タスクが両方を読んでいます)。
+
+代わりに、**自分専用のコンソール(= 誰も繋がっていないコンソール)なら起動直後に閉じる**
+ようにしてあります。シェルから起動したときは何もしません。加えてインストーラは
+ショートカットを「最小化で起動」に設定するので、閉じるまでの一瞬すら見えません。
+手で作ったショートカットで黒窓が一瞬光る場合は、プロパティの**実行時の大きさ = 最小化**を
+選んでください。
+</details>
+
 ## 1. ローカル(ビルド環境のある開発機)
 
 ```bash
@@ -35,6 +79,10 @@ cmake --build build-mingw
 ./build-mingw/viewer                       # Windows: .\build-mingw\viewer.exe
 ./build-mingw/viewer path/to/image.npy     # ファイル指定で開く
 ```
+
+ソースからビルドした場合もショートカットは同じスクリプトで作れます
+(`tools\install_shortcut.cmd` / `tools/install_shortcut.sh`)。ビルド時に
+`build*/icons/` へアイコン(`viewer.ico` / `viewer.png`)が生成され、スクリプトはそれを拾います。
 
 ## 2. リモート(サーバのデータを手元から見る)
 
@@ -116,6 +164,7 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 | `remote: deploy this build to the host` | サーバへ `scp` して動作確認まで |
 | `test: remote protocol self-check` | 上記のサンプル一致検証 |
 | `test: frame-time benchmark` | フレーム時間の計測 |
+| `install: desktop / Start menu shortcut` | **いまビルドした exe を指すショートカットを作る** |
 
 ホスト名などは毎回聞かれます。固定したい場合は `tasks.json` の `inputs` の `default` を書き換えてください。
 

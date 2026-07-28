@@ -25,6 +25,7 @@
 #include "ui_theme.h"
 #include "remote.h"
 #include "remote_proto.h"
+#include "app_icon.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4140,7 +4141,13 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 
 static void openPath(const std::string& path) {
     if (path.compare(0, 6, "ssh://") == 0 || path.compare(0, 8, "local://") == 0) {
-        openRemote(path);
+        // A url naming a file opens that file. A url naming a host or a
+        // directory means "start here": connect and browse it, the same thing
+        // File > Start Remote does - which is what a desktop shortcut to a
+        // machine passes, and what a half-remembered path pasted on the command
+        // line usually is. startRemote keeps the ssh handshake off this thread.
+        if (isNpyName(path)) openRemote(path);
+        else                 startRemote(path);
         return;
     }
     std::string low = path;
@@ -7833,6 +7840,9 @@ static void printUsage() {
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
         "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
         "                              here, only the visible region is fetched\n"
+        "  ssh://user@host/~/dir       connect and browse there instead (a host on\n"
+        "                              its own works too) - what a desktop shortcut\n"
+        "                              made by tools/install_shortcut.* passes\n"
         "  --remote-exe <path>         how to start the peer there (default: viewer)\n"
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
@@ -8256,6 +8266,34 @@ static void wakeUi(int frames = 3) {
     if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
 }
 
+// ---- window / taskbar icon ---------------------------------------------------
+// Drawn, not loaded (core/app_icon.cpp), for one reason beyond having no asset
+// file to ship: it can be redrawn while the app runs. A window looking at a
+// server's pixels gets the green frame the status bar uses for a live peer, so
+// two viewer buttons in the taskbar say which is which before you hover them.
+// macOS is excluded: there glfwSetWindowIcon is documented to fail (the dock
+// icon comes from the .app bundle, which tools/install_shortcut.sh writes).
+static void applyWindowIcon(GLFWwindow* w, bool remote) {
+#if !defined(__APPLE__)
+    static const int SIZES[] = {16, 24, 32, 48, 64, 128};
+    constexpr int N = (int)(sizeof(SIZES) / sizeof(SIZES[0]));
+    // rendered once per variant and kept: the pixels must outlive the call, and
+    // a reconnect must not re-rasterize six bitmaps
+    static std::vector<unsigned char> pix[2][N];
+    const int v = remote ? 1 : 0;
+    GLFWimage imgs[N];
+    for (int i = 0; i < N; i++) {
+        if (pix[v][i].empty())
+            pix[v][i] = app_icon::render(SIZES[i], remote ? app_icon::Remote : app_icon::Local);
+        imgs[i].width = imgs[i].height = SIZES[i];
+        imgs[i].pixels = pix[v][i].data();
+    }
+    glfwSetWindowIcon(w, N, imgs);
+#else
+    (void)w; (void)remote;
+#endif
+}
+
 static void dropCallback(GLFWwindow*, int count, const char** paths) {
     wakeUi(4);
     for (int i = 0; i < count; i++) openPath(paths[i]);
@@ -8275,7 +8313,39 @@ static void installWakeCallbacks(GLFWwindow* win) {
     glfwSetWindowRefreshCallback(win, [](GLFWwindow*) { wakeUi(2); redrawNow(); });
 }
 
+#if defined(_WIN32)
+// The black window a double-click leaves behind, and why this is not solved by
+// building for the WINDOWS subsystem.
+//
+// viewer.exe stays a CONSOLE-subsystem binary on purpose: cmd does not wait for
+// a GUI-subsystem process, so `viewer --help`, `--bench N`, `--lin-selftest`
+// and `--remote-selftest` would all return the prompt before printing anything,
+// and their exit codes would stop reaching the shell (the VSCode tasks read
+// both). The console is the cost of keeping the command line honest.
+//
+// It is only unwanted in one case, and that case is detectable: when nothing
+// else is attached to the console, it was created FOR this process - Explorer,
+// a desktop shortcut, a file association - rather than inherited from a shell,
+// and closing it immediately is exactly right. Started from a terminal, that
+// terminal is in the list too and this does nothing.
+// (install_shortcut.ps1 also marks its shortcuts "start minimized", so the
+// console does not even flash in the moment before we get here.)
+static void dropOwnConsole() {
+    DWORD pids[2];
+    if (GetConsoleProcessList(pids, 2) == 1) FreeConsole();
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    {
+        // --serve is the exception: its stdin/stdout are the protocol, and it is
+        // started by ssh, never by a person clicking something.
+        bool serve = false;
+        for (int i = 1; i < argc; i++) serve |= !strcmp(argv[i], "--serve");
+        if (!serve) dropOwnConsole();
+    }
+#endif
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { printUsage(); return 0; }
     // Serve mode is what ssh starts on the machine holding the data: no window,
@@ -8315,8 +8385,16 @@ int main(int argc, char** argv) {
     const char* glslVersion = "#version 130";
 #endif
     if (benchFrames) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    // How a Linux desktop matches a window to its launcher: without these the
+    // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
+    // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
+    // generic icon in a second, ungrouped dock entry. Ignored elsewhere.
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
     GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
+    applyWindowIcon(win, false);
     glfwMakeContextCurrent(win);
     glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
     installWakeCallbacks(win);        // before ImGui's backend: it chains to these
@@ -8787,9 +8865,26 @@ int main(int argc, char** argv) {
                     ImGui::SetTooltip("%s\n\n(everything the app has said, copyable)",
                                       app.msgLog.back().text.c_str());
             }
+            // Title bar and taskbar icon both carry "this window is looking at
+            // another machine": the title for the window list and the tooltip,
+            // the icon (green frame instead of blue) for the button itself.
+            // Either the session is up, or the image on screen came from one -
+            // a dropped connection does not make the pixels local.
+            const bool remoteNow = app.rbrowse.connected || (im && !im->remoteUrl.empty());
+            std::string rhost = app.rbrowse.host;
+            if (rhost.empty() && im && !im->remoteUrl.empty()) {
+                std::string rp;
+                remote::parseUrl(im->remoteUrl, rhost, rp);
+            }
             static std::string lastTitle;
             std::string title = im ? im->name + " - viewer" : "viewer v0.1";
+            if (remoteNow) title += "  [" + (rhost.empty() ? std::string("local peer") : rhost) + "]";
             if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
+            static int lastIconVariant = -1;
+            if ((int)remoteNow != lastIconVariant) {
+                applyWindowIcon(win, remoteNow);
+                lastIconVariant = (int)remoteNow;
+            }
         }
 
         drawRawModal();

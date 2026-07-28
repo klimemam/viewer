@@ -1,0 +1,37 @@
+// Windows resources for viewer.exe (configured by CMake: @VIEWER_ICO@ is the
+// icon tools/mkicon.cpp generates into the build tree).
+//
+// This is the icon Explorer, a desktop shortcut and a pinned taskbar button
+// read off the executable file. The *running* window's icon is set separately
+// at startup (glfwSetWindowIcon), because that one changes color while the app
+// runs to mark a window that is showing a remote machine's pixels.
+//
+// Resource id 1: the shell picks the lowest-numbered ICON resource as the
+// application icon.
+1 ICON "@VIEWER_ICO@"
+
+// Without a version block, Explorer's details pane and the taskbar tooltip fall
+// back to the bare file name.
+1 VERSIONINFO
+FILEVERSION    0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS         0x40004L   // VOS_NT_WINDOWS32
+FILETYPE       0x1L       // VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"   // US English, Unicode
+        BEGIN
+            VALUE "FileDescription", "viewer - engineering image viewer"
+            VALUE "FileVersion",     "0.1"
+            VALUE "InternalName",    "viewer"
+            VALUE "OriginalFilename","viewer.exe"
+            VALUE "ProductName",     "viewer"
+            VALUE "ProductVersion",  "0.1"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
