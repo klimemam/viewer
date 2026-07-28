@@ -7478,21 +7478,62 @@ static void drawPanelRemote() {
     auto joined = [&B](const std::string& n) {
         return B.dir == "/" ? "/" + n : B.dir + "/" + n;
     };
-    int nNpy = 0;
-    for (const auto& e : B.entries)
-        if (!e.dir && isNpyName(e.name)) nNpy += e.group ? (int)e.members.size() : 1;
-    if (nNpy >= 2) {
-        char lb[80];
-        snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
-        if (ImGui::Button(lb)) {
-            std::vector<std::string> files;
-            for (const auto& e : B.entries) {
-                if (e.dir || !isNpyName(e.name)) continue;
-                if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
-                else files.push_back(joined(e.name));
+    // Multi-select (Ctrl / Shift + click on file rows). Selection is keyed to
+    // the exact listing: a navigation or a refresh invalidates the indices, so
+    // it resets rather than pointing at different rows.
+    static std::vector<char> rbSel;
+    static int rbSelAnchor = -1;               // entry index of the last click
+    {
+        static std::string selSig;
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        if (sig != selSig) {
+            selSig = sig;
+            rbSel.assign(B.entries.size(), 0);
+            rbSelAnchor = -1;
+        }
+    }
+    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
+        // the frames can actually stack, BEFORE any pixel is transferred
+        int nSel = 0;
+        const remote::Entry* first = nullptr;
+        std::string reason;
+        for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+            if (!rbSel[i]) continue;
+            const remote::Entry& e = B.entries[i];
+            nSel++;
+            if (!isNpyName(e.name)) { reason = "only .npy files can form a stack"; continue; }
+            if (!e.hasMeta) {
+                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
+                continue;
             }
-            sortFramesNumerically(files);
-            openRemoteStack(B.host, files);
+            if (!first) { first = &e; continue; }
+            if (e.ndim != first->ndim || e.dtype != first->dtype ||
+                memcmp(e.dims, first->dims, sizeof e.dims) != 0)
+                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
+                         fmtEntryShape(e);
+        }
+        if (nSel >= 2) {
+            char lb[64];
+            snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
+            if (!reason.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button(lb)) {
+                std::vector<std::string> files;
+                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                    if (!rbSel[i]) continue;
+                    const remote::Entry& e = B.entries[i];
+                    if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
+                    else files.push_back(joined(e.name));
+                }
+                sortFramesNumerically(files);
+                openRemoteStack(B.host, files);
+                rbSel.assign(B.entries.size(), 0);
+            }
+            if (!reason.empty()) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", reason.empty()
+                    ? "frames stack in numeric name order" : reason.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
         }
     }
     // Filter what is already listed - no round-trip to the server. Substring by
@@ -7685,16 +7726,34 @@ static void drawPanelRemote() {
             if (e.group) lb += "  [" + std::to_string(e.frames) + " frames]";
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            if (ImGui::Selectable(lb.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && servable) {
-                if (e.dir) {
+            int ei = shown[row];
+            bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
+            if (ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns) && servable) {
+                ImGuiIO& sio = ImGui::GetIO();
+                bool canSel = !e.dir && ei < (int)rbSel.size();
+                if (sio.KeyCtrl && canSel) {
+                    rbSel[ei] ^= 1;                    // toggle, plain click still opens
+                    rbSelAnchor = ei;
+                } else if (sio.KeyShift && canSel) {
+                    // range in the order on SCREEN (sorted + filtered), anchor kept
+                    int a = -1;
+                    for (int k = 0; k < (int)shown.size(); k++)
+                        if (shown[k] == rbSelAnchor) a = k;
+                    if (a < 0) a = row;
+                    for (int k = std::min(a, row); k <= std::max(a, row); k++)
+                        if (!B.entries[shown[k]].dir && (size_t)shown[k] < rbSel.size())
+                            rbSel[shown[k]] = 1;
+                } else if (e.dir) {
                     remoteBrowseTo(joined(e.name));
                 } else if (e.group) {
                     // one row = one stack; members arrive numerically sorted
                     std::vector<std::string> files;
                     for (const auto& m : e.members) files.push_back(joined(m));
                     openRemoteStack(B.host, files);
+                    rbSelAnchor = ei;
                 } else {
                     openRemote(makeRemoteUrl(B.host, joined(e.name)));
+                    rbSelAnchor = ei;
                 }
             }
             if (!servable) {
