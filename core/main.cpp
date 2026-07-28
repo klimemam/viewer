@@ -528,13 +528,25 @@ struct App {
     int seqAskImage = -1;
     std::vector<std::string> seqAskFiles;
     std::string seqAskPattern;
-    // queued stacks from "Open Folder" (loaded one after another)
+    // queued stacks from "Open Folder" (loaded one after another).
+    // shape: "24x1200x1600 u16" when known (npy header peek locally, v3 listing
+    // metadata remotely); the picker shows it and the merge warning compares it.
     struct PendingGroup { std::string name; std::vector<std::string> files;
-                          bool isRaw = false; int batchId = 0; };
+                          bool isRaw = false; int batchId = 0; std::string shape; };
     std::vector<PendingGroup> seqQueue;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
-    // "which sequences do you want?" picker shown after scanning a folder
-    struct FolderPick { PendingGroup g; bool selected = true; };
+    // "which sequences do you want?" picker shown after scanning a folder.
+    // rel: each file's "folder/name" relative to the scanned root - the live
+    // filter matches against exactly these strings, so folder names and file
+    // names both narrow the tree. match/nMatch: the filter's current cut;
+    // filtered-out files are NOT loaded when the group is accepted.
+    struct FolderPick {
+        PendingGroup g;
+        bool selected = true;
+        std::vector<std::string> rel;     // parallel to g.files
+        std::vector<uint8_t> match;       // parallel to g.files; 1 = passes filter
+        int nMatch = 0;
+    };
     std::vector<FolderPick> folderPick;
     bool folderPickOpen = false;
     std::string folderPickRoot;
@@ -542,8 +554,10 @@ struct App {
     // rbOpenQueue / openRemoteStack instead of the local sequence loader
     bool folderPickRemote = false;
     std::string folderPickHost;
-    char pickInclude[128] = "";       // glob applied to "folder/pattern" (empty = all)
-    char pickExclude[128] = "";
+    // one live filter box: space-separated terms AND together, '!' excludes,
+    // * and ? wildcards, matched anywhere in FolderPick::rel (see applyPickFilter)
+    char pickFilter[256] = "";
+    int pickMerge = 0;                // 0 = one stack per group, 1 = ONE merged stack
     std::unique_ptr<pfd::select_folder> folderDlg;
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
@@ -3384,30 +3398,6 @@ static void enqueueGroups(std::vector<App::PendingGroup> groups) {
     startNextQueuedGroup();
 }
 
-static void openFolder(const std::string& path) {
-    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
-    if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
-    if (groups.size() >= 256)
-        toast("scan stopped at 256 sequences - narrow the folder or use the filters", true);
-    // One group opens outright. Several ALWAYS ask - including under "Always
-    // load folder", which used to bypass this. That setting is remembered from
-    // a long-ago "Load sequence?" prompt, and silently swallowing the picker
-    // because of it read as "the dialog stopped appearing" (verbatim, twice):
-    // the include/exclude filters ARE the way a capture tree gets narrowed.
-    // "Always load folder" keeps its original job - loading a single file's
-    // numbered siblings without asking - and no longer mutes this dialog.
-    {   // one fresh batch per Open Folder, named for the root (rename later)
-        int b = newBatch(baseName(path));
-        for (auto& g : groups) g.batchId = b;
-    }
-    if (groups.size() == 1) { enqueueGroups(std::move(groups)); return; }
-    app.folderPick.clear();
-    for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
-    app.folderPickRoot = path;
-    app.folderPickRemote = false;      // a stale remote flag would misroute these
-    app.folderPickOpen = true;
-}
-
 // Minimal glob: * (any run), ? (one char), case-insensitive, no character classes.
 static bool globMatch(const char* pat, const char* str) {
     const char *star = nullptr, *ss = str;
@@ -3422,6 +3412,7 @@ static bool globMatch(const char* pat, const char* str) {
     return *pat == 0;
 }
 // Comma-separated patterns; a bare word is treated as a substring (*word*).
+// Used by the remote listing filter (the picker has its own live filter).
 static bool globListMatch(const char* list, const std::string& subject) {
     if (!list || !*list) return false;
     std::string cur;
@@ -3440,15 +3431,236 @@ static bool globListMatch(const char* list, const std::string& subject) {
     }
     return any;
 }
-static void applyPickFilters() {
+
+// Read just enough of a .npy header for "24x1200x1600 u16": the picker shows it
+// per group and the merge warning compares it. Never touches pixel data; any
+// oddity returns "" (rendered as nothing, the pre-metadata behavior).
+static std::string peekNpyShape(const std::string& path) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return {};
+    uint8_t h[12] = {};
+    f.read((char*)h, 12);
+    if (f.gcount() < 10 || h[0] != 0x93 || memcmp(h + 1, "NUMPY", 5) != 0) return {};
+    size_t hlen, hoff;
+    if (h[6] >= 2) { uint32_t v; memcpy(&v, h + 8, 4); hlen = v; hoff = 12; }
+    else           { uint16_t v; memcpy(&v, h + 8, 2); hlen = v; hoff = 10; }
+    if (hlen == 0 || hlen > 65536) return {};
+    std::string hdr(hlen, '\0');
+    f.seekg((std::streamoff)hoff);
+    f.read(&hdr[0], (std::streamsize)hlen);
+    if ((size_t)f.gcount() != hlen) return {};
+    size_t k = hdr.find("'descr'");
+    if (k == std::string::npos) return {};
+    size_t q1 = hdr.find('\'', hdr.find(':', k));
+    if (q1 == std::string::npos) return {};
+    size_t q2 = hdr.find('\'', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    std::string code = hdr.substr(q1 + 1, q2 - q1 - 1);
+    if (!code.empty() && (code[0] == '<' || code[0] == '>' || code[0] == '|' || code[0] == '='))
+        code = code.substr(1);
+    static const struct { const char* np; const char* name; } DT[] = {
+        { "u1", "u8" }, { "i1", "i8" }, { "b1", "bool" }, { "u2", "u16" },
+        { "i2", "i16" }, { "u4", "u32" }, { "i4", "i32" }, { "f4", "f32" }, { "f8", "f64" },
+    };
+    for (const auto& d : DT) if (code == d.np) { code = d.name; break; }
+    size_t sp = hdr.find("'shape'");
+    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
+    if (sp == std::string::npos || p1 == std::string::npos || p2 == std::string::npos) return {};
+    std::string dims;
+    for (size_t i = p1 + 1; i < p2; i++) {
+        char c = hdr[i];
+        if (c >= '0' && c <= '9') dims.push_back(c);
+        else if (c == ',' && !dims.empty() && dims.back() != 'x') dims.push_back('x');
+    }
+    while (!dims.empty() && dims.back() == 'x') dims.pop_back();
+    if (dims.empty()) return {};
+    return dims + " " + code;
+}
+
+// The picker's ONE live filter, applied as the user types. Space-separated
+// terms AND together; a term matches if it appears ANYWHERE in a file's
+// "folder/name" relative to the scanned root (case-insensitive, * and ?
+// wildcards allowed); a '!' prefix turns a term into an exclusion. This cuts
+// each group's FILE list - accepted groups load only the surviving files - and
+// never touches the checkboxes: the filter narrows what is visible, the
+// checkboxes choose which groups open.
+static void applyPickFilter() {
+    std::vector<std::string> inc, exc;
+    {
+        std::string t;
+        auto flush = [&]() {
+            if (t.empty()) return;
+            if (t[0] == '!') { if (t.size() > 1) exc.push_back(t.substr(1)); }
+            else inc.push_back(t);
+            t.clear();
+        };
+        for (const char* c = app.pickFilter; ; c++) {
+            if (*c == 0 || *c == ' ' || *c == '\t') { flush(); if (!*c) break; }
+            else t.push_back(*c);
+        }
+    }
+    auto hit = [](const std::string& term, const std::string& subj) {
+        std::string p = "*" + term + "*";      // match anywhere: "frame_0??" must
+        return globMatch(p.c_str(), subj.c_str());   // not need to cover ".npy"
+    };
     for (auto& e : app.folderPick) {
-        bool inc = app.pickInclude[0] == 0 || globListMatch(app.pickInclude, e.g.name);
-        bool exc = globListMatch(app.pickExclude, e.g.name);
-        e.selected = inc && !exc;
+        e.match.assign(e.g.files.size(), 1);
+        e.nMatch = 0;
+        for (size_t i = 0; i < e.rel.size() && i < e.match.size(); i++) {
+            bool ok = true;
+            for (const auto& t : inc) if (!hit(t, e.rel[i])) { ok = false; break; }
+            if (ok) for (const auto& t : exc) if (hit(t, e.rel[i])) { ok = false; break; }
+            e.match[i] = ok ? 1 : 0;
+            if (ok) e.nMatch++;
+        }
     }
 }
 
-// Tree of what the scan found, with per-folder / per-sequence checkboxes.
+// Turn scan results into an open picker: per-file relative paths for the
+// filter, npy shapes for the merge warning, fresh filter and load mode.
+// stripRoot is the scanned directory (local path or remote dir); displayRoot
+// is what the dialog's first line shows (local path or ssh:// url).
+static void openPickerWith(std::vector<App::PendingGroup> groups,
+                           const std::string& displayRoot, const std::string& stripRoot,
+                           bool remoteMode, const std::string& host) {
+    std::string rootN = stripRoot;
+    std::replace(rootN.begin(), rootN.end(), '\\', '/');
+    while (!rootN.empty() && rootN.back() == '/') rootN.pop_back();
+    auto ieq = [](const std::string& a, const std::string& b, size_t n) {
+        for (size_t i = 0; i < n; i++)
+            if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+        return true;
+    };
+    app.folderPick.clear();
+    for (auto& g : groups) {
+        App::FolderPick e;
+        e.g = std::move(g);
+        if (e.g.shape.empty() && !e.g.isRaw && !remoteMode &&
+            e.g.files[0].size() > 4 &&
+            e.g.files[0].compare(e.g.files[0].size() - 4, 4, ".npy") == 0)
+            e.g.shape = peekNpyShape(e.g.files[0]);
+        e.rel.reserve(e.g.files.size());
+        for (const auto& f : e.g.files) {
+            std::string r = f;
+            std::replace(r.begin(), r.end(), '\\', '/');
+            if (r.size() > rootN.size() + 1 && r[rootN.size()] == '/' &&
+                ieq(r, rootN, rootN.size()))
+                r = r.substr(rootN.size() + 1);
+            else
+                r = baseName(r);
+            e.rel.push_back(std::move(r));
+        }
+        app.folderPick.push_back(std::move(e));
+    }
+    app.folderPickRoot = displayRoot;
+    app.folderPickRemote = remoteMode;     // a stale remote flag would misroute these
+    app.folderPickHost = host;
+    app.pickFilter[0] = 0;                 // a leftover filter would silently cut
+    app.pickMerge = 0;                     // the new scan - start every scan clean
+    applyPickFilter();
+    app.folderPickOpen = true;
+}
+
+static void openFolder(const std::string& path) {
+    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
+    if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
+    if (groups.size() >= 256)
+        toast("scan stopped at 256 sequences - narrow the folder or use the filter", true);
+    // ALWAYS ask, one group included - same rule the remote scan follows. The
+    // picker is where the file filter lives (UC3: "open only the *_dark*
+    // frames of this folder" needs the dialog even when the folder groups into
+    // a single sequence), and "Always load folder" no longer mutes it: that
+    // setting keeps its original job - loading a single FILE's numbered
+    // siblings without asking. Headless callers auto-accept via pickerAccept().
+    {   // one fresh batch per Open Folder, named for the root (rename later)
+        int b = newBatch(baseName(path));
+        for (auto& g : groups) g.batchId = b;
+    }
+    openPickerWith(std::move(groups), path, path, false, "");
+}
+
+// Stack name for a merged load: the common prefix of the merged group names,
+// trimmed of separator/placeholder debris; the root folder's name when the
+// prefix says nothing (three characters or less).
+static std::string mergedStackName(const std::vector<App::PendingGroup>& sel) {
+    std::string p = sel.empty() ? std::string() : sel[0].name;
+    for (const auto& g : sel) {
+        size_t n = 0;
+        while (n < p.size() && n < g.name.size() &&
+               tolower((unsigned char)p[n]) == tolower((unsigned char)g.name[n])) n++;
+        p.resize(n);
+    }
+    while (!p.empty() && strchr("?*_-/. ", p.back())) p.pop_back();
+    if (p.size() <= 3) p = baseName(app.folderPickRoot);
+    return p + " (merged)";
+}
+
+// The picker's answer: selected groups with their file lists cut to the live
+// filter (UC3), folded into ONE group when merge mode is on (UC2). Shared by
+// the Load button and every headless auto-accept, so the selftests exercise
+// exactly what the button does. Returns empty and sets err for a merge the
+// loader could not honor (raw and npy need different decode paths).
+static std::vector<App::PendingGroup> pickerSelection(std::string* errOut = nullptr) {
+    std::vector<App::PendingGroup> sel;
+    for (const auto& e : app.folderPick) {
+        if (!e.selected || e.nMatch == 0) continue;
+        App::PendingGroup g;
+        g.name = e.g.name; g.isRaw = e.g.isRaw; g.batchId = e.g.batchId; g.shape = e.g.shape;
+        for (size_t i = 0; i < e.g.files.size(); i++)
+            if (i < e.match.size() && e.match[i]) g.files.push_back(e.g.files[i]);
+        sel.push_back(std::move(g));
+    }
+    if (app.pickMerge == 1 && !sel.empty()) {
+        bool anyRaw = false, anyNpy = false;
+        for (const auto& g : sel) (g.isRaw ? anyRaw : anyNpy) = true;
+        if (anyRaw && anyNpy) {
+            if (errOut) *errOut = "cannot merge raw and npy files into one stack";
+            return {};
+        }
+        App::PendingGroup m;
+        m.isRaw = anyRaw;
+        m.batchId = sel[0].batchId;
+        m.shape = sel[0].shape;
+        m.name = mergedStackName(sel);
+        for (auto& g : sel)
+            m.files.insert(m.files.end(), std::make_move_iterator(g.files.begin()),
+                           std::make_move_iterator(g.files.end()));
+        sortFramesNumerically(m.files);    // natural order across the union
+        sel.clear();
+        sel.push_back(std::move(m));
+    }
+    return sel;
+}
+
+// Close the picker and open its selection through the route the scan came from.
+// No ImGui calls: the headless selftests and the auto-accept blocks in main()
+// go through this exact function.
+static void pickerAccept() {
+    std::string err;
+    std::vector<App::PendingGroup> sel = pickerSelection(&err);
+    bool remote = app.folderPickRemote;
+    std::string host = app.folderPickHost;
+    app.folderPick.clear();
+    app.folderPickOpen = false;
+    if (sel.empty()) { toast(err.empty() ? "nothing selected" : err, true); return; }
+    if (remote) {
+        // remote groups: through the open queue, one stack at a time, so the
+        // memory budget is applied against reality
+        int frames = 0;
+        for (const auto& g : sel) frames += (int)g.files.size();
+        toast("opening " + std::to_string(sel.size()) + " remote stack(s), " +
+              std::to_string(frames) + " frames");
+        for (auto& g : sel)
+            app.rbOpenQueue.push_back({ host, std::move(g.files), g.name, g.batchId });
+    } else {
+        enqueueGroups(std::move(sel));
+    }
+}
+
+// Tree of what the scan found. One live filter narrows FILES as you type;
+// checkboxes choose groups; the footer picks between "one stack per sequence"
+// and "everything as ONE stack". Group count is capped at 256 by the scans, so
+// the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
     if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences")) {
         fprintf(stderr, "picker: OpenPopup (remote=%d, %d groups)\n",
@@ -3463,72 +3675,91 @@ static void drawFolderPickModal() {
     if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
 
     ImGui::TextDisabled("%s", app.folderPickRoot.c_str());
-    int selGroups = 0, selFiles = 0, allFiles = 0;
+    int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
     for (const auto& e : app.folderPick) {
-        allFiles += (int)e.g.files.size();
-        if (e.selected) { selGroups++; selFiles += (int)e.g.files.size(); }
+        totalFiles += (int)e.g.files.size();
+        matchFiles += e.nMatch;
+        if (e.nMatch == 0) continue;               // fully filtered out: not loadable
+        if (e.selected) { selGroups++; selFiles += e.nMatch; }
     }
-    ImGui::Text("%d sequence(s), %d files found", (int)app.folderPick.size(), allFiles);
-    // glob filters beat clicking dozens of checkboxes.
-    // Widths are measured, not guessed: the fields share the row, the buttons
-    // get their own row so nothing is pushed off the right edge.
+
+    // ONE live filter, no Apply button: each keystroke re-cuts the tree below.
     {
-        const ImGuiStyle& st = ImGui::GetStyle();
-        float labelW = ImGui::CalcTextSize("exclude").x + st.ItemInnerSpacing.x;
-        float fieldW = (ImGui::GetContentRegionAvail().x - 2 * labelW - st.ItemSpacing.x) * 0.5f;
-        fieldW = std::max(fieldW, ImGui::GetFontSize() * 6);
-        ImGui::SetNextItemWidth(fieldW);
-        bool ch = ImGui::InputTextWithHint("include", "* or 00/*,*_dark*", app.pickInclude,
-                                           sizeof app.pickInclude);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere\n"
-                              "matched against \"folder/pattern\", e.g. 01/frame_###.npy");
+        float countW = ImGui::CalcTextSize("00000 / 00000 files match").x;
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - countW -
+                                         ImGui::GetStyle().ItemSpacing.x,
+                                         ImGui::GetFontSize() * 8));
+        if (ImGui::InputTextWithHint("##pickfilter", "filter files - e.g. dark  !ng  *_A.npy",
+                                     app.pickFilter, sizeof app.pickFilter))
+            applyPickFilter();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(
+                "Narrows WHICH FILES will load, as you type.\n"
+                "Each word is looked for anywhere in a file's \"folder/filename\"\n"
+                "(shown when you expand a sequence below). All words must match.\n"
+                "    dark          keep files whose folder or name contains \"dark\"\n"
+                "    !ng           drop files matching \"ng\"\n"
+                "    10lx *_A.npy  words combine; * and ? wildcards work anywhere\n"
+                "Sequences show \"kept / total\"; only the kept files are loaded.");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(fieldW);
-        ch |= ImGui::InputTextWithHint("exclude", "e.g. *_ng*,02/*", app.pickExclude,
-                                       sizeof app.pickExclude);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("comma separated; * and ? wildcards; a bare word matches anywhere");
-        if (ch) applyPickFilters();
+        if (app.pickFilter[0]) ImGui::Text("%d / %d files match", matchFiles, totalFiles);
+        else ImGui::TextDisabled("%d sequence(s), %d files", (int)app.folderPick.size(), totalFiles);
     }
-    if (ImGui::SmallButton("Apply filters")) applyPickFilters();
+    if (ImGui::SmallButton("All")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = true; }
     ImGui::SameLine();
-    if (ImGui::SmallButton("All")) for (auto& e : app.folderPick) e.selected = true;
+    if (ImGui::SmallButton("None")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = false; }
     ImGui::SameLine();
-    if (ImGui::SmallButton("None")) for (auto& e : app.folderPick) e.selected = false;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Invert")) for (auto& e : app.folderPick) e.selected = !e.selected;
+    if (ImGui::SmallButton("Invert")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = !e.selected; }
     ImGui::Separator();
 
-    float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing();
+    // footer: mode row + status/warning line(s) + button row, measured not guessed
+    std::string err;
+    std::vector<std::string> shapes;               // distinct known shapes in selection
+    bool mixedRawNpy = false;
+    {
+        bool anyRaw = false, anyNpy = false;
+        for (const auto& e : app.folderPick) {
+            if (!e.selected || e.nMatch == 0) continue;
+            (e.g.isRaw ? anyRaw : anyNpy) = true;
+            if (e.g.shape.empty()) continue;
+            bool dup = false;
+            for (const auto& s : shapes) if (s == e.g.shape) { dup = true; break; }
+            if (!dup) shapes.push_back(e.g.shape);
+        }
+        mixedRawNpy = anyRaw && anyNpy;
+    }
+    bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
+    float footer = ImGui::GetFrameHeightWithSpacing() * 2 +
+                   ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
     std::vector<std::string> folders;
-    for (const auto& e : app.folderPick) {
+    auto folderOf = [](const App::FolderPick& e) {
         size_t s = e.g.name.find_last_of('/');
-        std::string f = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+        return s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
+    };
+    for (const auto& e : app.folderPick) {
+        if (e.nMatch == 0) continue;               // the filter emptied it: hide
+        std::string f = folderOf(e);
         bool dup = false;
         for (const auto& x : folders) if (x == f) { dup = true; break; }
         if (!dup) folders.push_back(f);
     }
+    if (folders.empty())
+        ImGui::TextDisabled("no files match \"%s\"", app.pickFilter);
     for (const auto& f : folders) {
         ImGui::PushID(f.c_str());
         bool all = true, any = false;
         int files = 0;
         for (const auto& e : app.folderPick) {
-            size_t s = e.g.name.find_last_of('/');
-            std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
-            if (ef != f) continue;
-            files += (int)e.g.files.size();
+            if (e.nMatch == 0 || folderOf(e) != f) continue;
+            files += e.nMatch;
             e.selected ? (any = true) : (all = false);
         }
         bool parent = all;
         if (ImGui::Checkbox("##folder", &parent)) {
-            for (auto& e : app.folderPick) {
-                size_t s = e.g.name.find_last_of('/');
-                std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
-                if (ef == f) e.selected = parent;
-            }
+            for (auto& e : app.folderPick)
+                if (e.nMatch > 0 && folderOf(e) == f) e.selected = parent;
         }
         ImGui::SameLine();
         if (!all && any) ImGui::TextDisabled("~");     // partial selection marker
@@ -3538,18 +3769,43 @@ static void drawFolderPickModal() {
         snprintf(hdr, sizeof hdr, "%s   (%d files)", f.c_str(), files);
         if (ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
             for (auto& e : app.folderPick) {
+                if (e.nMatch == 0 || folderOf(e) != f) continue;
                 size_t s = e.g.name.find_last_of('/');
-                std::string ef = s == std::string::npos ? std::string("(root)") : e.g.name.substr(0, s);
-                if (ef != f) continue;
                 std::string leaf = s == std::string::npos ? e.g.name : e.g.name.substr(s + 1);
                 ImGui::PushID(&e);
-                char lb[320];
-                snprintf(lb, sizeof lb, "%s   %d file(s)%s", leaf.c_str(), (int)e.g.files.size(),
-                         e.g.isRaw ? "  [raw]" : "");
                 ImGui::Checkbox("##sel", &e.selected);
                 ImGui::SameLine();
-                ImGui::TextUnformatted(lb);   // not a label: '#' in names stays visible
+                // expandable: the files behind the pattern, so "what does the
+                // filter keep?" has a visible answer. Label text goes through
+                // TextUnformatted ('#' and '?' in names stay visible).
+                bool open = ImGui::TreeNodeEx("##files", ImGuiTreeNodeFlags_SpanAvailWidth);
+                ImGui::SameLine();
+                char lb[352];
+                if (e.nMatch == (int)e.g.files.size())
+                    snprintf(lb, sizeof lb, "%s   %d file(s)%s%s%s", leaf.c_str(), e.nMatch,
+                             e.g.isRaw ? "  [raw]" : "",
+                             e.g.shape.empty() ? "" : "  ", e.g.shape.c_str());
+                else
+                    snprintf(lb, sizeof lb, "%s   %d / %d files%s%s%s", leaf.c_str(), e.nMatch,
+                             (int)e.g.files.size(), e.g.isRaw ? "  [raw]" : "",
+                             e.g.shape.empty() ? "" : "  ", e.g.shape.c_str());
+                ImGui::TextUnformatted(lb);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
+                if (open) {
+                    std::vector<int> vis;          // files the filter keeps
+                    vis.reserve(e.nMatch);
+                    for (int i = 0; i < (int)e.g.files.size(); i++)
+                        if (i < (int)e.match.size() && e.match[i]) vis.push_back(i);
+                    ImGuiListClipper cl;           // thousands of frames stay cheap
+                    cl.Begin((int)vis.size());
+                    while (cl.Step())
+                        for (int row = cl.DisplayStart; row < cl.DisplayEnd; row++) {
+                            ImGui::TextDisabled("%s", e.rel[vis[row]].c_str());
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", e.g.files[vis[row]].c_str());
+                        }
+                    ImGui::TreePop();
+                }
                 ImGui::PopID();
             }
             ImGui::TreePop();
@@ -3558,8 +3814,37 @@ static void drawFolderPickModal() {
     }
     ImGui::EndChild();
 
-    ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
-    bool load = ImGui::Button("Load selected", ImVec2(150 * app.uiScale, 0));
+    // load mode: UC1 (one stack per sequence) vs UC2/UC3 (everything as ONE stack)
+    {
+        char m0[64], m1[64];
+        snprintf(m0, sizeof m0, "%d separate stack(s)###mode0", selGroups);
+        snprintf(m1, sizeof m1, "ONE stack of %d file(s)###mode1", selFiles);
+        ImGui::RadioButton(m0, &app.pickMerge, 0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("each checked sequence becomes its own stack");
+        ImGui::SameLine();
+        ImGui::RadioButton(m1, &app.pickMerge, 1);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ALL checked files merge into a single stack,\n"
+                              "frames in natural (numeric) order - for a capture\n"
+                              "split across folders, or a filtered subset");
+    }
+    bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
+    if (app.pickMerge == 1 && mixedRawNpy)
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                           "cannot merge raw and npy files into one stack");
+    else if (app.pickMerge == 1 && shapes.size() > 1)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                           "shapes differ (%s vs %s) - mismatched frames are skipped at load",
+                           shapes[0].c_str(), shapes[1].c_str());
+    else
+        ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
+    if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
+        ImGui::TextDisabled("check the shape column above to see which sequences differ");
+    ImGui::BeginDisabled(!loadable);
+    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack" : "Load selected",
+                              ImVec2(150 * app.uiScale, 0));
+    ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         app.folderPick.clear();
@@ -3567,25 +3852,8 @@ static void drawFolderPickModal() {
         ImGui::CloseCurrentPopup();
     }
     if (load) {
-        std::vector<App::PendingGroup> sel;
-        for (auto& e : app.folderPick) if (e.selected) sel.push_back(std::move(e.g));
-        app.folderPick.clear();
-        app.folderPickOpen = false;
         ImGui::CloseCurrentPopup();
-        if (sel.empty()) {
-            toast("nothing selected", true);
-        } else if (app.folderPickRemote) {
-            // remote groups: through the open queue, one stack at a time, so
-            // the memory budget is applied against reality
-            int frames = 0;
-            for (const auto& g : sel) frames += (int)g.files.size();
-            toast("opening " + std::to_string(sel.size()) + " remote stack(s), " +
-                  std::to_string(frames) + " frames");
-            for (auto& g : sel)
-                app.rbOpenQueue.push_back({ app.folderPickHost, std::move(g.files), g.name, g.batchId });
-        } else {
-            enqueueGroups(std::move(sel));
-        }
+        pickerAccept();                // same call the headless selftests make
     }
     ImGui::EndPopup();
 }
@@ -4185,6 +4453,11 @@ static void pumpRemoteBrowse() {
                 std::string base = joinR(r.dir, g.dir);
                 for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
                 pg.batchId = scanBatch;
+                if (g.entry.hasMeta && g.entry.ndim > 0) {   // v3 metadata -> the
+                    for (int d = 0; d < g.entry.ndim; d++)   // picker's shape column
+                        pg.shape += (d ? "x" : "") + std::to_string(g.entry.dims[d]);
+                    if (!g.entry.dtype.empty()) pg.shape += " " + g.entry.dtype;
+                }
                 groups.push_back(std::move(pg));
             }
             if (r.truncated)
@@ -4199,16 +4472,12 @@ static void pumpRemoteBrowse() {
             // scan STARTED INSIDE a leaf folder into "it opened everything
             // without asking" (verbatim, reported three times).
             {
-                app.folderPick.clear();
-                for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
-                app.folderPickRoot = makeRemoteUrl(r.host, r.dir);
-                app.folderPickRemote = true;
-                app.folderPickHost = r.host;
-                app.folderPickOpen = true;
                 // the picker "not appearing" has now been reported three times
                 // with three different causes; the trail stays in
                 fprintf(stderr, "remote scan: %d groups -> picker requested\n",
                         (int)groups.size());
+                openPickerWith(std::move(groups), makeRemoteUrl(r.host, r.dir),
+                               r.dir, true, r.host);
             }
             continue;
         }
@@ -9051,6 +9320,7 @@ static void drawHelpAbout() {
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
+static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 
 static void printUsage() {
     printf(
@@ -9171,6 +9441,8 @@ static void parseCli(int argc, char** argv) {
             g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
+        } else if (a == "--picker-selftest") {
+            g_pickerSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -9868,6 +10140,88 @@ int main(int argc, char** argv) {
     // Remote Open Folder, verifiable without a human or a second machine: connect
     // to the local peer, scan a folder-of-folders, and count what opened. Goes
     // through the REAL path - rb worker, LIST protocol, grouping, stack open.
+    // The picker's two new promises, verifiable without a human. UC3: a live
+    // filter cuts each group's FILE list, and accepting loads exactly the cut.
+    // UC2: merge mode folds the whole selection into ONE stack, union of files
+    // in natural order. Runs against an abset-style folder (A/B variants of
+    // the same numbering in one directory).
+    if (!g_pickerSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        auto stackFiles = [&](int seqId) {
+            std::vector<std::string> out;
+            for (int idx : framesOfSeq(seqId)) out.push_back(app.images[idx]->path);
+            return out;
+        };
+        auto joinBase = [&](const std::vector<std::string>& v) {
+            std::string s;
+            for (const auto& f : v) { s += s.empty() ? "" : ","; s += baseName(f); }
+            return s;
+        };
+        bool ok = true;
+
+        // ---- UC3: filter "_A", one stack per group -> only the A files load
+        openFolder(g_pickerSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "pickerselftest: picker did not open\n");
+            return 1;
+        }
+        int total = 0;
+        for (const auto& e : app.folderPick) total += (int)e.g.files.size();
+        snprintf(app.pickFilter, sizeof app.pickFilter, "_A");
+        applyPickFilter();
+        app.pickMerge = 0;
+        std::vector<App::PendingGroup> want = pickerSelection();
+        std::vector<std::string> wantFiles;
+        for (const auto& g : want)
+            wantFiles.insert(wantFiles.end(), g.files.begin(), g.files.end());
+        pickerAccept();
+        loadAll();
+        std::vector<std::string> got =
+            app.seqs.empty() ? std::vector<std::string>() : stackFiles(app.seqs[0].id);
+        fprintf(stderr, "pickerselftest: UC3 filter \"_A\" kept %d of %d files -> "
+                        "%d stack(s), loaded [%s]\n",
+                (int)wantFiles.size(), total, (int)app.seqs.size(), joinBase(got).c_str());
+        if ((int)wantFiles.size() >= total || wantFiles.empty()) {
+            fprintf(stderr, "pickerselftest: UC3 FAILED - filter cut nothing\n");
+            ok = false;
+        }
+        if (app.seqs.size() != want.size() || got != wantFiles) {
+            fprintf(stderr, "pickerselftest: UC3 FAILED - loaded files != filtered selection\n");
+            ok = false;
+        }
+
+        // ---- UC2: no filter, merge mode -> ONE stack, union, natural order
+        size_t seqsBefore = app.seqs.size();
+        openFolder(g_pickerSelftest);          // reopens the picker, filter cleared
+        app.pickMerge = 1;
+        std::vector<App::PendingGroup> mwant = pickerSelection();
+        pickerAccept();
+        loadAll();
+        std::vector<std::string> mgot = app.seqs.size() == seqsBefore + 1
+            ? stackFiles(app.seqs.back().id) : std::vector<std::string>();
+        fprintf(stderr, "pickerselftest: UC2 merge -> +%d stack(s) '%s', order [%s]\n",
+                (int)(app.seqs.size() - seqsBefore),
+                app.seqs.empty() ? "" : app.seqs.back().name.c_str(), joinBase(mgot).c_str());
+        if (mwant.size() != 1 || app.seqs.size() != seqsBefore + 1) {
+            fprintf(stderr, "pickerselftest: UC2 FAILED - merge did not make ONE stack\n");
+            ok = false;
+        } else if (mgot != mwant[0].files || (int)mgot.size() != total) {
+            fprintf(stderr, "pickerselftest: UC2 FAILED - merged stack != union in natural order\n");
+            ok = false;
+        }
+        fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
     if (!g_scanSelftest.empty()) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
@@ -9886,13 +10240,8 @@ int main(int argc, char** argv) {
                 scanSent = true;
             }
             // headless "Load selected": accept the picker with everything checked,
-            // exactly what the Load button does with the default selection
-            if (app.folderPickOpen && app.folderPickRemote) {
-                for (auto& e : app.folderPick)
-                    app.rbOpenQueue.push_back({ app.folderPickHost, std::move(e.g.files), e.g.name });
-                app.folderPick.clear();
-                app.folderPickOpen = false;
-            }
+            // through the SAME function the Load button calls
+            if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
             if (scanSent && !app.rbBusy && !app.seqs.empty() &&
                 app.rbOpenQueue.empty() && app.rfPending == 0) break;
             if (!app.rbrowse.err.empty()) break;
@@ -9919,13 +10268,7 @@ int main(int argc, char** argv) {
     if (g_fstatSelftest) {
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 600.0) {
-            if (app.folderPickOpen && !app.folderPickRemote) {   // headless accept
-                std::vector<App::PendingGroup> sel;
-                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
-                app.folderPick.clear();
-                app.folderPickOpen = false;
-                enqueueGroups(std::move(sel));
-            }
+            if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();   // headless accept
             pumpSequenceAndQueue();
             if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                 !app.folderPickOpen) break;
@@ -9946,15 +10289,9 @@ int main(int argc, char** argv) {
     if (g_linSelftest) {
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 600.0) {       // wall clock: the loader is a thread
-            // headless "Load selected": Open Folder now ALWAYS shows the picker,
+            // headless "Load selected": Open Folder ALWAYS shows the picker,
             // so a selftest accepts it the way the Load button would
-            if (app.folderPickOpen && !app.folderPickRemote) {
-                std::vector<App::PendingGroup> sel;
-                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
-                app.folderPick.clear();
-                app.folderPickOpen = false;
-                enqueueGroups(std::move(sel));
-            }
+            if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
             pumpSequenceAndQueue();
             if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                 !app.folderPickOpen) break;
