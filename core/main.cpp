@@ -273,6 +273,10 @@ struct App {
         // answer all of that without the surrounding session.
         std::string prov;
         float runMs = 0;
+        // presentation metadata, derived once per run (never in the draw loop):
+        std::vector<int> colColor;             // ANN palette per column; -1 = neutral
+        std::vector<std::string> units;        // per row; "" for text rows
+        std::vector<char> headline;            // per row: the number the user came for
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
@@ -6090,6 +6094,48 @@ static void drawPanelRois() {
     ImGui::EndChild();
 }
 
+// Unit resolution for grid rows: every numeric row gets a unit column entry.
+// Keys that can know their unit carry it in the name ("snr_db", "*_pct",
+// "mtf50 (cy/px)" - the documented plugin convention); image-value rows are in
+// the FILE's units, which only integer dtypes let us name honestly (DN). For
+// float data the dtype itself is shown instead of a unit we would be inventing
+// - a float .npy may hold reflectance, electrons, or anything (same rule the
+// Inspector applies to its value columns).
+static std::string unitForAnalysisKey(const std::string& key, const std::string& dtype) {
+    auto ends = [&](const char* s) {
+        size_t n = strlen(s);
+        return key.size() >= n && key.compare(key.size() - n, n, s) == 0;
+    };
+    bool isInt = !dtype.empty() && (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
+    std::string img = isInt ? "DN" : dtype;            // the file's own value unit
+    if (ends("snr_db"))                              return "dB";
+    if (ends("_pct"))                                return "%";
+    if (key.find("(cy/px)") != std::string::npos)    return "cy/px";
+    if (key == "sfr@nyquist" || key == "finite ratio") return "ratio";
+    if (ends("_deg"))                                return "deg";
+    if (key == "lines_used")                         return "lines";
+    if (key == "pixels")                             return "px";
+    if (ends(".entropy"))                            return "bit";
+    if (ends(".var"))                                return img + "^2";
+    if (key == "varlap" || key == "tenengrad" || key == "grad_mean")
+        return "a.u.";                               // relative-only metrics
+    if (ends(".mean") || ends(".std") || ends(".noise") || ends(".min") ||
+        ends(".max") || ends(".p1") || ends(".p50") || ends(".p99"))
+        return img;
+    return "";     // text rows (method / note) and keys we cannot vouch for
+}
+
+// The number the user came for, per analyzer: mtf50, prnu%, the noise floor.
+// Host knowledge until an ABI v3 lets plugins declare it - same trade-off as
+// the question groups in the Measure menu, and just as additive.
+static const char* analyzerHeadlineSuffix(const std::string& name) {
+    if (name == "noise/floor")         return ".noise";
+    if (name == "uniformity/prnu-fpn") return ".prnu_pct";
+    if (name == "sharpness/gradient")  return "tenengrad";
+    if (name == "iso12233/e-sfr")      return "mtf50 (cy/px)";
+    return nullptr;                    // stats/moments: all rows are peers
+}
+
 static void drawPanelAnalysis() {
     ImageDoc* im = cur();
     if (im && !plugin_host::analyzers().empty()) {
@@ -6164,6 +6210,7 @@ static void drawPanelAnalysis() {
         if (ranNow) {
             double runT0 = glfwGetTime();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
+            ana.colColor.clear(); ana.units.clear(); ana.headline.clear();
             ana.img = im; ana.uid = im->uid; ana.plugin = app.anaSel; ana.rev = app.annRev;
             ana.dataRev = im->dataRev; ana.black = effBlack(*im); ana.white = effWhite(*im);
             ana.cfa = im->cfa; ana.cfaPattern = im->cfaPattern;
@@ -6185,6 +6232,7 @@ static void drawPanelAnalysis() {
                     rows.clear();
                 }
                 ana.cols.push_back(colLabel);
+                ana.colColor.push_back(colorIdx);   // header wears the ROI's color
                 for (auto& r : ana.vals) r.resize(ana.cols.size());
                 for (const auto& kv : rows) {
                     if (kv.first == "roi") continue;        // grid header already says which ROI
@@ -6211,6 +6259,7 @@ static void drawPanelAnalysis() {
                     int rh = std::clamp(a->h, 0, im->h - ry);
                     if (rw < 1 || rh < 1) {
                         ana.cols.push_back(a->label + " (off)");
+                        ana.colColor.push_back(a->color & 7);
                         for (auto& r : ana.vals) r.resize(ana.cols.size());
                         continue;
                     }
@@ -6219,6 +6268,17 @@ static void drawPanelAnalysis() {
                 }
             }
             ana.runMs = (float)((glfwGetTime() - runT0) * 1000.0);
+            // per-row presentation, derived once here so the draw loop below
+            // only reads cached strings (no per-frame string building)
+            {
+                const char* hl = analyzerHeadlineSuffix(anas[app.anaSel].name);
+                size_t hn = hl ? strlen(hl) : 0;
+                for (const auto& k : ana.keys) {
+                    ana.units.push_back(unitForAnalysisKey(k, im->dtype));
+                    ana.headline.push_back(hl && k.size() >= hn &&
+                                           k.compare(k.size() - hn, hn, hl) == 0);
+                }
+            }
             {   // Provenance, built once per run and shown verbatim until the
                 // next one: where this ran, on what, over which target, when,
                 // and how long. [local] is a promise, not decoration - numbers
@@ -6258,37 +6318,96 @@ static void drawPanelAnalysis() {
                                    "|  inputs changed - Run (M)");
             }
         }
+        // results toolbar: a constant row (disabled while empty, never absent,
+        // so the grid below sits at a fixed height in every state)
+        ImGui::BeginDisabled(ana.img != im || ana.keys.empty());
+        if (ImGui::Button("Copy table (TSV)")) {
+            // provenance rides along as a # comment: a pasted grid must carry
+            // the same evidence as a screenshot of the panel
+            std::string tsv = "# " + ana.prov + "\n";
+            tsv += "metric\tunit";
+            for (const auto& cn : ana.cols) tsv += "\t" + cn;
+            tsv += "\n";
+            for (int k = 0; k < (int)ana.keys.size(); k++) {
+                tsv += ana.keys[k] + "\t" + (k < (int)ana.units.size() ? ana.units[k] : "");
+                for (int c = 0; c < (int)ana.cols.size(); c++)
+                    tsv += "\t" + (c < (int)ana.vals[k].size() ? ana.vals[k][c] : std::string());
+                tsv += "\n";
+            }
+            ImGui::SetClipboardText(tsv.c_str());
+            toast("result grid copied as TSV (provenance included)");
+        }
+        ImGui::EndDisabled();
         if (ana.img == im) {
             if (!ana.err.empty()) {
                 ImGui::PushTextWrapPos(0.0f);       // plugin errors carry paths
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
                 ImGui::PopTextWrapPos();
             }
-            int nCols = 1 + (int)ana.cols.size();
+            int nCols = 2 + (int)ana.cols.size();       // metric + unit + one per target
             // SizingFixedFit + explicit inner width: with StretchProp, ScrollX never
             // scrolled and simply clipped the numbers (hence the old 16-column cap)
             float colW = ImGui::GetFontSize() * 7.0f;
+            float unitW = ImGui::GetFontSize() * 3.0f;
+            float pad = ImGui::GetStyle().CellPadding.x * 2;
             if (!ana.keys.empty() &&
                 ImGui::BeginTable("anagrid", nCols,
                                   ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_BordersInnerV,
                                   ImVec2(0, 0),
-                                  nCols * (colW + ImGui::GetStyle().CellPadding.x * 2) + nCols + 1)) {
-                ImGui::TableSetupScrollFreeze(1, 1);   // keep the metric names in view
-                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, colW);
+                                  (nCols - 1) * (colW + pad) + unitW + pad + nCols + 1)) {
+                ImGui::TableSetupScrollFreeze(2, 1);   // metric + unit stay in view
+                ImGui::TableSetupColumn("metric", ImGuiTableColumnFlags_WidthFixed, colW);
+                ImGui::TableSetupColumn("unit", ImGuiTableColumnFlags_WidthFixed, unitW);
                 for (const auto& cn : ana.cols)
                     ImGui::TableSetupColumn(cn.c_str(), ImGuiTableColumnFlags_WidthFixed, colW);
-                ImGui::TableHeadersRow();
+                // custom header row so each target column wears its ROI's
+                // color: the frame on the canvas, the curve in the plot and
+                // the column in the grid identify each other without a legend
+                ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+                ImGui::TableNextColumn(); ImGui::TableHeader("metric");
+                ImGui::TableNextColumn(); ImGui::TableHeader("unit");
+                for (int c = 0; c < (int)ana.cols.size(); c++) {
+                    ImGui::TableNextColumn();
+                    int ci = c < (int)ana.colColor.size() ? ana.colColor[c] : -1;
+                    if (ci >= 0)
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImGui::ColorConvertU32ToFloat4(ANN_COLORS[ci & 7]));
+                    ImGui::TableHeader(ana.cols[c].c_str());
+                    if (ci >= 0) ImGui::PopStyleColor();
+                }
+                // headline rows (mtf50, prnu%, noise floor) wear the theme
+                // accent + a tinted row: the grid keeps every number, the
+                // emphasis says which one the analyzer exists to produce
+                ImVec4 acc = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+                ImU32 accBg = ImGui::GetColorU32(ImVec4(acc.x, acc.y, acc.z, 0.14f));
                 for (int k = 0; k < (int)ana.keys.size(); k++) {
+                    bool hl = k < (int)ana.headline.size() && ana.headline[k];
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", ana.keys[k].c_str());
+                    if (hl) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, accBg);
+                    ImGui::TableNextColumn();
+                    if (hl) ImGui::TextUnformatted(ana.keys[k].c_str());
+                    else    ImGui::TextDisabled("%s", ana.keys[k].c_str());
+                    ImGui::TableNextColumn();
+                    if (k < (int)ana.units.size() && !ana.units[k].empty())
+                        ImGui::TextDisabled("%s", ana.units[k].c_str());
                     for (int c = 0; c < (int)ana.cols.size(); c++) {
                         ImGui::TableNextColumn();
-                        if (c < (int)ana.vals[k].size() && !ana.vals[k][c].empty())
-                            ImGui::TextUnformatted(ana.vals[k][c].c_str());
-                        else
+                        if (c >= (int)ana.vals[k].size() || ana.vals[k][c].empty()) {
                             ImGui::TextDisabled("-");
+                            continue;
+                        }
+                        const std::string& v = ana.vals[k][c];
+                        // numbers right-aligned in their fixed column (textNum
+                        // rule: digits keep their place across runs); text rows
+                        // (method / note) stay left-aligned prose
+                        bool num = v[0] == '-' || v[0] == '+' || v[0] == '.' ||
+                                   (v[0] >= '0' && v[0] <= '9');
+                        if (hl) ImGui::PushStyleColor(ImGuiCol_Text, acc);
+                        if (num) textNumStr(v);
+                        else     ImGui::TextUnformatted(v.c_str());
+                        if (hl) ImGui::PopStyleColor();
                     }
                 }
                 ImGui::EndTable();
