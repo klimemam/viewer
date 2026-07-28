@@ -3885,6 +3885,66 @@ static std::vector<NameSeg> segmentName(const std::string& stem) {
     return segs;
 }
 
+// The '?' pattern of a set of file NAMES already in hand (no filesystem, no
+// peer): the same segment rule findSequenceSiblings and the peer's grouper use,
+// applied to an arbitrary selection. Empty when the names do not share a
+// structure - a caller that cannot name a stack must say so, not invent one.
+static std::string patternOfNames(std::vector<std::string> names) {
+    if (names.size() < 2) return {};
+    std::sort(names.begin(), names.end());
+    std::string ext;
+    {
+        size_t d = names[0].find_last_of('.');
+        if (d != std::string::npos) ext = names[0].substr(d);
+    }
+    std::vector<std::vector<NameSeg>> segs;
+    for (const auto& n : names) {
+        size_t d = n.find_last_of('.');
+        if ((d == std::string::npos ? std::string() : n.substr(d)) != ext) return {};
+        segs.push_back(segmentName(d == std::string::npos ? n : n.substr(0, d)));
+        if (segs.back().size() != segs[0].size()) return {};
+        for (size_t k = 0; k < segs[0].size(); k++) {
+            if (segs.back()[k].digit != segs[0][k].digit) return {};
+            if (!segs[0][k].digit && segs.back()[k].s != segs[0][k].s) return {};
+        }
+    }
+    // the frame axis is the LAST digit field that varies (capture software puts
+    // the counter last) - the rule findSequenceSiblings and serve.cpp both use
+    int best = -1;
+    for (size_t k = 0; k < segs[0].size(); k++) {
+        if (!segs[0][k].digit) continue;
+        for (size_t i = 1; i < segs.size(); i++)
+            if (segs[i][k].s != segs[0][k].s) { best = (int)k; break; }
+    }
+    if (best < 0) return {};
+    // every OTHER digit field has to be constant, or this is not one stack
+    for (size_t k = 0; k < segs[0].size(); k++) {
+        if (!segs[0][k].digit || (int)k == best) continue;
+        for (size_t i = 1; i < segs.size(); i++)
+            if (segs[i][k].s != segs[0][k].s) return {};
+    }
+    std::string pat;
+    for (size_t k = 0; k < segs[0].size(); k++)
+        pat += (int)k == best ? std::string(segs[0][k].s.size(), '?') : segs[0][k].s;
+    pat += ext;
+    return rp::patternWithExtent(pat, names);
+}
+
+// The canon's default stack name: `フォルダ/パターン` (docs/terminology.md).
+// Seven stacks all called frame_000.npy would be indistinguishable in every
+// panel, AND extractLevelFromName only strips a frame-axis extent run from a
+// name that HAS a folder part - so a bare member name parses its first digit
+// run as a level, which is how a lit stack ends up proposed at 0.
+static std::string stackNameFor(const std::string& dir, const std::string& pattern) {
+    if (pattern.empty()) return {};
+    std::string d = dir;
+    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    size_t s = d.find_last_of('/');
+    std::string leaf = s == std::string::npos ? d : d.substr(s + 1);
+    if (leaf == "~" || leaf == "." || leaf.empty()) return pattern;
+    return leaf + "/" + pattern;
+}
+
 // Siblings = files whose names differ ONLY in one digit field. The field is
 // chosen by which one actually varies in the folder, so "shot_0007_1920x1080.raw"
 // groups on 0007 and not on the resolution.
@@ -11448,7 +11508,9 @@ static void drawPanelRemote() {
             dropPreview();                   // the poster frame did its job
             std::vector<std::string> files;
             for (const auto& m : r.e->members) files.push_back(r.join(m));
-            openRemoteStack(B.host, files);
+            // the canon's `folder/pattern`, built from the SAME text the peer
+            // put in the group row (rp::patternWithExtent, shared verbatim)
+            openRemoteStack(B.host, files, stackNameFor(*r.dir, r.e->name));
             return;
         }
         for (const auto& di : app.images)
@@ -11693,7 +11755,10 @@ static void drawPanelRemote() {
                     else files.push_back(view[i].full());
                 }
                 sortFramesNumerically(files);
-                openRemoteStack(B.host, files);
+                std::vector<std::string> bases;
+                for (const auto& f : files) bases.push_back(baseName(f));
+                openRemoteStack(B.host, files,
+                                stackNameFor(B.dir, patternOfNames(bases)));
                 rbSel.assign(view.size(), 0);
             }
             if (!reason.empty()) ImGui::EndDisabled();
@@ -12032,7 +12097,7 @@ static void drawPanelRemote() {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
-                        openRemoteStack(B.host, files);
+                        openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name));
                     }
                     // the server aggregates WITHOUT opening: "is this set even
                     // worth transferring?" costs zero pixels this way. Group
@@ -12056,7 +12121,7 @@ static void drawPanelRemote() {
                         openRemote(makeRemoteUrl(B.host, full));
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
-                        openRemoteStack(B.host, { full });
+                        openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname));
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
@@ -12064,7 +12129,7 @@ static void drawPanelRemote() {
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
-                            openRemoteStack(B.host, files);
+                            openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name));
                         }
                     }
                     ImGui::Separator();
@@ -14793,6 +14858,52 @@ int main(int argc, char** argv) {
                         sepOk ? "ok" : "FAIL");
                 if (!sepOk) ok = false;
                 dropPreview();
+            }
+        }
+        {   // STACK IDENTITY. A Browse open must name the stack the way the
+            // canon does - `folder/pattern` (docs/terminology.md) - and the
+            // same way the SCAN picker does, or one folder has two identities
+            // depending on which door it was opened through. It is not only
+            // cosmetic: extractLevelFromName strips a frame-axis extent run
+            // only from a name that HAS a folder part, so a bare member name
+            // parses its first digit run as a LEVEL, and a lit stack gets
+            // proposed at 0 - which is the dark-reference value.
+            remoteBrowseTo(dir + "/scanroot/10lx");
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == dir + "/scanroot/10lx" && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
+            const RbRow* grp = nullptr;
+            for (const auto& r : gv) if (r.isGroup()) { grp = &r; break; }
+            if (!grp) {
+                fprintf(stderr, "browseselftest: identity: no group row in %s\n",
+                        B.dir.c_str());
+                ok = false;
+            } else {
+                closeAll();
+                std::vector<std::string> files;
+                for (const auto& m : grp->e->members) files.push_back(grp->join(m));
+                std::string want = stackNameFor(*grp->dir, grp->e->name);
+                openRemoteStack(B.host, files, want);       // exactly what a row click does
+                std::string got = app.seqs.empty() ? std::string() : app.seqs.back().name;
+                std::string src;
+                double lvl = extractLevelFromName(got, &src);
+                // ...and the multi-select leg, which has only file names
+                std::vector<std::string> bases;
+                for (const auto& f : files) bases.push_back(baseName(f));
+                std::string multi = stackNameFor(B.dir, patternOfNames(bases));
+                bool idOk = got.rfind("10lx/", 0) == 0 &&
+                            got.find(grp->e->name) != std::string::npos &&
+                            lvl == 10.0 && multi == want;
+                fprintf(stderr, "browseselftest: stack identity: group open -> '%s', "
+                                "level %.6g (from '%s'), multi-select name '%s': %s\n",
+                        got.c_str(), lvl, src.c_str(), multi.c_str(),
+                        idOk ? "ok" : "FAIL");
+                if (!idOk) ok = false;
+                closeAll();
             }
         }
         fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
