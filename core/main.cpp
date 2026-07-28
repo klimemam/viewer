@@ -379,7 +379,14 @@ struct App {
     // (not per folder - reopening the same folder makes a NEW batch), named
     // after the folder only as a starting value, renameable, session-saved.
     // It is the user's analysis grouping, deliberately decoupled from disk.
-    struct Batch { int id; std::string name; };
+    // srcDir: the DIRECTORY loose opens reuse a batch for. Keying that reuse
+    // on the leaf NAME made ~/runA/10lx and ~/runB/10lx one "10lx" batch -
+    // two different measurements in two different directories, so Close batch
+    // took files from a directory the user never named, and "Create a series
+    // from this batch's stacks" offered two unrelated runs as one sweep with
+    // every row pre-ticked. Empty for batches made by the pickers, which are
+    // per OPEN ACTION by design.
+    struct Batch { int id; std::string name; std::string srcDir; };
     std::vector<Batch> batches;
     int nextBatchId = 1;
     // ---- series (系列): the stacks of ONE swept parameter (docs/terminology.md) --
@@ -1010,14 +1017,22 @@ static void toast(const std::string& msg, bool err = false) {
 // One batch per OPEN ACTION: reopening a folder deliberately makes a fresh
 // one - "calling the same folder twice" must give two groupings you can name
 // apart, or the second load is invisible.
-static int newBatch(const std::string& name) {
-    app.batches.push_back({ app.nextBatchId, name.empty() ? "opened" : name });
+static std::string uniqueBatchName(std::string base);   // fwd
+static int newBatch(const std::string& name, const std::string& srcDir = std::string()) {
+    app.batches.push_back({ app.nextBatchId, name.empty() ? "opened" : name, srcDir });
     app.imagesRev++;                      // the Files grouping caches on this
     return app.nextBatchId++;
 }
-// Loose single-file opens share the folder-named batch instead (the old
-// behavior, and the right one for "clicked three files in a row").
-static int batchReuse(const std::string& name) {
+// Loose single-file opens share a batch instead of making one each - the right
+// behaviour for "clicked three files in a row". The identity is the source
+// DIRECTORY, not its leaf name: two directories that happen to end in the same
+// component are different measurements. `dir` empty = match by name, which is
+// what session restore does (the session persists batches BY NAME, by design).
+static int batchReuse(const std::string& name, const std::string& dir = std::string()) {
+    if (!dir.empty()) {
+        for (const auto& b : app.batches) if (b.srcDir == dir) return b.id;
+        return newBatch(uniqueBatchName(name), dir);
+    }
     for (const auto& b : app.batches) if (b.name == name) return b.id;
     return newBatch(name);
 }
@@ -2463,7 +2478,7 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
             std::string dir = sl == std::string::npos ? std::string() : im->path.substr(0, sl);
             size_t s2 = dir.find_last_of("/\\");
             std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
-            im->batchId = batchReuse(leaf.empty() ? "generated" : leaf);
+            im->batchId = batchReuse(leaf.empty() ? "generated" : leaf, dir);
         }
     }
     // --cfa says "this dump is mosaiced" for formats that carry no such flag (an
@@ -6486,7 +6501,7 @@ static void openRemote(const std::string& url, bool asPreview) {
         std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
         size_t s2 = dir.find_last_of('/');
         std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
-        doc->batchId = batchReuse(leaf.empty() ? host : leaf);
+        doc->batchId = batchReuse(leaf.empty() ? host : leaf, host + ":" + dir);
     }
     computeMinMax(*doc);
     defaultRange(*doc);
@@ -6620,7 +6635,8 @@ static void promotePreview(ImageDoc* d) {
         std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
         size_t s2 = dir.find_last_of('/');
         std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
-        d->batchId = batchReuse(leaf.empty() ? (host.empty() ? "opened" : host) : leaf);
+        d->batchId = batchReuse(leaf.empty() ? (host.empty() ? "opened" : host) : leaf,
+                                host + ":" + dir);
     }
     // the buffering the preview deferred, at REGISTERED priority now
     requestFullRemote(d);
@@ -12564,8 +12580,26 @@ static void drawFileList() {
               ImGui::SameLine();
               done |= ImGui::SmallButton("rename");
               if (done && nameBuf[0]) {
+                  // through the function that owns the uniqueness invariant.
+                  // Every CREATION path funnels through uniqueBatchName because
+                  // sessions restore batches by NAME; this was the one mutation
+                  // of b.name that skipped it, so renaming batch B to batch A's
+                  // name merged them on the next session round trip - and
+                  // `seriesbatch` travels by name too, so a series could be
+                  // restored into the wrong batch.
+                  std::string want = nameBuf, got;
                   for (auto& b : app.batches)
-                      if (b.id == group.batch) b.name = nameBuf;
+                      if (b.id == group.batch) {
+                          std::string keep = b.name;
+                          b.name.clear();          // exclude ITSELF from the
+                          got = uniqueBatchName(want);   // taken-set, or renaming
+                          b.name = keep;                 // "x (2)" to "x" gives "x (3)"
+                          b.name = got;
+                          break;
+                      }
+                  if (got != want)
+                      toast("'" + want + "' is taken - renamed to '" + got +
+                            "' (batch names are unique)", true);
                   app.imagesRev++;               // rebuild the cached labels
                   ImGui::CloseCurrentPopup();
               }
@@ -15312,6 +15346,67 @@ int main(int argc, char** argv) {
             app.seqs.size() != sids.size()) {
             fprintf(stderr, "batchselftest: FAILED - session did not restore the batch\n");
             ok = false;
+        }
+        {   // ---- loose opens: the batch is the source DIRECTORY, not its leaf
+            // ~/runA/10lx and ~/runB/10lx are different measurements. Keyed on
+            // the leaf name they became one "10lx" batch, so Close batch took
+            // files from a directory the user never named and the series modal
+            // offered two unrelated runs as one sweep with every row ticked.
+            closeAll();
+            int a1 = batchReuse("10lx", "/tmp/runA/10lx");
+            int a2 = batchReuse("10lx", "/tmp/runA/10lx");   // same dir: same batch
+            int b1 = batchReuse("10lx", "/tmp/runB/10lx");   // same leaf, other dir
+            std::string n1, n2;
+            for (const auto& b : app.batches) {
+                if (b.id == a1) n1 = b.name;
+                if (b.id == b1) n2 = b.name;
+            }
+            // ...while session restore still matches by NAME, which is how the
+            // session format works and is the canon's rule
+            int r1 = batchReuse(n2);
+            bool dirOk = a1 == a2 && a1 != b1 && n1 == "10lx" && n2 == "10lx (2)" &&
+                         r1 == b1;
+            fprintf(stderr, "batchselftest: loose opens: runA/10lx -> %d ('%s'), again "
+                            "-> %d, runB/10lx -> %d ('%s'), restore-by-name '%s' -> %d: %s\n",
+                    a1, n1.c_str(), a2, b1, n2.c_str(), n2.c_str(), r1,
+                    dirOk ? "ok" : "FAIL");
+            if (!dirOk) ok = false;
+        }
+        {   // ---- rename keeps the uniqueness invariant -----------------------
+            // Sessions restore batches by NAME (imgbatch -> batchReuse), so two
+            // batches sharing one name silently merge on the next load. Every
+            // CREATION path funnels through uniqueBatchName; the rename popup
+            // was the one writer that did not.
+            closeAll();
+            int p1 = newBatch(uniqueBatchName("data"));
+            int p2 = newBatch(uniqueBatchName("data"));
+            std::string was;
+            for (const auto& b : app.batches) if (b.id == p2) was = b.name;
+            // exactly what the rename popup now does
+            std::string want = "data", got;
+            for (auto& b : app.batches)
+                if (b.id == p2) {
+                    std::string keep = b.name;
+                    b.name.clear();
+                    got = uniqueBatchName(want);
+                    b.name = keep;
+                    b.name = got;
+                    break;
+                }
+            int dupes = 0;
+            for (size_t i = 0; i < app.batches.size(); i++)
+                for (size_t j = i + 1; j < app.batches.size(); j++)
+                    if (app.batches[i].name == app.batches[j].name) dupes++;
+            // "data" is taken by p1, so the closest free name is "data (2)" -
+            // which is what it already was: the rename is a no-op, not a
+            // runaway "data (3)"
+            bool renOk = was == "data (2)" && got == "data (2)" && dupes == 0;
+            fprintf(stderr, "batchselftest: rename '%s' -> 'data' became '%s', "
+                            "%d duplicate name(s) among %d batch(es): %s\n",
+                    was.c_str(), got.c_str(), dupes, (int)app.batches.size(),
+                    renOk ? "ok" : "FAIL");
+            if (!renOk) ok = false;
+            (void)p1;
         }
         fprintf(stderr, "batchselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
