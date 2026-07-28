@@ -9807,10 +9807,19 @@ static void drawPanelRemote() {
             return;
         }
         if (!isNpyName(r.name())) return;
+        // Everything this needs is read out of the row BEFORE the open, as
+        // VALUES: an RbRow is a pair of raw pointers into B.entries / the tree
+        // cache, and `r` is a reference into a vector rebuilt every frame.
+        // Nothing on the open path mutates either container today, but the row
+        // list is one refresh away from being replaced underneath us, and the
+        // tree work already had to defer a mid-frame clear for exactly this.
         // stepping context for the scrub bar / , and . : the whole sequence
         // when the row belongs to one, so a flat row still steps its siblings
-        const std::vector<std::string>* seq = (r.isGroup() || r.member >= 0) &&
-                                              !r.e->members.empty() ? &r.e->members : nullptr;
+        std::vector<std::string> seq;
+        if ((r.isGroup() || r.member >= 0) && !r.e->members.empty())
+            for (const auto& m : r.e->members) seq.push_back(r.join(m));
+        int seqAt = r.member >= 0 ? r.member : 0;
+        std::string seqLabel = r.e->name;
         std::string target = r.isGroup()
             ? r.join(r.e->members.empty() ? r.e->name : r.e->members[0])
             : r.full();
@@ -9822,11 +9831,10 @@ static void drawPanelRemote() {
         std::string u = makeRemoteUrl(B.host, target);
         if (pv && pv->remoteUrl == u) selectImage(app.current);
         else openRemote(u, true);
-        app.previewFiles.clear();
-        if (seq) {
-            for (const auto& m : *seq) app.previewFiles.push_back(r.join(m));
-            app.previewIndex = r.member >= 0 ? r.member : 0;
-            app.previewLabel = r.e->name;
+        app.previewFiles = std::move(seq);
+        if (!app.previewFiles.empty()) {
+            app.previewIndex = seqAt;
+            app.previewLabel = std::move(seqLabel);
         }
     };
     // What a double-click (and Enter) does: a REGISTERED open. A sequence row
@@ -9936,6 +9944,34 @@ static void drawPanelRemote() {
         }
         for (int i = 0; i < (int)view.size(); i++) if (keep[i]) shown.push_back(i);
     }
+    // ...and in SCREEN order, here, before anything indexes it. The sort used to
+    // happen inside the table, after the keyboard block had already turned the
+    // cursor's row index into a screen position: with any sort but the default
+    // the two disagreed, so the clipper was told to keep a different row alive
+    // than the one the cursor was on and SetScrollHereY never fired. The spec
+    // itself is stashed from the table one frame earlier (g_rbSortCol), exactly
+    // as the tree builder needs it - see RB_COL_NAME.
+    // Directories sort before files no matter the key: this is a browser, not a
+    // table of numbers. In TREE mode the sort has already happened per level,
+    // inside the builder; sorting the flattened tree here would tear children
+    // away from their parents.
+    if (!app.rbTree)
+        std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+            const RbRow& a = view[ia];
+            const RbRow& b = view[ib];
+            if (a.isDir() != b.isDir()) return a.isDir();
+            // an expanded frame has no size / mtime of its own: it sorts as
+            // unknown (0) rather than borrowing the group's totals
+            uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
+            int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
+            int cmp = 0;
+            switch (g_rbSortCol) {
+                case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
+                case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
+                default:           cmp = a.name().compare(b.name()); break;
+            }
+            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+        });
     if (rbFilter[0]) {
         ImGui::SameLine();
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
@@ -10261,12 +10297,10 @@ static void drawPanelRemote() {
         ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
                                             ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
         ImGui::TableHeadersRow();
-        // `shown` is rebuilt every frame, so sorting it here honors a changed
-        // sort spec, a fresh listing and the filter in one place. Directories
-        // sort before files no matter the key - this is a browser, not a table
-        // of numbers. In TREE mode the sort has already happened per level,
-        // inside the builder: sorting the flattened tree here would tear the
-        // children away from their parents. The spec is stashed for it.
+        // The spec is STASHED, not applied: `shown` was already sorted with it,
+        // above, where the keyboard and the clipper can agree with the screen.
+        // A sort change therefore lands on the next frame - invisible, and the
+        // same one-frame contract the tree builder has always had.
         if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
             if (sp->SpecsCount > 0) {
                 g_rbSortCol = (int)sp->Specs[0].ColumnUserID;
@@ -10275,34 +10309,17 @@ static void drawPanelRemote() {
                 g_rbSortCol = RB_COL_NAME;
                 g_rbSortDesc = false;
             }
-            if (!app.rbTree)
-            std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
-                const RbRow& a = view[ia];
-                const RbRow& b = view[ib];
-                if (a.isDir() != b.isDir()) return a.isDir();
-                for (int s = 0; s < sp->SpecsCount; s++) {
-                    const ImGuiTableColumnSortSpecs& c = sp->Specs[s];
-                    int cmp = 0;
-                    // an expanded frame has no size / mtime of its own: it sorts
-                    // as unknown (0) rather than borrowing the group's totals
-                    uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
-                    int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
-                    switch (c.ColumnUserID) {
-                        case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
-                        case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
-                        default:           cmp = a.name().compare(b.name()); break;
-                    }
-                    if (cmp) return c.SortDirection == ImGuiSortDirection_Descending ? cmp > 0
-                                                                                     : cmp < 0;
-                }
-                return false;
-            });
         }
         ImGuiListClipper clip;
-        // the cursor row must be SUBMITTED even when it is scrolled out, or
-        // there is no item for SetScrollHereY to scroll to
-        if (rbCursorScroll && rbCursorPos >= 0) clip.IncludeItemByIndex(rbCursorPos);
         clip.Begin((int)shown.size());
+        // The cursor row must be SUBMITTED even when it is scrolled out, or
+        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
+        // clipper allocates its range list there, and IncludeItemByIndex writes
+        // straight through the null TempData pointer otherwise - the two
+        // IM_ASSERTs that say so are compiled out of a release build, so a
+        // single Down arrow segfaulted the process before any handler ran.
+        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
+            clip.IncludeItemByIndex(rbCursorPos);
         while (clip.Step())
         for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
             const RbRow& r = view[shown[row]];
@@ -11458,6 +11475,20 @@ static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 
+// --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
+// frames. The other browse selftests call the panel's helpers directly, which
+// is enough for what the rows contain but blind to everything that only exists
+// inside a frame - and a single Down arrow segfaulted the process on an ImGui
+// clipper call that a frameless test can never reach. So this one connects a
+// LOCAL peer to <dir> in a hidden window and replays real UI actions into the
+// real input queue, one per script slot: the panel cannot tell them from a
+// human. Actions (--browse-keys overrides the canned list): focus, down, up,
+// left, right, enter, home, end, back, flat, tree.
+static std::string g_browseKeys;        // <dir>, empty = not running
+static std::string g_browseKeysActs =
+    "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
+    "left,end,home,up,down,back";
+
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
@@ -11599,6 +11630,10 @@ static void parseCli(int argc, char** argv) {
             g_localbrowseSelftest = next();        // handled in main()
         } else if (a == "--browse-selftest") {
             g_browseSelftest = next();             // handled in main()
+        } else if (a == "--browse-keys-selftest") {
+            g_browseKeys = next();                 // handled in main()'s frame loop
+        } else if (a == "--browse-keys") {
+            g_browseKeysActs = next();             // override the canned action list
         } else if (a == "--verify-selftest") {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
@@ -12326,7 +12361,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     const char* glslVersion = "#version 130";
 #endif
-    if (benchFrames) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     // How a Linux desktop matches a window to its launcher: without these the
     // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
     // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
@@ -14116,6 +14151,26 @@ int main(int argc, char** argv) {
         return L.fitValid ? 0 : 1;
     }
 
+    // --browse-keys-selftest: connect the local peer and open the panel; the
+    // action list is replayed inside the loop, below.
+    std::vector<std::string> keyActs;
+    size_t keyAct = 0;
+    int keyPhase = 0;
+    bool keysOk = false;
+    if (!g_browseKeys.empty()) {
+        std::string d = g_browseKeys;
+        std::replace(d.begin(), d.end(), '\\', '/');
+        while (d.size() > 1 && d.back() == '/') d.pop_back();
+        startRemote("local://" + d);
+        app.showRemote = true;
+        for (size_t i = 0, j; i <= g_browseKeysActs.size(); i = j + 1) {
+            j = g_browseKeysActs.find(',', i);
+            if (j == std::string::npos) j = g_browseKeysActs.size();
+            if (j > i) keyActs.push_back(g_browseKeysActs.substr(i, j - i));
+        }
+        fprintf(stderr, "browsekeys: %d action(s) on %s\n", (int)keyActs.size(), d.c_str());
+    }
+
     std::vector<double> benchMs;
     int benchLeft = benchFrames;
     if (benchFrames) {                 // exercise every panel, not just the defaults
@@ -14600,6 +14655,7 @@ int main(int argc, char** argv) {
         // first, a folder given to --bench never loads at all; without the
         // second, the numbers are the decode, not the frame.
         static bool benchWarm = false;
+        if (!g_browseKeys.empty()) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
         if (benchFrames) {
             glfwPollEvents(); app.wakeFrames = 1; busy = true;
             if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
@@ -14785,6 +14841,61 @@ int main(int argc, char** argv) {
             else if (bpos <= 0) benchDir = 1;
             gotoFrame(benchDir);
         }
+        // --browse-keys-selftest: one scripted UI action per 8 frames, replayed
+        // into the REAL input queue so the panel cannot tell it from a human.
+        if (!g_browseKeys.empty()) {
+            static double reproT0 = glfwGetTime();
+            static int reproIdle = 0;
+            static bool reproReady = false;
+            ImGuiIO& rio = ImGui::GetIO();
+            auto reproKey = [](const std::string& a) -> ImGuiKey {
+                if (a == "down")  return ImGuiKey_DownArrow;
+                if (a == "up")    return ImGuiKey_UpArrow;
+                if (a == "left")  return ImGuiKey_LeftArrow;
+                if (a == "right") return ImGuiKey_RightArrow;
+                if (a == "enter") return ImGuiKey_Enter;
+                if (a == "home")  return ImGuiKey_Home;
+                if (a == "end")   return ImGuiKey_End;
+                if (a == "back")  return ImGuiKey_Backspace;
+                return ImGuiKey_None;
+            };
+            if (!reproReady) {
+                if (app.rbrowse.connected && !app.rbrowse.entries.empty()) {
+                    reproReady = true;
+                    app.focusRemote = true;      // = clicking the panel
+                    fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
+                            (int)app.rbrowse.entries.size());
+                } else if (glfwGetTime() - reproT0 > 60.0) {
+                    fprintf(stderr, "browsekeys: no listing for %s (%s)\n",
+                            g_browseKeys.c_str(), app.rbrowse.err.c_str());
+                    break;
+                }
+            } else if (keyAct < keyActs.size()) {
+                const std::string& a = keyActs[keyAct];
+                if (keyPhase == 0) {
+                    // every action names what the panel is showing when it runs,
+                    // so a crash log ends on the action that caused it
+                    fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d preview=%s\n",
+                            (int)keyAct, a.c_str(), app.rbrowse.dir.c_str(),
+                            (int)app.rbrowse.entries.size(),
+                            app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
+                    fflush(stderr);
+                    if (a == "flat")       app.rbFlat = !app.rbFlat;
+                    else if (a == "tree")  app.rbTree = !app.rbTree;
+                    else if (a == "focus") app.focusRemote = true;
+                    else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
+                } else if (keyPhase == 1) {
+                    if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                }
+                if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
+            } else if (++reproIdle > 20) {
+                keysOk = true;
+                fprintf(stderr, "browsekeys: %d action(s) through real frames, "
+                                "no crash: ok\n", (int)keyActs.size());
+                fflush(stderr);
+                break;
+            }
+        }
         redrawNow();
         if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
@@ -14805,10 +14916,14 @@ int main(int argc, char** argv) {
 
     // it captures main's locals by reference, and teardown can still fire callbacks
     g_drawFrame = nullptr;
-    autosaveSession();                // also covers a normal quit
-    // Only what the user changed in this run: a one-off --sequence flag or the
-    // gamma inside a --session must not quietly become the default.
-    if (app.prefsDirty) savePrefs();
+    // a selftest must not leave its scripted clicks in the user's session or
+    // their preferences (the frameless ones return before ever getting here)
+    if (g_browseKeys.empty()) {
+        autosaveSession();            // also covers a normal quit
+        // Only what the user changed in this run: a one-off --sequence flag or
+        // the gamma inside a --session must not quietly become the default.
+        if (app.prefsDirty) savePrefs();
+    }
     stopSequenceLoader();             // join the workers before tearing anything down
     stopRemoteFetcher();
     stopMeasureWorker();
@@ -14819,5 +14934,9 @@ int main(int argc, char** argv) {
     glfwDestroyWindow(win);
     glfwTerminate();
     plugin_host::unloadAll();
+    if (!g_browseKeys.empty() && !keysOk) {
+        fprintf(stderr, "browsekeys: FAILED (the action list did not finish)\n");
+        return 1;
+    }
     return 0;
 }
