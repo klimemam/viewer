@@ -2143,6 +2143,22 @@ static void moveImageToBatch(int imageIdx, int batchId) {
     pruneEmptyBatches();
 }
 static void closeAll() {
+    // FIRST: stop everything that produces images, or Close All does not close.
+    // closeStack and closeBatch already know this - a queue the close leaves
+    // behind reopens the closed content the moment the loader/fetcher goes
+    // idle, stamped with a batchId app.batches no longer contains, so the
+    // frames are resident, unnamed and unreachable by pruneEmptyBatches.
+    // Measured before this line existed: Close All over 30 queued stacks left
+    // running=1 / queued=28, and draining brought back 86 frames in 28 stacks
+    // with batches=0. This is the one place that knows what a Close has to
+    // stop; loadSession used to open-code half of it two lines above its own
+    // closeAll() and inherits the whole rule now.
+    stopSequenceLoader();
+    app.seqLoadingId = 0;
+    app.seqQueue.clear();
+    app.seqRestore.clear();
+    app.rbOpenQueue.clear();
+    app.pendingRemoteOpen.clear();
     app.ana.img = nullptr;
     for (int k = 0; k < 2; k++) {     // both A and B slots
         app.hist[k] = App::HistState{};
@@ -3480,9 +3496,9 @@ static std::string loadSession(const std::string& path) {
     std::string line;
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
-    stopSequenceLoader();          // orphan frames from a previous load must not
-    app.seqQueue.clear();          // graft themselves onto the restored list
-    closeAll();
+    closeAll();                    // stops the loader and empties every open
+                                   // queue: orphan frames from a previous load
+                                   // must not graft onto the restored list
     app.anns.clear();
     app.selectedAnn = 0;
     app.annRev++;
@@ -6148,12 +6164,12 @@ static void dropPreview() {
     for (int i = 0; i < (int)app.images.size(); i++)
         if (app.images[i]->uid == app.previewUid) {
             if (!app.images[i]->preview) break;      // promoted: not ours anymore
-            forgetImage(app.images[i].get());
-            if (app.images[i]->tex) glDeleteTextures(1, &app.images[i]->tex);
-            app.images.erase(app.images.begin() + i);
-            if (app.current >= (int)app.images.size())
-                app.current = (int)app.images.size() - 1;
-            app.imagesRev++;
+            // through the one close path that re-points app.current BY UID.
+            // Erasing by index and clamping only the tail silently re-targets A
+            // at a different document whenever the preview sits below current:
+            // every uid-keyed cache then recomputes for the wrong image, and on
+            // openRemote's four failure returns nothing puts it back.
+            closeImages({ i });
             break;
         }
     app.previewUid = 0;
@@ -15655,6 +15671,99 @@ int main(int argc, char** argv) {
                 ok = false;
             }
         }
+        // ---- Close All while the producers are still running ----------------
+        // The menu item is a bare closeAll(). It used to clear images/seqs/
+        // batches and leave the sequence loader RUNNING with seqQueue and
+        // rbOpenQueue full, so the closed content reopened itself seconds
+        // later under batch ids app.batches no longer contained. Close has to
+        // stop the producers first; this asserts that it does, on both the
+        // local queue and the remote one.
+        {
+            closeAll();
+            openFolder(g_closeSelftest);
+            if (app.folderPickOpen) pickerAccept();
+            int queued0 = (int)app.seqQueue.size();
+            bool running0 = app.seqRunning;
+            closeAll();                       // exactly what File > Close All does
+            bool stopped = app.seqQueue.empty() && app.seqRestore.empty() &&
+                           !app.seqRunning && app.seqLoadingId == 0 &&
+                           app.rbOpenQueue.empty();
+            double t2 = glfwGetTime();        // give the producers 2 s to regrow
+            while (glfwGetTime() - t2 < 2.0) {
+                pumpSequenceAndQueue();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int dead = 0;                     // frames under a batch nobody names
+            for (const auto& d : app.images) {
+                bool named = d->batchId == 0;
+                for (const auto& bb : app.batches) if (bb.id == d->batchId) named = true;
+                if (!named) dead++;
+            }
+            bool closeOk = stopped && app.images.empty() && app.seqs.empty() && dead == 0;
+            fprintf(stderr, "closeselftest: Close All mid-load (%d queued, loader "
+                            "running=%d): queues emptied+loader stopped=%d; after a 2 s "
+                            "pump images=%d seqs=%d batches=%d, %d frame(s) under a dead "
+                            "batch: %s\n",
+                    queued0, running0 ? 1 : 0, stopped ? 1 : 0, (int)app.images.size(),
+                    (int)app.seqs.size(), (int)app.batches.size(), dead,
+                    closeOk ? "ok" : "FAIL");
+            if (!closeOk) ok = false;
+        }
+        {   // the same, for the REMOTE open queue: accept a scan of N stacks and
+            // Close All while stack 1 is still transferring
+            closeAll();
+            app.rbrowse = App::RemoteBrowse{};
+            startRemote("local://" + scanroot);
+            double t3 = glfwGetTime();
+            bool sent = false, caught = false;
+            int rq0 = 0;
+            while (glfwGetTime() - t3 < 120.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                if (app.rbrowse.connected && !sent) {
+                    App::RbJob j;
+                    j.kind = App::RbScan;
+                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                    rbEnqueue(std::move(j));
+                    sent = true;
+                }
+                if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+                if (!app.rbOpenQueue.empty()) {
+                    rq0 = (int)app.rbOpenQueue.size();
+                    caught = true;
+                    break;
+                }
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (!caught) {
+                fprintf(stderr, "closeselftest: FAILED - never caught a queued remote "
+                                "open (%s)\n", app.rbrowse.err.c_str());
+                ok = false;
+            } else {
+                closeAll();
+                bool emptied = app.rbOpenQueue.empty();
+                double t4 = glfwGetTime();
+                while (glfwGetTime() - t4 < 3.0) {
+                    pumpRemoteBrowse();
+                    pumpRemoteFetch();
+                    pumpRemoteOpenQueue();
+                    pumpSequenceAndQueue();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                bool rok = emptied && app.images.empty() && app.seqs.empty();
+                fprintf(stderr, "closeselftest: Close All with %d remote stack(s) "
+                                "queued: queue emptied=%d; after a 3 s pump images=%d "
+                                "seqs=%d: %s\n",
+                        rq0, emptied ? 1 : 0, (int)app.images.size(),
+                        (int)app.seqs.size(), rok ? "ok" : "FAIL");
+                if (!rok) ok = false;
+            }
+        }
         fprintf(stderr, "closeselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
@@ -15973,6 +16082,47 @@ int main(int argc, char** argv) {
             fprintf(stderr, "verifyselftest: V8 note: the in-flight drop path was%s "
                             "the one that had to catch it\n",
                     pendingAfter > 0 ? "" : " NOT");
+        }
+
+        // ---- V9: dropPreview must not silently re-target A -------------------
+        // The preview sits below app.current whenever anything is opened after
+        // it. Erasing by index and clamping only the TAIL leaves app.current
+        // naming the document that used to sit one slot higher - and every
+        // uid-keyed cache then recomputes for an image the user never chose.
+        // openRemote calls dropPreview() and has four failure returns after it,
+        // so on a failed open nothing puts it back.
+        {
+            reload();
+            auto mkPreview = [] {                  // a preview at index 0
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "preview.npy";
+                d->w = d->h = 2; d->ch = 1;
+                d->data.assign(4, 0.f);
+                d->uid = app.nextUid++;
+                d->preview = true;
+                app.previewUid = d->uid;
+                app.images.insert(app.images.begin(), std::move(d));
+                app.imagesRev++;
+            };
+            mkPreview();
+            app.current = 3;                       // neither the preview nor the last
+            uint64_t was = cur()->uid;
+            std::string wasName = cur()->name;
+            dropPreview();
+            uint64_t now = cur() ? cur()->uid : 0;
+            fprintf(stderr, "verifyselftest: V9 dropPreview with the preview BELOW "
+                            "current: A was uid %llu (%s), is now uid %llu (%s)\n",
+                    (unsigned long long)was, wasName.c_str(),
+                    (unsigned long long)now, cur() ? cur()->name.c_str() : "-");
+            check(now == was, "V9 dropPreview keeps A pointing at the same document");
+            // ...and dropping the preview WHILE it is current still lands
+            // somewhere valid rather than off the end
+            mkPreview();
+            app.current = 0;
+            dropPreview();
+            check(app.previewUid == 0 && app.current >= 0 &&
+                  app.current < (int)app.images.size(),
+                  "V9 dropping the current preview re-points A in range");
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
