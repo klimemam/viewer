@@ -259,7 +259,14 @@ struct App {
     // images stretched differently cannot be compared - any difference you see
     // is the stretch, not the pixels. Non-destructive: B keeps its own numbers
     // and gets them back when compare ends (the same contract as linkRange).
-    bool compareShareRange = true;
+    // How the two sides' DISPLAY range relates while comparing:
+    //   0 each own   - every side keeps its own stretch (shapes at wildly
+    //                  different exposures; the only case where it is honest)
+    //   1 B uses A's - one range, A's. Stable while stepping A.
+    //   2 union auto - both sides re-fit to min/max ACROSS A and B at the
+    //                  current frame pair, so neither clips and neither is
+    //                  favoured. This is "auto, but the same auto for both".
+    int compareRangeMode = 1;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -1044,17 +1051,30 @@ static void markAllTexDirty() {
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
 static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
+// The A/B display range. Mode 2 fits BOTH sides to the union of what the two
+// current frames actually contain, recomputed as you step - the "auto but the
+// same auto on both sides" a stack-vs-stack comparison needs. cur() is never
+// B (resolveB guarantees it), so none of this recurses.
+static bool abRange(const ImageDoc& im, float& lo, float& hi) {
+    if (app.compareRangeMode == 0) return false;
+    ImageDoc* a = cur();
+    ImageDoc* b = cmpB();
+    if (!a || !b || (&im != a && &im != b)) return false;
+    if (app.compareRangeMode == 1) { lo = a->black; hi = a->white; return true; }
+    lo = std::min(a->vmin, b->vmin);          // union of the CONTENT, not of the
+    hi = std::max(a->vmax, b->vmax);          // two stretches
+    return hi > lo;
+}
 static float effBlack(const ImageDoc& im) {
     if (app.linkRange) return app.linkBlack;
-    // B borrows A's range; cur() is never B, so this cannot recurse
-    if (app.compareShareRange && &im != cur() && cmpB() == &im && cur())
-        return cur()->black;
+    float lo, hi;
+    if (abRange(im, lo, hi)) return lo;
     return im.black;
 }
 static float effWhite(const ImageDoc& im) {
     if (app.linkRange) return app.linkWhite;
-    if (app.compareShareRange && &im != cur() && cmpB() == &im && cur())
-        return cur()->white;
+    float lo, hi;
+    if (abRange(im, lo, hi)) return hi;
     return im.white;
 }
 
@@ -2561,7 +2581,7 @@ static void writeSessionTo(std::ostream& f) {
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeScope << "\n";
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
-    f << "cmpshare " << (app.compareShareRange ? 1 : 0) << "\n";
+    f << "cmprange " << app.compareRangeMode << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2867,7 +2887,9 @@ static std::string loadSession(const std::string& path) {
                                        app.linkRange = on != 0; }
         else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
-        else if (key == "cmpshare") { int on = 1; ls >> on; app.compareShareRange = on != 0; }
+        else if (key == "cmprange") { ls >> app.compareRangeMode; }
+        // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own"
+        else if (key == "cmpshare") { int on = 1; ls >> on; app.compareRangeMode = on ? 1 : 0; }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -5572,11 +5594,12 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
-    // sharing means B is DISPLAYED with A's range: rebuild its texture whenever
-    // that range moves (dragging A's slider, stepping to a frame with another
-    // reference range), or B would keep the stretch it was last built with
-    if (imB && (imB->texBlack != effBlack(*imB) || imB->texWhite != effWhite(*imB)))
-        imB->texDirty = true;
+    // A shared range moves as you step (mode 2 refits to the frame pair), and a
+    // texture built with the old one is a wrong picture, not a stale label - so
+    // both sides are checked against what they would be built with NOW.
+    for (ImageDoc* d : { im, imB })
+        if (d && (d->texBlack != effBlack(*d) || d->texWhite != effWhite(*d)))
+            d->texDirty = true;
     const bool split = imB && app.compareMode == App::CmpSplit;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
     const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
@@ -6609,15 +6632,22 @@ static void drawInspector() {
                 // differently cannot be compared: the difference you see would
                 // be the stretch. When it is off, SAY the numbers differ - that
                 // is the case where a reading can mislead.
-                if (ImGui::Checkbox("A/B share A's range", &app.compareShareRange))
-                    b->texDirty = true;
+                ImGui::SetNextItemWidth(-1);
+                static const char* AB_RANGE_ITEMS[3] = {
+                    "A/B: each keeps its own", "A/B: B uses A's range",
+                    "A/B: auto over both (union)" };
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::Combo("##abrange", &app.compareRangeMode,
+                                 AB_RANGE_ITEMS, 3)) {
+                    b->texDirty = true; im->texDirty = true;
+                }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("B is displayed with A's black/white while comparing.\n"
                                       "Display only - B keeps its own numbers and gets them\n"
                                       "back when compare ends.\n"
                                       "Turn it off to let each side keep its own stretch\n"
                                       "(comparing SHAPES at very different exposures).");
-                if (!app.compareShareRange &&
+                if (app.compareRangeMode == 0 &&
                     (b->black != im->black || b->white != im->white)) {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
                     ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(im->black, im->dtype).c_str(),
@@ -9748,9 +9778,17 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::Separator();
             if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
                 app.compareFollowFrame = !app.compareFollowFrame;
-            if (ImGui::MenuItem("A/B share A's display range", nullptr, app.compareShareRange)) {
-                app.compareShareRange = !app.compareShareRange;
-                if (ImageDoc* bb = cmpB()) bb->texDirty = true;
+            {   // the display range relationship, where the compare modes live
+                static const char* RN[3] = { "  each side keeps its own range",
+                                             "  B uses A's range",
+                                             "  auto over both (union)" };
+                ImGui::TextDisabled("Display range");
+                for (int r = 0; r < 3; r++)
+                    if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
+                        app.compareRangeMode = r;
+                        if (ImageDoc* bb = cmpB()) bb->texDirty = true;
+                        if (cur()) cur()->texDirty = true;
+                    }
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Two images stretched differently cannot be compared -\n"
@@ -10122,6 +10160,7 @@ static void drawHelpAbout() {
 // ---------------------------------------------------------------- CLI
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
+static std::string g_rangeSelftest;      // --range-selftest <dir with 2 stacks>
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
@@ -10245,6 +10284,8 @@ static void parseCli(int argc, char** argv) {
             app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
+        } else if (a == "--range-selftest") {
+            g_rangeSelftest = next();
         } else if (a == "--framestats-selftest") {
             g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--scan-selftest") {
@@ -11854,6 +11895,77 @@ int main(int argc, char** argv) {
         stopRemoteFetcher();
         stopMeasureWorker();
         return ok ? 0 : 1;
+    }
+
+    // Every A/B range combination, printed. See scratchpad/rangetest.py.
+    if (!g_rangeSelftest.empty()) {
+        std::string dir = g_rangeSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        app.seqLoadMode = 1;
+        openFolder(dir);
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 300.0) {
+            if (app.folderPickOpen && !app.folderPickRemote) {
+                std::vector<App::PendingGroup> sel;
+                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
+                app.folderPick.clear();
+                app.folderPickOpen = false;
+                enqueueGroups(std::move(sel));
+            }
+            pumpSequenceAndQueue();
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                !app.folderPickOpen && app.seqs.size() >= 2) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (app.seqs.size() < 2) {
+            fprintf(stderr, "rangeselftest: need 2 stacks under %s\n", dir.c_str());
+            return 1;
+        }
+        std::vector<int> fa = framesOfSeq(app.seqs[0].id), fb = framesOfSeq(app.seqs[1].id);
+        if (fa.size() < 2 || fb.size() < 2) {
+            fprintf(stderr, "rangeselftest: stacks need 2+ frames\n");
+            return 1;
+        }
+        selectImage(fa[0]);
+        setCompareB(app.images[fb[0]].get());
+        app.compareMode = App::CmpSplit;
+        app.compareFollowFrame = true;
+        static const char* MODE[3] = { "auto-per-frame", "per-stack", "linked" };
+        static const char* SHARE[3] = { "each-own", "B-uses-A", "union-auto" };
+        int bad = 0;
+        for (int m = 0; m < 3; m++) {
+            app.rangeScope = m == 0 ? 0 : 1;
+            app.linkRange = m == 2;
+            if (app.linkRange) { app.linkBlack = app.images[fa[0]]->vmin;
+                                 app.linkWhite = app.images[fa[0]]->vmax; }
+            for (int sh = 0; sh < 3; sh++) {
+                app.compareRangeMode = sh;
+                for (int step = 0; step < 2; step++) {
+                    selectImage(fa[step]);
+                    ImageDoc* A = cur();
+                    ImageDoc* B = cmpB();
+                    if (!A || !B) { fprintf(stderr, "rangeselftest: no A/B\n"); return 1; }
+                    bool same = effBlack(*A) == effBlack(*B) && effWhite(*A) == effWhite(*B);
+                    fprintf(stderr,
+                            "rangeselftest: %-14s %-11s frame %d | A %.6g..%.6g  B %.6g..%.6g  "
+                            "| B frame %d | %s\n",
+                            MODE[m], SHARE[sh], step, effBlack(*A), effWhite(*A),
+                            effBlack(*B), effWhite(*B), B->seqIndex,
+                            same ? "MATCHED" : "differs");
+                    // the contract: anything but "each-own" must produce one range
+                    if (sh != 0 && !same) bad++;
+                    // follow-frame must keep the sides on the same frame number
+                    if (B->seqIndex != A->seqIndex) {
+                        fprintf(stderr, "rangeselftest: FOLLOW BROKEN A#%d vs B#%d\n",
+                                A->seqIndex, B->seqIndex);
+                        bad++;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
+        if (app.seqThread.joinable()) app.seqThread.join();
+        return bad ? 1 : 0;
     }
 
     // The per-frame table, verifiable without a human: load the stack given on
