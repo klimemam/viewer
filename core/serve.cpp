@@ -9,6 +9,7 @@
 #include "plugin_host.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <csignal>
 #include <cmath>
@@ -98,6 +99,10 @@ struct NpyFile {
     uint32_t dtype = DT_COUNT;
     bool bigEndian = false, fortran = false;
     int w = 0, h = 0, ch = 1, frames = 1;
+    // shape as declared in the file, before the w/h/ch/frames interpretation:
+    // the LIST metadata shows what the file says, not what the viewer made of it
+    int ndim = 0;
+    uint32_t odims[4] = { 0, 0, 0, 0 };
     uint64_t dataOffset = 0;
     size_t elemSize = 0;
     bool ok = false;
@@ -149,6 +154,8 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
         dims.push_back(atoll(hdr.c_str() + i));
         while (i < close && hdr[i] != ',') i++;
     }
+    n.ndim = (int)dims.size();
+    for (size_t i = 0; i < dims.size() && i < 4; i++) n.odims[i] = (uint32_t)dims[i];
     if (dims.size() == 2)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = 1; }
     else if (dims.size() == 3) {
         if (dims[2] <= 4)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = (int)dims[2]; }
@@ -278,6 +285,150 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
 // bottom of this file is one transport, and a WebSocket front end (the browser
 // client this project has always wanted) is another - same requests, same
 // replies, same code here. Only the framing differs.
+// Version the CLIENT announced in HELLO. A v2 viewer talking to this server
+// must get the LIST shape it knows how to parse; defaulting to 2 keeps a client
+// that never said hello (none of ours) on the safe format.
+static uint32_t g_clientVersion = 2;
+
+static bool isNpySuffix(const std::string& name) {
+    if (name.size() < 4) return false;
+    std::string ext = name.substr(name.size() - 4);
+    for (char& c : ext) c = (char)tolower((unsigned char)c);
+    return ext == ".npy";
+}
+
+// C++17 has no portable file_clock -> system_clock conversion (that is C++20);
+// anchoring the difference against "now" on both clocks is exact to well under
+// a second, which a directory listing does not care about.
+static int64_t unixMtime(const std::filesystem::path& p) {
+    std::error_code ec;
+    auto ft = std::filesystem::last_write_time(p, ec);
+    if (ec) return 0;
+    auto sys = std::chrono::system_clock::now() +
+               std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                   ft - std::filesystem::file_time_type::clock::now());
+    return (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+               sys.time_since_epoch()).count();
+}
+
+// One v3 listing entry. `peekBudget` bounds how many .npy headers one LIST may
+// open: a directory of thousands of files must not turn a listing into
+// thousands of file opens (the header itself is a few hundred bytes to read).
+static void putListEntryV3(Buf& out, const std::filesystem::path& full,
+                           const std::string& name, bool dir, uint64_t size,
+                           int64_t mtime, int& peekBudget) {
+    NpyFile n;
+    bool meta = false;
+    if (!dir && isNpySuffix(name) && peekBudget > 0) {
+        peekBudget--;
+        std::string e2;
+        meta = parseNpyHeader(n, full.u8string(), e2);   // reads only the header
+    }
+    out.putStr(name);
+    out.putU32((dir ? LE_DIR : 0u) | (meta ? LE_META : 0u));
+    out.putU32((uint32_t)(size & 0xFFFFFFFFu));
+    out.putU32((uint32_t)(size >> 32));
+    out.putU32((uint32_t)((uint64_t)mtime & 0xFFFFFFFFu));
+    out.putU32((uint32_t)((uint64_t)mtime >> 32));
+    if (meta) {
+        out.putU32(n.dtype);
+        out.putU32((uint32_t)n.ndim);
+        for (int i = 0; i < 4; i++) out.putU32(n.odims[i]);
+        out.putU32(n.fortran ? 1u : 0u);
+    }
+}
+
+// ---- numbered-sequence grouping ------------------------------------------
+// The grouping key is the name with its trailing digit run (the run just
+// before ".npy") removed - the same axis the client's numeric frame sort
+// orders by, so both ends agree on what a sequence is, and uneven zero-padding
+// (frame_9, frame_10) still lands in one group.
+static bool splitNumberedNpy(const std::string& name, std::string& pre,
+                             long long& num, int& width) {
+    if (!isNpySuffix(name)) return false;
+    size_t end = name.size() - 4;
+    size_t i = end;
+    while (i > 0 && isdigit((unsigned char)name[i - 1])) i--;
+    if (i == end) return false;                 // no digits before .npy
+    pre = name.substr(0, i);
+    num = atoll(name.c_str() + i);
+    width = (int)(end - i);
+    return true;
+}
+
+struct NpyGroup {
+    std::string pattern;                // frame_###.npy - display name
+    std::vector<std::string> names;     // member file names, numeric order
+    uint64_t bytes = 0;                 // sum over members
+    int64_t mtime = 0;                  // newest member
+    std::filesystem::path first;        // header peek target
+};
+
+// Partition one directory's files into numbered groups (>= 2 members) and the
+// indices of everything else. `files` are (name, path) of regular files only.
+static void groupNumberedNpy(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                             std::vector<NpyGroup>& groups, std::vector<size_t>& singles) {
+    struct Member { long long num; int width; size_t idx; };
+    struct Bucket { std::string pre; std::vector<Member> m; };
+    std::vector<Bucket> buckets;
+    std::vector<char> used(files.size(), 0);
+    for (size_t i = 0; i < files.size(); i++) {
+        std::string pre; long long num; int width;
+        if (!splitNumberedNpy(files[i].first, pre, num, width)) continue;
+        Bucket* b = nullptr;
+        for (auto& q : buckets) if (q.pre == pre) { b = &q; break; }
+        if (!b) { buckets.push_back({ pre, {} }); b = &buckets.back(); }
+        b->m.push_back({ num, width, i });
+    }
+    for (auto& b : buckets) {
+        if (b.m.size() < 2) continue;
+        std::sort(b.m.begin(), b.m.end(),
+                  [](const Member& a, const Member& c) { return a.num < c.num; });
+        NpyGroup g;
+        g.pattern = b.pre + std::string((size_t)b.m.front().width, '#') + ".npy";
+        for (const auto& m : b.m) {
+            g.names.push_back(files[m.idx].first);
+            used[m.idx] = 1;
+            std::error_code ec;
+            g.bytes += (uint64_t)std::filesystem::file_size(files[m.idx].second, ec);
+            g.mtime = std::max(g.mtime, unixMtime(files[m.idx].second));
+        }
+        g.first = files[b.m.front().idx].second;
+        groups.push_back(std::move(g));
+    }
+    for (size_t i = 0; i < files.size(); i++)
+        if (!used[i]) singles.push_back(i);
+}
+
+// A group crosses the wire as its explicit member names (no directory part).
+// A (prefix, start, count, width) encoding would be smaller, but real capture
+// dumps have gaps and uneven zero-padding, and reconstructing names that do
+// not exist is exactly the failure this tool must not have. Names only: even
+// a 1000-frame group is ~20 KB, noise next to one tile.
+static void putGroupEntryV3(Buf& out, const NpyGroup& g, int& peekBudget) {
+    NpyFile n;
+    bool meta = false;
+    if (peekBudget > 0) {
+        peekBudget--;
+        std::string e2;
+        meta = parseNpyHeader(n, g.first.u8string(), e2);
+    }
+    out.putStr(g.pattern);
+    out.putU32(LE_GROUP | (meta ? LE_META : 0u));
+    out.putU32((uint32_t)(g.bytes & 0xFFFFFFFFu));
+    out.putU32((uint32_t)(g.bytes >> 32));
+    out.putU32((uint32_t)((uint64_t)g.mtime & 0xFFFFFFFFu));
+    out.putU32((uint32_t)((uint64_t)g.mtime >> 32));
+    if (meta) {
+        out.putU32(n.dtype);
+        out.putU32((uint32_t)n.ndim);
+        for (int i = 0; i < 4; i++) out.putU32(n.odims[i]);
+        out.putU32(n.fortran ? 1u : 0u);
+    }
+    out.putU32((uint32_t)g.names.size());
+    for (const auto& nm : g.names) out.putStr(nm);
+}
+
 static void handleList(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad LIST"); return; }
@@ -295,18 +446,249 @@ static void handleList(Buf& in) {
               [](const std::filesystem::directory_entry& a, const std::filesystem::directory_entry& b) {
                   return a.path().filename().u8string() < b.path().filename().u8string();
               });
-    out.putU32((uint32_t)entries.size());
+    if (g_clientVersion < 3) {
+        out.putU32((uint32_t)entries.size());
+        for (auto& e : entries) {
+            std::error_code e2;
+            bool dir = e.is_directory(e2);
+            out.putStr(e.path().filename().u8string());
+            out.putU32(dir ? 1u : 0u);
+            // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
+            // routinely, and a silently clamped size is the failure mode this tool
+            // exists to avoid
+            uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
+            out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
+            out.putU32((uint32_t)(sz >> 32));
+        }
+        sendMsg(MSG_OK, out);
+        return;
+    }
+    // v3: numbered .npy siblings collapse into one synthetic stack entry;
+    // directories, non-npy files and loose .npy stay plain rows.
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+    std::vector<const std::filesystem::directory_entry*> dirs;
     for (auto& e : entries) {
         std::error_code e2;
-        bool dir = e.is_directory(e2);
-        out.putStr(e.path().filename().u8string());
-        out.putU32(dir ? 1u : 0u);
-        // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
-        // routinely, and a silently clamped size is the failure mode this tool
-        // exists to avoid
-        uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
-        out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
-        out.putU32((uint32_t)(sz >> 32));
+        if (e.is_directory(e2)) dirs.push_back(&e);
+        else files.push_back({ e.path().filename().u8string(), e.path() });
+    }
+    std::vector<NpyGroup> groups;
+    std::vector<size_t> singles;
+    groupNumberedNpy(files, groups, singles);
+    // one merged, name-sorted row list, so the reply reads like a directory
+    struct Row { std::string name; int kind; size_t idx; };   // 0 dir, 1 single, 2 group
+    std::vector<Row> rows;
+    for (size_t i = 0; i < dirs.size(); i++)
+        rows.push_back({ dirs[i]->path().filename().u8string(), 0, i });
+    for (size_t i : singles) rows.push_back({ files[i].first, 1, i });
+    for (size_t i = 0; i < groups.size(); i++)
+        rows.push_back({ groups[i].pattern, 2, i });
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.name < b.name; });
+    int peekBudget = 256;
+    out.putU32((uint32_t)rows.size());
+    for (const Row& r : rows) {
+        std::error_code e2;
+        if (r.kind == 0) {
+            putListEntryV3(out, dirs[r.idx]->path(), r.name, true, 0,
+                           unixMtime(dirs[r.idx]->path()), peekBudget);
+        } else if (r.kind == 1) {
+            const auto& f = files[r.idx];
+            putListEntryV3(out, f.second, r.name, false,
+                           (uint64_t)std::filesystem::file_size(f.second, e2),
+                           unixMtime(f.second), peekBudget);
+        } else {
+            putGroupEntryV3(out, groups[r.idx], peekBudget);
+        }
+    }
+    sendMsg(MSG_OK, out);
+}
+
+// GLOB: recursive find under a root. The pattern addresses a subtree, so *
+// and ? deliberately cross '/' (unlike a shell); "**/" additionally matches
+// zero directories, bash-globstar-style; a pattern with no wildcard is a
+// case-insensitive substring. Matching is case-insensitive throughout -
+// FRAME_001.NPY is the same capture dump.
+static bool globCross(const char* pat, const char* str) {
+    const char *star = nullptr, *ss = str;
+    while (*str) {
+        char p = *pat, s = *str;
+        if (p == '?' || (p && tolower((unsigned char)p) == tolower((unsigned char)s))) {
+            pat++; str++; continue;
+        }
+        if (p == '*') { star = pat++; ss = str; continue; }
+        if (star) { pat = star + 1; str = ++ss; continue; }
+        return false;
+    }
+    while (*pat == '*') pat++;
+    return *pat == 0;
+}
+static bool globPatternMatches(const std::string& pat, const std::string& rel) {
+    if (pat.find('*') == std::string::npos && pat.find('?') == std::string::npos) {
+        std::string a = pat, b = rel;
+        for (char& c : a) c = (char)tolower((unsigned char)c);
+        for (char& c : b) c = (char)tolower((unsigned char)c);
+        return b.find(a) != std::string::npos;
+    }
+    if (globCross(pat.c_str(), rel.c_str())) return true;
+    return pat.compare(0, 3, "**/") == 0 && globCross(pat.c_str() + 3, rel.c_str());
+}
+
+//   -> [str root][str pattern][u32 depthLimit][u32 maxResults]
+//   <- [u32 flags bit0=truncated][u32 skippedDirs][u32 n]
+//      n * ([str relPath][u32 isDir])   relPath uses '/' on every platform
+static void handleGlob(Buf& in) {
+    std::string root, pattern;
+    uint32_t depth = 6, cap = 2000;
+    if (!in.getStr(root) || !in.getStr(pattern) || !in.getU32(depth) || !in.getU32(cap)) {
+        sendErr("bad GLOB");
+        return;
+    }
+    if (pattern.empty()) { sendErr("empty GLOB pattern"); return; }
+    depth = std::min(depth, 32u);
+    cap = std::min(cap ? cap : 2000u, 100000u);
+    std::error_code ec;
+    std::filesystem::path rootP = std::filesystem::u8path(root);
+    if (!std::filesystem::is_directory(rootP, ec)) {
+        sendErr("not a directory: " + root);
+        return;
+    }
+    uint32_t skipped = 0;
+    bool trunc = false;
+    struct Hit { std::string rel; bool dir; };
+    std::vector<Hit> hits;
+    // same walk discipline as SCAN: no symlinks, unreadable = count and go on
+    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
+    while (!todo.empty() && !trunc) {
+        auto cur = todo.back();
+        todo.pop_back();
+        std::error_code dec;
+        std::filesystem::directory_iterator it(cur.first, dec), end;
+        if (dec) { skipped++; continue; }
+        for (; it != end && !trunc; it.increment(dec)) {
+            if (dec) { dec.clear(); skipped++; break; }
+            std::error_code fec;
+            if (it->is_symlink(fec)) continue;
+            bool isDir = it->is_directory(fec);
+            if (isDir && cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
+            std::string rel = it->path().lexically_relative(rootP).generic_u8string();
+            if (!globPatternMatches(pattern, rel)) continue;
+            if (hits.size() >= cap) { trunc = true; break; }
+            hits.push_back({ std::move(rel), isDir });
+        }
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.rel < b.rel; });
+    Buf out;
+    out.putU32(trunc ? 1u : 0u);
+    out.putU32(skipped);
+    out.putU32((uint32_t)hits.size());
+    for (const auto& h : hits) {
+        out.putStr(h.rel);
+        out.putU32(h.dir ? 1u : 0u);
+    }
+    sendMsg(MSG_OK, out);
+}
+
+// SCAN: the server-side half of "open this folder as stacks". Walks the
+// subtree (depth- and count-limited), groups numbered .npy per directory, and
+// returns ONE reply the client turns into open-as-stack jobs - the remote
+// mirror of the local openFolder() scan. Loose .npy become single-member
+// groups so a folder of unnumbered files still opens, exactly like locally.
+//   -> [str root][u32 depthLimit][u32 maxGroups]
+//   <- [u32 flags bit0=truncated][u32 skippedDirs][u32 n]
+//      n * ([str dirRel]  [group entry, v3 LIST encoding])
+static void handleScan(Buf& in) {
+    std::string root;
+    uint32_t depth = 6, cap = 256;
+    if (!in.getStr(root) || !in.getU32(depth) || !in.getU32(cap)) {
+        sendErr("bad SCAN");
+        return;
+    }
+    depth = std::min(depth, 32u);
+    cap = std::min(cap ? cap : 256u, 10000u);
+    std::error_code ec;
+    std::filesystem::path rootP = std::filesystem::u8path(root);
+    if (!std::filesystem::is_directory(rootP, ec)) {
+        sendErr("not a directory: " + root);
+        return;
+    }
+    uint32_t skipped = 0;
+    bool trunc = false;
+    struct Found { std::string rel; NpyGroup g; };
+    std::vector<Found> found;
+    // Manual walk: recursive_directory_iterator aborts everything on one
+    // unreadable entry, and symlinks are not followed at all - a cycle must
+    // cost nothing, not hang a session.
+    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
+    while (!todo.empty() && !trunc) {
+        auto cur = todo.back();
+        todo.pop_back();
+        std::error_code dec;
+        std::filesystem::directory_iterator it(cur.first, dec), end;
+        if (dec) { skipped++; continue; }
+        std::vector<std::pair<std::string, std::filesystem::path>> files;
+        for (; it != end; it.increment(dec)) {
+            if (dec) { dec.clear(); skipped++; break; }
+            std::error_code fec;
+            if (it->is_symlink(fec)) continue;
+            if (it->is_directory(fec)) {
+                if (cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
+            } else if (it->is_regular_file(fec) &&
+                       isNpySuffix(it->path().filename().u8string())) {
+                files.push_back({ it->path().filename().u8string(), it->path() });
+            }
+        }
+        if (files.empty()) continue;
+        std::sort(files.begin(), files.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<NpyGroup> gs;
+        std::vector<size_t> singles;
+        groupNumberedNpy(files, gs, singles);
+        // Two or more leftovers fold into ONE natural-order stack ("*.npy"):
+        // capture sets are not always numbered (capture_a / capture_b / ...),
+        // and N single-frame stacks from one folder is never what Open Folder
+        // meant. A lone file still opens as itself.
+        if (singles.size() >= 2) {
+            NpyGroup g;
+            g.pattern = "*.npy";
+            std::sort(singles.begin(), singles.end(), [&](size_t x, size_t y) {
+                return rp::naturalLess(files[x].first, files[y].first);
+            });
+            for (size_t i : singles) {
+                g.names.push_back(files[i].first);
+                std::error_code e2;
+                g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, e2);
+                g.mtime = std::max(g.mtime, unixMtime(files[i].second));
+            }
+            g.first = files[singles.front()].second;
+            gs.push_back(std::move(g));
+        } else if (singles.size() == 1) {
+            size_t i = singles[0];
+            NpyGroup g;
+            g.pattern = files[i].first;
+            g.names = { files[i].first };
+            std::error_code e2;
+            g.bytes = (uint64_t)std::filesystem::file_size(files[i].second, e2);
+            g.mtime = unixMtime(files[i].second);
+            g.first = files[i].second;
+            gs.push_back(std::move(g));
+        }
+        std::string rel = cur.first.lexically_relative(rootP).generic_u8string();
+        if (rel == ".") rel.clear();
+        for (auto& g : gs) {
+            if (found.size() >= cap) { trunc = true; break; }
+            found.push_back({ rel, std::move(g) });
+        }
+    }
+    Buf out;
+    out.putU32(trunc ? 1u : 0u);
+    out.putU32(skipped);
+    out.putU32((uint32_t)found.size());
+    int peekBudget = 512;
+    for (auto& f : found) {
+        out.putStr(f.rel);
+        putGroupEntryV3(out, f.g, peekBudget);
     }
     sendMsg(MSG_OK, out);
 }
@@ -814,6 +1196,8 @@ static void handleMeasure(Buf& in) {
 void handleRequest(uint32_t type, Buf& in) {
     switch (type) {
         case MSG_HELLO: {
+            uint32_t cv = 0;
+            if (in.getU32(cv) && cv) g_clientVersion = cv;   // gates the LIST shape
             Buf out;
             out.putU32(VERSION);
             out.putStr("viewer --serve");
@@ -821,6 +1205,8 @@ void handleRequest(uint32_t type, Buf& in) {
             break;
         }
         case MSG_LIST: handleList(in); break;
+        case MSG_GLOB: handleGlob(in); break;
+        case MSG_SCAN: handleScan(in); break;
         case MSG_META: handleMeta(in); break;
         case MSG_TILE: handleTile(in); break;
         case MSG_MEASURE: handleMeasure(in); break;

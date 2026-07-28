@@ -111,8 +111,10 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 1. **File > Start Remote (ssh)...**
 2. **ホストだけ**入力(`user@server`、`~/.ssh/config` の Host エイリアスも可)
 3. Connect → 初回は `installing the viewer peer on ...` と出て自動導入
-4. **Files パネルにサーバがノードとして現れます**。フォルダを辿ってファイルをクリックで開く。
-   連番フォルダなら「**Open all N .npy here as a stack**」で塊として開く
+4. **Remote パネルにサーバの一覧が現れます**。フォルダを辿ってファイルをクリックで開く。
+   連番は 1 行(`frame_###.npy  [24 frames]`)にまとまるので、その行をクリックで塊として開く。
+   任意の組み合わせは Ctrl/Shift+クリックで選んで「Open N selected as stack」。
+   フォルダ丸ごとは右クリック「Open folder (all stacks below)」か **File > Open Folder (Remote)...**
 
 パスの形(絶対か `~` 相対か)を先に考える必要はありません。接続してから見て選ぶだけです。
 

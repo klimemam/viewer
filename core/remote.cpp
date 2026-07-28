@@ -377,24 +377,138 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
     return true;
 }
 
+// One v3 entry (shared by the LIST and SCAN replies).
+static bool parseEntryV3(R& r, Entry& e) {
+    uint32_t d = 0, lo = 0, hi = 0, mlo = 0, mhi = 0;
+    if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi) ||
+        !r.u32(mlo) || !r.u32(mhi))
+        return false;
+    e.size = ((uint64_t)hi << 32) | lo;
+    e.dir = (d & rp::LE_DIR) != 0;
+    e.mtime = (int64_t)(((uint64_t)mhi << 32) | mlo);
+    if (d & rp::LE_META) {
+        uint32_t dt = 0, nd = 0, fo = 0;
+        if (!r.u32(dt) || !r.u32(nd)) return false;
+        for (uint32_t& v : e.dims) if (!r.u32(v)) return false;
+        if (!r.u32(fo)) return false;
+        e.hasMeta = true;
+        e.dtype = rp::dtypeName(dt);
+        e.ndim = (int)std::min(nd, 4u);
+        e.fortran = fo != 0;
+    }
+    if (d & rp::LE_GROUP) {
+        uint32_t cnt = 0;
+        if (!r.u32(cnt) || cnt > 1000000) return false;
+        e.group = true;
+        e.frames = cnt;
+        e.members.resize(cnt);
+        for (auto& m : e.members)
+            if (!r.str(m)) return false;
+    }
+    return true;
+}
+
+bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
+                      std::vector<Entry>& out, std::string& err) {
+    R r(payload);
+    uint32_t n = 0;
+    if (!r.u32(n)) { err = "bad LIST reply"; return false; }
+    out.clear();
+    for (uint32_t i = 0; i < n; i++) {
+        Entry e;
+        if (peerVersion < 3) {              // v2: name/dir/size was the whole row
+            uint32_t d = 0, lo = 0, hi = 0;
+            if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi)) {
+                err = "bad LIST reply"; return false;
+            }
+            e.dir = d != 0;
+            e.size = ((uint64_t)hi << 32) | lo;
+        } else if (!parseEntryV3(r, e)) {
+            err = "bad LIST reply";
+            return false;
+        }
+        out.push_back(std::move(e));
+    }
+    return true;
+}
+
 bool Session::list(const std::string& path, std::vector<Entry>& out, std::string& err) {
     W w; w.str(serverPath(path));
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_LIST, w.b, err) || !recv(type, reply, err)) return false;
+    if (type != rp::MSG_OK) { R r(reply); r.str(err); return false; }
+    return parseListPayload(reply, peerVersion_, out, err);
+}
+
+bool Session::scan(const std::string& root, int depth, int maxGroups,
+                   std::vector<ScanGroup>& out, bool& truncated, int& skippedDirs,
+                   std::string& err) {
+    if (peerVersion_ < 3) {
+        err = "the remote peer is protocol " + std::to_string(peerVersion_) +
+              " - File > Update remote peer enables folder scans";
+        return false;
+    }
+    W w;
+    w.str(serverPath(root));
+    w.u32((uint32_t)std::max(0, depth));
+    w.u32((uint32_t)std::max(0, maxGroups));
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_SCAN, w.b, err) || !recv(type, reply, err)) return false;
     R r(reply);
     if (type != rp::MSG_OK) { r.str(err); return false; }
-    uint32_t n = 0;
-    if (!r.u32(n)) { err = "bad LIST reply"; return false; }
+    uint32_t flags = 0, skipped = 0, n = 0;
+    if (!r.u32(flags) || !r.u32(skipped) || !r.u32(n) || n > 1000000) {
+        err = "bad SCAN reply";
+        return false;
+    }
+    truncated = (flags & 1) != 0;
+    skippedDirs = (int)skipped;
     out.clear();
     for (uint32_t i = 0; i < n; i++) {
-        Entry e; uint32_t d = 0, lo = 0, hi = 0;
-        if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi)) {
-            err = "bad LIST reply"; return false;
+        ScanGroup g;
+        if (!r.str(g.dir) || !parseEntryV3(r, g.entry)) {
+            err = "bad SCAN reply";
+            return false;
         }
-        e.dir = d != 0;
-        e.size = ((uint64_t)hi << 32) | lo;
-        out.push_back(std::move(e));
+        out.push_back(std::move(g));
+    }
+    return true;
+}
+
+bool Session::glob(const std::string& root, const std::string& pattern, int depth,
+                   int maxResults, std::vector<GlobHit>& out, bool& truncated,
+                   int& skippedDirs, std::string& err) {
+    if (peerVersion_ < 3) {
+        err = "the remote peer is protocol " + std::to_string(peerVersion_) +
+              " - File > Update remote peer enables recursive search";
+        return false;
+    }
+    W w;
+    w.str(serverPath(root));
+    w.str(pattern);
+    w.u32((uint32_t)std::max(0, depth));
+    w.u32((uint32_t)std::max(0, maxResults));
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_GLOB, w.b, err) || !recv(type, reply, err)) return false;
+    R r(reply);
+    if (type != rp::MSG_OK) { r.str(err); return false; }
+    uint32_t flags = 0, skipped = 0, n = 0;
+    if (!r.u32(flags) || !r.u32(skipped) || !r.u32(n) || n > 1000000) {
+        err = "bad GLOB reply";
+        return false;
+    }
+    truncated = (flags & 1) != 0;
+    skippedDirs = (int)skipped;
+    out.clear();
+    for (uint32_t i = 0; i < n; i++) {
+        GlobHit h;
+        uint32_t d = 0;
+        if (!r.str(h.rel) || !r.u32(d)) { err = "bad GLOB reply"; return false; }
+        h.dir = d != 0;
+        out.push_back(std::move(h));
     }
     return true;
 }

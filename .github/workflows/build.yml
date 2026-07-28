@@ -67,6 +67,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
+            # archive.ubuntu.com is flaky from Actions runners (two runs in a
+            # row died on "Connection failed" here); the Azure mirror is what
+            # the runner images themselves use, and retries cover the rest
+            sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
+            echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
             apt-get update -qq >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
             # miniz.c is C: compiling it as C++ turns its tentative definitions
@@ -106,8 +111,11 @@ jobs:
           # icons/viewer.png next to it, so both travel with the binaries
           cp tools/install_shortcut.sh build/
           tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh
+      # upload-artifact v6 / download-artifact v7 are the Node 24-native pairs
+      # (the major numbers differ by one across the two actions); v5 of each
+      # still declared node20 and warned on every run.
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binpath }}
@@ -125,7 +133,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           path: dist
       - name: Assemble the binaries branch

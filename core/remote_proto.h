@@ -13,11 +13,16 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
 
 namespace rp {
 
 static const uint32_t MAGIC = 0x56525031;   // "VRP1"
-static const uint32_t VERSION = 2;          // 1 = LIST/META/TILE; 2 adds MEASURE
+// 1 = LIST/META/TILE; 2 adds MEASURE; 3 extends the LIST reply (mtime, npy
+// header peek, synthetic stack-group entries) and adds GLOB/SCAN. The server
+// answers LIST in the v2 shape when the client's HELLO said 2, so either end
+// may lag the other by one protocol without breaking the session.
+static const uint32_t VERSION = 3;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -25,8 +30,25 @@ enum MsgType : uint32_t {
     MSG_META       = 3,   // -> (path)                     <- shape/dtype/frames
     MSG_TILE       = 4,   // -> (path, frame, rect, step)  <- pixels
     MSG_MEASURE    = 5,   // -> (op, frames, rois, name)   <- emitted results only
+    MSG_GLOB       = 6,   // -> (root, pattern, depth, cap) <- matching rel paths
+    MSG_SCAN       = 7,   // -> (root, depth, cap)         <- stack groups per subdir
     MSG_OK         = 128,
     MSG_ERR        = 129,
+};
+
+// LIST reply, v3. v2 was: [u32 n] then per entry [str name][u32 dir][u32 szLo]
+// [u32 szHi]. v3 is:      [u32 n] then per entry
+//   [str name][u32 flags][u32 szLo][u32 szHi][u32 mtimeLo][u32 mtimeHi]
+//   flags & LE_META : [u32 dtype][u32 ndim][u32 dims[4]] declaration order,
+//                     0-padded  [u32 fortran]           (.npy header peek)
+//   flags & LE_GROUP: [u32 frameCount][frameCount * str memberName]
+// mtime is unix seconds (64-bit as lo/hi like the size: 2038 is within the
+// service life of a lab tool). A group entry's size is the sum over members,
+// its mtime the newest member, its META fields those of the first frame.
+enum ListEntryFlags : uint32_t {
+    LE_DIR   = 1,   // directory
+    LE_META  = 2,   // npy header fields follow
+    LE_GROUP = 4,   // synthetic entry for a numbered .npy sequence
 };
 
 // MEASURE: run analysis where the data lives. A 300-frame statistic crosses the
@@ -108,6 +130,35 @@ uint32_t dtypeFromName(const char* s);
 
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.
 int runServeMode();
+
+// Natural order over the WHOLE name: every digit run compares as a number
+// ("img2_gain10" < "img10_gain2"), case-insensitive elsewhere. Lives here
+// because BOTH ends must agree on frame order - the client sorts what it
+// opens, the server sorts what a scan folds into an unnumbered group.
+inline bool naturalLess(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        unsigned char ca = a[i], cb = b[j];
+        if (ca >= '0' && ca <= '9' && cb >= '0' && cb <= '9') {
+            size_t i0 = i, j0 = j;
+            while (i < a.size() && a[i] >= '0' && a[i] <= '9') i++;
+            while (j < b.size() && b[j] >= '0' && b[j] <= '9') j++;
+            size_t ia = i0, jb = j0;                 // strip leading zeros
+            while (ia < i - 1 && a[ia] == '0') ia++;
+            while (jb < j - 1 && b[jb] == '0') jb++;
+            size_t la = i - ia, lb = j - jb;
+            if (la != lb) return la < lb;
+            int c = a.compare(ia, la, b, jb, lb);
+            if (c != 0) return c < 0;
+        } else {
+            int la = ca >= 'A' && ca <= 'Z' ? ca + 32 : ca;
+            int lb2 = cb >= 'A' && cb <= 'Z' ? cb + 32 : cb;
+            if (la != lb2) return la < lb2;
+            i++; j++;
+        }
+    }
+    return a.size() - i < b.size() - j;
+}
 
 // META reply: what the client needs to lay out the image before any pixel moves.
 struct MetaRep {
