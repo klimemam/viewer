@@ -66,6 +66,11 @@ win64\install_shortcut.cmd                                    :: Windows
 ショートカット用の緑アイコンはビルド時に `viewer-remote.ico` / `viewer-remote.png` として
 生成され、バイナリの隣に置かれます(無ければ exe のアイコンにフォールバック)。
 
+**タイトルバー**: 既定では OS のタイトルバーを出さず、メニューバーにタイトルと
+最小化/最大化/閉じるを統合しています(Aero Snap やスナップレイアウトはそのまま使えます)。
+戻すのは `View > Integrated title bar`、起動時なら `--frame system` ——
+[manual.md のタイトルバー節](manual.md#タイトルバー統合フレーム)。
+
 <details><summary>なぜコンソール窓が一瞬出る(ことがある)のか</summary>
 
 `viewer.exe` は**コンソールアプリのまま**にしてあります。GUI サブシステムにすると
