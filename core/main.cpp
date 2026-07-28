@@ -1306,13 +1306,48 @@ static void splitAnalyzerName(const std::string& full, std::string& cat, std::st
     if (s == std::string::npos) { cat = "misc"; item = full; }
     else { cat = full.substr(0, s); item = full.substr(s + 1); }
 }
-// precondition hints; ABI v2 moves this into a plugin-declared description field
-static const char* analyzerHint(const std::string& name) {
-    if (name == "stats/moments")       return "any image / ROI";
-    if (name == "noise/floor")         return "flat-ish ROI";
-    if (name == "uniformity/prnu-fpn") return "bright flat field";
-    if (name == "sharpness/gradient")  return "same-scene compare";
-    return "";
+// The Measure menu groups by the QUESTION being asked, not by the plugin file:
+// nobody opens the menu thinking "iso12233", they think "is the resolution
+// there?". The mapping is host knowledge (tiny, additive); unknown categories
+// from third-party plugins fall through and keep their own name as a heading.
+struct MeasureGroup { const char* cat; const char* group; };
+static const MeasureGroup MEASURE_GROUPS[] = {
+    { "noise",      "Noise / SNR" },
+    { "iso12233",   "Resolution / Focus" },
+    { "sharpness",  "Resolution / Focus" },
+    { "uniformity", "Uniformity / Flat field" },
+    { "stats",      "Statistics / Sanity" },
+};
+static const char* measureGroupOf(const std::string& cat) {
+    for (const auto& g : MEASURE_GROUPS)
+        if (cat == g.cat) return g.group;
+    return nullptr;
+}
+
+// Machine-checkable preconditions only. The host must never guess about scene
+// content - it cannot tell a flat field from a portrait, so "wants a flat
+// field" stays a tooltip and the plugin's own error does the talking. What it
+// CAN prove (no image at all, a mosaic the plugin is documented to reject) is
+// worth a disabled item: the reason appears where the click would have been.
+static const char* analyzerDisabledReason(const AnalyzerPluginInfo& a, const ImageDoc* im) {
+    if (!im) return "open an image first";
+    if (a.name == "iso12233/e-sfr" && im->ch == 1 && im->cfa != 0)
+        return "CFA mosaic input - run Process > demosaic (bilinear) first";
+    return nullptr;
+}
+
+// Running a measurement and showing its result are one gesture: the Measure
+// menu (and the M key) must never leave the numbers in a hidden or buried
+// panel. Reveal is half of it - a docked Analysis tab sitting behind
+// Histogram would still swallow the result, hence the explicit focus.
+static void revealAnalysis() {
+    app.showAnalysis = true;
+    ImGui::SetWindowFocus("Analysis");
+}
+static void requestMeasure(int sel) {
+    app.anaSel = sel;
+    app.anaRunRequest = true;   // consumed by the Analysis panel this frame
+    revealAnalysis();
 }
 
 // Set while the background queue loads: newly arrived images must never steal
@@ -6664,21 +6699,73 @@ static void drawMenuBar(GLFWwindow* win) {
     }
     if (!plugin_host::analyzers().empty() && ImGui::BeginMenu("Measure")) {
         const auto& anas = plugin_host::analyzers();
-        std::string lastCat;
-        for (int i = 0; i < (int)anas.size(); i++) {
-            std::string c, n;
-            splitAnalyzerName(anas[i].name, c, n);
-            if (c != lastCat) {
-                if (!lastCat.empty()) ImGui::Separator();
-                ImGui::TextDisabled("%s", c.c_str());
-                lastCat = c;
+        ImageDoc* im = cur();
+        app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
+        // Rerun accelerator first: stepping through frames/images and pressing
+        // M is the comparison loop, and the menu is where M gets discovered.
+        std::string again = "Measure again: " + anas[app.anaSel].name;
+        if (ImGui::MenuItem(again.c_str(), "M", false, im != nullptr))
+            requestMeasure(app.anaSel);
+        if (ImGui::MenuItem("Auto re-run on change", nullptr, app.anaAuto))
+            app.anaAuto = !app.anaAuto;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("re-measure whenever the image, ROI set,\n"
+                              "display range or CFA layout changes");
+        ImGui::Separator();
+        // one pass per question group so co-answering plugins sit together
+        // regardless of registration order; then unknown categories verbatim
+        std::vector<std::string> headers;
+        for (const auto& g : MEASURE_GROUPS) {
+            bool present = false, seen = false;
+            for (const auto& a : anas) {
+                std::string c, n;
+                splitAnalyzerName(a.name, c, n);
+                if (c == g.cat) present = true;
             }
-            const char* hint = !anas[i].desc.empty() ? anas[i].desc.c_str()
-                                                     : analyzerHint(anas[i].name);
-            if (ImGui::MenuItem(n.c_str(), hint[0] ? hint : nullptr,
-                                app.anaSel == i, cur() != nullptr)) {
-                app.anaSel = i;
-                app.anaRunRequest = true;   // panel runs it this frame
+            for (const auto& h : headers) if (h == g.group) seen = true;
+            if (present && !seen) headers.push_back(g.group);
+        }
+        for (const auto& a : anas) {
+            std::string c, n;
+            splitAnalyzerName(a.name, c, n);
+            if (measureGroupOf(c)) continue;
+            bool seen = false;
+            for (const auto& h : headers) if (h == c) seen = true;
+            if (!seen) headers.push_back(c);
+        }
+        for (size_t hi = 0; hi < headers.size(); hi++) {
+            if (hi) ImGui::Separator();
+            ImGui::TextDisabled("%s", headers[hi].c_str());
+            for (int i = 0; i < (int)anas.size(); i++) {
+                std::string c, n;
+                splitAnalyzerName(anas[i].name, c, n);
+                const char* grp = measureGroupOf(c);
+                if ((grp ? grp : c.c_str()) != headers[hi]) continue;
+                const char* reason = analyzerDisabledReason(anas[i], im);
+                // the right column keeps the plugin's identity (the category is
+                // the standard number for iso* measurements); the precondition
+                // moved into the tooltip, where there is room to say it fully
+                if (ImGui::MenuItem(n.c_str(), c.c_str(), app.anaSel == i, !reason))
+                    requestMeasure(i);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (reason) ImGui::SetTooltip("%s", reason);
+                    else if (!anas[i].desc.empty()) ImGui::SetTooltip("%s", anas[i].desc.c_str());
+                }
+            }
+            // Temporal noise is the stack half of the noise question. It is
+            // host-computed (Temporal panel), not a frame analyzer, but the
+            // user asking "how noisy?" must find it HERE, not by knowing the
+            // implementation boundary.
+            if (headers[hi] == "Noise / SNR") {
+                bool inStack = im && im->seqId != 0;
+                if (ImGui::MenuItem("temporal (Temporal panel)", nullptr, false, inStack)) {
+                    app.showTemporal = true;
+                    ImGui::SetWindowFocus("Temporal");
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(inStack
+                        ? "sigma_t / sigma_fpn over the loaded stack (whole frames or the selected ROI)"
+                        : "needs a stack: load a numbered sequence first");
             }
         }
         ImGui::EndMenu();
@@ -6804,6 +6891,7 @@ static void drawHelpAbout() {
                 row("Shift+B",       "pin this frame as B (then move A: frame vs frame)");
                 row("[ / ]",         "move the divider 1% (Shift: 10%)");
                 row("G",             "pixel grid (zoom >= 8x)");
+                row("M",             "measure again (rerun the selected analyzer, focus Analysis)");
                 row("H",             "this help");
                 ImGui::EndTable();
             }
@@ -7477,6 +7565,12 @@ int main(int argc, char** argv) {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
+            // M = measure again: rerun the selected analyzer on the current
+            // image and ROI set, and bring the Analysis panel forward. This is
+            // the whole multi-image comparison loop: arrow key, M, read.
+            if (ImGui::IsKeyPressed(ImGuiKey_M, false) && cur() &&
+                !plugin_host::analyzers().empty())
+                requestMeasure(app.anaSel);
             // P drops a pin at the pixel under the cursor - no click, no modifier
             if (ImGui::IsKeyPressed(ImGuiKey_P, false) && app.hoverX >= 0 &&
                 !annBlockedOnPreview())
