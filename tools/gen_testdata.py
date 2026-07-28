@@ -81,11 +81,39 @@ for k in range(24):
 np.save(rb / "dark.npy", np.zeros((64, 64), np.float32))
 np.save(rb / "flat.npy", np.full((64, 64), 1000.0, np.float32))
 (rb / "notes.txt").write_text("not an image\n")
+# peer grouping stage-2 fixtures (--remote-selftest): gainset has TWO digit
+# runs but only the trailing one is the frame axis (pattern must keep gain10
+# literal: gain10_???.npy, never gain??_???.npy); expset's two varying runs
+# must SPLIT into per-condition stacks instead of growing a second '?' run
+gset = rb / "gainset"
+gset.mkdir(exist_ok=True)
+for gain in (10, 20):
+    for k in range(8):
+        np.save(gset / f"gain{gain}_{k:03d}.npy",
+                (rng3.random((16, 16)) * 4095).astype(np.float32))
+eset = rb / "expset"
+eset.mkdir(exist_ok=True)
+for g in range(2):
+    for e in range(4):
+        np.save(eset / f"g{g:02d}_e{e:02d}.npy",
+                (rng3.random((16, 16)) * 4095).astype(np.float32))
 for lv in ("10lx", "20lx", "40lx"):
     d = rb / "scanroot" / lv
     d.mkdir(parents=True, exist_ok=True)
     for k in range(8):
         np.save(d / f"frame_{k:03d}.npy", (rng3.random((32, 32)) * 4095).astype(np.float32))
+
+# picker batch-mode fixture (--picker-selftest UC5): three top-level condition
+# folders, each a numbered stack plus a single representative average.npy -
+# "one batch per top folder" must make three batches, stacks intact
+bs = out / "batchset"
+rng4 = np.random.default_rng(21)
+for sub in ("00", "01", "02"):
+    d = bs / sub
+    d.mkdir(parents=True, exist_ok=True)
+    for k in range(3):
+        np.save(d / f"frame_{k:03d}.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
+    np.save(d / "average.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
 
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):

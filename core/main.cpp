@@ -466,14 +466,19 @@ struct App {
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
     bool focusRemote = false;         // bring it forward when a menu item asks
+    bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
-        int seqId = -1;
+        int seqId = -1;               // owning stack; -2 = detached (browser-fired
+                                      // aggregate over files nobody opened)
         bool valid = false, pending = false;
+        bool detached = false;        // browser origin: no SeqInfo backs this
         std::string host, err;
+        std::string label;            // what was measured ("10lx/frame_???.npy")
+        std::vector<std::string> files;   // detached only: for "Open as stack"
         int frames = 0;
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
         std::vector<float> idx, frameMean, frameStd;
@@ -535,6 +540,12 @@ struct App {
     struct PendingGroup { std::string name; std::vector<std::string> files;
                           bool isRaw = false; int batchId = 0; std::string shape; };
     std::vector<PendingGroup> seqQueue;
+    // Sibling loads a session asked for, drained one at a time.
+    // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
+    // calling it N times in the parse loop cancelled every load but the last:
+    // a 3-stack session came back with 7 of its 15 frames.
+    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
+    std::vector<SeqRestore> seqRestore;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -559,7 +570,14 @@ struct App {
     // * and ? wildcards, matched anywhere in FolderPick::rel (see applyPickFilter)
     char pickFilter[256] = "";
     int pickMerge = 0;                // 0 = one stack per group, 1 = ONE merged stack
+    // batch assignment for the accepted selection: 0 = the whole Open is ONE
+    // batch (the canon's default), 1 = one batch per top-level folder of the
+    // scanned root. Ignored under pickMerge (a merged stack is one batch).
+    int pickBatchMode = 0;
+    std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
+    int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+                                      // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
         int seqId = -1;
@@ -695,6 +713,21 @@ static int newBatch(const std::string& name) {
 static int batchReuse(const std::string& name) {
     for (const auto& b : app.batches) if (b.name == name) return b.id;
     return newBatch(name);
+}
+// Batch names must be UNIQUE (docs/terminology.md): sessions restore batches BY
+// NAME (imgbatch -> batchReuse), so two batches sharing one name silently merge
+// on the next load. Collisions get " (2)", " (3)", ...
+static std::string uniqueBatchName(std::string base) {
+    if (base.empty()) base = "opened";
+    auto taken = [](const std::string& n) {
+        for (const auto& b : app.batches) if (b.name == n) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int k = 2;; k++) {
+        std::string n = base + " (" + std::to_string(k) + ")";
+        if (!taken(n)) return n;
+    }
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
@@ -1114,6 +1147,7 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
 }
 
 // UI thread: swap arrived frames in. After this an ex-preview is a local image.
+static App::SeqInfo* seqInfo(int id);   // fwd: closed-stack results are dropped
 static void pumpRemoteFetch() {
     std::vector<App::RFetchDone> batch;
     {
@@ -1131,6 +1165,11 @@ static void pumpRemoteFetch() {
             app.rfFetched = 0;
         }
         if (d.uid == 0) {                        // a new frame of a remote stack
+            // Closed while this fetch was in flight: closeStack swept the QUEUE,
+            // but the one job the worker was already running could not be
+            // removed there - its result lands here and must be dropped, or a
+            // closed stack regrows one orphan frame at a time.
+            if (d.seqId != 0 && !seqInfo(d.seqId)) continue;
             if (!d.err.empty()) {
                 if (app.seqNote.empty())         // first error explains the gap
                     app.seqNote = "remote: " + d.err;
@@ -1148,11 +1187,13 @@ static void pumpRemoteFetch() {
             doc->seqId = d.seqId; doc->seqIndex = d.seqIndex;
             doc->uid = app.nextUid++;
             doc->texDirty = true;
-            // frames of one stack share the display range, like the local loader
+            // frames of one stack share the display range (like the local
+            // loader) and its batch (frame ⊂ stack ⊂ batch)
             bool ranged = false;
             for (const auto& q : app.images)
                 if (q->seqId == d.seqId) {
                     doc->black = q->black; doc->white = q->white;
+                    doc->batchId = q->batchId;
                     ranged = true;
                     break;
                 }
@@ -1308,14 +1349,173 @@ static void pumpMeasure() {
     }
 }
 
-static void closeCurrent() {
+// ---- close, per layer (docs/terminology.md) -----------------------------------
+// The canon: Close on a stack member closes the STACK - frames vanishing one at
+// a time from a measurement set was the reported bug. Ctrl+Alt+W stays as the
+// one-frame escape hatch.
+static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below)
+static App::SeqInfo* seqInfo(int id);             // fwd
+static void stopSequenceLoader();                 // fwd
+static void pruneEmptyBatches();                  // fwd (defined with the moves)
+
+// Close a set of images by index: erase in descending order so the indices stay
+// valid, one forget per cache that can name them, current re-picked at the end.
+static void closeImages(std::vector<int> idxs) {
+    if (idxs.empty()) return;
+    std::sort(idxs.begin(), idxs.end());
+    idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+    uint64_t curUid = cur() ? cur()->uid : 0;
+    bool closedCur = false;
+    for (int i = (int)idxs.size() - 1; i >= 0; i--) {
+        int idx = idxs[i];
+        if (idx < 0 || idx >= (int)app.images.size()) continue;
+        ImageDoc* im = app.images[idx].get();
+        if (im->uid == curUid) closedCur = true;
+        if (im->uid == app.previewUid) app.previewUid = 0;
+        forgetImage(im);
+        if (im->tex) glDeleteTextures(1, &im->tex);
+        app.images.erase(app.images.begin() + idx);
+    }
+    if (curUid) {                     // re-point current: same doc if it survived
+        if (!closedCur) {
+            app.current = -1;
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i]->uid == curUid) { app.current = i; break; }
+        }
+        if (closedCur || app.current < 0) {
+            app.current = app.images.empty() ? -1
+                        : std::min(idxs.front(), (int)app.images.size() - 1);
+            app.fitRequested = true;
+        }
+    } else if (app.current >= (int)app.images.size()) {
+        app.current = (int)app.images.size() - 1;
+    }
+    app.imagesRev++;
+    if (!resolveB()) {   // B went with them: a later same-name file must not
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
+    pruneEmptyBatches();
+}
+
+// Close every frame of a stack plus its SeqInfo, and stop everything that
+// would quietly regrow it: the sequence loader (pumpSequence stamps
+// seqLoadingId on frames as they land), the remote prefetch queue, the
+// linearity row, the server temporal result.
+static void closeStack(int seqId) {
+    if (seqId == 0) return;
+    if (app.seqLoadingId == seqId) { stopSequenceLoader(); app.seqLoadingId = 0; }
+    {   // queued remote prefetches. The ONE job the worker may be running right
+        // now cannot be removed here - pumpRemoteFetch drops its result on
+        // arrival instead (seqInfo(d.seqId) == nullptr). Both are needed.
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        int removed = 0;
+        for (auto it = app.rfQueue.begin(); it != app.rfQueue.end();)
+            if (it->seqId == seqId) { it = app.rfQueue.erase(it); removed++; }
+            else ++it;
+        app.rfPending -= removed;
+        if (app.rfPending <= 0) { app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; }
+    }
+    // rbOpenQueue entries carry no seqId yet, so a stack whose FOLDER is still
+    // queued may open later regardless - accepted; closeBatch removes those by
+    // batchId, which the queue does know.
+    closeImages(framesOfSeq(seqId));
+    for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+        if (it->id == seqId) { app.seqs.erase(it); break; }
+    for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
+        if (it->seqId == seqId) it = app.lin.rows.erase(it);
+        else ++it;
+    app.lin.rev++;
+    app.temporal.seqId = -1;
+    if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
+}
+
+// Close a batch: every stack and loose frame in it, plus the queued opens that
+// would resurrect it the moment the fetcher goes idle.
+static void closeBatch(int batchId) {
+    std::vector<int> seqIds;
+    for (const auto& d : app.images)
+        if (d->batchId == batchId && d->seqId != 0 &&
+            std::find(seqIds.begin(), seqIds.end(), d->seqId) == seqIds.end())
+            seqIds.push_back(d->seqId);
+    for (int s : seqIds) closeStack(s);
+    std::vector<int> loose;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->batchId == batchId) loose.push_back(i);
+    closeImages(loose);
+    for (auto it = app.rbOpenQueue.begin(); it != app.rbOpenQueue.end();)
+        if (it->batchId == batchId) it = app.rbOpenQueue.erase(it);
+        else ++it;
+    for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
+        if (it->batchId == batchId) it = app.seqQueue.erase(it);
+        else ++it;
+    if (app.loadBatchId == batchId) app.loadBatchId = 0;
+    pruneEmptyBatches();       // the queue purge above may have freed this batch
+}
+
+// Ctrl+W: the stack when the frame is in one (the canon), the image otherwise.
+// frameOnly = the Ctrl+Alt+W escape hatch: just this one frame.
+static void closeCurrent(bool frameOnly = false) {
     ImageDoc* im = cur();
     if (!im) return;
+    if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
+    int seqId = im->seqId;
     forgetImage(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
     app.fitRequested = true;
+    app.imagesRev++;
+    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
+    // same-named frame of another stack (every stack has a frame_001.npy).
+    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
+    // this path duplicates closeImages' body and inherited the omission.
+    if (!resolveB()) {
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
+    // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
+    // too, or a zero-frame stack haunts the linearity table
+    if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
+    pruneEmptyBatches();
+}
+
+// Drop batches nothing references anymore: no image, no queued group, no
+// pending remote open, not the load target. Called after every close and after
+// every move - an empty Files heading is a lie about what is open. The preview
+// pseudo-batch stays: its emptiness is its normal state between previews.
+static void pruneEmptyBatches() {
+    for (auto it = app.batches.begin(); it != app.batches.end();) {
+        bool used = it->name == "preview" || app.loadBatchId == it->id;
+        if (!used)
+            for (const auto& d : app.images)
+                if (d->batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.seqQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.rbOpenQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used) {
+            it = app.batches.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Move a STACK between batches - the whole stack, per the canon's containment
+// (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
+static void moveStackToBatch(int seqId, int batchId) {
+    for (int idx : framesOfSeq(seqId)) app.images[idx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
+}
+// A standalone frame (no stack) hangs off the batch directly and moves alone.
+static void moveImageToBatch(int imageIdx, int batchId) {
+    if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
+    app.images[imageIdx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
 }
 static void closeAll() {
     app.ana.img = nullptr;
@@ -2662,6 +2862,12 @@ static std::string loadSession(const std::string& path) {
                 ini += l2;
                 ini += "\n";
             }
+            {   // sessions saved before the "Remote" -> "Browse###Remote"
+                // rename: migrate the window entry or the panel undocks
+                size_t p;
+                while ((p = ini.find("[Window][Remote]")) != std::string::npos)
+                    ini.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+            }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);
             app.resetLayout = false;   // otherwise the default rebuild wipes it
@@ -2702,7 +2908,9 @@ static std::string loadSession(const std::string& path) {
             if (on && lastImageOk && cur() && !cur()->path.empty() && cur()->seqId == 0) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
-                if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
+                // queued, not started: see App::seqRestore
+                if (files.size() >= 2)
+                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat });
             }
         }
         else if (key == "ann") {
@@ -3113,6 +3321,9 @@ static void pumpSequence() {
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
             doc->cfaColorize = ref->cfaColorize;
             doc->displayLut = ref->displayLut;
+            // frame ⊂ stack ⊂ batch: every frame carries its stack's batch, or
+            // "close batch" / "move to batch" sees only the head frame
+            doc->batchId = ref->batchId;
         } else {
             defaultRange(*doc);
         }
@@ -3149,6 +3360,17 @@ static bool seqReadyPending() {
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
+    // one restore at a time, matched by uid: indices shift as frames land
+    if (!app.seqRestore.empty() && !app.seqRunning && !seqReadyPending()) {
+        App::SeqRestore r = std::move(app.seqRestore.front());
+        app.seqRestore.erase(app.seqRestore.begin());
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
+                startSequenceLoad(i, r.files, r.pattern);
+                break;
+            }
+        return;                 // let it start before chaining anything else
+    }
     if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
 }
 
@@ -3570,6 +3792,13 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.folderPickHost = host;
     app.pickFilter[0] = 0;                 // a leftover filter would silently cut
     app.pickMerge = 0;                     // the new scan - start every scan clean
+    app.pickBatchMode = 0;                 // batch layout too: one batch is the canon
+    {   // batch names stem from the scanned root's leaf ("batchset", "scanroot")
+        std::string leaf = rootN;
+        size_t sl = leaf.find_last_of('/');
+        if (sl != std::string::npos && sl + 1 < leaf.size()) leaf = leaf.substr(sl + 1);
+        app.folderPickBatchBase = leaf.empty() ? "opened" : leaf;
+    }
     applyPickFilter();
     app.folderPickOpen = true;
 }
@@ -3585,10 +3814,9 @@ static void openFolder(const std::string& path) {
     // a single sequence), and "Always load folder" no longer mutes it: that
     // setting keeps its original job - loading a single FILE's numbered
     // siblings without asking. Headless callers auto-accept via pickerAccept().
-    {   // one fresh batch per Open Folder, named for the root (rename later)
-        int b = newBatch(baseName(path));
-        for (auto& g : groups) g.batchId = b;
-    }
+    // Batches are created at ACCEPT time (pickerAccept), not here: creating one
+    // per scan left an empty batch behind on Cancel, and the picker's batch
+    // mode (one / per top folder) is only known once the user answers.
     openPickerWith(std::move(groups), path, path, false, "");
 }
 
@@ -3653,9 +3881,33 @@ static void pickerAccept() {
     std::vector<App::PendingGroup> sel = pickerSelection(&err);
     bool remote = app.folderPickRemote;
     std::string host = app.folderPickHost;
+    int batchMode = app.pickMerge == 1 ? 0 : app.pickBatchMode;
+    std::string batchBase = app.folderPickBatchBase;
     app.folderPick.clear();
     app.folderPickOpen = false;
     if (sel.empty()) { toast(err.empty() ? "nothing selected" : err, true); return; }
+    // Batches are created HERE, on accept - Cancel used to leave an empty one
+    // behind. Mode 0 (default): the whole Open is one batch named for the root.
+    // Mode 1: one batch per TOP folder of the group name, "root/00" style, so
+    // per-condition folders open as ready-made analysis groupings.
+    if (batchMode == 1) {
+        std::vector<std::pair<std::string, int>> made;   // top folder -> batchId
+        for (auto& g : sel) {
+            size_t sl = g.name.find('/');
+            std::string top = sl == std::string::npos ? std::string() : g.name.substr(0, sl);
+            int id = 0;
+            for (const auto& m : made) if (m.first == top) id = m.second;
+            if (!id) {
+                id = newBatch(uniqueBatchName(top.empty() ? batchBase
+                                                          : batchBase + "/" + top));
+                made.emplace_back(top, id);
+            }
+            g.batchId = id;
+        }
+    } else {
+        int id = newBatch(uniqueBatchName(batchBase));
+        for (auto& g : sel) g.batchId = id;
+    }
     if (remote) {
         // remote groups: through the open queue, one stack at a time, so the
         // memory budget is applied against reality
@@ -3741,7 +3993,7 @@ static void drawFolderPickModal() {
         mixedRawNpy = anyRaw && anyNpy;
     }
     bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
-    float footer = ImGui::GetFrameHeightWithSpacing() * 2 +
+    float footer = ImGui::GetFrameHeightWithSpacing() * 3 +
                    ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
@@ -3840,6 +4092,41 @@ static void drawFolderPickModal() {
             ImGui::SetTooltip("ALL checked files merge into a single stack,\n"
                               "frames in natural (numeric) order - for a capture\n"
                               "split across folders, or a filtered subset");
+    }
+    // batch row: how the accepted selection is GROUPED in the Files panel.
+    // One batch per Open is the canon's default; per-top-folder splits a root
+    // of condition folders into ready-made analysis groupings. Merge wins over
+    // this (a single merged stack is one batch by construction).
+    {
+        int topFolders = 0;
+        {
+            std::vector<std::string> tops;
+            for (const auto& e : app.folderPick) {
+                if (!e.selected || e.nMatch == 0) continue;
+                size_t sl = e.g.name.find('/');
+                std::string top = sl == std::string::npos ? std::string()
+                                                          : e.g.name.substr(0, sl);
+                bool dup = false;
+                for (const auto& t : tops) if (t == top) { dup = true; break; }
+                if (!dup) tops.push_back(top);
+            }
+            topFolders = (int)tops.size();
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("batch:");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(app.pickMerge == 1);
+        ImGui::RadioButton("one batch###batch0", &app.pickBatchMode, 0);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("everything from this Open lands under ONE Files heading");
+        ImGui::SameLine();
+        char b1[80];
+        snprintf(b1, sizeof b1, "%d batches (one per top folder)###batch1", topFolders);
+        ImGui::RadioButton(b1, &app.pickBatchMode, 1);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("each top-level folder of the scanned root becomes\n"
+                              "its own batch (its own Files heading)");
+        ImGui::EndDisabled();
     }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
@@ -4288,6 +4575,38 @@ static void maybeRequestServerTemporal(int seqId) {
     mEnqueue(std::move(j));
 }
 
+// Temporal stats for a stack that is NOT opened: fired from the browser's group
+// row / multi-selection, so the answer to "is this set worth transferring?"
+// costs zero pixels. Runs on the MEASURE worker - the browse worker serializes
+// behind LIST/SCAN and shares the browsing ssh session, so a 300-frame
+// aggregate there would freeze navigation. cfaType stays 0 on purpose:
+// guessing a mosaic for a file nobody opened would silently split the planes
+// wrong - the panel tag says plane=all instead.
+static void requestBrowseTemporal(const std::string& host,
+                                  std::vector<std::string> files,
+                                  const std::string& label) {
+    if (files.empty()) return;
+    sortFramesNumerically(files);
+    App::ServerTemporal& S = app.srvTemporal;
+    S = App::ServerTemporal{};
+    S.seqId = -2;                     // sentinel: no SeqInfo backs this result
+    S.detached = true;
+    S.label = label;
+    S.host = host;
+    S.files = files;
+    S.token = g_measureToken++;
+    S.pending = true;
+    App::MJob j;
+    j.token = S.token;
+    j.op = rp::MOP_TEMPORAL_STATS;
+    j.url = makeRemoteUrl(host, files[0]);
+    if (files.size() > 1)
+        for (const auto& f : files) j.files.push_back(f);
+    mEnqueue(std::move(j));
+    app.showTemporal = true;          // the result lands in the Temporal panel
+    app.focusTemporal = true;
+}
+
 // ---- the connect/browse worker -------------------------------------------------
 static void rbSetPhase(const std::string& p) {
     std::lock_guard<std::mutex> lk(app.rbMtx);
@@ -4454,17 +4773,13 @@ static void pumpRemoteBrowse() {
                 return a == "/" ? "/" + b : a + "/" + b;
             };
             std::vector<App::PendingGroup> groups;
-            std::string broot = r.dir;
-            while (broot.size() > 1 && broot.back() == '/') broot.pop_back();
-            size_t bsl = broot.find_last_of('/');
-            int scanBatch = newBatch(bsl == std::string::npos || bsl + 1 >= broot.size()
-                                     ? broot : broot.substr(bsl + 1));
+            // batchId stays 0 here: batches are made at ACCEPT time in
+            // pickerAccept (Cancel must not leave an empty batch behind)
             for (const auto& g : r.scanGroups) {
                 App::PendingGroup pg;
                 pg.name = g.dir.empty() ? g.entry.name : g.dir + "/" + g.entry.name;
                 std::string base = joinR(r.dir, g.dir);
                 for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
-                pg.batchId = scanBatch;
                 if (g.entry.hasMeta && g.entry.ndim > 0) {   // v3 metadata -> the
                     for (int d = 0; d < g.entry.ndim; d++)   // picker's shape column
                         pg.shape += (d ? "x" : "") + std::to_string(g.entry.dims[d]);
@@ -4955,7 +5270,28 @@ static void openFolderDialog() {
         return;
     }
     if (app.folderDlg) return;
+    app.folderDlgMode = 0;
     app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+}
+// The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
+// folder opens in the Browse panel through the LOCAL peer - the same listing,
+// grouping, filters and server stats a remote machine gets, on this disk.
+static void browseLocalFolder(std::string p) {
+    if (p.empty()) return;
+    std::replace(p.begin(), p.end(), '\\', '/');
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    startRemote("local://" + p);
+    app.showRemote = true;
+    app.focusRemote = true;
+}
+static void browseFolderDialog() {
+    if (!pfd::settings::available()) {
+        toast("no file-dialog backend found (install zenity or kdialog)", true);
+        return;
+    }
+    if (app.folderDlg) return;
+    app.folderDlgMode = 1;
+    app.folderDlg = std::make_unique<pfd::select_folder>("Browse folder (local)");
 }
 static void saveSessionDialog() {
     if (app.images.empty()) { toast("nothing to save - no images loaded", true); return; }
@@ -4990,7 +5326,10 @@ static void pollFileDialog() {           // called once per frame from the main 
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
-        if (!p.empty()) openFolder(p);
+        if (!p.empty()) {
+            if (app.folderDlgMode == 1) browseLocalFolder(p);   // Browse panel
+            else openFolder(p);                                 // load stacks
+        }
     }
 }
 
@@ -7198,6 +7537,86 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     return true;
 }
 
+// Server temporal for a stack that is NOT opened (fired from the browser's
+// group row or multi-selection). Takes over the panel until dismissed (x) or
+// superseded: the user just asked for it, and it has no current-image to hang
+// off. "Open as stack" turns the measurement into a real open in one click -
+// whose own server temporal then replaces this one.
+static void drawBrowseTemporal() {
+    App::ServerTemporal& S = app.srvTemporal;
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    if (S.pending) {
+        ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
+                           S.host.empty() ? "local peer" : S.host.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        return;
+    }
+    if (!S.valid) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[server failed]");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", S.err.c_str());
+        return;
+    }
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames - not opened: %s]",
+                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open as stack")) {
+        // copy first: openRemoteStack fires its own server temporal, which
+        // resets S while we are still reading it
+        std::string host = S.host, label = S.label;
+        std::vector<std::string> files = S.files;
+        openRemoteStack(host, files, label);
+        return;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("open %s for real (frames transfer in the background)",
+                          S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+    ImGui::Separator();
+    // cfaType was 0 by design (no open file to read a mosaic from): say so,
+    // or a Bayer stack's plane-blind sigma reads as a wrong number
+    ImGui::TextDisabled("plane=all (file not opened - no CFA split)");
+    if (ImGui::BeginTable("srvbtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
+        auto row = [](const char* k, double v) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn(); textNum("%.6g", v);
+        };
+        row("mean [DN]", S.mean);
+        row("temporal noise (sigma_t)", S.tempNoise);
+        row("fixed pattern (sigma_fpn)", S.fixedPattern);
+        row("total (quadrature)", S.totalNoise);
+        ImGui::EndTable();
+    }
+    if (!S.frameMean.empty()) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
+        float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        PlotRect tp = beginPlot("frame number", "frame mean value [DN]",
+                                fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            for (size_t i = 1; i < S.frameMean.size(); i++)
+                dl->AddLine(tp.at(S.idx[i - 1], S.frameMean[i - 1]),
+                            tp.at(S.idx[i], S.frameMean[i]), IM_COL32(105, 180, 240, 255), 1.5f);
+            dl->PopClipRect();
+        }
+    }
+}
+
 // Per-frame S1 stats of a stack as TSV on the clipboard, one row per frame:
 // file, path, per-plane spatial mean/sigma, and the H/V projection non-
 // uniformity (sigma of the column-mean / row-mean profile, as % of the plane
@@ -7290,6 +7709,10 @@ static void copyPerFrameStats(int seqId) {
 }
 
 static void drawPanelTemporal() {
+    // a browser-fired aggregate (files nobody opened) owns the panel until
+    // dismissed - it is the freshest thing the user asked for and has no
+    // current image to attach to
+    if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
     if (im && im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
@@ -8049,6 +8472,11 @@ static void drawRemotePlacesCombo() {
     if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
                            ImGuiComboFlags_HeightLarge))
         return;
+    // display only: a local place reads better as "[local] path" than as the
+    // url scheme (the stored prefs string stays the url)
+    auto placeLabel = [](const std::string& u) {
+        return u.rfind("local://", 0) == 0 ? "[local] " + u.substr(8) : u;
+    };
     int rm = -1;
     if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");
     for (int i = 0; i < (int)app.rbBookmarks.size(); i++) {
@@ -8056,7 +8484,8 @@ static void drawRemotePlacesCombo() {
         if (ImGui::SmallButton("x")) rm = i;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
         ImGui::SameLine();
-        if (ImGui::Selectable(app.rbBookmarks[i].c_str())) goToPlace(app.rbBookmarks[i]);
+        if (ImGui::Selectable(placeLabel(app.rbBookmarks[i]).c_str()))
+            goToPlace(app.rbBookmarks[i]);
         ImGui::PopID();
     }
     if (rm >= 0) {
@@ -8067,7 +8496,8 @@ static void drawRemotePlacesCombo() {
     if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
         ImGui::PushID(1000 + i);
-        if (ImGui::Selectable(app.rbRecents[i].c_str())) goToPlace(app.rbRecents[i]);
+        if (ImGui::Selectable(placeLabel(app.rbRecents[i]).c_str()))
+            goToPlace(app.rbRecents[i]);
         ImGui::PopID();
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
@@ -8261,6 +8691,44 @@ static void drawPanelRemote() {
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("%s", reason.empty()
                     ? "frames stack in numeric name order" : reason.c_str());
+            ImGui::SameLine();
+            {   // the server aggregate for the selection, without opening it.
+                // MEASURE exists from protocol 2, but v2 has no hasMeta to
+                // pre-validate shapes - a mismatch falls to [server failed].
+                int pv2 = 0;
+                {
+                    std::lock_guard<std::mutex> lk(app.sesMtx);
+                    if (app.remoteSession) pv2 = app.remoteSession->peerVersion();
+                }
+                bool tempOk = pv2 >= 2;
+                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++)
+                    if (rbSel[i] && !isNpyName(B.entries[i].name)) tempOk = false;
+                ImGui::BeginDisabled(!tempOk);
+                if (ImGui::Button("Temporal stats (server)")) {
+                    std::vector<std::string> files;
+                    for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                        if (!rbSel[i]) continue;
+                        const remote::Entry& e = B.entries[i];
+                        if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
+                        else files.push_back(joined(e.name));
+                    }
+                    std::string leaf = B.dir;
+                    size_t sl2 = leaf.find_last_of('/');
+                    if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                        leaf = leaf.substr(sl2 + 1);
+                    requestBrowseTemporal(B.host, files,
+                                          leaf + " (" + std::to_string(files.size()) +
+                                          " selected)");
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(tempOk
+                        ? "sigma_t / sigma_fpn computed on the server over the\n"
+                          "selected files, shown in the Temporal panel - nothing\n"
+                          "opens, no pixel transfers. plane=all (no CFA split)."
+                        : pv2 < 2 ? "needs a protocol 2+ peer (File > Update remote peer)"
+                                  : "only .npy files can form a stack");
+            }
             ImGui::SameLine();
             if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
         }
@@ -8561,6 +9029,22 @@ static void drawPanelRemote() {
                         for (const auto& m : e.members) files.push_back(joined(m));
                         openRemoteStack(B.host, files);
                     }
+                    // the server aggregates WITHOUT opening: "is this set even
+                    // worth transferring?" costs zero pixels this way. Group
+                    // rows only exist from protocol 3 on, so no version gate.
+                    if (ImGui::MenuItem("Temporal stats (server)")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(joined(m));
+                        std::string leaf = B.dir;
+                        size_t sl2 = leaf.find_last_of('/');
+                        if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                            leaf = leaf.substr(sl2 + 1);
+                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
+                                          "shown in the Temporal panel - nothing opens,\n"
+                                          "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
                 } else if (isNpyName(e.name)) {
                     if (ImGui::MenuItem("Open"))
@@ -8667,6 +9151,42 @@ static void drawFileList() {
         if (ImGui::SmallButton("dismiss##seqnote")) app.seqNote.clear();
     }
     ImGui::Separator();
+    // Context-menu closes and moves are DEFERRED to the end of the walk:
+    // closing erases images mid-iteration while the row loop still holds
+    // indices into the pre-close stacksCached() snapshot, and a move prunes
+    // app.batches while the submenu is iterating it.
+    int pendingCloseSeq = 0, pendingCloseBatch = 0;
+    int pendingMoveSeq = 0, pendingMoveImg = -1, pendingMoveTarget = 0;
+    // "Move to batch" submenu, shared by the stack row (seqctx) and the
+    // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
+    // Batch names go through a ### suffix: user text must not become the ID.
+    auto moveToBatchMenu = [&](int curBatch) -> int {
+        int target = 0;
+        if (ImGui::BeginMenu("Move to batch")) {
+            for (const auto& b : app.batches) {
+                if (b.id == curBatch) continue;           // already there
+                if (b.name == "preview") continue;        // pseudo-batch
+                char lb2[300];
+                snprintf(lb2, sizeof lb2, "%s###mb%d", b.name.c_str(), b.id);
+                if (ImGui::MenuItem(lb2)) target = b.id;
+            }
+            ImGui::Separator();
+            static char nbBuf[256] = "";
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+            bool go = ImGui::InputTextWithHint("##newbatch", "New batch...",
+                                               nbBuf, sizeof nbBuf,
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            go |= ImGui::SmallButton("create");
+            if (go && nbBuf[0]) {
+                target = newBatch(uniqueBatchName(nbBuf));
+                nbBuf[0] = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndMenu();
+        }
+        return target;
+    };
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
     // produced a flat list of bare filenames with nothing saying where each came
@@ -8724,6 +9244,9 @@ static void drawFileList() {
                   app.imagesRev++;               // rebuild the cached labels
                   ImGui::CloseCurrentPopup();
               }
+              ImGui::Separator();
+              if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
+                  pendingCloseBatch = group.batch;
               ImGui::EndPopup();
           }
       }
@@ -8754,10 +9277,19 @@ static void drawFileList() {
             int i = stack.front();
             char lb[512];
             snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
+            ImGui::PushID(i);
             if (rowWithMeta(head, lb, i == app.current, nullptr)) {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
+            // a standalone frame hangs off the batch directly, so it gets the
+            // move menu itself (stacks move via seqctx below)
+            if (ImGui::BeginPopupContextItem("imgctx")) {
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
             continue;
         }
         App::SeqInfo* si = seqInfo(head.seqId);
@@ -8792,6 +9324,13 @@ static void drawFileList() {
                 app.lin.rev++;            // linearity rows show stack names
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::Separator();
+            {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveSeq = si->id; pendingMoveTarget = t; }
+            }
+            if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
+                pendingCloseSeq = si->id;
             ImGui::EndPopup();
         }
         if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
@@ -8804,6 +9343,10 @@ static void drawFileList() {
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
     }
+    if (pendingCloseSeq) closeStack(pendingCloseSeq);
+    if (pendingCloseBatch) closeBatch(pendingCloseBatch);
+    if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
+    if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
 }
 
 static void drawSequenceModal() {
@@ -8846,6 +9389,13 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // The local mirror of browsing a server: look around, preview, use the
+        // server-side stats - without loading anything. Same Browse panel, the
+        // peer just runs on this machine.
+        if (ImGui::MenuItem("Browse Folder (Local)...")) browseFolderDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("open a folder in the Browse panel: list, preview\n"
+                              "and measure without loading anything");
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
@@ -8884,7 +9434,18 @@ static void drawMenuBar(GLFWwindow* win) {
             if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
+        {   // Close follows the layer canon (docs/terminology.md): Ctrl+W closes
+            // the STACK when the current frame is in one, the image otherwise.
+            // Ctrl+Alt+W is the one-frame escape hatch; Ctrl+Shift+W the batch.
+            bool inStack = cur() && cur()->seqId != 0;
+            if (ImGui::MenuItem(inStack ? "Close Stack" : "Close Image", SC_MOD "+W",
+                                false, cur() != nullptr))
+                closeCurrent();
+            if (ImGui::MenuItem("Close Frame", SC_MOD "+Alt+W", false, inStack))
+                closeCurrent(true);
+            if (ImGui::MenuItem("Close Batch", SC_MOD "+Shift+W", false, cur() != nullptr))
+                closeBatch(cur()->batchId);
+        }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
         if (ImGui::BeginMenu("Sequence loading")) {
@@ -9034,7 +9595,7 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
-            ImGui::MenuItem("Remote", nullptr, &app.showRemote);
+            ImGui::MenuItem("Browse", nullptr, &app.showRemote);
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
@@ -9345,6 +9906,11 @@ static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
+static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
+static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
+static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
+static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
+static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 
 static void printUsage() {
     printf(
@@ -9467,6 +10033,16 @@ static void parseCli(int argc, char** argv) {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
             g_pickerSelftest = next();             // handled in main()
+        } else if (a == "--close-selftest") {
+            g_closeSelftest = next();              // handled in main()
+        } else if (a == "--batch-selftest") {
+            g_batchSelftest = next();              // handled in main()
+        } else if (a == "--rtemporal-selftest") {
+            g_rtemporalSelftest = next();          // handled in main()
+        } else if (a == "--localbrowse-selftest") {
+            g_localbrowseSelftest = next();        // handled in main()
+        } else if (a == "--verify-selftest") {
+            g_verifySelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -9654,6 +10230,64 @@ static int remoteSelfTest(const char* exe, const char* path) {
                     g ? g->name.c_str() : "?", nGroups, nPlain,
                     g ? g->frames : 0, g ? fmtEntryShape(*g).c_str() : "?",
                     ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Grouping stage 2: '?' covers ONLY the varying digit run. gainset has
+        // a constant gain digit next to the frame counter - the pattern must
+        // keep it literal (gain10_???.npy), or two gains read as one stack.
+        std::string gd = dir + "/rb/gainset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(gd, ents, err)) {
+            fprintf(stderr, "selftest: LIST gainset: skipped (%s: %s)\n",
+                    gd.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames8 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames8 &= e.frames == 8; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames8 &&
+                      pats[0] == "gain10_???.npy" && pats[1] == "gain20_???.npy";
+            fprintf(stderr, "selftest: LIST grouping gainset -> %d group(s) [%s], "
+                            "8 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames8 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Grouping stage 2, split: expset varies TWO digit runs. One stack per
+        // condition (g00_e??.npy / g01_e??.npy), never a second '?' run - a
+        // condition-mixed stack has a meaningless sigma_t.
+        std::string ed = dir + "/rb/expset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(ed, ents, err)) {
+            fprintf(stderr, "selftest: LIST expset: skipped (%s: %s)\n",
+                    ed.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames4 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames4 &= e.frames == 4; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames4 &&
+                      pats[0] == "g00_e??.npy" && pats[1] == "g01_e??.npy";
+            fprintf(stderr, "selftest: LIST grouping expset (2 varying runs) -> "
+                            "%d group(s) [%s], 4 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames4 ? 1 : 0, ok ? "ok" : "FAIL");
             bad += ok ? 0 : 1;
         }
     }
@@ -10116,6 +10750,21 @@ int main(int argc, char** argv) {
         }
         if (iniPath.empty()) { io.IniFilename = nullptr; app.resetLayout = true; }
     }
+    // One-time migration: the browser window was renamed "Remote" ->
+    // "Browse###Remote". ImHashStr treats the ### part as the whole identity,
+    // so a saved [Window][Remote] entry no longer matches and the panel would
+    // silently lose its docked place. Rewrite the ini before ImGui reads it.
+    if (!iniPath.empty()) {
+        std::string txt;
+        if (readWholeFile(iniPath, txt) &&
+            txt.find("[Window][Remote]") != std::string::npos) {
+            size_t p;
+            while ((p = txt.find("[Window][Remote]")) != std::string::npos)
+                txt.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+            std::ofstream mf(pathFromUtf8(iniPath), std::ios::binary);
+            if (mf) mf << txt;
+        }
+    }
 
     float xs = 1, ys = 1;
     glfwGetWindowContentScale(win, &xs, &ys);
@@ -10241,8 +10890,711 @@ int main(int argc, char** argv) {
             fprintf(stderr, "pickerselftest: UC2 FAILED - merged stack != union in natural order\n");
             ok = false;
         }
+        // ---- UC5: batch mode "one per top folder" -> N batches, unique names
+        {
+            std::string bsdir;
+            {   // fixture: batchset/ next to the given folder, else testdata
+                std::string d2 = g_pickerSelftest;
+                std::replace(d2.begin(), d2.end(), '\\', '/');
+                size_t sl = d2.find_last_of('/');
+                bsdir = (sl == std::string::npos ? std::string(".") : d2.substr(0, sl))
+                      + "/batchset";
+                std::error_code ec;
+                if (!std::filesystem::is_directory(pathFromUtf8(bsdir), ec))
+                    bsdir = "tools/testdata/batchset";
+            }
+            size_t imagesBefore = app.images.size();
+            openFolder(bsdir);
+            if (!app.folderPickOpen) {
+                fprintf(stderr, "pickerselftest: UC5 FAILED - picker did not open\n");
+                ok = false;
+            } else {
+                app.pickBatchMode = 1;             // the new footer radio
+                pickerAccept();
+                loadAll();
+                std::vector<int> bids;             // distinct batches actually used
+                for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                    int b = app.images[i]->batchId;
+                    if (std::find(bids.begin(), bids.end(), b) == bids.end())
+                        bids.push_back(b);
+                }
+                bool stacksOneBatch = true;        // a stack never straddles batches
+                for (const auto& si : app.seqs) {
+                    int b0 = -1;
+                    for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                        if (app.images[i]->seqId != si.id) continue;
+                        if (b0 < 0) b0 = app.images[i]->batchId;
+                        else if (app.images[i]->batchId != b0) stacksOneBatch = false;
+                    }
+                }
+                bool namesUnique = true;           // sessions restore by NAME
+                for (size_t a2 = 0; a2 < app.batches.size(); a2++)
+                    for (size_t b2 = a2 + 1; b2 < app.batches.size(); b2++)
+                        if (app.batches[a2].name == app.batches[b2].name)
+                            namesUnique = false;
+                std::string names;
+                for (int b : bids)
+                    for (const auto& bb : app.batches)
+                        if (bb.id == b) names += (names.empty() ? "" : ",") + bb.name;
+                fprintf(stderr, "pickerselftest: UC5 batch-per-top-folder -> %d batch(es) "
+                                "[%s], stacks one-batch=%d, names unique=%d\n",
+                        (int)bids.size(), names.c_str(), stacksOneBatch ? 1 : 0,
+                        namesUnique ? 1 : 0);
+                if (bids.size() != 3 || !stacksOneBatch || !namesUnique) {
+                    fprintf(stderr, "pickerselftest: UC5 FAILED - batches wrong\n");
+                    ok = false;
+                }
+            }
+        }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // The local-browse entry, verifiable without a human: the function behind
+    // File > Browse Folder (Local)... must land the picked folder in the Browse
+    // panel through the LOCAL peer - connected, empty host, entries listed.
+    if (!g_localbrowseSelftest.empty()) {
+        browseLocalFolder(g_localbrowseSelftest);   // exactly what the menu does
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const App::RemoteBrowse& B = app.rbrowse;
+        bool ok = B.connected && B.host.empty() && !B.entries.empty() &&
+                  app.showRemote;
+        fprintf(stderr, "localbrowseselftest: connected=%d host='%s' dir=%s "
+                        "entries=%d showBrowse=%d%s%s\n",
+                B.connected ? 1 : 0, B.host.c_str(), B.dir.c_str(),
+                (int)B.entries.size(), app.showRemote ? 1 : 0,
+                B.err.empty() ? "" : " err=", B.err.c_str());
+        fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // Browser-fired temporal, verifiable without a human (docs/terminology.md):
+    // the server aggregate for a stack NOBODY OPENED must land in the Temporal
+    // panel as a detached [not opened] result and match an independent local
+    // computation to full float64 precision.
+    if (!g_rtemporalSelftest.empty()) {
+        std::string dir = g_rtemporalSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        std::vector<std::string> files;
+        {
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec)) {
+                std::string n = e.path().filename().u8string();
+                if (isNpyName(n)) files.push_back(dir + "/" + n);
+            }
+        }
+        sortFramesNumerically(files);
+        if (files.size() < 2) {
+            fprintf(stderr, "rtemporalselftest: need >= 2 npy under %s\n", dir.c_str());
+            return 1;
+        }
+        // independent reference: per-pixel f64 accumulation over the local files
+        double refMean = 0, refSt = 0, refFpn = 0;
+        {
+            std::vector<double> sum, sum2;
+            size_t samples = 0;
+            int N = 0;
+            for (const auto& f : files) {
+                std::string err;
+                std::unique_ptr<ImageDoc> d = decodeNpy(f, err);
+                if (!d) {
+                    fprintf(stderr, "rtemporalselftest: %s: %s\n", f.c_str(), err.c_str());
+                    return 1;
+                }
+                if (!samples) {
+                    samples = d->data.size();
+                    sum.assign(samples, 0.0);
+                    sum2.assign(samples, 0.0);
+                }
+                if (d->data.size() != samples) {
+                    fprintf(stderr, "rtemporalselftest: shape mismatch in fixture\n");
+                    return 1;
+                }
+                for (size_t i = 0; i < samples; i++) {
+                    double v = d->data[i];
+                    sum[i] += v; sum2[i] += v * v;
+                }
+                N++;
+            }
+            double aM = 0, aM2 = 0, aV = 0;
+            for (size_t i = 0; i < samples; i++) {
+                double mm = sum[i] / N;
+                aM += mm; aM2 += mm * mm;
+                aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+            }
+            refMean = aM / samples;
+            refSt = sqrt(aV / samples);
+            refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+        }
+        // connect the browser, then fire the SAME call the group row's menu makes
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        bool fired = false, ok = true;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpMeasure();
+            if (app.rbrowse.connected && !fired) {
+                std::string leaf = dir.substr(dir.find_last_of('/') + 1);
+                requestBrowseTemporal(app.rbrowse.host, files, leaf + "/frame_???.npy");
+                fired = true;
+            }
+            if (fired && !app.srvTemporal.pending) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        App::ServerTemporal& S = app.srvTemporal;
+        auto rel = [](double a, double b) {
+            return fabs(a - b) / std::max({ fabs(a), fabs(b), 1e-12 });
+        };
+        fprintf(stderr, "rtemporalselftest: [server %s, %d frames - not opened: %s] "
+                        "valid=%d seqId=%d, %d image(s) open\n",
+                S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                S.label.c_str(), S.valid ? 1 : 0, S.seqId, (int)app.images.size());
+        if (!fired || !S.valid || S.seqId != -2 || S.frames != (int)files.size() ||
+            !app.images.empty()) {
+            fprintf(stderr, "rtemporalselftest: FAILED - no valid detached result (%s)\n",
+                    S.err.c_str());
+            ok = false;
+        } else {
+            fprintf(stderr, "rtemporalselftest: sigma_t server %.12g vs ref %.12g "
+                            "(rel %.3g), sigma_fpn %.12g vs %.12g (rel %.3g), "
+                            "mean rel %.3g\n",
+                    S.tempNoise, refSt, rel(S.tempNoise, refSt),
+                    S.fixedPattern, refFpn, rel(S.fixedPattern, refFpn),
+                    rel(S.mean, refMean));
+            if (rel(S.tempNoise, refSt) > 1e-9 || rel(S.fixedPattern, refFpn) > 1e-9 ||
+                rel(S.mean, refMean) > 1e-9) {
+                fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "rtemporalselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopMeasureWorker();
+        stopRemoteFetcher();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // Move-to-batch, verifiable without a human (docs/terminology.md): stacks
+    // move between batches WHOLE, emptied batches are pruned, and the batch
+    // name survives a session save/load round-trip (imgbatch travels by name).
+    if (!g_batchSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_batchSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "batchselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        if (app.seqs.empty() || app.images.empty()) {
+            fprintf(stderr, "batchselftest: nothing loaded\n");
+            return 1;
+        }
+        int oldBatch = app.images[0]->batchId;
+        int nb = newBatch(uniqueBatchName("moved"));
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        for (int s : sids) moveStackToBatch(s, nb);
+        int offBatch = 0;
+        for (const auto& d : app.images) if (d->batchId != nb) offBatch++;
+        bool oldGone = true;
+        for (const auto& b : app.batches) if (b.id == oldBatch) oldGone = false;
+        fprintf(stderr, "batchselftest: moved %d stack(s) to batch '%s': "
+                        "%d of %d frames off-batch, old batch %d pruned=%d\n",
+                (int)sids.size(), "moved", offBatch, (int)app.images.size(),
+                oldBatch, oldGone ? 1 : 0);
+        if (offBatch != 0 || !oldGone) {
+            fprintf(stderr, "batchselftest: FAILED - move left strays\n");
+            ok = false;
+        }
+        // ---- session round-trip: the batch travels BY NAME ----
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_batchselftest.vsession").u8string();
+        saveSession(sess, true);
+        std::string lerr = loadSession(sess);      // closeAll happens inside
+        if (!lerr.empty()) {
+            fprintf(stderr, "batchselftest: FAILED - session reload: %s\n", lerr.c_str());
+            ok = false;
+        }
+        loadAll();                                 // seqload rescans the folders
+        int movedId = 0;
+        for (const auto& b : app.batches) if (b.name == "moved") movedId = b.id;
+        int strays = 0;
+        for (const auto& d : app.images) if (d->batchId != movedId) strays++;
+        fprintf(stderr, "batchselftest: reloaded session: %d image(s), %d stack(s), "
+                        "batch 'moved' %s, %d stray frame(s)\n",
+                (int)app.images.size(), (int)app.seqs.size(),
+                movedId ? "restored" : "MISSING", strays);
+        if (!movedId || strays != 0 || app.images.empty() ||
+            app.seqs.size() != sids.size()) {
+            fprintf(stderr, "batchselftest: FAILED - session did not restore the batch\n");
+            ok = false;
+        }
+        fprintf(stderr, "batchselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        return ok ? 0 : 1;
+    }
+
+    // Close per layer, verifiable without a human (docs/terminology.md): Ctrl+W's
+    // closeCurrent() on a stack member removes the WHOLE stack and every trace of
+    // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
+    if (!g_closeSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_closeSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "closeselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        linRecompute();                    // rows exist, so residue is detectable
+        int imagesBefore = (int)app.images.size(), seqsBefore = (int)app.seqs.size();
+        if (seqsBefore < 3) {
+            fprintf(stderr, "closeselftest: expected 3 stacks under %s, got %d\n",
+                    g_closeSelftest.c_str(), seqsBefore);
+            return 1;
+        }
+        int sid = app.seqs[seqsBefore / 2].id;
+        std::vector<int> fr = framesOfSeq(sid);
+        int stackFrames = (int)fr.size();
+        selectImage(fr[fr.size() / 2]);    // a MIDDLE frame: the reported bug
+        closeCurrent();                    // Ctrl+W's path: must close the stack
+        bool linResidue = false;
+        for (const auto& r : app.lin.rows) if (r.seqId == sid) linResidue = true;
+        fprintf(stderr, "closeselftest: closeCurrent on mid frame of stack %d: "
+                        "images %d->%d, seqs %d->%d, frames(seq)=%d, "
+                        "temporal.seqId=%d, lin rows for seq: %s\n",
+                sid, imagesBefore, (int)app.images.size(), seqsBefore,
+                (int)app.seqs.size(), (int)framesOfSeq(sid).size(),
+                app.temporal.seqId, linResidue ? "RESIDUE" : "none");
+        if ((int)app.images.size() != imagesBefore - stackFrames ||
+            (int)app.seqs.size() != seqsBefore - 1 || !framesOfSeq(sid).empty() ||
+            app.temporal.seqId != -1 || linResidue) {
+            fprintf(stderr, "closeselftest: FAILED - stack close left residue\n");
+            ok = false;
+        }
+        // ---- a stack closed while its remote prefetch is still in flight ----
+        std::string scanroot = g_closeSelftest;
+        std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+        {
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+        }
+        int seqsNow = (int)app.seqs.size();
+        startRemote("local://" + scanroot);
+        double t0 = glfwGetTime();
+        bool scanSent = false, closed = false;
+        int rsid = 0, rfLeft = -1;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpRemoteFetch();
+            pumpRemoteOpenQueue();
+            pumpSequenceAndQueue();
+            if (app.rbrowse.connected && !scanSent) {
+                App::RbJob j;
+                j.kind = App::RbScan;
+                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                rbEnqueue(std::move(j));
+                scanSent = true;
+            }
+            if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+            if (!closed && (int)app.seqs.size() > seqsNow && app.rfPending > 0) {
+                rsid = app.seqs.back().id;     // the stack the fetcher is filling
+                closeStack(rsid);
+                closed = true;
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                rfLeft = 0;
+                for (const auto& jj : app.rfQueue) if (jj.seqId == rsid) rfLeft++;
+                break;
+            }
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!closed) {
+            fprintf(stderr, "closeselftest: FAILED - never caught a stack mid-fetch (%s)\n",
+                    app.rbrowse.err.c_str());
+            ok = false;
+        } else {
+            // the in-flight job (and the rest of the queue) gets 2 s to land;
+            // nothing of the closed stack may grow back
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 2.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "closeselftest: closeStack(%d) mid-fetch: %d queued job(s) "
+                            "for it left, %d frame(s) regrew after 2 s pump\n",
+                    rsid, rfLeft, orphans);
+            if (rfLeft != 0 || orphans != 0) {
+                fprintf(stderr, "closeselftest: FAILED - closed stack regrew\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "closeselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // VERIFICATION ADDITION (functional-verification agent, not part of the
+    // feature work): the corners of the close / batch rules that the six
+    // feature selftests do not reach - non-contiguous stacks, the Ctrl+Alt+W
+    // escape hatch, compare-B left dangling, prune's reference set, a move
+    // issued mid-load, closeBatch against a queued remote open, and the
+    // remote in-flight drop actually being the path that catches a fetch.
+    if (!g_verifySelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        auto reload = [&]() {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            loadAll();
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "verifyselftest: %-46s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+
+        // ---- V1: a stack whose frames are NOT contiguous in app.images ----
+        reload();
+        if (app.seqs.size() < 3) {
+            fprintf(stderr, "verifyselftest: need 3 stacks under %s\n", g_verifySelftest.c_str());
+            return 1;
+        }
+        {   // interleave: round-robin the three stacks so no stack is a run
+            std::vector<std::unique_ptr<ImageDoc>> mixed;
+            for (size_t k = 0; mixed.size() < app.images.size(); k++)
+                for (auto& d : app.images)
+                    if (d && (size_t)d->seqIndex == k) mixed.push_back(std::move(d));
+            for (auto& d : app.images) if (d) mixed.push_back(std::move(d));
+            app.images.swap(mixed);
+            app.current = 0;
+        }
+        {
+            int a0 = app.seqs[0].id, a1 = app.seqs[1].id, a2 = app.seqs[2].id;
+            std::vector<int> f1 = framesOfSeq(a1);
+            bool contiguous = true;                 // prove the fixture is nasty
+            for (size_t i = 1; i < f1.size(); i++)
+                if (f1[i] != f1[i - 1] + 1) contiguous = false;
+            int before = (int)app.images.size(), n1 = (int)f1.size();
+            closeStack(a1);
+            fprintf(stderr, "verifyselftest: V1 interleaved(contig=%d) closeStack(%d): "
+                            "images %d->%d (-%d), survivors %zu/%zu frames\n",
+                    contiguous ? 1 : 0, a1, before, (int)app.images.size(), n1,
+                    framesOfSeq(a0).size(), framesOfSeq(a2).size());
+            check(!contiguous, "V1 fixture really is non-contiguous");
+            check((int)app.images.size() == before - n1 && framesOfSeq(a1).empty() &&
+                  framesOfSeq(a0).size() == 5 && framesOfSeq(a2).size() == 5,
+                  "V1 non-contiguous closeStack keeps neighbours");
+        }
+
+        // ---- V2: Ctrl+Alt+W on a middle frame leaves a coherent stack ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            std::vector<int> fr = framesOfSeq(sid);
+            int want = (int)fr.size() - 1;
+            uint64_t revBefore = app.imagesRev;
+            selectImage(fr[fr.size() / 2]);
+            int goneIndex = cur()->seqIndex;
+            closeCurrent(true);                     // Ctrl+Alt+W
+            std::vector<int> after = framesOfSeq(sid);
+            bool gap = false;                       // the removed seqIndex is absent
+            for (int idx : after) if (app.images[idx]->seqIndex == goneIndex) gap = true;
+            fprintf(stderr, "verifyselftest: V2 Ctrl+Alt+W frame %d of stack %d: "
+                            "%zu frames left, seqs=%zu, imagesRev %llu->%llu\n",
+                    goneIndex, sid, after.size(), app.seqs.size(),
+                    (unsigned long long)revBefore, (unsigned long long)app.imagesRev);
+            check((int)after.size() == want && !gap, "V2 single-frame close leaves N-1 frames");
+            check(seqInfo(sid) != nullptr, "V2 stack survives a single-frame close");
+            check(app.imagesRev != revBefore, "V2 imagesRev bumped (Files cache)");
+        }
+
+        // ---- V3: closing the LAST frame of a stack drops the SeqInfo ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            while (framesOfSeq(sid).size() > 1) {
+                selectImage(framesOfSeq(sid).front());
+                closeCurrent(true);
+            }
+            selectImage(framesOfSeq(sid).front());
+            closeCurrent(true);                     // the last one
+            fprintf(stderr, "verifyselftest: V3 emptied stack %d one frame at a time: "
+                            "seqInfo=%s, frames=%zu\n",
+                    sid, seqInfo(sid) ? "STILL THERE" : "gone", framesOfSeq(sid).size());
+            check(seqInfo(sid) == nullptr && framesOfSeq(sid).empty(),
+                  "V3 last-frame close drops the SeqInfo");
+        }
+
+        // ---- V4: compare-B pointing into a closed stack ----
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(app.seqs[0].id).front());
+            setCompareB(app.images[framesOfSeq(sid)[1]].get());
+            app.compareMode = App::CmpWipe;
+            bool had = resolveB() != nullptr;
+            closeStack(sid);
+            fprintf(stderr, "verifyselftest: V4 closeStack(%d) with B inside: "
+                            "hadB=%d uid=%llu name='%s' seq=%d resolveB=%p\n",
+                    sid, had ? 1 : 0, (unsigned long long)app.compareBUid,
+                    app.compareB.c_str(), app.compareBSeq, (void*)resolveB());
+            check(had, "V4 B really pointed into the stack");
+            check(app.compareBUid == 0 && app.compareB.empty() && !resolveB(),
+                  "V4 closeStack clears a dangling compare-B");
+        }
+        // ---- V4b: the Ctrl+Alt+W escape hatch and a dangling compare-B.
+        // ensureCompareB() re-points B away from cur(), so "close the frame that
+        // IS B" cannot be reached from the UI; this pins B by hand to probe
+        // whether closeCurrent(frameOnly) does the closeImages() cleanup at all.
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(sid)[1]);
+            app.compareBUid = cur()->uid;           // white-box: B == the current frame
+            app.compareB = cur()->name;
+            app.compareBSeq = cur()->seqIndex;
+            app.compareMode = App::CmpWipe;
+            std::string bname = app.compareB;
+            closeCurrent(true);                     // close exactly the B frame
+            std::string leftName = app.compareB;
+            // first resolveB() only drops the stale uid and returns null; the
+            // SECOND one falls through to the name path, which is why
+            // closeImages() clears the name and this path must too
+            ImageDoc* b1 = resolveB();
+            ImageDoc* b2 = resolveB();
+            fprintf(stderr, "verifyselftest: V4b Ctrl+Alt+W on the B frame (B pinned by "
+                            "hand): saved '%s', name left behind '%s', "
+                            "resolveB #1 -> %s, resolveB #2 -> %s\n",
+                    bname.c_str(), leftName.c_str(),
+                    b1 ? b1->name.c_str() : "(null)",
+                    b2 ? (b2->path + " seq " + std::to_string(b2->seqId)).c_str() : "(null)");
+            check(leftName.empty(), "V4b frameOnly close clears the compare-B name");
+            check(b2 == nullptr, "V4b closed B does not re-latch onto a same-named frame");
+        }
+
+        // ---- V5: prune must keep batches referenced only by a queue ----
+        reload();
+        {
+            int b1 = newBatch(uniqueBatchName("qseq"));
+            int b2 = newBatch(uniqueBatchName("qrb"));
+            int b3 = newBatch(uniqueBatchName("qload"));
+            int b4 = newBatch(uniqueBatchName("qnone"));
+            App::PendingGroup pg; pg.name = "x"; pg.files.push_back("x.npy"); pg.batchId = b1;
+            app.seqQueue.push_back(pg);
+            app.rbOpenQueue.push_back({ "", { "y.npy" }, "y", b2 });
+            app.loadBatchId = b3;
+            pruneEmptyBatches();
+            auto live = [&](int id) {
+                for (const auto& b : app.batches) if (b.id == id) return true;
+                return false;
+            };
+            fprintf(stderr, "verifyselftest: V5 prune with refs: seqQueue=%d rbOpen=%d "
+                            "loadBatchId=%d unreferenced=%d\n",
+                    live(b1) ? 1 : 0, live(b2) ? 1 : 0, live(b3) ? 1 : 0, live(b4) ? 1 : 0);
+            check(live(b1) && live(b2) && live(b3), "V5 prune keeps queue-referenced batches");
+            check(!live(b4), "V5 prune drops the unreferenced batch");
+            // ---- V5b: closeBatch removes the queued remote open too ----
+            size_t rbBefore = app.rbOpenQueue.size();
+            closeBatch(b2);
+            fprintf(stderr, "verifyselftest: V5b closeBatch(qrb): rbOpenQueue %zu->%zu, "
+                            "batch %s\n", rbBefore, app.rbOpenQueue.size(),
+                    live(b2) ? "STILL THERE" : "gone");
+            check(app.rbOpenQueue.size() == rbBefore - 1 && !live(b2),
+                  "V5b closeBatch purges its rbOpenQueue entry");
+            app.seqQueue.clear();
+            app.rbOpenQueue.clear();
+            app.loadBatchId = 0;
+        }
+
+        // ---- V6: move a stack that is still loading ----
+        {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            int movedSeq = 0, target = 0;
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {    // catch it mid-load
+                pumpSequenceAndQueue();
+                if (!movedSeq && app.seqRunning && app.seqLoadingId &&
+                    framesOfSeq(app.seqLoadingId).size() >= 1 &&
+                    framesOfSeq(app.seqLoadingId).size() < 5) {
+                    movedSeq = app.seqLoadingId;
+                    target = newBatch(uniqueBatchName("midload"));
+                    moveStackToBatch(movedSeq, target);
+                }
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            int off = 0;
+            std::vector<int> fr = movedSeq ? framesOfSeq(movedSeq) : std::vector<int>();
+            for (int idx : fr) if (app.images[idx]->batchId != target) off++;
+            fprintf(stderr, "verifyselftest: V6 move-mid-load stack %d: %zu frames, "
+                            "%d off-batch\n", movedSeq, fr.size(), off);
+            check(movedSeq != 0, "V6 caught a stack mid-load");
+            check(fr.size() == 5 && off == 0, "V6 late frames follow the moved stack");
+        }
+
+        // ---- V7: two same-named batches survive a session round trip apart ----
+        reload();
+        {
+            // create-then-move one at a time: moveStackToBatch prunes, and an
+            // empty second batch would be pruned before it could be filled
+            int b1 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[0].id, b1);
+            int b2 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[1].id, b2);
+            std::string n1, n2;
+            for (const auto& b : app.batches) {
+                if (b.id == b1) n1 = b.name;
+                if (b.id == b2) n2 = b.name;
+            }
+            std::error_code vec;
+            std::string sess = (std::filesystem::temp_directory_path(vec) /
+                                "viewer_verifyselftest.vsession").u8string();
+            saveSession(sess, true);
+            loadSession(sess);
+            loadAll();
+            int f1 = 0, f2 = 0, id1 = 0, id2 = 0;
+            for (const auto& b : app.batches) {
+                if (b.name == n1) id1 = b.id;
+                if (b.name == n2) id2 = b.id;
+            }
+            for (const auto& d : app.images) {
+                if (d->batchId == id1) f1++;
+                if (d->batchId == id2) f2++;
+            }
+            fprintf(stderr, "verifyselftest: V7 '%s' + '%s' round trip: both present=%d, "
+                            "frames %d / %d, merged=%d\n",
+                    n1.c_str(), n2.c_str(), (id1 && id2) ? 1 : 0, f1, f2,
+                    (id1 && id1 == id2) ? 1 : 0);
+            check(n1 != n2, "V7 uniqueBatchName disambiguates the collision");
+            check(id1 && id2 && id1 != id2, "V7 both batches survive the round trip apart");
+            std::filesystem::remove(std::filesystem::u8path(sess), vec);
+        }
+
+        // ---- V8: the remote IN-FLIGHT drop, not just the queue sweep ----
+        {
+            closeAll();
+            std::string scanroot = g_verifySelftest;
+            std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+            startRemote("local://" + scanroot);
+            double t0 = glfwGetTime();
+            bool scanSent = false, closed = false;
+            int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                if (app.rbrowse.connected && !scanSent) {
+                    App::RbJob j;
+                    j.kind = App::RbScan;
+                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                    rbEnqueue(std::move(j));
+                    scanSent = true;
+                }
+                if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+                // Wait for a moment when the WORKER holds a job: rfPending counts
+                // queued + in-flight, so rfPending > (jobs still in rfQueue) means
+                // exactly one is out of the queue's reach. That is the only state
+                // in which the pumpRemoteFetch drop is load-bearing.
+                if (!closed && !app.seqs.empty() && app.rfPending > 0) {
+                    int sid2 = app.seqs.back().id, q = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(app.rfMtx);
+                        for (const auto& jj : app.rfQueue) if (jj.seqId == sid2) q++;
+                    }
+                    if (app.rfPending > q) {        // a job is IN FLIGHT right now
+                        rsid = sid2; queuedForSeq = q;
+                        closeStack(rsid);
+                        pendingAfter = app.rfPending;
+                        closed = true;
+                        break;
+                    }
+                }
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 3.0) {
+                pumpRemoteBrowse(); pumpRemoteFetch();
+                pumpRemoteOpenQueue(); pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "verifyselftest: V8 closeStack(%d): %d job(s) swept from the "
+                            "queue, rfPending after = %d (in flight), %d frame(s) regrew\n",
+                    rsid, queuedForSeq, pendingAfter, orphans);
+            check(closed, "V8 caught a remote stack with a fetch outstanding");
+            check(orphans == 0, "V8 nothing of the closed stack regrew");
+            fprintf(stderr, "verifyselftest: V8 note: the in-flight drop path was%s "
+                            "the one that had to catch it\n",
+                    pendingAfter > 0 ? "" : " NOT");
+        }
+
+        fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
         return ok ? 0 : 1;
     }
 
@@ -10382,6 +11734,11 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
+            // the layer variants (docs/terminology.md): frame-only escape hatch
+            // and whole-batch close
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Alt | ImGuiKey_W)) closeCurrent(true);
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_W) && cur())
+                closeBatch(cur()->batchId);
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
             // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
@@ -10389,7 +11746,7 @@ int main(int argc, char** argv) {
             // the filter box there), so frame-stepping must yield to it.
             ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
             bool remoteFocused = nav && nav->RootWindow &&
-                                 strcmp(nav->RootWindow->Name, "Remote") == 0;
+                                 strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
             if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
@@ -10494,7 +11851,7 @@ int main(int argc, char** argv) {
             right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
             bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.28f, nullptr, &center);
             ImGui::DockBuilderDockWindow("Files", left);
-            ImGui::DockBuilderDockWindow("Remote", left);   // tabbed with Files
+            ImGui::DockBuilderDockWindow("Browse###Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
@@ -10513,7 +11870,10 @@ int main(int argc, char** argv) {
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         if (app.showRemote) {
             if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
-            if (ImGui::Begin("Remote", &app.showRemote)) drawPanelRemote();
+            // Renamed "Browse" (it browses local folders too, via the local
+            // peer), with the ImGui ID pinned by the ### suffix so the title
+            // can change again without orphaning docked layouts.
+            if (ImGui::Begin("Browse###Remote", &app.showRemote)) drawPanelRemote();
             ImGui::End();
         }
         if (app.showMessages) {
@@ -10534,6 +11894,7 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
         if (app.showTemporal) {
+            if (app.focusTemporal) { ImGui::SetNextWindowFocus(); app.focusTemporal = false; }
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
@@ -10852,6 +12213,7 @@ int main(int argc, char** argv) {
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
+                working |= !app.seqRestore.empty();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
