@@ -7973,38 +7973,35 @@ static void drawPanelRemote() {
             ImGui::PushID(shown[row]);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            // vscode-style rows: an icon column drawn with the draw list (the
-            // bundled font has no icon glyphs), names plain - no [brackets]
-            std::string lb = "   " + e.name;
+            // vscode-quiet rows: a dim chevron marks a folder, a stack gets
+            // three hairlines, a file gets nothing - the name is the row.
+            // (First cut had drawn folder/page pictograms; they collided with
+            // the text and were, verbatim, "くどい".)
+            std::string lb = "  " + e.name;
             if (e.group) lb += "   [" + std::to_string(e.frames) + " frames]";
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
-            {   // the icon, over the space the three-space prefix reserved
+            if (e.dir || e.group) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
                 ImVec2 p = ImGui::GetItemRectMin();
                 float h = ImGui::GetTextLineHeight();
-                float x = p.x + 2 * app.uiScale, y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
-                if (e.dir) {          // folder: tab + body, the universal shape
-                    ImU32 c = IM_COL32(222, 179, 92, 230);
-                    rdl->AddRectFilled(ImVec2(x, y + h * 0.22f), ImVec2(x + h * 0.45f, y + h * 0.40f),
-                                       c, 1.0f);
-                    rdl->AddRectFilled(ImVec2(x, y + h * 0.32f), ImVec2(x + h * 0.95f, y + h * 0.88f),
-                                       c, 2.0f);
-                } else if (e.group) { // stack: three offset pages
-                    ImU32 c = IM_COL32(120, 170, 220, 230);
-                    for (int k = 2; k >= 0; k--)
-                        rdl->AddRect(ImVec2(x + k * 2.0f * app.uiScale, y + h * 0.18f + k * 1.5f * app.uiScale),
-                                     ImVec2(x + k * 2.0f * app.uiScale + h * 0.55f,
-                                            y + h * 0.66f + k * 1.5f * app.uiScale), c, 1.0f);
-                } else {              // file: a page, dimmed for the unservable
-                    ImU32 c = servable ? IM_COL32(160, 170, 180, 220) : IM_COL32(120, 126, 132, 130);
-                    rdl->AddRect(ImVec2(x + h * 0.12f, y + h * 0.10f),
-                                 ImVec2(x + h * 0.72f, y + h * 0.90f), c, 1.0f);
-                    rdl->AddLine(ImVec2(x + h * 0.24f, y + h * 0.35f), ImVec2(x + h * 0.60f, y + h * 0.35f), c);
-                    rdl->AddLine(ImVec2(x + h * 0.24f, y + h * 0.55f), ImVec2(x + h * 0.60f, y + h * 0.55f), c);
+                float gut = ImGui::CalcTextSize("  ").x;      // never touch the name
+                float y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
+                float cxm = p.x + gut * 0.45f, cym = y + h * 0.5f;
+                if (e.dir) {          // › chevron, the way a tree hints "enter me"
+                    ImU32 c = IM_COL32(150, 158, 166, 170);
+                    float a = std::min(h * 0.16f, gut * 0.30f);
+                    rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
+                    rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
+                } else {              // stack: three hairlines, barely there
+                    ImU32 c = IM_COL32(130, 165, 200, 150);
+                    float w = std::min(h * 0.36f, gut * 0.8f);
+                    for (int k = -1; k <= 1; k++)
+                        rdl->AddLine(ImVec2(cxm - w * 0.5f, cym + k * h * 0.18f),
+                                     ImVec2(cxm + w * 0.5f, cym + k * h * 0.18f), c, 1.0f);
                 }
             }
             if (rowClicked && servable) {
