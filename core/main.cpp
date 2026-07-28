@@ -9423,7 +9423,7 @@ static void drawFileList() {
         const ImageDoc& head = *app.images[stack.front()];
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
-                              const char* extra = nullptr) -> bool {
+                              const char* extra = nullptr, bool isB = false) -> bool {
             const ImGuiStyle& st = ImGui::GetStyle();
             char meta[96];
             snprintf(meta, sizeof meta, "%dx%d %dch %s%s", d.w, d.h, d.ch, d.dtype.c_str(),
@@ -9445,6 +9445,13 @@ static void drawFileList() {
                                              ImVec2(avail, 0));
             ImGui::PopClipRect();
             bool hov = ImGui::IsItemHovered();
+            if (isB) {   // which row is the compare partner, without hunting a menu
+                ImVec2 m = ImGui::GetItemRectMin();
+                float h = ImGui::GetTextLineHeight();
+                ImVec2 tp(m.x + 2 * app.uiScale,
+                          m.y + (ImGui::GetItemRectSize().y - h) * 0.5f);
+                ImGui::GetWindowDrawList()->AddText(tp, IM_COL32(120, 190, 255, 255), "B");
+            }
             if (room) {   // draw-list, not an item: the row must stay the last item
                 ImVec2 m = ImGui::GetItemRectMin();
                 ImGui::GetWindowDrawList()->AddText(
@@ -9458,9 +9465,10 @@ static void drawFileList() {
         if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
-            snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
+            snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
             ImGui::PushID(i);
-            if (rowWithMeta(head, lb, i == app.current, nullptr)) {
+            const ImageDoc* bnow = cmpB();
+            if (rowWithMeta(head, lb, i == app.current, nullptr, bnow == &head)) {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
@@ -9489,10 +9497,13 @@ static void drawFileList() {
             if (stack[k] == app.current) { pos = k; active = true; }
         ImGui::PushID(head.seqId);
         char lb[512];
-        snprintf(lb, 512, "%s", si ? si->name.c_str() : "sequence");
+        snprintf(lb, 512, "  %s", si ? si->name.c_str() : "sequence");
         char frames[24];
         snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
-        if (rowWithMeta(head, lb, active, frames)) {
+        const ImageDoc* bnow = cmpB();
+        bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
+        if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
+        if (rowWithMeta(head, lb, active, frames, stackHasB)) {
             selectImage(stack[pos]);
             if (app.fitOnSwitch) app.fitRequested = true;
         }
