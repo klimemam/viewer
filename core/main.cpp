@@ -254,6 +254,18 @@ struct App {
     // it was on and every step compares against a stale image. Off when B is a
     // single reference image (a dark, a golden sample) - then B must not move.
     bool compareFollowFrame = true;
+    // A/B statistics panels: how the two sides are laid out. ONE global setting,
+    // not one per panel - "the same arrangement as the image" is a property of
+    // the comparison, not of the histogram, and per-panel state would multiply
+    // by five with no way to tell which panel is showing what.
+    // Auto mirrors the image: CmpSplit puts the images left/right, so the plots
+    // go left/right; wipe / blink / diff have ONE image area, so the plots overlay.
+    enum { AbAuto = 0, AbOverlay = 1, AbSide = 2 };
+    int abStatsLayout = AbAuto;
+    // Slot 1 of every statistics cache is filled ONLY while compare is on. This
+    // records whether it still holds anything, so compare-off invalidates it
+    // exactly once and then costs nothing at all.
+    bool abSlot1Live = false;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -314,7 +326,7 @@ struct App {
         bool roiUsed = false;
         double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
         const char* seriesNames[4] = {};
-    } hist;
+    } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
     bool histLog = true;
 
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
@@ -598,7 +610,7 @@ struct App {
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0;
         bool valid = false;
         bool roiUsed = false;
-    } temporal;
+    } temporal[2];                    // 0 = A, 1 = B (compare)
     // H/V projections (line profiles) of the selected ROI / whole image
     struct ProjState {
         const ImageDoc* img = nullptr;
@@ -614,7 +626,7 @@ struct App {
         struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
         Stats hStat[4], vStat[4];
         bool roiUsed = false;
-    } proj;
+    } proj[2];                        // 0 = A, 1 = B (compare)
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
     int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
@@ -706,6 +718,19 @@ static void setCompareB(const ImageDoc* d) {
     app.compareBUid = d ? d->uid : 0;
     app.compareB = d ? d->name : std::string();
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
+}
+
+// Slot 1 of every statistics cache belongs to the B side and is filled only
+// while a B exists. Called once per frame BEFORE the panels draw: the first
+// frame after compare goes off clears it, and every frame after that does
+// nothing at all - so compare-off costs exactly what it did before A/B stats.
+static void abStatsFrame() {
+    if (cmpB()) { app.abSlot1Live = true; return; }
+    if (!app.abSlot1Live) return;
+    app.hist[1] = App::HistState{};
+    app.proj[1] = App::ProjState{};
+    app.temporal[1] = App::TemporalState{};
+    app.abSlot1Live = false;
 }
 
 static void toast(const std::string& msg, bool err = false) {
@@ -1054,9 +1079,13 @@ static void forgetTexture(ImageDoc* im) {
 // One place that drops an image from every cache that can name it.
 static void forgetImage(ImageDoc* im) {
     if (app.ana.img == im) app.ana.img = nullptr;
-    if (app.hist.img == im) app.hist.img = nullptr;
-    if (app.proj.img == im) app.proj.img = nullptr;
-    app.temporal.seqId = -1;
+    // BOTH slots: the image being dropped may be the B side, and a cache still
+    // naming it is a dangling pointer the next draw would follow
+    for (int k = 0; k < 2; k++) {
+        if (app.hist[k].img == im) { app.hist[k].img = nullptr; app.hist[k].uid = 0; }
+        if (app.proj[k].img == im) { app.proj[k].img = nullptr; app.proj[k].uid = 0; }
+        app.temporal[k].seqId = -1;
+    }
     forgetTexture(im);
     app.imagesRev++;
 }
@@ -1446,7 +1475,7 @@ static void closeStack(int seqId) {
         if (it->seqId == seqId) it = app.lin.rows.erase(it);
         else ++it;
     app.lin.rev++;
-    app.temporal.seqId = -1;
+    app.temporal[0].seqId = app.temporal[1].seqId = -1;
     if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
 }
 
@@ -1540,9 +1569,12 @@ static void moveImageToBatch(int imageIdx, int batchId) {
 }
 static void closeAll() {
     app.ana.img = nullptr;
-    app.hist.img = nullptr;
-    app.proj.img = nullptr;
-    app.temporal.seqId = -1;
+    for (int k = 0; k < 2; k++) {     // both A and B slots
+        app.hist[k] = App::HistState{};
+        app.proj[k] = App::ProjState{};
+        app.temporal[k] = App::TemporalState{};
+    }
+    app.abSlot1Live = false;
     app.texLru.clear();
     app.imagesRev++;
     for (auto& d : app.images)
@@ -3373,7 +3405,7 @@ static void pumpSequence() {
     double nowT = glfwGetTime();
     if (!app.seqRunning || nowT - lastTemporalInvalidate > 0.5) {
         lastTemporalInvalidate = nowT;
-        app.temporal.seqId = -1;
+        app.temporal[0].seqId = app.temporal[1].seqId = -1;
     }
     if (!app.seqRunning && app.seqThread.joinable()) {
         app.seqThread.join();
@@ -4215,9 +4247,10 @@ static void maybeOfferSequence(int imageIdx) {
 // ---------------------------------------------------------------- temporal analysis
 // Built-in (L2): per-frame mean/std over the current ROI plus the temporal /
 // fixed-pattern noise split — the same decomposition EMVA 1288 is built on.
-static void recomputeTemporalIfNeeded() {
-    ImageDoc* im = cur();
-    App::TemporalState& T = app.temporal;
+// The cache slot is a parameter, not app.temporal: slot 0 is A, slot 1 is the
+// compare B side. The body is otherwise unchanged - which is the point, A's
+// numbers must not move because a B exists.
+static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T) {
     if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
     std::vector<int> f = framesOfSeq(im->seqId);
     if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
@@ -6200,8 +6233,9 @@ static void drawCanvas(ImVec2 avail) {
     }
 }
 
-static void recomputeHistogramIfNeeded(ImageDoc* im) {
-    App::HistState& H = app.hist;
+// The cache slot is a parameter (slot 0 = A, slot 1 = compare B). Everything
+// below is the previous body with `app.hist` replaced by `H`.
+static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H) {
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
@@ -6289,6 +6323,37 @@ struct PlotRect {
                       p1.y - (y - ymin) / (ymax - ymin) * (p1.y - p0.y));
     }
 };
+
+// ImDrawList has no dashed line, and the A/B panels need one: hue is already
+// spoken for by the CFA plane (R/Gr/Gb/B each own a colour), so the DASH is the
+// only thing left that can say "this curve is B". Dash length is measured along
+// the polyline, so a dense curve does not turn the dashes into a solid line.
+static void addDashedPolyline(ImDrawList* dl, const ImVec2* pts, int n, ImU32 col,
+                              float thick, float dash, float gap) {
+    if (n < 2 || dash <= 0 || gap <= 0) return;
+    float phase = 0;                          // distance walked inside dash+gap
+    for (int i = 1; i < n; i++) {
+        ImVec2 a = pts[i - 1], b = pts[i];
+        float dx = b.x - a.x, dy = b.y - a.y;
+        float len = sqrtf(dx * dx + dy * dy);
+        if (!(len > 0) || !std::isfinite(len)) continue;
+        float t = 0;
+        while (t < len) {
+            float period = dash + gap;
+            float inPeriod = fmodf(phase, period);
+            bool on = inPeriod < dash;
+            float left = on ? dash - inPeriod : period - inPeriod;
+            float step = std::min(left, len - t);
+            if (on) {
+                ImVec2 p0(a.x + dx * (t / len), a.y + dy * (t / len));
+                ImVec2 p1(a.x + dx * ((t + step) / len), a.y + dy * ((t + step) / len));
+                dl->AddLine(p0, p1, col, thick);
+            }
+            t += step;
+            phase += step;
+        }
+    }
+}
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
     if (integer) snprintf(buf, n, "%.0f", v);
@@ -6429,8 +6494,8 @@ static void drawAnalysisPlots() {
             float y = pr.at(pr.xmin, app.anaRef).y;
             ImU32 rc = IM_COL32(255, 184, 77, 220);
             float dash = 6.0f * app.uiScale;
-            for (float x = pr.p0.x; x < pr.p1.x; x += dash * 2)
-                dl->AddLine(ImVec2(x, y), ImVec2(std::min(x + dash, pr.p1.x), y), rc);
+            ImVec2 seg[2] = { ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y) };
+            addDashedPolyline(dl, seg, 2, rc, 1.0f, dash, dash);
             char rb[32];
             snprintf(rb, sizeof rb, "ref %.4g", app.anaRef);
             ImVec2 rts = ImGui::CalcTextSize(rb);
@@ -6798,8 +6863,8 @@ static void drawInspector() {
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
-        recomputeHistogramIfNeeded(im);
-        const App::HistState& H = app.hist;
+        recomputeHistogramIfNeeded(im, app.hist[0]);
+        const App::HistState& H = app.hist[0];
         ImGui::Text("Statistics");
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
@@ -6878,8 +6943,8 @@ static void drawPanelHistogram() {
 // H/V projections: column means (horizontal profile) and row means (vertical
 // profile) over the selected ROI. Column FPN, banding and shading show up here
 // far more clearly than in the image itself.
-static void recomputeProjectionIfNeeded(ImageDoc* im) {
-    App::ProjState& P = app.proj;
+// Slot 0 = A, slot 1 = compare B; the body is unchanged apart from the slot.
+static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
     bool roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
@@ -6997,8 +7062,8 @@ static void drawPanelProjection() {
     }
     ImGui::SameLine(); ImGui::Checkbox("H", &app.showProjH);
     ImGui::SameLine(); ImGui::Checkbox("V", &app.showProjV);
-    recomputeProjectionIfNeeded(im);
-    const App::ProjState& P = app.proj;
+    recomputeProjectionIfNeeded(im, app.proj[0]);
+    const App::ProjState& P = app.proj[0];
     ImGui::SameLine();
     ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
 
@@ -7800,8 +7865,8 @@ static void drawPanelTemporal() {
                                   "tab-separated for Excel.");
             return;
         }
-        recomputeTemporalIfNeeded();
-        const App::TemporalState& T = app.temporal;
+        recomputeTemporalIfNeeded(im, app.temporal[0]);
+        const App::TemporalState& T = app.temporal[0];
         ImGui::Text("Temporal");
         ImGui::SameLine();
         // for a remote stack whose server measure failed, be explicit that this
@@ -10053,6 +10118,7 @@ static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
+static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 
 static void printUsage() {
     printf(
@@ -10082,7 +10148,10 @@ static void printUsage() {
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
+        "  --bench-step                ...and step A one frame per bench frame (A/B\n"
+        "                              follow-frame cost: both sides recompute)\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
+        "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -10161,6 +10230,8 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--sequence expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test") {
             next();                                // consumed in main(), not an error
+        } else if (a == "--bench-step") {
+            /* consumed in main(): no value */
         } else if (a == "--cfa") {                 // none | bayer | quad
             std::string v = next();
             app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
@@ -10185,6 +10256,8 @@ static void parseCli(int argc, char** argv) {
             g_localbrowseSelftest = next();        // handled in main()
         } else if (a == "--verify-selftest") {
             g_verifySelftest = next();             // handled in main()
+        } else if (a == "--abstats-selftest") {
+            g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -10834,6 +10907,15 @@ int main(int argc, char** argv) {
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
     }
+    // --bench-step: advance A by one frame before every benched frame. --bench
+    // alone holds one image still, so every cache key stays hit and the loop
+    // measures drawing only. The A/B question is the opposite one - what a
+    // FRAME STEP costs when compareFollowFrame moves B too and both sides'
+    // histogram / projection caches miss - and it cannot be measured without
+    // actually stepping.
+    bool benchStep = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--bench-step")) benchStep = true;
     app.exePath = argv[0];
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
@@ -11342,10 +11424,10 @@ int main(int argc, char** argv) {
                         "temporal.seqId=%d, lin rows for seq: %s\n",
                 sid, imagesBefore, (int)app.images.size(), seqsBefore,
                 (int)app.seqs.size(), (int)framesOfSeq(sid).size(),
-                app.temporal.seqId, linResidue ? "RESIDUE" : "none");
+                app.temporal[0].seqId, linResidue ? "RESIDUE" : "none");
         if ((int)app.images.size() != imagesBefore - stackFrames ||
             (int)app.seqs.size() != seqsBefore - 1 || !framesOfSeq(sid).empty() ||
-            app.temporal.seqId != -1 || linResidue) {
+            app.temporal[0].seqId != -1 || linResidue) {
             fprintf(stderr, "closeselftest: FAILED - stack close left residue\n");
             ok = false;
         }
@@ -11740,6 +11822,341 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // ---- A/B statistics caches (docs/ab-stats-plan.md, section 6) -------------
+    // The five statistics panels keep TWO cache slots now: 0 = A (the current
+    // frame), 1 = B (the compare side). Headless, what has to hold:
+    //   A1  both slots fill, each keyed to its OWN document
+    //   A2  B's numbers really are B's - recomputed here from B's pixels by a
+    //       second implementation, not by calling the panel's code
+    //   A3  A's numbers are byte-identical to the compare-off run: B's existence
+    //       must not move a single digit on the A side
+    //   A4  a frame step follows on both sides, and temporal (keyed on the STACK,
+    //       not the frame) does NOT re-run for it
+    //   A6  compare off invalidates slot 1 exactly once, and closing B leaves no
+    //       dangling ImageDoc* behind in it
+    if (!g_abstatsSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "abstatsselftest: %-54s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        auto relEq = [](double x, double y, double tol) {
+            double m = std::max(std::max(fabs(x), fabs(y)), 1e-300);
+            return fabs(x - y) <= tol * m;
+        };
+
+        openFolder(g_abstatsSelftest);
+        loadAll();
+        if (app.seqs.size() < 2) {
+            fprintf(stderr, "abstatsselftest: need 2 stacks under %s\n",
+                    g_abstatsSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+
+        // ---- the reference implementations, written from the rule, not shared
+        // with the panel: 256 bins across black..white, one sample every
+        // `step`-th pixel of the resolved rect, CFA planes never mixed.
+        struct RefHist {
+            uint32_t bins[4][256] = {};
+            double mean[4] = {}, sd[4] = {};
+            size_t sampled = 0;
+            int nSeries = 0;
+        };
+        auto refHistogram = [](const ImageDoc& im) {
+            RefHist R;
+            const int rw = im.w, rh = im.h;             // whole image: no ROI here
+            bool cfa = im.ch == 1 && im.cfa != 0;
+            R.nSeries = cfa ? 4 : std::min(im.ch, 3);
+            const float black = effBlack(im), white = effWhite(im);
+            const float inv = 256.0f / std::max(white - black, 1e-20f);
+            const size_t total = (size_t)rw * rh;
+            const size_t step = std::max<size_t>(1, total / 1000000);
+            double s1[4] = {}, s2[4] = {};
+            size_t n[4] = {};
+            // row-major walk, keeping every step-th linear index: the same
+            // sample SET as the panel, reached a different way
+            for (int y = 0; y < rh; y++)
+                for (int x = 0; x < rw; x++) {
+                    size_t p = (size_t)y * rw + x;
+                    if (p % step) continue;
+                    const float* src = &im.data[((size_t)y * im.w + x) * im.ch];
+                    if (cfa) {
+                        float v = src[0];
+                        if (std::isfinite(v)) {
+                            int s = cfaChannelAt(im, x, y);
+                            float t = (v - black) * inv;
+                            int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
+                            R.bins[s][b]++;
+                            s1[s] += v; s2[s] += (double)v * v; n[s]++;
+                        }
+                    } else {
+                        for (int c = 0; c < R.nSeries; c++) {
+                            float v = src[c];
+                            if (!std::isfinite(v)) continue;
+                            float t = (v - black) * inv;
+                            int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
+                            R.bins[c][b]++;
+                            s1[c] += v; s2[c] += (double)v * v; n[c]++;
+                        }
+                    }
+                    R.sampled++;
+                }
+            for (int s = 0; s < R.nSeries; s++) {
+                if (!n[s]) continue;
+                double m = s1[s] / n[s], var = s2[s] / n[s] - m * m;
+                R.mean[s] = m;
+                R.sd[s] = sqrt(var > 0 ? var : 0);
+            }
+            return R;
+        };
+        // Independent temporal noise over a stack: per-sample variance across
+        // the resident frames, on the same 40000-sample grid.
+        auto refSigmaT = [](const ImageDoc& im) {
+            std::vector<int> f = framesOfSeq(im.seqId);
+            const size_t total = (size_t)im.w * im.h;
+            const size_t step = std::max<size_t>(1, total / 40000);
+            std::vector<size_t> offs;
+            for (int y = 0; y < im.h; y++)
+                for (int x = 0; x < im.w; x++) {
+                    size_t p = (size_t)y * im.w + x;
+                    if (p % step == 0) offs.push_back(((size_t)y * im.w + x) * im.ch);
+                }
+            std::vector<double> s1(offs.size(), 0), s2(offs.size(), 0);
+            int used = 0;
+            for (int fi : f) {
+                const ImageDoc& fr = *app.images[fi];
+                if (fr.w != im.w || fr.h != im.h || fr.ch != im.ch) continue;
+                bool any = false;
+                for (size_t k = 0; k < offs.size(); k++) {
+                    float v = fr.data[offs[k]];
+                    if (!std::isfinite(v)) continue;
+                    s1[k] += v; s2[k] += (double)v * v; any = true;
+                }
+                if (any) used++;
+            }
+            double tvar = 0;
+            if (used >= 2)
+                for (size_t k = 0; k < offs.size(); k++) {
+                    double m = s1[k] / used, v = s2[k] / used - m * m;
+                    tvar += v > 0 ? v : 0;
+                }
+            return offs.empty() ? 0.0 : sqrt(tvar / offs.size());
+        };
+        // "byte-identical" as the plan means it: every number the panel puts on
+        // screen, compared bit for bit. (Not memcmp over the whole struct - its
+        // padding bytes are unspecified and would make the test lie either way.)
+        auto histSame = [](const App::HistState& a, const App::HistState& b) {
+            return a.nSeries == b.nSeries && a.maxBin == b.maxBin &&
+                   a.sampled == b.sampled && a.rx == b.rx && a.ry == b.ry &&
+                   a.rw == b.rw && a.rh == b.rh && a.roiUsed == b.roiUsed &&
+                   memcmp(&a.black, &b.black, sizeof a.black) == 0 &&
+                   memcmp(&a.white, &b.white, sizeof a.white) == 0 &&
+                   memcmp(a.bins, b.bins, sizeof a.bins) == 0 &&
+                   memcmp(a.mean, b.mean, sizeof a.mean) == 0 &&
+                   memcmp(a.sd, b.sd, sizeof a.sd) == 0 &&
+                   memcmp(&a.clipLo, &b.clipLo, sizeof a.clipLo) == 0 &&
+                   memcmp(&a.clipHi, &b.clipHi, sizeof a.clipHi) == 0;
+        };
+        auto vecSame = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() &&
+                   (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+        };
+        auto projSame = [&](const App::ProjState& a, const App::ProjState& b) {
+            if (a.nSeries != b.nSeries || a.rw != b.rw || a.rh != b.rh) return false;
+            if (memcmp(&a.hMin, &b.hMin, sizeof a.hMin) || memcmp(&a.hMax, &b.hMax, sizeof a.hMax) ||
+                memcmp(&a.vMin, &b.vMin, sizeof a.vMin) || memcmp(&a.vMax, &b.vMax, sizeof a.vMax))
+                return false;
+            for (int s = 0; s < 4; s++) {
+                if (!vecSame(a.h[s], b.h[s]) || !vecSame(a.v[s], b.v[s])) return false;
+                const App::ProjState::Stats& x = a.hStat[s]; const App::ProjState::Stats& y = b.hStat[s];
+                const App::ProjState::Stats& u = a.vStat[s]; const App::ProjState::Stats& w2 = b.vStat[s];
+                if (memcmp(&x, &y, sizeof(double) * 6) || x.valid != y.valid) return false;
+                if (memcmp(&u, &w2, sizeof(double) * 6) || u.valid != w2.valid) return false;
+            }
+            return true;
+        };
+        auto tempSame = [&](const App::TemporalState& a, const App::TemporalState& b) {
+            return a.seqId == b.seqId && a.frames == b.frames && a.valid == b.valid &&
+                   a.rx == b.rx && a.ry == b.ry && a.rw == b.rw && a.rh == b.rh &&
+                   vecSame(a.idx, b.idx) && vecSame(a.frameMean, b.frameMean) &&
+                   vecSame(a.frameStd, b.frameStd) &&
+                   memcmp(&a.tempNoise, &b.tempNoise, sizeof a.tempNoise) == 0 &&
+                   memcmp(&a.fixedPattern, &b.fixedPattern, sizeof a.fixedPattern) == 0 &&
+                   memcmp(&a.totalNoise, &b.totalNoise, sizeof a.totalNoise) == 0;
+        };
+
+        int sidA = app.seqs[0].id, sidB = app.seqs[1].id;
+        std::vector<int> frA = framesOfSeq(sidA), frB = framesOfSeq(sidB);
+        selectImage(frA.front());
+
+        // ---- A3 baseline: everything A, with compare OFF ----
+        app.compareMode = App::CmpOff;
+        abStatsFrame();
+        recomputeHistogramIfNeeded(cur(), app.hist[0]);
+        recomputeProjectionIfNeeded(cur(), app.proj[0]);
+        recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+        App::HistState hOff = app.hist[0];
+        App::ProjState pOff = app.proj[0];
+        App::TemporalState tOff = app.temporal[0];
+        fprintf(stderr, "abstatsselftest: compare OFF, A='%s' (stack %d): "
+                        "hist sampled=%zu maxBin=%u mean0=%.9g, sigma_t=%.9g\n",
+                cur()->name.c_str(), sidA, hOff.sampled, hOff.maxBin, hOff.mean[0],
+                tOff.tempNoise);
+        check(app.hist[1].uid == 0 && app.proj[1].uid == 0 &&
+              app.temporal[1].seqId == -1,
+              "A0 compare off leaves slot 1 empty");
+
+        // ---- A1: compare on, both slots fill ----
+        setCompareB(app.images[frB.front()].get());
+        app.compareMode = App::CmpSplit;
+        app.compareFollowFrame = true;
+        abStatsFrame();
+        ImageDoc* B = cmpB();
+        if (!B) { fprintf(stderr, "abstatsselftest: no B after setCompareB\n"); return 1; }
+        recomputeHistogramIfNeeded(cur(), app.hist[0]);
+        recomputeProjectionIfNeeded(cur(), app.proj[0]);
+        recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+        recomputeHistogramIfNeeded(B, app.hist[1]);
+        recomputeProjectionIfNeeded(B, app.proj[1]);
+        recomputeTemporalIfNeeded(B, app.temporal[1]);
+        fprintf(stderr, "abstatsselftest: compare SPLIT+follow, B='%s' (stack %d): "
+                        "hist[0].uid=%llu (A=%llu)  hist[1].uid=%llu (B=%llu)  "
+                        "proj[1].uid=%llu  temporal[1].seqId=%d frames=%d\n",
+                B->name.c_str(), sidB,
+                (unsigned long long)app.hist[0].uid, (unsigned long long)cur()->uid,
+                (unsigned long long)app.hist[1].uid, (unsigned long long)B->uid,
+                (unsigned long long)app.proj[1].uid,
+                app.temporal[1].seqId, app.temporal[1].frames);
+        check(app.hist[0].uid == cur()->uid && app.hist[1].uid == B->uid &&
+              app.hist[0].uid != app.hist[1].uid, "A1 histogram: both slots, own uid");
+        check(app.proj[0].uid == cur()->uid && app.proj[1].uid == B->uid,
+              "A1 projection: both slots, own uid");
+        check(app.temporal[0].seqId == sidA && app.temporal[1].seqId == sidB &&
+              app.temporal[0].valid && app.temporal[1].valid,
+              "A1 temporal: both slots, own stack");
+        check(app.hist[1].img == B && app.proj[1].img == B,
+              "A1 slot 1 names B, not A");
+
+        // ---- A2: B's numbers recomputed here, from B's pixels ----
+        {
+            RefHist R = refHistogram(*B);
+            const App::HistState& HB = app.hist[1];
+            bool binsEq = R.nSeries == HB.nSeries &&
+                          memcmp(R.bins, HB.bins, sizeof R.bins) == 0 &&
+                          R.sampled == HB.sampled;
+            bool statEq = true;
+            for (int s = 0; s < R.nSeries; s++)
+                if (!relEq(R.mean[s], HB.mean[s], 1e-6) || !relEq(R.sd[s], HB.sd[s], 1e-6))
+                    statEq = false;
+            double refSig = refSigmaT(*B);
+            fprintf(stderr, "abstatsselftest: B independent recompute: series=%d "
+                            "sampled=%zu/%zu  mean0 %.12g vs %.12g  sd0 %.12g vs %.12g  "
+                            "sigma_t %.12g vs %.12g\n",
+                    R.nSeries, R.sampled, HB.sampled, R.mean[0], HB.mean[0],
+                    R.sd[0], HB.sd[0], refSig, app.temporal[1].tempNoise);
+            check(binsEq, "A2 B histogram bins match an independent pass exactly");
+            check(statEq, "A2 B mean/sd match within 1e-6 relative");
+            check(relEq(refSig, app.temporal[1].tempNoise, 1e-6),
+                  "A2 B sigma_t matches within 1e-6 relative");
+            // the two sides really are different data, or A2/A3 prove nothing
+            check(memcmp(app.hist[0].bins, app.hist[1].bins, sizeof app.hist[0].bins) != 0,
+                  "A2 fixture: A and B histograms actually differ");
+        }
+
+        // ---- A3: A did not move ----
+        check(histSame(hOff, app.hist[0]), "A3 A histogram byte-identical with B present");
+        check(projSame(pOff, app.proj[0]), "A3 A projection byte-identical with B present");
+        check(tempSame(tOff, app.temporal[0]), "A3 A temporal byte-identical with B present");
+
+        // ---- A4: five frame steps, both keys follow; temporal does not re-run ----
+        {
+            App::TemporalState tB0 = app.temporal[1];
+            uint64_t bUid0 = B->uid;
+            bool keysFollow = true, temporalMoved = false, bMoved = false;
+            for (int k = 0; k < 5; k++) {
+                gotoFrame(1);
+                abStatsFrame();
+                ImageDoc* b2 = cmpB();
+                if (!b2) { keysFollow = false; break; }
+                recomputeHistogramIfNeeded(cur(), app.hist[0]);
+                recomputeHistogramIfNeeded(b2, app.hist[1]);
+                recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+                recomputeTemporalIfNeeded(b2, app.temporal[1]);
+                if (app.hist[0].uid != cur()->uid || app.hist[1].uid != b2->uid)
+                    keysFollow = false;
+                if (b2->uid != bUid0) bMoved = true;
+                if (!tempSame(tB0, app.temporal[1])) temporalMoved = true;
+            }
+            fprintf(stderr, "abstatsselftest: 5x gotoFrame(1): A frame=%d, B frame=%d, "
+                            "B uid %llu->%llu, temporal[1].seqId=%d frames=%d\n",
+                    cur()->seqIndex, cmpB() ? cmpB()->seqIndex : -1,
+                    (unsigned long long)bUid0,
+                    (unsigned long long)(cmpB() ? cmpB()->uid : 0),
+                    app.temporal[1].seqId, app.temporal[1].frames);
+            check(keysFollow, "A4 both hist slots follow the frame step");
+            check(bMoved && cmpB() && cmpB()->seqIndex == cur()->seqIndex,
+                  "A4 follow-frame put B on A's frame number");
+            check(!temporalMoved && app.temporal[1].seqId == sidB,
+                  "A4 temporal[1] unchanged by a frame step (keyed on the stack)");
+        }
+
+        // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
+        app.compareMode = App::CmpOff;
+        abStatsFrame();
+        fprintf(stderr, "abstatsselftest: CmpOff: hist[1].uid=%llu img=%p, "
+                        "proj[1].uid=%llu img=%p, temporal[1].seqId=%d, slot1Live=%d\n",
+                (unsigned long long)app.hist[1].uid, (const void*)app.hist[1].img,
+                (unsigned long long)app.proj[1].uid, (const void*)app.proj[1].img,
+                app.temporal[1].seqId, app.abSlot1Live ? 1 : 0);
+        check(app.hist[1].uid == 0 && app.hist[1].img == nullptr &&
+              app.proj[1].uid == 0 && app.proj[1].img == nullptr &&
+              app.temporal[1].seqId == -1 && !app.abSlot1Live,
+              "A6 CmpOff invalidates slot 1");
+        {   // and once only: a second frame with compare off must not touch it
+            app.hist[1].uid = 12345;              // white-box tripwire
+            abStatsFrame();
+            check(app.hist[1].uid == 12345, "A6 compare-off frames after the first do nothing");
+            app.hist[1] = App::HistState{};
+        }
+        {   // B closed while slot 1 held it: no dangling ImageDoc* may survive
+            app.compareMode = App::CmpSplit;
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            abStatsFrame();
+            ImageDoc* b3 = cmpB();
+            recomputeHistogramIfNeeded(b3, app.hist[1]);
+            recomputeProjectionIfNeeded(b3, app.proj[1]);
+            const void* held = app.hist[1].img;
+            closeStack(sidB);
+            fprintf(stderr, "abstatsselftest: closeStack(B=%d): slot 1 held %p, now "
+                            "hist[1].img=%p uid=%llu, proj[1].img=%p, cmpB()=%p\n",
+                    sidB, held, (const void*)app.hist[1].img,
+                    (unsigned long long)app.hist[1].uid,
+                    (const void*)app.proj[1].img, (const void*)cmpB());
+            check(held != nullptr, "A6 fixture: slot 1 really held B");
+            check(app.hist[1].img == nullptr && app.hist[1].uid == 0 &&
+                  app.proj[1].img == nullptr && app.proj[1].uid == 0 && !cmpB(),
+                  "A6 closing B leaves no dangling pointer in slot 1");
+        }
+
+        fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
     if (!g_scanSelftest.empty()) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
@@ -11967,6 +12384,8 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) fr = std::clamp(fr + 0.10f, 0.03f, 0.97f);
         }
         drawMenuBar(win);
+        // before any panel draws: the B cache slots exist only while compare does
+        abStatsFrame();
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -12290,7 +12709,19 @@ int main(int argc, char** argv) {
                     // auto blink alternates on a timer, so it needs frames with
                     // no input at all - same case as a background load
                     (app.compareMode == App::CmpFlip && app.flipAuto);
-        if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
+        // --bench on a FOLDER: accept the picker the way the Load button does,
+        // and do not start counting until the loaders are idle. Without the
+        // first, a folder given to --bench never loads at all; without the
+        // second, the numbers are the decode, not the frame.
+        static bool benchWarm = false;
+        if (benchFrames) {
+            glfwPollEvents(); app.wakeFrames = 1; busy = true;
+            if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+            benchWarm = (app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
+                         app.folderPickOpen || app.rfPending > 0 ||
+                         app.pendingCompare >= 0) &&
+                        glfwGetTime() < 600.0;
+        }
         bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
         if (active || busy) {
             // Frame pacing lives here, not in the swap: the driver may ignore
@@ -12385,10 +12816,18 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "--compare needs two images\n");
             } else {
                 selectImage(0);
-                for (const auto& d : app.images)
-                    if (d->path != app.images[0]->path || d->npzMember != app.images[0]->npzMember) {
-                        setCompareB(d.get()); break;
-                    }
+                const ImageDoc* a0 = app.images[0].get();
+                for (const auto& d : app.images) {
+                    // A different STACK when A is in one. "A different source
+                    // file" was the old rule and it picks frame_001.npy of A's
+                    // OWN stack for a folder-of-frames capture - which is the
+                    // self-comparison this loop exists to avoid, and it also
+                    // pins compareFollowFrame (it only steps B across stacks).
+                    bool other = a0->seqId != 0
+                               ? d->seqId != a0->seqId
+                               : (d->path != a0->path || d->npzMember != a0->npzMember);
+                    if (other) { setCompareB(d.get()); break; }
+                }
                 if (!resolveB()) setCompareB(app.images[1].get());   // same file twice
                 app.compareMode = app.pendingCompare;
             }
@@ -12442,8 +12881,21 @@ int main(int argc, char** argv) {
         // PeekMessage/DispatchMessage), which delivers WM_PAINT/WM_SIZE to our
         // own callbacks and would start a second ImGui frame inside this one.
         // IM_ASSERT is compiled out in release, so that corrupts silently.
+        // --bench-step: one frame step per benched frame, bouncing off the ends
+        // so every step is a real cache miss and never a no-op clamp at the last
+        // frame. Stepped BEFORE the draw, so the frame we time is the one that
+        // has to recompute (and, with compare on, recompute B as well).
+        if (benchStep && !benchWarm && cur() && cur()->seqId != 0) {
+            static int benchDir = 1;
+            std::vector<int> bf = framesOfSeq(cur()->seqId);
+            int bpos = 0;
+            for (int i = 0; i < (int)bf.size(); i++) if (bf[i] == app.current) bpos = i;
+            if (bpos >= (int)bf.size() - 1) benchDir = -1;
+            else if (bpos <= 0) benchDir = 1;
+            gotoFrame(benchDir);
+        }
         redrawNow();
-        if (benchFrames) {
+        if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
             benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
             if (--benchLeft <= 0) break;
