@@ -692,6 +692,19 @@ struct App {
     // empty - it exists for hand-written and third-party files, and it creates
     // a series only where the file actually says there was a sweep.
     std::vector<std::pair<std::string, double>> seqLevelLegacy;
+    // A sweep the PICKER was told to make ("open as a sweep"), resolved once
+    // its stacks are open - the same lateness as seriesRestore and for the same
+    // reason. Members are named by their GROUP name, which becomes the stack's
+    // name (PendingGroup::name / RemoteOpen::name -> SeqInfo::name): the remote
+    // queue holds no seqId, so a name is the only handle there is.
+    struct SeriesPending {
+        bool active = false;
+        int batchId = 0;
+        std::string name, paramName, unit;
+        int kind = Series::KLinearity;
+        std::vector<std::pair<std::string, double>> byName;   // stack name -> value
+    };
+    SeriesPending seriesPending;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -720,6 +733,14 @@ struct App {
     // batch (the canon's default), 1 = one batch per top-level folder of the
     // scanned root. Ignored under pickMerge (a merged stack is one batch).
     int pickBatchMode = 0;
+    // "open as a sweep": the accepted groups also become ONE series. Not
+    // persisted and cleared on accept - a sticky box would create a sweep on
+    // some later Open that nobody asked for, which is the one thing series are
+    // never allowed to do. Exclusive with pickBatchMode (a series lives in one
+    // batch); the parameter name and unit are the series', typed here.
+    bool pickSweep = false;
+    char pickSweepParam[64] = "";
+    char pickSweepUnit[16] = "";
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
@@ -1597,6 +1618,10 @@ static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below
 static App::SeqInfo* seqInfo(int id);             // fwd
 static void stopSequenceLoader();                 // fwd
 static void pruneEmptyBatches();                  // fwd (defined with the moves)
+// The value a stack's NAME suggests, and the text it was read out of. Declared
+// here because the picker proposes one per group long before the linearity
+// code that defines it (the default argument lives on this declaration only).
+static double extractLevelFromName(const std::string& name, std::string* srcOut = nullptr);
 
 // ---- series (系列), the model (docs/terminology.md, docs/series-plan.md) -------
 // No UI here on purpose: the invariants have to hold before anything can draw
@@ -1981,6 +2006,7 @@ static void closeAll() {
     app.curSeriesId = 0;
     app.seriesRestore.clear();
     app.seqLevelLegacy.clear();
+    app.seriesPending = App::SeriesPending{};   // it named stacks being thrown away
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
@@ -4018,6 +4044,66 @@ static void migrateLegacyLevels() {
     }
 }
 
+// The picker's "open as a sweep", once its stacks exist. Matching is BY NAME:
+// the group name the picker accepted becomes the stack's name, and for a remote
+// stack it is that name plus " [remote xN]" (openRemoteStack). The remote queue
+// carries no seqId at all, so there is nothing else to match on.
+//
+// Nothing here invents anything: the values were read from the group names and
+// shown in the picker before Load was pressed, and a group whose stack never
+// opened is COUNTED and said out loud rather than dropped.
+static void resolvePendingSeries() {
+    App::SeriesPending P = std::move(app.seriesPending);
+    app.seriesPending = App::SeriesPending{};
+    if (!P.active) return;
+    std::vector<int> used;
+    int id = 0, made = 0, lost = 0;
+    for (const auto& e : P.byName) {
+        int seqId = 0;
+        for (const auto& si : app.seqs) {
+            if (batchOfStack(si.id) != P.batchId) continue;
+            if (std::find(used.begin(), used.end(), si.id) != used.end()) continue;
+            bool same = si.name == e.first ||
+                        (si.name.size() > e.first.size() + 10 &&
+                         si.name.compare(0, e.first.size(), e.first) == 0 &&
+                         si.name.compare(e.first.size(), 10, " [remote x") == 0);
+            if (same) { seqId = si.id; break; }
+        }
+        if (!seqId) { lost++; continue; }
+        used.push_back(seqId);
+        if (!id) {                       // the first member that resolves makes it
+            id = newSeries(P.batchId, P.name);
+            if (App::Series* S = seriesById(id)) {
+                S->paramName = P.paramName;
+                snprintf(S->unit, sizeof S->unit, "%s", P.unit.c_str());
+                S->kind = P.kind;
+            }
+        }
+        if (addToSeries(id, seqId, e.second)) made++;
+        else lost++;
+    }
+    // In VALUE order, not the order the folders happened to sort in: the groups
+    // arrive as 0,10,160,20,320,40,80 (lexicographic), and a sweep is a
+    // parameter axis - reading it out of order is reading it wrong. Unset
+    // values keep their relative order and go last (they are not "before 0").
+    // The modal's arrows and "Sort by value" still own the order after this.
+    if (App::Series* S = seriesById(id))
+        std::stable_sort(S->members.begin(), S->members.end(),
+                         [](const App::Series::Member& a, const App::Series::Member& b) {
+                             bool fa = std::isfinite(a.value), fb = std::isfinite(b.value);
+                             if (fa != fb) return fa;          // set before unset
+                             return fa && a.value < b.value;
+                         });
+    pruneEmptySeries();
+    if (id && seriesById(id)) app.curSeriesId = id;
+    const App::Series* S = seriesById(id);
+    std::string msg = "sweep: " + std::to_string(made) + " stack(s) in series \"" +
+                      (S ? S->name : std::string("(none)")) + "\"";
+    if (lost) msg += "; " + std::to_string(lost) + " could not be matched";
+    toast(msg, lost > 0);
+    fprintf(stderr, "series: %s\n", msg.c_str());
+}
+
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
@@ -4036,11 +4122,13 @@ static void pumpSequenceAndQueue() {
     // Series LAST, and only once everything a member could name is open: the
     // stacks arrive over many frames, and a lookup one frame too early would
     // report perfectly good members as missing.
-    if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty()) &&
+    if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty() ||
+         app.seriesPending.active) &&
         !app.seqRunning && app.seqQueue.empty() && app.seqRestore.empty() &&
         app.rbOpenQueue.empty() && !seqReadyPending()) {
         if (!app.seriesRestore.empty()) resolveSeriesRestore();
         if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
+        if (app.seriesPending.active) resolvePendingSeries();
     }
 }
 
@@ -4562,7 +4650,13 @@ static void pickerAccept() {
     std::vector<App::PendingGroup> sel = pickerSelection(&err);
     bool remote = app.folderPickRemote;
     std::string host = app.folderPickHost;
-    int batchMode = app.pickMerge == 1 ? 0 : app.pickBatchMode;
+    // "as a sweep" is exclusive with batch-per-top-folder HERE, not only in the
+    // dialog: a series lives in one batch, and that has to hold for every
+    // caller, headless ones included.
+    bool sweep = app.pickSweep && app.pickMerge == 0;
+    int batchMode = (app.pickMerge == 1 || sweep) ? 0 : app.pickBatchMode;
+    std::string swParam = app.pickSweepParam, swUnit = app.pickSweepUnit;
+    app.pickSweep = false;            // a per-Open choice, never sticky
     std::string batchBase = app.folderPickBatchBase;
     app.folderPick.clear();
     app.folderPickOpen = false;
@@ -4588,6 +4682,20 @@ static void pickerAccept() {
     } else {
         int id = newBatch(uniqueBatchName(batchBase));
         for (auto& g : sel) g.batchId = id;
+    }
+    // The sweep is only a NOTE here - the stacks do not exist yet, and half of
+    // them will arrive over the next several seconds. Built before sel is moved
+    // away below; two groups minimum, because one point is not a sweep.
+    if (sweep && sel.size() >= 2) {
+        App::SeriesPending P;
+        P.active = true;
+        P.batchId = sel.front().batchId;
+        P.paramName = swParam;
+        P.unit = swUnit;                       // may be empty: then no fit, and
+        P.kind = App::Series::KLinearity;      // the panel says exactly that
+        for (const auto& g : sel)
+            P.byName.emplace_back(g.name, extractLevelFromName(g.name));
+        app.seriesPending = std::move(P);
     }
     if (remote) {
         // remote groups: through the open queue, one stack at a time, so the
@@ -4674,8 +4782,14 @@ static void drawFolderPickModal() {
         mixedRawNpy = anyRaw && anyNpy;
     }
     bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
-    float footer = ImGui::GetFrameHeightWithSpacing() * 3 +
-                   ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
+    // The sweep row exists only where a sweep could: separate stacks, two or
+    // more of them. Hidden, the box is FORCED OFF - a control nobody can see
+    // must not be able to create a series (docs/terminology.md: never auto).
+    const bool sweepRow = app.pickMerge == 0 && selGroups >= 2;
+    if (!sweepRow) app.pickSweep = false;
+    float footer = ImGui::GetFrameHeightWithSpacing() * (sweepRow ? 4 : 3) +
+                   ImGui::GetTextLineHeightWithSpacing() *
+                       ((mergeWarn ? 2 : 1) + (app.pickSweep ? 1 : 0));
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
     std::vector<std::string> folders;
@@ -4736,6 +4850,24 @@ static void drawFolderPickModal() {
                              e.g.shape.empty() ? "" : "  ", e.g.shape.c_str());
                 ImGui::TextUnformatted(lb);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
+                // the sweep preview: the value this group's NAME suggests, on
+                // the row it was read from, BEFORE Load is pressed. A proposal
+                // nobody looked at is not a confirmation.
+                if (app.pickSweep && e.selected) {
+                    std::string from;
+                    double v = extractLevelFromName(e.g.name, &from);
+                    ImGui::SameLine();
+                    if (std::isfinite(v))
+                        ImGui::TextDisabled("-> %.6g %s", v, app.pickSweepUnit);
+                    else
+                        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "-> no value in the name");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(std::isfinite(v)
+                            ? "read from \"%s\" - correct it later in Edit series..."
+                            : "nothing numeric in \"%s\": this stack joins UNSET,\n"
+                              "and an unset value never enters a fit as 0.",
+                            from.empty() ? e.g.name.c_str() : from.c_str());
+                }
                 if (open) {
                     std::vector<int> vis;          // files the filter keeps
                     vis.reserve(e.nMatch);
@@ -4796,7 +4928,7 @@ static void drawFolderPickModal() {
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("batch:");
         ImGui::SameLine();
-        ImGui::BeginDisabled(app.pickMerge == 1);
+        ImGui::BeginDisabled(app.pickMerge == 1 || app.pickSweep);
         ImGui::RadioButton("one batch###batch0", &app.pickBatchMode, 0);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("everything from this Open lands under ONE Files heading");
@@ -4805,9 +4937,56 @@ static void drawFolderPickModal() {
         snprintf(b1, sizeof b1, "%d batches (one per top folder)###batch1", topFolders);
         ImGui::RadioButton(b1, &app.pickBatchMode, 1);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("each top-level folder of the scanned root becomes\n"
-                              "its own batch (its own Files heading)");
+            ImGui::SetTooltip(app.pickSweep
+                ? "not while \"open as a sweep\" is on: a series lives in ONE\n"
+                  "batch, so one batch is the only grouping that can hold it"
+                : "each top-level folder of the scanned root becomes\n"
+                  "its own batch (its own Files heading)");
         ImGui::EndDisabled();
+    }
+    // ---- row 3: open as a sweep (docs/series-plan.md §5) --------------------
+    // The one place in the program that creates a series without the modal, and
+    // it does it because a human ticked a box that says so. Unticked, NOTHING
+    // is created - a sweep guessed from a folder tree is a lie that fits.
+    if (sweepRow) {
+        ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+                              "the value read from its name, and linearity / PTC measure the\n"
+                              "series as a whole.\n"
+                              "Nothing is created unless this is ticked.", selGroups);
+        if (app.pickSweep) {
+            app.pickBatchMode = 0;              // series ⊂ batch, strictly
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+            ImGui::InputTextWithHint("##swparam", "parameter", app.pickSweepParam,
+                                     sizeof app.pickSweepParam);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            ImGui::InputTextWithHint("##swunit", "unit", app.pickSweepUnit,
+                                     sizeof app.pickSweepUnit);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("lx, ms, photons/px ... LEAVE IT EMPTY if you do not\n"
+                                  "know yet: an unset unit means no fit, which is the\n"
+                                  "honest answer, and Edit series... sets it later.");
+        }
+    }
+    if (app.pickSweep) {
+        int valued = 0;
+        for (const auto& e : app.folderPick)
+            if (e.selected && e.nMatch && std::isfinite(extractLevelFromName(e.g.name)))
+                valued++;
+        if (valued < selGroups)
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                               "%d of %d have a value in their name; the rest join UNSET "
+                               "(never 0)", valued, selGroups);
+        else if (!app.pickSweepUnit[0])
+            ImGui::TextDisabled("all %d have a value. No unit yet - the series opens, "
+                                "the fit waits for one.", valued);
+        else
+            ImGui::TextDisabled("all %d have a value, in %s", valued, app.pickSweepUnit);
     }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
@@ -4822,13 +5001,16 @@ static void drawFolderPickModal() {
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
         ImGui::TextDisabled("check the shape column above to see which sequences differ");
     ImGui::BeginDisabled(!loadable);
-    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack" : "Load selected",
+    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
+                              : app.pickSweep   ? "Load as a sweep"
+                                                : "Load selected",
                               ImVec2(150 * app.uiScale, 0));
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         app.folderPick.clear();
         app.folderPickOpen = false;
+        app.pickSweep = false;         // Cancel decides nothing, here least of all
         ImGui::CloseCurrentPopup();
     }
     if (load) {
@@ -8276,7 +8458,8 @@ static void drawPanelProjection() {
 // Rule: the first number in the FOLDER part when there is one, else in the whole
 // name. Deliberately simple - this is only a SUGGESTION a human confirms, and
 // srcOut reports the text it was read out of so the modal can show its work.
-static double extractLevelFromName(const std::string& name, std::string* srcOut = nullptr) {
+// (the default for srcOut is on the forward declaration, with the model.)
+static double extractLevelFromName(const std::string& name, std::string* srcOut) {
     std::string part = name;
     size_t slash = part.find_last_of('/');
     if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
@@ -14364,6 +14547,90 @@ int main(int argc, char** argv) {
                 check("invariant 1: audit after Close series", audit());
             }
         }
+
+        // ---- phase 5: the picker's "open as a sweep" --------------------------
+        // Both halves. Ticked: one series, values off the group names, one
+        // batch even though batch-per-top-folder was asked for. UNTICKED: the
+        // same Open, and NOTHING is created - that half is the whole point.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);          // local scan: synchronous
+            check("phase 5: the picker opened", app.folderPickOpen);
+            app.pickSweep = true;
+            app.pickBatchMode = 1;                 // ...and gets overridden
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the box is cleared on accept (a sweep is never sticky)",
+                  !app.pickSweep);
+            loadAll();
+            double t5 = glfwGetTime();
+            while (glfwGetTime() - t5 < 120.0 && app.seriesPending.active) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* W = app.series.empty() ? nullptr : &app.series.front();
+            std::vector<int> bids;                 // batches that actually hold data
+            for (const auto& d : app.images)
+                if (std::find(bids.begin(), bids.end(), d->batchId) == bids.end())
+                    bids.push_back(d->batchId);
+            bool valuesOk = W != nullptr && !W->members.empty();
+            std::string vals;
+            if (W)
+                for (const auto& m : W->members) {
+                    App::SeqInfo* si = seqInfo(m.seqId);
+                    double want = si ? extractLevelFromName(si->name) : 0;
+                    char b[32];
+                    snprintf(b, sizeof b, "%.6g", m.value);
+                    vals += (vals.empty() ? "" : ",");
+                    vals += std::isfinite(m.value) ? b : "unset";
+                    if (!si || !std::isfinite(m.value) || !std::isfinite(want) ||
+                        fabs(m.value - want) > 1e-9 * std::max(1.0, fabs(want)))
+                        valuesOk = false;
+                }
+            fprintf(stderr, "seriesselftest: sweep -> %d series '%s' param '%s' unit '%s' "
+                            "kind %d, %d member(s) [%s], %d batch(es), %d stack(s)\n",
+                    (int)app.series.size(), W ? W->name.c_str() : "",
+                    W ? W->paramName.c_str() : "", W ? W->unit : "", W ? W->kind : -1,
+                    W ? (int)W->members.size() : -1, vals.c_str(), (int)bids.size(),
+                    (int)app.seqs.size());
+            check("open as a sweep makes exactly ONE series", app.series.size() == 1);
+            check("...over every stack the picker loaded",
+                  W && W->members.size() == app.seqs.size() && app.seqs.size() >= 4);
+            check("...with the parameter and unit typed in the picker",
+                  W && W->paramName == "illuminance" && std::string(W->unit) == "lx" &&
+                  W->kind == App::Series::KLinearity);
+            check("...named \"<batch> 掃引\"",
+                  W && W->name == batchNameOf(W->batchId) + " 掃引");
+            check("...each member at the value its NAME gave", valuesOk);
+            {   // a sweep is a parameter axis: it comes out in value order, not
+                // in the folders' lexicographic order (0,10,160,20,320,40,80)
+                bool asc = true;
+                for (size_t i = 1; W && i < W->members.size(); i++)
+                    if (W->members[i - 1].value > W->members[i].value) asc = false;
+                check("...and the members are in VALUE order", W && asc);
+            }
+            check("a sweep forces ONE batch (series ⊂ batch beats the batch radio)",
+                  bids.size() == 1 && W && W->batchId == bids.front());
+            check("invariant 1: audit after the sweep", audit());
+            // ...and the half that must NOT happen.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            check("phase 5: the picker opened again", app.folderPickOpen);
+            check("the sweep box came up UNTICKED", !app.pickSweep);
+            pickerAccept();
+            loadAll();
+            double t6 = glfwGetTime();             // give a late resolve every chance
+            while (glfwGetTime() - t6 < 1.0) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: sweep unticked -> %d series, %d stack(s)\n",
+                    (int)app.series.size(), (int)app.seqs.size());
+            check("unticked: the same Open creates NO series",
+                  app.series.empty() && !app.seqs.empty());
+            app.pickBatchMode = 0;
+        }
         fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
@@ -16096,6 +16363,7 @@ int main(int argc, char** argv) {
                 working |= !app.seqRestore.empty();
                 // a session's series wait for their stacks, then need one frame
                 working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
+                working |= app.seriesPending.active;   // ...and so does the picker's
                 working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
