@@ -8797,6 +8797,10 @@ static void drawPanelRemote() {
             // the bar that names the folder.
             if (ImGui::BeginPopupContextItem("crumbctx")) {
                 const std::string& target = segs[k].path;
+                // the same item a folder ROW carries, aimed at a folder that is
+                // not in any listing - the one you are inside, or an ancestor
+                if (ImGui::MenuItem("Open folder (all stacks below)"))
+                    remoteScanFolder(target);
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
                     rbSearchFocus = true;
@@ -8958,6 +8962,15 @@ static void drawPanelRemote() {
         ImGui::SameLine();
         if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("list this folder again");
+        ImGui::SameLine();
+        // Open Folder for the folder you are IN. It used to exist only on a
+        // folder ROW, so opening the directory being browsed meant going up a
+        // level to find its own name in the parent's listing - and if that
+        // directory was the home or the root, there was no level to go up to.
+        if (ImGui::SmallButton("open folder")) remoteScanFolder(B.dir);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
+                              "which stacks to open:\n%s", B.dir.c_str());
         ImGui::SameLine();
         // Grouped <-> flat. No round trip: the peer already sent every member.
         if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
@@ -9925,27 +9938,19 @@ static void drawMenuBar(GLFWwindow* win) {
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
-        if (ImGui::MenuItem("Start Remote (ssh)...")) app.remoteDlgOpen = true;
-        // Where the muscle memory goes looking. Connected: raise the browser.
-        // Not connected: there is nothing to browse yet, so ask for the host -
-        // the same two steps either way, just entered from the familiar place.
-        if (ImGui::MenuItem("Open File (Remote)...")) {
+        // The ONE remote entry point. "Open File (Remote)..." and "Open Folder
+        // (Remote)..." used to sit under it and are gone: see the panel's own
+        // toolbar. Revealing the panel here is what both of them really did.
+        if (ImGui::MenuItem("Start Remote (ssh)...")) {
             app.showRemote = true;
             app.focusRemote = true;
-            if (!app.rbrowse.connected) app.remoteDlgOpen = true;
+            app.remoteDlgOpen = true;
         }
-        // The remote mirror of Open Folder: every stack below the current
-        // browse directory, one stack per subfolder. Not connected yet: ask
-        // for the host first - the same two steps as Open File (Remote).
-        if (ImGui::MenuItem("Open Folder (Remote)...")) {
-            app.showRemote = true;
-            app.focusRemote = true;
-            if (app.rbrowse.connected) remoteScanFolder(app.rbrowse.dir);
-            else app.remoteDlgOpen = true;
-        }
-        if (app.rbrowse.connected && ImGui::IsItemHovered())
-            ImGui::SetTooltip("scans %s - browse to the folder you want first",
-                              app.rbrowse.dir.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("connect to a machine. Opening files and folders\n"
+                              "happens in the Browse panel: click a file to look\n"
+                              "at it, double-click to open it, \"open folder\" for\n"
+                              "every stack below the folder you are in.");
         if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
             App::RbJob j; j.kind = App::RbUpdatePeer;
             j.host = app.rbrowse.host; j.port = app.rbrowse.port;
@@ -11659,6 +11664,36 @@ int main(int argc, char** argv) {
                      memberCells) ? "ok" : "FAIL");
             if (!(sizes && gRows == nGroups && nGroups >= 1 && same && nogroups && memberCells))
                 ok = false;
+        }
+        {   // "Open folder" on the folder being browsed: the same call the
+            // toolbar button and the breadcrumb menu make. The scan must
+            // include the CURRENT directory itself (a stack whose name has no
+            // folder prefix), which is exactly what the old row-only entry
+            // could not reach without first going up a level.
+            remoteScanFolder(B.dir);
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 120.0) {
+                pumpRemoteBrowse();
+                if (app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int here = 0, below = 0;
+            std::string names;
+            for (const auto& fp : app.folderPick) {
+                if (fp.g.name.find('/') == std::string::npos) here++;
+                else below++;
+                if (names.size() < 160)
+                    names += (names.empty() ? "" : ",") + fp.g.name;
+            }
+            bool scanOk = app.folderPickOpen && app.folderPickRemote && here >= 1 && below >= 1;
+            fprintf(stderr, "browseselftest: open-folder on the current dir %s -> picker "
+                            "open=%d remote=%d, %d stack(s) in this folder, %d below "
+                            "[%s]: %s\n",
+                    B.dir.c_str(), app.folderPickOpen ? 1 : 0, app.folderPickRemote ? 1 : 0,
+                    here, below, names.c_str(), scanOk ? "ok" : "FAIL");
+            if (!scanOk) ok = false;
+            app.folderPick.clear();          // Cancel: nothing must be opened
+            app.folderPickOpen = false;
         }
         fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
