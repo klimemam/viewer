@@ -5,7 +5,7 @@
 | 構成 | ウィンドウ | 画素の場所 | 準備 |
 |---|---|---|---|
 | ローカル | 手元 | 手元 | なし |
-| **リモート(推奨)** | **手元** | サーバ | サーバに `viewer-serve` を1つ置く |
+| **リモート(推奨)** | **手元** | サーバ | **不要**(初回接続時にサーバが自動導入) |
 | ローカル(テスト用ピア) | 手元 | 手元(別プロセス経由) | なし |
 
 ---
@@ -38,50 +38,51 @@ cmake --build build-mingw
 
 ## 2. リモート(サーバのデータを手元から見る)
 
-### 2-1. サーバ側にバイナリを置く(初回だけ)
+### 2-1. 準備
 
-**手元とサーバで OS が違う場合、バイナリは2つ必要です**(例: 手元 Windows / サーバ Linux)。
+**サーバ側の準備は不要です。** 初回接続時に、サーバが自分で `binaries` ブランチから
+`viewer-serve` とプラグインを取得し `~/.viewer/` に配置します(サーバに git と
+ネットワークが必要)。手元のバイナリを送りつけるわけではないので、Windows 版の
+配布物が重くなることもありません。
 
-| 置く場所 | 使うバイナリ | 役割 |
-|---|---|---|
-| 手元(Windows) | **`viewer.exe`**(Windows 版) | GUI。ウィンドウを出す側 |
-| サーバ(Linux) | **`viewer-serve`**(Linux 版) | 画素を返す側。ウィンドウは出さない |
+必要なのは**公開鍵認証が通ること**だけです:
 
-**サーバには `viewer` ではなく `viewer-serve` を置いてください。** GUI 版は OpenGL と X11 にリンクしているため、それらが入っていない計算機では**起動すらできません**(`--serve` に到達する前に動的リンカが失敗します)。`viewer-serve` は miniz と C++ ランタイム以外に何もリンクしていない 0.3 MB の実行ファイルで、素のサーバでそのまま動きます。
-
-```bash
-# サーバに開発環境があるなら、サーバ上でビルドするのが一番簡単です。
-# viewer-serve ターゲットは GUI 依存(GLFW/OpenGL/X11)を一切持ちません:
-ssh user@host 'git clone <repo> viewer && cmake -S viewer -B viewer/b -DCMAKE_BUILD_TYPE=Release && cmake --build viewer/b --target viewer-serve'
-ssh user@host 'install -D viewer/b/viewer-serve ~/bin/viewer-serve'
-
-# ビルドしない場合は binaries ブランチの linux-x64/viewer-serve を scp でも可
-ssh user@host '~/bin/viewer-serve --help'           # 動くことの確認
+```powershell
+ssh -o BatchMode=yes user@server true; echo $?      # 0 なら準備完了
 ```
 
-プロトコルは全メッセージが 32bit 整数の並びなので、**Windows ↔ Linux でそのまま通ります**(x86-64 はどちらもリトルエンディアン、構造体にパディングも入りません)。
+パスワードを聞かれる場合は鍵を作って登録してください:
 
-### 2-2. 手元から開く
-
-GUI からは **File > Open Remote (ssh://)...** で URL とリモート側バイナリのパスを
-入力できます(どちらも記憶され、次回はプリフィルされます)。CLI なら:
-
-```bash
-.\build-mingw\viewer.exe ssh://user@host/data/run42/frame_000.npy --remote-exe ~/bin/viewer-serve
+```powershell
+ssh-keygen -t ed25519
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/authorized_keys"
 ```
 
-これだけです。内部で次が起きます:
+### 2-2. 接続してから選ぶ
 
+1. **File > Start Remote (ssh)...**
+2. **ホストだけ**入力(`user@server`、`~/.ssh/config` の Host エイリアスも可)
+3. Connect → 初回は `installing the viewer peer on ...` と出て自動導入
+4. **Files パネルにサーバがノードとして現れます**。フォルダを辿ってファイルをクリックで開く。
+   連番フォルダなら「**Open all N .npy here as a stack**」で塊として開く
+
+パスの形(絶対か `~` 相対か)を先に考える必要はありません。接続してから見て選ぶだけです。
+
+**URL を直接渡したい場合**(CLI やペースト)は以下すべて有効です:
+
+| 記法 | 意味 |
+|---|---|
+| `ssh://user@host/data/run42` | 絶対パス(RFC 3986) |
+| `ssh://user@host:2222/data` | **ポート指定** |
+| `ssh://user@host/~/data` | ホーム相対(git 拡張) |
+| `user@host:~/data` | scp 形式 |
+
+```powershell
+.\viewer.exe ssh://user@server/data/run42/frame_000.npy
 ```
-手元の viewer.exe ──ssh user@host ~/bin/viewer-serve──> サーバ側のピア
-              <── 見えている領域の画素 / 測定した数値 だけ ──
-```
 
-- **`~/.ssh/config` にエイリアス**を書いておくと短くなります(`Host lab1` → `ssh://lab1/data/...`)
-- 認証は ssh に任せています。パスワード対話はできないので、**公開鍵認証を設定してください**
-  (`-o BatchMode=yes` で起動するため、鍵がないと即座に失敗します)
-- `--remote-exe` は省略すると `viewer` を探します。`viewer-serve` を置く運用では常に指定してください
-
+ピアの場所を変えたい場合のみ、ダイアログの **advanced** で指定します
+(既定 `~/.viewer/viewer-serve`)。**File > Update remote peer** で更新できます。
 ### 2-3. 何が速くなるのか
 
 `ssh -X` はウィンドウ全体(1600x1000 で約 6.4 MB)を**毎フレーム**送るため、実測で 500 ms/frame・入力遅延 300 ms でした。この方式で送るのは:
@@ -128,8 +129,8 @@ GUI からは **File > Open Remote (ssh://)...** で URL とリモート側バ�
 
 ## 現在の制限(実装中)
 
-- リモートで開けるのは **`.npy` のみ**。RAW はレシピの受け渡しが未実装、`.npz` も未対応
-- **フォルダ/連番のリモート読み込みは未配線**(`LIST` はプロトコルにあるが UI 未接続)
-- **`MEASURE`(サーバ側で解析を実行)は未実装** — 現状、解析は手元に来た画素に対して走ります
+- リモートで開けるのは **`.npy` のみ**(C order / Fortran order 両対応)。RAW はレシピの受け渡しが未実装、`.npz` も未対応
+- 自動導入はサーバに **git とネットワーク**がある前提。無い場合は `~/.viewer/viewer-serve` に手で置けば動きます
+- **`MEASURE` は実装済み** — 塊を開くと転送を待たずサーバ側で時間統計を計算し、`[server, N frames]` タグ付きで表示します(File > Sequence loading > Remote processing で切替)
 - 先読み・タイルキャッシュ未実装のため、ズーム/パンのたびに取得が発生します
 - Fortran order の `.npy` はサーバ側で拒否されます(ローカルで開いてください)
