@@ -340,6 +340,7 @@ struct App {
     // around - which is why nobody has to know the path shape up front.
     struct RemoteBrowse {
         bool connected = false;
+        bool autoUpdateTried = false; // one shot per connect: no update loops
         std::string host, dir = "~", err;
         int port = 0;
         std::vector<remote::Entry> entries;
@@ -368,6 +369,7 @@ struct App {
         // RbGlob payload
         std::vector<remote::GlobHit> hits;
         uint32_t gen = 0;
+        int peerVersion = 0;              // what the peer answered in HELLO
     };
     std::thread rbThread;
     std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
@@ -3984,6 +3986,7 @@ static void rbWorker() {
                     r.err = err;
                 }
             }
+            if (app.remoteSession) r.peerVersion = app.remoteSession->peerVersion();
         }
         rbSetPhase("");
         {
@@ -4021,6 +4024,15 @@ static void pumpRemoteBrowse() {
             g_bootstrapLog = r.info;
             toast(r.ok ? "remote peer updated on " + r.host
                        : "remote update failed: " + r.err, !r.ok);
+            // The update stopped the session; reconnect to where the user was,
+            // so the listing comes back with the new peer's metadata without
+            // another trip through Start Remote.
+            if (r.ok && B.host == r.host) {
+                App::RbJob j;
+                j.kind = App::RbConnect;
+                j.host = B.host; j.port = B.port; j.dir = B.dir;
+                rbEnqueue(std::move(j));
+            }
             continue;
         }
         if (r.kind == App::RbGlob) {
@@ -4105,6 +4117,23 @@ static void pumpRemoteBrowse() {
             app.showRemote = true;
             app.focusRemote = true;
             toast("connected to " + (r.host.empty() ? std::string("local peer") : r.host));
+        }
+        // An outdated peer ANSWERS perfectly well, so the install-on-failure
+        // path never runs for it - and every listing would show "-" for shape
+        // and mtime until someone finds the update menu item. Update it now,
+        // unasked, once per connect: this is the vscode-server model the whole
+        // remote design follows. The reconnect rides on the RbUpdatePeer
+        // result above; autoUpdateTried stops a loop if the update binary is
+        // still old (e.g. the binaries branch has not rebuilt yet).
+        if (r.kind == App::RbConnect && !r.host.empty() && r.peerVersion > 0 &&
+            r.peerVersion < (int)rp::VERSION && !B.autoUpdateTried) {
+            B.autoUpdateTried = true;
+            toast("peer on " + r.host + " is protocol " + std::to_string(r.peerVersion) +
+                  " - updating it now...");
+            App::RbJob j;
+            j.kind = App::RbUpdatePeer;
+            j.host = r.host; j.port = r.port;
+            rbEnqueue(std::move(j));
         }
         if (!app.pendingRemoteOpen.empty()) {   // a url was pasted with the host
             std::string u = app.pendingRemoteOpen;
@@ -9432,6 +9461,10 @@ int main(int argc, char** argv) {
                 ok ? "ok" : ("FAILED " + app.rbrowse.err).c_str());
         stopRbWorker();
         stopSequenceLoader();
+        // opening stacks spun up the fetch and measure workers too; an unjoined
+        // std::thread at exit is std::terminate, i.e. a "passing" test that dies
+        stopRemoteFetcher();
+        stopMeasureWorker();
         return ok ? 0 : 1;
     }
 
