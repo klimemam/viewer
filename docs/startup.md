@@ -48,15 +48,23 @@ win64\install_shortcut.cmd                                    :: Windows
 |---|---|
 | タスクバーに常駐 | 一度起動 → タスクバーのボタンを右クリック → **ピン留め** |
 | ファイルを開く | `.npy` / `.raw` を**ショートカットにドロップ**(起動後のウィンドウへの D&D も可) |
-| **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、Files パネルにそのフォルダが出ます |
+| **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、Remote パネルにそのフォルダが出ます |
 
 パスを省くとホーム(`~`)を開きます。`.npy` を指定すればその画像を直接開きます。
 
-**アイコン**: ウィンドウ/タスクバーのアイコンは **CFA の 2x2(R/Gr/Gb/B)を枠で囲んだ印**で、
-枠の色が状態を表します —— **青 = ローカル、緑 = リモート接続中**(ステータスバーの
-リンク表示と同じ緑)。タイトルバーにも `frame_000.npy - viewer [user@server]` のように
-接続先が出るので、ローカルとリモートのウィンドウを並べても取り違えません。
+**アイコン**: **CFA の 2x2(R/Gr/Gb/B)を枠で囲んだ印**で、枠の色が状態を表します ——
+**青 = ローカル、緑 = リモート**(ステータスバーのリンク表示と同じ緑)。
+
+| どこ | 見え方 |
+|---|---|
+| デスクトップ/スタートメニューの `viewer` | 青 |
+| デスクトップ/スタートメニューの `viewer (host)` | **緑**(サーバ直結のショートカットだと一目で分かる) |
+| 走っているウィンドウ・タスクバーのボタン | **接続したら青→緑に変わる**(切断で戻る) |
+| タイトルバー | `frame_000.npy - viewer [user@server]` |
+
 アイコンは実行時に描いているので、接続/切断した瞬間にタスクバーの色が変わります。
+ショートカット用の緑アイコンはビルド時に `viewer-remote.ico` / `viewer-remote.png` として
+生成され、バイナリの隣に置かれます(無ければ exe のアイコンにフォールバック)。
 
 **タイトルバー**: 既定では OS のタイトルバーを出さず、メニューバーにタイトルと
 最小化/最大化/閉じるを統合しています(Aero Snap やスナップレイアウトはそのまま使えます)。
@@ -116,10 +124,23 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 1. **File > Start Remote (ssh)...**
 2. **ホストだけ**入力(`user@server`、`~/.ssh/config` の Host エイリアスも可)
 3. Connect → 初回は `installing the viewer peer on ...` と出て自動導入
-4. **Remote パネルにサーバの一覧が現れます**。フォルダを辿ってファイルをクリックで開く。
-   連番は 1 行(`frame_###.npy  [24 frames]`)にまとまるので、その行をクリックで塊として開く。
-   任意の組み合わせは Ctrl/Shift+クリックで選んで「Open N selected as stack」。
-   フォルダ丸ごとは右クリック「Open folder (all stacks below)」か **File > Open Folder (Remote)...**
+4. **Browse パネルにサーバの一覧が現れます**(ローカルのフォルダも同じパネルで見られます:
+   **File > Browse Folder (Local)...**)。
+
+| したいこと | 操作 |
+|---|---|
+| 中身を見る(開かない) | ファイル行を**シングルクリック** → 使い捨てプレビュー。Files には登録されず、次のクリックで置き換わる |
+| 連番を送って見る | 連番は 1 行(`frame_???.npy [24 frames]`)にまとまる。クリックでプレビュー、パネル下端の `< >` / スライダー / `,` `.` で**開かずにフレーム送り** |
+| 正式に開く | **ダブルクリック**(または測定・比較に使った瞬間に自動で昇格) |
+| 任意の組み合わせ | Ctrl/Shift+クリックで選んで「Open N selected as stack」 |
+| フォルダ丸ごと | 右クリック「Open folder (all stacks below)」 |
+| 開かずに時間統計 | 連番行の右クリック「Temporal stats (server)」 |
+
+フォルダを開くと **Select sequences** ダイアログが必ず出ます。ここで
+`include`/`exclude` にライブで絞り込みを打ち込み(打鍵ごとに反映)、
+**「N 個の別スタック」か「まとめて 1 スタック」**か、
+**「1 batch」か「トップフォルダ毎に batch」**かを決めてから読み込みます。
+リモートは 1 フレーム = 1 転送なので、読む前に絞るのが効きます。
 
 パスの形(絶対か `~` 相対か)を先に考える必要はありません。接続してから見て選ぶだけです。
 
@@ -183,10 +204,36 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 
 ---
 
+## 用語(詳しくは docs/terminology.md)
+
+| 層 | 何か |
+|---|---|
+| **frame** | 1 枚 |
+| **stack** | 同一条件の連番。時間軸を持つので σ_t / FPN が意味を持つ |
+| **series (系列)** | 条件を 1 つ振った並び。パラメータ軸を持つのでリニアリティ等のフィットが意味を持つ(実装中) |
+| **batch (塊)** | 開いたものの入れ物。1 回の Open = 1 batch が既定。**名前を付け替えられます**(Files の見出しを右クリック) |
+
+stack も batch も右クリック(stack は F2 でも)でリネームでき、名前はセッションに残ります。
+`Move to batch` で入れ替えもできます。同名ファイルだらけの測定でも、人間に分かる名前を付けて
+区別するための層です。
+
+## A/B 比較
+
+- B の指定は **Files で対象行を右クリック > Set as compare B**(名前ではなく実体を指すので、
+  同名スタックだらけでも取り違えません)。選ばれている行には青い **B** が付きます
+- 両方 stack なら **A を送ると B も同じフレーム番号に追従**します(`Compare A/B > B follows A's frame number`)
+- **表示レンジの関係**は 3 通り(Inspector か Compare メニュー):
+  `each keeps its own` / `B uses A's range` / **`auto over both (union)`(既定)**。
+  露出が違うもの同士は union にすると**どちらも飽和せず**に比べられます。
+  既定が union なのは、`B uses A's range` だと露出違いの B が飽和して
+  (実測 `>white 99.69%`)ヒストグラムが右端の 1 本になってしまうためです
+  (union では同じデータで `0.02%`)。一度選んだ設定は `cmprange` として保存されます
+
 ## 現在の制限(実装中)
 
 - リモートで開けるのは **`.npy` のみ**(C order / Fortran order 両対応)。RAW はレシピの受け渡しが未実装、`.npz` も未対応
 - 自動導入はサーバに **git とネットワーク**がある前提。無い場合は `~/.viewer/viewer-serve` に手で置けば動きます
 - **`MEASURE` は実装済み** — 塊を開くと転送を待たずサーバ側で時間統計を計算し、`[server, N frames]` タグ付きで表示します(File > Sequence loading > Remote processing で切替)
 - 先読み・タイルキャッシュ未実装のため、ズーム/パンのたびに取得が発生します
-- Fortran order の `.npy` はサーバ側で拒否されます(ローカルで開いてください)
+- **series 層は実装中**。今のリニアリティは開いている stack を全部 1 本の掃引として扱うので、
+  掃引を 2 つ同時に開くと混ざります

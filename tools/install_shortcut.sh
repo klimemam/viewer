@@ -76,7 +76,8 @@ if [ "$uninstall" = 1 ]; then
         for f in "$d/$name.desktop" "$d/$name-remote.desktop"; do
             [ -f "$f" ] && { rm -f "$f"; echo "removed  $f"; }
         done
-        rm -f "$HOME/.local/share/icons/hicolor/256x256/apps/$name.png"
+        rm -f "$HOME/.local/share/icons/hicolor/256x256/apps/$name.png" \
+              "$HOME/.local/share/icons/hicolor/256x256/apps/$name-remote.png"
         command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$d" || true
     fi
     echo 'done.'
@@ -98,10 +99,17 @@ echo "viewer:  $bin"
     "$self/../build/icons/viewer.png" "$self/../build-mingw/icons/viewer.png") || icon=''
 [ -n "$icon" ] && echo "icon:    $icon" || echo "icon:    (none found - build once to generate it)"
 
+# the green variant, for the entry that connects to a server: it says where it
+# starts before it is running, which is the one moment the window cannot
+icon_remote=''
+[ -n "$icon" ] && [ -f "$(dirname "$icon")/viewer-remote.png" ] &&
+    icon_remote="$(dirname "$icon")/viewer-remote.png"
+
 # ---- macOS: a .app wrapper --------------------------------------------------
 if [ "$plat" = mac ]; then
-    make_app() {                       # $1 = app name, $2 = argument to pass
+    make_app() {                       # $1 = app name, $2 = argument, $3 = icon, $4 = bundle id
         app="$HOME/Applications/$1.app"
+        bid=${4:-com.klimemam.viewer}
         rm -rf "$app"
         mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
         cat > "$app/Contents/Info.plist" <<PLIST
@@ -110,7 +118,7 @@ if [ "$plat" = mac ]; then
 <plist version="1.0"><dict>
     <key>CFBundleName</key><string>$1</string>
     <key>CFBundleDisplayName</key><string>$1</string>
-    <key>CFBundleIdentifier</key><string>com.klimemam.viewer</string>
+    <key>CFBundleIdentifier</key><string>$bid</string>
     <key>CFBundleExecutable</key><string>launch</string>
     <key>CFBundleIconFile</key><string>viewer</string>
     <key>CFBundlePackageType</key><string>APPL</string>
@@ -124,21 +132,25 @@ PLIST
 exec "$bin" $2 "\$@"
 LAUNCH
         chmod +x "$app/Contents/MacOS/launch"
-        if [ -n "$icon" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+        src=${3:-$icon}
+        if [ -n "$src" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
             set=$(mktemp -d)/viewer.iconset
             mkdir -p "$set"
             for s in 16 32 128 256 512; do
-                sips -z $s $s "$icon" --out "$set/icon_${s}x${s}.png" >/dev/null 2>&1 || true
+                sips -z $s $s "$src" --out "$set/icon_${s}x${s}.png" >/dev/null 2>&1 || true
                 d=$((s * 2))
-                sips -z $d $d "$icon" --out "$set/icon_${s}x${s}@2x.png" >/dev/null 2>&1 || true
+                sips -z $d $d "$src" --out "$set/icon_${s}x${s}@2x.png" >/dev/null 2>&1 || true
             done
             iconutil -c icns "$set" -o "$app/Contents/Resources/viewer.icns" 2>/dev/null || true
             rm -rf "$set"
         fi
         echo "created  $app"
     }
-    make_app "$name" ''
-    [ -n "$host" ] && make_app "$name (remote)" "'$(remote_url)'"
+    make_app "$name" '' "$icon"
+    # the remote bundle gets the green icon, and its own bundle id so the Dock
+    # keeps the two apart instead of collapsing them into one tile
+    [ -n "$host" ] &&
+        make_app "$name (remote)" "'$(remote_url)'" "${icon_remote:-$icon}" com.klimemam.viewer.remote
     echo ''
     echo 'Open it once from ~/Applications, then keep it in the Dock (right-click > Options > Keep in Dock).'
     exit 0
@@ -148,17 +160,24 @@ fi
 appdir=$HOME/.local/share/applications
 mkdir -p "$appdir"
 iconref=$name
+iconref_remote=$name
 if [ -n "$icon" ]; then
     icondir=$HOME/.local/share/icons/hicolor/256x256/apps
     mkdir -p "$icondir"
     cp -f "$icon" "$icondir/$name.png"
+    if [ -n "$icon_remote" ]; then
+        cp -f "$icon_remote" "$icondir/$name-remote.png"
+        iconref_remote=$name-remote
+    fi
     command -v gtk-update-icon-cache >/dev/null 2>&1 &&
         gtk-update-icon-cache -q -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 else
     iconref=image-x-generic
+    iconref_remote=image-x-generic
 fi
 
-write_entry() {                        # $1 = file, $2 = visible name, $3 = args
+write_entry() {                        # $1 = file, $2 = visible name, $3 = args, $4 = icon
+    ref=$4
     cat > "$1" <<DESKTOP
 [Desktop Entry]
 Type=Application
@@ -166,7 +185,7 @@ Version=1.0
 Name=$2
 Comment=Engineering image viewer - npy / RAW / Bayer, measured in place
 Exec="$bin" $3%F
-Icon=$iconref
+Icon=$ref
 Terminal=false
 Categories=Graphics;Science;RasterGraphics;Viewer;
 Keywords=npy;raw;bayer;image;sensor;
@@ -178,8 +197,9 @@ DESKTOP
 }
 
 # the url is double-quoted because "~" is a reserved character in an Exec line
-write_entry "$appdir/$name.desktop" "$name" ''
-[ -n "$host" ] && write_entry "$appdir/$name-remote.desktop" "$name ($host)" "\"$(remote_url)\" "
+write_entry "$appdir/$name.desktop" "$name" '' "$iconref"
+[ -n "$host" ] &&
+    write_entry "$appdir/$name-remote.desktop" "$name ($host)" "\"$(remote_url)\" " "$iconref_remote"
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$appdir" 2>/dev/null || true
 

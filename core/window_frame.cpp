@@ -8,6 +8,18 @@
 #include <vector>
 
 #if defined(_WIN32)
+  // Ask for the Windows 8 API surface BEFORE any Windows header is pulled in.
+  // mingw-w64 guards ABM_GETAUTOHIDEBAREX (and the Win11 DWM attributes) behind
+  // this target level, and nothing else in the project sets one - so the file
+  // did not compile at all with the toolchain that builds the shipped exe.
+  // 0x0602 is Windows 8: the oldest release that has the auto-hide-bar query
+  // this file needs, and far below anything this tool actually runs on.
+  #ifndef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0602
+  #endif
+  #ifndef NTDDI_VERSION
+    #define NTDDI_VERSION 0x06020000
+  #endif
   #define GLFW_EXPOSE_NATIVE_WIN32
   #include <GLFW/glfw3native.h>
   #include <windows.h>

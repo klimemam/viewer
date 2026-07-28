@@ -126,6 +126,7 @@ struct ImageDoc {
     float black = 0, white = 255;     // display range
     GLuint tex = 0;
     bool texDirty = true;
+    float texBlack = 0, texWhite = 0;   // the range this texture was built with
     bool texNearest = true;
     // CFA (Bayer) metadata
     int batchId = 0;                  // which 塊 (Files header) this belongs to
@@ -250,6 +251,44 @@ struct App {
     uint64_t compareBUid = 0;
     std::string compareB;             // B's name, for the session file
     int compareBSeq = -1;             // ...and its frame index, when B is in a stack
+    // Stack-vs-stack compare: step A and B follows to the same frame NUMBER.
+    // Without this, comparing two 300-frame captures pins B to whatever frame
+    // it was on and every step compares against a stale image. Off when B is a
+    // single reference image (a dark, a golden sample) - then B must not move.
+    bool compareFollowFrame = true;
+    // How the two sides' DISPLAY range relates while comparing. Non-destructive
+    // throughout: B keeps its own numbers and gets them back when compare ends,
+    // exactly the contract linkRange has.
+    //   0 each own   - every side keeps its own stretch (shapes at wildly
+    //                  different exposures; the only case where it is honest)
+    //   1 B uses A's - one range, A's. Stable while stepping A.
+    //   2 union auto - both sides re-fit to min/max ACROSS A and B at the
+    //                  current frame pair, so neither clips and neither is
+    //                  favoured. This is "auto, but the same auto for both".
+    // The DEFAULT is 2. It used to be 1, and on two stacks captured at
+    // different levels that renders B at >white 99.69%: B's whole histogram
+    // collapses into one dashed line against the right edge of the plot, and
+    // its half of a side-by-side pair is empty. A mode whose purpose is "see B
+    // against A's reference" is not doing that when B saturates. The union
+    // shows both distributions on identical bins, and clipping drops to 0.02%
+    // on the same data. The cmprange pref persists a CHOSEN value, so only the
+    // out-of-the-box one moves.
+    int compareRangeMode = 2;
+    // A/B statistics panels: how the two sides are laid out. ONE global setting,
+    // not one per panel - "the same arrangement as the image" is a property of
+    // the comparison, not of the histogram, and per-panel state would multiply
+    // by five with no way to tell which panel is showing what.
+    // Auto mirrors the image: CmpSplit puts the images left/right, so the plots
+    // go left/right; wipe / blink / diff have ONE image area, so the plots overlay.
+    enum { AbAuto = 0, AbOverlay = 1, AbSide = 2 };
+    int abStatsLayout = AbAuto;
+    // Slot 1 of every statistics cache is filled ONLY while compare is on. This
+    // records whether it still holds anything, so compare-off invalidates it
+    // exactly once and then costs nothing at all.
+    bool abSlot1Live = false;
+    // While frames are being stepped faster than a person reads them, the B
+    // caches are NOT recomputed (see selectImage). glfwGetTime() deadline.
+    double abStepBusyUntil = 0;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -310,8 +349,13 @@ struct App {
         bool roiUsed = false;
         double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
         const char* seriesNames[4] = {};
-    } hist;
+    } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
     bool histLog = true;
+    // Which plane the histogram draws: -1 = all, else the series index. Four
+    // CFA planes times two sides is eight curves on one axis; the selector is
+    // what makes a CFA overlay readable at all. Presentation only - the bins
+    // are computed for every plane either way.
+    int histPlane = -1;
 
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
     struct SeqInfo {
@@ -325,9 +369,10 @@ struct App {
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
-        // linearity: the exposure level this stack was captured at (lux, ms,
-        // photons - the unit lives in App::lin.unit). NaN = not set.
-        double level = std::numeric_limits<double>::quiet_NaN();
+        // NO level here. The value a stack was captured at is meaningless
+        // without the parameter's NAME and UNIT, and both of those belong to
+        // the series - so the value does too (Series::Member::value). Keeping
+        // it on the stack is what forced "one unit for the whole application".
     };
     std::vector<SeqInfo> seqs;
     // A batch is the unit the Files panel groups by: created per OPEN ACTION
@@ -337,8 +382,44 @@ struct App {
     struct Batch { int id; std::string name; };
     std::vector<Batch> batches;
     int nextBatchId = 1;
+    // ---- series (系列): the stacks of ONE swept parameter (docs/terminology.md) --
+    // A batch makes no structural claim; a series does. Its members carry a
+    // PARAMETER VALUE and an ORDER, and the whole run is one measurement - so
+    // the parameter's name, its unit and the kind of fit live HERE, not on the
+    // stack and not once per application.
+    //
+    // Series::members is the ONLY truth about membership. There is deliberately
+    // no SeqInfo::seriesId: two places holding the same fact drift apart, and
+    // the reverse lookup (seriesOfStack) is a walk over a handful of series.
+    struct Series {
+        enum { KLinearity = 0, KPtc = 1, KTemperature = 2, KOther = 3 };
+        int id = 0, batchId = 0;      // the batch it lives in - strictly ONE
+        std::string name;             // "<batch> 掃引" until a human names it
+        std::string paramName;        // "illuminance" / "exposure" / ...
+        // Empty = NOT SET, and that is the default: assuming "lx" would put a
+        // unit on an axis nobody chose. No unit, no fit (see seriesCanFit).
+        char unit[16] = "";
+        int kind = KLinearity;
+        // value NaN = not set. NEVER treated as 0 - it is left out of the fit
+        // and reads as "unset" on screen.
+        struct Member {
+            int seqId = 0;
+            double value = std::numeric_limits<double>::quiet_NaN();
+            bool include = true;
+        };
+        std::vector<Member> members;  // order = display order (sorting is a button)
+    };
+    std::vector<Series> series;
+    int nextSeriesId = 1;
+    int curSeriesId = 0;              // which series the Linearity panel shows
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
+    // Where that preview came from, so the browser can step through the
+    // sequence without opening it: the group's member paths and the index
+    // currently shown. Cleared with the preview.
+    std::vector<std::string> previewFiles;
+    int previewIndex = 0;
+    std::string previewLabel;
     int nextSeqId = 1;
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
@@ -363,7 +444,10 @@ struct App {
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
-    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4 };
+    // RbTreeList is an ordinary LIST whose answer lands in the tree cache
+    // instead of replacing the listing: expanding a node must not navigate.
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4,
+                  RbTreeList = 5 };
     struct RbJob {
         int kind = RbConnect;
         std::string host, dir;
@@ -441,8 +525,8 @@ struct App {
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
-    // Linearity: one row per stack (level in, response out), fits per CFA plane.
-    // Recomputed only on demand - this walks hundreds of frames.
+    // Linearity: one row per MEMBER of one series (value in, response out), fits
+    // per CFA plane. Recomputed only on demand - this walks hundreds of frames.
     struct LinState {
         struct Row {
             int seqId = 0;
@@ -454,6 +538,11 @@ struct App {
             std::string err;
         };
         std::vector<Row> rows;
+        int seriesId = 0;                 // the series these rows describe
+        // NOT the unit of any measurement: the PREFILL a newly created series
+        // starts from (prefs key linunit, unchanged). What gets printed on an
+        // axis comes from Series::unit, and empty there means "not set" - it
+        // never silently becomes "lx".
         char unit[16] = "lx";
         int tablePlane = 0;               // which CFA plane the per-stack table shows
         bool fitValid = false, roiUsed = false;
@@ -464,21 +553,83 @@ struct App {
         uint64_t rev = 0, computedRev = 0;
     } lin;
     bool showLinearity = false;
+    // Create / edit a series. ONE modal for both: the fields are identical and
+    // "edit" is only "create with the boxes already ticked". The value column
+    // is a SUGGESTION the user confirms - see drawSeriesModal.
+    struct SeriesEdit {
+        bool open = false;
+        int editId = 0;                   // 0 = creating a new one
+        int batchId = 0;
+        char name[128] = "";
+        char param[64] = "";
+        char unit[16] = "";
+        int kind = Series::KLinearity;
+        struct Row {
+            int seqId = 0;
+            bool check = true;
+            // TEXT, not a double: "" has to stay distinguishable from 0, and a
+            // numeric box cannot be empty. Parsed on accept; empty = NaN = unset.
+            char value[32] = "";
+            bool suggested = false;       // still extractLevelFromName's proposal
+            // An EXISTING member's value, kept as the double it is. The box shows
+            // it as "%.6g" and a Save that never touched the box must give the
+            // member back UNCHANGED - re-parsing the display text would quietly
+            // round 1234567.89 to 1234570 on every visit to the dialog.
+            double orig = std::numeric_limits<double>::quiet_NaN();
+            bool haveOrig = false;        // this row is already a member
+            bool touched = false;         // a human typed in the box
+            // extractLevelFromName's proposal when it is NOT in the box: offered
+            // in the "read from" column, where it cannot be committed by accident.
+            double guess = std::numeric_limits<double>::quiet_NaN();
+            std::string name, from;       // from = the text the number was read out of
+        };
+        std::vector<Row> rows;
+    } seriesEdit;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
+    // Browse listing view: false = the collapsed group rows the peer sends,
+    // true = every frame of every sequence as its own row. Expansion is a pure
+    // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
+    // so the toggle costs no round trip. Persisted: it is a way of working.
+    bool rbFlat = false;
+    // Browse header: false = just the path bar and the toolbar (the common
+    // case), true = also the connection row and the server-side search. Also
+    // persisted - "I always search" and "I never do" are both ways of working.
+    bool rbAdvanced = false;
+    // Tree mode: a directory expands IN PLACE instead of replacing the listing,
+    // so a folder of folders can be compared without losing your place. LAZY -
+    // expanding a node costs exactly one LIST, issued on the browse worker and
+    // never on the UI thread, and collapsing KEEPS the answer: re-expanding is
+    // free. Cache keyed by absolute path, so it survives navigation; dropped
+    // when the machine changes or on an explicit refresh.
+    bool rbTree = false;                                        // persisted
+    std::map<std::string, std::vector<remote::Entry>> rbTreeCache;
+    std::vector<std::string> rbExpanded;      // absolute dirs currently open
+    std::vector<std::string> rbTreePending;   // ...and those still being listed
+    int rbTreeLists = 0;                      // node LISTs issued (selftest)
     bool focusRemote = false;         // bring it forward when a menu item asks
+    bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
-        int seqId = -1;
+        int seqId = -1;               // owning stack; -2 = detached (browser-fired
+                                      // aggregate over files nobody opened)
         bool valid = false, pending = false;
+        bool detached = false;        // browser origin: no SeqInfo backs this
         std::string host, err;
+        std::string label;            // what was measured ("10lx/frame_???.npy")
+        std::vector<std::string> files;   // detached only: for "Open as stack"
         int frames = 0;
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
         std::vector<float> idx, frameMean, frameStd;
     } srvTemporal;
+    // The same, for the compare B side. NEVER fired automatically: a server
+    // aggregate is a real job on a real machine, and B following A around
+    // would double them silently. The Temporal panel's "Measure B" button is
+    // the only thing that fills this.
+    ServerTemporal srvTemporalB;
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -536,6 +687,47 @@ struct App {
     struct PendingGroup { std::string name; std::vector<std::string> files;
                           bool isRaw = false; int batchId = 0; std::string shape; };
     std::vector<PendingGroup> seqQueue;
+    // Sibling loads a session asked for, drained one at a time.
+    // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
+    // calling it N times in the parse loop cancelled every load but the last:
+    // a 3-stack session came back with 7 of its 15 frames.
+    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
+    std::vector<SeqRestore> seqRestore;
+    // Series a session asked for, resolved LAZILY for the same reason: at parse
+    // time the stacks do not exist yet (a folder stack is one loose image plus a
+    // queued rescan), so a member cannot be looked up. Members are named by the
+    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because seqname is
+    // dropped on restore for exactly this reason (cur()->seqId is still 0 when
+    // the line is parsed; verified in loadSession).
+    struct SeriesRestore {
+        std::string name, batchName, paramName, unit;
+        int kind = 0;
+        int badValues = 0;                // value fields the parser could not read
+        struct M { double value; bool include; std::string path; };
+        std::vector<M> members;
+    };
+    std::vector<SeriesRestore> seriesRestore;
+    // MIGRATION of the old per-stack level, also by path. saveSession has never
+    // written "seqlevel" (verified over the whole history), so this is normally
+    // empty - it exists for hand-written and third-party files, and it creates
+    // a series only where the file actually says there was a sweep.
+    std::vector<std::pair<std::string, double>> seqLevelLegacy;
+    // A sweep the PICKER was told to make ("open as a sweep"), resolved once
+    // its stacks are open - the same lateness as seriesRestore and for the same
+    // reason. Members are named by their GROUP name, which becomes the stack's
+    // name (PendingGroup::name / RemoteOpen::name -> SeqInfo::name): the remote
+    // queue holds no seqId, so a name is the only handle there is.
+    struct SeriesPending {
+        int batchId = 0;
+        std::string name, paramName, unit;
+        int kind = Series::KLinearity;
+        std::vector<std::pair<std::string, double>> byName;   // stack name -> value
+    };
+    // A QUEUE, not a slot. Resolution waits for every load to drain, which for a
+    // folder-of-folders is seconds and for a remote sweep much longer, and File >
+    // Open Folder is available throughout - a single slot meant the second sweep
+    // silently threw the first one's ticked box, typed parameter and unit away.
+    std::vector<SeriesPending> seriesPending;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -560,7 +752,22 @@ struct App {
     // * and ? wildcards, matched anywhere in FolderPick::rel (see applyPickFilter)
     char pickFilter[256] = "";
     int pickMerge = 0;                // 0 = one stack per group, 1 = ONE merged stack
+    // batch assignment for the accepted selection: 0 = the whole Open is ONE
+    // batch (the canon's default), 1 = one batch per top-level folder of the
+    // scanned root. Ignored under pickMerge (a merged stack is one batch).
+    int pickBatchMode = 0;
+    // "open as a sweep": the accepted groups also become ONE series. Not
+    // persisted and cleared on accept - a sticky box would create a sweep on
+    // some later Open that nobody asked for, which is the one thing series are
+    // never allowed to do. Exclusive with pickBatchMode (a series lives in one
+    // batch); the parameter name and unit are the series', typed here.
+    bool pickSweep = false;
+    char pickSweepParam[64] = "";
+    char pickSweepUnit[16] = "";
+    std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
+    int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+                                      // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
         int seqId = -1;
@@ -570,7 +777,7 @@ struct App {
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0;
         bool valid = false;
         bool roiUsed = false;
-    } temporal;
+    } temporal[2];                    // 0 = A, 1 = B (compare)
     // H/V projections (line profiles) of the selected ROI / whole image
     struct ProjState {
         const ImageDoc* img = nullptr;
@@ -586,7 +793,7 @@ struct App {
         struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
         Stats hStat[4], vStat[4];
         bool roiUsed = false;
-    } proj;
+    } proj[2];                        // 0 = A, 1 = B (compare)
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
     int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
@@ -627,6 +834,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
+static void rbTreeForget();       // drop the tree's cached children
 static std::string placeUrl(const std::string& host, int port, const std::string& path);
 static void rbEnqueue(App::RbJob job);
 static void pumpRemoteBrowse();
@@ -646,10 +854,20 @@ static void promotePreview(ImageDoc* d);   // fwd: preview -> registered open
 // The B side of an A/B compare, or null when compare is off / B is gone / B is A.
 static ImageDoc* resolveB() {
     if (app.compareBUid) {
+        ImageDoc* b = nullptr;
         for (const auto& d : app.images)
-            if (d->uid == app.compareBUid) return d.get() == cur() ? nullptr : d.get();
-        app.compareBUid = 0;                     // B was closed
-        return nullptr;
+            if (d->uid == app.compareBUid) { b = d.get(); break; }
+        if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
+        // B tracks A's frame number when BOTH sides are stacks. A single-image
+        // B (a dark frame, a golden sample) has no frame axis and stays put -
+        // which is the other half of what stack comparison has to support.
+        ImageDoc* a = cur();
+        if (app.compareFollowFrame && a && b->seqId != 0 && a->seqId != 0 &&
+            b->seqId != a->seqId && b->seqIndex != a->seqIndex) {
+            for (const auto& d : app.images)
+                if (d->seqId == b->seqId && d->seqIndex == a->seqIndex) { b = d.get(); break; }
+        }
+        return b == cur() ? nullptr : b;
     }
     if (app.compareB.empty()) return nullptr;
     // session fallback: match the saved name (and frame, for a stack), then latch
@@ -664,6 +882,10 @@ static ImageDoc* resolveB() {
 }
 static ImageDoc* cmpB() { return app.compareMode == App::CmpOff ? nullptr : resolveB(); }
 
+// fwd: A and B are named by their STACK wherever the two are set against each
+// other - two stacks of a series hold identically named frames
+static std::string abDocLabel(const ImageDoc* d);
+
 // remember B as an identity, not as a name
 static void setCompareB(const ImageDoc* d) {
     // making a preview the B side IS using it: promote before it can vanish
@@ -671,6 +893,54 @@ static void setCompareB(const ImageDoc* d) {
     app.compareBUid = d ? d->uid : 0;
     app.compareB = d ? d->name : std::string();
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
+}
+
+// The B side FOR THE STATISTICS PANELS: the compare partner, but only when it
+// has pixels to measure - a remote preview placeholder has none.
+static ImageDoc* abStatsB() {
+    ImageDoc* b = cmpB();
+    if (!b || b->w < 1 || b->h < 1 || b->data.empty()) return nullptr;
+    return b;
+}
+
+// Side by side, or overlaid? One answer for every panel (App::abStatsLayout).
+// Auto mirrors the IMAGE: CmpSplit puts A and B left/right, so the plots go
+// left/right too; wipe / blink / difference have one image area, so they overlay.
+static bool abSideBySide() {
+    if (app.abStatsLayout == App::AbOverlay) return false;
+    if (app.abStatsLayout == App::AbSide) return true;
+    return app.compareMode == App::CmpSplit;
+}
+
+// Can A's and B's profiles be drawn on ONE axis? Only when both sampled the
+// same range - same origin and same length. Anything else would have to be
+// stretched to line up, and stretching invents a correspondence between two
+// captures that nothing in the data supports. False means: side by side, and
+// say why (docs/ab-stats-plan.md 5).
+static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) {
+    return A.rx == B.rx && A.rw == B.rw && A.ry == B.ry && A.rh == B.rh;
+}
+
+// --no-ab-throttle: developer flag, so the cost the throttle removes can be
+// measured on the same binary instead of quoted from an older one.
+static bool g_abNoThrottle = false;
+// True while frames are being stepped continuously. The B slots skip their
+// recompute then; whoever draws B must say "stale" (docs/ab-stats-plan.md 1).
+static bool abStepBusy() {
+    return !g_abNoThrottle && app.abStepBusyUntil > glfwGetTime();
+}
+
+// Slot 1 of every statistics cache belongs to the B side and is filled only
+// while a B exists. Called once per frame BEFORE the panels draw: the first
+// frame after compare goes off clears it, and every frame after that does
+// nothing at all - so compare-off costs exactly what it did before A/B stats.
+static void abStatsFrame() {
+    if (cmpB()) { app.abSlot1Live = true; return; }
+    if (!app.abSlot1Live) return;
+    app.hist[1] = App::HistState{};
+    app.proj[1] = App::ProjState{};
+    app.temporal[1] = App::TemporalState{};
+    app.abSlot1Live = false;
 }
 
 static void toast(const std::string& msg, bool err = false) {
@@ -699,6 +969,21 @@ static int newBatch(const std::string& name) {
 static int batchReuse(const std::string& name) {
     for (const auto& b : app.batches) if (b.name == name) return b.id;
     return newBatch(name);
+}
+// Batch names must be UNIQUE (docs/terminology.md): sessions restore batches BY
+// NAME (imgbatch -> batchReuse), so two batches sharing one name silently merge
+// on the next load. Collisions get " (2)", " (3)", ...
+static std::string uniqueBatchName(std::string base) {
+    if (base.empty()) base = "opened";
+    auto taken = [](const std::string& n) {
+        for (const auto& b : app.batches) if (b.name == n) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int k = 2;; k++) {
+        std::string n = base + " (" + std::to_string(k) + ")";
+        if (!taken(n)) return n;
+    }
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
@@ -739,7 +1024,7 @@ static void pinCurrentAsB() {
     if (!cur()) return;
     setCompareB(cur());
     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-    toast("B = " + app.compareB + "  (move A somewhere else)");
+    toast("B = " + abDocLabel(cur()) + "  (move A somewhere else)");
 }
 
 static void swapCompare() {
@@ -751,7 +1036,7 @@ static void swapCompare() {
         return;
     }
     const ImageDoc* a = cur();
-    std::string an = a->name, bn = b->name;
+    std::string an = abDocLabel(a), bn = abDocLabel(b);
     uint64_t bUid = b->uid;
     setCompareB(a);                       // set B before moving A: cur() changes
     for (int i = 0; i < (int)app.images.size(); i++)
@@ -904,6 +1189,7 @@ static void rebuildTexture(ImageDoc& im) {
     static std::vector<uint8_t> rgba;
     rgba.resize((size_t)im.w * im.h * 4);
     const float ib = effBlack(im), iw = effWhite(im);
+    im.texBlack = ib; im.texWhite = iw;
     float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
@@ -986,8 +1272,33 @@ static void markAllTexDirty() {
 }
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
-static float effBlack(const ImageDoc& im) { return app.linkRange ? app.linkBlack : im.black; }
-static float effWhite(const ImageDoc& im) { return app.linkRange ? app.linkWhite : im.white; }
+static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
+// The A/B display range. Mode 2 fits BOTH sides to the union of what the two
+// current frames actually contain, recomputed as you step - the "auto but the
+// same auto on both sides" a stack-vs-stack comparison needs. cur() is never
+// B (resolveB guarantees it), so none of this recurses.
+static bool abRange(const ImageDoc& im, float& lo, float& hi) {
+    if (app.compareRangeMode == 0) return false;
+    ImageDoc* a = cur();
+    ImageDoc* b = cmpB();
+    if (!a || !b || (&im != a && &im != b)) return false;
+    if (app.compareRangeMode == 1) { lo = a->black; hi = a->white; return true; }
+    lo = std::min(a->vmin, b->vmin);          // union of the CONTENT, not of the
+    hi = std::max(a->vmax, b->vmax);          // two stretches
+    return hi > lo;
+}
+static float effBlack(const ImageDoc& im) {
+    if (app.linkRange) return app.linkBlack;
+    float lo, hi;
+    if (abRange(im, lo, hi)) return lo;
+    return im.black;
+}
+static float effWhite(const ImageDoc& im) {
+    if (app.linkRange) return app.linkWhite;
+    float lo, hi;
+    if (abRange(im, lo, hi)) return hi;
+    return im.white;
+}
 
 static void setRange(ImageDoc& im, float black, float white) {
     if (!(white > black)) return;
@@ -1004,9 +1315,13 @@ static void forgetTexture(ImageDoc* im) {
 // One place that drops an image from every cache that can name it.
 static void forgetImage(ImageDoc* im) {
     if (app.ana.img == im) app.ana.img = nullptr;
-    if (app.hist.img == im) app.hist.img = nullptr;
-    if (app.proj.img == im) app.proj.img = nullptr;
-    app.temporal.seqId = -1;
+    // BOTH slots: the image being dropped may be the B side, and a cache still
+    // naming it is a dangling pointer the next draw would follow
+    for (int k = 0; k < 2; k++) {
+        if (app.hist[k].img == im) { app.hist[k].img = nullptr; app.hist[k].uid = 0; }
+        if (app.proj[k].img == im) { app.proj[k].img = nullptr; app.proj[k].uid = 0; }
+        app.temporal[k].seqId = -1;
+    }
     forgetTexture(im);
     app.imagesRev++;
 }
@@ -1118,6 +1433,7 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
 }
 
 // UI thread: swap arrived frames in. After this an ex-preview is a local image.
+static App::SeqInfo* seqInfo(int id);   // fwd: closed-stack results are dropped
 static void pumpRemoteFetch() {
     std::vector<App::RFetchDone> batch;
     {
@@ -1135,6 +1451,11 @@ static void pumpRemoteFetch() {
             app.rfFetched = 0;
         }
         if (d.uid == 0) {                        // a new frame of a remote stack
+            // Closed while this fetch was in flight: closeStack swept the QUEUE,
+            // but the one job the worker was already running could not be
+            // removed there - its result lands here and must be dropped, or a
+            // closed stack regrows one orphan frame at a time.
+            if (d.seqId != 0 && !seqInfo(d.seqId)) continue;
             if (!d.err.empty()) {
                 if (app.seqNote.empty())         // first error explains the gap
                     app.seqNote = "remote: " + d.err;
@@ -1152,11 +1473,13 @@ static void pumpRemoteFetch() {
             doc->seqId = d.seqId; doc->seqIndex = d.seqIndex;
             doc->uid = app.nextUid++;
             doc->texDirty = true;
-            // frames of one stack share the display range, like the local loader
+            // frames of one stack share the display range (like the local
+            // loader) and its batch (frame ⊂ stack ⊂ batch)
             bool ranged = false;
             for (const auto& q : app.images)
                 if (q->seqId == d.seqId) {
                     doc->black = q->black; doc->white = q->white;
+                    doc->batchId = q->batchId;
                     ranged = true;
                     break;
                 }
@@ -1290,8 +1613,13 @@ static void pumpMeasure() {
     }
     for (auto& d : batch) {
         app.mPending--;
-        if (d.token != app.srvTemporal.token) continue;   // superseded request
-        App::ServerTemporal& S = app.srvTemporal;
+        // the A slot or the explicitly-measured B slot, by token
+        App::ServerTemporal* Sp = nullptr;
+        if (app.srvTemporal.token && d.token == app.srvTemporal.token) Sp = &app.srvTemporal;
+        else if (app.srvTemporalB.token && d.token == app.srvTemporalB.token)
+            Sp = &app.srvTemporalB;
+        if (!Sp) continue;                                // superseded request
+        App::ServerTemporal& S = *Sp;
         S.pending = false;
         S.host = d.host;
         if (!d.ok) { S.valid = false; S.err = d.err; continue; }
@@ -1312,26 +1640,519 @@ static void pumpMeasure() {
     }
 }
 
-static void closeCurrent() {
+// ---- close, per layer (docs/terminology.md) -----------------------------------
+// The canon: Close on a stack member closes the STACK - frames vanishing one at
+// a time from a measurement set was the reported bug. Ctrl+Alt+W stays as the
+// one-frame escape hatch.
+static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below)
+static App::SeqInfo* seqInfo(int id);             // fwd
+static void stopSequenceLoader();                 // fwd
+static void pruneEmptyBatches();                  // fwd (defined with the moves)
+// The value a stack's NAME suggests, and the text it was read out of. Declared
+// here because the picker proposes one per group long before the linearity
+// code that defines it (the default argument lives on this declaration only).
+static double extractLevelFromName(const std::string& name, std::string* srcOut = nullptr);
+
+// ---- series (系列), the model (docs/terminology.md, docs/series-plan.md) -------
+// No UI here on purpose: the invariants have to hold before anything can draw
+// them. Series are few and members are tens, so every lookup is a plain walk.
+static App::Series* seriesById(int id) {
+    for (auto& s : app.series) if (s.id == id) return &s;
+    return nullptr;
+}
+// Reverse membership. The canon: a stack belongs to AT MOST ONE series, so the
+// first hit is the only hit (seriesAudit proves it, addToSeries maintains it).
+static App::Series* seriesOfStack(int seqId) {
+    if (seqId == 0) return nullptr;
+    for (auto& s : app.series)
+        for (const auto& m : s.members)
+            if (m.seqId == seqId) return &s;
+    return nullptr;
+}
+// The batch a stack is in, read off its frames (the frames own batchId).
+// 0 = the stack has no frames resident, so it claims no batch.
+static int batchOfStack(int seqId) {
+    for (const auto& d : app.images) if (d->seqId == seqId) return d->batchId;
+    return 0;
+}
+static std::string batchNameOf(int batchId) {
+    for (const auto& b : app.batches) if (b.id == batchId) return b.name;
+    return {};
+}
+// Default name until a human gives it one (docs/terminology.md).
+static int newSeries(int batchId, const std::string& name) {
+    App::Series s;
+    s.id = app.nextSeriesId++;
+    s.batchId = batchId;
+    s.name = name.empty() ? batchNameOf(batchId) + " 掃引" : name;
+    app.series.push_back(std::move(s));
+    app.imagesRev++;                  // the Files grouping caches on this
+    return app.series.back().id;
+}
+// Drop one stack from whatever series holds it. Returns the series' id, or 0.
+static int removeFromSeries(int seqId) {
+    for (auto& s : app.series)
+        for (auto it = s.members.begin(); it != s.members.end(); ++it)
+            if (it->seqId == seqId) {
+                s.members.erase(it);
+                app.imagesRev++;
+                return s.id;
+            }
+    return 0;
+}
+// Add a stack to a series. Fails (false) when the stack is not in the series'
+// batch - the canon's strict containment, enforced rather than papered over:
+// the caller's answer is "Move to batch first", never "we widened the series".
+// Adding a stack that already sits in another series MOVES it (at most one).
+static bool addToSeries(int seriesId, int seqId, double value, bool include = true) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || seqId == 0 || !seqInfo(seqId)) return false;
+    int b = batchOfStack(seqId);
+    if (b != S->batchId) return false;
+    for (auto& m : S->members)
+        if (m.seqId == seqId) { m.value = value; m.include = include; return true; }
+    removeFromSeries(seqId);
+    S->members.push_back({ seqId, value, include });
+    app.imagesRev++;
+    return true;
+}
+// A series with nothing in it is not a work in progress, it is litter: the
+// creation path leaves one member behind, closes take the rest away.
+static void pruneEmptySeries() {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->members.empty()) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+}
+// Text -> a parameter value, and NOTHING ELSE to a number. atof() answers 0 for
+// every string it cannot read, and 0 in a series is not a missing point: it is
+// the dark stack the offset is anchored to and the read noise is MEASURED in
+// (linRecompute). "-", "", "1e", "notanumber" and a truncated write all mean the
+// same thing here - UNSET, which the whole layer already knows how to show and
+// how to keep out of a fit.
+static double parseSeriesValue(const char* s) {
+    const double NOTSET = std::numeric_limits<double>::quiet_NaN();
+    if (!s) return NOTSET;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s || (s[0] == '-' && s[1] == '\0')) return NOTSET;   // "-" = unset
+    char* end = nullptr;
+    double v = strtod(s, &end);
+    if (end == s) return NOTSET;                     // nothing numeric at all
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end) return NOTSET;                         // trailing junk: "1e", "12x"
+    return std::isfinite(v) ? v : NOTSET;            // inf/nan are not measurements
+}
+// A double as text that reads back as the SAME double. The session file is
+// written at setprecision(9), which is right for a view offset and wrong for the
+// axis a fit is taken against: 1234567.89 comes back as 1234570. Nine digits
+// first, so every value that already round-tripped keeps its old spelling.
+static std::string fmtExact(double v) {
+    char b[48];
+    for (int p = 9; p < 17; p++) {
+        snprintf(b, sizeof b, "%.*g", p, v);
+        if (strtod(b, nullptr) == v) return b;
+    }
+    snprintf(b, sizeof b, "%.17g", v);
+    return b;
+}
+// The Linearity panel's numbers describe ONE set of members with ONE set of
+// values on the axis, and every label around them is read live off the series.
+// Change the series and a fit left standing is not merely old, it is relabelled:
+// lux measurements headed "DN/ms". linFitStale keeps the per-stack MEASUREMENTS
+// (they are DN whatever the axis says) and drops only the fit; linInvalidate
+// drops the rows too, for when the membership itself moved.
+static void linFitStale() { app.lin.fitValid = false; app.lin.rev++; }
+static void linInvalidate() {
+    app.lin.rows.clear();
+    app.lin.seriesId = 0;
+    app.lin.nPts = 0;
+    linFitStale();
+}
+// Points a fit would actually use: included, value SET (NaN is "unset", never
+// 0), and the stack still there.
+static int seriesFitPoints(const App::Series& S) {
+    int n = 0;
+    for (const auto& m : S.members)
+        if (m.include && std::isfinite(m.value) && seqInfo(m.seqId)) n++;
+    return n;
+}
+static const char* seriesKindName(int k) {
+    switch (k) {
+        case App::Series::KPtc:         return "PTC";
+        case App::Series::KTemperature: return "temperature";
+        case App::Series::KOther:       return "other";
+        default:                        return "linearity";
+    }
+}
+// Whether the Linearity panel's EQUATIONS are the ones this series asked for.
+// The canon (docs/terminology.md: 測定の種類 ... fit の式と出す量が決まる) makes
+// the kind decide that, and this panel knows exactly two: a straight response
+// against the swept parameter, and the photon transfer taken alongside it. A
+// temperature run pushed through them comes out as a "sensitivity" in DN per
+// degree, a system gain K read off stacks that differ in temperature rather
+// than in signal, and a read noise "measured in the level-0 stack" - meaning
+// whichever stack happened to sit at 0 degrees.
+static bool seriesFitKind(const App::Series& S) {
+    return S.kind == App::Series::KLinearity || S.kind == App::Series::KPtc;
+}
+// Two points, a named unit, and a kind whose equation this is. A series of one
+// is perfectly legal (it is being built); it just cannot be fitted yet. An unset
+// unit is the same kind of "not yet" - fitting without one would print numbers
+// per nothing.
+static bool seriesCanFit(const App::Series& S) {
+    return seriesFitKind(S) && S.unit[0] != '\0' && seriesFitPoints(S) >= 2;
+}
+// Every invariant the canon states, checked exhaustively. Used by
+// --series-selftest after every mutation; cheap enough to call from anywhere.
+static bool seriesAudit(std::string& why) {
+    std::vector<int> seen;
+    for (const auto& S : app.series) {
+        if (S.members.empty()) { why = "series '" + S.name + "' has no members"; return false; }
+        bool haveBatch = false;
+        for (const auto& b : app.batches) if (b.id == S.batchId) haveBatch = true;
+        if (!haveBatch) { why = "series '" + S.name + "' points at a dead batch"; return false; }
+        for (const auto& m : S.members) {
+            if (!seqInfo(m.seqId)) {
+                why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                      " does not exist";
+                return false;
+            }
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId != S.batchId) {
+                    why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                          " has a frame in batch " + std::to_string(d->batchId) +
+                          " (series batch " + std::to_string(S.batchId) + ")";
+                    return false;
+                }
+            for (int s : seen)
+                if (s == m.seqId) {
+                    why = "stack " + std::to_string(m.seqId) + " is in two series";
+                    return false;
+                }
+            seen.push_back(m.seqId);
+        }
+    }
+    why.clear();
+    return true;
+}
+
+// Close a set of images by index: erase in descending order so the indices stay
+// valid, one forget per cache that can name them, current re-picked at the end.
+static void closeImages(std::vector<int> idxs) {
+    if (idxs.empty()) return;
+    std::sort(idxs.begin(), idxs.end());
+    idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+    uint64_t curUid = cur() ? cur()->uid : 0;
+    bool closedCur = false;
+    for (int i = (int)idxs.size() - 1; i >= 0; i--) {
+        int idx = idxs[i];
+        if (idx < 0 || idx >= (int)app.images.size()) continue;
+        ImageDoc* im = app.images[idx].get();
+        if (im->uid == curUid) closedCur = true;
+        if (im->uid == app.previewUid) app.previewUid = 0;
+        forgetImage(im);
+        if (im->tex) glDeleteTextures(1, &im->tex);
+        app.images.erase(app.images.begin() + idx);
+    }
+    if (curUid) {                     // re-point current: same doc if it survived
+        if (!closedCur) {
+            app.current = -1;
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i]->uid == curUid) { app.current = i; break; }
+        }
+        if (closedCur || app.current < 0) {
+            app.current = app.images.empty() ? -1
+                        : std::min(idxs.front(), (int)app.images.size() - 1);
+            app.fitRequested = true;
+        }
+    } else if (app.current >= (int)app.images.size()) {
+        app.current = (int)app.images.size() - 1;
+    }
+    app.imagesRev++;
+    if (!resolveB()) {   // B went with them: a later same-name file must not
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
+    pruneEmptyBatches();
+}
+
+// Close every frame of a stack plus its SeqInfo, and stop everything that
+// would quietly regrow it: the sequence loader (pumpSequence stamps
+// seqLoadingId on frames as they land), the remote prefetch queue, the
+// linearity row, the server temporal result.
+static void closeStack(int seqId) {
+    if (seqId == 0) return;
+    if (app.seqLoadingId == seqId) { stopSequenceLoader(); app.seqLoadingId = 0; }
+    {   // queued remote prefetches. The ONE job the worker may be running right
+        // now cannot be removed here - pumpRemoteFetch drops its result on
+        // arrival instead (seqInfo(d.seqId) == nullptr). Both are needed.
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        int removed = 0;
+        for (auto it = app.rfQueue.begin(); it != app.rfQueue.end();)
+            if (it->seqId == seqId) { it = app.rfQueue.erase(it); removed++; }
+            else ++it;
+        app.rfPending -= removed;
+        if (app.rfPending <= 0) { app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; }
+    }
+    // rbOpenQueue entries carry no seqId yet, so a stack whose FOLDER is still
+    // queued may open later regardless - accepted; closeBatch removes those by
+    // batchId, which the queue does know.
+    closeImages(framesOfSeq(seqId));
+    for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+        if (it->id == seqId) { app.seqs.erase(it); break; }
+    // the stack is gone, so it is not a member of anything anymore; a series
+    // that held nothing else goes with it (docs/series-plan.md invariant 3)
+    removeFromSeries(seqId);
+    pruneEmptySeries();
+    for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
+        if (it->seqId == seqId) it = app.lin.rows.erase(it);
+        else ++it;
+    // ...and the fit that row was part of goes with it: dropping the dot while
+    // the line and the "%d points" count still include it is worse than saying
+    // "press Compute".
+    linFitStale();
+    app.temporal[0].seqId = app.temporal[1].seqId = -1;
+    if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
+    if (app.srvTemporalB.seqId == seqId) app.srvTemporalB = App::ServerTemporal{};
+}
+
+// Close a batch: every stack and loose frame in it, plus the queued opens that
+// would resurrect it the moment the fetcher goes idle. A series lives in
+// exactly one batch, so the batch's series go too - Close on a batch is the
+// canon's "discard the contents", not "ungroup".
+static void closeBatch(int batchId) {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->batchId == batchId) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+    std::vector<int> seqIds;
+    for (const auto& d : app.images)
+        if (d->batchId == batchId && d->seqId != 0 &&
+            std::find(seqIds.begin(), seqIds.end(), d->seqId) == seqIds.end())
+            seqIds.push_back(d->seqId);
+    for (int s : seqIds) closeStack(s);
+    std::vector<int> loose;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->batchId == batchId) loose.push_back(i);
+    closeImages(loose);
+    for (auto it = app.rbOpenQueue.begin(); it != app.rbOpenQueue.end();)
+        if (it->batchId == batchId) it = app.rbOpenQueue.erase(it);
+        else ++it;
+    for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
+        if (it->batchId == batchId) it = app.seqQueue.erase(it);
+        else ++it;
+    if (app.loadBatchId == batchId) app.loadBatchId = 0;
+    pruneEmptyBatches();       // the queue purge above may have freed this batch
+}
+
+// Ctrl+W: the stack when the frame is in one (the canon), the image otherwise.
+// frameOnly = the Ctrl+Alt+W escape hatch: just this one frame.
+static void closeCurrent(bool frameOnly = false) {
     ImageDoc* im = cur();
     if (!im) return;
+    if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
+    int seqId = im->seqId;
     forgetImage(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
     app.fitRequested = true;
+    app.imagesRev++;
+    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
+    // same-named frame of another stack (every stack has a frame_001.npy).
+    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
+    // this path duplicates closeImages' body and inherited the omission.
+    if (!resolveB()) {
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
+    // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
+    // too, or a zero-frame stack haunts the linearity table
+    if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
+    pruneEmptyBatches();
+}
+
+// Drop batches nothing references anymore: no image, no queued group, no
+// pending remote open, not the load target. Called after every close and after
+// every move - an empty Files heading is a lie about what is open. The preview
+// pseudo-batch stays: its emptiness is its normal state between previews.
+static void pruneEmptyBatches() {
+    for (auto it = app.batches.begin(); it != app.batches.end();) {
+        bool used = it->name == "preview" || app.loadBatchId == it->id;
+        if (!used)
+            for (const auto& d : app.images)
+                if (d->batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.seqQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.rbOpenQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used) {
+            it = app.batches.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Move a STACK between batches - the whole stack, per the canon's containment
+// (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
+// A member moved out ALONE leaves its series: series ⊂ batch is strict, and the
+// canon says say so rather than forbid it. Moving the series itself is a
+// different operation (it carries every member and its own batchId along).
+static void moveStackToBatch(int seqId, int batchId) {
+    if (App::Series* S = seriesOfStack(seqId))
+        if (S->batchId != batchId) {
+            std::string sn = S->name;
+            App::SeqInfo* si = seqInfo(seqId);
+            removeFromSeries(seqId);
+            pruneEmptySeries();
+            toast((si ? si->name : std::string("stack")) + " left series \"" + sn +
+                  "\" (moved to another batch)");
+        }
+    for (int idx : framesOfSeq(seqId)) app.images[idx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
+}
+// ---- what the Files panel's series row does (docs/series-plan.md §4) --------
+// Move a SERIES between batches: every member goes with it and so does the
+// series itself, so strict containment holds at every instant. The series'
+// batchId is set FIRST on purpose - moveStackToBatch drops a member whose
+// series stays behind, which is the right rule for a lone stack and exactly
+// the wrong one here.
+static void moveSeriesToBatch(int seriesId, int batchId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || batchId == 0 || S->batchId == batchId) return;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    S->batchId = batchId;
+    for (int s : ids) moveStackToBatch(s, batchId);
+    app.imagesRev++;
+}
+// UNGROUP (解散): take the fence away and leave everything standing. This is
+// NOT Close - nothing is discarded, every stack stays open exactly where it is
+// and merely stops being part of a sweep. The canon lists the two side by side
+// because they are different operations, not two words for one.
+static void ungroupSeries(int seriesId) {
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            std::string n = it->name;
+            int members = (int)it->members.size();
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            toast("ungrouped \"" + n + "\": " + std::to_string(members) +
+                  " stack(s) stay open");
+            break;
+        }
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+}
+// Close a series: the canon's Close, which discards the CONTENTS. Each member's
+// closeStack removes it from the series, and the last one takes the series with
+// it (pruneEmptySeries) - the erase below is only for a series whose members
+// were all gone already.
+static void closeSeries(int seriesId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S) return;
+    std::string n = S->name;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    for (int s : ids) closeStack(s);
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            break;
+        }
+    toast("closed series \"" + n + "\": " + std::to_string(ids.size()) + " stack(s)");
+}
+// "seqctx > Series > <name>": the one join that does not go through the modal.
+// A function like every other command behind a Files row, so the selftest can
+// press it. Returns false (and a reason) when strict containment refuses.
+//
+// The value comes from the stack's NAME and is said out loud - the menu item
+// showed it before the click, and the toast repeats both the number and the text
+// it was read out of. A name with nothing numeric in it joins UNSET, never at 0.
+static bool seriesJoinFromMenu(int seriesId, int seqId, std::string* msgOut) {
+    App::Series* S = seriesById(seriesId);
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!S || !si) return false;
+    std::string from;
+    double v = extractLevelFromName(si->name, &from);
+    // the series it is LEAVING: taking the last member out of one empties it
+    const App::Series* was = seriesOfStack(seqId);
+    int wasId = was && was->id != S->id ? was->id : 0;
+    std::string wasName = wasId ? was->name : std::string();
+    if (!addToSeries(S->id, seqId, v)) {
+        if (msgOut)
+            *msgOut = si->name + " is not in batch \"" + batchNameOf(S->batchId) +
+                      "\" - Move to batch first";
+        return false;
+    }
+    std::string msg = si->name + " joined series \"" + S->name + "\"";
+    if (std::isfinite(v)) {
+        char b[96];
+        snprintf(b, sizeof b, " at %.6g%s%s", v, S->unit[0] ? " " : "", S->unit);
+        msg += b;
+        if (!from.empty()) msg += " (read from \"" + from + "\")";
+    } else {
+        msg += " with NO value yet - set it in Edit...";
+    }
+    // Every other caller of addToSeries prunes; this one did not, so joining the
+    // sole member of one series into another left the first behind with zero
+    // members - the state plan §1 invariant 3 forbids and seriesAudit rejects.
+    pruneEmptySeries();
+    if (wasId && !seriesById(wasId)) msg += "; series \"" + wasName + "\" is now empty and gone";
+    linFitStale();          // the fit below was measured over the old membership
+    if (msgOut) *msgOut = msg;
+    return true;
+}
+// A standalone frame (no stack) hangs off the batch directly and moves alone.
+static void moveImageToBatch(int imageIdx, int batchId) {
+    if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
+    app.images[imageIdx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
 }
 static void closeAll() {
     app.ana.img = nullptr;
-    app.hist.img = nullptr;
-    app.proj.img = nullptr;
-    app.temporal.seqId = -1;
+    for (int k = 0; k < 2; k++) {     // both A and B slots
+        app.hist[k] = App::HistState{};
+        app.proj[k] = App::ProjState{};
+        app.temporal[k] = App::TemporalState{};
+    }
+    app.abSlot1Live = false;
     app.texLru.clear();
     app.imagesRev++;
     for (auto& d : app.images)
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.seqs.clear();
+    // Series name stacks that no longer exist; they go with them (and with the
+    // batches below - a series cannot outlive its batch). Pending restores name
+    // stacks of the list being thrown away, so they go too.
+    app.series.clear();
+    app.curSeriesId = 0;
+    app.seriesRestore.clear();
+    app.seqLevelLegacy.clear();
+    app.seriesPending.clear();                  // they named stacks being thrown away
+    // The batches go with their contents: an empty batch that survives Close
+    // All keeps its NAME reserved, so reopening the same folder came back as
+    // "multi (2)" - the uniquifier colliding with a ghost.
+    app.batches.clear();
+    app.loadBatchId = 0;
+    app.previewUid = 0;
+    app.previewFiles.clear();
+    app.previewLabel.clear();
     app.current = -1;
     // compare state refers to docs that no longer exist; leaving it would let a
     // later file with the same name silently become B again
@@ -2275,7 +3096,8 @@ static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 // Rendering is separate from writing so the crash handler can keep a pre-rendered
 // copy and never has to build one while the process is already dying.
-static void writeSessionTo(std::ostream& f) {
+static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
+                           int* lostMembersOut = nullptr) {
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << app.dispGamma << "\n";
@@ -2315,6 +3137,10 @@ static void writeSessionTo(std::ostream& f) {
     // display state that lives outside the per-image range
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
+    f << "rangescope " << app.rangeScope << "\n";
+    f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
+    f << "cmprange " << app.compareRangeMode << "\n";
+    f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2388,6 +3214,48 @@ static void writeSessionTo(std::ostream& f) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
         }
     }
+    // ---- series (系列), after the image lines -------------------------------
+    // A FLAT block with unique keys, on purpose: an older viewer skips every
+    // line it does not know and still opens the session, and this one opens a
+    // session with no block as zero series. Nothing else in the format moves.
+    //
+    // Members travel by the PATH OF THEIR FIRST FRAME. A stack NAME would be
+    // the obvious choice and is the wrong one: seqname is written but silently
+    // dropped on restore for folder stacks (when the line is parsed the stack
+    // does not exist yet - the frames arrive from a queued rescan), so half the
+    // members would resolve to nothing. A path is what the session already
+    // proves it can round-trip: it is how the image lines themselves work.
+    int lostSeries = 0, lostMembers = 0;
+    for (const auto& S : app.series) {
+        std::string bn = batchNameOf(S.batchId);
+        // no batch, nothing to restore it into - and nothing silently: the load
+        // side counts every member it cannot resolve, so the save side owes the
+        // same. A series that leaves the file is a sweep's worth of hand-typed
+        // parameter values gone.
+        if (bn.empty()) { lostSeries++; lostMembers += (int)S.members.size(); continue; }
+        f << "series " << S.name << "\n";              // name last on its line: spaces
+        f << "seriesbatch " << bn << "\n";             // by NAME, like imgbatch
+        f << "seriesparam " << S.paramName << "\n";
+        f << "seriesunit " << S.unit << "\n";          // empty line = unit not set
+        f << "serieskind " << S.kind << "\n";
+        for (const auto& m : S.members) {
+            std::vector<int> fr = framesOfSeq(m.seqId);
+            if (fr.empty()) { lostMembers++; continue; }
+            f << "seriesmember ";
+            // EXACTLY, not to the file-wide 9 digits: this is the axis a fit is
+            // taken against, and the modal no longer rounds it either.
+            if (std::isfinite(m.value)) f << fmtExact(m.value);
+            else f << "-";                             // "-" = unset, NOT zero
+            f << " " << (m.include ? 1 : 0) << " "
+              << app.images[fr.front()]->path << "\n";   // path last: spaces
+        }
+        f << "seriesend\n";
+    }
+    if (lostSeries || lostMembers)
+        fprintf(stderr, "series: NOT saved: %d series and %d member(s) had nothing to "
+                        "restore them from\n", lostSeries, lostMembers);
+    if (lostSeriesOut) *lostSeriesOut = lostSeries;
+    if (lostMembersOut) *lostMembersOut = lostMembers;
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " "
@@ -2407,8 +3275,15 @@ static void saveSession(std::string path, bool quiet = false) {
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
-    writeSessionTo(f);
-    if (!quiet) toast("session saved: " + baseName(path));
+    int lostSeries = 0, lostMembers = 0;
+    writeSessionTo(f, &lostSeries, &lostMembers);
+    if (quiet) return;
+    std::string msg = "session saved: " + baseName(path);
+    // the load side counts what it could not restore; so does this one now
+    if (lostSeries || lostMembers)
+        msg += " (" + std::to_string(lostSeries) + " series and " +
+               std::to_string(lostMembers) + " series member(s) could NOT be saved)";
+    toast(msg, lostSeries > 0 || lostMembers > 0);
 }
 
 static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
@@ -2466,6 +3341,9 @@ static void savePrefs() {
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "frame " << app.frameMode << "\n";
+    f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
+    f << "rbadv " << (app.rbAdvanced ? 1 : 0) << "\n";
+    f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -2502,6 +3380,9 @@ static void loadPrefs() {
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;
                                          app.frameMode = std::clamp(app.frameMode, 0, 1); }
+        else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
+        else if (key == "rbadv")       { ls >> v; app.rbAdvanced = v != 0; }
+        else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
             std::string s;
@@ -2600,6 +3481,7 @@ static std::string loadSession(const std::string& path) {
     // whole stack, so resolve it to a real index once that line is fully applied
     // (seqframe, which picks the frame, comes after the image line).
     int lineOrd = -1, wantCurrent = -1, resolvedCurrent = -1;
+    int curSeries = -1;               // index into app.seriesRestore, -1 = outside a block
     bool capturing = false;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
@@ -2621,6 +3503,15 @@ static std::string loadSession(const std::string& path) {
         else if (key == "current") ls >> wantCurrent;
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
+        else if (key == "rangescope") { ls >> app.rangeScope; }
+        else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
+        else if (key == "cmprange") { ls >> app.compareRangeMode; }
+        // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own".
+        // NOT onto the new default - it records a choice somebody actually made.
+        else if (key == "cmpshare") { int on = 1; ls >> on; app.compareRangeMode = on ? 1 : 0; }
+        else if (key == "abstats") { ls >> app.abStatsLayout >> app.histPlane;
+                                     app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
+                                     app.histPlane = std::clamp(app.histPlane, -1, 3); }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -2669,6 +3560,12 @@ static std::string loadSession(const std::string& path) {
                 ini += l2;
                 ini += "\n";
             }
+            {   // sessions saved before the "Remote" -> "Browse###Remote"
+                // rename: migrate the window entry or the panel undocks
+                size_t p;
+                while ((p = ini.find("[Window][Remote]")) != std::string::npos)
+                    ini.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+            }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);
             app.resetLayout = false;   // otherwise the default rebuild wipes it
@@ -2688,10 +3585,53 @@ static std::string loadSession(const std::string& path) {
             if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
                 if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
         }
-        else if (key == "seqlevel") {   // the exposure level of the stack above
+        // MIGRATION of the old per-stack level. saveSession has never written
+        // this key (verified over the whole history: no commit ever emitted
+        // it), so it fires only for hand-written or third-party files. Note the
+        // old reader also required cur()->seqId != 0, which is FALSE for a
+        // folder stack at parse time - it could only ever have worked for an
+        // in-file frame axis. This one keys on the PATH, which works for both,
+        // and turns into a series only where there is a sweep to speak of.
+        else if (key == "seqlevel") {
             double lv = 0; ls >> lv;
-            if (lastImageOk && cur() && cur()->seqId != 0)
-                if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->level = lv;
+            if (lastImageOk && cur() && !cur()->path.empty() && std::isfinite(lv))
+                app.seqLevelLegacy.push_back({ cur()->path, lv });
+        }
+        // ---- series (系列) block: collected here, RESOLVED later -------------
+        // Nothing can be looked up yet - a folder stack is still one loose image
+        // with a queued rescan behind it. See resolveSeriesRestore.
+        else if (key == "series") {
+            App::SeriesRestore r;
+            r.name = restOfLine(ls);
+            app.seriesRestore.push_back(std::move(r));
+            curSeries = (int)app.seriesRestore.size() - 1;
+        }
+        else if (key == "seriesend") curSeries = -1;
+        else if (key == "seriesbatch") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].batchName = restOfLine(ls);
+        }
+        else if (key == "seriesparam") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].paramName = restOfLine(ls);
+        }
+        else if (key == "seriesunit") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].unit = restOfLine(ls);
+        }
+        else if (key == "serieskind") {
+            if (curSeries >= 0) { int k = 0; ls >> k; app.seriesRestore[curSeries].kind = k; }
+        }
+        else if (key == "seriesmember") {   // "<value|-> <0|1> <path of frame 0>"
+            // Both fields as TEXT. A value this program cannot read is UNSET,
+            // not 0: atof() turns "notanumber", "1e" or a half-written line into
+            // a hard measurement at zero, which the fit then treats as the dark
+            // stack. A loader is exactly where that must not be assumed.
+            std::string v, inc;
+            ls >> v >> inc;
+            std::string p = restOfLine(ls);
+            if (curSeries >= 0 && !p.empty()) {
+                double val = parseSeriesValue(v.c_str());
+                if (v != "-" && !std::isfinite(val)) app.seriesRestore[curSeries].badValues++;
+                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p });
+            }
         }
         else if (key == "linunit") { std::string u = restOfLine(ls);
                                      snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
@@ -2709,7 +3649,9 @@ static std::string loadSession(const std::string& path) {
             if (on && lastImageOk && cur() && !cur()->path.empty() && cur()->seqId == 0) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
-                if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
+                // queued, not started: see App::seqRestore
+                if (files.size() >= 2)
+                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat });
             }
         }
         else if (key == "ann") {
@@ -2921,9 +3863,12 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
     }
     if (cands.size() < 2) return out;
 
-    // pick the digit field that varies (most distinct values); later field wins ties
+    // The frame axis is the LAST digit field that varies among the siblings -
+    // capture software puts the counter last (frame_001, IMG_0001, lv000_f02).
+    // Picking the field with the most distinct values instead made a folder of
+    // 10 illuminances x 3 frames group by ILLUMINANCE, so each "stack" spanned
+    // ten levels and its sigma_t meant nothing. The peer uses the same rule.
     int best = -1;
-    size_t bestCount = 0;
     for (size_t k = 0; k < segs.size(); k++) {
         if (!segs[k].digit) continue;
         std::vector<std::string> vals;
@@ -2938,7 +3883,7 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
             if (!dup) vals.push_back(c.segs[k].s);
         }
         (void)othersMatch;
-        if (vals.size() >= 2 && vals.size() >= bestCount) { bestCount = vals.size(); best = (int)k; }
+        if (vals.size() >= 2) best = (int)k;     // keep overwriting: the last wins
     }
     if (best < 0) return out;
 
@@ -2958,7 +3903,16 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
         // every all-digit sequence name in the picker ('?' also reads as glob)
         patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
     patternOut += ext;
-    for (auto& f : found) out.push_back(f.second);
+    std::vector<std::string> bases;
+    bases.reserve(found.size());
+    for (auto& f : found) {
+        out.push_back(f.second);
+        bases.push_back(baseName(f.second));
+    }
+    // ...then say what the '?' run actually spans. Same function the peer runs
+    // (rp::patternWithExtent): a folder opened locally and the same folder
+    // listed over ssh must produce the identical stack name.
+    patternOut = rp::patternWithExtent(patternOut, bases);
     return out;
 }
 
@@ -3120,6 +4074,9 @@ static void pumpSequence() {
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
             doc->cfaColorize = ref->cfaColorize;
             doc->displayLut = ref->displayLut;
+            // frame ⊂ stack ⊂ batch: every frame carries its stack's batch, or
+            // "close batch" / "move to batch" sees only the head frame
+            doc->batchId = ref->batchId;
         } else {
             defaultRange(*doc);
         }
@@ -3133,7 +4090,7 @@ static void pumpSequence() {
     double nowT = glfwGetTime();
     if (!app.seqRunning || nowT - lastTemporalInvalidate > 0.5) {
         lastTemporalInvalidate = nowT;
-        app.temporal.seqId = -1;
+        app.temporal[0].seqId = app.temporal[1].seqId = -1;
     }
     if (!app.seqRunning && app.seqThread.joinable()) {
         app.seqThread.join();
@@ -3153,10 +4110,215 @@ static bool seqReadyPending() {
     return !app.seqReady.empty();
 }
 
+// The stack a session's series member names, found by the path of its FIRST
+// frame. 0 = that frame is not open (or is not part of a stack).
+//
+// preferBatch disambiguates the case the canon explicitly blesses: reopening
+// the same folder makes a NEW batch, so one file is legitimately resident in two
+// stacks at once. Taking "the first one" then hands every member of the second
+// copy's series a stack in the wrong batch, strict containment rejects them all,
+// and the whole series is lost - permanently, at the next autosave.
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0) {
+    int any = 0;
+    for (const auto& d : app.images) {
+        if (d->seqId == 0 || d->path != path) continue;
+        if (preferBatch && d->batchId == preferBatch) return d->seqId;
+        if (!any) any = d->seqId;
+    }
+    return any;
+}
+
+// Turn what the session file said into real series. Runs once, when every
+// stack the file asked for exists - a member cannot be looked up before then.
+// Members that cannot be found are COUNTED and reported: silently dropping
+// points out of a measurement is the one thing this must not do.
+static void resolveSeriesRestore() {
+    int made = 0, lost = 0, lostSeries = 0, badValues = 0;
+    for (const auto& R : app.seriesRestore) {
+        badValues += R.badValues;
+        int bid = 0;
+        for (const auto& b : app.batches) if (b.name == R.batchName) bid = b.id;
+        if (!bid) { lostSeries++; lost += (int)R.members.size(); continue; }
+        std::vector<App::Series::Member> ms;
+        for (const auto& m : R.members) {
+            int sid = seqIdOfFirstFramePath(m.path, bid);
+            // strict containment survives the round trip too, or not at all
+            if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
+            bool dup = false;
+            for (const auto& x : ms) if (x.seqId == sid) dup = true;
+            if (dup) continue;
+            ms.push_back({ sid, m.value, m.include });
+        }
+        if (ms.empty()) { lostSeries++; continue; }
+        int id = newSeries(bid, R.name);
+        for (const auto& m : ms) {           // at most one series per stack
+            App::Series* other = seriesOfStack(m.seqId);
+            if (other && other->id != id) removeFromSeries(m.seqId);
+        }
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = R.paramName;
+            snprintf(S->unit, sizeof S->unit, "%s", R.unit.c_str());
+            S->kind = std::clamp(R.kind, 0, 3);
+            S->members = std::move(ms);
+            made++;
+        }
+    }
+    app.seriesRestore.clear();
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made || lost || lostSeries || badValues) {
+        std::string msg = "restored " + std::to_string(made) + " series";
+        if (lost || lostSeries)
+            msg += "; " + std::to_string(lost) + " member(s) and " +
+                   std::to_string(lostSeries) + " series could not be resolved";
+        // a value the file states but this program cannot read is left UNSET,
+        // and that is a fit point fewer than the file claims - say so
+        if (badValues)
+            msg += "; " + std::to_string(badValues) +
+                   " unreadable value(s) left unset (never 0)";
+        toast(msg, lost > 0 || lostSeries > 0 || badValues > 0);
+        fprintf(stderr, "series: %s\n", msg.c_str());
+    }
+}
+
+// Old sessions that carried a per-stack "seqlevel": one series per BATCH that
+// actually has two or more levelled stacks, named "<batch> 掃引", unit = the
+// prefill, kind = linearity. A batch with fewer gets NOTHING - guessing a sweep
+// out of the folder structure is precisely what the canon forbids.
+static void migrateLegacyLevels() {
+    std::vector<std::pair<int, double>> lvl;      // seqId -> level
+    for (const auto& p : app.seqLevelLegacy) {
+        int sid = seqIdOfFirstFramePath(p.first);
+        if (!sid || seriesOfStack(sid)) continue;   // an explicit series wins
+        bool dup = false;
+        for (const auto& q : lvl) if (q.first == sid) dup = true;
+        if (!dup) lvl.emplace_back(sid, p.second);
+    }
+    app.seqLevelLegacy.clear();
+    std::vector<int> batches;
+    for (const auto& q : lvl) {
+        int b = batchOfStack(q.first);
+        if (!b) continue;
+        bool seen = false;
+        for (int x : batches) if (x == b) seen = true;
+        if (!seen) batches.push_back(b);
+    }
+    int made = 0;
+    for (int b : batches) {
+        int n = 0;
+        for (const auto& q : lvl) if (batchOfStack(q.first) == b) n++;
+        if (n < 2) continue;                        // not a sweep, do not invent one
+        int id = newSeries(b, "");
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = "level";
+            snprintf(S->unit, sizeof S->unit, "%s", app.lin.unit);
+            S->kind = App::Series::KLinearity;
+        }
+        for (const auto& q : lvl)
+            if (batchOfStack(q.first) == b) addToSeries(id, q.first, q.second);
+        made++;
+    }
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made) {
+        toast("migrated " + std::to_string(made) +
+              " series from an old session's stack levels");
+        fprintf(stderr, "series: migrated %d from seqlevel\n", made);
+    }
+}
+
+// The picker's "open as a sweep", once its stacks exist. Matching is BY NAME:
+// the group name the picker accepted becomes the stack's name, and for a remote
+// stack it is that name plus " [remote xN]" (openRemoteStack). The remote queue
+// carries no seqId at all, so there is nothing else to match on.
+//
+// Nothing here invents anything: the values were read from the group names and
+// shown in the picker before Load was pressed, and a group whose stack never
+// opened is COUNTED and said out loud rather than dropped.
+static void resolveOnePendingSeries(const App::SeriesPending& P) {
+    std::vector<int> used;
+    int id = 0, made = 0, lost = 0;
+    for (const auto& e : P.byName) {
+        int seqId = 0;
+        for (const auto& si : app.seqs) {
+            if (batchOfStack(si.id) != P.batchId) continue;
+            if (std::find(used.begin(), used.end(), si.id) != used.end()) continue;
+            bool same = si.name == e.first ||
+                        (si.name.size() > e.first.size() + 10 &&
+                         si.name.compare(0, e.first.size(), e.first) == 0 &&
+                         si.name.compare(e.first.size(), 10, " [remote x") == 0);
+            if (same) { seqId = si.id; break; }
+        }
+        if (!seqId) { lost++; continue; }
+        used.push_back(seqId);
+        if (!id) {                       // the first member that resolves makes it
+            id = newSeries(P.batchId, P.name);
+            if (App::Series* S = seriesById(id)) {
+                S->paramName = P.paramName;
+                snprintf(S->unit, sizeof S->unit, "%s", P.unit.c_str());
+                S->kind = P.kind;
+            }
+        }
+        if (addToSeries(id, seqId, e.second)) made++;
+        else lost++;
+    }
+    // In VALUE order, not the order the folders happened to sort in: the groups
+    // arrive as 0,10,160,20,320,40,80 (lexicographic), and a sweep is a
+    // parameter axis - reading it out of order is reading it wrong. Unset
+    // values keep their relative order and go last (they are not "before 0").
+    // The modal's arrows and "Sort by value" still own the order after this.
+    if (App::Series* S = seriesById(id))
+        std::stable_sort(S->members.begin(), S->members.end(),
+                         [](const App::Series::Member& a, const App::Series::Member& b) {
+                             bool fa = std::isfinite(a.value), fb = std::isfinite(b.value);
+                             if (fa != fb) return fa;          // set before unset
+                             return fa && a.value < b.value;
+                         });
+    pruneEmptySeries();
+    if (id && seriesById(id)) app.curSeriesId = id;
+    const App::Series* S = seriesById(id);
+    std::string msg = "sweep: " + std::to_string(made) + " stack(s) in series \"" +
+                      (S ? S->name : std::string("(none)")) + "\"";
+    if (lost) msg += "; " + std::to_string(lost) + " could not be matched";
+    toast(msg, lost > 0);
+    fprintf(stderr, "series: %s\n", msg.c_str());
+}
+// Every sweep the picker was told to open, in the order it was told. They all
+// wait for the same drain (a member cannot be looked up before its stack
+// exists), so they all resolve here - none of them is thrown away because a
+// second Open happened while the first was still loading.
+static void resolvePendingSeries() {
+    std::vector<App::SeriesPending> queue;
+    queue.swap(app.seriesPending);
+    for (const auto& P : queue) resolveOnePendingSeries(P);
+}
+
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
+    // one restore at a time, matched by uid: indices shift as frames land
+    if (!app.seqRestore.empty() && !app.seqRunning && !seqReadyPending()) {
+        App::SeqRestore r = std::move(app.seqRestore.front());
+        app.seqRestore.erase(app.seqRestore.begin());
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
+                startSequenceLoad(i, r.files, r.pattern);
+                break;
+            }
+        return;                 // let it start before chaining anything else
+    }
     if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
+    // Series LAST, and only once everything a member could name is open: the
+    // stacks arrive over many frames, and a lookup one frame too early would
+    // report perfectly good members as missing.
+    if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty() ||
+         !app.seriesPending.empty()) &&
+        !app.seqRunning && app.seqQueue.empty() && app.seqRestore.empty() &&
+        app.rbOpenQueue.empty() && !seqReadyPending()) {
+        if (!app.seriesRestore.empty()) resolveSeriesRestore();
+        if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
+        if (!app.seriesPending.empty()) resolvePendingSeries();
+    }
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -3209,6 +4371,17 @@ static void selectImage(int idx) {
     }
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
+    // Held-down frame stepping: B's caches cost real milliseconds per step
+    // (measured, see the A/B stats commits), so a key repeat would drag the
+    // whole UI down for as long as the key is held. Two switches inside 300 ms
+    // means "still stepping"; the B slots then hold their last result and say
+    // so, and refresh once the stepping stops. Same shape as annBusy.
+    {
+        static double lastSwitch = -1e9;
+        double now = glfwGetTime();
+        if (now - lastSwitch < 0.30) app.abStepBusyUntil = now + 0.30;
+        lastSwitch = now;
+    }
     app.current = idx;
     ImageDoc* d = app.images[idx].get();
     // Value-range scope. The stack default (frames inherit the reference
@@ -3218,9 +4391,9 @@ static void selectImage(int idx) {
     //   1 per stack  - the inherited behavior (default, unchanged)
     //   2 everything - the range follows you across stacks too
     if (prev && d != prev) {
-        if (app.rangeScope == 0) defaultRange(*d);
-        else if (app.rangeScope == 2) { d->black = prev->black; d->white = prev->white; }
-        if (app.rangeScope != 1) d->texDirty = true;
+        // linked mode overlays one range non-destructively (effBlack/effWhite),
+        // so only auto-per-frame touches the image's own numbers here
+        if (app.rangeScope == 0 && !app.linkRange) { defaultRange(*d); d->texDirty = true; }
     }
     if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
         app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
@@ -3410,10 +4583,18 @@ static void startNextQueuedGroup() {
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
     if (groups.empty()) return;
     app.folderRecipeValid = false;
-    app.seqQueue = std::move(groups);
-    int frames = 0;
-    for (const auto& g : app.seqQueue) frames += (int)g.files.size();
-    toast("opening " + std::to_string(app.seqQueue.size()) + " stack(s), " +
+    // APPEND. This used to be `app.seqQueue = std::move(groups)`, so a second
+    // Open while the first was still loading silently CANCELLED every stack the
+    // first Open had not started yet - the second Open's folder came up looking
+    // complete while most of the first one was simply gone. startNextQueuedGroup
+    // already refuses to start while one is running, so the queue just gets
+    // longer. (Found while reproducing the series pending-slot finding: fixing
+    // the slot alone still left the first sweep with one stack out of seven.)
+    int added = (int)groups.size(), frames = 0;
+    for (const auto& g : groups) frames += (int)g.files.size();
+    app.seqQueue.insert(app.seqQueue.end(), std::make_move_iterator(groups.begin()),
+                        std::make_move_iterator(groups.end()));
+    toast("opening " + std::to_string(added) + " stack(s), " +
           std::to_string(frames) + " files");
     startNextQueuedGroup();
 }
@@ -3577,6 +4758,20 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.folderPickHost = host;
     app.pickFilter[0] = 0;                 // a leftover filter would silently cut
     app.pickMerge = 0;                     // the new scan - start every scan clean
+    app.pickBatchMode = 0;                 // batch layout too: one batch is the canon
+    // ...and the sweep, which is the one that could invent a measurement: a
+    // parameter name and a unit left over from the last Open would be applied to
+    // a folder that has nothing to do with it, and "単位を仮定しない" means not
+    // assuming the PREVIOUS one either.
+    app.pickSweep = false;
+    app.pickSweepParam[0] = '\0';
+    app.pickSweepUnit[0] = '\0';
+    {   // batch names stem from the scanned root's leaf ("batchset", "scanroot")
+        std::string leaf = rootN;
+        size_t sl = leaf.find_last_of('/');
+        if (sl != std::string::npos && sl + 1 < leaf.size()) leaf = leaf.substr(sl + 1);
+        app.folderPickBatchBase = leaf.empty() ? "opened" : leaf;
+    }
     applyPickFilter();
     app.folderPickOpen = true;
 }
@@ -3592,10 +4787,9 @@ static void openFolder(const std::string& path) {
     // a single sequence), and "Always load folder" no longer mutes it: that
     // setting keeps its original job - loading a single FILE's numbered
     // siblings without asking. Headless callers auto-accept via pickerAccept().
-    {   // one fresh batch per Open Folder, named for the root (rename later)
-        int b = newBatch(baseName(path));
-        for (auto& g : groups) g.batchId = b;
-    }
+    // Batches are created at ACCEPT time (pickerAccept), not here: creating one
+    // per scan left an empty batch behind on Cancel, and the picker's batch
+    // mode (one / per top folder) is only known once the user answers.
     openPickerWith(std::move(groups), path, path, false, "");
 }
 
@@ -3660,9 +4854,52 @@ static void pickerAccept() {
     std::vector<App::PendingGroup> sel = pickerSelection(&err);
     bool remote = app.folderPickRemote;
     std::string host = app.folderPickHost;
+    // "as a sweep" is exclusive with batch-per-top-folder HERE, not only in the
+    // dialog: a series lives in one batch, and that has to hold for every
+    // caller, headless ones included.
+    bool sweep = app.pickSweep && app.pickMerge == 0;
+    int batchMode = (app.pickMerge == 1 || sweep) ? 0 : app.pickBatchMode;
+    std::string swParam = app.pickSweepParam, swUnit = app.pickSweepUnit;
+    app.pickSweep = false;            // a per-Open choice, never sticky
+    std::string batchBase = app.folderPickBatchBase;
     app.folderPick.clear();
     app.folderPickOpen = false;
     if (sel.empty()) { toast(err.empty() ? "nothing selected" : err, true); return; }
+    // Batches are created HERE, on accept - Cancel used to leave an empty one
+    // behind. Mode 0 (default): the whole Open is one batch named for the root.
+    // Mode 1: one batch per TOP folder of the group name, "root/00" style, so
+    // per-condition folders open as ready-made analysis groupings.
+    if (batchMode == 1) {
+        std::vector<std::pair<std::string, int>> made;   // top folder -> batchId
+        for (auto& g : sel) {
+            size_t sl = g.name.find('/');
+            std::string top = sl == std::string::npos ? std::string() : g.name.substr(0, sl);
+            int id = 0;
+            for (const auto& m : made) if (m.first == top) id = m.second;
+            if (!id) {
+                id = newBatch(uniqueBatchName(top.empty() ? batchBase
+                                                          : batchBase + "/" + top));
+                made.emplace_back(top, id);
+            }
+            g.batchId = id;
+        }
+    } else {
+        int id = newBatch(uniqueBatchName(batchBase));
+        for (auto& g : sel) g.batchId = id;
+    }
+    // The sweep is only a NOTE here - the stacks do not exist yet, and half of
+    // them will arrive over the next several seconds. Built before sel is moved
+    // away below; two groups minimum, because one point is not a sweep.
+    if (sweep && sel.size() >= 2) {
+        App::SeriesPending P;
+        P.batchId = sel.front().batchId;
+        P.paramName = swParam;
+        P.unit = swUnit;                       // may be empty: then no fit, and
+        P.kind = App::Series::KLinearity;      // the panel says exactly that
+        for (const auto& g : sel)
+            P.byName.emplace_back(g.name, extractLevelFromName(g.name));
+        app.seriesPending.push_back(std::move(P));   // QUEUED, never overwritten
+    }
     if (remote) {
         // remote groups: through the open queue, one stack at a time, so the
         // memory budget is applied against reality
@@ -3748,8 +4985,14 @@ static void drawFolderPickModal() {
         mixedRawNpy = anyRaw && anyNpy;
     }
     bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
-    float footer = ImGui::GetFrameHeightWithSpacing() * 2 +
-                   ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
+    // The sweep row exists only where a sweep could: separate stacks, two or
+    // more of them. Hidden, the box is FORCED OFF - a control nobody can see
+    // must not be able to create a series (docs/terminology.md: never auto).
+    const bool sweepRow = app.pickMerge == 0 && selGroups >= 2;
+    if (!sweepRow) app.pickSweep = false;
+    float footer = ImGui::GetFrameHeightWithSpacing() * (sweepRow ? 4 : 3) +
+                   ImGui::GetTextLineHeightWithSpacing() *
+                       ((mergeWarn ? 2 : 1) + (app.pickSweep ? 1 : 0));
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
     std::vector<std::string> folders;
@@ -3810,6 +5053,26 @@ static void drawFolderPickModal() {
                              e.g.shape.empty() ? "" : "  ", e.g.shape.c_str());
                 ImGui::TextUnformatted(lb);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
+                // the sweep preview: the value this group's NAME suggests, on
+                // the row it was read from, BEFORE Load is pressed. A proposal
+                // nobody looked at is not a confirmation.
+                if (app.pickSweep && e.selected) {
+                    std::string from;
+                    double v = extractLevelFromName(e.g.name, &from);
+                    ImGui::SameLine();
+                    if (std::isfinite(v))   // a number per NOTHING says so, here too
+                        ImGui::TextDisabled("-> %.6g %s", v,
+                                            app.pickSweepUnit[0] ? app.pickSweepUnit
+                                                                 : "[unit not set]");
+                    else
+                        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "-> no value in the name");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(std::isfinite(v)
+                            ? "read from \"%s\" - correct it later in Edit series..."
+                            : "nothing numeric in \"%s\": this stack joins UNSET,\n"
+                              "and an unset value never enters a fit as 0.",
+                            from.empty() ? e.g.name.c_str() : from.c_str());
+                }
                 if (open) {
                     std::vector<int> vis;          // files the filter keeps
                     vis.reserve(e.nMatch);
@@ -3848,6 +5111,88 @@ static void drawFolderPickModal() {
                               "frames in natural (numeric) order - for a capture\n"
                               "split across folders, or a filtered subset");
     }
+    // batch row: how the accepted selection is GROUPED in the Files panel.
+    // One batch per Open is the canon's default; per-top-folder splits a root
+    // of condition folders into ready-made analysis groupings. Merge wins over
+    // this (a single merged stack is one batch by construction).
+    {
+        int topFolders = 0;
+        {
+            std::vector<std::string> tops;
+            for (const auto& e : app.folderPick) {
+                if (!e.selected || e.nMatch == 0) continue;
+                size_t sl = e.g.name.find('/');
+                std::string top = sl == std::string::npos ? std::string()
+                                                          : e.g.name.substr(0, sl);
+                bool dup = false;
+                for (const auto& t : tops) if (t == top) { dup = true; break; }
+                if (!dup) tops.push_back(top);
+            }
+            topFolders = (int)tops.size();
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("batch:");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(app.pickMerge == 1 || app.pickSweep);
+        ImGui::RadioButton("one batch###batch0", &app.pickBatchMode, 0);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("everything from this Open lands under ONE Files heading");
+        ImGui::SameLine();
+        char b1[80];
+        snprintf(b1, sizeof b1, "%d batches (one per top folder)###batch1", topFolders);
+        ImGui::RadioButton(b1, &app.pickBatchMode, 1);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(app.pickSweep
+                ? "not while \"open as a sweep\" is on: a series lives in ONE\n"
+                  "batch, so one batch is the only grouping that can hold it"
+                : "each top-level folder of the scanned root becomes\n"
+                  "its own batch (its own Files heading)");
+        ImGui::EndDisabled();
+    }
+    // ---- row 3: open as a sweep (docs/series-plan.md §5) --------------------
+    // The one place in the program that creates a series without the modal, and
+    // it does it because a human ticked a box that says so. Unticked, NOTHING
+    // is created - a sweep guessed from a folder tree is a lie that fits.
+    if (sweepRow) {
+        ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+                              "the value read from its name, and linearity / PTC measure the\n"
+                              "series as a whole.\n"
+                              "Nothing is created unless this is ticked.", selGroups);
+        if (app.pickSweep) {
+            app.pickBatchMode = 0;              // series ⊂ batch, strictly
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+            ImGui::InputTextWithHint("##swparam", "parameter", app.pickSweepParam,
+                                     sizeof app.pickSweepParam);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            ImGui::InputTextWithHint("##swunit", "unit", app.pickSweepUnit,
+                                     sizeof app.pickSweepUnit);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("lx, ms, photons/px ... LEAVE IT EMPTY if you do not\n"
+                                  "know yet: an unset unit means no fit, which is the\n"
+                                  "honest answer, and Edit series... sets it later.");
+        }
+    }
+    if (app.pickSweep) {
+        int valued = 0;
+        for (const auto& e : app.folderPick)
+            if (e.selected && e.nMatch && std::isfinite(extractLevelFromName(e.g.name)))
+                valued++;
+        if (valued < selGroups)
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                               "%d of %d have a value in their name; the rest join UNSET "
+                               "(never 0)", valued, selGroups);
+        else if (!app.pickSweepUnit[0])
+            ImGui::TextDisabled("all %d have a value. No unit yet - the series opens, "
+                                "the fit waits for one.", valued);
+        else
+            ImGui::TextDisabled("all %d have a value, in %s", valued, app.pickSweepUnit);
+    }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
@@ -3861,13 +5206,16 @@ static void drawFolderPickModal() {
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
         ImGui::TextDisabled("check the shape column above to see which sequences differ");
     ImGui::BeginDisabled(!loadable);
-    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack" : "Load selected",
+    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
+                              : app.pickSweep   ? "Load as a sweep"
+                                                : "Load selected",
                               ImVec2(150 * app.uiScale, 0));
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         app.folderPick.clear();
         app.folderPickOpen = false;
+        app.pickSweep = false;         // Cancel decides nothing, here least of all
         ImGui::CloseCurrentPopup();
     }
     if (load) {
@@ -3899,9 +5247,10 @@ static void maybeOfferSequence(int imageIdx) {
 // ---------------------------------------------------------------- temporal analysis
 // Built-in (L2): per-frame mean/std over the current ROI plus the temporal /
 // fixed-pattern noise split — the same decomposition EMVA 1288 is built on.
-static void recomputeTemporalIfNeeded() {
-    ImageDoc* im = cur();
-    App::TemporalState& T = app.temporal;
+// The cache slot is a parameter, not app.temporal: slot 0 is A, slot 1 is the
+// compare B side. The body is otherwise unchanged - which is the point, A's
+// numbers must not move because a B exists.
+static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T) {
     if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
     std::vector<int> f = framesOfSeq(im->seqId);
     if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
@@ -4273,11 +5622,12 @@ static uint64_t g_measureToken = 1;
 // Fire the server-side temporal aggregate for a remote stack, if policy allows.
 // The result feeds the Temporal panel with a [server, N frames] tag, in seconds,
 // without waiting for any frame transfer.
-static void maybeRequestServerTemporal(int seqId) {
+// `into` is the slot the answer lands in: app.srvTemporal for A (automatic),
+// app.srvTemporalB for the compare side (button only - see the struct).
+static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     App::SeqInfo* si = nullptr;
     for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
     if (!si || !serverComputes(*si)) return;
-    App::ServerTemporal& S = app.srvTemporal;
     S = App::ServerTemporal{};
     S.seqId = seqId;
     S.token = g_measureToken++;
@@ -4293,6 +5643,41 @@ static void maybeRequestServerTemporal(int seqId) {
         j.url = si->remoteUrl;
     }
     mEnqueue(std::move(j));
+}
+static void maybeRequestServerTemporal(int seqId) {
+    requestServerTemporal(seqId, app.srvTemporal);
+}
+
+// Temporal stats for a stack that is NOT opened: fired from the browser's group
+// row / multi-selection, so the answer to "is this set worth transferring?"
+// costs zero pixels. Runs on the MEASURE worker - the browse worker serializes
+// behind LIST/SCAN and shares the browsing ssh session, so a 300-frame
+// aggregate there would freeze navigation. cfaType stays 0 on purpose:
+// guessing a mosaic for a file nobody opened would silently split the planes
+// wrong - the panel tag says plane=all instead.
+static void requestBrowseTemporal(const std::string& host,
+                                  std::vector<std::string> files,
+                                  const std::string& label) {
+    if (files.empty()) return;
+    sortFramesNumerically(files);
+    App::ServerTemporal& S = app.srvTemporal;
+    S = App::ServerTemporal{};
+    S.seqId = -2;                     // sentinel: no SeqInfo backs this result
+    S.detached = true;
+    S.label = label;
+    S.host = host;
+    S.files = files;
+    S.token = g_measureToken++;
+    S.pending = true;
+    App::MJob j;
+    j.token = S.token;
+    j.op = rp::MOP_TEMPORAL_STATS;
+    j.url = makeRemoteUrl(host, files[0]);
+    if (files.size() > 1)
+        for (const auto& f : files) j.files.push_back(f);
+    mEnqueue(std::move(j));
+    app.showTemporal = true;          // the result lands in the Temporal panel
+    app.focusTemporal = true;
 }
 
 // ---- the connect/browse worker -------------------------------------------------
@@ -4461,17 +5846,13 @@ static void pumpRemoteBrowse() {
                 return a == "/" ? "/" + b : a + "/" + b;
             };
             std::vector<App::PendingGroup> groups;
-            std::string broot = r.dir;
-            while (broot.size() > 1 && broot.back() == '/') broot.pop_back();
-            size_t bsl = broot.find_last_of('/');
-            int scanBatch = newBatch(bsl == std::string::npos || bsl + 1 >= broot.size()
-                                     ? broot : broot.substr(bsl + 1));
+            // batchId stays 0 here: batches are made at ACCEPT time in
+            // pickerAccept (Cancel must not leave an empty batch behind)
             for (const auto& g : r.scanGroups) {
                 App::PendingGroup pg;
                 pg.name = g.dir.empty() ? g.entry.name : g.dir + "/" + g.entry.name;
                 std::string base = joinR(r.dir, g.dir);
                 for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
-                pg.batchId = scanBatch;
                 if (g.entry.hasMeta && g.entry.ndim > 0) {   // v3 metadata -> the
                     for (int d = 0; d < g.entry.ndim; d++)   // picker's shape column
                         pg.shape += (d ? "x" : "") + std::to_string(g.entry.dims[d]);
@@ -4500,6 +5881,22 @@ static void pumpRemoteBrowse() {
             }
             continue;
         }
+        if (r.kind == App::RbTreeList) {
+            // A node's children. It must NOT touch B.dir / B.entries / recents:
+            // expanding a folder in the tree is not a navigation.
+            app.rbTreePending.erase(std::remove(app.rbTreePending.begin(),
+                                                app.rbTreePending.end(), r.dir),
+                                    app.rbTreePending.end());
+            if (r.ok) app.rbTreeCache[r.dir] = std::move(r.entries);
+            else {
+                // an unreadable folder collapses again, with a reason
+                app.rbExpanded.erase(std::remove(app.rbExpanded.begin(),
+                                                 app.rbExpanded.end(), r.dir),
+                                     app.rbExpanded.end());
+                toast(r.dir + ": " + r.err, true);
+            }
+            continue;
+        }
         if (!r.ok) {
             B.err = r.err;
             if (r.kind == App::RbConnect) {
@@ -4525,6 +5922,7 @@ static void pumpRemoteBrowse() {
         }
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
+            rbTreeForget();               // another machine: other children entirely
             // a listing nobody can see is not a connection anyone believes in
             app.showRemote = true;
             app.focusRemote = true;
@@ -4553,6 +5951,37 @@ static void pumpRemoteBrowse() {
             openRemote(u);
         }
     }
+}
+
+// ---- tree mode: expand / collapse one node ------------------------------------
+// Expanding is LAZY and asynchronous: the LIST goes to the browse worker, and
+// the node shows "(listing...)" until the answer lands in the cache. Collapsing
+// keeps the cache, so opening the same node again costs nothing at all - which
+// is the whole reason a tree is usable over ssh.
+static bool rbHas(const std::vector<std::string>& v, const std::string& s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+}
+static void rbTreeExpand(const std::string& dir) {
+    if (!rbHas(app.rbExpanded, dir)) app.rbExpanded.push_back(dir);
+    if (app.rbTreeCache.count(dir) || rbHas(app.rbTreePending, dir)) return;
+    app.rbTreePending.push_back(dir);
+    app.rbTreeLists++;
+    App::RbJob j;
+    j.kind = App::RbTreeList;
+    j.host = app.rbrowse.host;
+    j.port = app.rbrowse.port;
+    j.dir = dir;
+    rbEnqueue(std::move(j));
+}
+static void rbTreeCollapse(const std::string& dir) {
+    app.rbExpanded.erase(std::remove(app.rbExpanded.begin(), app.rbExpanded.end(), dir),
+                         app.rbExpanded.end());
+}
+// A different machine, or "list this again": the cached children are stale.
+static void rbTreeForget() {
+    app.rbTreeCache.clear();
+    app.rbExpanded.clear();
+    app.rbTreePending.clear();
 }
 
 // Browse one directory on the connected server (async: a dead link hangs the
@@ -4699,6 +6128,29 @@ static void dropPreview() {
             break;
         }
     app.previewUid = 0;
+    // the sequence it belonged to goes with it (stepPreviewFrame restores its
+    // own copy across the openRemote inside a step)
+    app.previewFiles.clear();
+    app.previewIndex = 0;
+    app.previewLabel.clear();
+}
+
+// Walk the previewed sequence without opening it. Each step replaces the one
+// preview slot, so browsing a 300-frame capture costs one frame of transfer at
+// a time - the whole point of previewing rather than opening.
+static void stepPreviewFrame(int delta) {
+    if (app.previewFiles.size() < 2) return;
+    int n = (int)app.previewFiles.size();
+    int want = std::clamp(app.previewIndex + delta, 0, n - 1);
+    if (want == app.previewIndex) return;
+    std::string host = app.rbrowse.host;
+    std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
+    std::string label = app.previewLabel;
+    app.previewIndex = want;
+    openRemote(makeRemoteUrl(host, files[want]), true);
+    app.previewFiles = std::move(files);
+    app.previewIndex = want;
+    app.previewLabel = std::move(label);
 }
 
 static void openRemote(const std::string& url, bool asPreview) {
@@ -4962,7 +6414,28 @@ static void openFolderDialog() {
         return;
     }
     if (app.folderDlg) return;
+    app.folderDlgMode = 0;
     app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+}
+// The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
+// folder opens in the Browse panel through the LOCAL peer - the same listing,
+// grouping, filters and server stats a remote machine gets, on this disk.
+static void browseLocalFolder(std::string p) {
+    if (p.empty()) return;
+    std::replace(p.begin(), p.end(), '\\', '/');
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    startRemote("local://" + p);
+    app.showRemote = true;
+    app.focusRemote = true;
+}
+static void browseFolderDialog() {
+    if (!pfd::settings::available()) {
+        toast("no file-dialog backend found (install zenity or kdialog)", true);
+        return;
+    }
+    if (app.folderDlg) return;
+    app.folderDlgMode = 1;
+    app.folderDlg = std::make_unique<pfd::select_folder>("Browse folder (local)");
 }
 static void saveSessionDialog() {
     if (app.images.empty()) { toast("nothing to save - no images loaded", true); return; }
@@ -4997,7 +6470,10 @@ static void pollFileDialog() {           // called once per frame from the main 
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
-        if (!p.empty()) openFolder(p);
+        if (!p.empty()) {
+            if (app.folderDlgMode == 1) browseLocalFolder(p);   // Browse panel
+            else openFolder(p);                                 // load stacks
+        }
     }
 }
 
@@ -5160,6 +6636,12 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
+    // A shared range moves as you step (mode 2 refits to the frame pair), and a
+    // texture built with the old one is a wrong picture, not a stale label - so
+    // both sides are checked against what they would be built with NOW.
+    for (ImageDoc* d : { im, imB })
+        if (d && (d->texBlack != effBlack(*d) || d->texWhite != effWhite(*d)))
+            d->texDirty = true;
     const bool split = imB && app.compareMode == App::CmpSplit;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
     const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
@@ -5809,8 +7291,19 @@ static void drawCanvas(ImVec2 avail) {
     }
 }
 
-static void recomputeHistogramIfNeeded(ImageDoc* im) {
-    App::HistState& H = app.hist;
+// The cache slot is a parameter (slot 0 = A, slot 1 = compare B). Everything
+// below is the previous body with `app.hist` replaced by `H`.
+//
+// binBlack / binWhite: the value range the 256 bins span. NaN (the default, and
+// what A always passes) means the image's own display range. The B slot is
+// handed A's range instead: two histograms sharing one x axis have to be BINNED
+// alike or the overlay is a lie - and it keeps the axis A's, which is what the
+// user set. It is a cache key, so changing A's range re-bins B.
+static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
+                                       float binBlack = std::numeric_limits<float>::quiet_NaN(),
+                                       float binWhite = std::numeric_limits<float>::quiet_NaN()) {
+    const float wantBlack = std::isfinite(binBlack) ? binBlack : effBlack(*im);
+    const float wantWhite = std::isfinite(binWhite) ? binWhite : effWhite(*im);
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
@@ -5822,13 +7315,13 @@ static void recomputeHistogramIfNeeded(ImageDoc* im) {
             if (cw > 0 && ch2 > 0) { rx = cx; ry = cy; rw = cw; rh = ch2; roiUsed = true; }
         }
     }
-    if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == effBlack(*im) &&
-        H.white == effWhite(*im) && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
+    if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == wantBlack &&
+        H.white == wantWhite && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
         H.rx == rx && H.ry == ry && H.rw == rw && H.rh == rh)
         return;
     if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
     H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
-    H.black = effBlack(*im); H.white = effWhite(*im);
+    H.black = wantBlack; H.white = wantWhite;
     H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
     H.rx = rx; H.ry = ry; H.rw = rw; H.rh = rh; H.roiUsed = roiUsed;
     memset(H.bins, 0, sizeof H.bins);
@@ -5898,6 +7391,70 @@ struct PlotRect {
                       p1.y - (y - ymin) / (ymax - ymin) * (p1.y - p0.y));
     }
 };
+
+// ImDrawList has no dashed line, and the A/B panels need one: hue is already
+// spoken for by the CFA plane (R/Gr/Gb/B each own a colour), so the DASH is the
+// only thing left that can say "this curve is B". Dash length is measured along
+// the polyline, so a dense curve does not turn the dashes into a solid line.
+static void addDashedPolyline(ImDrawList* dl, const ImVec2* pts, int n, ImU32 col,
+                              float thick, float dash, float gap) {
+    if (n < 2 || dash <= 0 || gap <= 0) return;
+    float phase = 0;                          // distance walked inside dash+gap
+    for (int i = 1; i < n; i++) {
+        ImVec2 a = pts[i - 1], b = pts[i];
+        float dx = b.x - a.x, dy = b.y - a.y;
+        float len = sqrtf(dx * dx + dy * dy);
+        if (!(len > 0) || !std::isfinite(len)) continue;
+        float t = 0;
+        while (t < len) {
+            float period = dash + gap;
+            float inPeriod = fmodf(phase, period);
+            bool on = inPeriod < dash;
+            float left = on ? dash - inPeriod : period - inPeriod;
+            float step = std::min(left, len - t);
+            if (on) {
+                ImVec2 p0(a.x + dx * (t / len), a.y + dy * (t / len));
+                ImVec2 p1(a.x + dx * ((t + step) / len), a.y + dy * ((t + step) / len));
+                dl->AddLine(p0, p1, col, thick);
+            }
+            t += step;
+            phase += step;
+        }
+    }
+}
+
+// Long file names would push the legend off the plot; elide the FRONT, because
+// the tail ("_gain10_000.npy") is the part that tells two captures apart.
+static std::string elideFront(const std::string& s, size_t keep) {
+    return s.size() <= keep ? s : ("..." + s.substr(s.size() - keep));
+}
+
+// The one amber this UI warns in: the fallback notices, the mismatch notices,
+// and the [stale] marker below. Anything the reader must NOTICE is this colour.
+static const ImVec4 AB_AMBER(0.95f, 0.72f, 0.35f, 1.0f);
+static const ImU32  AB_AMBER32 = IM_COL32(242, 184, 89, 255);
+// B's numbers are one frame behind while A is being stepped. The marker used to
+// be appended to B's NAME and drawn in the surrounding grey, which during fast
+// stepping is indistinguishable from part of the file name - the one moment it
+// exists to be read. It is a separate token now, in the warning amber.
+static const char* AB_STALE_TOKEN = "[stale]";
+
+// What A or B is CALLED, everywhere the two are set against each other.
+// A capture series names every stack's frames identically - 00/frame_000.npy
+// and 01/frame_000.npy are both "frame_000.npy" - so the FILE name identifies
+// neither side, and the legend, the side-by-side bands, the status bar, the
+// Inspector and the B-image menu all read "frame_000.npy" twice. The STACK is
+// what tells them apart, and SeqInfo::name already carries the folder the
+// Files panel disambiguates with ("00/frame_000..004.npy"). A loose frame
+// belongs to no stack and keeps its own name, which is unambiguous by
+// definition - there is only one of it.
+static std::string abDocLabel(const ImageDoc* d) {
+    if (!d) return std::string();
+    if (d->seqId != 0)
+        if (const App::SeqInfo* si = seqInfo(d->seqId))
+            if (!si->name.empty()) return si->name;
+    return d->name;
+}
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
     if (integer) snprintf(buf, n, "%.0f", v);
@@ -5974,6 +7531,124 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
     return pr;
 }
 
+// The A/B legend, on its own row BENEATH the plot. It used to be a filled box
+// pinned inside the plot rect, top right, where it covered the data it was
+// explaining: on a narrow panel it took roughly half the plot width, and any
+// distribution with its peak on the right disappeared behind it. (The union
+// range default makes that rarer; it does not make a box that hides data
+// right.) One line, left to right, like everything else in these panels, at
+// the cost of one text row - which the layouts reserve whether or not compare
+// is on, so turning it on never moves the plot out from under the cursor.
+//
+// The swatches show a SAMPLE of each stroke - solid for A, dashed for B -
+// because a text-only "A" and "B" leaves the reader matching words to lines.
+// A is the neutral ink every plot draws in; B carries the blue tint it is
+// actually drawn with (a mono series would otherwise give both sides the same
+// grey). Names are elided from the FRONT: the tail is what tells two captures
+// apart. They come from abDocLabel, so two stacks of one series do not both
+// read "frame_000.npy".
+static float abLegendSw()  { return 24 * app.uiScale; }
+static float abLegendGap() { return 6 * app.uiScale; }
+static std::string abLegendText(const char* side, const std::string& name) {
+    return std::string(side) + ": " + elideFront(name, 26);
+}
+static float abLegendEntryW(const char* side, const std::string& name, bool stale) {
+    float w = abLegendSw() + abLegendGap() +
+              ImGui::CalcTextSize(abLegendText(side, name).c_str()).x;
+    if (stale) w += abLegendGap() + ImGui::CalcTextSize(AB_STALE_TOKEN).x;
+    return w;
+}
+// Too narrow for both entries side by side: stack them rather than clip one.
+static bool abLegendOneLine(const std::string& aName, const std::string& bName, bool bStale) {
+    return abLegendEntryW("A", aName, false) + 18 * app.uiScale +
+           abLegendEntryW("B", bName, bStale) <= ImGui::GetContentRegionAvail().x;
+}
+static float abLegendH(const std::string& aName, const std::string& bName, bool bStale) {
+    return ImGui::GetTextLineHeightWithSpacing() *
+           (abLegendOneLine(aName, bName, bStale) ? 1.0f : 2.0f);
+}
+static void drawABLegendRow(const std::string& aName, const std::string& bName,
+                            bool bStale = false) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float s = app.uiScale, fh = ImGui::GetFontSize();
+    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * s;
+    const ImU32 ink = IM_COL32(215, 222, 228, 255);
+    const ImU32 inkB = IM_COL32(120, 190, 255, 255);
+    const bool one = abLegendOneLine(aName, bName, bStale);
+    const float lineAdvance = ImGui::GetTextLineHeightWithSpacing();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const std::string la = abLegendText("A", aName), lb = abLegendText("B", bName);
+    dl->AddLine(ImVec2(p.x, p.y + fh * 0.5f), ImVec2(p.x + sw, p.y + fh * 0.5f), ink, 1.6f);
+    dl->AddText(ImVec2(p.x + sw + gap, p.y), ink, la.c_str());
+    const float bx = one ? p.x + abLegendEntryW("A", aName, false) + sep : p.x;
+    const float by = one ? p.y : p.y + lineAdvance;
+    ImVec2 dash[2] = { ImVec2(bx, by + fh * 0.5f), ImVec2(bx + sw, by + fh * 0.5f) };
+    addDashedPolyline(dl, dash, 2, inkB, 1.6f, 4 * s, 3 * s);
+    dl->AddText(ImVec2(bx + sw + gap, by), ink, lb.c_str());
+    if (bStale)
+        dl->AddText(ImVec2(bx + sw + gap + ImGui::CalcTextSize(lb.c_str()).x + gap, by),
+                    AB_AMBER32, AB_STALE_TOKEN);
+    // consume exactly what abLegendH promised (ImGui adds one ItemSpacing after)
+    ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x,
+                        one ? ImGui::GetTextLineHeight()
+                            : ImGui::GetTextLineHeight() + lineAdvance));
+}
+
+// The heading strip over one half of a side-by-side pair. Neutral colour: which
+// side you are looking at is the message, not which channel.
+static void drawABBand(const char* side, const std::string& name, bool stale = false) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float s = app.uiScale;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    float h = ImGui::GetTextLineHeight() + 4 * s;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(52, 58, 66, 255), 3 * s);
+    std::string t = std::string(side) + "   " + elideFront(name, 34);
+    dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);
+    dl->AddText(ImVec2(p.x + 6 * s, p.y + 2 * s), IM_COL32(225, 230, 236, 255), t.c_str());
+    if (stale)
+        dl->AddText(ImVec2(p.x + 6 * s + ImGui::CalcTextSize(t.c_str()).x + 8 * s,
+                           p.y + 2 * s), AB_AMBER32, AB_STALE_TOKEN);
+    dl->PopClipRect();
+    ImGui::Dummy(ImVec2(w, h + 2 * s));
+}
+
+// Why the side-by-side layout fell back to an overlay. Two things it has to get
+// right and did not: it must WRAP (Text does not, and at exactly the width that
+// triggers it the line was cut mid-word - "panel narrower than 480 px: overlaid
+// ins..."), and it must quote the LOGICAL threshold. It used to print the
+// DPI-scaled minSide, so a 150% display was told to widen past 480 px while the
+// code compares against 320 logical ones - a number the user cannot act on.
+static const char* AB_NARROW_MSG =
+    "panel narrower than 320 px (logical width, before display scaling): "
+    "overlaid instead of side by side";
+static const float AB_MIN_SIDE = 320.0f;
+// The height it will take at the current width, so the plot layout can reserve
+// exactly what the wrapped text uses. A note that appears and pushes the plot
+// down is the same defect as the browser's scrub bar and the preview row.
+static float abNarrowNoteH() {
+    return ImGui::CalcTextSize(AB_NARROW_MSG, nullptr, false,
+                               ImGui::GetContentRegionAvail().x).y +
+           ImGui::GetStyle().ItemSpacing.y;
+}
+static void abNarrowNote() {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1));
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(AB_NARROW_MSG);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
+// A and B series correspond BY NAME (R <-> R), never by index: the canon says
+// CFA planes are never mixed, and ch0 is not R. -1 = this series exists on one
+// side only, and is drawn as such.
+static int abSeriesMatch(const char* const* names, int n, const char* want) {
+    if (!want) return -1;
+    for (int i = 0; i < n; i++)
+        if (names[i] && strcmp(names[i], want) == 0) return i;
+    return -1;
+}
+
 // L2 host service: line plot for analyzer curve output (the only curve UI —
 // plugins never draw; they emit_series and this renders every curve the same way)
 static void drawAnalysisPlots() {
@@ -6038,8 +7713,8 @@ static void drawAnalysisPlots() {
             float y = pr.at(pr.xmin, app.anaRef).y;
             ImU32 rc = IM_COL32(255, 184, 77, 220);
             float dash = 6.0f * app.uiScale;
-            for (float x = pr.p0.x; x < pr.p1.x; x += dash * 2)
-                dl->AddLine(ImVec2(x, y), ImVec2(std::min(x + dash, pr.p1.x), y), rc);
+            ImVec2 seg[2] = { ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y) };
+            addDashedPolyline(dl, seg, 2, rc, 1.0f, dash, dash);
             char rb[32];
             snprintf(rb, sizeof rb, "ref %.4g", app.anaRef);
             ImVec2 rts = ImGui::CalcTextSize(rb);
@@ -6181,21 +7856,47 @@ static void drawInspector() {
             ImGui::EndTable();
         }
         if (b && im) {
-            ImGui::TextDisabled("B: %s", b->name.c_str());
+            ImGui::TextDisabled("A: %s", abDocLabel(im).c_str());
+            ImGui::TextDisabled("B: %s", abDocLabel(b).c_str());
             if (b->w != im->w || b->h != im->h)
                 ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "size differs: B is %dx%d",
                                    b->w, b->h);
             // Two images auto-ranged to their own min/max look different even when
             // the pixels are identical - the fastest way to a wrong conclusion.
-            if (!app.linkRange && (effBlack(*b) != effBlack(*im) || effWhite(*b) != effWhite(*im))) {
-                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
-                ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(effBlack(*im), im->dtype).c_str(),
-                                    fmtVal(effWhite(*im), im->dtype).c_str(),
-                                    fmtVal(effBlack(*b), b->dtype).c_str(),
-                                    fmtVal(effWhite(*b), b->dtype).c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("match B to A")) {
-                    b->black = effBlack(*im); b->white = effWhite(*im); b->texDirty = true;
+            if (!app.linkRange) {
+                // Sharing is the default because two images stretched
+                // differently cannot be compared: the difference you see would
+                // be the stretch. When it is off, SAY the numbers differ - that
+                // is the case where a reading can mislead.
+                ImGui::SetNextItemWidth(-1);
+                static const char* AB_RANGE_ITEMS[3] = {
+                    "A/B: each keeps its own", "A/B: B uses A's range",
+                    "A/B: auto over both (union)" };
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::Combo("##abrange", &app.compareRangeMode,
+                                 AB_RANGE_ITEMS, 3)) {
+                    b->texDirty = true; im->texDirty = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "How the two sides are STRETCHED while comparing. Display only -\n"
+                        "both keep their own numbers and get them back when compare ends.\n"
+                        "  auto over both (union), the default: both re-fit to min/max\n"
+                        "    across A and B, so neither side clips and neither is\n"
+                        "    favoured. Two stacks at different exposures need this - B\n"
+                        "    against A's range alone saturates into a single bin.\n"
+                        "  B uses A's range: one range, A's, and it does not move while\n"
+                        "    you step A. Right when B really is measured against A.\n"
+                        "  each keeps its own: comparing SHAPES at wildly different\n"
+                        "    exposures - the one case where the two are not directly\n"
+                        "    comparable, and it says so.");
+                if (app.compareRangeMode == 0 &&
+                    (b->black != im->black || b->white != im->white)) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
+                    ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(im->black, im->dtype).c_str(),
+                                        fmtVal(im->white, im->dtype).c_str(),
+                                        fmtVal(b->black, b->dtype).c_str(),
+                                        fmtVal(b->white, b->dtype).c_str());
                 }
             }
             if (b->dtype != im->dtype)
@@ -6329,17 +8030,32 @@ static void drawInspector() {
         }
 
         ImGui::SeparatorText("Range (black / white)");
-        {   // link: one range for every open image, so frames/files stay comparable
-            bool wasLinked = app.linkRange;
-            if (ImGui::Checkbox("link across all images", &app.linkRange)) {
+        {   // ONE mode control. It used to be a "link across all images"
+            // checkbox PLUS an on-switch combo whose third entry re-implemented
+            // linking destructively (copying the range into each image instead
+            // of overlaying one) - two mechanisms for the same intent, spotted
+            // as such immediately. Modes:
+            //   0 auto per frame - every frame re-fits to its own min..max
+            //   1 per stack      - frames of a stack share the reference range
+            //   2 linked         - one display range overlays every open image
+            int mode = app.linkRange ? 2 : (app.rangeScope == 0 ? 0 : 1);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##rangemode", &mode,
+                             "Auto per frame\0Per stack (default)\0Linked across all images\0")) {
+                bool wasLinked = app.linkRange;
+                app.linkRange = mode == 2;
+                app.rangeScope = mode == 0 ? 0 : 1;
                 if (app.linkRange && !wasLinked) {      // seed from what is on screen
                     app.linkBlack = im->black; app.linkWhite = im->white;
                 }
-                markAllTexDirty();                      // unlink -> each image returns to its own
+                if (app.linkRange != wasLinked) markAllTexDirty();
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("shared range for display only - each image keeps its own,\n"
-                                  "unlink to get them back");
+                ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
+                                  "Per stack: frames of one stack share the reference\n"
+                                  "  frame's range, so they compare directly\n"
+                                  "Linked: one display range for every open image - display\n"
+                                  "  only, each image keeps its own and gets it back on unlink");
         }
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
@@ -6389,14 +8105,71 @@ static void drawInspector() {
 
 }
 
+// The unit a PIXEL VALUE is quoted in, anywhere one is labelled: DN, always.
+// A float .npy is still a digital number - f32 is how the value is STORED, not
+// what it measures, and an axis reading "pixel value (f32)" states a storage
+// class where a unit belongs. The per-frame TSV has always written [DN]
+// unconditionally. Lives here, above the first plot, because every axis label
+// below goes through it; the dtype argument is kept so the rule has one place
+// to change if a file ever carries a real unit.
+// (Statements ABOUT the file - the Inspector's "1920x1080 1ch f32", the browse
+// listing's shape column, a dtype-mismatch warning - are not this: they say how
+// the data is stored, which is exactly what they mean.)
+static std::string abValueUnit(const std::string&) {
+    return "DN";
+}
+
+// ...and WHOSE range that value is plotted against. It has to name the range
+// actually in force: with the union default the x axis spans A and B together,
+// and an axis that still says "A's black-white range" is simply telling the
+// reader something untrue about the picture in front of them.
+// Mode 0 is not an exception. Each side keeps its own STRETCH, but the two
+// histograms are still binned on A's black/white - one bin grid, or the curves
+// are not comparable at all (see recomputeHistogramIfNeeded) - so naming A's
+// range there stays true.
+static const char* abRangeSaid(bool haveB) {
+    if (!haveB) return "black-white range";
+    return app.compareRangeMode == 2 ? "A and B combined range" : "A's black-white range";
+}
+
+// The histogram's x axis label, built in one place so --range-selftest can
+// print the exact string the panel draws.
+static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
+    char xl[192];
+    const std::string xu = abValueUnit(a->dtype);
+    const char* xr = abRangeSaid(b != nullptr);
+    if (b && b->dtype != a->dtype)
+        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins both sides)"
+                                "  -  A %s / B %s, DTYPE MISMATCH",
+                 xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str());
+    else
+        snprintf(xl, sizeof xl, "pixel value (%s, %s)", xu.c_str(), xr);
+    return xl;
+}
+
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
-        recomputeHistogramIfNeeded(im);
-        const App::HistState& H = app.hist;
+        ImageDoc* Bim = abStatsB();
+        recomputeHistogramIfNeeded(im, app.hist[0]);
+        // B is binned on A's black/white: one x axis, one bin grid, or the two
+        // curves are not comparable. Sizes may differ freely - the y axis below
+        // normalises that away. Skipped while frames are being stepped: an
+        // empty slot is always filled, a filled one waits for the stepping to
+        // stop and is labelled stale until then.
+        if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
+            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
+        const App::HistState& H = app.hist[0];
+        const App::HistState& HB = app.hist[1];
+        const bool bStale = Bim && HB.uid != Bim->uid;
+        const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
+        // with a B on screen, an unlabelled table of numbers is ambiguous:
+        // say whose numbers these are
+        if (Bim) ImGui::TextDisabled("A: %s   (%s)", elideFront(abDocLabel(im), 26).c_str(),
+                                     H.roiUsed ? "selected ROI" : "whole image");
+        else     ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
         // fixed widths + right-aligned numbers: columns must not reflow while
         // stepping through frames, otherwise values are impossible to compare
@@ -6430,41 +8203,186 @@ static void drawPanelHistogram() {
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
         static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
                                            IM_COL32(92, 155, 255, 150) };
+        const ImU32 ODD_COL = IM_COL32(185, 192, 200, 190);   // a series only one side has
         bool cfaHist = im->ch == 1 && im->cfa != 0;
-        double logMax = log1p((double)H.maxBin);
-        char yl[64];
-        snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)" : "pixel count (max %u)",
-                 H.maxBin);
-        char xl[80];
-        snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+
+        // ---- plane selector: four CFA planes times two sides is eight curves
+        // on one axis. Same control as the ROI table's, and it filters BOTH
+        // sides, so a comparison is always plane against the same plane.
+        app.histPlane = std::clamp(app.histPlane, -1, std::max(H.nSeries - 1, -1));
+        if (H.nSeries > 1) {
+            const char* selName = app.histPlane < 0 ? "all" : H.seriesNames[app.histPlane];
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            if (ImGui::BeginCombo("plane##hist", selName)) {
+                if (ImGui::Selectable("all", app.histPlane < 0)) app.histPlane = -1;
+                for (int s = 0; s < H.nSeries; s++)
+                    if (ImGui::Selectable(H.seriesNames[s], app.histPlane == s)) app.histPlane = s;
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Which plane the curves show. The bins are computed for\n"
+                                  "all of them either way - this only chooses what is drawn.");
+        }
+        auto drawn = [&](int s) { return app.histPlane < 0 || app.histPlane == s; };
+        int nDrawn = 0;
+        for (int s = 0; s < H.nSeries; s++) if (drawn(s)) nDrawn++;
+
+        // ---- y axis. Without a B: pixel counts, exactly as before. With a B:
+        // a share of each side's OWN sampled pixels, because two images of
+        // different size put incomparable bar heights on one axis.
+        const bool norm = Bim != nullptr;
+        const double scA = 100.0 / (double)std::max<size_t>(H.sampled, 1);
+        const double scB = 100.0 / (double)std::max<size_t>(HB.sampled, 1);
+        double yTop = 0;
+        for (int s = 0; s < H.nSeries; s++) {
+            if (!drawn(s)) continue;
+            for (int b = 0; b < 256; b++)
+                yTop = std::max(yTop, H.bins[s][b] * (norm ? scA : 1.0));
+        }
+        if (norm)
+            for (int s = 0; s < HB.nSeries; s++) {
+                int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                for (int b = 0; b < 256; b++) yTop = std::max(yTop, HB.bins[s][b] * scB);
+            }
+        if (!(yTop > 0)) yTop = 1;
+        const double logTop = log1p(yTop);
+        char yl[96];
+        if (norm)
+            snprintf(yl, sizeof yl, app.histLog ? "share of sampled px [%%] (log, max %.3g %%)"
+                                                : "share of sampled px [%%] (max %.3g %%)", yTop);
+        else
+            snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)"
+                                                : "pixel count (max %u)", H.maxBin);
+        const std::string xlBuf = abHistXLabel(im, Bim);
+        const char* xl = xlBuf.c_str();
+
+        // one curve, one way to draw it: filled bars, solid outline, dashed
+        // outline. The staircase is built once and reused by all three.
+        auto plotSeries = [&](const PlotRect& pr, const uint32_t bins[256], double sc,
+                              ImU32 col, int style) {          // 0 fill, 1 solid, 2 dashed
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            float pw = pr.p1.x - pr.p0.x, ph = pr.p1.y - pr.p0.y;
+            auto yOf = [&](uint32_t v) {
+                double u = v * sc;
+                double f = app.histLog ? (logTop > 0 ? log1p(u) / logTop : 0.0) : u / yTop;
+                return pr.p1.y - (float)std::clamp(f, 0.0, 1.0) * ph;
+            };
+            if (style == 0) {
+                for (int b = 0; b < 256; b++) {
+                    if (!bins[b]) continue;
+                    float bx0 = pr.p0.x + (float)b / 256.0f * pw;
+                    dl->AddRectFilled(ImVec2(bx0, yOf(bins[b])),
+                                      ImVec2(bx0 + pw / 256.0f + 0.5f, pr.p1.y), col);
+                }
+                return;
+            }
+            std::vector<ImVec2> pts;
+            pts.reserve(512);
+            for (int b = 0; b < 256; b++) {
+                float bx0 = pr.p0.x + (float)b / 256.0f * pw;
+                float bx1 = pr.p0.x + (float)(b + 1) / 256.0f * pw;
+                float y = yOf(bins[b]);
+                pts.push_back(ImVec2(bx0, y));
+                pts.push_back(ImVec2(bx1, y));
+            }
+            if (style == 1) dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, 1.4f);
+            else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, 1.4f,
+                                   5 * app.uiScale, 4 * app.uiScale);
+        };
+        // Four CFA planes (or three RGB ones) as eight filled areas is unreadable,
+        // so at three drawn curves or more BOTH sides become outlines. Below that
+        // A keeps its fill and only B is an outline.
+        const bool outlineA = Bim && nDrawn >= 3;
+        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantB) {
+            if (!pr.ok) return;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(pr.p0, pr.p1, true);
+            if (wantA)
+                for (int s = 0; s < H.nSeries; s++) {
+                    if (!drawn(s)) continue;
+                    ImU32 col = cfaHist ? CFA_COLS[s]
+                              : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
+                    plotSeries(pr, H.bins[s], norm ? scA : 1.0, col, outlineA ? 1 : 0);
+                }
+            if (wantB && Bim)
+                for (int s = 0; s < HB.nSeries; s++) {
+                    // matched by NAME; a series only B has is drawn neutral, and
+                    // never coloured as if it were one of A's planes
+                    int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+                    if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                    // A single grey series gave B the SAME colour as A's fill,
+                    // leaving a 1.4 px dashed line at ~30/255 contrast wherever
+                    // it crossed that fill - the dash pattern was B's only cue.
+                    // Mono B gets a cool tint so it reads against A's grey; the
+                    // coloured cases already differ by hue per plane.
+                    ImU32 col = a < 0 ? ODD_COL
+                              : (cfaHist ? CFA_COLS[a]
+                                         : (H.nSeries == 1 ? IM_COL32(120, 190, 255, 235)
+                                                           : RGB_COLS[a]));
+                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 2);
+                }
+            dl->PopClipRect();
+        };
+
+        const float minSide = AB_MIN_SIDE * app.uiScale;
+        bool side = Bim && abSideBySide();
+        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+        if (tooNarrow) side = false;
         // fill the rest of the panel: a fixed height overflowed the bottom dock
+        float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
+                      + (tooNarrow ? abNarrowNoteH() : 0.0f);
+        // the legend row lives under the overlaid plot, and its height comes off
+        // the plot BEFORE the plot is laid out
+        float legendH = Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f;
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
-                     - ImGui::GetTextLineHeightWithSpacing();
-        PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f, false, false,
-                                std::max(hAvail, 70.0f * app.uiScale));
-        if (hp.ok) {
-            ImDrawList* hdl = ImGui::GetWindowDrawList();
-            hdl->PushClipRect(hp.p0, hp.p1, true);
-            float pw2 = hp.p1.x - hp.p0.x;
-            for (int s = 0; s < H.nSeries; s++) {
-                ImU32 col = cfaHist ? CFA_COLS[s]
-                                    : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
-                for (int b = 0; b < 256; b++) {
-                    uint32_t v = H.bins[s][b];
-                    if (!v) continue;
-                    float f = app.histLog ? (float)(log1p((double)v) / logMax)
-                                          : (float)v / (float)H.maxBin;
-                    float bx0 = hp.p0.x + (float)b / 256.0f * pw2;
-                    hdl->AddRectFilled(ImVec2(bx0, hp.p1.y - f * (hp.p1.y - hp.p0.y)),
-                                       ImVec2(bx0 + pw2 / 256.0f + 0.5f, hp.p1.y), col);
-                }
-            }
-            hdl->PopClipRect();
+                     - footerH - legendH;
+        if (side) hAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // heading band
+        float plotH = std::max(hAvail, 70.0f * app.uiScale);
+
+        if (!side) {
+            PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                                    false, false, plotH);
+            drawAll(hp, true, true);
+            if (Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
+        } else {
+            // Always 50/50, never splitFrac: comparing two shapes needs two
+            // plots of the SAME width. What the layout copies from the image is
+            // the ORDER (A on the left), not the divider position.
+            const ImGuiStyle& st = ImGui::GetStyle();
+            float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+            float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
+                         + ImGui::GetTextLineHeight() + 8 * app.uiScale;
+            ImGui::BeginChild("##histA", ImVec2(half, childH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand("A", abDocLabel(im));
+            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                              false, false, plotH), true, false);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("##histB", ImVec2(half, childH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand("B", bLabel, bStale);
+            // identical axis ranges by construction: same xl/yl, same limits
+            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                              false, false, plotH), false, true);
+            ImGui::EndChild();
         }
-        ImGui::TextDisabled("%zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
+        if (tooNarrow) abNarrowNote();
+        // the real pixel counts survive the normalised axis
+        ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
                             H.clipLo * 100.0, H.clipHi * 100.0,
                             cfaHist ? " | R/Gr/Gb/B" : "");
+        if (Bim) {
+            ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
+                                HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
+                                bLabel.c_str());
+            if (bStale) {   // never inside the disabled string: it must stand out
+                ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
+                ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
+            }
+        }
     }
 
 }
@@ -6472,8 +8390,8 @@ static void drawPanelHistogram() {
 // H/V projections: column means (horizontal profile) and row means (vertical
 // profile) over the selected ROI. Column FPN, banding and shading show up here
 // far more clearly than in the image itself.
-static void recomputeProjectionIfNeeded(ImageDoc* im) {
-    App::ProjState& P = app.proj;
+// Slot 0 = A, slot 1 = compare B; the body is unchanged apart from the slot.
+static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
     bool roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
@@ -6591,10 +8509,20 @@ static void drawPanelProjection() {
     }
     ImGui::SameLine(); ImGui::Checkbox("H", &app.showProjH);
     ImGui::SameLine(); ImGui::Checkbox("V", &app.showProjV);
-    recomputeProjectionIfNeeded(im);
-    const App::ProjState& P = app.proj;
+    ImageDoc* Bim = abStatsB();
+    recomputeProjectionIfNeeded(im, app.proj[0]);
+    // skipped while frames are being stepped (see abStepBusy), except on the
+    // first fill - an empty B plot would be worse than a stale one
+    if (Bim && (!abStepBusy() || app.proj[1].uid == 0))
+        recomputeProjectionIfNeeded(Bim, app.proj[1]);
+    const App::ProjState& P = app.proj[0];
+    const App::ProjState& PB = app.proj[1];
+    const bool bStale = Bim && PB.uid != Bim->uid;
+    const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
     ImGui::SameLine();
-    ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
+    if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
+                                 P.roiUsed ? "ROI" : "whole image");
+    else     ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
 
     // value axis: a rescaling y axis makes profiles impossible to compare
     const char* ymodes[3] = { "auto", "display range", "fixed" };
@@ -6618,7 +8546,13 @@ static void drawPanelProjection() {
     float yLo, yHi;
     if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
     else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
-    else { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }   // shared H/V
+    else {                                   // shared across H, V - and A and B
+        yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax);
+        if (Bim) {
+            yLo = std::min(yLo, std::min(PB.hMin, PB.vMin));
+            yHi = std::max(yHi, std::max(PB.hMax, PB.vMax));
+        }
+    }
     if (app.projYMode == 2) {
         ImGui::SameLine();
         // shadow buffer: committing per keystroke would re-project the image on
@@ -6638,88 +8572,194 @@ static void drawPanelProjection() {
                                        IM_COL32(60, 180, 140, 220), IM_COL32(92, 155, 255, 220) };
     static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 210), IM_COL32(79, 221, 107, 210),
                                        IM_COL32(92, 155, 255, 210) };
+    const ImU32 ODD_COL = IM_COL32(185, 192, 200, 210);   // a series only one side has
     bool cfa = im->ch == 1 && im->cfa != 0;
     int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
     if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
+
+    // Overlay is only honest when the two profiles are the SAME axis: same
+    // length and same origin. Different lengths cannot be aligned without
+    // knowing the physical mapping between the two captures, and stretching one
+    // to fit the other would invent a correspondence that does not exist. So:
+    // fall back to side by side and say why.
+    const bool canOverlay = !Bim || abProjOverlayable(P, PB);
+    const float minSide = AB_MIN_SIDE * app.uiScale;
+    bool side = Bim && (abSideBySide() || !canOverlay);
+    // the narrow-panel fallback yields to correctness: mismatched profiles are
+    // never overlaid, however little room there is
+    bool tooNarrow = side && canOverlay && ImGui::GetContentRegionAvail().x < minSide;
+    if (tooNarrow) side = false;
+
     // reserve the statistics table first: the plots must not push it off-panel
-    int statRows = P.nSeries * plots;
+    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0)) * plots;
     float lineH = ImGui::GetTextLineHeightWithSpacing();
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
                  + lineH;                                  // footnote
-    float avail = ImGui::GetContentRegionAvail().y - statsH;
+    if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
+    if (tooNarrow) statsH += abNarrowNoteH();
+    // one legend row under each overlaid plot, reserved before they are sized
+    const std::string aLabel = abDocLabel(im);
+    float legendH = Bim && !side ? abLegendH(aLabel, bLabel, bStale) : 0.0f;
+    float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
+    if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
-    auto plotSeries = [&](bool horizontal) {
-        const std::vector<float>* series = horizontal ? P.h : P.v;
-        float lo = yLo, hi = yHi;      // one value axis for H, V and every image
-        int n = horizontal ? P.rw : P.rh;
-        int origin = horizontal ? P.rx : P.ry;
-        char yl[80];
-        snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
-                 im->dtype.c_str());
-        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
-                                (float)origin, (float)(origin + std::max(n - 1, 1)),
-                                lo, hi, true, false, each);
-        if (!pr.ok) return;
+    // x range: the UNION of A's and B's sample ranges, so both plots (side by
+    // side or overlaid) carry the same axis and neither is rescaled to fit.
+    auto xRange = [&](bool horizontal, float& x0, float& x1) {
+        int o = horizontal ? P.rx : P.ry, n = horizontal ? P.rw : P.rh;
+        x0 = (float)o; x1 = (float)(o + std::max(n - 1, 1));
+        if (Bim) {
+            int ob = horizontal ? PB.rx : PB.ry, nb = horizontal ? PB.rw : PB.rh;
+            x0 = std::min(x0, (float)ob);
+            x1 = std::max(x1, (float)(ob + std::max(nb - 1, 1)));
+        }
+    };
+    // Stroke one side's profiles. dashed = this is B. bars = draw the min-max
+    // range of a decimated bucket; A only, per the plan - two sets of range
+    // bars on one plot is noise, and the reader needs one reference.
+    auto stroke = [&](const PlotRect& pr, const App::ProjState& S, bool horizontal,
+                      bool dashed, bool bars) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->PushClipRect(pr.p0, pr.p1, true);
-        for (int s = 0; s < P.nSeries; s++) {
-            ImU32 col = cfa ? CFA_COLS[s]
-                            : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[s]);
+        const std::vector<float>* series = horizontal ? S.h : S.v;
+        int origin = horizontal ? S.rx : S.ry;
+        for (int s = 0; s < S.nSeries; s++) {
+            // colour follows A's series OF THE SAME NAME (R is always R); a
+            // series only one side has gets a neutral stroke, never a plane hue
+            int a = dashed ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            ImU32 col = a < 0 ? ODD_COL
+                      : (cfa ? CFA_COLS[a]
+                             : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
             const std::vector<float>& d = series[s];
             // decimate to the plot's pixel width: 4000 samples into 400 px was
             // 4000 line segments per series per frame
             int px = std::max(1, (int)(pr.p1.x - pr.p0.x));
             int stride = std::max(1, (int)d.size() / px);
-            ImVec2 prev(0, 0); bool has = false;
+            std::vector<ImVec2> run;
+            auto flush = [&]() {
+                if (run.size() >= 2) {
+                    if (dashed) addDashedPolyline(dl, run.data(), (int)run.size(), col, 1.2f,
+                                                  5 * app.uiScale, 4 * app.uiScale);
+                    else dl->AddPolyline(run.data(), (int)run.size(), col, 0, 1.2f);
+                }
+                run.clear();
+            };
             for (int i = 0; i < (int)d.size(); i += stride) {
                 float lo = FLT_MAX, hi = -FLT_MAX;
                 for (int k = i; k < std::min(i + stride, (int)d.size()); k++)
                     if (std::isfinite(d[k])) { lo = std::min(lo, d[k]); hi = std::max(hi, d[k]); }
-                if (lo > hi) { has = false; continue; }
-                ImVec2 a = pr.at((float)(origin + i), lo), b = pr.at((float)(origin + i), hi);
-                if (stride > 1 && b.y != a.y) dl->AddLine(a, b, col, 1.2f);   // min-max bar
-                ImVec2 pt = pr.at((float)(origin + i), (lo + hi) * 0.5f);
-                if (has) dl->AddLine(prev, pt, col, 1.2f);
-                prev = pt; has = true;
+                if (lo > hi) { flush(); continue; }
+                if (bars && stride > 1) {
+                    ImVec2 a2 = pr.at((float)(origin + i), lo), b2 = pr.at((float)(origin + i), hi);
+                    if (b2.y != a2.y) dl->AddLine(a2, b2, col, 1.2f);   // min-max bar
+                }
+                run.push_back(pr.at((float)(origin + i), (lo + hi) * 0.5f));
             }
+            flush();
         }
-        // "There is a spike - WHICH column is it?" The readout answers with the
-        // exact index and the values under the cursor, without decimation: the
-        // marker snaps to the true sample, not to the plotted min-max bucket.
-        if (ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) {
-            float mx = ImGui::GetMousePos().x;
-            float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
-            int i = std::clamp((int)(t * (float)(n - 1) + 0.5f), 0, std::max(n - 1, 0));
-            dl->AddLine(pr.at((float)(origin + i), lo), pr.at((float)(origin + i), hi),
-                        IM_COL32(230, 200, 90, 140), 1.0f);
-            char tip[256];
-            int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y",
-                               origin + i);
-            static const char* CFA_N[4] = { "R", "Gr", "Gb", "B" };
-            static const char* RGB_N[4] = { "R", "G", "B", "A" };
-            for (int s2 = 0; s2 < P.nSeries; s2++) {
-                if (i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
-                const char* nm = P.nSeries == 1 ? "" : (cfa ? CFA_N[s2] : RGB_N[s2]);
-                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%.6g %s",
-                                nm, *nm ? ": " : "", series[s2][i], im->dtype.c_str());
-                dl->AddCircleFilled(pr.at((float)(origin + i), series[s2][i]), 3.0f,
+    };
+    // "There is a spike - WHICH column is it?" The readout answers with the
+    // exact index and the values under the cursor, without decimation: the
+    // marker snaps to the true sample, not to the plotted min-max bucket.
+    auto hoverReadout = [&](const PlotRect& pr, bool horizontal, bool wantA, bool wantB) {
+        if (!ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float mx = ImGui::GetMousePos().x;
+        float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
+        int at = (int)(pr.xmin + t * (pr.xmax - pr.xmin) + 0.5f);
+        dl->AddLine(pr.at((float)at, pr.ymin), pr.at((float)at, pr.ymax),
+                    IM_COL32(230, 200, 90, 140), 1.0f);
+        char tip[512];
+        int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y", at);
+        auto one = [&](const App::ProjState& S, const char* side2, const std::string& dt) {
+            const std::vector<float>* series = horizontal ? S.h : S.v;
+            int origin = horizontal ? S.rx : S.ry;
+            int i = at - origin;
+            for (int s2 = 0; s2 < S.nSeries; s2++) {
+                if (i < 0 || i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
+                const char* nm = S.nSeries == 1 ? "" : S.seriesNames[s2];
+                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%s%.6g %s",
+                                side2, nm, *nm ? ": " : "", series[s2][i], dt.c_str());
+                dl->AddCircleFilled(pr.at((float)at, series[s2][i]), 3.0f,
                                     IM_COL32(230, 200, 90, 230));
             }
-            ImGui::SetTooltip("%s", tip);
-        }
-        dl->PopClipRect();
+        };
+        if (wantA) one(P, Bim ? "A " : "", abValueUnit(im->dtype));
+        if (wantB && Bim) one(PB, "B ", abValueUnit(Bim->dtype));
+        ImGui::SetTooltip("%s", tip);
     };
-    if (app.showProjH) plotSeries(true);
-    if (app.showProjV) plotSeries(false);
+    auto onePlot = [&](bool horizontal, bool wantA, bool wantB) {
+        float x0, x1;
+        xRange(horizontal, x0, x1);
+        char yl[176];
+        // "display range" is effBlack/effWhite, which with compare on is the A/B
+        // range - so say which one, exactly as the histogram's x axis does
+        char yr[80] = "";
+        if (app.projYMode == 1)
+            snprintf(yr, sizeof yr, ", %s", abRangeSaid(Bim != nullptr));
+        if (Bim && Bim->dtype != im->dtype)
+            snprintf(yl, sizeof yl, "%s value (%s%s)  -  A %s / B %s, DTYPE MISMATCH",
+                     modes[std::clamp(app.projMode, 0, 2)], abValueUnit(im->dtype).c_str(),
+                     yr, im->dtype.c_str(), Bim->dtype.c_str());
+        else
+            snprintf(yl, sizeof yl, "%s value (%s%s)", modes[std::clamp(app.projMode, 0, 2)],
+                     abValueUnit(im->dtype).c_str(), yr);
+        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
+                                x0, x1, yLo, yHi, true, false, each);
+        if (!pr.ok) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pr.p0, pr.p1, true);
+        if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
+        if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
+        dl->PopClipRect();
+        hoverReadout(pr, horizontal, wantA, wantB);
+        if (wantA && wantB && Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
+    };
+
+    if (!side) {
+        if (app.showProjH) onePlot(true, true, true);
+        if (app.showProjV) onePlot(false, true, true);
+    } else {
+        // always 50/50 and always A on the left (docs/ab-stats-plan.md 3)
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        float childH = ImGui::GetTextLineHeight() + 8 * app.uiScale
+                     + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        ImGui::BeginChild("##projA", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("A", abDocLabel(im));
+        if (app.showProjH) onePlot(true, true, false);
+        if (app.showProjV) onePlot(false, true, false);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("##projB", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("B", bLabel, bStale);
+        if (app.showProjH) onePlot(true, false, true);
+        if (app.showProjV) onePlot(false, false, true);
+        ImGui::EndChild();
+    }
+    if (Bim && !canOverlay)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "profiles do not share an axis (A x %d..%d, y %d..%d px; "
+                           "B x %d..%d, y %d..%d px): shown side by side, never stretched",
+                           P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
+                           PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
+    if (tooNarrow) abNarrowNote();
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
-    int nCols = 2 + 4;
+    int nCols = (Bim ? 3 : 2) + 4;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+        // one row per (side, axis, plane). The table's axis is the QUANTITY, so
+        // A and B cannot be a column pair here - they are rows, and the side
+        // column says which is which (docs/ab-stats-plan.md 4).
+        if (Bim)
+            ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::GetFontSize() * 1.6f);
         ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -6727,21 +8767,22 @@ static void drawPanelProjection() {
         ImGui::TableSetupColumn("sigma %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
-        auto rows = [&](bool horizontal) {
-            for (int s = 0; s < P.nSeries; s++) {
-                const App::ProjState::Stats& st = horizontal ? P.hStat[s] : P.vStat[s];
+        auto rows = [&](const App::ProjState& S, const char* sideName, bool horizontal) {
+            for (int s = 0; s < S.nSeries; s++) {
+                const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
                 if (!st.valid) continue;
                 ImGui::TableNextRow();
+                if (Bim) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", P.seriesNames[s]);
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
                 ImGui::TableNextColumn(); textNum("%.6g", st.mean);
                 ImGui::TableNextColumn(); textNum("%.6g", st.sd);
                 ImGui::TableNextColumn(); textNum("%.3f", st.pct);
                 ImGui::TableNextColumn(); textNum("%.6g", st.pp);
             }
         };
-        if (app.showProjH) rows(true);
-        if (app.showProjV) rows(false);
+        if (app.showProjH) { rows(P, "A", true);  if (Bim) rows(PB, "B", true); }
+        if (app.showProjV) { rows(P, "A", false); if (Bim) rows(PB, "B", false); }
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
@@ -6757,14 +8798,32 @@ static void drawPanelProjection() {
 
 // "100lx/frame_###.npy" -> 100; "00/f_###" -> 0; "run42_200ms.npy [remote]" -> 42.
 // Rule: the first number in the FOLDER part when there is one, else in the whole
-// name. Deliberately simple - the field is editable, this is only the default.
-static double extractLevelFromName(const std::string& name) {
+// name. Deliberately simple - this is only a SUGGESTION a human confirms, and
+// srcOut reports the text it was read out of so the modal can show its work.
+// (the default for srcOut is on the forward declaration, with the model.)
+static double extractLevelFromName(const std::string& name, std::string* srcOut) {
     std::string part = name;
     size_t slash = part.find_last_of('/');
     if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
+    else {
+        // No folder qualifier (a stack opened straight out of its own folder):
+        // the FILE part is all there is, and its frame-axis extent is a frame
+        // count, never an illuminance. Cut the extent run out before reading -
+        // "0000..0003.npy" must stay "no level here", exactly as "????.npy"
+        // did before the extent replaced the wildcard.
+        size_t d = part.find("\xE2\x80\xA5");
+        if (d != std::string::npos) {
+            size_t a = d, b = d + 3;
+            while (a > 0 && isdigit((unsigned char)part[a - 1])) a--;
+            while (b < part.size() && isdigit((unsigned char)part[b])) b++;
+            part.erase(a, b - a);
+        }
+    }
+    if (srcOut) srcOut->clear();
     for (size_t i = 0; i < part.size(); i++) {
         if (isdigit((unsigned char)part[i])) {
             // avoid the "###" pattern placeholder and sizes like 640x480
+            if (srcOut) *srcOut = part;
             return atof(part.c_str() + i);
         }
     }
@@ -6868,37 +8927,59 @@ static const ImU32 LIN_COLS[4] = {
 
 // Everything the panel shows, recomputed only when Compute is pressed: this is
 // a measurement action over potentially hundreds of frames, not a per-frame UI.
-static void linRecompute() {
+//
+// ONE SERIES, not "every open stack". The old walk over app.seqs meant two
+// sweeps open at the same time were silently fitted as one curve, and the
+// parameter values had nowhere to live but the stacks themselves. The rows are
+// the series' members, in the series' order; include and value come straight
+// off Series::Member, so a table row IS members[i] and there is nothing to
+// carry across a recompute.
+static void linRecompute(int seriesId) {
     App::LinState& L = app.lin;
+    L.seriesId = seriesId;
     // the ROI is shared with everything else: the selected rect, or whole frame
     int rx = 0, ry = 0, rw = 0, rh = 0;
     L.roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn))
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; L.roiUsed = true; }
-    std::vector<std::pair<int, bool>> keepInc;
-    for (const auto& r : L.rows) keepInc.push_back({ r.seqId, r.include });
     L.rows.clear();
-    for (const auto& si : app.seqs) {
-        std::vector<int> fr = framesOfSeq(si.id);
-        if (fr.size() < 2 && si.expectedFrames < 2) continue;
+    App::Series* S = seriesById(seriesId);
+    if (!S) {
+        L.fitValid = false;
+        L.nPl = 1; L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
+    for (const auto& m : S->members) {
+        App::SeqInfo* si = seqInfo(m.seqId);
+        if (!si) continue;              // seriesAudit says this cannot happen
         App::LinState::Row r;
-        r.seqId = si.id;
-        r.name = si.name;
-        r.level = si.level;
-        StackStats st = computeStackStats(si.id, rx, ry, rw, rh);
+        r.seqId = m.seqId;
+        r.name = si->name;
+        r.level = m.value;
+        r.include = m.include;
+        StackStats st = computeStackStats(m.seqId, rx, ry, rw, rh);
         r.valid = st.valid;
         r.err = st.err;
         r.frames = st.frames;
         r.nPl = st.nPl;
         for (int p = 0; p < 4; p++) { r.mean[p] = st.mean[p]; r.sigmaT[p] = st.sigmaT[p]; }
-        for (const auto& k : keepInc) if (k.first == si.id) r.include = k.second;
         L.rows.push_back(std::move(r));
     }
-    // fits, per plane, over rows that have both a level and a measurement
+    // fits, per plane, over rows that have both a value and a measurement
     L.fitValid = false;
     L.nPl = 1;
     for (const auto& r : L.rows) if (r.valid) L.nPl = std::max(L.nPl, r.nPl);
     int fitted = 0;
+    // No unit, no fit - and no fit for a kind these equations do not describe.
+    // The per-stack MEANS above are DN either way and stay on screen; a
+    // sensitivity is DN per SOMETHING measured by a KNOWN law, and inventing
+    // either is exactly the assumption the series layer exists to stop.
+    if (S->unit[0] == '\0' || !seriesFitKind(*S)) {
+        L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
     for (int p = 0; p < L.nPl; p++) {
         std::vector<double> lx, ly, pm, pv;
         for (const auto& r : L.rows) {
@@ -6946,30 +9027,373 @@ static void linRecompute() {
     L.computedRev = ++L.rev;
 }
 
+// SELFTEST ONLY - the one place in the program that creates a series without a
+// human. The canon forbids auto-creation because a guessed sweep is a lie that
+// fits; a headless test has nobody to press Create, so it presses it here, in
+// the open: ONE series over every stack of one batch, values from
+// extractLevelFromName (exactly the proposal the Create modal puts on screen),
+// unit = the same prefill that modal starts from. Called only from --*-selftest
+// branches in main(); returns 0 when the batch held no stacks.
+static int selftestMakeSeries(int batchId, const char* unitPrefill) {
+    if (!batchId) return 0;
+    int id = newSeries(batchId, "");
+    if (App::Series* S = seriesById(id)) {
+        S->paramName = "level";
+        snprintf(S->unit, sizeof S->unit, "%s",
+                 unitPrefill && *unitPrefill ? unitPrefill : "lx");
+    }
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != batchId) continue;
+        addToSeries(id, si.id, extractLevelFromName(si.name));
+    }
+    App::Series* S = seriesById(id);
+    if (!S || S->members.empty()) { pruneEmptySeries(); return 0; }
+    return id;
+}
+
+static const char* SERIES_KINDS = "linearity\0PTC\0temperature\0other\0";
+
+// What one row of the create/edit table means as a number. An untouched row of
+// an existing member is its stored double, not a re-read of the six digits the
+// box happens to be showing; anything else is the text, and text the program
+// cannot read is UNSET, never 0 (parseSeriesValue).
+static double seriesEditRowValue(const App::SeriesEdit::Row& r) {
+    if (r.haveOrig && !r.touched) return r.orig;
+    return parseSeriesValue(r.value);
+}
+
+// Fill the create/edit modal. Creating: every stack of the batch, all ticked,
+// each with extractLevelFromName's proposal ALREADY in its value box and marked
+// as a proposal. Editing: the members first, in their order, with their own
+// values, then the batch's non-members, unticked.
+//
+// The proposal is the whole point of the old "Auto levels" button, moved to
+// where it belongs: the user sees the numbers and the text they were read out
+// of BEFORE pressing Create, so pressing it is a confirmation. Nothing here
+// runs by itself - series are never auto-created (docs/terminology.md).
+static void openSeriesModal(int batchId, int editId) {
+    App::SeriesEdit& E = app.seriesEdit;
+    E = App::SeriesEdit{};
+    E.editId = editId;
+    E.batchId = batchId;
+    const App::Series* S = editId ? seriesById(editId) : nullptr;
+    if (S) {
+        E.batchId = S->batchId;
+        snprintf(E.name, sizeof E.name, "%s", S->name.c_str());
+        snprintf(E.param, sizeof E.param, "%s", S->paramName.c_str());
+        snprintf(E.unit, sizeof E.unit, "%s", S->unit);
+        E.kind = S->kind;
+    } else {
+        snprintf(E.name, sizeof E.name, "%s 掃引", batchNameOf(batchId).c_str());
+        // the prefill, and only that: an empty box stays empty (prefs linunit)
+        snprintf(E.unit, sizeof E.unit, "%s", app.lin.unit);
+    }
+    auto addRow = [&](int seqId, bool checked, double value, bool haveValue) {
+        App::SeriesEdit::Row r;
+        r.seqId = seqId;
+        r.check = checked;
+        App::SeqInfo* si = seqInfo(seqId);
+        r.name = si ? si->name : std::string();
+        double guess = extractLevelFromName(r.name, &r.from);
+        if (haveValue) {
+            // An EXISTING member. Its value is the user's - INCLUDING the
+            // decision not to set one. A guess proposed over that is a proposal
+            // on a row nobody came here to look at (Edit... is mostly opened to
+            // rename), and Save would commit it: "value unset" becomes a fit
+            // point with zero keystrokes. Creating is where a proposal belongs
+            // (docs/series-plan.md §2: 見た上で Create を押させる); here it is
+            // offered in the column beside the box instead of inside it.
+            r.orig = value;
+            r.haveOrig = true;
+            if (std::isfinite(value)) snprintf(r.value, sizeof r.value, "%.6g", value);
+            else r.guess = guess;
+        } else if (std::isfinite(guess)) {
+            snprintf(r.value, sizeof r.value, "%.6g", guess);
+            r.suggested = true;           // dim + "(guess)" until it is touched
+        }
+        E.rows.push_back(std::move(r));
+    };
+    if (S)
+        for (const auto& m : S->members) addRow(m.seqId, true, m.value, true);
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != E.batchId) continue;
+        bool already = false;
+        for (const auto& r : E.rows) if (r.seqId == si.id) already = true;
+        if (!already) addRow(si.id, S == nullptr, 0, false);
+    }
+    E.open = true;
+}
+
+// The modal's Save / Create button, as a plain function. Every other command in
+// this layer already is one (that is what let the selftest drive them); this one
+// was inline in the draw call, which is exactly why "open Edit... and press Save
+// without touching anything" had to be found by hand instead of by a test.
+// Returns the series' id, or 0 when nothing was accepted.
+static int seriesModalAccept() {
+    App::SeriesEdit& E = app.seriesEdit;
+    // Build the member list in TABLE ORDER: the row order is the series
+    // order, which is why the arrows exist.
+    std::vector<App::Series::Member> ms;
+    for (const auto& r : E.rows) {
+        if (!r.check || !seqInfo(r.seqId)) continue;
+        if (batchOfStack(r.seqId) != E.batchId) continue;   // strict containment
+        App::Series::Member m;
+        m.seqId = r.seqId;
+        m.value = seriesEditRowValue(r);
+        m.include = true;
+        if (const App::Series* old = seriesById(E.editId))   // keep the fit flag
+            for (const auto& om : old->members)
+                if (om.seqId == r.seqId) m.include = om.include;
+        ms.push_back(m);
+    }
+    if (ms.empty()) return 0;
+    int id = E.editId ? E.editId : newSeries(E.batchId, E.name);
+    // a stack belongs to AT MOST ONE series: taking one in takes it out of
+    // wherever it was
+    for (const auto& m : ms) {
+        App::Series* other = seriesOfStack(m.seqId);
+        if (other && other->id != id) removeFromSeries(m.seqId);
+    }
+    if (App::Series* S = seriesById(id)) {
+        S->name = E.name[0] ? E.name : batchNameOf(E.batchId) + " 掃引";
+        S->paramName = E.param;
+        snprintf(S->unit, sizeof S->unit, "%s", E.unit);
+        S->kind = std::clamp(E.kind, 0, 3);
+        S->members = std::move(ms);
+    }
+    // the next new series starts from the unit this one ended with
+    if (E.unit[0]) snprintf(app.lin.unit, sizeof app.lin.unit, "%s", E.unit);
+    app.prefsDirty = true;
+    pruneEmptySeries();
+    if (seriesById(id)) app.curSeriesId = id;
+    // Whatever was on screen measured the series as it WAS. The panel reads its
+    // labels live off the series, so a fit left standing here does not merely go
+    // stale - it gets relabelled with the new unit and the new parameter name.
+    linInvalidate();
+    app.imagesRev++;
+    return seriesById(id) ? id : 0;
+}
+
+static void drawSeriesModal() {
+    App::SeriesEdit& E = app.seriesEdit;
+    // "###" fixes the popup's identity while the title changes: ImGui hashes
+    // only what follows it, so create and edit really are one modal.
+    const char* POPUP = "Series###seriesmodal";
+    char title[64];
+    snprintf(title, sizeof title, "%s###seriesmodal",
+             E.editId ? "Edit series" : "Create series");
+    if (E.open && !ImGui::IsPopupOpen(POPUP)) ImGui::OpenPopup(POPUP);
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(640 * app.uiScale, 480 * app.uiScale), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_None)) return;
+    if (!E.open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+
+    ImGui::Text("batch: %s", batchNameOf(E.batchId).c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(a series lives in exactly one batch)");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+    ImGui::InputText("name", E.name, sizeof E.name);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+    ImGui::InputText("parameter", E.param, sizeof E.param);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::InputText("unit", E.unit, sizeof E.unit);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... printed on every axis and\n"
+                          "column. LEAVE IT EMPTY if you do not know it yet: an\n"
+                          "unset unit means no fit, which is the honest answer.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+    ImGui::Combo("kind", &E.kind, SERIES_KINDS);
+    if (!E.unit[0])
+        ImGui::TextDisabled("unit not set - members and means still show, the fit will not.");
+
+    ImGui::SeparatorText("members  (value = the parameter this stack was captured at)");
+    if (ImGui::SmallButton("Sort by value")) {
+        std::stable_sort(E.rows.begin(), E.rows.end(),
+                         [](const App::SeriesEdit::Row& a, const App::SeriesEdit::Row& b) {
+                             double av = seriesEditRowValue(a), bv = seriesEditRowValue(b);
+                             if (!std::isfinite(av)) av = HUGE_VAL;   // unset goes last
+                             if (!std::isfinite(bv)) bv = HUGE_VAL;
+                             return av < bv;
+                         });
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("All")) for (auto& r : E.rows) r.check = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) for (auto& r : E.rows) r.check = false;
+    ImGui::SameLine();
+    int nChecked = 0, nValued = 0;
+    for (const auto& r : E.rows) {
+        if (!r.check) continue;
+        nChecked++;
+        // what the row would BE, not whether the box has characters in it: a box
+        // holding "-" or "1e" is an unset member, and the count has to say so
+        if (std::isfinite(seriesEditRowValue(r))) nValued++;
+    }
+    ImGui::TextDisabled("| %d of %d stacks, %d with a value", nChecked,
+                        (int)E.rows.size(), nValued);
+
+    const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
+    float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
+    int moveFrom = -1, moveTo = -1;
+    if (ImGui::BeginTable("sermembers", 5, TF, ImVec2(0, std::max(tableH, 80.0f * app.uiScale)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("read from", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 9);
+        ImGui::TableSetupColumn("order", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFrameHeight() * 2.4f);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)E.rows.size(); i++) {
+            App::SeriesEdit::Row& r = E.rows[i];
+            ImGui::PushID(r.seqId);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("##m", &r.check);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-1);
+            if (r.suggested)      // a proposal reads as one until it is confirmed
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::InputText("##v", r.value, sizeof r.value,
+                                 ImGuiInputTextFlags_CharsScientific)) {
+                r.suggested = false;
+                r.touched = true;         // from here the TEXT is the value
+            }
+            if (r.suggested) ImGui::PopStyleColor();
+            if (r.value[0] && !std::isfinite(seriesEditRowValue(r)) &&
+                ImGui::IsItemHovered())
+                ImGui::SetTooltip("\"%s\" is not a number - this member saves as UNSET,\n"
+                                  "which is left out of the fit. It is never read as 0.",
+                                  r.value);
+            ImGui::TableNextColumn();
+            if (r.suggested) ImGui::TextDisabled("(guess) %s", r.from.c_str());
+            else if (!r.value[0] && std::isfinite(r.guess)) {
+                // offered, NOT filled in: this member's value is deliberately
+                // unset and only a human may change that
+                ImGui::TextDisabled("guess: %.6g", r.guess);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("\"%s\" suggests %.6g. The box is empty because this\n"
+                                      "member has NO value set - type it in to use the\n"
+                                      "suggestion; saving as it is keeps it unset.",
+                                      r.from.c_str(), r.guess);
+            }
+            else if (r.from.empty() && !r.value[0]) ImGui::TextDisabled("-");
+            else ImGui::TextDisabled("%s", r.from.c_str());
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::SmallButton("^")) { moveFrom = i; moveTo = i - 1; }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(i == (int)E.rows.size() - 1);
+            if (ImGui::SmallButton("v")) { moveFrom = i; moveTo = i + 1; }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (moveFrom >= 0) std::swap(E.rows[moveFrom], E.rows[moveTo]);
+
+    ImGui::Separator();
+    bool canAccept = nChecked > 0;
+    ImGui::BeginDisabled(!canAccept);
+    if (ImGui::Button(E.editId ? "Save" : "Create", ImVec2(140 * app.uiScale, 0))) {
+        seriesModalAccept();
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110 * app.uiScale, 0))) {
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!canAccept) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("tick at least one stack");
+    }
+    ImGui::EndPopup();
+}
+
 static void drawPanelLinearity() {
     App::LinState& L = app.lin;
-    int nStacks = 0;
-    for (const auto& si : app.seqs)
-        if (framesOfSeq(si.id).size() >= 2 || si.expectedFrames >= 2) nStacks++;
-    if (nStacks < 2) {
-        ImGui::TextDisabled("linearity needs several stacks, one per exposure level");
-        ImGui::TextDisabled("(open a folder of folders: each subfolder = one level)");
+    // ---- which series? Nothing here creates one on its own -------------------
+    if (app.series.empty()) {
+        ImGui::TextWrapped("No series yet. Linearity is measured over a SERIES: the stacks "
+                           "of one swept parameter, each with its value, and the parameter's "
+                           "name and unit belong to that series - not to the application.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("A sweep is never guessed from the folder tree. One wrong");
+        ImGui::TextDisabled("guess would quietly fit data that was never a sweep.");
+        ImGui::Spacing();
+        int b = cur() ? cur()->batchId : 0;
+        ImGui::BeginDisabled(b == 0);
+        if (ImGui::Button("Create a series from this batch's stacks..."))
+            openSeriesModal(b, 0);
+        ImGui::EndDisabled();
+        if (b == 0) ImGui::TextDisabled("(nothing is open yet)");
+        else ImGui::TextDisabled("batch: %s", batchNameOf(b).c_str());
         return;
     }
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
-    ImGui::InputText("level unit", L.unit, sizeof L.unit);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... whatever the x axis of\n"
-                          "your experiment is. Written on every axis and column.");
-    ImGui::SameLine();
-    if (ImGui::Button("Auto levels")) {
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
+    if (!seriesById(app.curSeriesId)) app.curSeriesId = app.series.front().id;
+    App::Series* S = seriesById(app.curSeriesId);
+    {
+        char label[320];
+        snprintf(label, sizeof label, "%s / %s", batchNameOf(S->batchId).c_str(),
+                 S->name.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 17);
+        if (ImGui::BeginCombo("##series", label)) {
+            for (const auto& s : app.series) {
+                char it[384];
+                // "##" would cut a batch or series name in half: give every row
+                // an explicit id and let the visible part be whatever it is.
+                // The KIND is on the row because this panel cannot measure them
+                // all: picking a temperature run here has to be a visible choice.
+                snprintf(it, sizeof it, "%s / %s%s%s##ser%d", batchNameOf(s.batchId).c_str(),
+                         s.name.c_str(), seriesFitKind(s) ? "" : "   ",
+                         seriesFitKind(s) ? "" : seriesKindName(s.kind), s.id);
+                if (ImGui::Selectable(it, s.id == app.curSeriesId)) app.curSeriesId = s.id;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Edit...")) openSeriesModal(S->batchId, S->id);
+        ImGui::SameLine();
+        if (ImGui::Button("New...")) openSeriesModal(cur() ? cur()->batchId : S->batchId, 0);
+        S = seriesById(app.curSeriesId);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("read the level from each stack's folder name\n(first number; only fills empty fields)");
+    const bool haveUnit = S->unit[0] != '\0';
+    const bool fitKind = seriesFitKind(*S);
+    if (S->paramName.empty()) ImGui::TextDisabled("(parameter unnamed)");
+    else ImGui::TextUnformatted(S->paramName.c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Compute")) linRecompute();
+    if (haveUnit) ImGui::Text("[%s]", S->unit);
+    else ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "[unit not set]");
+    if (!haveUnit && ImGui::IsItemHovered())
+        ImGui::SetTooltip("A sensitivity is DN per SOMETHING. Set the unit in\n"
+                          "Edit... - it is not assumed for you.");
+    if (!fitKind) {   // the kind picks the equation; this panel knows two of them
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "[%s series]",
+                           seriesKindName(S->kind));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This panel fits a linearity / PTC sweep. A %s series\n"
+                              "is a different measurement with a different equation,\n"
+                              "so no fit is printed for it - the per-stack means are\n"
+                              "measured either way.\n"
+                              "Change the kind in Edit... if this really is a sweep.",
+                              seriesKindName(S->kind));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Compute")) linRecompute(S->id);
     ImGui::SameLine();
     ImGui::TextDisabled(L.roiUsed ? "| selected ROI" : "| whole frame");
     // The per-stack table has room for ONE response column. Averaging the CFA
@@ -6981,17 +9405,18 @@ static void drawPanelLinearity() {
         ImGui::Combo("table plane", &L.tablePlane, "R\0Gr\0Gb\0B\0");
         L.tablePlane = std::clamp(L.tablePlane, 0, L.nPl - 1);
     }
+    const bool fresh = L.seriesId == S->id;
 
-    // one row per stack: level in, response out
+    // one row per MEMBER, in the series' order: value in, response out
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
-    char lvlHdr[48], meanHdr[32], sigHdr[32];
-    snprintf(lvlHdr, sizeof lvlHdr, "level [%s]", L.unit);
+    char lvlHdr[64], meanHdr[32], sigHdr[32];
+    snprintf(lvlHdr, sizeof lvlHdr, "value [%s]", haveUnit ? S->unit : "unit not set");
     const char* pl = L.nPl > 1 ? LIN_PLANES[std::clamp(L.tablePlane, 0, 3)] : "";
     snprintf(meanHdr, sizeof meanHdr, "mean %s [DN]", pl);
     snprintf(sigHdr, sizeof sigHdr, "sigma_t %s [DN]", pl);
-    float tableH = ImGui::GetFontSize() * std::min(10, nStacks + 2) * 1.6f;
-    if (ImGui::BeginTable("lintab", 5 + (L.fitValid && L.nPl > 1 ? 2 : 2), TF, ImVec2(0, tableH))) {
+    float tableH = ImGui::GetFontSize() * std::min<int>(10, (int)S->members.size() + 2) * 1.6f;
+    if (ImGui::BeginTable("lintab", 7, TF, ImVec2(0, tableH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
         ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
@@ -7001,23 +9426,28 @@ static void drawPanelLinearity() {
         ImGui::TableSetupColumn(sigHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2);
         ImGui::TableHeadersRow();
-        for (auto& si : app.seqs) {
-            if (framesOfSeq(si.id).size() < 2 && si.expectedFrames < 2) continue;
-            ImGui::PushID(si.id);
+        for (auto& m : S->members) {
+            App::SeqInfo* si = seqInfo(m.seqId);
+            if (!si) continue;
+            ImGui::PushID(m.seqId);
             const App::LinState::Row* row = nullptr;
-            for (const auto& r : L.rows) if (r.seqId == si.id) { row = &r; break; }
+            if (fresh)
+                for (const auto& r : L.rows) if (r.seqId == m.seqId) { row = &r; break; }
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            bool inc = true;
-            for (auto& r : L.rows) if (r.seqId == si.id) inc = r.include;
-            if (ImGui::Checkbox("##inc", &inc))
-                for (auto& r : L.rows) if (r.seqId == si.id) r.include = inc;
+            if (ImGui::Checkbox("##inc", &m.include)) {
+                for (auto& r : L.rows) if (r.seqId == m.seqId) r.include = m.include;
+                // the fit below was measured WITH this point (or without it):
+                // it is now describing a set of points that is not on screen
+                linFitStale();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("include this point in the fit");
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(si.name.c_str());
+            ImGui::TextUnformatted(si->name.c_str());
             ImGui::TableNextColumn();
-            double lv = std::isfinite(si.level) ? si.level : 0.0;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputDouble("##lv", &lv, 0, 0, "%.6g")) si.level = lv;
+            // NEVER 0 for "not set": the whole reason values live on the member
+            if (std::isfinite(m.value)) textNum("%.6g", m.value);
+            else ImGui::TextDisabled("unset");
             ImGui::TableNextColumn();
             if (row && row->valid) ImGui::Text("%d", row->frames);
             else ImGui::TextDisabled("-");
@@ -7033,18 +9463,28 @@ static void drawPanelLinearity() {
         }
         ImGui::EndTable();
     }
+    ImGui::TextDisabled("values are edited in Edit... - a blank one is UNSET, not zero");
 
-    if (!L.fitValid) {
-        ImGui::TextDisabled("set levels (Auto levels or type them), then Compute.");
-        ImGui::TextDisabled("3+ stacks with levels give a fit; CFA planes stay separate.");
+    if (!L.fitValid || !fresh) {
+        if (!haveUnit)
+            ImGui::TextDisabled("no unit: set one in Edit... and the fit follows.");
+        else if (!fitKind)
+            ImGui::TextDisabled("kind is \"%s\": the linearity / PTC equations are not the "
+                                "ones this series asked for.", seriesKindName(S->kind));
+        else if (seriesFitPoints(*S) < 2)
+            ImGui::TextDisabled("a fit needs 2+ members with a value (3+ to see linearity).");
+        else if (!fresh)
+            ImGui::TextDisabled("press Compute to measure this series.");
+        else
+            ImGui::TextDisabled("press Compute; CFA planes stay separate throughout.");
         return;
     }
 
     // ---- the answers ----
-    ImGui::SeparatorText("fit  (response = sensitivity * level + offset)");
+    ImGui::SeparatorText("fit  (response = sensitivity * value + offset)");
     if (ImGui::BeginTable("linfit", 7, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         char sensHdr[64];
-        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", L.unit);
+        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", S->unit);
         ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn(sensHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("offset [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -7101,8 +9541,12 @@ static void drawPanelLinearity() {
         }
     }
     if (pts.empty()) return;
-    char xl[64];
-    snprintf(xl, sizeof xl, "level [%s]", L.unit);
+    // A plotted axis states the quantity AND the unit, and the unit is the
+    // series' - there is no fit without one, and editing the series drops the
+    // fit (linInvalidate), so it cannot have been emptied out from under this.
+    char xl[96];
+    snprintf(xl, sizeof xl, "%s [%s]",
+             S->paramName.empty() ? "value" : S->paramName.c_str(), S->unit);
     float half = std::max((ImGui::GetContentRegionAvail().y - ImGui::GetFontSize() * 5) * 0.5f,
                           70.0f * app.uiScale);
     {
@@ -7205,6 +9649,86 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     return true;
 }
 
+// Server temporal for a stack that is NOT opened (fired from the browser's
+// group row or multi-selection). Takes over the panel until dismissed (x) or
+// superseded: the user just asked for it, and it has no current-image to hang
+// off. "Open as stack" turns the measurement into a real open in one click -
+// whose own server temporal then replaces this one.
+static void drawBrowseTemporal() {
+    App::ServerTemporal& S = app.srvTemporal;
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    if (S.pending) {
+        ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
+                           S.host.empty() ? "local peer" : S.host.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        return;
+    }
+    if (!S.valid) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[server failed]");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+        ImGui::Separator();
+        ImGui::TextDisabled("not opened: %s", S.label.c_str());
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", S.err.c_str());
+        return;
+    }
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames - not opened: %s]",
+                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open as stack")) {
+        // copy first: openRemoteStack fires its own server temporal, which
+        // resets S while we are still reading it
+        std::string host = S.host, label = S.label;
+        std::vector<std::string> files = S.files;
+        openRemoteStack(host, files, label);
+        return;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("open %s for real (frames transfer in the background)",
+                          S.label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
+    ImGui::Separator();
+    // cfaType was 0 by design (no open file to read a mosaic from): say so,
+    // or a Bayer stack's plane-blind sigma reads as a wrong number
+    ImGui::TextDisabled("plane=all (file not opened - no CFA split)");
+    if (ImGui::BeginTable("srvbtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
+        auto row = [](const char* k, double v) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn(); textNum("%.6g", v);
+        };
+        row("mean [DN]", S.mean);
+        row("temporal noise (sigma_t)", S.tempNoise);
+        row("fixed pattern (sigma_fpn)", S.fixedPattern);
+        row("total (quadrature)", S.totalNoise);
+        ImGui::EndTable();
+    }
+    if (!S.frameMean.empty()) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
+        float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        PlotRect tp = beginPlot("frame number", "frame mean value [DN]",
+                                fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            for (size_t i = 1; i < S.frameMean.size(); i++)
+                dl->AddLine(tp.at(S.idx[i - 1], S.frameMean[i - 1]),
+                            tp.at(S.idx[i], S.frameMean[i]), IM_COL32(105, 180, 240, 255), 1.5f);
+            dl->PopClipRect();
+        }
+    }
+}
+
 // Per-frame S1 stats of a stack as TSV on the clipboard, one row per frame:
 // file, path, per-plane spatial mean/sigma, and the H/V projection non-
 // uniformity (sigma of the column-mean / row-mean profile, as % of the plane
@@ -7296,8 +9820,266 @@ static void copyPerFrameStats(int seqId) {
     toast(b, skipped != 0);
 }
 
+// One side's temporal numbers, wherever they came from. The A/B table takes
+// both sides through this, so a server-measured A and a locally computed B land
+// in the same rows under the same headers - and "there is no number here" is a
+// stated reason instead of a blank.
+struct AbTemporal {
+    bool valid = false, isStack = false, fromServer = false;
+    double sigT = 0, sigS = 0, sigTot = 0;
+    int frames = 0, expected = 0;
+    const std::vector<float>* idx = nullptr;
+    const std::vector<float>* mean = nullptr;
+    const char* note = "";
+};
+static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
+                               const App::ServerTemporal& S) {
+    AbTemporal o;
+    if (!d || d->seqId == 0) { o.note = "not a stack"; return o; }
+    o.isStack = true;
+    if (const App::SeqInfo* si = seqInfo(d->seqId)) o.expected = si->expectedFrames;
+    if (S.valid && S.seqId == d->seqId) {          // server-measured wins: it saw
+        o.valid = true; o.fromServer = true;       // every frame, not the resident ones
+        o.sigT = S.tempNoise; o.sigS = S.fixedPattern; o.sigTot = S.totalNoise;
+        o.frames = S.frames;
+        o.idx = &S.idx; o.mean = &S.frameMean;
+        return o;
+    }
+    if (T.valid && T.seqId == d->seqId) {
+        o.valid = true;
+        o.sigT = T.tempNoise; o.sigS = T.fixedPattern; o.sigTot = T.totalNoise;
+        o.frames = T.frames;
+        o.idx = &T.idx; o.mean = &T.frameMean;
+        return o;
+    }
+    o.note = S.pending && S.seqId == d->seqId ? "measuring on the server..."
+                                              : "needs >= 2 loaded frames";
+    return o;
+}
+
+// A difference only means something when both sides measured the same quantity.
+// A 1-channel stack's sigma_t and a 3-channel one's are not the same number, so
+// the delta columns stay empty rather than subtract two unlike things
+// (docs/ab-stats-plan.md 5).
+static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
+    return a && b && a->ch == b->ch;
+}
+
+// The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
+// (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
+static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
+    recomputeTemporalIfNeeded(im, app.temporal[0]);
+    // NOT throttled: temporal is keyed on the STACK and its ROI, so stepping
+    // frames never invalidates it (see the A4 check in --abstats-selftest).
+    recomputeTemporalIfNeeded(Bim, app.temporal[1]);
+    AbTemporal A = abTemporalOf(im, app.temporal[0], app.srvTemporal);
+    AbTemporal B = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
+
+    const std::string uA = abValueUnit(im->dtype), uB = abValueUnit(Bim->dtype);
+    // the UNIT is DN on both sides; the STORAGE can still differ, and a delta
+    // between an f32 and a u16 stack is worth a warning even so
+    const bool dtypeMix = im->dtype != Bim->dtype;
+    const std::string unit = uA == uB ? uA : (uA + "/" + uB);
+    const bool canDelta = abDeltaMeaningful(im, Bim);
+
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%s, %s]", app.temporal[0].roiUsed ? "selected ROI" : "whole image",
+                        A.fromServer || B.fromServer ? "server + local" : "local");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("One row per resident frame of A's stack, tab-separated.");
+    // B's server aggregate is never fired automatically - one explicit press,
+    // one remote job (docs/ab-stats-plan.md 4).
+    if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
+        if (serverComputes(*sb)) {
+            ImGui::SameLine();
+            bool busy = app.srvTemporalB.pending && app.srvTemporalB.seqId == Bim->seqId;
+            ImGui::BeginDisabled(busy);
+            if (ImGui::SmallButton(busy ? "Measuring B..." : "Measure B"))
+                requestServerTemporal(Bim->seqId, app.srvTemporalB);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Run the server-side aggregate over B's stack.\n"
+                                  "It is never started on its own: B follows A, and\n"
+                                  "an automatic B measurement would double every\n"
+                                  "remote job you did not ask for.");
+        }
+    ImGui::Separator();
+
+    char hA[64], hB[64];
+    auto frames = [](char* buf, size_t n, const char* side, const AbTemporal& s) {
+        if (!s.isStack) snprintf(buf, n, "%s", side);
+        else if (s.expected > s.frames) snprintf(buf, n, "%s (n=%d/%d)", side, s.frames, s.expected);
+        else snprintf(buf, n, "%s (n=%d/%d)", side, s.frames, s.frames);
+    };
+    frames(hA, sizeof hA, "A", A);
+    frames(hB, sizeof hB, "B", B);
+    std::string cQ = "quantity [" + unit + "]";
+    std::string cD = "delta A-B [" + unit + "]";
+
+    if (ImGui::BeginTable("abtemporal", 5, ImGuiTableFlags_SizingFixedFit |
+                                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+        ImGui::TableSetupColumn(cQ.c_str(), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(hA, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(hB, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(cD.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("delta [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableHeadersRow();
+        // isPct: the quantity is already a percentage, so a relative difference
+        // of a percentage is meaningless - the absolute one, in points, is the
+        // honest answer. Kept general; today's three rows are all in DN.
+        auto row = [&](const char* k, double a, double b, bool isPct) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn();
+            A.valid ? textNum("%.6g", a) : textNumStr("-");
+            ImGui::TableNextColumn();
+            if (B.valid) textNum("%.6g", b);
+            else textNumStr(B.isStack ? "-" : "- (not a stack)");
+            ImGui::TableNextColumn();
+            if (A.valid && B.valid && canDelta) textNum("%.6g", a - b); else textNumStr("");
+            ImGui::TableNextColumn();
+            if (!A.valid || !B.valid || !canDelta) textNumStr("");
+            // a quantity that is ALREADY a percentage has no meaningful relative
+            // difference: points are the honest answer. (Today's three rows are
+            // all in DN; the rule is here so the next row cannot get it wrong.)
+            else if (isPct) { char t[48]; snprintf(t, sizeof t, "%.4g pt", a - b); textNumStr(t); }
+            else if (a == 0) textNumStr("-  (A = 0)");
+            else textNum("%.4g", (a - b) / fabs(a) * 100.0);
+        };
+        row("temporal noise (sigma_t)", A.sigT, B.sigT, false);
+        row("fixed pattern (sigma_s)", A.sigS, B.sigS, false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
+                              "includes scene detail unless the ROI is flat");
+        row("total (quadrature)", A.sigTot, B.sigTot, false);
+        ImGui::EndTable();
+    }
+    if (!A.valid || !B.valid)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "A: %s   |   B: %s",
+                           A.valid ? "ok" : A.note, B.valid ? "ok" : B.note);
+    if (dtypeMix)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "dtype mismatch (A %s, B %s): both sides are DN, but the "
+                           "delta spans two storage classes", im->dtype.c_str(),
+                           Bim->dtype.c_str());
+    if (!canDelta)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "channel counts differ (A %dch, B %dch): no delta - the two "
+                           "columns are not the same quantity", im->ch, Bim->ch);
+    if (A.fromServer || B.fromServer)
+        ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
+                            B.fromServer ? "server" : "local");
+
+    // ---- per-frame mean over time: A solid, B dashed, one shared axis ----
+    if (!A.mean || A.mean->empty()) return;
+    float mn = FLT_MAX, mx = -FLT_MAX, fx0 = FLT_MAX, fx1 = -FLT_MAX;
+    auto span = [&](const AbTemporal& s) {
+        if (!s.mean || s.mean->empty()) return;
+        for (float v : *s.mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        if (s.idx && !s.idx->empty()) {
+            fx0 = std::min(fx0, s.idx->front()); fx1 = std::max(fx1, s.idx->back());
+        }
+    };
+    span(A); span(B);
+    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
+    char yl[128];
+    if (im->dtype != Bim->dtype)
+        snprintf(yl, sizeof yl, "ROI mean value (%s)  -  A %s / B %s, DTYPE MISMATCH",
+                 unit.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
+    else snprintf(yl, sizeof yl, "ROI mean value (%s)", unit.c_str());
+    const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
+
+    auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool dashed) {
+        if (!tp.ok || !s.mean || s.mean->size() < 2 || !s.idx) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        std::vector<ImVec2> pts;
+        pts.reserve(s.mean->size());
+        for (size_t i = 0; i < s.mean->size() && i < s.idx->size(); i++)
+            pts.push_back(tp.at((*s.idx)[i], (*s.mean)[i]));
+        if (pts.size() < 2) return;
+        if (dashed) addDashedPolyline(dl, pts.data(), (int)pts.size(), CURVE, 1.5f,
+                                      5 * app.uiScale, 4 * app.uiScale);
+        else dl->AddPolyline(pts.data(), (int)pts.size(), CURVE, 0, 1.5f);
+    };
+    auto marker = [&](const PlotRect& tp, const ImageDoc* d) {
+        if (!tp.ok || !d) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float mxp = tp.at((float)d->seqIndex, tp.ymin).x;
+        dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
+    };
+    const float minSide = AB_MIN_SIDE * app.uiScale;
+    bool side = abSideBySide();
+    bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+    if (tooNarrow) side = false;
+    const std::string aLabel = abDocLabel(im), bLabel = abDocLabel(Bim);
+    float tAvail = ImGui::GetContentRegionAvail().y
+                 - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
+                 - (tooNarrow ? abNarrowNoteH() : 0.0f)
+                 - (side ? 0.0f : abLegendH(aLabel, bLabel, false));
+    if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;
+    float plotH = std::max(tAvail, 70.0f * app.uiScale);
+    const char* xlab = "frame number (index in sequence)";
+    if (!side) {
+        PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            curve(tp, A, false);
+            curve(tp, B, true);
+            marker(tp, im);
+            dl->PopClipRect();
+        }
+        drawABLegendRow(aLabel, bLabel);
+    } else {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
+                     + ImGui::GetTextLineHeight() + 8 * app.uiScale;
+        ImGui::BeginChild("##tempA", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("A", aLabel);
+        {
+            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+            if (tp.ok) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                curve(tp, A, false); marker(tp, im);
+                dl->PopClipRect();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("##tempB", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("B", abDocLabel(Bim));
+        {   // same limits as A's plot, by construction
+            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+            if (tp.ok) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                curve(tp, B, true); marker(tp, Bim);
+                dl->PopClipRect();
+            }
+        }
+        ImGui::EndChild();
+    }
+    if (tooNarrow) abNarrowNote();
+}
+
 static void drawPanelTemporal() {
+    // a browser-fired aggregate (files nobody opened) owns the panel until
+    // dismissed - it is the freshest thing the user asked for and has no
+    // current image to attach to
+    if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
+    // Compare on, and A is a stack: the A|B|delta|delta% table. A B that is not
+    // a stack still gets its column, saying exactly that. With no B at all the
+    // panel is exactly what it always was.
+    if (ImageDoc* Bim = abStatsB())
+        if (im && im->seqId != 0) { drawTemporalAB(im, Bim); return; }
     if (im && im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
         if (drawServerTemporal(si)) {         // remote stack, computed on the server
@@ -7310,8 +10092,8 @@ static void drawPanelTemporal() {
                                   "tab-separated for Excel.");
             return;
         }
-        recomputeTemporalIfNeeded();
-        const App::TemporalState& T = app.temporal;
+        recomputeTemporalIfNeeded(im, app.temporal[0]);
+        const App::TemporalState& T = app.temporal[0];
         ImGui::Text("Temporal");
         ImGui::SameLine();
         // for a remote stack whose server measure failed, be explicit that this
@@ -7356,7 +10138,7 @@ static void drawPanelTemporal() {
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
             float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
             char yl[64];
-            snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+            snprintf(yl, sizeof yl, "ROI mean value (%s)", abValueUnit(im->dtype).c_str());
             float tAvail = ImGui::GetContentRegionAvail().y
                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
             PlotRect tp = beginPlot("frame number (index in sequence)", yl,
@@ -8049,6 +10831,143 @@ static std::string fmtEntryShape(const remote::Entry& e) {
     return s;
 }
 
+// ---- listing view: one row of the Browse table --------------------------------
+// A numbered sequence arrives as ONE synthetic entry carrying `.members`, so
+// "show me the individual frames" is a view over the reply we already have -
+// no LIST, no round trip, nothing to invalidate. `member` picks which face the
+// row wears: -1 = the entry itself (folder, plain file, or the collapsed group
+// row), >= 0 = the n-th frame of a group.
+//
+// What an expanded frame does NOT have is its own size and mtime: the group
+// reply carries the SUM of the members' bytes and the NEWEST member's time,
+// and there is no per-file breakdown in it. Those cells stay blank rather than
+// repeating the group's numbers on 24 rows, which would be a lie 24 times.
+// shape/dtype are shared by construction (the peer only groups files that
+// agree), so they are shown.
+// In TREE mode rows no longer all come from one directory, so a row carries the
+// directory it was listed from. `dir` points at a string that outlives the
+// frame: either App::RemoteBrowse::dir or a key of App::rbTreeCache (std::map
+// nodes do not move).
+struct RbRow {
+    const remote::Entry* e = nullptr;
+    const std::string* dir = nullptr;
+    int member = -1;
+    int depth = 0;                 // tree indent level; 0 = the listed folder
+    bool ph = false;               // "(listing...)": a node whose LIST is in flight
+    const std::string& name() const { return member < 0 ? e->name : e->members[member]; }
+    bool isDir()   const { return !ph && member < 0 && e->dir; }
+    bool isGroup() const { return !ph && member < 0 && e->group; }
+    bool ownFile() const { return member < 0; }   // has its own size / mtime
+    // absolute path of this row, and of one of its members
+    std::string join(const std::string& n) const {
+        return *dir == "/" ? "/" + n : *dir + "/" + n;
+    }
+    std::string full() const { return join(name()); }
+};
+// The listing table's columns, and the sort the tree builder has to honour.
+// Stashed from the table (TableGetSortSpecs only exists between Begin/EndTable,
+// and a tree has to be sorted per LEVEL while it is being built, one frame
+// earlier). A sort change therefore lands on the next frame - invisible, and
+// far cheaper than building the view twice.
+enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+static int  g_rbSortCol = RB_COL_NAME;
+static bool g_rbSortDesc = false;
+
+static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+                      bool flat, bool tree, int depth, std::vector<RbRow>& out);
+
+// Grouped or flat, listing or tree, from the same entries. Free function so the
+// headless selftest drives exactly what the panel draws.
+static std::vector<RbRow> rbBuildView(const std::string* dir,
+                                      const std::vector<remote::Entry>& entries,
+                                      bool flat, bool tree) {
+    std::vector<RbRow> v;
+    v.reserve(entries.size());
+    rbAddRows(dir, entries, flat, tree, 0, v);
+    return v;
+}
+static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+                      bool flat, bool tree, int depth, std::vector<RbRow>& out) {
+    if (depth > 24) return;                    // a symlink loop is not a tree
+    std::vector<int> order(ents.size());
+    for (int i = 0; i < (int)ents.size(); i++) order[i] = i;
+    if (tree) {
+        // Per LEVEL: a global sort over a flattened tree would tear children
+        // away from their parents. Directories first, as in the flat listing.
+        std::stable_sort(order.begin(), order.end(), [&](int ia, int ib) {
+            const remote::Entry& a = ents[ia];
+            const remote::Entry& b = ents[ib];
+            if (a.dir != b.dir) return a.dir;
+            int cmp = 0;
+            switch (g_rbSortCol) {
+                case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
+                case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
+                default:           cmp = a.name.compare(b.name); break;
+            }
+            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+        });
+    }
+    for (int oi : order) {
+        const remote::Entry& e = ents[oi];
+        if (flat && e.group && !e.members.empty()) {
+            for (int m = 0; m < (int)e.members.size(); m++)
+                out.push_back({ &e, dir, m, depth, false });
+            continue;
+        }
+        out.push_back({ &e, dir, -1, depth, false });
+        if (!tree || !e.dir) continue;
+        std::string sub = *dir == "/" ? "/" + e.name : *dir + "/" + e.name;
+        if (!rbHas(app.rbExpanded, sub)) continue;
+        auto it = app.rbTreeCache.find(sub);
+        if (it != app.rbTreeCache.end())
+            rbAddRows(&it->first, it->second, flat, tree, depth + 1, out);
+        else {
+            // the LIST is still in flight: say so where the children will be
+            static const remote::Entry busy = [] {
+                remote::Entry b; b.name = "(listing...)"; return b;
+            }();
+            out.push_back({ &busy, dir, -1, depth + 1, true });
+        }
+    }
+}
+
+// ---- deferred panel actions -------------------------------------------------
+// Every row the listing draws is an RbRow: RAW POINTERS into app.rbrowse.entries
+// and into the tree cache, held in a `view` vector that is rebuilt each frame
+// and read from the moment it is built until the table ends. An action that
+// REPLACES either container therefore cannot run where it is clicked - the rest
+// of the frame would read freed memory.
+//
+// The tree cache knew this ("a mid-frame clear would dangle every row below the
+// refresh button") and hand-rolled a one-flag deferral. The Places combo did
+// not: picking a bookmark on another host runs goToPlace, which assigns a fresh
+// App::RemoteBrowse over the live one, and the table below then dereferenced
+// nine destroyed entries - reproduced as a SIGSEGV inside strlen, one click
+// after connecting.
+//
+// So it is a rule now instead of three careful call sites: navigation, the tree
+// cache and the connection state are QUEUED here and run once `view` is dead.
+// A new button inherits the rule instead of having to remember it.
+static std::vector<std::function<void()>> g_rbDeferred;
+static void rbDefer(std::function<void()> f) { g_rbDeferred.push_back(std::move(f)); }
+static size_t rbDeferredPending() { return g_rbDeferred.size(); }
+// RAII, so the panel's early returns run the queue too. Declared BEFORE `view`
+// in drawPanelRemote: reverse destruction order is what guarantees the rows are
+// already gone when the queue runs.
+struct RbDeferredActions {
+    ~RbDeferredActions() {
+        std::vector<std::function<void()>> q;
+        q.swap(g_rbDeferred);          // an action may queue another
+        for (auto& f : q) f();
+    }
+};
+// Every navigation the panel offers. remoteBrowseTo only enqueues a job today,
+// so this changes nothing that can be seen - it makes "the panel never
+// navigates mid-draw" true by construction rather than by inspection.
+static void rbGoTo(const std::string& dir) {
+    rbDefer([dir] { remoteBrowseTo(dir); });
+}
+
 // Bookmarks + recents in one dropdown. Available connected or not: picking a
 // place while disconnected is exactly how a session starts next morning.
 static void drawRemotePlacesCombo() {
@@ -8056,6 +10975,11 @@ static void drawRemotePlacesCombo() {
     if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
                            ImGuiComboFlags_HeightLarge))
         return;
+    // display only: a local place reads better as "[local] path" than as the
+    // url scheme (the stored prefs string stays the url)
+    auto placeLabel = [](const std::string& u) {
+        return u.rfind("local://", 0) == 0 ? "[local] " + u.substr(8) : u;
+    };
     int rm = -1;
     if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");
     for (int i = 0; i < (int)app.rbBookmarks.size(); i++) {
@@ -8063,7 +10987,8 @@ static void drawRemotePlacesCombo() {
         if (ImGui::SmallButton("x")) rm = i;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
         ImGui::SameLine();
-        if (ImGui::Selectable(app.rbBookmarks[i].c_str())) goToPlace(app.rbBookmarks[i]);
+        if (ImGui::Selectable(placeLabel(app.rbBookmarks[i]).c_str()))
+            rbDefer([u = app.rbBookmarks[i]] { goToPlace(u); });   // see rbDefer
         ImGui::PopID();
     }
     if (rm >= 0) {
@@ -8074,7 +10999,8 @@ static void drawRemotePlacesCombo() {
     if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
         ImGui::PushID(1000 + i);
-        if (ImGui::Selectable(app.rbRecents[i].c_str())) goToPlace(app.rbRecents[i]);
+        if (ImGui::Selectable(placeLabel(app.rbRecents[i]).c_str()))
+            rbDefer([u = app.rbRecents[i]] { goToPlace(u); });
         ImGui::PopID();
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
@@ -8084,6 +11010,11 @@ static void drawRemotePlacesCombo() {
 
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
+    // FIRST, so it is destroyed LAST - after `view` and after every row that
+    // points into the browse state. Anything that replaces that state is queued
+    // through rbDefer and runs here. (This replaces a one-flag "forget the tree
+    // next frame" deferral that covered the tree cache and nothing else.)
+    RbDeferredActions rbActions;
     ImGui::PushID("remotetree");
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
@@ -8101,38 +11032,29 @@ static void drawPanelRemote() {
         ImGui::PopID();
         return;
     }
-    // Where we are, and how to leave: host row first, path row under it.
-    ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("disconnect")) { B = App::RemoteBrowse{}; ImGui::PopID(); return; }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("home")) remoteBrowseTo("~");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
-    if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
-    {   // star = bookmark the place being looked at; the combo recalls them
-        std::string curUrl = placeUrl(B.host, B.port, B.dir);
-        bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
-                                 curUrl) != app.rbBookmarks.end();
-        if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
-        if (ImGui::SmallButton("*")) {
-            if (starred)
-                app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
-                                                  app.rbBookmarks.end(), curUrl),
-                                      app.rbBookmarks.end());
-            else
-                app.rbBookmarks.push_back(curUrl);
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (starred) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
-                              curUrl.c_str());
-        ImGui::SameLine();
-        drawRemotePlacesCombo();
-    }
-    // ---- path bar: breadcrumbs, or one text field while editing ----
+    // The panel used to stack FIVE things above the listing: a host row with
+    // three buttons, the breadcrumb bar, the filter, the server-search row, and
+    // (when a preview was alive) the scrub bar. Four of them were there for the
+    // rare case. What is left permanently on screen is what browsing actually
+    // needs - where am I (breadcrumbs) and narrow it down (toolbar + filter) -
+    // and everything else is one click away under "more", with nothing removed.
+    bool& rbAdvanced = app.rbAdvanced;
+    // Server-side search: a different thing from the filter (which only narrows
+    // what is already listed). Declared up here because the path bar's context
+    // menu can aim it at a folder.
+    static char rbSearchBuf[256] = "";
+    static bool rbSearchFocus = false;
+    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
+    // where we are, and how to leave
+    bool atRoot = B.dir == "~" || B.dir == "/";
+    auto rbGoParent = [&]() {
+        if (atRoot) return;
+        std::string d = B.dir;
+        size_t s = d.find_last_of('/');
+        rbGoTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                : d.substr(0, s));
+    };
+    // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     static char rbPathEdit[1024];
     static bool rbPathEditing = false, rbPathFocus = false;
     if (!rbPathEditing) {
@@ -8165,16 +11087,49 @@ static void drawPanelRemote() {
                     ImGui::CalcTextSize(segs[k].label.c_str()).x + ImGui::GetFontSize())
                     ImGui::NewLine();
             }
-            if (ImGui::SmallButton(segs[k].label.c_str())) remoteBrowseTo(segs[k].path);
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) editReq = true;
+            if (ImGui::SmallButton(segs[k].label.c_str())) rbGoTo(segs[k].path);
+            // Right-click used to jump straight into path editing. It is a menu
+            // now: the actions that take a FOLDER as their subject all belong on
+            // the bar that names the folder.
+            if (ImGui::BeginPopupContextItem("crumbctx")) {
+                const std::string& target = segs[k].path;
+                // the same item a folder ROW carries, aimed at a folder that is
+                // not in any listing - the one you are inside, or an ancestor
+                if (ImGui::MenuItem("Open folder (all stacks below)"))
+                    remoteScanFolder(target);
+                if (ImGui::MenuItem("Search under here")) {
+                    rbSearchRoot = target;
+                    rbSearchFocus = true;
+                    rbAdvanced = true;          // the search row lives under "more"
+                }
+                if (ImGui::MenuItem("Bookmark")) {
+                    std::string u = placeUrl(B.host, B.port, target);
+                    if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
+                        app.rbBookmarks.end()) {
+                        app.rbBookmarks.push_back(u);
+                        app.prefsDirty = true;
+                        savePrefs();
+                    }
+                    toast("bookmarked " + u);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Copy path")) {
+                    ImGui::SetClipboardText(target.c_str());
+                    toast("copied " + target);
+                }
+                if (ImGui::MenuItem("Edit path...")) editReq = true;
+                ImGui::EndPopup();
+            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\n(right-click to edit the path)", segs[k].path.c_str());
+                ImGui::SetTooltip("%s\n(right-click for what can be done to this folder)",
+                                  segs[k].path.c_str());
             ImGui::PopID();
         }
         if (!segs.empty()) ImGui::SameLine();
         if (ImGui::SmallButton("edit##path")) editReq = true;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("type or paste a path (right-clicking the bar works too)");
+            ImGui::SetTooltip("type or paste a path (right-clicking a crumb works too)");
+        if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
         if (editReq) {
             snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
             rbPathEditing = true;
@@ -8191,7 +11146,7 @@ static void drawPanelRemote() {
             while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
             while (p.size() > 1 && p.back() == '/') p.pop_back();
             rbPathEditing = false;
-            remoteBrowseTo(p.empty() ? "~" : p);
+            rbGoTo(p.empty() ? "~" : p);
         } else if (ImGui::IsItemDeactivated()) {
             rbPathEditing = false;    // Esc (ImGui reverts the text) or focus loss
         }
@@ -8210,77 +11165,165 @@ static void drawPanelRemote() {
             toast("copied");
         }
     }
-    // full remote path of a listed name
-    auto joined = [&B](const std::string& n) {
-        return B.dir == "/" ? "/" + n : B.dir + "/" + n;
-    };
-    // Multi-select (Ctrl / Shift + click on file rows). Selection is keyed to
-    // the exact listing: a navigation or a refresh invalidates the indices, so
-    // it resets rather than pointing at different rows.
+    // The listing as ROWS: grouped (one row per sequence) or flat (one row per
+    // frame), listing or tree. Rebuilt every frame - see rbBuildView.
+    std::vector<RbRow> view = rbBuildView(&B.dir, B.entries, app.rbFlat, app.rbTree);
+    // Multi-select (Ctrl / Shift + click on file rows), indexed by ROW. A
+    // navigation or a refresh invalidates the indices, so it resets rather
+    // than pointing at different rows. A grouped/flat TOGGLE does not: the
+    // selection carries across by owning entry, so expanding a selected
+    // sequence selects its frames and collapsing them selects the sequence.
     static std::vector<char> rbSel;
-    static int rbSelAnchor = -1;               // entry index of the last click
+    static int rbSelAnchor = -1;               // row index of the last click
+    static bool rbSelFlat = false;             // which view rbSel was built for
+    static bool rbSelTree = false;
     {
         static std::string selSig;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
         if (sig != selSig) {
             selSig = sig;
-            rbSel.assign(B.entries.size(), 0);
+            rbSel.assign(view.size(), 0);
+            rbSelAnchor = -1;
+        } else if (rbSelFlat != app.rbFlat || rbSelTree != app.rbTree) {
+            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, rbSelFlat, rbSelTree);
+            std::vector<const remote::Entry*> sel;
+            for (size_t i = 0; i < old.size() && i < rbSel.size(); i++)
+                if (rbSel[i]) sel.push_back(old[i].e);
+            rbSel.assign(view.size(), 0);
+            for (size_t i = 0; i < view.size(); i++)
+                if (std::find(sel.begin(), sel.end(), view[i].e) != sel.end()) rbSel[i] = 1;
             rbSelAnchor = -1;
         }
+        rbSelFlat = app.rbFlat;
+        rbSelTree = app.rbTree;
+        // an expand or a collapse moved every row below it: start clean
+        if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
-    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
-        // the frames can actually stack, BEFORE any pixel is transferred
-        int nSel = 0;
-        const remote::Entry* first = nullptr;
-        std::string reason;
-        for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
-            if (!rbSel[i]) continue;
-            const remote::Entry& e = B.entries[i];
-            nSel++;
-            if (!isNpyName(e.name)) { reason = "only .npy files can form a stack"; continue; }
-            if (!e.hasMeta) {
-                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
-                continue;
-            }
-            if (!first) { first = &e; continue; }
-            if (e.ndim != first->ndim || e.dtype != first->dtype ||
-                memcmp(e.dims, first->dims, sizeof e.dims) != 0)
-                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
-                         fmtEntryShape(e);
+    // What a plain click does: enter a folder, or show a throwaway PREVIEW of
+    // a file / of a sequence's poster frame. Nothing is registered. Factored
+    // out because the keyboard (arrow keys) has to do exactly the same thing.
+    auto rbActivateRow = [&](const RbRow& r) {
+        if (r.ph) return;
+        if (r.isDir()) {
+            // In a TREE a folder opens where it is; the listing still enters it.
+            if (app.rbTree) {
+                if (rbHas(app.rbExpanded, r.full())) rbTreeCollapse(r.full());
+                else rbTreeExpand(r.full());
+            } else rbGoTo(r.full());
+            return;
         }
-        if (nSel >= 2) {
-            char lb[64];
-            snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
-            if (!reason.empty()) ImGui::BeginDisabled();
-            if (ImGui::Button(lb)) {
-                std::vector<std::string> files;
-                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    const remote::Entry& e = B.entries[i];
-                    if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
-                    else files.push_back(joined(e.name));
-                }
-                sortFramesNumerically(files);
-                openRemoteStack(B.host, files);
-                rbSel.assign(B.entries.size(), 0);
-            }
-            if (!reason.empty()) ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", reason.empty()
-                    ? "frames stack in numeric name order" : reason.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
+        if (!isNpyName(r.name())) return;
+        // Everything this needs is read out of the row BEFORE the open, as
+        // VALUES: an RbRow is a pair of raw pointers into B.entries / the tree
+        // cache, and `r` is a reference into a vector rebuilt every frame.
+        // Nothing on the open path mutates either container today, but the row
+        // list is one refresh away from being replaced underneath us, and the
+        // tree work already had to defer a mid-frame clear for exactly this.
+        // stepping context for the scrub bar / , and . : the whole sequence
+        // when the row belongs to one, so a flat row still steps its siblings
+        std::vector<std::string> seq;
+        if ((r.isGroup() || r.member >= 0) && !r.e->members.empty())
+            for (const auto& m : r.e->members) seq.push_back(r.join(m));
+        int seqAt = r.member >= 0 ? r.member : 0;
+        std::string seqLabel = r.e->name;
+        std::string target = r.isGroup()
+            ? r.join(r.e->members.empty() ? r.e->name : r.e->members[0])
+            : r.full();
+        // idempotent: clicking the same file again re-shows the preview
+        // instead of re-fetching it
+        ImageDoc* pv = nullptr;
+        for (const auto& di : app.images)
+            if (di->uid == app.previewUid && di->preview) pv = di.get();
+        std::string u = makeRemoteUrl(B.host, target);
+        if (pv && pv->remoteUrl == u) selectImage(app.current);
+        else openRemote(u, true);
+        app.previewFiles = std::move(seq);
+        if (!app.previewFiles.empty()) {
+            app.previewIndex = seqAt;
+            app.previewLabel = std::move(seqLabel);
         }
-    }
-    // Filter what is already listed - no round-trip to the server. Substring by
-    // default, glob when * or ? appears (globListMatch's contract), because a
-    // capture dump directory holds hundreds of entries and one condition matters.
+    };
+    // What a double-click (and Enter) does: a REGISTERED open. A sequence row
+    // opens the whole stack; a frame promotes the preview it just made.
+    auto rbOpenRow = [&](const RbRow& r) {
+        if (r.ph) return;
+        if (r.isDir()) { rbGoTo(r.full()); return; }
+        if (!isNpyName(r.name())) return;
+        if (r.isGroup()) {
+            dropPreview();                   // the poster frame did its job
+            std::vector<std::string> files;
+            for (const auto& m : r.e->members) files.push_back(r.join(m));
+            openRemoteStack(B.host, files);
+            return;
+        }
+        for (const auto& di : app.images)
+            if (di->uid == app.previewUid && di->preview) promotePreview(di.get());
+    };
+    // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
+    // narrow it down. Everything else is behind "more".
     static char rbFilter[256] = "";
     {
+        ImGui::BeginDisabled(atRoot);
+        if (ImGui::SmallButton("up")) rbGoParent();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("parent folder (Backspace)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("home")) rbGoTo("~");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("refresh")) {
+            rbDefer([] { rbTreeForget(); });        // in order: forget, then list
+            rbGoTo(B.dir);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
+        ImGui::SameLine();
+        // Open Folder for the folder you are IN. It used to exist only on a
+        // folder ROW, so opening the directory being browsed meant going up a
+        // level to find its own name in the parent's listing - and if that
+        // directory was the home or the root, there was no level to go up to.
+        if (ImGui::SmallButton("open folder")) remoteScanFolder(B.dir);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
+                              "which stacks to open:\n%s", B.dir.c_str());
+        ImGui::SameLine();
+        // Grouped <-> flat. No round trip: the peer already sent every member.
+        if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
+            app.rbFlat = !app.rbFlat;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(app.rbFlat
+                ? "flat: every frame is its own row.\nclick to collapse numbered "
+                  "sequences back into one row each.\n(per-frame size and date are "
+                  "not in the listing reply - those cells stay blank)"
+                : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
+                  "individually (no request to the server).");
+        ImGui::SameLine();
+        // List <-> tree. Expanding a node costs ONE list, once.
+        if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
+            app.rbTree = !app.rbTree;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(app.rbTree
+                ? "tree: a folder opens IN PLACE (click it; Right/Left also do).\n"
+                  "double-click or Enter still goes INTO it.\neach node is listed "
+                  "once and kept - collapsing costs nothing to undo.\nclick to go "
+                  "back to one folder at a time."
+                : "list: one folder at a time, a click enters it.\nclick to expand "
+                  "folders in place instead.");
+        ImGui::SameLine();
+        // Filter what is already listed - no round trip. Substring by default,
+        // glob when * or ? appears (globListMatch's contract), because a capture
+        // dump directory holds hundreds of entries and one condition matters.
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
             ImGui::SetKeyboardFocusHere();
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
         ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
                                  rbFilter, sizeof rbFilter);
         if (ImGui::IsItemHovered())
@@ -8288,23 +11331,106 @@ static void drawPanelRemote() {
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
     }
-    // filtered view of B.entries, by index (the clipper needs random access)
+    // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
-    shown.reserve(B.entries.size());
-    for (int i = 0; i < (int)B.entries.size(); i++)
-        if (!rbFilter[0] || globListMatch(rbFilter, B.entries[i].name))
-            shown.push_back(i);
+    shown.reserve(view.size());
+    if (!app.rbTree || !rbFilter[0]) {
+        for (int i = 0; i < (int)view.size(); i++)
+            if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
+                shown.push_back(i);
+    } else {
+        // In a tree, dropping a folder because its own NAME does not match
+        // would orphan the matching files inside it. Rows are in pre-order, so
+        // one backward pass keeps every match and every ancestor of a match.
+        std::vector<char> keep(view.size(), 0);
+        int need = -1;                 // an ancestor shallower than this is wanted
+        for (int i = (int)view.size() - 1; i >= 0; i--) {
+            bool m = !view[i].ph && globListMatch(rbFilter, view[i].name());
+            if (m || (need >= 0 && view[i].depth < need)) {
+                keep[i] = 1;
+                need = view[i].depth;
+            }
+        }
+        for (int i = 0; i < (int)view.size(); i++) if (keep[i]) shown.push_back(i);
+    }
+    // ...and in SCREEN order, here, before anything indexes it. The sort used to
+    // happen inside the table, after the keyboard block had already turned the
+    // cursor's row index into a screen position: with any sort but the default
+    // the two disagreed, so the clipper was told to keep a different row alive
+    // than the one the cursor was on and SetScrollHereY never fired. The spec
+    // itself is stashed from the table one frame earlier (g_rbSortCol), exactly
+    // as the tree builder needs it - see RB_COL_NAME.
+    // Directories sort before files no matter the key: this is a browser, not a
+    // table of numbers. In TREE mode the sort has already happened per level,
+    // inside the builder; sorting the flattened tree here would tear children
+    // away from their parents.
+    if (!app.rbTree)
+        std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+            const RbRow& a = view[ia];
+            const RbRow& b = view[ib];
+            if (a.isDir() != b.isDir()) return a.isDir();
+            // an expanded frame has no size / mtime of its own: it sorts as
+            // unknown (0) rather than borrowing the group's totals
+            uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
+            int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
+            int cmp = 0;
+            switch (g_rbSortCol) {
+                case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
+                case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
+                default:           cmp = a.name().compare(b.name()); break;
+            }
+            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+        });
     if (rbFilter[0]) {
         ImGui::SameLine();
-        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
+        ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
-    // Server-side search - a different thing from the filter above (which only
-    // narrows what is already listed), so it gets its own labelled row.
-    static char rbSearchBuf[256] = "";
-    static bool rbSearchFocus = false;
-    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
-    {
+    ImGui::SameLine();
+    if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
+        rbAdvanced = !rbAdvanced;
+        app.prefsDirty = true;
+        savePrefs();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the connection, the places list and the server-side\n"
+                          "recursive search - the things a browse does not need\n"
+                          "every minute");
+    // ---- row 3, on request: the connection and the server-side search ----
+    if (rbAdvanced) {
+        ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("disconnect")) {
+            rbDefer([] {                 // another machine, other children
+                app.rbrowse = App::RemoteBrowse{};
+                rbTreeForget();
+            });
+            ImGui::PopID();
+            return;
+        }
+        ImGui::SameLine();
+        {   // star = bookmark the place being looked at; the combo recalls them
+            std::string curUrl = placeUrl(B.host, B.port, B.dir);
+            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                     curUrl) != app.rbBookmarks.end();
+            if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
+            if (ImGui::SmallButton("*")) {
+                if (starred)
+                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                      app.rbBookmarks.end(), curUrl),
+                                          app.rbBookmarks.end());
+                else
+                    app.rbBookmarks.push_back(curUrl);
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            if (starred) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
+                                  curUrl.c_str());
+            ImGui::SameLine();
+            drawRemotePlacesCombo();
+        }
         if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
         ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
         bool go = ImGui::InputTextWithHint("##rbsearch",
@@ -8328,6 +11454,93 @@ static void drawPanelRemote() {
             ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
             ImGui::SameLine();
             if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
+        }
+    } else if (!rbSearchRoot.empty() || app.rbSearch.running) {
+        // a search aimed or running is state the user set: never silently
+        // hidden by a fold, even though the row that made it is folded away
+        if (app.rbSearch.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
+        else ImGui::TextDisabled("search aimed at: %s  (\"more\")", rbSearchRoot.c_str());
+    }
+    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
+        // the frames can actually stack, BEFORE any pixel is transferred
+        int nSel = 0;
+        const remote::Entry* first = nullptr;
+        std::string reason;
+        for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+            if (!rbSel[i]) continue;
+            const remote::Entry& e = *view[i].e;
+            nSel++;
+            if (!isNpyName(view[i].name())) { reason = "only .npy files can form a stack"; continue; }
+            if (!e.hasMeta) {
+                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
+                continue;
+            }
+            if (!first) { first = &e; continue; }
+            if (e.ndim != first->ndim || e.dtype != first->dtype ||
+                memcmp(e.dims, first->dims, sizeof e.dims) != 0)
+                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
+                         fmtEntryShape(e);
+        }
+        if (nSel >= 2) {
+            char lb[64];
+            snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
+            if (!reason.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button(lb)) {
+                std::vector<std::string> files;
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                    if (!rbSel[i]) continue;
+                    if (view[i].isGroup())
+                        for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+                    else files.push_back(view[i].full());
+                }
+                sortFramesNumerically(files);
+                openRemoteStack(B.host, files);
+                rbSel.assign(view.size(), 0);
+            }
+            if (!reason.empty()) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", reason.empty()
+                    ? "frames stack in numeric name order" : reason.c_str());
+            ImGui::SameLine();
+            {   // the server aggregate for the selection, without opening it.
+                // MEASURE exists from protocol 2, but v2 has no hasMeta to
+                // pre-validate shapes - a mismatch falls to [server failed].
+                int pv2 = 0;
+                {
+                    std::lock_guard<std::mutex> lk(app.sesMtx);
+                    if (app.remoteSession) pv2 = app.remoteSession->peerVersion();
+                }
+                bool tempOk = pv2 >= 2;
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
+                    if (rbSel[i] && !isNpyName(view[i].name())) tempOk = false;
+                ImGui::BeginDisabled(!tempOk);
+                if (ImGui::Button("Temporal stats (server)")) {
+                    std::vector<std::string> files;
+                    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                        if (!rbSel[i]) continue;
+                        if (view[i].isGroup())
+                            for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+                        else files.push_back(view[i].full());
+                    }
+                    std::string leaf = B.dir;
+                    size_t sl2 = leaf.find_last_of('/');
+                    if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                        leaf = leaf.substr(sl2 + 1);
+                    requestBrowseTemporal(B.host, files,
+                                          leaf + " (" + std::to_string(files.size()) +
+                                          " selected)");
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(tempOk
+                        ? "sigma_t / sigma_fpn computed on the server over the\n"
+                          "selected files, shown in the Temporal panel - nothing\n"
+                          "opens, no pixel transfers. plane=all (no CFA split)."
+                        : pv2 < 2 ? "needs a protocol 2+ peer (File > Update remote peer)"
+                                  : "only .npy files can form a stack");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
         }
     }
     // The metadata columns exist from protocol 3 on. Say so once, up here - a
@@ -8371,22 +11584,22 @@ static void drawPanelRemote() {
                 if (ImGui::Selectable(lb.c_str())) {
                     std::string full = joinS(h.rel);
                     if (h.dir) {
-                        remoteBrowseTo(full);
+                        rbGoTo(full);
                     } else if (isNpyName(h.rel)) {
                         openRemote(makeRemoteUrl(B.host, full));
                     } else {
                         // not servable: at least go where it lives
                         size_t sl = full.find_last_of('/');
-                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
-                                                                          : full.substr(0, sl));
+                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                 : full.substr(0, sl));
                     }
                 }
                 if (ImGui::BeginPopupContextItem("sctx")) {
                     std::string full = joinS(h.rel);
                     if (!h.dir && ImGui::MenuItem("Go to containing folder")) {
                         size_t sl = full.find_last_of('/');
-                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
-                                                                          : full.substr(0, sl));
+                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                 : full.substr(0, sl));
                     }
                     if (ImGui::MenuItem("Copy path")) {
                         ImGui::SetClipboardText(full.c_str());
@@ -8401,11 +11614,74 @@ static void drawPanelRemote() {
         ImGui::PopID();
         return;
     }
-    if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
-        std::string d = B.dir;
-        size_t s = d.find_last_of('/');
-        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                        : d.substr(0, s));
+    // The "[..]" row that used to sit here is gone: the toolbar's "up" button
+    // and Backspace both do it, and a row that exists only outside the home
+    // directory shifted every listing row by one line on the way in and out.
+    // ---- keyboard navigation of the listing --------------------------------
+    // Up / Down walk the rows and preview as they go (what a plain click does),
+    // Enter opens for real (what a double-click does), Backspace leaves for the
+    // parent. Gated on IsAnyItemActive so the filter box, the path field and
+    // the search field keep every key they type; disjoint from the , / . frame
+    // stepping under the listing, which owns different keys entirely.
+    static int rbCursor = -1;            // row index, or -1 = no cursor yet
+    static bool rbCursorScroll = false;  // bring it into view this frame
+    {
+        static std::string curSig;
+        static bool curFlat = false, curTree = false;
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        if (sig != curSig) { curSig = sig; rbCursor = -1; }
+        else if (curFlat != app.rbFlat || curTree != app.rbTree) {
+            // follow the row across a grouped/flat or list/tree toggle
+            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, curFlat, curTree);
+            const remote::Entry* was = rbCursor >= 0 && rbCursor < (int)old.size()
+                                     ? old[rbCursor].e : nullptr;
+            rbCursor = -1;
+            if (was)
+                for (size_t i = 0; i < view.size(); i++)
+                    if (view[i].e == was) { rbCursor = (int)i; break; }
+            rbCursorScroll = rbCursor >= 0;
+        }
+        curFlat = app.rbFlat;
+        curTree = app.rbTree;
+        if (rbCursor >= (int)view.size()) rbCursor = -1;
+    }
+    int rbCursorPos = -1;                // ...where it sits on SCREEN
+    for (int k = 0; k < (int)shown.size(); k++) if (shown[k] == rbCursor) rbCursorPos = k;
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        int want = rbCursorPos;
+        int last = (int)shown.size() - 1;
+        if (!shown.empty()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+                want = rbCursorPos < 0 ? 0 : std::min(rbCursorPos + 1, last);
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))
+                want = rbCursorPos < 0 ? last : std::max(rbCursorPos - 1, 0);
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) want = 0;
+            if (ImGui::IsKeyPressed(ImGuiKey_End, false))  want = last;
+        }
+        if (want != rbCursorPos && want >= 0) {
+            rbCursorPos = want;
+            rbCursor = shown[want];
+            rbCursorScroll = true;
+            // moving onto a FOLDER must not enter it - walking a list of
+            // folders would then dive into the first one and never come back
+            if (!view[rbCursor].isDir()) rbActivateRow(view[rbCursor]);
+        }
+        if (rbCursor >= 0 && rbCursor < (int)view.size() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
+            rbOpenRow(view[rbCursor]);
+        // Right / Left expand and collapse the folder under the cursor. Only in
+        // tree mode: in the flat listing there is nothing to open in place.
+        if (app.rbTree && rbCursor >= 0 && rbCursor < (int)view.size() &&
+            view[rbCursor].isDir()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
+                rbTreeExpand(view[rbCursor].full());
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
+                rbTreeCollapse(view[rbCursor].full());
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) rbGoParent();
     }
     // The listing scrolls on its own so the header above never leaves the view.
     // Properties target: a snapshot, because the row may scroll out of the
@@ -8413,10 +11689,15 @@ static void drawPanelRemote() {
     static remote::Entry rbPropsEntry;
     static std::string rbPropsPath;
     static bool rbPropsOpen = false;
-    enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+    static bool rbPropsNoSize = false;   // an expanded frame: no size/mtime of its own
+    // footer space for the preview scrub bar: RESERVED even when no preview is
+    // alive, so starting one never shifts the rows under the cursor (a bar
+    // that appeared above the list moved every row mid-double-click)
+    float rbFootH = ImGui::GetFrameHeightWithSpacing();
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                                       ImGuiTableFlags_SortTristate)) {
+                                       ImGuiTableFlags_SortTristate,
+                                       ImVec2(0, -rbFootH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
@@ -8427,34 +11708,34 @@ static void drawPanelRemote() {
         ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
                                             ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
         ImGui::TableHeadersRow();
-        // `shown` is rebuilt every frame, so sorting it here honors a changed
-        // sort spec, a fresh listing and the filter in one place. Directories
-        // sort before files no matter the key - this is a browser, not a table
-        // of numbers.
+        // The spec is STASHED, not applied: `shown` was already sorted with it,
+        // above, where the keyboard and the clipper can agree with the screen.
+        // A sort change therefore lands on the next frame - invisible, and the
+        // same one-frame contract the tree builder has always had.
         if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
-            std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
-                const remote::Entry& a = B.entries[ia];
-                const remote::Entry& b = B.entries[ib];
-                if (a.dir != b.dir) return a.dir;
-                for (int s = 0; s < sp->SpecsCount; s++) {
-                    const ImGuiTableColumnSortSpecs& c = sp->Specs[s];
-                    int cmp = 0;
-                    switch (c.ColumnUserID) {
-                        case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
-                        case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
-                        default:           cmp = a.name.compare(b.name); break;
-                    }
-                    if (cmp) return c.SortDirection == ImGuiSortDirection_Descending ? cmp > 0
-                                                                                     : cmp < 0;
-                }
-                return false;
-            });
+            if (sp->SpecsCount > 0) {
+                g_rbSortCol = (int)sp->Specs[0].ColumnUserID;
+                g_rbSortDesc = sp->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+            } else {
+                g_rbSortCol = RB_COL_NAME;
+                g_rbSortDesc = false;
+            }
         }
         ImGuiListClipper clip;
         clip.Begin((int)shown.size());
+        // The cursor row must be SUBMITTED even when it is scrolled out, or
+        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
+        // clipper allocates its range list there, and IncludeItemByIndex writes
+        // straight through the null TempData pointer otherwise - the two
+        // IM_ASSERTs that say so are compiled out of a release build, so a
+        // single Down arrow segfaulted the process before any handler ran.
+        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
+            clip.IncludeItemByIndex(rbCursorPos);
         while (clip.Step())
         for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
-            const remote::Entry& e = B.entries[shown[row]];
+            const RbRow& r = view[shown[row]];
+            const remote::Entry& e = *r.e;
+            const std::string& rname = r.name();
             ImGui::PushID(shown[row]);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
@@ -8462,25 +11743,44 @@ static void drawPanelRemote() {
             // three hairlines, a file gets nothing - the name is the row.
             // (First cut had drawn folder/page pictograms; they collided with
             // the text and were, verbatim, "くどい".)
-            std::string lb = "  " + e.name;
-            if (e.group) lb += "   [" + std::to_string(e.frames) + " frames]";
-            bool servable = e.dir || isNpyName(e.name);
+            // the tree's indent is drawn as leading spaces, so the Selectable
+            // still spans the whole row and the hit target never narrows
+            std::string lb(2 + (size_t)r.depth * 3, ' ');
+            lb += rname;
+            if (r.isGroup()) lb += "   [" + std::to_string(e.frames) + " frames]";
+            bool servable = !r.ph && (r.isDir() || isNpyName(rname));   // (ph draws dimmed)
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
-            if (e.dir || e.group) {   // inside the two-space gutter the label reserves
+            if (shown[row] == rbCursor) {
+                // the keyboard cursor: an outline, not a fill - the fill means
+                // "selected for a multi-file action" and the two are not the same
+                if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
+                                                    ImGui::GetItemRectMax(),
+                                                    IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
+            }
+            if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
                 ImVec2 p = ImGui::GetItemRectMin();
                 float h = ImGui::GetTextLineHeight();
                 float gut = ImGui::CalcTextSize("  ").x;      // never touch the name
+                float indent = ImGui::CalcTextSize("   ").x * (float)r.depth;
                 float y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
-                float cxm = p.x + gut * 0.45f, cym = y + h * 0.5f;
-                if (e.dir) {          // › chevron, the way a tree hints "enter me"
+                float cxm = p.x + indent + gut * 0.45f, cym = y + h * 0.5f;
+                if (r.isDir()) {      // › chevron, the way a tree hints "enter me"
                     ImU32 c = IM_COL32(150, 158, 166, 170);
                     float a = std::min(h * 0.16f, gut * 0.30f);
-                    rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
-                    rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
+                    // in a tree it also SAYS which way the node is: › closed,
+                    // v open, the one glyph carrying both meanings
+                    if (app.rbTree && rbHas(app.rbExpanded, r.full())) {
+                        rdl->AddLine(ImVec2(cxm - a, cym - a * 0.5f), ImVec2(cxm, cym + a * 0.5f), c, 1.4f);
+                        rdl->AddLine(ImVec2(cxm, cym + a * 0.5f), ImVec2(cxm + a, cym - a * 0.5f), c, 1.4f);
+                    } else {
+                        rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
+                        rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
+                    }
                 } else {              // stack: three hairlines, barely there
                     ImU32 c = IM_COL32(130, 165, 200, 150);
                     float w = std::min(h * 0.36f, gut * 0.8f);
@@ -8491,7 +11791,7 @@ static void drawPanelRemote() {
             }
             if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
-                bool canSel = !e.dir && ei < (int)rbSel.size();
+                bool canSel = !r.isDir() && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
                     rbSel[ei] ^= 1;                    // toggle, plain click still opens
                     rbSelAnchor = ei;
@@ -8502,49 +11802,24 @@ static void drawPanelRemote() {
                         if (shown[k] == rbSelAnchor) a = k;
                     if (a < 0) a = row;
                     for (int k = std::min(a, row); k <= std::max(a, row); k++)
-                        if (!B.entries[shown[k]].dir && (size_t)shown[k] < rbSel.size())
+                        if (!view[shown[k]].isDir() && (size_t)shown[k] < rbSel.size())
                             rbSel[shown[k]] = 1;
-                } else if (e.dir) {
-                    remoteBrowseTo(joined(e.name));
-                } else if (e.group) {
-                    // single click: a poster-frame PREVIEW of the stack (frame
-                    // 0, decimated, nothing registered). Double-click below
-                    // opens the stack for real.
-                    openRemote(makeRemoteUrl(B.host, joined(e.members.empty()
-                                             ? e.name : e.members[0])), true);
-                    rbSelAnchor = ei;
                 } else {
-                    // idempotent: clicking the same file again re-shows the
-                    // preview instead of re-fetching it
-                    std::string u = makeRemoteUrl(B.host, joined(e.name));
-                    ImageDoc* pv = nullptr;
-                    for (const auto& di : app.images)
-                        if (di->uid == app.previewUid && di->preview) pv = di.get();
-                    if (pv && pv->remoteUrl == u) selectImage(app.current);
-                    else openRemote(u, true);
+                    rbActivateRow(r);
                     rbSelAnchor = ei;
                 }
+                rbCursor = ei;          // the keyboard picks up where the mouse left off
             }
             // Double-click = a registered open (the VSCode pinning gesture).
             // The first of the two clicks already made the preview; this
             // promotes it - or, for a stack row, opens the whole stack.
-            if (servable && !e.dir && ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                if (e.group) {
-                    dropPreview();               // the poster frame did its job
-                    std::vector<std::string> files;
-                    for (const auto& m : e.members) files.push_back(joined(m));
-                    openRemoteStack(B.host, files);
-                } else {
-                    for (const auto& di : app.images)
-                        if (di->uid == app.previewUid && di->preview)
-                            promotePreview(di.get());
-                }
-            }
+            if (servable && !r.isDir() && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                rbOpenRow(r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
-            if (ImGui::BeginPopupContextItem("ctx")) {
-                std::string full = joined(e.name);
-                if (e.dir) {
+            if (!r.ph && ImGui::BeginPopupContextItem("ctx")) {
+                std::string full = r.full();
+                if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(full);
                     if (ImGui::MenuItem("Search under here")) {
@@ -8562,42 +11837,105 @@ static void drawPanelRemote() {
                         toast("bookmarked " + u);
                     }
                     ImGui::Separator();
-                } else if (e.group) {
+                } else if (r.isGroup()) {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
-                        for (const auto& m : e.members) files.push_back(joined(m));
+                        for (const auto& m : e.members) files.push_back(r.join(m));
                         openRemoteStack(B.host, files);
                     }
+                    // the server aggregates WITHOUT opening: "is this set even
+                    // worth transferring?" costs zero pixels this way. Group
+                    // rows only exist from protocol 3 on, so no version gate.
+                    if (ImGui::MenuItem("Temporal stats (server)")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(r.join(m));
+                        std::string leaf = B.dir;
+                        size_t sl2 = leaf.find_last_of('/');
+                        if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
+                            leaf = leaf.substr(sl2 + 1);
+                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
+                                          "shown in the Temporal panel - nothing opens,\n"
+                                          "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
-                } else if (isNpyName(e.name)) {
+                } else if (isNpyName(rname)) {
                     if (ImGui::MenuItem("Open"))
                         openRemote(makeRemoteUrl(B.host, full));
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
                         openRemoteStack(B.host, { full });
+                    // an expanded frame still knows the sequence it came from
+                    if (r.member >= 0) {
+                        char sl[64];
+                        snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
+                        if (ImGui::MenuItem(sl)) {
+                            std::vector<std::string> files;
+                            for (const auto& m : e.members) files.push_back(r.join(m));
+                            openRemoteStack(B.host, files);
+                        }
+                    }
                     ImGui::Separator();
                 }
                 if (ImGui::MenuItem("Copy path")) {
                     ImGui::SetClipboardText(full.c_str());
                     toast("copied " + full);
                 }
-                if (!e.dir && ImGui::MenuItem("Properties...")) {
+                if (!r.isDir() && ImGui::MenuItem("Properties...")) {
                     rbPropsEntry = e;
+                    if (r.member >= 0) {          // an expanded frame: the group's
+                        rbPropsEntry.name = rname;   // meta, but none of its totals
+                        rbPropsEntry.group = false;
+                        rbPropsEntry.frames = 0;
+                        rbPropsEntry.members.clear();
+                    }
+                    rbPropsNoSize = r.member >= 0;
                     rbPropsPath = full;
                     rbPropsOpen = true;
                 }
                 ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
-            if (!e.dir && isNpyName(e.name)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
+            if (!r.ph && !r.isDir() && isNpyName(rname))
+                ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
             ImGui::TableNextColumn();
-            if (!e.dir) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
+            // blank, not zero: the group reply has no per-frame size or mtime
+            if (!r.ph && !r.isDir() && r.ownFile())
+                ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
             ImGui::TableNextColumn();
-            if (e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
-            else if (!e.dir) ImGui::TextDisabled("-");
+            if (!r.ph && r.ownFile() && e.mtime > 0)
+                ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    // Preview scrub bar lives BELOW the listing, in space reserved above:
+    // appearing must never move the rows (double-click depends on it).
+    if (app.previewFiles.size() >= 2) {
+        int n = (int)app.previewFiles.size();
+        ImGui::PushID("pvstep");
+        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
+        ImGui::SameLine();
+        int slider = app.previewIndex;
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
+            stepPreviewFrame(slider - app.previewIndex);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
+                              app.previewLabel.c_str());
+        // , and . while the browser has focus: the same keys the image view uses
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            !ImGui::IsAnyItemActive()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+        }
+        ImGui::PopID();
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
     if (ImGui::BeginPopup("Remote properties")) {
@@ -8614,9 +11952,16 @@ static void drawPanelRemote() {
         }
         if (e.group)
             ImGui::Text("stack: %u frames (%s)", e.frames, e.name.c_str());
+        if (rbPropsNoSize) {
+            // Never invent one: the listing reply carries the group's total
+            // bytes and its newest mtime, and no per-member breakdown.
+            ImGui::TextDisabled("size      -   (not in the sequence listing)");
+            ImGui::TextDisabled("modified  -   (not in the sequence listing)");
+        } else {
         ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
                     (unsigned long long)e.size, e.group ? "  - all frames" : "");
         ImGui::Text("modified  %s (this machine's timezone)", fmtUnixTime(e.mtime).c_str());
+        }
         ImGui::Text("shape     %s%s", fmtEntryShape(e).c_str(),
                     e.hasMeta && e.group ? "  - per frame" : "");
         if (!e.hasMeta)
@@ -8674,6 +12019,48 @@ static void drawFileList() {
         if (ImGui::SmallButton("dismiss##seqnote")) app.seqNote.clear();
     }
     ImGui::Separator();
+    // Context-menu closes and moves are DEFERRED to the end of the walk:
+    // closing erases images mid-iteration while the row loop still holds
+    // indices into the pre-close stacksCached() snapshot, and a move prunes
+    // app.batches while the submenu is iterating it. Every series command is
+    // deferred for the same reason squared - the walk is iterating app.series
+    // itself, and one join would resize it under the loop drawing it.
+    int pendingCloseSeq = 0, pendingCloseBatch = 0;
+    int pendingMoveSeq = 0, pendingMoveImg = -1, pendingMoveTarget = 0;
+    int pendingSerEdit = 0, pendingSerMove = 0, pendingSerMoveTo = 0;
+    int pendingSerUngroup = 0, pendingSerClose = 0, pendingSerRename = 0;
+    std::string pendingSerName;
+    int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
+    // "Move to batch" submenu, shared by the stack row (seqctx) and the
+    // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
+    // Batch names go through a ### suffix: user text must not become the ID.
+    auto moveToBatchMenu = [&](int curBatch) -> int {
+        int target = 0;
+        if (ImGui::BeginMenu("Move to batch")) {
+            for (const auto& b : app.batches) {
+                if (b.id == curBatch) continue;           // already there
+                if (b.name == "preview") continue;        // pseudo-batch
+                char lb2[300];
+                snprintf(lb2, sizeof lb2, "%s###mb%d", b.name.c_str(), b.id);
+                if (ImGui::MenuItem(lb2)) target = b.id;
+            }
+            ImGui::Separator();
+            static char nbBuf[256] = "";
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+            bool go = ImGui::InputTextWithHint("##newbatch", "New batch...",
+                                               nbBuf, sizeof nbBuf,
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            go |= ImGui::SmallButton("create");
+            if (go && nbBuf[0]) {
+                target = newBatch(uniqueBatchName(nbBuf));
+                nbBuf[0] = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndMenu();
+        }
+        return target;
+    };
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
     // produced a flat list of bare filenames with nothing saying where each came
@@ -8703,16 +12090,36 @@ static void drawFileList() {
             }
             g->stacks.push_back(&stack);
         }
+        // The transient preview is PINNED LAST and never reorders the rest.
+        // It used to sort in wherever its batch was created, so glancing at a
+        // file in the browser inserted a heading in the middle of the list and
+        // pushed everything the user was working with down a row - the opposite
+        // of what a throwaway look should cost.
+        for (size_t i = 0; i + 1 < groups.size(); i++)
+            if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
+                                                            groups.begin() + i + 1,
+                                                            groups.end()); break; }
     }
-    // one file open needs no header
-    bool showHeaders = groups.size() > 1 || (groups.size() == 1 && stacks.size() > 1);
+    // The batch heading is ALWAYS drawn. It used to appear only once there was
+    // more than one thing open, so opening a second folder made a heading
+    // materialise above rows that had none - and a batch you can rename and
+    // move things into cannot be a thing that exists only sometimes.
+    const bool showHeaders = !groups.empty();
     for (const auto& group : groups) {
       ImGui::PushID(group.batch);
       bool open = true;
       if (showHeaders) {
-          open = ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                            ImGuiTreeNodeFlags_SpanAvailWidth,
-                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+          bool isPreview = group.label == "preview";
+          if (isPreview) ImGui::PushStyleColor(ImGuiCol_Text,
+                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+          open = isPreview
+              ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                           ImGuiTreeNodeFlags_SpanAvailWidth,
+                                  "preview (transient)   (%d)", (int)group.stacks.size())
+              : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                           ImGuiTreeNodeFlags_SpanAvailWidth,
+                                  "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+          if (isPreview) ImGui::PopStyleColor();
           if (ImGui::IsItemHovered() && !group.dir.empty())
               ImGui::SetTooltip("%s\n\n(right-click to rename this batch)", group.dir.c_str());
           // the batch is the user's grouping, so its name is theirs to change
@@ -8731,61 +12138,130 @@ static void drawFileList() {
                   app.imagesRev++;               // rebuild the cached labels
                   ImGui::CloseCurrentPopup();
               }
+              ImGui::Separator();
+              if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
+                  pendingCloseBatch = group.batch;
               ImGui::EndPopup();
           }
       }
-      if (open)
-      for (const auto& stackPtr : group.stacks) {
-        const auto& stack = *stackPtr;
-        const ImageDoc& head = *app.images[stack.front()];
+      if (open) {
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
-                              const char* extra = nullptr) -> bool {
+                              const char* extra = nullptr, bool isB = false) -> bool {
             const ImGuiStyle& st = ImGui::GetStyle();
             char meta[96];
             snprintf(meta, sizeof meta, "%dx%d %dch %s%s", d.w, d.h, d.ch, d.dtype.c_str(),
                      extra ? extra : "");
             float avail = ImGui::GetContentRegionAvail().x;
             float metaW = ImGui::CalcTextSize(meta).x;
-            // one source of truth for the split, so the two halves cannot overlap
+            // The row is ONE item spanning the full width, and the metadata is
+            // painted onto it rather than being a second item. It used to be a
+            // name-width Selectable followed by a TextDisabled, which made the
+            // metadata the "last item" - so right-clicking a stack opened the
+            // context menu only over that dim strip on the right, and never on
+            // the name, where everyone aims.
             float nameW = std::max(avail - metaW - st.ItemSpacing.x, ImGui::GetFontSize() * 4.0f);
-            bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowOverlap,
-                                             ImVec2(nameW, 0));
-            bool hov = ImGui::IsItemHovered();     // the NAME, not the dimmed metadata
-            ImGui::SameLine(nameW + st.ItemSpacing.x);
-            ImGui::TextDisabled("%s", meta);
-            if (hov) ImGui::SetTooltip("%s", d.path.c_str());
+            bool room = avail > metaW + ImGui::GetFontSize() * 6.0f;   // else: name only
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::PushClipRect(p0, ImVec2(p0.x + (room ? nameW : avail),
+                                           p0.y + ImGui::GetFrameHeight()), true);
+            bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_SpanAllColumns,
+                                             ImVec2(avail, 0));
+            ImGui::PopClipRect();
+            bool hov = ImGui::IsItemHovered();
+            if (isB) {   // which row is the compare partner, without hunting a menu
+                ImVec2 m = ImGui::GetItemRectMin();
+                float h = ImGui::GetTextLineHeight();
+                ImVec2 tp(m.x + 2 * app.uiScale,
+                          m.y + (ImGui::GetItemRectSize().y - h) * 0.5f);
+                ImGui::GetWindowDrawList()->AddText(tp, IM_COL32(120, 190, 255, 255), "B");
+            }
+            if (room) {   // draw-list, not an item: the row must stay the last item
+                ImVec2 m = ImGui::GetItemRectMin();
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(m.x + avail - metaW, m.y + (ImGui::GetItemRectSize().y -
+                                                       ImGui::GetTextLineHeight()) * 0.5f),
+                    ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
+            }
+            if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
             return clicked;
         };
-        if (head.seqId == 0) {
+        // One row. mem != nullptr means the row is being drawn INSIDE a series
+        // node: it is indented by the node and the member's VALUE leads the
+        // label. Everything else about the row is identical - a member is not
+        // a different kind of stack, it is a stack that is also in a sweep.
+        auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
+                                const App::Series::Member* mem) {
+          const ImageDoc& head = *app.images[stack.front()];
+          if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
-            snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
-            if (rowWithMeta(head, lb, i == app.current, nullptr)) {
+            snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
+            ImGui::PushID(i);
+            const ImageDoc* bnow = cmpB();
+            if (rowWithMeta(head, lb, i == app.current, nullptr, bnow == &head)) {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
-            continue;
-        }
-        App::SeqInfo* si = seqInfo(head.seqId);
-        int pos = 0;
-        bool active = false;
-        for (int k = 0; k < (int)stack.size(); k++)
-            if (stack[k] == app.current) { pos = k; active = true; }
-        ImGui::PushID(head.seqId);
-        char lb[512];
-        snprintf(lb, 512, "%s", si ? si->name.c_str() : "sequence");
-        char frames[24];
-        snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
-        if (rowWithMeta(head, lb, active, frames)) {
-            selectImage(stack[pos]);
-            if (app.fitOnSwitch) app.fitRequested = true;
-        }
-        // The stack is the unit measurements attach to, so it earns a name of
-        // its own: "the 25C dark set", not whatever the capture script called
-        // the folder. F2 / right-click renames; the folder name is only the
-        // starting value.
-        if (si && ImGui::BeginPopupContextItem("seqctx")) {
+            // a standalone frame hangs off the batch directly, so it gets the
+            // move menu itself (stacks move via seqctx below)
+            if (ImGui::BeginPopupContextItem("imgctx")) {
+                // by IDENTITY, not by name: the B-image menu lists names, and
+                // two batches full of frame_001.npy made it a coin toss
+                if (ImGui::MenuItem("Set as compare B", nullptr, false,
+                                    app.images[i].get() != cur())) {
+                    setCompareB(app.images[i].get());
+                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+                }
+                ImGui::Separator();
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+            return;
+          }
+          App::SeqInfo* si = seqInfo(head.seqId);
+          int pos = 0;
+          bool active = false;
+          for (int k = 0; k < (int)stack.size(); k++)
+              if (stack[k] == app.current) { pos = k; active = true; }
+          ImGui::PushID(head.seqId);
+          char lb[600];
+          const char* sname = si ? si->name.c_str() : "sequence";
+          if (mem) {
+              // The value LEADS the label. It is the reason the row is in this
+              // series at all, and it is not metadata: an unset one has to be
+              // readable as unset, not inferable from a blank column at the
+              // right edge. The "##m<seqId>" suffix is the row's ID, so renaming
+              // the stack does not reset its widget state - it does NOT protect
+              // the text: ImGui cuts a label at the FIRST "##", so a stack the
+              // user renames to "a##b" renders as "a" in either shape of row.
+              char vb[64];
+              if (std::isfinite(mem->value)) {
+                  if (ser->unit[0]) snprintf(vb, sizeof vb, "%.6g %s", mem->value, ser->unit);
+                  else snprintf(vb, sizeof vb, "%.6g", mem->value);
+              } else {
+                  snprintf(vb, sizeof vb, "value unset");
+              }
+              snprintf(lb, sizeof lb, "%s · %s##m%d", vb, sname, head.seqId);
+          } else {
+              snprintf(lb, sizeof lb, "  %s", sname);
+          }
+          char frames[24];
+          snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
+          const ImageDoc* bnow = cmpB();
+          bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
+          if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
+          if (rowWithMeta(head, lb, active, frames, stackHasB)) {
+              selectImage(stack[pos]);
+              if (app.fitOnSwitch) app.fitRequested = true;
+          }
+          // The stack is the unit measurements attach to, so it earns a name of
+          // its own: "the 25C dark set", not whatever the capture script called
+          // the folder. F2 / right-click renames; the folder name is only the
+          // starting value.
+          if (si && ImGui::BeginPopupContextItem("seqctx")) {
             static char renameBuf[256];
             if (ImGui::IsWindowAppearing())
                 snprintf(renameBuf, sizeof renameBuf, "%s", si->name.c_str());
@@ -8799,17 +12275,223 @@ static void drawFileList() {
                 app.lin.rev++;            // linearity rows show stack names
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::Separator();
+            {   // by identity, not name - same reason as the frame row's item.
+                // B = the frame this stack is showing; with "B follows A's
+                // frame number" on, it tracks A from there anyway.
+                ImageDoc* bpick = app.images[stack.front()].get();
+                if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
+                    app.images[si->lastImageIdx]->seqId == si->id)
+                    bpick = app.images[si->lastImageIdx].get();
+                if (ImGui::MenuItem("Set as compare B", nullptr, false, bpick != cur())) {
+                    setCompareB(bpick);
+                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+                }
+            }
+            ImGui::Separator();
+            // The series (系列) this stack is in, or could be. Multi-select is
+            // a later phase; until then this menu is how a stack joins a sweep
+            // without going through the Linearity panel.
+            if (ImGui::BeginMenu("Series")) {
+                const App::Series* mine = seriesOfStack(si->id);
+                // The value joining would give this stack, BEFORE the click. The
+                // modal shows its proposal and the picker paints one per row;
+                // this was the one place a number entered a measurement without
+                // having been on screen first (docs/series-plan.md §2 = 確認).
+                std::string jfrom;
+                double jv = extractLevelFromName(si->name, &jfrom);
+                if (std::isfinite(jv)) ImGui::TextDisabled("joins at %.6g (from \"%s\")",
+                                                           jv, jfrom.c_str());
+                else ImGui::TextDisabled("joins with NO value (nothing numeric in the name)");
+                int listed = 0;
+                for (const auto& s : app.series) {
+                    bool same = s.batchId == head.batchId;
+                    bool isMine = mine && mine->id == s.id;
+                    char lb2[416];
+                    if (std::isfinite(jv) && same && !isMine)
+                        snprintf(lb2, sizeof lb2, "%s   -> %.6g %s###addser%d", s.name.c_str(),
+                                 jv, s.unit[0] ? s.unit : "[unit not set]", s.id);
+                    else
+                        snprintf(lb2, sizeof lb2, "%s###addser%d", s.name.c_str(), s.id);
+                    if (ImGui::MenuItem(lb2, nullptr, isMine, same && !isMine)) {
+                        pendingJoinSeq = si->id;
+                        pendingJoinSer = s.id;
+                    }
+                    // A series cannot widen to reach another batch: the answer
+                    // is to move the stack first, and the menu says so instead
+                    // of leaving a dead item with no reason.
+                    if (!same && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("\"%s\" is in batch \"%s\".\n"
+                                          "A series lives in ONE batch - use Move to batch\n"
+                                          "first, then add it here.",
+                                          s.name.c_str(), batchNameOf(s.batchId).c_str());
+                    listed++;
+                }
+                if (!listed) ImGui::TextDisabled("(no series yet)");
+                ImGui::Separator();
+                if (ImGui::MenuItem("New series...")) pendingNewSerBatch = head.batchId;
+                if (mine && ImGui::MenuItem("Remove from this series"))
+                    pendingLeaveSeq = si->id;
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+                if (const App::Series* mine = seriesOfStack(si->id))
+                    ImGui::TextDisabled("in series \"%s\": moving it alone leaves it",
+                                        mine->name.c_str());
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveSeq = si->id; pendingMoveTarget = t; }
+            }
+            if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
+                pendingCloseSeq = si->id;
             ImGui::EndPopup();
+          }
+          if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+              ImGui::OpenPopup("seqctx");
+          // No frame slider here: it used to appear under the active row, and a
+          // row that grows on selection makes the whole list jump - the scrub bar
+          // lives at the bottom of the Image View now, where the frames are.
+          ImGui::PopID();
+        };
+        // The stack of one seqId, out of this batch's cached list (members are
+        // named by seqId; the panel walks by stack).
+        auto stackOfSeq = [&](int seqId) -> const std::vector<int>* {
+            for (const auto* sp : group.stacks)
+                if (app.images[sp->front()]->seqId == seqId) return sp;
+            return nullptr;
+        };
+        // ---- the batch's series come FIRST, each with its members inside -----
+        // Non-member stacks keep their place and their indentation below: a
+        // sweep appearing must not push everything else down a level.
+        for (const auto& S : app.series) {
+            if (S.batchId != group.batch) continue;
+            ImGui::PushID(S.id);
+            const ImGuiStyle& st = ImGui::GetStyle();
+            char smeta[96];
+            // the unit is the series', and "not set" is a state to read, not a
+            // blank to guess at (the panel says the same thing the same way)
+            if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
+                                    (int)S.members.size());
+            else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
+            float avail = ImGui::GetContentRegionAvail().x;
+            float mw = ImGui::CalcTextSize(smeta).x;
+            bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            // same rule as the stack rows: ONE item spanning the row, the unit
+            // and the count PAINTED on it. A second widget on the right is what
+            // made a context menu unreachable on the name once already.
+            if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
+                                                     p0.y + ImGui::GetFrameHeight()), true);
+            bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
+                                                    ImGuiTreeNodeFlags_SpanAvailWidth,
+                                           "%s", S.name.c_str());
+            if (room) ImGui::PopClipRect();
+            if (room) {
+                ImVec2 m = ImGui::GetItemRectMin();
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
+                                                    ImGui::GetTextLineHeight()) * 0.5f),
+                    S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                              : IM_COL32(255, 184, 90, 255), smeta);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+                                  "(right-click: rename, edit, move, ungroup, close)",
+                                  (int)S.members.size(),
+                                  S.paramName.empty() ? "parameter" : S.paramName.c_str());
+            if (ImGui::BeginPopupContextItem("serctx")) {
+                static char sbuf[256];
+                if (ImGui::IsWindowAppearing())
+                    snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+                bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                done |= ImGui::SmallButton("rename");
+                if (done && sbuf[0]) {
+                    pendingSerRename = S.id;
+                    pendingSerName = sbuf;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                // the same modal creation uses: members, values, order, unit
+                if (ImGui::MenuItem("Edit series...")) {
+                    pendingSerEdit = S.id;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                {   // the SERIES moves - every member with it, so that
+                    // series ⊂ batch never stops being true on the way
+                    int t = moveToBatchMenu(S.batchId);
+                    if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
+                    ImGui::TextDisabled("   (all %d member(s) move with it)",
+                                        (int)S.members.size());
+                }
+                ImGui::Separator();
+                // Two DIFFERENT operations, spelled out rather than one word
+                // with a modifier: one keeps the data, the other destroys it.
+                if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                                      "exactly where they are - they just stop being a sweep.",
+                                      (int)S.members.size());
+                if (ImGui::MenuItem("Close series (discard its stacks)"))
+                    pendingSerClose = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                                      (int)S.members.size());
+                ImGui::EndPopup();
+            }
+            if (sopen) {
+                for (const auto& m : S.members)
+                    if (const std::vector<int>* sp = stackOfSeq(m.seqId))
+                        drawStackRow(*sp, &S, &m);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
         }
-        if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-            ImGui::OpenPopup("seqctx");
-        // No frame slider here: it used to appear under the active row, and a
-        // row that grows on selection makes the whole list jump - the scrub bar
-        // lives at the bottom of the Image View now, where the frames are.
-        ImGui::PopID();
+        // ---- then everything this batch holds that is NOT in a series -------
+        for (const auto& stackPtr : group.stacks) {
+            const ImageDoc& head = *app.images[stackPtr->front()];
+            if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
+            drawStackRow(*stackPtr, nullptr, nullptr);
+        }
       }
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
+    }
+    if (pendingCloseSeq) closeStack(pendingCloseSeq);
+    if (pendingCloseBatch) closeBatch(pendingCloseBatch);
+    if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
+    if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
+    // ---- the series commands, after the walk that drew them -----------------
+    if (pendingSerRename)
+        if (App::Series* S = seriesById(pendingSerRename)) {
+            S->name = pendingSerName;
+            app.imagesRev++;
+            app.lin.rev++;                // the panel's selector shows this name
+        }
+    if (pendingSerEdit)
+        if (App::Series* S = seriesById(pendingSerEdit)) openSeriesModal(S->batchId, S->id);
+    if (pendingSerMove && pendingSerMoveTo) moveSeriesToBatch(pendingSerMove, pendingSerMoveTo);
+    if (pendingSerUngroup) ungroupSeries(pendingSerUngroup);
+    if (pendingSerClose) closeSeries(pendingSerClose);
+    if (pendingNewSerBatch) openSeriesModal(pendingNewSerBatch, 0);
+    if (pendingLeaveSeq) {
+        App::Series* S = seriesOfStack(pendingLeaveSeq);
+        App::SeqInfo* si = seqInfo(pendingLeaveSeq);
+        if (S) {
+            std::string n = S->name;
+            removeFromSeries(pendingLeaveSeq);
+            pruneEmptySeries();
+            linFitStale();          // the fit below counted this point
+            toast((si ? si->name : std::string("stack")) + " left series \"" + n + "\"");
+        }
+    }
+    if (pendingJoinSeq && pendingJoinSer) {
+        std::string msg;
+        bool joined = seriesJoinFromMenu(pendingJoinSer, pendingJoinSeq, &msg);
+        if (!msg.empty()) toast(msg, !joined);
     }
 }
 
@@ -8968,30 +12650,29 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // The local mirror of browsing a server: look around, preview, use the
+        // server-side stats - without loading anything. Same Browse panel, the
+        // peer just runs on this machine.
+        if (ImGui::MenuItem("Browse Folder (Local)...")) browseFolderDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("open a folder in the Browse panel: list, preview\n"
+                              "and measure without loading anything");
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
-        if (ImGui::MenuItem("Start Remote (ssh)...")) app.remoteDlgOpen = true;
-        // Where the muscle memory goes looking. Connected: raise the browser.
-        // Not connected: there is nothing to browse yet, so ask for the host -
-        // the same two steps either way, just entered from the familiar place.
-        if (ImGui::MenuItem("Open File (Remote)...")) {
+        // The ONE remote entry point. "Open File (Remote)..." and "Open Folder
+        // (Remote)..." used to sit under it and are gone: see the panel's own
+        // toolbar. Revealing the panel here is what both of them really did.
+        if (ImGui::MenuItem("Start Remote (ssh)...")) {
             app.showRemote = true;
             app.focusRemote = true;
-            if (!app.rbrowse.connected) app.remoteDlgOpen = true;
+            app.remoteDlgOpen = true;
         }
-        // The remote mirror of Open Folder: every stack below the current
-        // browse directory, one stack per subfolder. Not connected yet: ask
-        // for the host first - the same two steps as Open File (Remote).
-        if (ImGui::MenuItem("Open Folder (Remote)...")) {
-            app.showRemote = true;
-            app.focusRemote = true;
-            if (app.rbrowse.connected) remoteScanFolder(app.rbrowse.dir);
-            else app.remoteDlgOpen = true;
-        }
-        if (app.rbrowse.connected && ImGui::IsItemHovered())
-            ImGui::SetTooltip("scans %s - browse to the folder you want first",
-                              app.rbrowse.dir.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("connect to a machine. Opening files and folders\n"
+                              "happens in the Browse panel: click a file to look\n"
+                              "at it, double-click to open it, \"open folder\" for\n"
+                              "every stack below the folder you are in.");
         if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
             App::RbJob j; j.kind = App::RbUpdatePeer;
             j.host = app.rbrowse.host; j.port = app.rbrowse.port;
@@ -9006,7 +12687,18 @@ static void drawMenuBar(GLFWwindow* win) {
             if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
+        {   // Close follows the layer canon (docs/terminology.md): Ctrl+W closes
+            // the STACK when the current frame is in one, the image otherwise.
+            // Ctrl+Alt+W is the one-frame escape hatch; Ctrl+Shift+W the batch.
+            bool inStack = cur() && cur()->seqId != 0;
+            if (ImGui::MenuItem(inStack ? "Close Stack" : "Close Image", SC_MOD "+W",
+                                false, cur() != nullptr))
+                closeCurrent();
+            if (ImGui::MenuItem("Close Frame", SC_MOD "+Alt+W", false, inStack))
+                closeCurrent(true);
+            if (ImGui::MenuItem("Close Batch", SC_MOD "+Shift+W", false, cur() != nullptr))
+                closeBatch(cur()->batchId);
+        }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
         if (ImGui::BeginMenu("Sequence loading")) {
@@ -9093,9 +12785,54 @@ static void drawMenuBar(GLFWwindow* win) {
                     app.diffAbs = !app.diffAbs;
             }
             ImGui::Separator();
+            if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
+                app.compareFollowFrame = !app.compareFollowFrame;
+            {   // the display range relationship, where the compare modes live
+                static const char* RN[3] = { "  each side keeps its own range",
+                                             "  B uses A's range",
+                                             "  auto over both (union)" };
+                ImGui::TextDisabled("Display range");
+                for (int r = 0; r < 3; r++)
+                    if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
+                        app.compareRangeMode = r;
+                        if (ImageDoc* bb = cmpB()) bb->texDirty = true;
+                        if (cur()) cur()->texDirty = true;
+                    }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Two images stretched differently cannot be compared -\n"
+                                  "what you would be looking at is the stretch. Display\n"
+                                  "only: B keeps its own black/white.");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Two stacks: stepping A steps B to the SAME frame number,\n"
+                                  "so frame 42 is compared against frame 42.\n"
+                                  "Turn it off to hold B still - which is what you want when\n"
+                                  "B is one reference image (a dark, a golden sample).\n"
+                                  "A single-image B never moves either way.");
             if (ImGui::MenuItem("Pin this frame as B", "Shift+B", false, cur() != nullptr)) pinCurrentAsB();
             if (ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C", false, cmpB() != nullptr))
                 swapCompare();
+            ImGui::Separator();
+            // ONE setting for every statistics panel: "same arrangement as the
+            // image" is a property of the comparison, not of the histogram.
+            ImGui::TextDisabled("Statistics panels");
+            if (ImGui::MenuItem("  Auto (follow the image layout)", nullptr,
+                                app.abStatsLayout == App::AbAuto))
+                app.abStatsLayout = App::AbAuto;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Side by side images (split) -> side by side plots.\n"
+                                  "Wipe / blink / difference have one image area,\n"
+                                  "so their plots overlay.");
+            if (ImGui::MenuItem("  Overlay (A solid, B dashed)", nullptr,
+                                app.abStatsLayout == App::AbOverlay))
+                app.abStatsLayout = App::AbOverlay;
+            if (ImGui::MenuItem("  Side by side (A on the left)", nullptr,
+                                app.abStatsLayout == App::AbSide))
+                app.abStatsLayout = App::AbSide;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Always 50/50 and always A on the left: two shapes\n"
+                                  "can only be compared on plots of equal width.\n"
+                                  "Narrow panels fall back to the overlay.");
             ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a
@@ -9112,8 +12849,15 @@ static void drawMenuBar(GLFWwindow* win) {
                 }
                 if (++shown > 40) { ImGui::TextDisabled("... %d more (use Files)",
                                                         (int)app.images.size() - shown); break; }
-                std::string lbl = d->name + (d->seqId != 0 ? "   [stack]" : "");
-                if (ImGui::MenuItem(lbl.c_str(), nullptr, app.compareBUid == d->uid)) {
+                // by STACK name, and with the uid as the ImGui id: two stacks of
+                // one series list identically named frames, so "frame_000.npy"
+                // twice was the whole menu's content (### also keeps a name
+                // containing ## from eating its own label)
+                char lbl[320];
+                snprintf(lbl, sizeof lbl, "%s%s###b%llu", abDocLabel(d).c_str(),
+                         d->seqId != 0 ? "   [stack]" : "",
+                         (unsigned long long)d->uid);
+                if (ImGui::MenuItem(lbl, nullptr, app.compareBUid == d->uid)) {
                     setCompareB(d);
                     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
                 }
@@ -9129,18 +12873,6 @@ static void drawMenuBar(GLFWwindow* win) {
             app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
-        if (ImGui::BeginMenu("Value range scope")) {
-            if (ImGui::MenuItem("Auto per frame", nullptr, app.rangeScope == 0)) app.rangeScope = 0;
-            if (ImGui::MenuItem("Shared within a stack", nullptr, app.rangeScope == 1)) app.rangeScope = 1;
-            if (ImGui::MenuItem("Shared across everything", nullptr, app.rangeScope == 2)) app.rangeScope = 2;
-            ImGui::EndMenu();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("What happens to black/white when you switch images:%s"
-                              "per frame = every frame auto-ranges to its own min..max%s"
-                              "per stack = frames of a stack share the reference range (default)%s"
-                              "everything = the current range follows you everywhere",
-                              "\n", "\n", "\n");
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
@@ -9173,7 +12905,7 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
-            ImGui::MenuItem("Remote", nullptr, &app.showRemote);
+            ImGui::MenuItem("Browse", nullptr, &app.showRemote);
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
@@ -9462,6 +13194,17 @@ static void drawHelpAbout() {
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("M",             "measure again (rerun the selected analyzer, focus Analysis)");
                 row("H",             "this help");
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("--- Browse panel (when it has focus) ---");
+                row("up / down",     "walk the listing, previewing as it goes");
+                row("Home / End",    "first / last row");
+                row("Enter",         "open for real (the double-click: a stack opens whole)");
+                row("right / left",  "tree mode: expand / collapse the folder under the cursor");
+                row("Backspace",     "up to the parent folder");
+                row(SC_MOD "+F",     "focus the filter box");
+                row(", / .",         "step the previewed sequence");
                 ImGui::EndTable();
             }
         }
@@ -9483,8 +13226,32 @@ static void drawHelpAbout() {
 // ---------------------------------------------------------------- CLI
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
+static std::string g_rangeSelftest;      // --range-selftest <dir with 2 stacks>
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
+static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
+static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
+static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
+static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
+static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
+static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
+static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
+static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
+
+// --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
+// frames. The other browse selftests call the panel's helpers directly, which
+// is enough for what the rows contain but blind to everything that only exists
+// inside a frame - and a single Down arrow segfaulted the process on an ImGui
+// clipper call that a frameless test can never reach. So this one connects a
+// LOCAL peer to <dir> in a hidden window and replays real UI actions into the
+// real input queue, one per script slot: the panel cannot tell them from a
+// human. Actions (--browse-keys overrides the canned list): focus, down, up,
+// left, right, enter, home, end, back, flat, tree.
+static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
+static std::string g_browseKeys;        // <dir>, empty = not running
+static std::string g_browseKeysActs =
+    "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
+    "left,end,home,up,down,more,down,back";
 
 static void printUsage() {
     printf(
@@ -9514,9 +13281,14 @@ static void printUsage() {
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
+        "  --bench-step                ...and step A one frame per bench frame (A/B\n"
+        "                              follow-frame cost: both sides recompute)\n"
+        "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
+        "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
+        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -9595,6 +13367,10 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--sequence expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame") {
             next();                                // consumed in main(), not an error
+        } else if (a == "--bench-step") {
+            /* consumed in main(): no value */
+        } else if (a == "--no-ab-throttle") {
+            g_abNoThrottle = true;     // measure what the B-slot throttle saves
         } else if (a == "--cfa") {                 // none | bayer | quad
             std::string v = next();
             app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
@@ -9603,12 +13379,34 @@ static void parseCli(int argc, char** argv) {
             app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
+        } else if (a == "--range-selftest") {
+            g_rangeSelftest = next();
         } else if (a == "--framestats-selftest") {
             g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
             g_pickerSelftest = next();             // handled in main()
+        } else if (a == "--close-selftest") {
+            g_closeSelftest = next();              // handled in main()
+        } else if (a == "--batch-selftest") {
+            g_batchSelftest = next();              // handled in main()
+        } else if (a == "--rtemporal-selftest") {
+            g_rtemporalSelftest = next();          // handled in main()
+        } else if (a == "--localbrowse-selftest") {
+            g_localbrowseSelftest = next();        // handled in main()
+        } else if (a == "--browse-selftest") {
+            g_browseSelftest = next();             // handled in main()
+        } else if (a == "--browse-keys-selftest") {
+            g_browseKeys = next();                 // handled in main()'s frame loop
+        } else if (a == "--browse-keys") {
+            g_browseKeysActs = next();             // override the canned action list
+        } else if (a == "--verify-selftest") {
+            g_verifySelftest = next();             // handled in main()
+        } else if (a == "--abstats-selftest") {
+            g_abstatsSelftest = next();            // handled in main()
+        } else if (a == "--series-selftest") {
+            g_seriesSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -9782,9 +13580,11 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 if (e.group) { nGroups++; g = &e; }
                 else nPlain++;
             }
+            // the pattern SHOWS ITS EXTENT: no bare '?' run survives into the
+            // name a user reads (rp::patternWithExtent)
             bool ok = nGroups == 1 && nPlain == 3 && g && g->frames == 24 &&
                       g->members.size() == 24 && g->hasMeta && g->dtype == "f32" &&
-                      g->name.find('?') != std::string::npos;
+                      g->name == "frame_000\xE2\x80\xA5" "023.npy";
             // the member names must lead back to real files, or the row is a lie
             remote::Meta gm;
             if (ok && !s.meta(rb + "/" + g->members[0], gm, err)) {
@@ -9795,6 +13595,113 @@ static int remoteSelfTest(const char* exe, const char* path) {
                             "%u frames %s: %s\n",
                     g ? g->name.c_str() : "?", nGroups, nPlain,
                     g ? g->frames : 0, g ? fmtEntryShape(*g).c_str() : "?",
+                    ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Grouping stage 2: the extent covers ONLY the varying digit run.
+        // gainset has a constant gain digit next to the frame counter - the
+        // pattern must keep it LITERAL (gain10_000..007.npy, never
+        // gain10..20_...), or two gains read as one stack.
+        std::string gd = dir + "/rb/gainset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(gd, ents, err)) {
+            fprintf(stderr, "selftest: LIST gainset: skipped (%s: %s)\n",
+                    gd.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames8 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames8 &= e.frames == 8; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames8 &&
+                      pats[0] == "gain10_000\xE2\x80\xA5" "007.npy" &&
+                      pats[1] == "gain20_000\xE2\x80\xA5" "007.npy";
+            fprintf(stderr, "selftest: LIST grouping gainset -> %d group(s) [%s], "
+                            "8 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames8 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Grouping stage 2, split: expset varies TWO digit runs. One stack per
+        // condition (g00_e??.npy / g01_e??.npy), never a second '?' run - a
+        // condition-mixed stack has a meaningless sigma_t.
+        std::string ed = dir + "/rb/expset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(ed, ents, err)) {
+            fprintf(stderr, "selftest: LIST expset: skipped (%s: %s)\n",
+                    ed.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames4 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames4 &= e.frames == 4; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames4 &&
+                      pats[0] == "g00_e00\xE2\x80\xA5" "03.npy" &&
+                      pats[1] == "g01_e00\xE2\x80\xA5" "03.npy";
+            fprintf(stderr, "selftest: LIST grouping expset (2 varying runs) -> "
+                            "%d group(s) [%s], 4 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames4 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Pattern extent, and the agreement between the two ends. digitset is
+        // all digits ("????.npy" by the rule, which says nothing); padset has
+        // uneven padding, so the extent has to be read by VALUE. For each, the
+        // peer's LIST pattern and the pattern the CLIENT builds for the same
+        // folder (findSequenceSiblings) must be the identical string - a
+        // capture opened locally and listed over ssh names one stack, not two.
+        struct PatCase { const char* sub; const char* first; const char* want; };
+        const PatCase pcs[] = {
+            { "digitset", "0000.npy", "0000\xE2\x80\xA5" "0003.npy" },
+            { "padset",   "f_9.npy",  "f_9\xE2\x80\xA5" "11.npy" },
+            { "gainset",  "gain10_000.npy", "gain10_000\xE2\x80\xA5" "007.npy" },
+        };
+        for (const PatCase& pc : pcs) {
+            std::string pd = dir + "/rb/" + pc.sub;
+            std::vector<remote::Entry> ents;
+            if (!s.list(pd, ents, err)) {
+                fprintf(stderr, "selftest: pattern %s: skipped (%s)\n", pc.sub, err.c_str());
+                continue;
+            }
+            std::string peerPat;
+            for (const auto& e : ents) if (e.group && peerPat.empty()) peerPat = e.name;
+            std::string clientPat;
+            findSequenceSiblings(pd + "/" + pc.first, clientPat);
+            bool ok = peerPat == pc.want && clientPat == pc.want;
+            fprintf(stderr, "selftest: pattern %s -> peer '%s', client '%s' "
+                            "(want '%s'): %s\n",
+                    pc.sub, peerPat.c_str(), clientPat.c_str(), pc.want,
+                    ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+        {   // The pattern is ALSO the stack name, and linearity's Auto levels
+            // parses stack names. It reads the FOLDER part - verified here, not
+            // assumed - so a changed file part is safe; and where there is no
+            // folder part the extent run is cut out first, so an all-digit
+            // stack still reports "no level" exactly as "????.npy" did.
+            double folder = extractLevelFromName("10lx/0000\xE2\x80\xA5" "0003.npy");
+            double bare   = extractLevelFromName("0000\xE2\x80\xA5" "0003.npy");
+            double gain   = extractLevelFromName("gain10_000\xE2\x80\xA5" "007.npy");
+            bool ok = folder == 10.0 && !std::isfinite(bare) && gain == 10.0;
+            fprintf(stderr, "selftest: auto-level from '10lx/...' -> %g, from a bare "
+                            "extent -> %s, from 'gain10_...' -> %g: %s\n",
+                    folder, std::isfinite(bare) ? "a number (WRONG)" : "none", gain,
                     ok ? "ok" : "FAIL");
             bad += ok ? 0 : 1;
         }
@@ -10205,7 +14112,20 @@ int main(int argc, char** argv) {
         // the window frame has to be decided before the window exists
         if (!strcmp(argv[i], "--frame")) cliFrame = !strcmp(argv[i + 1], "system") ? 0 : 1;
     }
+    // --bench-step: advance A by one frame before every benched frame. --bench
+    // alone holds one image still, so every cache key stays hit and the loop
+    // measures drawing only. The A/B question is the opposite one - what a
+    // FRAME STEP costs when compareFollowFrame moves B too and both sides'
+    // histogram / projection caches miss - and it cannot be measured without
+    // actually stepping.
+    bool benchStep = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--bench-step")) benchStep = true;
     app.exePath = argv[0];
+    // the out-of-the-box A/B range mode, read before anything can override it:
+    // --range-selftest checks it, and prefs on the machine running the test
+    // would otherwise decide what "the default" is
+    g_abRangeDefault = app.compareRangeMode;
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
@@ -10220,7 +14140,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     const char* glslVersion = "#version 130";
 #endif
-    if (benchFrames) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     // How a Linux desktop matches a window to its launcher: without these the
     // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
     // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
@@ -10270,6 +14190,21 @@ int main(int argc, char** argv) {
         }
         if (iniPath.empty()) { io.IniFilename = nullptr; app.resetLayout = true; }
     }
+    // One-time migration: the browser window was renamed "Remote" ->
+    // "Browse###Remote". ImHashStr treats the ### part as the whole identity,
+    // so a saved [Window][Remote] entry no longer matches and the panel would
+    // silently lose its docked place. Rewrite the ini before ImGui reads it.
+    if (!iniPath.empty()) {
+        std::string txt;
+        if (readWholeFile(iniPath, txt) &&
+            txt.find("[Window][Remote]") != std::string::npos) {
+            size_t p;
+            while ((p = txt.find("[Window][Remote]")) != std::string::npos)
+                txt.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+            std::ofstream mf(pathFromUtf8(iniPath), std::ios::binary);
+            if (mf) mf << txt;
+        }
+    }
 
     float xs = 1, ys = 1;
     glfwGetWindowContentScale(win, &xs, &ys);
@@ -10283,9 +14218,20 @@ int main(int argc, char** argv) {
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
     std::string fontPath = jpFontPath();
+    // The Japanese ranges plus U+2025 TWO DOT LEADER: stack names carry it
+    // (frame_000‥023.npy - see rp::patternWithExtent), and a glyph the atlas
+    // does not hold renders as a fallback '?', which is precisely the
+    // uninformative character the extent exists to remove.
+    static ImVector<ImWchar> fontRanges;
+    {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        b.AddChar((ImWchar)0x2025);
+        b.BuildRanges(&fontRanges);
+    }
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
-                                       io.Fonts->GetGlyphRangesJapanese());
+                                       fontRanges.Data);
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
@@ -10395,8 +14341,2284 @@ int main(int argc, char** argv) {
             fprintf(stderr, "pickerselftest: UC2 FAILED - merged stack != union in natural order\n");
             ok = false;
         }
+        // ---- UC5: batch mode "one per top folder" -> N batches, unique names
+        {
+            std::string bsdir;
+            {   // fixture: batchset/ next to the given folder, else testdata
+                std::string d2 = g_pickerSelftest;
+                std::replace(d2.begin(), d2.end(), '\\', '/');
+                size_t sl = d2.find_last_of('/');
+                bsdir = (sl == std::string::npos ? std::string(".") : d2.substr(0, sl))
+                      + "/batchset";
+                std::error_code ec;
+                if (!std::filesystem::is_directory(pathFromUtf8(bsdir), ec))
+                    bsdir = "tools/testdata/batchset";
+            }
+            size_t imagesBefore = app.images.size();
+            openFolder(bsdir);
+            if (!app.folderPickOpen) {
+                fprintf(stderr, "pickerselftest: UC5 FAILED - picker did not open\n");
+                ok = false;
+            } else {
+                app.pickBatchMode = 1;             // the new footer radio
+                pickerAccept();
+                loadAll();
+                std::vector<int> bids;             // distinct batches actually used
+                for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                    int b = app.images[i]->batchId;
+                    if (std::find(bids.begin(), bids.end(), b) == bids.end())
+                        bids.push_back(b);
+                }
+                bool stacksOneBatch = true;        // a stack never straddles batches
+                for (const auto& si : app.seqs) {
+                    int b0 = -1;
+                    for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                        if (app.images[i]->seqId != si.id) continue;
+                        if (b0 < 0) b0 = app.images[i]->batchId;
+                        else if (app.images[i]->batchId != b0) stacksOneBatch = false;
+                    }
+                }
+                bool namesUnique = true;           // sessions restore by NAME
+                for (size_t a2 = 0; a2 < app.batches.size(); a2++)
+                    for (size_t b2 = a2 + 1; b2 < app.batches.size(); b2++)
+                        if (app.batches[a2].name == app.batches[b2].name)
+                            namesUnique = false;
+                std::string names;
+                for (int b : bids)
+                    for (const auto& bb : app.batches)
+                        if (bb.id == b) names += (names.empty() ? "" : ",") + bb.name;
+                fprintf(stderr, "pickerselftest: UC5 batch-per-top-folder -> %d batch(es) "
+                                "[%s], stacks one-batch=%d, names unique=%d\n",
+                        (int)bids.size(), names.c_str(), stacksOneBatch ? 1 : 0,
+                        namesUnique ? 1 : 0);
+                if (bids.size() != 3 || !stacksOneBatch || !namesUnique) {
+                    fprintf(stderr, "pickerselftest: UC5 FAILED - batches wrong\n");
+                    ok = false;
+                }
+            }
+        }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // The local-browse entry, verifiable without a human: the function behind
+    // File > Browse Folder (Local)... must land the picked folder in the Browse
+    // panel through the LOCAL peer - connected, empty host, entries listed.
+    if (!g_localbrowseSelftest.empty()) {
+        browseLocalFolder(g_localbrowseSelftest);   // exactly what the menu does
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const App::RemoteBrowse& B = app.rbrowse;
+        bool ok = B.connected && B.host.empty() && !B.entries.empty() &&
+                  app.showRemote;
+        fprintf(stderr, "localbrowseselftest: connected=%d host='%s' dir=%s "
+                        "entries=%d showBrowse=%d%s%s\n",
+                B.connected ? 1 : 0, B.host.c_str(), B.dir.c_str(),
+                (int)B.entries.size(), app.showRemote ? 1 : 0,
+                B.err.empty() ? "" : " err=", B.err.c_str());
+        fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // The Browse panel's own behaviour, verifiable without a human. Connects a
+    // LOCAL peer to <dir> and drives the same functions the panel draws with.
+    if (!g_browseSelftest.empty()) {
+        std::string dir = g_browseSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const App::RemoteBrowse& B = app.rbrowse;
+        if (!B.connected || B.entries.empty()) {
+            fprintf(stderr, "browseselftest: no listing for %s (%s)\n",
+                    dir.c_str(), B.err.c_str());
+            stopRbWorker(); stopRemoteFetcher(); stopMeasureWorker();
+            return 1;
+        }
+        bool ok = true;
+        {   // Grouped <-> flat is a CLIENT-SIDE view over one reply: the flat
+            // listing must be exactly the group's members, in the peer's order,
+            // and the grouped one exactly one row for them.
+            const remote::Entry* g = nullptr;
+            int nGroups = 0, nMembers = 0;
+            for (const auto& e : B.entries) {
+                if (!e.group) continue;
+                nGroups++;
+                nMembers += (int)e.members.size();
+                if (!g) g = &e;
+            }
+            std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
+            std::vector<RbRow> fv = rbBuildView(&B.dir, B.entries, true, false);
+            bool sizes = gv.size() == B.entries.size() &&
+                         fv.size() == B.entries.size() - nGroups + nMembers;
+            // one grouped row for the sequence, and it is the group entry
+            int gRows = 0;
+            for (const auto& r : gv) if (r.isGroup()) gRows++;
+            // the expanded rows, in order, ARE the members
+            std::vector<std::string> expanded;
+            bool memberCells = true;
+            for (const auto& r : fv) {
+                if (r.e != g || r.member < 0) continue;
+                expanded.push_back(r.name());
+                // an expanded frame has no size / mtime of its own, but keeps
+                // the shape/dtype the group shares by construction
+                if (r.ownFile() || r.isGroup() || r.isDir()) memberCells = false;
+                if (r.e->hasMeta != g->hasMeta || r.e->dtype != g->dtype) memberCells = false;
+            }
+            bool same = g && expanded == g->members;
+            bool nogroups = true;
+            for (const auto& r : fv) if (r.isGroup()) nogroups = false;
+            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d sequence row(s), "
+                            "'%s' x%d], flat %d row(s), members match=%d, no group rows "
+                            "when flat=%d, member size/mtime blank=%d: %s\n",
+                    dir.c_str(), (int)gv.size(), gRows, g ? g->name.c_str() : "?",
+                    g ? (int)g->members.size() : 0, (int)fv.size(), same ? 1 : 0,
+                    nogroups ? 1 : 0, memberCells ? 1 : 0,
+                    (sizes && gRows == nGroups && nGroups >= 1 && same && nogroups &&
+                     memberCells) ? "ok" : "FAIL");
+            if (!(sizes && gRows == nGroups && nGroups >= 1 && same && nogroups && memberCells))
+                ok = false;
+        }
+        {   // The deferred-action invariant. Every row the listing draws is a
+            // pair of raw pointers into B.entries; the Places combo used to
+            // replace the whole browse state from inside the draw, and the
+            // table below it then read nine destroyed entries (SIGSEGV in
+            // strlen). Nothing that replaces that state may run while a row
+            // list is alive - it is queued and runs when the rows are gone.
+            int ranAt = -1, marker = 0;
+            bool queued = false, aliveOk = false;
+            size_t pend0 = rbDeferredPending();
+            {
+                RbDeferredActions guard;
+                std::vector<RbRow> rows = rbBuildView(&B.dir, B.entries, false, false);
+                rbDefer([&] { ranAt = marker; });     // what picking a place queues
+                marker = 1;
+                queued = rbDeferredPending() == pend0 + 1 && ranAt == -1;
+                // ...and the rows are still readable, which is the whole point
+                aliveOk = !rows.empty() && rows[0].e == &B.entries[0] &&
+                          rows[0].e->name == B.entries[0].name;
+                marker = 2;                            // the row list dies here
+            }
+            bool defOk = queued && aliveOk && ranAt == 2 && rbDeferredPending() == 0;
+            fprintf(stderr, "browseselftest: deferred actions: queued while the rows "
+                            "were alive=%d, rows valid throughout=%d, ran only after "
+                            "they died=%d, queue drained=%d: %s\n",
+                    queued ? 1 : 0, aliveOk ? 1 : 0, ranAt == 2 ? 1 : 0,
+                    rbDeferredPending() == 0 ? 1 : 0, defOk ? "ok" : "FAIL");
+            if (!defOk) ok = false;
+        }
+        {   // Tree mode, lazily: expanding a node issues exactly ONE LIST, on
+            // the worker; the children appear under the folder at depth+1;
+            // collapsing keeps the cache, so re-expanding issues nothing.
+            std::string sub;
+            for (const auto& e : B.entries)
+                if (e.dir && (sub.empty() || e.name == "scanroot")) sub = e.name;
+            if (sub.empty()) {
+                fprintf(stderr, "browseselftest: tree: no subfolder in %s to expand\n",
+                        dir.c_str());
+                ok = false;
+            } else {
+                std::string subPath = dir + "/" + sub;
+                int before = app.rbTreeLists;
+                // nothing is listed until it is asked for
+                bool lazy0 = app.rbTreeCache.empty();
+                rbTreeExpand(subPath);
+                double t1 = glfwGetTime();
+                while (glfwGetTime() - t1 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (app.rbTreeCache.count(subPath)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                int afterExpand = app.rbTreeLists;
+                std::vector<RbRow> tv = rbBuildView(&B.dir, B.entries, false, true);
+                // the children sit directly under their folder, one level in
+                int at = -1;
+                for (int i = 0; i < (int)tv.size(); i++)
+                    if (tv[i].isDir() && tv[i].name() == sub) { at = i; break; }
+                size_t nKids = app.rbTreeCache.count(subPath)
+                             ? app.rbTreeCache[subPath].size() : 0;
+                int kidsUnder = 0;
+                bool contiguous = at >= 0;
+                for (int i = at + 1; i < (int)tv.size() && tv[i].depth > tv[at].depth; i++)
+                    kidsUnder++;
+                if (at < 0 || (size_t)kidsUnder != nKids) contiguous = false;
+                // ...and they know which directory they came from
+                bool paths = at >= 0;
+                for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
+                    if (tv[i].full() != subPath + "/" + tv[i].name()) paths = false;
+                // collapse: rows go, the cache stays
+                rbTreeCollapse(subPath);
+                std::vector<RbRow> cv = rbBuildView(&B.dir, B.entries, false, true);
+                bool collapsed = cv.size() == B.entries.size() &&
+                                 app.rbTreeCache.count(subPath) == 1;
+                // re-expand: no second round trip
+                rbTreeExpand(subPath);
+                int afterAgain = app.rbTreeLists;
+                std::vector<RbRow> rv = rbBuildView(&B.dir, B.entries, false, true);
+                bool freeAgain = afterAgain == afterExpand && rv.size() == tv.size();
+                // and a grandchild: the recursion must indent, not flatten
+                int deep = 0, atDeep = -1;
+                if (at >= 0)
+                    for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
+                        if (tv[i].isDir()) { atDeep = i; break; }
+                if (atDeep >= 0) {
+                    rbTreeExpand(rv[atDeep].full());
+                    double t2 = glfwGetTime();
+                    while (glfwGetTime() - t2 < 120.0) {
+                        pumpRemoteBrowse();
+                        if (app.rbTreeCache.count(rv[atDeep].full())) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    std::vector<RbRow> dv = rbBuildView(&B.dir, B.entries, false, true);
+                    for (const auto& q : dv) if (q.depth == 2) deep++;
+                }
+                bool treeOk = lazy0 && afterExpand == before + 1 && nKids > 0 &&
+                              contiguous && paths && collapsed && freeAgain &&
+                              (atDeep < 0 || deep > 0);
+                fprintf(stderr, "browseselftest: tree lazy: nothing cached before=%d, "
+                                "expand %s -> %d LIST(s) (%d children at depth %d, paths "
+                                "ok=%d), collapse -> %d row(s) with the cache kept=%d, "
+                                "re-expand -> %d extra LIST(s), grandchild rows at "
+                                "depth 2 = %d: %s\n",
+                        lazy0 ? 1 : 0, sub.c_str(), afterExpand - before, kidsUnder,
+                        at >= 0 && at + 1 < (int)tv.size() ? tv[at + 1].depth : -1,
+                        paths ? 1 : 0, (int)cv.size(), collapsed ? 1 : 0,
+                        afterAgain - afterExpand, deep, treeOk ? "ok" : "FAIL");
+                if (!treeOk) ok = false;
+                rbTreeForget();
+            }
+        }
+        {   // "Open folder" on the folder being browsed: the same call the
+            // toolbar button and the breadcrumb menu make. The scan must
+            // include the CURRENT directory itself (a stack whose name has no
+            // folder prefix), which is exactly what the old row-only entry
+            // could not reach without first going up a level.
+            remoteScanFolder(B.dir);
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 120.0) {
+                pumpRemoteBrowse();
+                if (app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int here = 0, below = 0;
+            std::string names;
+            for (const auto& fp : app.folderPick) {
+                if (fp.g.name.find('/') == std::string::npos) here++;
+                else below++;
+                if (names.size() < 160)
+                    names += (names.empty() ? "" : ",") + fp.g.name;
+            }
+            bool scanOk = app.folderPickOpen && app.folderPickRemote && here >= 1 && below >= 1;
+            fprintf(stderr, "browseselftest: open-folder on the current dir %s -> picker "
+                            "open=%d remote=%d, %d stack(s) in this folder, %d below "
+                            "[%s]: %s\n",
+                    B.dir.c_str(), app.folderPickOpen ? 1 : 0, app.folderPickRemote ? 1 : 0,
+                    here, below, names.c_str(), scanOk ? "ok" : "FAIL");
+            if (!scanOk) ok = false;
+            app.folderPick.clear();          // Cancel: nothing must be opened
+            app.folderPickOpen = false;
+        }
+        fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // Browser-fired temporal, verifiable without a human (docs/terminology.md):
+    // the server aggregate for a stack NOBODY OPENED must land in the Temporal
+    // panel as a detached [not opened] result and match an independent local
+    // computation to full float64 precision.
+    if (!g_rtemporalSelftest.empty()) {
+        std::string dir = g_rtemporalSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        std::vector<std::string> files;
+        {
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec)) {
+                std::string n = e.path().filename().u8string();
+                if (isNpyName(n)) files.push_back(dir + "/" + n);
+            }
+        }
+        sortFramesNumerically(files);
+        if (files.size() < 2) {
+            fprintf(stderr, "rtemporalselftest: need >= 2 npy under %s\n", dir.c_str());
+            return 1;
+        }
+        // independent reference: per-pixel f64 accumulation over the local files
+        double refMean = 0, refSt = 0, refFpn = 0;
+        {
+            std::vector<double> sum, sum2;
+            size_t samples = 0;
+            int N = 0;
+            for (const auto& f : files) {
+                std::string err;
+                std::unique_ptr<ImageDoc> d = decodeNpy(f, err);
+                if (!d) {
+                    fprintf(stderr, "rtemporalselftest: %s: %s\n", f.c_str(), err.c_str());
+                    return 1;
+                }
+                if (!samples) {
+                    samples = d->data.size();
+                    sum.assign(samples, 0.0);
+                    sum2.assign(samples, 0.0);
+                }
+                if (d->data.size() != samples) {
+                    fprintf(stderr, "rtemporalselftest: shape mismatch in fixture\n");
+                    return 1;
+                }
+                for (size_t i = 0; i < samples; i++) {
+                    double v = d->data[i];
+                    sum[i] += v; sum2[i] += v * v;
+                }
+                N++;
+            }
+            double aM = 0, aM2 = 0, aV = 0;
+            for (size_t i = 0; i < samples; i++) {
+                double mm = sum[i] / N;
+                aM += mm; aM2 += mm * mm;
+                aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+            }
+            refMean = aM / samples;
+            refSt = sqrt(aV / samples);
+            refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+        }
+        // connect the browser, then fire the SAME call the group row's menu makes
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        bool fired = false, ok = true;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpMeasure();
+            if (app.rbrowse.connected && !fired) {
+                std::string leaf = dir.substr(dir.find_last_of('/') + 1);
+                requestBrowseTemporal(app.rbrowse.host, files, leaf + "/frame_???.npy");
+                fired = true;
+            }
+            if (fired && !app.srvTemporal.pending) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        App::ServerTemporal& S = app.srvTemporal;
+        auto rel = [](double a, double b) {
+            return fabs(a - b) / std::max({ fabs(a), fabs(b), 1e-12 });
+        };
+        fprintf(stderr, "rtemporalselftest: [server %s, %d frames - not opened: %s] "
+                        "valid=%d seqId=%d, %d image(s) open\n",
+                S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                S.label.c_str(), S.valid ? 1 : 0, S.seqId, (int)app.images.size());
+        if (!fired || !S.valid || S.seqId != -2 || S.frames != (int)files.size() ||
+            !app.images.empty()) {
+            fprintf(stderr, "rtemporalselftest: FAILED - no valid detached result (%s)\n",
+                    S.err.c_str());
+            ok = false;
+        } else {
+            fprintf(stderr, "rtemporalselftest: sigma_t server %.12g vs ref %.12g "
+                            "(rel %.3g), sigma_fpn %.12g vs %.12g (rel %.3g), "
+                            "mean rel %.3g\n",
+                    S.tempNoise, refSt, rel(S.tempNoise, refSt),
+                    S.fixedPattern, refFpn, rel(S.fixedPattern, refFpn),
+                    rel(S.mean, refMean));
+            if (rel(S.tempNoise, refSt) > 1e-9 || rel(S.fixedPattern, refFpn) > 1e-9 ||
+                rel(S.mean, refMean) > 1e-9) {
+                fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "rtemporalselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopMeasureWorker();
+        stopRemoteFetcher();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // Move-to-batch, verifiable without a human (docs/terminology.md): stacks
+    // move between batches WHOLE, emptied batches are pruned, and the batch
+    // name survives a session save/load round-trip (imgbatch travels by name).
+    if (!g_batchSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_batchSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "batchselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        if (app.seqs.empty() || app.images.empty()) {
+            fprintf(stderr, "batchselftest: nothing loaded\n");
+            return 1;
+        }
+        int oldBatch = app.images[0]->batchId;
+        int nb = newBatch(uniqueBatchName("moved"));
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        for (int s : sids) moveStackToBatch(s, nb);
+        int offBatch = 0;
+        for (const auto& d : app.images) if (d->batchId != nb) offBatch++;
+        bool oldGone = true;
+        for (const auto& b : app.batches) if (b.id == oldBatch) oldGone = false;
+        fprintf(stderr, "batchselftest: moved %d stack(s) to batch '%s': "
+                        "%d of %d frames off-batch, old batch %d pruned=%d\n",
+                (int)sids.size(), "moved", offBatch, (int)app.images.size(),
+                oldBatch, oldGone ? 1 : 0);
+        if (offBatch != 0 || !oldGone) {
+            fprintf(stderr, "batchselftest: FAILED - move left strays\n");
+            ok = false;
+        }
+        // ---- session round-trip: the batch travels BY NAME ----
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_batchselftest.vsession").u8string();
+        saveSession(sess, true);
+        std::string lerr = loadSession(sess);      // closeAll happens inside
+        if (!lerr.empty()) {
+            fprintf(stderr, "batchselftest: FAILED - session reload: %s\n", lerr.c_str());
+            ok = false;
+        }
+        loadAll();                                 // seqload rescans the folders
+        int movedId = 0;
+        for (const auto& b : app.batches) if (b.name == "moved") movedId = b.id;
+        int strays = 0;
+        for (const auto& d : app.images) if (d->batchId != movedId) strays++;
+        fprintf(stderr, "batchselftest: reloaded session: %d image(s), %d stack(s), "
+                        "batch 'moved' %s, %d stray frame(s)\n",
+                (int)app.images.size(), (int)app.seqs.size(),
+                movedId ? "restored" : "MISSING", strays);
+        if (!movedId || strays != 0 || app.images.empty() ||
+            app.seqs.size() != sids.size()) {
+            fprintf(stderr, "batchselftest: FAILED - session did not restore the batch\n");
+            ok = false;
+        }
+        fprintf(stderr, "batchselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        return ok ? 0 : 1;
+    }
+
+    // The series (系列) layer - the MODEL, with no UI behind it (phase 1 draws
+    // nothing at all). Every invariant docs/terminology.md and docs/series-plan.md
+    // state, checked exhaustively (seriesAudit) after every mutation, on the real
+    // load path: Open Folder -> picker -> stacks.
+    if (!g_seriesSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 600.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](const char* what, bool cond) {
+            fprintf(stderr, "seriesselftest: %-62s %s\n", what, cond ? "ok" : "FAILED");
+            if (!cond) ok = false;
+        };
+        auto audit = [&]() {
+            std::string why;
+            if (seriesAudit(why)) return true;
+            fprintf(stderr, "seriesselftest: AUDIT: %s\n", why.c_str());
+            return false;
+        };
+        openFolder(g_seriesSelftest);
+        loadAll();
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        if (sids.size() < 4 || app.images.empty()) {
+            fprintf(stderr, "seriesselftest: need >= 4 stacks under %s, got %d\n",
+                    g_seriesSelftest.c_str(), (int)sids.size());
+            return 1;
+        }
+        int b0 = app.images[0]->batchId;
+
+        // ---- 1. build one series out of every stack of one batch --------------
+        int S1 = newSeries(b0, "");                 // "" = the canon's default name
+        {
+            App::Series* S = seriesById(S1);
+            S->paramName = "illuminance";
+            snprintf(S->unit, sizeof S->unit, "lx");
+        }
+        int added = 0;
+        for (int s : sids)
+            if (addToSeries(S1, s, extractLevelFromName(seqInfo(s)->name))) added++;
+        App::Series* S = seriesById(S1);
+        int valued = 0, batchOk = 0;
+        for (const auto& m : S->members) {
+            if (std::isfinite(m.value)) valued++;
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId == S->batchId) { batchOk++; break; }
+        }
+        fprintf(stderr, "seriesselftest: created series '%s' in batch '%s': %d member(s), "
+                        "%d valued, param '%s' unit '%s' kind %d\n",
+                S->name.c_str(), batchNameOf(b0).c_str(), (int)S->members.size(), valued,
+                S->paramName.c_str(), S->unit, S->kind);
+        check("every stack of the batch joined", added == (int)sids.size() &&
+                                                 S->members.size() == sids.size());
+        check("every member's value came from its name", valued == (int)S->members.size());
+        check("every member's frames are in the series' batch", batchOk == (int)S->members.size());
+        check("default name is \"<batch> 掃引\"", S->name == batchNameOf(b0) + " 掃引");
+        check("invariant 1: audit after create", audit());
+        check("N members + a unit -> seriesCanFit", seriesCanFit(*S));
+        {   // the unit is never assumed: without one there is no fit, ever
+            char keep[16];
+            snprintf(keep, sizeof keep, "%s", S->unit);
+            S->unit[0] = '\0';
+            check("unit unset -> no fit (never assumed)", !seriesCanFit(*S));
+            snprintf(S->unit, sizeof S->unit, "%s", keep);
+        }
+
+        // ---- persistence: save -> load -> lazy resolve ------------------------
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_seriesselftest.vsession").u8string();
+        std::string legacy = (std::filesystem::temp_directory_path(tec) /
+                              "viewer_serieslegacy.vsession").u8string();
+        int legacyCount = 0;
+        {   // an OLD-format session, written now while the paths are known. It
+            // has to be built by hand because saveSession has NEVER emitted
+            // "seqlevel" - which is the honest reason the migration below is
+            // nearly always a no-op.
+            std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+            lf << "viewer-session 1\n" << std::setprecision(9);
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                if (fr.empty() || !std::isfinite(m.value)) continue;
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << app.images[fr.front()]->path << "\n";
+                lf << "imgbatch legacyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel " << m.value << "\n";
+                legacyCount++;
+            }
+        }
+        const char* RENAMED = "renamed member stack";
+        {
+            // Doctor the series first, so the round trip has something to lose:
+            // a renamed stack, an UNSET value, an excluded member, and a value
+            // with more significant digits than the file's default precision -
+            // the axis of a fit is the last place to accept a rounded number.
+            seqInfo(S->members[1].seqId)->name = RENAMED;
+            S->members[2].value = std::numeric_limits<double>::quiet_NaN();
+            S->members[3].include = false;
+            S->members[4].value = 1234567.891234;
+            struct Want { std::string path; double value; bool include; };
+            std::vector<Want> want;
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                want.push_back({ fr.empty() ? std::string() : app.images[fr.front()]->path,
+                                 m.value, m.include });
+            }
+            std::string wantName = S->name, wantParam = S->paramName, wantUnit = S->unit;
+            std::string wantBatch = batchNameOf(S->batchId);
+            int wantKind = S->kind;
+            saveSession(sess, true);
+            std::string lerr = loadSession(sess);       // closeAll happens inside
+            check("session reloaded", lerr.empty());
+            loadAll();                                  // stacks come back first
+            double tr = glfwGetTime();                  // ...the series after them
+            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            App::Series* R = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: round trip: %d series; '%s' param '%s' "
+                            "unit '%s' kind %d, %d member(s), batch '%s'\n",
+                    (int)app.series.size(), R ? R->name.c_str() : "",
+                    R ? R->paramName.c_str() : "", R ? R->unit : "", R ? R->kind : -1,
+                    R ? (int)R->members.size() : -1,
+                    R ? batchNameOf(R->batchId).c_str() : "");
+            check("exactly one series came back", app.series.size() == 1);
+            check("name / parameter / unit / kind survive",
+                  R && R->name == wantName && R->paramName == wantParam &&
+                  wantUnit == R->unit && R->kind == wantKind);
+            check("the series is in its batch, restored BY NAME",
+                  R && batchNameOf(R->batchId) == wantBatch);
+            bool memOk = R && R->members.size() == want.size();
+            if (memOk)
+                for (size_t i = 0; i < want.size(); i++) {
+                    std::vector<int> fr = framesOfSeq(R->members[i].seqId);
+                    std::string p = fr.empty() ? std::string() : app.images[fr.front()]->path;
+                    double a = want[i].value, b = R->members[i].value;
+                    bool vOk = std::isfinite(a) == std::isfinite(b) &&
+                               (!std::isfinite(a) ||
+                                fabs(a - b) <= 1e-9 * std::max(1.0, fabs(a)));
+                    if (p != want[i].path || !vOk ||
+                        R->members[i].include != want[i].include) memOk = false;
+                }
+            check("members: order, first-frame path, value and include all survive", memOk);
+            check("a value with more digits than the file's precision survives EXACTLY",
+                  R && R->members.size() > 4 && R->members[4].value == 1234567.891234);
+            check("the unset member came back UNSET, not 0",
+                  R && R->members.size() > 2 && !std::isfinite(R->members[2].value));
+            check("the excluded member came back excluded",
+                  R && R->members.size() > 3 && !R->members[3].include);
+            check("invariant 1: audit after restore", audit());
+            // Why members are keyed by PATH and not by stack name: the name of a
+            // FOLDER stack does not survive at all. seqname is written, but when
+            // it is parsed the stack does not exist yet (the frames come from a
+            // queued rescan), so the line lands on nothing.
+            bool nameSurvived = false;
+            for (const auto& si : app.seqs) if (si.name == RENAMED) nameSurvived = true;
+            fprintf(stderr, "seriesselftest: the renamed stack's name after restore: %s\n",
+                    nameSurvived ? "SURVIVED" : "lost (folder stack: seqname lands on nothing)");
+            check("stack names do NOT survive for folder stacks (hence path keys)",
+                  !nameSurvived);
+        }
+        // everything below works on what came back: the reload minted new ids
+        if (app.series.empty() || app.images.empty() || app.series.front().members.size() < 4) {
+            fprintf(stderr, "seriesselftest: nothing usable survived the round trip\n");
+            return 1;
+        }
+        S1 = app.series.front().id;
+        S = seriesById(S1);
+        b0 = S->batchId;
+        sids.clear();
+        for (const auto& m : S->members) sids.push_back(m.seqId);
+        // Undo the exclusion; the value deliberately left UNSET stays unset - it
+        // is the point of the next block. (It cannot be re-derived from the name
+        // either: a restored folder stack is called "frame_000‥023.npy", with no
+        // folder part to read a level out of. That is the same seqname hole,
+        // seen from the other side.)
+        for (auto& m : S->members) m.include = true;
+
+        // ---- invariant 6: an unset value is UNSET, never 0 --------------------
+        int ptsAll = seriesFitPoints(*S);
+        {
+            double keep = S->members[0].value;
+            S->members[0].value = std::numeric_limits<double>::quiet_NaN();
+            int nanPts = seriesFitPoints(*S);
+            S->members[0].value = keep;
+            S->members[0].include = false;
+            int excPts = seriesFitPoints(*S);
+            S->members[0].include = true;
+            fprintf(stderr, "seriesselftest: fit points %d -> %d with one value unset, "
+                            "%d with one excluded\n", ptsAll, nanPts, excPts);
+            check("invariant 6: an unset value leaves the fit", nanPts == ptsAll - 1);
+            check("an excluded member leaves the fit", excPts == ptsAll - 1);
+            check("both are reversible", seriesFitPoints(*S) == ptsAll);
+        }
+
+        // ---- invariant 2: a stack is in AT MOST ONE series --------------------
+        int S2 = newSeries(b0, "second");
+        {
+            int moved = sids[0];
+            bool didMove = addToSeries(S2, moved, 1.0);
+            S = seriesById(S1);
+            App::Series* T = seriesById(S2);
+            fprintf(stderr, "seriesselftest: stack %d added to '%s': '%s' now %d member(s), "
+                            "'%s' %d\n", moved, T->name.c_str(), S->name.c_str(),
+                    (int)S->members.size(), T->name.c_str(), (int)T->members.size());
+            check("invariant 2: adding elsewhere MOVES the stack",
+                  didMove && T->members.size() == 1 && S->members.size() == sids.size() - 1 &&
+                  seriesOfStack(moved) == T);
+            check("invariant 5: a single member cannot be fitted", !seriesCanFit(*T));
+            check("invariant 1: audit after the move", audit());
+            addToSeries(S1, moved, extractLevelFromName(seqInfo(moved)->name));
+            pruneEmptySeries();
+            check("emptied series is pruned", seriesById(S2) == nullptr &&
+                  seriesById(S1)->members.size() == sids.size());
+        }
+
+        // ---- invariant 4: a member moved out alone LEAVES the series ----------
+        {
+            int other = newBatch(uniqueBatchName("other"));
+            int mv = sids[1];
+            size_t before = seriesById(S1)->members.size();
+            app.toast.clear();
+            moveStackToBatch(mv, other);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: moveStackToBatch(%d -> '%s'): %d -> %d member(s), "
+                            "toast \"%s\"\n", mv, "other", (int)before,
+                    (int)S->members.size(), app.toast.c_str());
+            check("invariant 4: the moved stack left the series",
+                  S->members.size() == before - 1 && seriesOfStack(mv) == nullptr);
+            check("...and the screen was told", app.toast.find("left series") != std::string::npos);
+            check("invariant 1: audit after the move-to-batch", audit());
+            bool crossed = addToSeries(S1, mv, 1.0);
+            fprintf(stderr, "seriesselftest: addToSeries across batches returned %d\n",
+                    crossed ? 1 : 0);
+            check("a stack of another batch cannot join", !crossed && seriesOfStack(mv) == nullptr);
+        }
+
+        // ---- invariant 3: closeStack removes the member ----------------------
+        {
+            int cl = seriesById(S1)->members.front().seqId;
+            size_t before = seriesById(S1)->members.size();
+            closeStack(cl);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: closeStack(%d): %d -> %d member(s)\n",
+                    cl, (int)before, S ? (int)S->members.size() : -1);
+            check("invariant 3: closeStack drops the member",
+                  S && S->members.size() == before - 1 && seriesOfStack(cl) == nullptr);
+            check("invariant 1: audit after closeStack", audit());
+        }
+
+        // ---- invariant 5: one member is legal, just not fittable --------------
+        while (seriesById(S1) && seriesById(S1)->members.size() > 1)
+            removeFromSeries(seriesById(S1)->members.back().seqId);
+        S = seriesById(S1);
+        check("a one-member series is legal", S != nullptr && S->members.size() == 1);
+        check("invariant 5: ...and seriesCanFit() is false", S && !seriesCanFit(*S));
+
+        // ---- invariant 3: closeBatch takes its series with it -----------------
+        {
+            int before = (int)app.series.size();
+            closeBatch(b0);
+            fprintf(stderr, "seriesselftest: closeBatch(%d): %d -> %d series\n",
+                    b0, before, (int)app.series.size());
+            check("invariant 3: closeBatch discards its series",
+                  seriesById(S1) == nullptr && app.series.empty());
+            check("invariant 1: audit after closeBatch", audit());
+        }
+
+        // ---- migration: an OLD session that carried per-stack levels -----------
+        {
+            std::string lerr = loadSession(legacy);
+            check("legacy (seqlevel) session loaded", lerr.empty());
+            loadAll();
+            double tm = glfwGetTime();
+            while (glfwGetTime() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* M = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: seqlevel migration: %d series, %d member(s), "
+                            "name '%s' unit '%s' kind %d (%d levelled stacks in the file)\n",
+                    (int)app.series.size(), M ? (int)M->members.size() : -1,
+                    M ? M->name.c_str() : "", M ? M->unit : "", M ? M->kind : -1,
+                    legacyCount);
+            check("one series migrated out of the levels", app.series.size() == 1);
+            check("...holding every levelled stack",
+                  M && (int)M->members.size() == legacyCount);
+            check("...named \"<batch> 掃引\", kind linearity",
+                  M && M->name == "legacyset 掃引" && M->kind == App::Series::KLinearity);
+            check("invariant 1: audit after migration", audit());
+            // The negative half of the same rule: ONE levelled stack is not a
+            // sweep, and nothing may be invented from it.
+            std::string onePath;
+            if (M && !M->members.empty()) {
+                std::vector<int> fr = framesOfSeq(M->members.front().seqId);
+                if (!fr.empty()) onePath = app.images[fr.front()]->path;
+            }
+            {
+                std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+                lf << "viewer-session 1\n";
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << onePath << "\n";
+                lf << "imgbatch lonelyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel 42\n";
+            }
+            loadSession(legacy);
+            loadAll();
+            double tm2 = glfwGetTime();
+            while (glfwGetTime() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: one levelled stack alone -> %d series, "
+                            "%d stack(s) open\n", (int)app.series.size(),
+                    (int)app.seqs.size());
+            check("a single levelled stack makes NO series", app.series.empty() &&
+                                                            !app.seqs.empty());
+        }
+
+        // ---- the create/edit modal, pressed the way a human presses it --------
+        // A number that nobody chose is the failure this whole layer exists to
+        // prevent, and the modal is the shortest path to one: it is opened to
+        // rename a series, and its Save rebuilds every member from the boxes.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int b = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sid = selftestMakeSeries(b, "lx");
+            App::Series* M = seriesById(sid);
+            if (!M || M->members.size() < 4) {
+                fprintf(stderr, "seriesselftest: modal fixture failed\n");
+                return 1;
+            }
+            // one member deliberately UNSET, one carrying more digits than the
+            // box can show. Pick the unset one where the NAME does suggest a
+            // number, so the guess has something to fabricate.
+            int unsetIdx = -1;
+            for (int i = 0; i < (int)M->members.size(); i++) {
+                double g = extractLevelFromName(seqInfo(M->members[i].seqId)->name);
+                if (std::isfinite(g) && fabs(g) > 1e-9) { unsetIdx = i; break; }
+            }
+            const double PRECISE = 1234567.89;
+            int preciseIdx = unsetIdx == 0 ? 1 : 0;
+            if (unsetIdx < 0) { fprintf(stderr, "seriesselftest: no named level\n"); return 1; }
+            int unsetSeq = M->members[unsetIdx].seqId;
+            std::string unsetName = seqInfo(unsetSeq)->name;
+            double guess = extractLevelFromName(unsetName);
+            M->members[unsetIdx].value = std::numeric_limits<double>::quiet_NaN();
+            M->members[preciseIdx].value = PRECISE;
+            int preciseSeq = M->members[preciseIdx].seqId;
+            // "Edit series..." and then "Save", with NOTHING touched between.
+            openSeriesModal(b, sid);
+            const App::SeriesEdit::Row* r0 = nullptr;
+            for (const auto& r : app.seriesEdit.rows) if (r.seqId == unsetSeq) r0 = &r;
+            int nValued = 0;
+            for (const auto& r : app.seriesEdit.rows)
+                if (r.check && std::isfinite(seriesEditRowValue(r))) nValued++;
+            fprintf(stderr, "seriesselftest: Edit... on '%s' (value unset, name suggests "
+                            "%.6g): box \"%s\", %d of %d rows have a value\n",
+                    unsetName.c_str(), guess, r0 ? r0->value : "?", nValued,
+                    (int)app.seriesEdit.rows.size());
+            check("Edit... leaves an unset member's box EMPTY (no re-guess)",
+                  r0 && r0->value[0] == '\0' && std::isfinite(guess));
+            check("...and the modal's counter does not claim it has a value",
+                  nValued == (int)app.seriesEdit.rows.size() - 1);
+            seriesModalAccept();
+            M = seriesById(sid);
+            double vu = 0, vp = 0;
+            for (const auto& m : M->members) {
+                if (m.seqId == unsetSeq) vu = m.value;
+                if (m.seqId == preciseSeq) vp = m.value;
+            }
+            fprintf(stderr, "seriesselftest: after a Save that touched nothing: unset "
+                            "member %s, %.11g -> %.11g\n",
+                    std::isfinite(vu) ? "HAS A VALUE NOW" : "still unset", PRECISE, vp);
+            check("a Save that edited nothing leaves the unset member UNSET",
+                  !std::isfinite(vu));
+            check("...and does not round the values it never touched", vp == PRECISE);
+            check("invariant 1: audit after the no-op Save", audit());
+
+            // Text the program cannot read is UNSET, not 0. 0 is not "missing":
+            // it is the dark stack the offset is anchored to and the read noise
+            // is measured in (linRecompute), so a typo lands on the one value
+            // that changes the answer most.
+            openSeriesModal(b, sid);
+            const char* JUNK[] = { "-", "1e", "12x", "" };
+            std::vector<int> junkSeq;
+            for (int i = 0; i < 4 && i < (int)app.seriesEdit.rows.size(); i++) {
+                App::SeriesEdit::Row& r = app.seriesEdit.rows[i];
+                snprintf(r.value, sizeof r.value, "%s", JUNK[i]);
+                r.touched = true;
+                junkSeq.push_back(r.seqId);
+            }
+            seriesModalAccept();
+            M = seriesById(sid);
+            int zeroed = 0, unset = 0;
+            for (const auto& m : M->members)
+                if (std::find(junkSeq.begin(), junkSeq.end(), m.seqId) != junkSeq.end()) {
+                    if (!std::isfinite(m.value)) unset++;
+                    else if (fabs(m.value) < 1e-9) zeroed++;
+                }
+            fprintf(stderr, "seriesselftest: value boxes \"-\" \"1e\" \"12x\" \"\" -> "
+                            "%d unset, %d at 0\n", unset, zeroed);
+            check("a value box that is not a number saves as UNSET, never 0",
+                  unset == (int)junkSeq.size() && zeroed == 0);
+
+            // Editing a series makes the fit on screen a measurement of a series
+            // that no longer exists - and the panel reads its LABELS live, so a
+            // fit left standing gets relabelled with the new unit.
+            for (auto& m : M->members) m.value = extractLevelFromName(seqInfo(m.seqId)->name);
+            linRecompute(sid);
+            bool wasFit = app.lin.fitValid;
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "ms");
+            seriesModalAccept();
+            fprintf(stderr, "seriesselftest: fit before the unit edit %s, after %s\n",
+                    wasFit ? "valid" : "invalid", app.lin.fitValid ? "STILL VALID" : "dropped");
+            check("a fit exists before the edit", wasFit);
+            check("editing the series drops the fit it no longer describes",
+                  !app.lin.fitValid && app.lin.seriesId == 0);
+            // ...and with the unit CLEARED there is no fit at all, which is the
+            // one rule this layer was built to enforce.
+            openSeriesModal(b, sid);
+            app.seriesEdit.unit[0] = '\0';
+            seriesModalAccept();
+            linRecompute(sid);
+            fprintf(stderr, "seriesselftest: unit cleared -> fit %s, %d point(s)\n",
+                    app.lin.fitValid ? "PRINTED" : "refused", app.lin.nPts);
+            check("a series whose unit was cleared cannot be fitted",
+                  !app.lin.fitValid && !seriesCanFit(*seriesById(sid)));
+
+            // The KIND decides the equation (docs/terminology.md). This panel
+            // knows linearity and photon transfer; a temperature run pushed
+            // through them prints a "sensitivity" in DN per degree.
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "degC");
+            app.seriesEdit.kind = App::Series::KTemperature;
+            seriesModalAccept();
+            linRecompute(sid);
+            fprintf(stderr, "seriesselftest: kind=temperature -> canFit %d, fit %s\n",
+                    seriesCanFit(*seriesById(sid)) ? 1 : 0,
+                    app.lin.fitValid ? "PRINTED" : "refused");
+            check("a temperature series is not fitted as linearity",
+                  !seriesCanFit(*seriesById(sid)) && !app.lin.fitValid);
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "lx");
+            app.seriesEdit.kind = App::Series::KLinearity;
+            seriesModalAccept();
+            linRecompute(sid);
+            check("...and putting the kind back brings the fit back",
+                  app.lin.fitValid && seriesCanFit(*seriesById(sid)));
+
+            // seqctx > Series > <name>: joining the SOLE member of one series
+            // into another empties the first, and an empty series is the state
+            // the audit rejects (plan §1 invariant 3).
+            int lone = newSeries(b, "lone");
+            if (App::Series* L2 = seriesById(lone))
+                snprintf(L2->unit, sizeof L2->unit, "lx");
+            int moved = seriesById(sid)->members.front().seqId;
+            addToSeries(lone, moved, 1.0);
+            std::string jmsg;
+            bool joined = seriesJoinFromMenu(sid, moved, &jmsg);
+            fprintf(stderr, "seriesselftest: join -> %d, \"%s\"; %d series left\n",
+                    joined ? 1 : 0, jmsg.c_str(), (int)app.series.size());
+            check("the menu join reports the value and the text it read it from",
+                  joined && jmsg.find("read from") != std::string::npos);
+            check("...and does not leave the emptied series behind",
+                  seriesById(lone) == nullptr);
+            check("invariant 1: audit after the menu join", audit());
+        }
+
+        // ---- sessions this program did not write ------------------------------
+        // The writer honours "unset is not 0"; the reader is where a hand-made,
+        // third-party or half-written file gets to claim otherwise.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            std::vector<std::string> paths;
+            for (const auto& si : app.seqs) {
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (!fr.empty()) paths.push_back(app.images[fr.front()]->path);
+            }
+            std::string bn = batchNameOf(app.images.empty() ? 0 : app.images[0]->batchId);
+            std::string hostile = (std::filesystem::temp_directory_path(tec) /
+                                   "viewer_serieshostile.vsession").u8string();
+            {
+                std::ofstream hf(pathFromUtf8(hostile), std::ios::binary);
+                hf << "viewer-session 1\n";
+                for (const auto& p : paths)
+                    hf << "image 0 1 npy3 0 0 0 0 0 0 0 " << p << "\n"
+                       << "imgbatch " << bn << "\n" << "seqload 1\n";
+                hf << "series hostile\nseriesbatch " << bn << "\n"
+                   << "seriesparam illuminance\nseriesunit lx\nserieskind 0\n";
+                const char* VALS[] = { "notanumber", "-", "1e", "nan", "12x", "160", "320" };
+                for (size_t i = 0; i < paths.size(); i++)
+                    hf << "seriesmember " << VALS[std::min<size_t>(i, 6)] << " 1 "
+                       << paths[i] << "\n";
+                hf << "seriesend\n";
+            }
+            loadSession(hostile);
+            loadAll();
+            double th = glfwGetTime();
+            while (glfwGetTime() - th < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* H = app.series.empty() ? nullptr : &app.series.front();
+            std::string got;
+            int atZero = 0;
+            if (H)
+                for (const auto& m : H->members) {
+                    char bb[32];
+                    snprintf(bb, sizeof bb, "%.6g", m.value);
+                    got += (got.empty() ? "" : ",");
+                    got += std::isfinite(m.value) ? bb : "unset";
+                    if (std::isfinite(m.value) && fabs(m.value) < 1e-9) atZero++;
+                }
+            fprintf(stderr, "seriesselftest: hostile values -> [%s]\n", got.c_str());
+            check("one series came back from the hostile file", app.series.size() == 1);
+            check("no unreadable value became 0", atZero == 0);
+            check("...they are UNSET, and the readable ones survived",
+                  H && H->members.size() == paths.size() &&
+                  std::isfinite(H->members.back().value));
+            check("invariant 1: audit after the hostile file", audit());
+            std::filesystem::remove(std::filesystem::u8path(hostile), tec);
+
+            // The same folder open TWICE is two batches (the canon blesses it),
+            // so one path names two stacks. A restore that takes "the first one"
+            // rejects every member of the second copy's series on containment
+            // and loses the whole series - permanently, at the next autosave.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bA = app.images.empty() ? 0 : app.images[0]->batchId;
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bB = 0;
+            for (const auto& bt : app.batches) if (bt.id != bA) bB = bt.id;
+            int sA = selftestMakeSeries(bA, "lx"), sB = selftestMakeSeries(bB, "ms");
+            size_t nA = seriesById(sA) ? seriesById(sA)->members.size() : 0;
+            size_t nB = seriesById(sB) ? seriesById(sB)->members.size() : 0;
+            std::string dup = (std::filesystem::temp_directory_path(tec) /
+                               "viewer_seriesdup.vsession").u8string();
+            saveSession(dup, true);
+            loadSession(dup);
+            loadAll();
+            double td = glfwGetTime();
+            while (glfwGetTime() - td < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::vector<int> sbatch;
+            for (const auto& s : app.series)
+                if (std::find(sbatch.begin(), sbatch.end(), s.batchId) == sbatch.end())
+                    sbatch.push_back(s.batchId);
+            fprintf(stderr, "seriesselftest: same folder in two batches: saved %d + %d "
+                            "member(s), restored %d series in %d batch(es)\n",
+                    (int)nA, (int)nB, (int)app.series.size(), (int)sbatch.size());
+            check("both series survive when one folder is open in two batches",
+                  app.series.size() == 2 && nA > 0 && nB > 0 &&
+                  app.series[0].members.size() == nA &&
+                  app.series[1].members.size() == nB);
+            check("...each in its own batch", app.series.size() == 2 &&
+                  app.series[0].batchId != app.series[1].batchId);
+            check("invariant 1: audit after the two-batch restore", audit());
+            std::filesystem::remove(std::filesystem::u8path(dup), tec);
+        }
+
+        // ---- phase 4: what the Files panel's series row actually does ---------
+        // The rows themselves are ImGui, but every command behind them is a
+        // function, and these are the three that can lose data if they are
+        // wrong: a move that drops members, an ungroup that closes something,
+        // a Close that leaves stacks behind.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int b = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sid = selftestMakeSeries(b, "lx");
+            App::Series* P = seriesById(sid);
+            int nStacks = (int)app.seqs.size();
+            check("phase 4 fixture: one series over the whole batch",
+                  P && (int)P->members.size() == nStacks && nStacks >= 4);
+            if (!P) { fprintf(stderr, "seriesselftest: phase 4 fixture failed\n"); return 1; }
+            // Move the SERIES: unlike a lone member, it takes everything with it
+            // and stays whole (the row's "Move to batch (all members move)").
+            {
+                int dest = newBatch(uniqueBatchName("moved"));
+                std::vector<int> was;
+                for (const auto& m : P->members) was.push_back(m.seqId);
+                app.toast.clear();
+                moveSeriesToBatch(sid, dest);
+                P = seriesById(sid);
+                bool kept = P && P->members.size() == was.size() && P->batchId == dest;
+                if (kept)
+                    for (size_t i = 0; i < was.size(); i++)
+                        if (P->members[i].seqId != was[i] || batchOfStack(was[i]) != dest)
+                            kept = false;
+                fprintf(stderr, "seriesselftest: moveSeriesToBatch -> batch '%s', "
+                                "%d member(s), toast \"%s\"\n", batchNameOf(dest).c_str(),
+                        P ? (int)P->members.size() : -1, app.toast.c_str());
+                check("a series moved to another batch keeps every member", kept);
+                check("...and nothing was told it 'left the series'",
+                      app.toast.find("left series") == std::string::npos);
+                check("invariant 1: audit after the series move", audit());
+            }
+            // UNGROUP: the fence goes, the data stays. This is the operation
+            // that must NOT be confused with Close.
+            {
+                int stacksBefore = (int)app.seqs.size();
+                size_t imagesBefore = app.images.size();
+                app.toast.clear();
+                ungroupSeries(sid);
+                fprintf(stderr, "seriesselftest: ungroup -> %d series, %d stack(s), "
+                                "%d frame(s), toast \"%s\"\n", (int)app.series.size(),
+                        (int)app.seqs.size(), (int)app.images.size(), app.toast.c_str());
+                check("ungroup removes the series", seriesById(sid) == nullptr);
+                check("...and keeps every stack and frame",
+                      (int)app.seqs.size() == stacksBefore &&
+                      app.images.size() == imagesBefore);
+                check("invariant 1: audit after ungroup", audit());
+            }
+            // Close series: the canon's Close, which discards the CONTENTS.
+            {
+                int b2 = app.images.empty() ? 0 : app.images[0]->batchId;
+                int sid2 = selftestMakeSeries(b2, "lx");
+                App::Series* Q = seriesById(sid2);
+                int members = Q ? (int)Q->members.size() : 0;
+                int stacksBefore = (int)app.seqs.size();
+                app.toast.clear();
+                closeSeries(sid2);
+                fprintf(stderr, "seriesselftest: close series (%d member(s)) -> %d series, "
+                                "%d stack(s) left, toast \"%s\"\n", members,
+                        (int)app.series.size(), (int)app.seqs.size(), app.toast.c_str());
+                check("Close series discards its stacks",
+                      seriesById(sid2) == nullptr &&
+                      (int)app.seqs.size() == stacksBefore - members);
+                check("invariant 1: audit after Close series", audit());
+            }
+        }
+
+        // ---- phase 5: the picker's "open as a sweep" --------------------------
+        // Both halves. Ticked: one series, values off the group names, one
+        // batch even though batch-per-top-folder was asked for. UNTICKED: the
+        // same Open, and NOTHING is created - that half is the whole point.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);          // local scan: synchronous
+            check("phase 5: the picker opened", app.folderPickOpen);
+            app.pickSweep = true;
+            app.pickBatchMode = 1;                 // ...and gets overridden
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the box is cleared on accept (a sweep is never sticky)",
+                  !app.pickSweep);
+            loadAll();
+            double t5 = glfwGetTime();
+            while (glfwGetTime() - t5 < 120.0 && !app.seriesPending.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* W = app.series.empty() ? nullptr : &app.series.front();
+            std::vector<int> bids;                 // batches that actually hold data
+            for (const auto& d : app.images)
+                if (std::find(bids.begin(), bids.end(), d->batchId) == bids.end())
+                    bids.push_back(d->batchId);
+            bool valuesOk = W != nullptr && !W->members.empty();
+            std::string vals;
+            if (W)
+                for (const auto& m : W->members) {
+                    App::SeqInfo* si = seqInfo(m.seqId);
+                    double want = si ? extractLevelFromName(si->name) : 0;
+                    char b[32];
+                    snprintf(b, sizeof b, "%.6g", m.value);
+                    vals += (vals.empty() ? "" : ",");
+                    vals += std::isfinite(m.value) ? b : "unset";
+                    if (!si || !std::isfinite(m.value) || !std::isfinite(want) ||
+                        fabs(m.value - want) > 1e-9 * std::max(1.0, fabs(want)))
+                        valuesOk = false;
+                }
+            fprintf(stderr, "seriesselftest: sweep -> %d series '%s' param '%s' unit '%s' "
+                            "kind %d, %d member(s) [%s], %d batch(es), %d stack(s)\n",
+                    (int)app.series.size(), W ? W->name.c_str() : "",
+                    W ? W->paramName.c_str() : "", W ? W->unit : "", W ? W->kind : -1,
+                    W ? (int)W->members.size() : -1, vals.c_str(), (int)bids.size(),
+                    (int)app.seqs.size());
+            check("open as a sweep makes exactly ONE series", app.series.size() == 1);
+            check("...over every stack the picker loaded",
+                  W && W->members.size() == app.seqs.size() && app.seqs.size() >= 4);
+            check("...with the parameter and unit typed in the picker",
+                  W && W->paramName == "illuminance" && std::string(W->unit) == "lx" &&
+                  W->kind == App::Series::KLinearity);
+            check("...named \"<batch> 掃引\"",
+                  W && W->name == batchNameOf(W->batchId) + " 掃引");
+            check("...each member at the value its NAME gave", valuesOk);
+            {   // a sweep is a parameter axis: it comes out in value order, not
+                // in the folders' lexicographic order (0,10,160,20,320,40,80)
+                bool asc = true;
+                for (size_t i = 1; W && i < W->members.size(); i++)
+                    if (W->members[i - 1].value > W->members[i].value) asc = false;
+                check("...and the members are in VALUE order", W && asc);
+            }
+            check("a sweep forces ONE batch (series ⊂ batch beats the batch radio)",
+                  bids.size() == 1 && W && W->batchId == bids.front());
+            check("invariant 1: audit after the sweep", audit());
+            // ...and the half that must NOT happen.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            check("phase 5: the picker opened again", app.folderPickOpen);
+            check("the sweep box came up UNTICKED", !app.pickSweep);
+            pickerAccept();
+            loadAll();
+            double t6 = glfwGetTime();             // give a late resolve every chance
+            while (glfwGetTime() - t6 < 1.0) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: sweep unticked -> %d series, %d stack(s)\n",
+                    (int)app.series.size(), (int)app.seqs.size());
+            check("unticked: the same Open creates NO series",
+                  app.series.empty() && !app.seqs.empty());
+            app.pickBatchMode = 0;
+
+            // A second Open before the first sweep has resolved. Resolution
+            // waits for every load to drain, which is seconds locally and much
+            // longer over the wire, and File > Open Folder is available the
+            // whole time: a single pending slot threw the first sweep away -
+            // its ticked box, its typed parameter and its unit - in silence.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the first sweep is pending, not applied yet",
+                  app.seriesPending.size() == 1);
+            openFolder(g_seriesSelftest);       // ...while the first is still loading
+            // the picker starts clean on every scan, the sweep boxes included:
+            // a unit left over from the last Open would be applied to a folder
+            // that has nothing to do with it
+            fprintf(stderr, "seriesselftest: second scan's sweep row: box %d, param \"%s\", "
+                            "unit \"%s\"\n", app.pickSweep ? 1 : 0, app.pickSweepParam,
+                    app.pickSweepUnit);
+            check("a new scan resets the sweep box, its parameter and its unit",
+                  !app.pickSweep && !app.pickSweepParam[0] && !app.pickSweepUnit[0]);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "exposure");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "ms");
+            pickerAccept();
+            check("the second does not overwrite it - both are queued",
+                  app.seriesPending.size() == 2);
+            loadAll();
+            double t7 = glfwGetTime();
+            while (glfwGetTime() - t7 < 240.0 && !app.seriesPending.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::string units;
+            for (const auto& s : app.series)
+                units += std::string(s.unit) + "x" + std::to_string(s.members.size()) + " ";
+            fprintf(stderr, "seriesselftest: two sweeps opened back to back -> %d series "
+                            "[%s], %d stack(s)\n", (int)app.series.size(), units.c_str(),
+                    (int)app.seqs.size());
+            check("a sweep opened while another is loading is NOT thrown away",
+                  app.series.size() == 2);
+            check("...and neither Open loses the stacks it had queued",
+                  app.series.size() == 2 && app.series[0].members.size() == 7 &&
+                  app.series[1].members.size() == 7);
+            check("...and each keeps the parameter and unit it was given",
+                  app.series.size() == 2 && app.series[0].paramName == "illuminance" &&
+                  std::string(app.series[0].unit) == "lx" &&
+                  app.series[1].paramName == "exposure" &&
+                  std::string(app.series[1].unit) == "ms");
+            check("invariant 1: audit after two queued sweeps", audit());
+        }
+        fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        std::filesystem::remove(std::filesystem::u8path(legacy), tec);
+        return ok ? 0 : 1;
+    }
+
+    // Close per layer, verifiable without a human (docs/terminology.md): Ctrl+W's
+    // closeCurrent() on a stack member removes the WHOLE stack and every trace of
+    // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
+    if (!g_closeSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_closeSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "closeselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        // rows exist, so residue is detectable - and the stack being closed is a
+        // series member, so closeStack's series hook is on the hook too
+        linRecompute(selftestMakeSeries(app.images.empty() ? 0 : app.images[0]->batchId,
+                                        app.lin.unit));
+        int imagesBefore = (int)app.images.size(), seqsBefore = (int)app.seqs.size();
+        if (seqsBefore < 3) {
+            fprintf(stderr, "closeselftest: expected 3 stacks under %s, got %d\n",
+                    g_closeSelftest.c_str(), seqsBefore);
+            return 1;
+        }
+        int sid = app.seqs[seqsBefore / 2].id;
+        std::vector<int> fr = framesOfSeq(sid);
+        int stackFrames = (int)fr.size();
+        selectImage(fr[fr.size() / 2]);    // a MIDDLE frame: the reported bug
+        closeCurrent();                    // Ctrl+W's path: must close the stack
+        bool linResidue = false;
+        for (const auto& r : app.lin.rows) if (r.seqId == sid) linResidue = true;
+        fprintf(stderr, "closeselftest: closeCurrent on mid frame of stack %d: "
+                        "images %d->%d, seqs %d->%d, frames(seq)=%d, "
+                        "temporal.seqId=%d, lin rows for seq: %s\n",
+                sid, imagesBefore, (int)app.images.size(), seqsBefore,
+                (int)app.seqs.size(), (int)framesOfSeq(sid).size(),
+                app.temporal[0].seqId, linResidue ? "RESIDUE" : "none");
+        if ((int)app.images.size() != imagesBefore - stackFrames ||
+            (int)app.seqs.size() != seqsBefore - 1 || !framesOfSeq(sid).empty() ||
+            app.temporal[0].seqId != -1 || linResidue) {
+            fprintf(stderr, "closeselftest: FAILED - stack close left residue\n");
+            ok = false;
+        }
+        // ---- a stack closed while its remote prefetch is still in flight ----
+        std::string scanroot = g_closeSelftest;
+        std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+        {
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+        }
+        int seqsNow = (int)app.seqs.size();
+        startRemote("local://" + scanroot);
+        double t0 = glfwGetTime();
+        bool scanSent = false, closed = false;
+        int rsid = 0, rfLeft = -1;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpRemoteFetch();
+            pumpRemoteOpenQueue();
+            pumpSequenceAndQueue();
+            if (app.rbrowse.connected && !scanSent) {
+                App::RbJob j;
+                j.kind = App::RbScan;
+                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                rbEnqueue(std::move(j));
+                scanSent = true;
+            }
+            if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+            if (!closed && (int)app.seqs.size() > seqsNow && app.rfPending > 0) {
+                rsid = app.seqs.back().id;     // the stack the fetcher is filling
+                closeStack(rsid);
+                closed = true;
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                rfLeft = 0;
+                for (const auto& jj : app.rfQueue) if (jj.seqId == rsid) rfLeft++;
+                break;
+            }
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!closed) {
+            fprintf(stderr, "closeselftest: FAILED - never caught a stack mid-fetch (%s)\n",
+                    app.rbrowse.err.c_str());
+            ok = false;
+        } else {
+            // the in-flight job (and the rest of the queue) gets 2 s to land;
+            // nothing of the closed stack may grow back
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 2.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "closeselftest: closeStack(%d) mid-fetch: %d queued job(s) "
+                            "for it left, %d frame(s) regrew after 2 s pump\n",
+                    rsid, rfLeft, orphans);
+            if (rfLeft != 0 || orphans != 0) {
+                fprintf(stderr, "closeselftest: FAILED - closed stack regrew\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "closeselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // VERIFICATION ADDITION (functional-verification agent, not part of the
+    // feature work): the corners of the close / batch rules that the six
+    // feature selftests do not reach - non-contiguous stacks, the Ctrl+Alt+W
+    // escape hatch, compare-B left dangling, prune's reference set, a move
+    // issued mid-load, closeBatch against a queued remote open, and the
+    // remote in-flight drop actually being the path that catches a fetch.
+    if (!g_verifySelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        auto reload = [&]() {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            loadAll();
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "verifyselftest: %-46s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+
+        // ---- V1: a stack whose frames are NOT contiguous in app.images ----
+        reload();
+        if (app.seqs.size() < 3) {
+            fprintf(stderr, "verifyselftest: need 3 stacks under %s\n", g_verifySelftest.c_str());
+            return 1;
+        }
+        {   // interleave: round-robin the three stacks so no stack is a run
+            std::vector<std::unique_ptr<ImageDoc>> mixed;
+            for (size_t k = 0; mixed.size() < app.images.size(); k++)
+                for (auto& d : app.images)
+                    if (d && (size_t)d->seqIndex == k) mixed.push_back(std::move(d));
+            for (auto& d : app.images) if (d) mixed.push_back(std::move(d));
+            app.images.swap(mixed);
+            app.current = 0;
+        }
+        {
+            int a0 = app.seqs[0].id, a1 = app.seqs[1].id, a2 = app.seqs[2].id;
+            std::vector<int> f1 = framesOfSeq(a1);
+            bool contiguous = true;                 // prove the fixture is nasty
+            for (size_t i = 1; i < f1.size(); i++)
+                if (f1[i] != f1[i - 1] + 1) contiguous = false;
+            int before = (int)app.images.size(), n1 = (int)f1.size();
+            closeStack(a1);
+            fprintf(stderr, "verifyselftest: V1 interleaved(contig=%d) closeStack(%d): "
+                            "images %d->%d (-%d), survivors %zu/%zu frames\n",
+                    contiguous ? 1 : 0, a1, before, (int)app.images.size(), n1,
+                    framesOfSeq(a0).size(), framesOfSeq(a2).size());
+            check(!contiguous, "V1 fixture really is non-contiguous");
+            check((int)app.images.size() == before - n1 && framesOfSeq(a1).empty() &&
+                  framesOfSeq(a0).size() == 5 && framesOfSeq(a2).size() == 5,
+                  "V1 non-contiguous closeStack keeps neighbours");
+        }
+
+        // ---- V2: Ctrl+Alt+W on a middle frame leaves a coherent stack ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            std::vector<int> fr = framesOfSeq(sid);
+            int want = (int)fr.size() - 1;
+            uint64_t revBefore = app.imagesRev;
+            selectImage(fr[fr.size() / 2]);
+            int goneIndex = cur()->seqIndex;
+            closeCurrent(true);                     // Ctrl+Alt+W
+            std::vector<int> after = framesOfSeq(sid);
+            bool gap = false;                       // the removed seqIndex is absent
+            for (int idx : after) if (app.images[idx]->seqIndex == goneIndex) gap = true;
+            fprintf(stderr, "verifyselftest: V2 Ctrl+Alt+W frame %d of stack %d: "
+                            "%zu frames left, seqs=%zu, imagesRev %llu->%llu\n",
+                    goneIndex, sid, after.size(), app.seqs.size(),
+                    (unsigned long long)revBefore, (unsigned long long)app.imagesRev);
+            check((int)after.size() == want && !gap, "V2 single-frame close leaves N-1 frames");
+            check(seqInfo(sid) != nullptr, "V2 stack survives a single-frame close");
+            check(app.imagesRev != revBefore, "V2 imagesRev bumped (Files cache)");
+        }
+
+        // ---- V3: closing the LAST frame of a stack drops the SeqInfo ----
+        reload();
+        {
+            int sid = app.seqs[1].id;
+            while (framesOfSeq(sid).size() > 1) {
+                selectImage(framesOfSeq(sid).front());
+                closeCurrent(true);
+            }
+            selectImage(framesOfSeq(sid).front());
+            closeCurrent(true);                     // the last one
+            fprintf(stderr, "verifyselftest: V3 emptied stack %d one frame at a time: "
+                            "seqInfo=%s, frames=%zu\n",
+                    sid, seqInfo(sid) ? "STILL THERE" : "gone", framesOfSeq(sid).size());
+            check(seqInfo(sid) == nullptr && framesOfSeq(sid).empty(),
+                  "V3 last-frame close drops the SeqInfo");
+        }
+
+        // ---- V4: compare-B pointing into a closed stack ----
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(app.seqs[0].id).front());
+            setCompareB(app.images[framesOfSeq(sid)[1]].get());
+            app.compareMode = App::CmpWipe;
+            bool had = resolveB() != nullptr;
+            closeStack(sid);
+            fprintf(stderr, "verifyselftest: V4 closeStack(%d) with B inside: "
+                            "hadB=%d uid=%llu name='%s' seq=%d resolveB=%p\n",
+                    sid, had ? 1 : 0, (unsigned long long)app.compareBUid,
+                    app.compareB.c_str(), app.compareBSeq, (void*)resolveB());
+            check(had, "V4 B really pointed into the stack");
+            check(app.compareBUid == 0 && app.compareB.empty() && !resolveB(),
+                  "V4 closeStack clears a dangling compare-B");
+        }
+        // ---- V4b: the Ctrl+Alt+W escape hatch and a dangling compare-B.
+        // ensureCompareB() re-points B away from cur(), so "close the frame that
+        // IS B" cannot be reached from the UI; this pins B by hand to probe
+        // whether closeCurrent(frameOnly) does the closeImages() cleanup at all.
+        reload();
+        {
+            int sid = app.seqs[2].id;
+            selectImage(framesOfSeq(sid)[1]);
+            app.compareBUid = cur()->uid;           // white-box: B == the current frame
+            app.compareB = cur()->name;
+            app.compareBSeq = cur()->seqIndex;
+            app.compareMode = App::CmpWipe;
+            std::string bname = app.compareB;
+            closeCurrent(true);                     // close exactly the B frame
+            std::string leftName = app.compareB;
+            // first resolveB() only drops the stale uid and returns null; the
+            // SECOND one falls through to the name path, which is why
+            // closeImages() clears the name and this path must too
+            ImageDoc* b1 = resolveB();
+            ImageDoc* b2 = resolveB();
+            fprintf(stderr, "verifyselftest: V4b Ctrl+Alt+W on the B frame (B pinned by "
+                            "hand): saved '%s', name left behind '%s', "
+                            "resolveB #1 -> %s, resolveB #2 -> %s\n",
+                    bname.c_str(), leftName.c_str(),
+                    b1 ? b1->name.c_str() : "(null)",
+                    b2 ? (b2->path + " seq " + std::to_string(b2->seqId)).c_str() : "(null)");
+            check(leftName.empty(), "V4b frameOnly close clears the compare-B name");
+            check(b2 == nullptr, "V4b closed B does not re-latch onto a same-named frame");
+        }
+
+        // ---- V5: prune must keep batches referenced only by a queue ----
+        reload();
+        {
+            int b1 = newBatch(uniqueBatchName("qseq"));
+            int b2 = newBatch(uniqueBatchName("qrb"));
+            int b3 = newBatch(uniqueBatchName("qload"));
+            int b4 = newBatch(uniqueBatchName("qnone"));
+            App::PendingGroup pg; pg.name = "x"; pg.files.push_back("x.npy"); pg.batchId = b1;
+            app.seqQueue.push_back(pg);
+            app.rbOpenQueue.push_back({ "", { "y.npy" }, "y", b2 });
+            app.loadBatchId = b3;
+            pruneEmptyBatches();
+            auto live = [&](int id) {
+                for (const auto& b : app.batches) if (b.id == id) return true;
+                return false;
+            };
+            fprintf(stderr, "verifyselftest: V5 prune with refs: seqQueue=%d rbOpen=%d "
+                            "loadBatchId=%d unreferenced=%d\n",
+                    live(b1) ? 1 : 0, live(b2) ? 1 : 0, live(b3) ? 1 : 0, live(b4) ? 1 : 0);
+            check(live(b1) && live(b2) && live(b3), "V5 prune keeps queue-referenced batches");
+            check(!live(b4), "V5 prune drops the unreferenced batch");
+            // ---- V5b: closeBatch removes the queued remote open too ----
+            size_t rbBefore = app.rbOpenQueue.size();
+            closeBatch(b2);
+            fprintf(stderr, "verifyselftest: V5b closeBatch(qrb): rbOpenQueue %zu->%zu, "
+                            "batch %s\n", rbBefore, app.rbOpenQueue.size(),
+                    live(b2) ? "STILL THERE" : "gone");
+            check(app.rbOpenQueue.size() == rbBefore - 1 && !live(b2),
+                  "V5b closeBatch purges its rbOpenQueue entry");
+            app.seqQueue.clear();
+            app.rbOpenQueue.clear();
+            app.loadBatchId = 0;
+        }
+
+        // ---- V6: move a stack that is still loading ----
+        {
+            closeAll();
+            openFolder(g_verifySelftest);
+            if (app.folderPickOpen) pickerAccept();
+            int movedSeq = 0, target = 0;
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {    // catch it mid-load
+                pumpSequenceAndQueue();
+                if (!movedSeq && app.seqRunning && app.seqLoadingId &&
+                    framesOfSeq(app.seqLoadingId).size() >= 1 &&
+                    framesOfSeq(app.seqLoadingId).size() < 5) {
+                    movedSeq = app.seqLoadingId;
+                    target = newBatch(uniqueBatchName("midload"));
+                    moveStackToBatch(movedSeq, target);
+                }
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            int off = 0;
+            std::vector<int> fr = movedSeq ? framesOfSeq(movedSeq) : std::vector<int>();
+            for (int idx : fr) if (app.images[idx]->batchId != target) off++;
+            fprintf(stderr, "verifyselftest: V6 move-mid-load stack %d: %zu frames, "
+                            "%d off-batch\n", movedSeq, fr.size(), off);
+            check(movedSeq != 0, "V6 caught a stack mid-load");
+            check(fr.size() == 5 && off == 0, "V6 late frames follow the moved stack");
+        }
+
+        // ---- V7: two same-named batches survive a session round trip apart ----
+        reload();
+        {
+            // create-then-move one at a time: moveStackToBatch prunes, and an
+            // empty second batch would be pruned before it could be filled
+            int b1 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[0].id, b1);
+            int b2 = newBatch(uniqueBatchName("dup"));
+            moveStackToBatch(app.seqs[1].id, b2);
+            std::string n1, n2;
+            for (const auto& b : app.batches) {
+                if (b.id == b1) n1 = b.name;
+                if (b.id == b2) n2 = b.name;
+            }
+            std::error_code vec;
+            std::string sess = (std::filesystem::temp_directory_path(vec) /
+                                "viewer_verifyselftest.vsession").u8string();
+            saveSession(sess, true);
+            loadSession(sess);
+            loadAll();
+            int f1 = 0, f2 = 0, id1 = 0, id2 = 0;
+            for (const auto& b : app.batches) {
+                if (b.name == n1) id1 = b.id;
+                if (b.name == n2) id2 = b.id;
+            }
+            for (const auto& d : app.images) {
+                if (d->batchId == id1) f1++;
+                if (d->batchId == id2) f2++;
+            }
+            fprintf(stderr, "verifyselftest: V7 '%s' + '%s' round trip: both present=%d, "
+                            "frames %d / %d, merged=%d\n",
+                    n1.c_str(), n2.c_str(), (id1 && id2) ? 1 : 0, f1, f2,
+                    (id1 && id1 == id2) ? 1 : 0);
+            check(n1 != n2, "V7 uniqueBatchName disambiguates the collision");
+            check(id1 && id2 && id1 != id2, "V7 both batches survive the round trip apart");
+            std::filesystem::remove(std::filesystem::u8path(sess), vec);
+        }
+
+        // ---- V8: the remote IN-FLIGHT drop, not just the queue sweep ----
+        {
+            closeAll();
+            std::string scanroot = g_verifySelftest;
+            std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+            startRemote("local://" + scanroot);
+            double t0 = glfwGetTime();
+            bool scanSent = false, closed = false;
+            int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                if (app.rbrowse.connected && !scanSent) {
+                    App::RbJob j;
+                    j.kind = App::RbScan;
+                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                    rbEnqueue(std::move(j));
+                    scanSent = true;
+                }
+                if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+                // Wait for a moment when the WORKER holds a job: rfPending counts
+                // queued + in-flight, so rfPending > (jobs still in rfQueue) means
+                // exactly one is out of the queue's reach. That is the only state
+                // in which the pumpRemoteFetch drop is load-bearing.
+                if (!closed && !app.seqs.empty() && app.rfPending > 0) {
+                    int sid2 = app.seqs.back().id, q = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(app.rfMtx);
+                        for (const auto& jj : app.rfQueue) if (jj.seqId == sid2) q++;
+                    }
+                    if (app.rfPending > q) {        // a job is IN FLIGHT right now
+                        rsid = sid2; queuedForSeq = q;
+                        closeStack(rsid);
+                        pendingAfter = app.rfPending;
+                        closed = true;
+                        break;
+                    }
+                }
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 3.0) {
+                pumpRemoteBrowse(); pumpRemoteFetch();
+                pumpRemoteOpenQueue(); pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "verifyselftest: V8 closeStack(%d): %d job(s) swept from the "
+                            "queue, rfPending after = %d (in flight), %d frame(s) regrew\n",
+                    rsid, queuedForSeq, pendingAfter, orphans);
+            check(closed, "V8 caught a remote stack with a fetch outstanding");
+            check(orphans == 0, "V8 nothing of the closed stack regrew");
+            fprintf(stderr, "verifyselftest: V8 note: the in-flight drop path was%s "
+                            "the one that had to catch it\n",
+                    pendingAfter > 0 ? "" : " NOT");
+        }
+
+        fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // ---- A/B statistics caches (docs/ab-stats-plan.md, section 6) -------------
+    // The five statistics panels keep TWO cache slots now: 0 = A (the current
+    // frame), 1 = B (the compare side). Headless, what has to hold:
+    //   A1  both slots fill, each keyed to its OWN document
+    //   A2  B's numbers really are B's - recomputed here from B's pixels by a
+    //       second implementation, not by calling the panel's code
+    //   A3  A's numbers are byte-identical to the compare-off run: B's existence
+    //       must not move a single digit on the A side
+    //   A4  a frame step follows on both sides, and temporal (keyed on the STACK,
+    //       not the frame) does NOT re-run for it
+    //   A6  compare off invalidates slot 1 exactly once, and closing B leaves no
+    //       dangling ImageDoc* behind in it
+    if (!g_abstatsSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "abstatsselftest: %-54s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        auto relEq = [](double x, double y, double tol) {
+            double m = std::max(std::max(fabs(x), fabs(y)), 1e-300);
+            return fabs(x - y) <= tol * m;
+        };
+
+        openFolder(g_abstatsSelftest);
+        loadAll();
+        if (app.seqs.size() < 2) {
+            fprintf(stderr, "abstatsselftest: need 2 stacks under %s\n",
+                    g_abstatsSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+
+        // ---- the reference implementations, written from the rule, not shared
+        // with the panel: 256 bins across black..white, one sample every
+        // `step`-th pixel of the resolved rect, CFA planes never mixed.
+        struct RefHist {
+            uint32_t bins[4][256] = {};
+            double mean[4] = {}, sd[4] = {};
+            size_t sampled = 0;
+            int nSeries = 0;
+        };
+        auto refHistogram = [](const ImageDoc& im) {
+            RefHist R;
+            const int rw = im.w, rh = im.h;             // whole image: no ROI here
+            bool cfa = im.ch == 1 && im.cfa != 0;
+            R.nSeries = cfa ? 4 : std::min(im.ch, 3);
+            const float black = effBlack(im), white = effWhite(im);
+            const float inv = 256.0f / std::max(white - black, 1e-20f);
+            const size_t total = (size_t)rw * rh;
+            const size_t step = std::max<size_t>(1, total / 1000000);
+            double s1[4] = {}, s2[4] = {};
+            size_t n[4] = {};
+            // row-major walk, keeping every step-th linear index: the same
+            // sample SET as the panel, reached a different way
+            for (int y = 0; y < rh; y++)
+                for (int x = 0; x < rw; x++) {
+                    size_t p = (size_t)y * rw + x;
+                    if (p % step) continue;
+                    const float* src = &im.data[((size_t)y * im.w + x) * im.ch];
+                    if (cfa) {
+                        float v = src[0];
+                        if (std::isfinite(v)) {
+                            int s = cfaChannelAt(im, x, y);
+                            float t = (v - black) * inv;
+                            int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
+                            R.bins[s][b]++;
+                            s1[s] += v; s2[s] += (double)v * v; n[s]++;
+                        }
+                    } else {
+                        for (int c = 0; c < R.nSeries; c++) {
+                            float v = src[c];
+                            if (!std::isfinite(v)) continue;
+                            float t = (v - black) * inv;
+                            int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
+                            R.bins[c][b]++;
+                            s1[c] += v; s2[c] += (double)v * v; n[c]++;
+                        }
+                    }
+                    R.sampled++;
+                }
+            for (int s = 0; s < R.nSeries; s++) {
+                if (!n[s]) continue;
+                double m = s1[s] / n[s], var = s2[s] / n[s] - m * m;
+                R.mean[s] = m;
+                R.sd[s] = sqrt(var > 0 ? var : 0);
+            }
+            return R;
+        };
+        // Independent temporal noise over a stack: per-sample variance across
+        // the resident frames, on the same 40000-sample grid.
+        auto refSigmaT = [](const ImageDoc& im) {
+            std::vector<int> f = framesOfSeq(im.seqId);
+            const size_t total = (size_t)im.w * im.h;
+            const size_t step = std::max<size_t>(1, total / 40000);
+            std::vector<size_t> offs;
+            for (int y = 0; y < im.h; y++)
+                for (int x = 0; x < im.w; x++) {
+                    size_t p = (size_t)y * im.w + x;
+                    if (p % step == 0) offs.push_back(((size_t)y * im.w + x) * im.ch);
+                }
+            std::vector<double> s1(offs.size(), 0), s2(offs.size(), 0);
+            int used = 0;
+            for (int fi : f) {
+                const ImageDoc& fr = *app.images[fi];
+                if (fr.w != im.w || fr.h != im.h || fr.ch != im.ch) continue;
+                bool any = false;
+                for (size_t k = 0; k < offs.size(); k++) {
+                    float v = fr.data[offs[k]];
+                    if (!std::isfinite(v)) continue;
+                    s1[k] += v; s2[k] += (double)v * v; any = true;
+                }
+                if (any) used++;
+            }
+            double tvar = 0;
+            if (used >= 2)
+                for (size_t k = 0; k < offs.size(); k++) {
+                    double m = s1[k] / used, v = s2[k] / used - m * m;
+                    tvar += v > 0 ? v : 0;
+                }
+            return offs.empty() ? 0.0 : sqrt(tvar / offs.size());
+        };
+        // "byte-identical" as the plan means it: every number the panel puts on
+        // screen, compared bit for bit. (Not memcmp over the whole struct - its
+        // padding bytes are unspecified and would make the test lie either way.)
+        auto histSame = [](const App::HistState& a, const App::HistState& b) {
+            return a.nSeries == b.nSeries && a.maxBin == b.maxBin &&
+                   a.sampled == b.sampled && a.rx == b.rx && a.ry == b.ry &&
+                   a.rw == b.rw && a.rh == b.rh && a.roiUsed == b.roiUsed &&
+                   memcmp(&a.black, &b.black, sizeof a.black) == 0 &&
+                   memcmp(&a.white, &b.white, sizeof a.white) == 0 &&
+                   memcmp(a.bins, b.bins, sizeof a.bins) == 0 &&
+                   memcmp(a.mean, b.mean, sizeof a.mean) == 0 &&
+                   memcmp(a.sd, b.sd, sizeof a.sd) == 0 &&
+                   memcmp(&a.clipLo, &b.clipLo, sizeof a.clipLo) == 0 &&
+                   memcmp(&a.clipHi, &b.clipHi, sizeof a.clipHi) == 0;
+        };
+        auto vecSame = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() &&
+                   (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+        };
+        auto projSame = [&](const App::ProjState& a, const App::ProjState& b) {
+            if (a.nSeries != b.nSeries || a.rw != b.rw || a.rh != b.rh) return false;
+            if (memcmp(&a.hMin, &b.hMin, sizeof a.hMin) || memcmp(&a.hMax, &b.hMax, sizeof a.hMax) ||
+                memcmp(&a.vMin, &b.vMin, sizeof a.vMin) || memcmp(&a.vMax, &b.vMax, sizeof a.vMax))
+                return false;
+            for (int s = 0; s < 4; s++) {
+                if (!vecSame(a.h[s], b.h[s]) || !vecSame(a.v[s], b.v[s])) return false;
+                const App::ProjState::Stats& x = a.hStat[s]; const App::ProjState::Stats& y = b.hStat[s];
+                const App::ProjState::Stats& u = a.vStat[s]; const App::ProjState::Stats& w2 = b.vStat[s];
+                if (memcmp(&x, &y, sizeof(double) * 6) || x.valid != y.valid) return false;
+                if (memcmp(&u, &w2, sizeof(double) * 6) || u.valid != w2.valid) return false;
+            }
+            return true;
+        };
+        auto tempSame = [&](const App::TemporalState& a, const App::TemporalState& b) {
+            return a.seqId == b.seqId && a.frames == b.frames && a.valid == b.valid &&
+                   a.rx == b.rx && a.ry == b.ry && a.rw == b.rw && a.rh == b.rh &&
+                   vecSame(a.idx, b.idx) && vecSame(a.frameMean, b.frameMean) &&
+                   vecSame(a.frameStd, b.frameStd) &&
+                   memcmp(&a.tempNoise, &b.tempNoise, sizeof a.tempNoise) == 0 &&
+                   memcmp(&a.fixedPattern, &b.fixedPattern, sizeof a.fixedPattern) == 0 &&
+                   memcmp(&a.totalNoise, &b.totalNoise, sizeof a.totalNoise) == 0;
+        };
+
+        int sidA = app.seqs[0].id, sidB = app.seqs[1].id;
+        std::vector<int> frA = framesOfSeq(sidA), frB = framesOfSeq(sidB);
+        selectImage(frA.front());
+
+        // ---- A3 baseline: everything A, with compare OFF ----
+        app.compareMode = App::CmpOff;
+        abStatsFrame();
+        recomputeHistogramIfNeeded(cur(), app.hist[0]);
+        recomputeProjectionIfNeeded(cur(), app.proj[0]);
+        recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+        App::HistState hOff = app.hist[0];
+        App::ProjState pOff = app.proj[0];
+        App::TemporalState tOff = app.temporal[0];
+        fprintf(stderr, "abstatsselftest: compare OFF, A='%s' (stack %d): "
+                        "hist sampled=%zu maxBin=%u mean0=%.9g, sigma_t=%.9g\n",
+                cur()->name.c_str(), sidA, hOff.sampled, hOff.maxBin, hOff.mean[0],
+                tOff.tempNoise);
+        check(app.hist[1].uid == 0 && app.proj[1].uid == 0 &&
+              app.temporal[1].seqId == -1,
+              "A0 compare off leaves slot 1 empty");
+
+        // ---- A1: compare on, both slots fill ----
+        // Explicitly on "B uses A's range". A3 below asserts that adding B does
+        // not move A, and that is only the contract in this mode: under the
+        // union default A's bin axis is SUPPOSED to widen to cover B - that is
+        // the whole mode - and the union's own contract is checked in A3b.
+        app.compareRangeMode = 1;
+        setCompareB(app.images[frB.front()].get());
+        app.compareMode = App::CmpSplit;
+        app.compareFollowFrame = true;
+        abStatsFrame();
+        ImageDoc* B = cmpB();
+        if (!B) { fprintf(stderr, "abstatsselftest: no B after setCompareB\n"); return 1; }
+        recomputeHistogramIfNeeded(cur(), app.hist[0]);
+        recomputeProjectionIfNeeded(cur(), app.proj[0]);
+        recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+        recomputeHistogramIfNeeded(B, app.hist[1]);
+        recomputeProjectionIfNeeded(B, app.proj[1]);
+        recomputeTemporalIfNeeded(B, app.temporal[1]);
+        fprintf(stderr, "abstatsselftest: compare SPLIT+follow, B='%s' (stack %d): "
+                        "hist[0].uid=%llu (A=%llu)  hist[1].uid=%llu (B=%llu)  "
+                        "proj[1].uid=%llu  temporal[1].seqId=%d frames=%d\n",
+                B->name.c_str(), sidB,
+                (unsigned long long)app.hist[0].uid, (unsigned long long)cur()->uid,
+                (unsigned long long)app.hist[1].uid, (unsigned long long)B->uid,
+                (unsigned long long)app.proj[1].uid,
+                app.temporal[1].seqId, app.temporal[1].frames);
+        check(app.hist[0].uid == cur()->uid && app.hist[1].uid == B->uid &&
+              app.hist[0].uid != app.hist[1].uid, "A1 histogram: both slots, own uid");
+        check(app.proj[0].uid == cur()->uid && app.proj[1].uid == B->uid,
+              "A1 projection: both slots, own uid");
+        check(app.temporal[0].seqId == sidA && app.temporal[1].seqId == sidB &&
+              app.temporal[0].valid && app.temporal[1].valid,
+              "A1 temporal: both slots, own stack");
+        check(app.hist[1].img == B && app.proj[1].img == B,
+              "A1 slot 1 names B, not A");
+
+        // ---- A2: B's numbers recomputed here, from B's pixels ----
+        {
+            RefHist R = refHistogram(*B);
+            const App::HistState& HB = app.hist[1];
+            bool binsEq = R.nSeries == HB.nSeries &&
+                          memcmp(R.bins, HB.bins, sizeof R.bins) == 0 &&
+                          R.sampled == HB.sampled;
+            bool statEq = true;
+            for (int s = 0; s < R.nSeries; s++)
+                if (!relEq(R.mean[s], HB.mean[s], 1e-6) || !relEq(R.sd[s], HB.sd[s], 1e-6))
+                    statEq = false;
+            double refSig = refSigmaT(*B);
+            fprintf(stderr, "abstatsselftest: B independent recompute: series=%d "
+                            "sampled=%zu/%zu  mean0 %.12g vs %.12g  sd0 %.12g vs %.12g  "
+                            "sigma_t %.12g vs %.12g\n",
+                    R.nSeries, R.sampled, HB.sampled, R.mean[0], HB.mean[0],
+                    R.sd[0], HB.sd[0], refSig, app.temporal[1].tempNoise);
+            check(binsEq, "A2 B histogram bins match an independent pass exactly");
+            check(statEq, "A2 B mean/sd match within 1e-6 relative");
+            check(relEq(refSig, app.temporal[1].tempNoise, 1e-6),
+                  "A2 B sigma_t matches within 1e-6 relative");
+            // the two sides really are different data, or A2/A3 prove nothing
+            check(memcmp(app.hist[0].bins, app.hist[1].bins, sizeof app.hist[0].bins) != 0,
+                  "A2 fixture: A and B histograms actually differ");
+        }
+
+        // ---- A3: A did not move (on "B uses A's range") ----
+        check(histSame(hOff, app.hist[0]), "A3 A histogram byte-identical with B present");
+        check(projSame(pOff, app.proj[0]), "A3 A projection byte-identical with B present");
+        check(tempSame(tOff, app.temporal[0]), "A3 A temporal byte-identical with B present");
+
+        // ---- A3b: the union default bins BOTH sides on A and B together ----
+        {
+            app.compareRangeMode = 2;
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            recomputeHistogramIfNeeded(B, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            float uLo = std::min(cur()->vmin, B->vmin), uHi = std::max(cur()->vmax, B->vmax);
+            bool axis = app.hist[0].black == uLo && app.hist[0].white == uHi;
+            bool shared = app.hist[0].black == app.hist[1].black &&
+                          app.hist[0].white == app.hist[1].white;
+            fprintf(stderr, "abstatsselftest: union: A bins %.9g..%.9g, B bins %.9g..%.9g "
+                            "| content A %.9g..%.9g, B %.9g..%.9g | A alone %.9g..%.9g\n",
+                    app.hist[0].black, app.hist[0].white, app.hist[1].black, app.hist[1].white,
+                    cur()->vmin, cur()->vmax, B->vmin, B->vmax, hOff.black, hOff.white);
+            check(axis, "A3b union: A is binned on the A-and-B union, not on A alone");
+            check(shared, "A3b union: both sides land on the same bin axis");
+            // ...and it is a DISPLAY overlay: going back restores A exactly
+            app.compareRangeMode = 1;
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            check(histSame(hOff, app.hist[0]),
+                  "A3b back on A's range: A is byte-identical to compare-off again");
+        }
+
+        // ---- A4: five frame steps, both keys follow; temporal does not re-run ----
+        {
+            App::TemporalState tB0 = app.temporal[1];
+            uint64_t bUid0 = B->uid;
+            bool keysFollow = true, temporalMoved = false, bMoved = false;
+            for (int k = 0; k < 5; k++) {
+                gotoFrame(1);
+                abStatsFrame();
+                ImageDoc* b2 = cmpB();
+                if (!b2) { keysFollow = false; break; }
+                recomputeHistogramIfNeeded(cur(), app.hist[0]);
+                recomputeHistogramIfNeeded(b2, app.hist[1]);
+                recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+                recomputeTemporalIfNeeded(b2, app.temporal[1]);
+                if (app.hist[0].uid != cur()->uid || app.hist[1].uid != b2->uid)
+                    keysFollow = false;
+                if (b2->uid != bUid0) bMoved = true;
+                if (!tempSame(tB0, app.temporal[1])) temporalMoved = true;
+            }
+            fprintf(stderr, "abstatsselftest: 5x gotoFrame(1): A frame=%d, B frame=%d, "
+                            "B uid %llu->%llu, temporal[1].seqId=%d frames=%d\n",
+                    cur()->seqIndex, cmpB() ? cmpB()->seqIndex : -1,
+                    (unsigned long long)bUid0,
+                    (unsigned long long)(cmpB() ? cmpB()->uid : 0),
+                    app.temporal[1].seqId, app.temporal[1].frames);
+            check(keysFollow, "A4 both hist slots follow the frame step");
+            check(bMoved && cmpB() && cmpB()->seqIndex == cur()->seqIndex,
+                  "A4 follow-frame put B on A's frame number");
+            check(!temporalMoved && app.temporal[1].seqId == sidB,
+                  "A4 temporal[1] unchanged by a frame step (keyed on the stack)");
+        }
+
+        // ---- P1: the histogram's own rules ----
+        {
+            ImageDoc* b4 = cmpB();
+            // B gets a deliberately DIFFERENT display range; the bins must still
+            // be A's, or the two curves share an x axis they were not binned on
+            float bBlack0 = b4->black, bWhite0 = b4->white;
+            b4->black = bBlack0 - 137.5f; b4->white = bWhite0 + 211.25f;
+            recomputeHistogramIfNeeded(b4, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            fprintf(stderr, "abstatsselftest: P1 bin axis: A black/white %.6g/%.6g, "
+                            "B's own %.6g/%.6g, hist[1] binned on %.6g/%.6g\n",
+                    effBlack(*cur()), effWhite(*cur()), effBlack(*b4), effWhite(*b4),
+                    app.hist[1].black, app.hist[1].white);
+            // b4->black/white, NOT effBlack: since the A/B range modes landed,
+            // effBlack(B) deliberately returns A's range, so asking it whether
+            // B "differs" answers a different question and always says no.
+            check(b4->black != cur()->black || b4->white != cur()->white,
+                  "P1 fixture: B's own range really differs");
+            check(app.hist[1].black == effBlack(*cur()) &&
+                  app.hist[1].white == effWhite(*cur()),
+                  "P1 B is binned on A's black/white, not its own");
+            b4->black = bBlack0; b4->white = bWhite0;
+            recomputeHistogramIfNeeded(b4, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+        }
+        {   // the plane selector is presentation only: it must not touch a bin
+            App::HistState hA = app.hist[0], hB = app.hist[1];
+            int keep = app.histPlane;
+            bool same = true;
+            for (int p = -1; p < 4; p++) {
+                app.histPlane = p;
+                recomputeHistogramIfNeeded(cur(), app.hist[0]);
+                recomputeHistogramIfNeeded(cmpB(), app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+                if (!histSame(hA, app.hist[0]) || !histSame(hB, app.hist[1])) same = false;
+            }
+            app.histPlane = keep;
+            check(same, "P1 plane selector changes nothing that was measured");
+        }
+        {   // Auto mirrors the image; an explicit choice overrides it both ways
+            int keep = app.abStatsLayout;
+            app.abStatsLayout = App::AbAuto;
+            app.compareMode = App::CmpSplit; bool autoSplit = abSideBySide();
+            app.compareMode = App::CmpWipe;  bool autoWipe = abSideBySide();
+            app.abStatsLayout = App::AbSide; bool forcedSide = abSideBySide();
+            app.abStatsLayout = App::AbOverlay;
+            app.compareMode = App::CmpSplit; bool forcedOver = abSideBySide();
+            fprintf(stderr, "abstatsselftest: P1 layout: auto/split=%d auto/wipe=%d "
+                            "forced-side/wipe=%d forced-overlay/split=%d\n",
+                    autoSplit, autoWipe, forcedSide, forcedOver);
+            check(autoSplit && !autoWipe && forcedSide && !forcedOver,
+                  "P1 Auto follows the image layout, explicit overrides it");
+            app.abStatsLayout = keep;
+            app.compareMode = App::CmpSplit;
+        }
+
+        // ---- P2: a B that does not share A's axis must never be overlaid ----
+        {
+            check(abProjOverlayable(app.proj[0], app.proj[1]),
+                  "P2 same-size B shares A's profile axis");
+            std::string root = g_abstatsSelftest;
+            std::replace(root.begin(), root.end(), '\\', '/');
+            while (!root.empty() && root.back() == '/') root.pop_back();
+            size_t sl = root.find_last_of('/');
+            root = sl == std::string::npos ? std::string(".") : root.substr(0, sl);
+            size_t before = app.images.size();
+            openPath(root + "/grad_u16.npy");           // 640x480 against A's 80x64
+            loadAll();
+            if (app.images.size() > before) {
+                ImageDoc* odd = app.images.back().get();
+                selectImage(frA.front());
+                setCompareB(odd);
+                app.compareMode = App::CmpSplit;
+                abStatsFrame();
+                ImageDoc* b5 = cmpB();
+                recomputeProjectionIfNeeded(cur(), app.proj[0]);
+                recomputeProjectionIfNeeded(b5, app.proj[1]);
+                bool over = abProjOverlayable(app.proj[0], app.proj[1]);
+                fprintf(stderr, "abstatsselftest: P2 odd B '%s' %dx%d vs A %dx%d: "
+                                "profile A x %d..%d / B x %d..%d, overlayable=%d\n",
+                        b5->name.c_str(), b5->w, b5->h, cur()->w, cur()->h,
+                        app.proj[0].rx, app.proj[0].rx + app.proj[0].rw - 1,
+                        app.proj[1].rx, app.proj[1].rx + app.proj[1].rw - 1, over ? 1 : 0);
+                check(b5->w != cur()->w || b5->h != cur()->h,
+                      "P2 fixture: the odd B really is a different size");
+                check(!over, "P2 size-mismatched B is refused the overlay");
+                // and the channel counts differ too, which P3's delta columns use
+                check(app.proj[0].nSeries != app.proj[1].nSeries ||
+                      cur()->ch == b5->ch, "P2 series count reflects the channel count");
+                selectImage((int)app.images.size() - 1);  // the extra image ITSELF
+                closeCurrent(true);                       // ...and only that one
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                abStatsFrame();
+            } else {
+                fprintf(stderr, "abstatsselftest: P2 skipped (%s/grad_u16.npy not there)\n",
+                        root.c_str());
+            }
+        }
+
+        // ---- P2b: held-down stepping holds B's slots instead of recomputing ----
+        {
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            app.abStepBusyUntil = 0;
+            abStatsFrame();
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            recomputeHistogramIfNeeded(cmpB(), app.hist[1],
+                                       effBlack(*cur()), effWhite(*cur()));
+            uint64_t held = app.hist[1].uid;
+            gotoFrame(1); gotoFrame(1);            // two switches inside 300 ms
+            bool armed = abStepBusy();
+            ImageDoc* b6 = cmpB();
+            // exactly what the panel does
+            if (b6 && (!abStepBusy() || app.hist[1].uid == 0))
+                recomputeHistogramIfNeeded(b6, app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+            bool heldStale = b6 && app.hist[1].uid == held && app.hist[1].uid != b6->uid;
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+            bool released = !abStepBusy();
+            if (b6 && (!abStepBusy() || app.hist[1].uid == 0))
+                recomputeHistogramIfNeeded(b6, app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+            fprintf(stderr, "abstatsselftest: P2b throttle: armed=%d held uid=%llu vs B "
+                            "uid=%llu, released=%d, after release uid=%llu\n",
+                    armed ? 1 : 0, (unsigned long long)held,
+                    (unsigned long long)(b6 ? b6->uid : 0), released ? 1 : 0,
+                    (unsigned long long)app.hist[1].uid);
+            check(armed, "P2b rapid stepping arms the B throttle");
+            check(heldStale, "P2b B slot holds its last result while stepping (stale)");
+            check(released && b6 && app.hist[1].uid == b6->uid,
+                  "P2b B refreshes once the stepping stops");
+            selectImage(frA.front());
+            app.abStepBusyUntil = 0;
+        }
+
+        // ---- P3: the A|B|delta|delta% table's inputs ----
+        {
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            abStatsFrame();
+            ImageDoc* b7 = cmpB();
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            recomputeTemporalIfNeeded(b7, app.temporal[1]);
+            AbTemporal TA = abTemporalOf(cur(), app.temporal[0], app.srvTemporal);
+            AbTemporal TB = abTemporalOf(b7, app.temporal[1], app.srvTemporalB);
+            double dAbs = TA.sigT - TB.sigT;
+            double dPct = TA.sigT != 0 ? (TA.sigT - TB.sigT) / fabs(TA.sigT) * 100.0 : 0.0;
+            fprintf(stderr, "abstatsselftest: P3 table inputs: A sigma_t=%.9g (n=%d/%d, "
+                            "server=%d), B sigma_t=%.9g (n=%d/%d, server=%d), "
+                            "delta A-B=%.9g, delta=%.6g %%, unit=[%s]\n",
+                    TA.sigT, TA.frames, TA.expected, TA.fromServer ? 1 : 0,
+                    TB.sigT, TB.frames, TB.expected, TB.fromServer ? 1 : 0,
+                    dAbs, dPct, abValueUnit(cur()->dtype).c_str());
+            check(TA.valid && TB.valid && TA.isStack && TB.isStack,
+                  "P3 both sides resolve to stack temporal numbers");
+            check(!TA.fromServer && !TB.fromServer,
+                  "P3 local stacks come from the local computation");
+            check(dAbs == TA.sigT - TB.sigT && !TA.fromServer,
+                  "P3 delta is A - B (the difference image's sign)");
+            check(abDeltaMeaningful(cur(), b7), "P3 equal channel counts allow a delta");
+            // B's server aggregate must never have been fired on its own
+            check(app.srvTemporalB.token == 0 && !app.srvTemporalB.pending &&
+                  app.srvTemporalB.seqId == -1,
+                  "P3 B's server temporal is never fired automatically");
+        }
+        {   // a B that is not a stack, and a B with a different channel count
+            std::string root = g_abstatsSelftest;
+            std::replace(root.begin(), root.end(), '\\', '/');
+            while (!root.empty() && root.back() == '/') root.pop_back();
+            size_t sl = root.find_last_of('/');
+            root = sl == std::string::npos ? std::string(".") : root.substr(0, sl);
+            size_t before = app.images.size();
+            openPath(root + "/rgb_u8.npy");            // 3 channels, single frame
+            loadAll();
+            if (app.images.size() > before) {
+                ImageDoc* lone = app.images.back().get();
+                selectImage(frA.front());
+                setCompareB(lone);
+                abStatsFrame();
+                ImageDoc* b8 = cmpB();
+                recomputeTemporalIfNeeded(b8, app.temporal[1]);
+                AbTemporal TB2 = abTemporalOf(b8, app.temporal[1], app.srvTemporalB);
+                fprintf(stderr, "abstatsselftest: P3 lone B '%s' %dch: isStack=%d valid=%d "
+                                "note='%s', delta meaningful=%d (A %dch)\n",
+                        b8->name.c_str(), b8->ch, TB2.isStack ? 1 : 0, TB2.valid ? 1 : 0,
+                        TB2.note, abDeltaMeaningful(cur(), b8) ? 1 : 0, cur()->ch);
+                check(!TB2.isStack && !TB2.valid && std::string(TB2.note) == "not a stack",
+                      "P3 a B that is not a stack says so instead of a number");
+                check(cur()->ch != b8->ch && !abDeltaMeaningful(cur(), b8),
+                      "P3 different channel counts suppress the delta columns");
+                selectImage((int)app.images.size() - 1);  // the extra image ITSELF
+                closeCurrent(true);                       // ...and only that one
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                abStatsFrame();
+            } else {
+                fprintf(stderr, "abstatsselftest: P3 lone-B checks skipped (%s/rgb_u8.npy "
+                                "not there)\n", root.c_str());
+            }
+        }
+
+        // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
+        app.compareMode = App::CmpOff;
+        abStatsFrame();
+        fprintf(stderr, "abstatsselftest: CmpOff: hist[1].uid=%llu img=%p, "
+                        "proj[1].uid=%llu img=%p, temporal[1].seqId=%d, slot1Live=%d\n",
+                (unsigned long long)app.hist[1].uid, (const void*)app.hist[1].img,
+                (unsigned long long)app.proj[1].uid, (const void*)app.proj[1].img,
+                app.temporal[1].seqId, app.abSlot1Live ? 1 : 0);
+        check(app.hist[1].uid == 0 && app.hist[1].img == nullptr &&
+              app.proj[1].uid == 0 && app.proj[1].img == nullptr &&
+              app.temporal[1].seqId == -1 && !app.abSlot1Live,
+              "A6 CmpOff invalidates slot 1");
+        {   // and once only: a second frame with compare off must not touch it
+            app.hist[1].uid = 12345;              // white-box tripwire
+            abStatsFrame();
+            check(app.hist[1].uid == 12345, "A6 compare-off frames after the first do nothing");
+            app.hist[1] = App::HistState{};
+        }
+        {   // B closed while slot 1 held it: no dangling ImageDoc* may survive
+            app.compareMode = App::CmpSplit;
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            abStatsFrame();
+            ImageDoc* b3 = cmpB();
+            recomputeHistogramIfNeeded(b3, app.hist[1]);
+            recomputeProjectionIfNeeded(b3, app.proj[1]);
+            const void* held = app.hist[1].img;
+            closeStack(sidB);
+            fprintf(stderr, "abstatsselftest: closeStack(B=%d): slot 1 held %p, now "
+                            "hist[1].img=%p uid=%llu, proj[1].img=%p, cmpB()=%p\n",
+                    sidB, held, (const void*)app.hist[1].img,
+                    (unsigned long long)app.hist[1].uid,
+                    (const void*)app.proj[1].img, (const void*)cmpB());
+            check(held != nullptr, "A6 fixture: slot 1 really held B");
+            check(app.hist[1].img == nullptr && app.hist[1].uid == 0 &&
+                  app.proj[1].img == nullptr && app.proj[1].uid == 0 && !cmpB(),
+                  "A6 closing B leaves no dangling pointer in slot 1");
+        }
+
+        fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
         return ok ? 0 : 1;
     }
 
@@ -10440,6 +16662,113 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // Every A/B range combination, printed. See scratchpad/rangetest.py.
+    if (!g_rangeSelftest.empty()) {
+        std::string dir = g_rangeSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        app.seqLoadMode = 1;
+        openFolder(dir);
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 300.0) {
+            if (app.folderPickOpen && !app.folderPickRemote) {
+                std::vector<App::PendingGroup> sel;
+                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
+                app.folderPick.clear();
+                app.folderPickOpen = false;
+                enqueueGroups(std::move(sel));
+            }
+            pumpSequenceAndQueue();
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                !app.folderPickOpen && app.seqs.size() >= 2) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (app.seqs.size() < 2) {
+            fprintf(stderr, "rangeselftest: need 2 stacks under %s\n", dir.c_str());
+            return 1;
+        }
+        std::vector<int> fa = framesOfSeq(app.seqs[0].id), fb = framesOfSeq(app.seqs[1].id);
+        if (fa.size() < 2 || fb.size() < 2) {
+            fprintf(stderr, "rangeselftest: stacks need 2+ frames\n");
+            return 1;
+        }
+        selectImage(fa[0]);
+        setCompareB(app.images[fb[0]].get());
+        app.compareMode = App::CmpSplit;
+        app.compareFollowFrame = true;
+        static const char* MODE[3] = { "auto-per-frame", "per-stack", "linked" };
+        static const char* SHARE[3] = { "each-own", "B-uses-A", "union-auto" };
+        int bad = 0;
+        {   // The two stacks of a capture series hold identically NAMED frames
+            // (00/frame_000.npy and 01/frame_000.npy are both frame_000.npy),
+            // so this is also the check that the compare UI can tell them apart
+            // at all: every label there goes through abDocLabel.
+            std::string la = abDocLabel(cur()), lb = abDocLabel(cmpB());
+            fprintf(stderr, "rangeselftest: labels | A = %s | B = %s | files %s / %s | %s\n",
+                    la.c_str(), lb.c_str(), cur()->name.c_str(), cmpB()->name.c_str(),
+                    la != lb ? "DISTINCT" : "AMBIGUOUS");
+            if (la == lb) bad++;
+        }
+        {   // The out-of-the-box display-range mode. "B uses A's range" renders
+            // a B captured at another level at >white 99.7% - one dashed line
+            // jammed against the right edge, and an empty half in side by side.
+            // Union bins both sides identically and clips neither.
+            fprintf(stderr, "rangeselftest: default compareRangeMode at startup = %d (%s)%s\n",
+                    g_abRangeDefault,
+                    g_abRangeDefault >= 0 && g_abRangeDefault < 3 ? SHARE[g_abRangeDefault] : "?",
+                    g_abRangeDefault == 2 ? "" : "  <- EXPECTED 2 (union-auto)");
+            if (g_abRangeDefault != 2) bad++;
+        }
+        {   // The axis label has to name the range ACTUALLY in force. It read
+            // "A's black-white range" in every mode, including the union - a
+            // claim about the picture that the picture does not support.
+            int save = app.compareRangeMode;
+            for (int sh = 0; sh < 3; sh++) {
+                app.compareRangeMode = sh;
+                std::string lab = abHistXLabel(cur(), cmpB());
+                bool named = sh == 2 ? lab.find("A and B combined") != std::string::npos
+                                     : lab.find("A\'s black-white") != std::string::npos;
+                fprintf(stderr, "rangeselftest: hist x axis | %-11s | %s | %s\n",
+                        SHARE[sh], lab.c_str(),
+                        named ? "names the range in force" : "WRONG");
+                if (!named) bad++;
+            }
+            app.compareRangeMode = save;
+        }
+        for (int m = 0; m < 3; m++) {
+            app.rangeScope = m == 0 ? 0 : 1;
+            app.linkRange = m == 2;
+            if (app.linkRange) { app.linkBlack = app.images[fa[0]]->vmin;
+                                 app.linkWhite = app.images[fa[0]]->vmax; }
+            for (int sh = 0; sh < 3; sh++) {
+                app.compareRangeMode = sh;
+                for (int step = 0; step < 2; step++) {
+                    selectImage(fa[step]);
+                    ImageDoc* A = cur();
+                    ImageDoc* B = cmpB();
+                    if (!A || !B) { fprintf(stderr, "rangeselftest: no A/B\n"); return 1; }
+                    bool same = effBlack(*A) == effBlack(*B) && effWhite(*A) == effWhite(*B);
+                    fprintf(stderr,
+                            "rangeselftest: %-14s %-11s frame %d | A %.6g..%.6g  B %.6g..%.6g  "
+                            "| B frame %d | %s\n",
+                            MODE[m], SHARE[sh], step, effBlack(*A), effWhite(*A),
+                            effBlack(*B), effWhite(*B), B->seqIndex,
+                            same ? "MATCHED" : "differs");
+                    // the contract: anything but "each-own" must produce one range
+                    if (sh != 0 && !same) bad++;
+                    // follow-frame must keep the sides on the same frame number
+                    if (B->seqIndex != A->seqIndex) {
+                        fprintf(stderr, "rangeselftest: FOLLOW BROKEN A#%d vs B#%d\n",
+                                A->seqIndex, B->seqIndex);
+                        bad++;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
+        if (app.seqThread.joinable()) app.seqThread.join();
+        return bad ? 1 : 0;
+    }
+
     // The per-frame table, verifiable without a human: load the stack given on
     // the command line, run the exact clipboard path, print the TSV to stdout.
     // An independent numpy implementation must reproduce every number.
@@ -10475,24 +16804,62 @@ int main(int argc, char** argv) {
                 !app.folderPickOpen) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
-        linRecompute();
-        const App::LinState& L = app.lin;
-        for (const auto& r : L.rows)
-            fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
-                            "mean=%.6g sigma_t=%.6g %s\n",
-                    r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
-                    r.valid ? "" : ("ERR:" + r.err).c_str());
-        for (int p = 0; p < L.nPl; p++)
-            fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
-                            "LEmax=%.4f K=%.6g read=%.5g\n",
-                    L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
-                    L.leMax[p], L.ptcK[p], L.readDN[p]);
-        fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
-                L.fitValid ? "ok" : "FAILED");
+        // The fit is per SERIES now, and the application never creates one by
+        // itself (docs/terminology.md) - so this selftest creates it, in the
+        // open, through selftestMakeSeries: one series per BATCH over that
+        // batch's stacks, member values from extractLevelFromName (the same
+        // proposal the Create modal shows a human), unit = the prefill
+        // (prefs linunit, "lx" unless the user changed it). That is the ONLY
+        // auto-creation in the program and it lives behind this flag.
+        bool fitOk = false;
+        std::vector<int> bids;
+        for (const auto& b : app.batches) bids.push_back(b.id);
+        for (int bid : bids) {
+            int sid = selftestMakeSeries(bid, app.lin.unit);
+            if (!sid) continue;
+            linRecompute(sid);
+            const App::LinState& L = app.lin;
+            const App::Series* S = seriesById(sid);
+            fprintf(stderr, "linselftest: series '%s' (batch '%s') unit '%s': %d member(s)\n",
+                    S->name.c_str(), batchNameOf(bid).c_str(), S->unit,
+                    (int)S->members.size());
+            for (const auto& r : L.rows)
+                fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
+                                "mean=%.6g sigma_t=%.6g %s\n",
+                        r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
+                        r.valid ? "" : ("ERR:" + r.err).c_str());
+            for (int p = 0; p < L.nPl; p++)
+                fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
+                                "LEmax=%.4f K=%.6g read=%.5g\n",
+                        L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
+                        L.leMax[p], L.ptcK[p], L.readDN[p]);
+            fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
+                    L.fitValid ? "ok" : "FAILED");
+            fitOk |= L.fitValid;
+        }
+        if (!fitOk) fprintf(stderr, "linselftest: no series could be fitted\n");
         if (app.seqThread.joinable()) app.seqThread.join();
-        return L.fitValid ? 0 : 1;
+        return fitOk ? 0 : 1;
+    }
+
+    // --browse-keys-selftest: connect the local peer and open the panel; the
+    // action list is replayed inside the loop, below.
+    std::vector<std::string> keyActs;
+    size_t keyAct = 0;
+    int keyPhase = 0;
+    bool keysOk = false;
+    if (!g_browseKeys.empty()) {
+        std::string d = g_browseKeys;
+        std::replace(d.begin(), d.end(), '\\', '/');
+        while (d.size() > 1 && d.back() == '/') d.pop_back();
+        startRemote("local://" + d);
+        app.showRemote = true;
+        for (size_t i = 0, j; i <= g_browseKeysActs.size(); i = j + 1) {
+            j = g_browseKeysActs.find(',', i);
+            if (j == std::string::npos) j = g_browseKeysActs.size();
+            if (j > i) keyActs.push_back(g_browseKeysActs.substr(i, j - i));
+        }
+        fprintf(stderr, "browsekeys: %d action(s) on %s\n", (int)keyActs.size(), d.c_str());
     }
 
     std::vector<double> benchMs;
@@ -10500,6 +16867,7 @@ int main(int argc, char** argv) {
     if (benchFrames) {                 // exercise every panel, not just the defaults
         app.showFiles = app.showInspector = app.showRois = app.showAnalysis = true;
         app.showHistogram = app.showTemporal = app.showProjection = true;
+        app.showLinearity = true;      // ...which now includes the series selector
         benchMs.reserve(benchFrames);
     }
     double lastFrameEnd = glfwGetTime();
@@ -10536,6 +16904,11 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
+            // the layer variants (docs/terminology.md): frame-only escape hatch
+            // and whole-batch close
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Alt | ImGuiKey_W)) closeCurrent(true);
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_W) && cur())
+                closeBatch(cur()->batchId);
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
             // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
@@ -10543,7 +16916,7 @@ int main(int argc, char** argv) {
             // the filter box there), so frame-stepping must yield to it.
             ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
             bool remoteFocused = nav && nav->RootWindow &&
-                                 strcmp(nav->RootWindow->Name, "Remote") == 0;
+                                 strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
             if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
@@ -10625,6 +16998,8 @@ int main(int argc, char** argv) {
         // and shrink with the plugins that are loaded
         window_frame::beginFrame(uiScale);
         drawMenuBar(win);
+        // before any panel draws: the B cache slots exist only while compare does
+        abStatsFrame();
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -10651,7 +17026,7 @@ int main(int argc, char** argv) {
             right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
             bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.28f, nullptr, &center);
             ImGui::DockBuilderDockWindow("Files", left);
-            ImGui::DockBuilderDockWindow("Remote", left);   // tabbed with Files
+            ImGui::DockBuilderDockWindow("Browse###Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
@@ -10670,7 +17045,10 @@ int main(int argc, char** argv) {
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         if (app.showRemote) {
             if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
-            if (ImGui::Begin("Remote", &app.showRemote)) drawPanelRemote();
+            // Renamed "Browse" (it browses local folders too, via the local
+            // peer), with the ImGui ID pinned by the ### suffix so the title
+            // can change again without orphaning docked layouts.
+            if (ImGui::Begin("Browse###Remote", &app.showRemote)) drawPanelRemote();
             ImGui::End();
         }
         if (app.showMessages) {
@@ -10691,6 +17069,7 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
         if (app.showTemporal) {
+            if (app.focusTemporal) { ImGui::SetNextWindowFocus(); app.focusTemporal = false; }
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
@@ -10811,12 +17190,13 @@ int main(int argc, char** argv) {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "   |  A/B: no B image");
                 } else if (app.compareMode == App::CmpDiff) {
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  %s +-%g  B: %s",
-                                       app.diffAbs ? "|A-B|" : "A-B", app.diff.gain, b->name.c_str());
+                                       app.diffAbs ? "|A-B|" : "A-B", app.diff.gain,
+                                       abDocLabel(b).c_str());
                 } else {
                     float fr = app.compareMode == App::CmpSplit ? app.splitFrac : app.wipeFrac;
                     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "   |  A/B %s %.0f%%  B: %s",
                                        app.compareMode == App::CmpSplit ? "split" : "wipe",
-                                       fr * 100, b->name.c_str());
+                                       fr * 100, abDocLabel(b).c_str());
                 }
                 // swapping A and B is a thing you reach for constantly, so it needs
                 // a visible control and not only a keyboard shortcut
@@ -10827,6 +17207,23 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("Put %s on the A side and %s on the B side"
                                           "   (Shift+\\ or Shift+C)",
                                           b->name.c_str(), cur() ? cur()->name.c_str() : "");
+                    // how the STATISTICS panels show the same pair, next to the
+                    // divider setting they belong with (also in View > Compare A/B)
+                    static const char* ABL[3] = { "stats: auto", "stats: overlay",
+                                                  "stats: side by side" };
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(ImGui::CalcTextSize(ABL[2]).x +
+                                            ImGui::GetFrameHeight() * 1.4f);
+                    int alv = std::clamp(app.abStatsLayout, 0, 2);
+                    if (ImGui::BeginCombo("##abstatslayout", ABL[alv])) {
+                        for (int i = 0; i < 3; i++)
+                            if (ImGui::Selectable(ABL[i], alv == i)) app.abStatsLayout = i;
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Histogram / Projection / Temporal layout for this\n"
+                                          "comparison. Auto follows the image: split -> side by\n"
+                                          "side, wipe / blink / difference -> overlay.");
                 }
             }
             if (app.showFps) {
@@ -10884,6 +17281,7 @@ int main(int argc, char** argv) {
 
         drawRawModal();
         drawSequenceModal();
+        drawSeriesModal();
         drawFolderPickModal();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
@@ -10939,10 +17337,28 @@ int main(int argc, char** argv) {
                     app.rbBusy || app.mPending > 0 ||
                     app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
+                    // the A/B step throttle is a DEADLINE, not an event: without
+                    // a frame after it expires, B's statistics stay stale until
+                    // the user happens to move the mouse (the input wake tail is
+                    // 0.25 s, the throttle 0.30, and low-bandwidth has no tail)
+                    frameT0 < app.abStepBusyUntil ||
                     // auto blink alternates on a timer, so it needs frames with
                     // no input at all - same case as a background load
                     (app.compareMode == App::CmpFlip && app.flipAuto);
-        if (benchFrames) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
+        // --bench on a FOLDER: accept the picker the way the Load button does,
+        // and do not start counting until the loaders are idle. Without the
+        // first, a folder given to --bench never loads at all; without the
+        // second, the numbers are the decode, not the frame.
+        static bool benchWarm = false;
+        if (!g_browseKeys.empty()) { glfwPollEvents(); app.wakeFrames = 1; busy = true; }
+        if (benchFrames) {
+            glfwPollEvents(); app.wakeFrames = 1; busy = true;
+            if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+            benchWarm = (app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
+                         app.folderPickOpen || app.rfPending > 0 ||
+                         app.pendingCompare >= 0) &&
+                        glfwGetTime() < 600.0;
+        }
         bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
         if (active || busy) {
             // Frame pacing lives here, not in the swap: the driver may ignore
@@ -11006,7 +17422,16 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
+                working |= !app.seqRestore.empty();
+                // a session's series wait for their stacks, then need one frame
+                working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
+                working |= !app.seriesPending.empty();   // ...and so do the picker's
+                working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
+                // a tree node whose LIST is still out: its "(listing...)" row
+                // has to become children without waiting for the mouse to move
+                working |= !app.rbTreePending.empty();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
@@ -11036,10 +17461,18 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "--compare needs two images\n");
             } else {
                 selectImage(0);
-                for (const auto& d : app.images)
-                    if (d->path != app.images[0]->path || d->npzMember != app.images[0]->npzMember) {
-                        setCompareB(d.get()); break;
-                    }
+                const ImageDoc* a0 = app.images[0].get();
+                for (const auto& d : app.images) {
+                    // A different STACK when A is in one. "A different source
+                    // file" was the old rule and it picks frame_001.npy of A's
+                    // OWN stack for a folder-of-frames capture - which is the
+                    // self-comparison this loop exists to avoid, and it also
+                    // pins compareFollowFrame (it only steps B across stacks).
+                    bool other = a0->seqId != 0
+                               ? d->seqId != a0->seqId
+                               : (d->path != a0->path || d->npzMember != a0->npzMember);
+                    if (other) { setCompareB(d.get()); break; }
+                }
                 if (!resolveB()) setCompareB(app.images[1].get());   // same file twice
                 app.compareMode = app.pendingCompare;
             }
@@ -11065,6 +17498,7 @@ int main(int argc, char** argv) {
                              (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
                              (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
                              (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
+                             (uint64_t)(app.abStatsLayout * 8192 + (app.histPlane + 1) * 65536) +
                              (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
                                         app.projMode * 64 + app.projYMode * 256 +
                                         app.roiChannel * 1024 + app.selectedAnn * 4096) +
@@ -11093,8 +17527,77 @@ int main(int argc, char** argv) {
         // PeekMessage/DispatchMessage), which delivers WM_PAINT/WM_SIZE to our
         // own callbacks and would start a second ImGui frame inside this one.
         // IM_ASSERT is compiled out in release, so that corrupts silently.
+        // --bench-step: one frame step per benched frame, bouncing off the ends
+        // so every step is a real cache miss and never a no-op clamp at the last
+        // frame. Stepped BEFORE the draw, so the frame we time is the one that
+        // has to recompute (and, with compare on, recompute B as well).
+        if (benchStep && !benchWarm && cur() && cur()->seqId != 0) {
+            static int benchDir = 1;
+            std::vector<int> bf = framesOfSeq(cur()->seqId);
+            int bpos = 0;
+            for (int i = 0; i < (int)bf.size(); i++) if (bf[i] == app.current) bpos = i;
+            if (bpos >= (int)bf.size() - 1) benchDir = -1;
+            else if (bpos <= 0) benchDir = 1;
+            gotoFrame(benchDir);
+        }
+        // --browse-keys-selftest: one scripted UI action per 8 frames, replayed
+        // into the REAL input queue so the panel cannot tell it from a human.
+        if (!g_browseKeys.empty()) {
+            static double reproT0 = glfwGetTime();
+            static int reproIdle = 0;
+            static bool reproReady = false;
+            ImGuiIO& rio = ImGui::GetIO();
+            auto reproKey = [](const std::string& a) -> ImGuiKey {
+                if (a == "down")  return ImGuiKey_DownArrow;
+                if (a == "up")    return ImGuiKey_UpArrow;
+                if (a == "left")  return ImGuiKey_LeftArrow;
+                if (a == "right") return ImGuiKey_RightArrow;
+                if (a == "enter") return ImGuiKey_Enter;
+                if (a == "home")  return ImGuiKey_Home;
+                if (a == "end")   return ImGuiKey_End;
+                if (a == "back")  return ImGuiKey_Backspace;
+                return ImGuiKey_None;
+            };
+            if (!reproReady) {
+                if (app.rbrowse.connected && !app.rbrowse.entries.empty()) {
+                    reproReady = true;
+                    app.focusRemote = true;      // = clicking the panel
+                    fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
+                            (int)app.rbrowse.entries.size());
+                } else if (glfwGetTime() - reproT0 > 60.0) {
+                    fprintf(stderr, "browsekeys: no listing for %s (%s)\n",
+                            g_browseKeys.c_str(), app.rbrowse.err.c_str());
+                    break;
+                }
+            } else if (keyAct < keyActs.size()) {
+                const std::string& a = keyActs[keyAct];
+                if (keyPhase == 0) {
+                    // every action names what the panel is showing when it runs,
+                    // so a crash log ends on the action that caused it
+                    fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d preview=%s\n",
+                            (int)keyAct, a.c_str(), app.rbrowse.dir.c_str(),
+                            (int)app.rbrowse.entries.size(),
+                            app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
+                    fflush(stderr);
+                    if (a == "more")       app.rbAdvanced = !app.rbAdvanced;
+                    else if (a == "flat")  app.rbFlat = !app.rbFlat;
+                    else if (a == "tree")  app.rbTree = !app.rbTree;
+                    else if (a == "focus") app.focusRemote = true;
+                    else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
+                } else if (keyPhase == 1) {
+                    if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                }
+                if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
+            } else if (++reproIdle > 20) {
+                keysOk = true;
+                fprintf(stderr, "browsekeys: %d action(s) through real frames, "
+                                "no crash: ok\n", (int)keyActs.size());
+                fflush(stderr);
+                break;
+            }
+        }
         redrawNow();
-        if (benchFrames) {
+        if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
             benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
             if (--benchLeft <= 0) break;
@@ -11113,10 +17616,14 @@ int main(int argc, char** argv) {
 
     // it captures main's locals by reference, and teardown can still fire callbacks
     g_drawFrame = nullptr;
-    autosaveSession();                // also covers a normal quit
-    // Only what the user changed in this run: a one-off --sequence flag or the
-    // gamma inside a --session must not quietly become the default.
-    if (app.prefsDirty) savePrefs();
+    // a selftest must not leave its scripted clicks in the user's session or
+    // their preferences (the frameless ones return before ever getting here)
+    if (g_browseKeys.empty()) {
+        autosaveSession();            // also covers a normal quit
+        // Only what the user changed in this run: a one-off --sequence flag or
+        // the gamma inside a --session must not quietly become the default.
+        if (app.prefsDirty) savePrefs();
+    }
     stopSequenceLoader();             // join the workers before tearing anything down
     stopRemoteFetcher();
     stopMeasureWorker();
@@ -11127,5 +17634,9 @@ int main(int argc, char** argv) {
     glfwDestroyWindow(win);
     glfwTerminate();
     plugin_host::unloadAll();
+    if (!g_browseKeys.empty() && !keysOk) {
+        fprintf(stderr, "browsekeys: FAILED (the action list did not finish)\n");
+        return 1;
+    }
     return 0;
 }

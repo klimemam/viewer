@@ -102,13 +102,15 @@ else()
   target_include_directories(mkicon PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
   add_custom_command(
     OUTPUT ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png
-    BYPRODUCTS ${VIEWER_ICON_DIR}/viewer-remote.png
+           ${VIEWER_ICON_DIR}/viewer-remote.ico ${VIEWER_ICON_DIR}/viewer-remote.png
     COMMAND ${CMAKE_COMMAND} -E make_directory ${VIEWER_ICON_DIR}
     COMMAND mkicon ${VIEWER_ICON_DIR}
     DEPENDS mkicon
     COMMENT "generating the application icon (ico + png)")
   add_custom_target(viewer_icons
-                    DEPENDS ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png)
+                    DEPENDS ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png
+                            ${VIEWER_ICON_DIR}/viewer-remote.ico
+                            ${VIEWER_ICON_DIR}/viewer-remote.png)
   add_dependencies(viewer viewer_icons)
   if(WIN32)
     set(VIEWER_ICO "${VIEWER_ICON_DIR}/viewer.ico")

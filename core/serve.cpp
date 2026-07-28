@@ -374,8 +374,34 @@ static bool npySegKey(const std::string& name, std::string& key, std::string& pa
     return anyDigit;
 }
 
+// One stem split into digit / non-digit runs, digit runs keeping their text.
+// Second stage of the grouping needs the VALUES, not just the positions.
+struct SegRun { bool digit; std::string s; };
+static std::vector<SegRun> segRuns(const std::string& stem) {
+    std::vector<SegRun> out;
+    for (size_t i = 0; i < stem.size();) {
+        bool d = isdigit((unsigned char)stem[i]) != 0;
+        size_t j = i;
+        while (j < stem.size() && (isdigit((unsigned char)stem[j]) != 0) == d) j++;
+        out.push_back({ d, stem.substr(i, j - i) });
+        i = j;
+    }
+    return out;
+}
+
 // Partition one directory's files into numbered groups (>= 2 members) and the
 // indices of everything else. `files` are (name, path) of regular files only.
+//
+// Two stages. Stage 1 buckets by npySegKey (every digit run collapsed) - cheap
+// and unchanged. Stage 2 decides, PER BUCKET, which digit run is the frame
+// axis: the LAST varying run (the client's findSequenceSiblings rule). The
+// pattern then keeps every other
+// digit run literal - "gain10_???.npy", never "gain??_???.npy": '?' means
+// "varies along the stack", and a gain digit under a '?' claims two gains got
+// averaged. When a SECOND run also varies, the bucket splits by the other
+// runs' values instead of growing a second '?' - a condition-mixed stack has a
+// meaningless sigma_t, and the client splits those sets too. One-member
+// sub-buckets fall back to singles.
 static void groupNumberedNpy(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                              std::vector<NpyGroup>& groups, std::vector<size_t>& singles) {
     struct Bucket { std::string key, pattern; std::vector<size_t> m; };
@@ -389,22 +415,97 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         if (!b) { buckets.push_back({ key, pat, {} }); b = &buckets.back(); }
         b->m.push_back(i);
     }
-    for (auto& b : buckets) {
-        if (b.m.size() < 2) continue;
-        std::sort(b.m.begin(), b.m.end(), [&](size_t x, size_t y) {
-            return rp::naturalLess(files[x].first, files[y].first);
-        });
+    // emit one group from members that are already in natural order; pattern
+    // from the FIRST member: '?' over the frame-axis run only. Zero-padding
+    // may be uneven (frame_9 / frame_10): the first member's digit count wins,
+    // display-only - members always travel by real name (putGroupEntryV3).
+    auto emit = [&](const std::vector<size_t>& mem, int frameAxis,
+                    const std::string& fallbackPattern) {
         NpyGroup g;
-        g.pattern = b.pattern;
-        for (size_t i : b.m) {
+        if (frameAxis >= 0) {
+            const std::string& nm = files[mem.front()].first;
+            std::vector<SegRun> sr = segRuns(nm.substr(0, nm.size() - 4));
+            int run = 0;
+            for (const auto& r : sr) {
+                if (r.digit && run++ == frameAxis) g.pattern += std::string(r.s.size(), '?');
+                else g.pattern += r.s;
+            }
+            g.pattern += ".npy";
+        } else {
+            g.pattern = fallbackPattern;      // degenerate bucket: stage-1 view
+        }
+        for (size_t i : mem) {
             g.names.push_back(files[i].first);
             used[i] = 1;
             std::error_code ec;
             g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, ec);
             g.mtime = std::max(g.mtime, unixMtime(files[i].second));
         }
-        g.first = files[b.m.front()].second;
+        // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
+        // client applies the SAME function to the patterns it builds locally -
+        // see rp::patternWithExtent for why it has to be the same one.
+        if (frameAxis >= 0) g.pattern = rp::patternWithExtent(g.pattern, g.names);
+        g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
+    };
+    for (auto& b : buckets) {
+        if (b.m.size() < 2) continue;
+        std::sort(b.m.begin(), b.m.end(), [&](size_t x, size_t y) {
+            return rp::naturalLess(files[x].first, files[y].first);
+        });
+        // digit-run values per member (same key -> same run structure)
+        std::vector<std::vector<std::string>> vals(b.m.size());
+        size_t nRuns = 0;
+        bool segOk = true;
+        for (size_t i = 0; i < b.m.size() && segOk; i++) {
+            const std::string& nm = files[b.m[i]].first;
+            for (const auto& r : segRuns(nm.substr(0, nm.size() - 4)))
+                if (r.digit) vals[i].push_back(r.s);
+            if (i == 0) nRuns = vals[i].size();
+            else if (vals[i].size() != nRuns) segOk = false;
+        }
+        int frameAxis = -1, varying = 0;
+        if (segOk) {
+            // The frame axis is the LAST varying run, not the one with the most
+            // distinct values. Capture software puts the counter last -
+            // frame_001, IMG_0001, lv000_f02 - and a condition run can easily
+            // outnumber the frames: 10 illuminances x 3 frames grouped by
+            // illuminance, producing three "stacks" each spanning 10 levels,
+            // which is exactly the condition-mixed stack the canon forbids.
+            for (size_t r = 0; r < nRuns; r++) {
+                std::vector<std::string> distinct;
+                for (const auto& v : vals) {
+                    bool dup = false;
+                    for (const auto& d : distinct) if (d == v[r]) { dup = true; break; }
+                    if (!dup) distinct.push_back(v[r]);
+                }
+                if (distinct.size() < 2) continue;
+                varying++;
+                frameAxis = (int)r;           // keep overwriting: the last one wins
+            }
+        }
+        if (!segOk || frameAxis < 0) {        // cannot analyze: stage-1 grouping
+            emit(b.m, -1, b.pattern);
+            continue;
+        }
+        if (varying < 2) {                    // one varying run: the whole bucket
+            emit(b.m, frameAxis, b.pattern);
+            continue;
+        }
+        // >= 2 varying runs: sub-bucket by every run EXCEPT the frame axis
+        std::vector<std::pair<std::string, std::vector<size_t>>> subs;
+        for (size_t i = 0; i < b.m.size(); i++) {
+            std::string ck;
+            for (size_t r = 0; r < nRuns; r++)
+                if ((int)r != frameAxis) { ck += vals[i][r]; ck += '\x01'; }
+            std::vector<size_t>* sv = nullptr;
+            for (auto& sp : subs) if (sp.first == ck) { sv = &sp.second; break; }
+            if (!sv) { subs.push_back({ ck, {} }); sv = &subs.back().second; }
+            sv->push_back(b.m[i]);
+        }
+        for (const auto& sp : subs)
+            if (sp.second.size() >= 2) emit(sp.second, frameAxis, b.pattern);
+            // < 2: stays unused -> falls through to singles below
     }
     for (size_t i = 0; i < files.size(); i++)
         if (!used[i]) singles.push_back(i);
