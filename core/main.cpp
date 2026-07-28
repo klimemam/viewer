@@ -2927,6 +2927,9 @@ struct RawDialog {
 } rawDlg;
 // raw settings captured once and reused for every stack queued by "Open Folder"
 static RawDialog g_folderRecipe;
+// published by drawRawModal each frame: ImGui::IsPopupOpen(name) needs a live
+// frame, and --browse-keys-selftest's action list runs between frames
+static bool g_rawPopupAlive = false;
 static void openRawDialogFor(const std::string& path);
 
 static void rawGuessDims(RawDialog& d) {
@@ -4676,8 +4679,10 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
 // Start the next queued stack once the loader is idle. Raw stacks need format
 // settings: the dialog is shown once and the recipe is reused for the rest.
 static void startNextQueuedGroup() {
-    if (app.seqQueue.empty() || app.seqRunning || rawDlg.open || rawDlg.forQueue ||
-        app.folderPickOpen) return;
+    // rawDlg.open now means "the RAW dialog is alive", and forQueue can only
+    // be true while it is - so a lost dialog can no longer strand the queue
+    if (app.seqQueue.empty() || app.seqRunning || rawDlg.open ||
+        (rawDlg.forQueue && rawDlg.open) || app.folderPickOpen) return;
     App::PendingGroup g = app.seqQueue.front();
     if (g.isRaw && !app.folderRecipeValid) {
         openRawDialogFor(g.files[0]);          // ask once for the whole batch
@@ -5048,7 +5053,12 @@ static void pickerAccept() {
 // and "everything as ONE stack". Group count is capped at 256 by the scans, so
 // the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
-    if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences")) {
+    // Not just "my popup is not open" but "no popup is open": two root-level
+    // modals that each reopen themselves every frame evict each other inside a
+    // SINGLE frame (drag-drop a numbered .npy while the picker is up), and both
+    // windows are then submitted on top of one another every frame. Whoever
+    // loses simply opens when the winner closes.
+    if (app.folderPickOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         fprintf(stderr, "picker: OpenPopup (remote=%d, %d groups)\n",
                 app.folderPickRemote ? 1 : 0, (int)app.folderPick.size());
         ImGui::OpenPopup("Select sequences");
@@ -6727,7 +6737,19 @@ static std::string fmtVal(float v, const std::string& dtype) {
 
 // ---------------------------------------------------------------- UI
 static void drawRawModal() {
-    if (rawDlg.open) { ImGui::OpenPopup("RAW load settings"); rawDlg.open = false; }
+    // LEVEL-triggered, like the picker / sequence-ask / Start-remote dialogs.
+    // It used to be one-shot (`rawDlg.open` consumed on the frame it opened),
+    // and ImGui's OpenPopupEx CLOSES whatever sits at the current stack level
+    // when a different id is opened there - so an F2 rename or a drag-drop
+    // sequence prompt destroyed this dialog permanently. When it had been
+    // opened for a queued folder that also wedged rawDlg.forQueue true forever,
+    // and forQueue is only ever cleared inside this modal: every later Open
+    // Folder then sat at "queued" until restart. rawDlg.open now means "the
+    // dialog is alive", cleared only by Load or Cancel, so a replaced dialog
+    // comes back and its precondition cannot outlive it.
+    if (rawDlg.open && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        ImGui::OpenPopup("RAW load settings");
+    g_rawPopupAlive = ImGui::IsPopupOpen("RAW load settings");
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("RAW load settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
@@ -6805,6 +6827,7 @@ static void drawRawModal() {
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         rawDlg.replaceIdx = -1;
         if (rawDlg.forQueue) { rawDlg.forQueue = false; app.seqQueue.clear(); }
+        rawDlg.open = false;              // dismissed for real, not replaced
         ImGui::CloseCurrentPopup();
     }
     if (ok) {
@@ -6817,6 +6840,7 @@ static void drawRawModal() {
             g_folderRecipe.replaceIdx = -1;
             app.folderRecipeValid = true;
             rawDlg.forQueue = false;
+            rawDlg.open = false;
             App::PendingGroup g = app.seqQueue.front();
             app.seqQueue.erase(app.seqQueue.begin());
             if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
@@ -6825,6 +6849,7 @@ static void drawRawModal() {
             bool fresh = rawDlg.replaceIdx < 0;
             toast((fresh ? "loaded " : "reinterpreted ") + baseName(rawDlg.path));
             rawDlg.replaceIdx = -1;
+            rawDlg.open = false;
             ImGui::CloseCurrentPopup();
             if (fresh) maybeOfferSequence(app.current);
         }
@@ -12630,7 +12655,14 @@ static void drawFileList() {
                 pendingCloseSeq = si->id;
             ImGui::EndPopup();
           }
-          if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+          // The only shortcut in the program that used to act on an UNFOCUSED
+          // panel, with no text-input and no popup gate - so F2 while typing in
+          // the Browse filter opened a rename popup, and F2 while a modal was up
+          // REPLACED that modal (OpenPopup at root level evicts what is there).
+          if (active && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+              !ImGui::GetIO().WantTextInput &&
+              !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+              ImGui::IsKeyPressed(ImGuiKey_F2, false))
               ImGui::OpenPopup("seqctx");
           // No frame slider here: it used to appear under the active row, and a
           // row that grows on selection makes the whole list jump - the scrub bar
@@ -12780,7 +12812,7 @@ static void drawFileList() {
 }
 
 static void drawSequenceModal() {
-    if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen("Load sequence?"))
+    if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
         ImGui::OpenPopup("Load sequence?");
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -13198,7 +13230,7 @@ static bool isNpyName(const std::string& n) {   // FRAME_001.NPY is still a .npy
 // removes the guesswork - once the session is up, the Files panel browses the
 // server and nobody has to know whether their data is under ~ or /data.
 static void drawRemoteOpenModal() {
-    if (app.remoteDlgOpen && !ImGui::IsPopupOpen("Start remote (ssh)")) {
+    if (app.remoteDlgOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         ImGui::OpenPopup("Start remote (ssh)");
         app.remoteDlgOpen = false;
     }
@@ -13407,6 +13439,11 @@ static std::string g_browseKeys;        // <dir>, empty = not running
 static int g_navKeyGlobal = 0;
 static int g_navKeyYielded = 0;
 static int g_navKeyAtBlur = -1, g_navKeyYieldAtBlur = -1;   // snapshot at "blur"
+// Root-level popup collision evidence: "popupcheck" records whether the RAW
+// dialog is still on the popup stack, once before and once after a competing
+// root-level modal asks to open.
+static int g_popupCheck[2] = { -1, -1 };
+static int g_popupChecks = 0;
 static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
@@ -13414,7 +13451,11 @@ static std::string g_browseKeysActs =
     // ...then hand focus back to nobody and repeat four of the same keys: the
     // main view must own them again, or the gate would be "the arrows are dead"
     // rather than "the panel owns them while it has focus"
-    "blur,down,up,end,home";
+    "blur,down,up,end,home,"
+    // ...and finally the root-level popup collision: open the RAW dialog for a
+    // QUEUE, then ask for the sequence prompt, which is the other root-level
+    // modal. The RAW dialog must survive.
+    "rawopen,popupcheck,seqask,popupcheck";
 
 static void printUsage() {
     printf(
@@ -18131,6 +18172,27 @@ int main(int argc, char** argv) {
                     else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
+                    else if (a == "rawopen") {
+                        App::PendingGroup pg;
+                        pg.files = { "a.raw", "b.raw" };
+                        pg.isRaw = true;
+                        app.seqQueue.push_back(pg);
+                        rawDlg = RawDialog{};
+                        rawDlg.path = "a.raw";
+                        rawDlg.fileSize = 1024;
+                        rawDlg.open = true;
+                        rawDlg.forQueue = true;
+                        rawDlg.queueCount = 1;
+                    }
+                    else if (a == "seqask") {          // the competing root modal
+                        app.seqAskImage = 0;
+                        app.seqAskFiles = { "a.npy", "b.npy" };
+                        app.seqAskPattern = "?.npy";
+                    }
+                    else if (a == "popupcheck") {
+                        if (g_popupChecks < 2)
+                            g_popupCheck[g_popupChecks++] = g_rawPopupAlive ? 1 : 0;
+                    }
                     else if (a == "blur")  { g_browseKeysBlur = true;
                                              g_navKeyAtBlur = g_navKeyGlobal;
                                              g_navKeyYieldAtBlur = g_navKeyYielded; }
@@ -18155,10 +18217,24 @@ int main(int argc, char** argv) {
                                 "after blur it ran %d more: %s\n",
                         g_navKeyAtBlur, g_navKeyYieldAtBlur, afterBlur,
                         routeOk ? "ok" : "FAIL");
-                keysOk = routeOk;
+                // POPUP COLLISION. ImGui's OpenPopupEx closes whatever sits at
+                // the current stack LEVEL when a different id opens there. The
+                // RAW dialog used to be one-shot (its flag consumed the frame it
+                // opened), so any competing root-level OpenPopup destroyed it for
+                // good - and with rawDlg.forQueue set, the only code that clears
+                // that flag lives inside the now-unreachable modal, so every
+                // later Open Folder sat at "queued" until restart.
+                bool popOk = g_popupCheck[0] == 1 && g_popupCheck[1] == 1 &&
+                             (!rawDlg.forQueue || rawDlg.open);
+                fprintf(stderr, "browsekeys: root popup collision: RAW dialog open "
+                                "before the competing modal=%d, after=%d; forQueue "
+                                "implies a live dialog=%d: %s\n",
+                        g_popupCheck[0], g_popupCheck[1],
+                        (!rawDlg.forQueue || rawDlg.open) ? 1 : 0, popOk ? "ok" : "FAIL");
+                keysOk = routeOk && popOk;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
                                 "no crash: %s\n", (int)keyActs.size(),
-                                routeOk ? "ok" : "FAILED");
+                                (routeOk && popOk) ? "ok" : "FAILED");
                 fflush(stderr);
                 break;
             }
