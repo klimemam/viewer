@@ -97,8 +97,11 @@ jobs:
       - name: Package (preserve executable bit)
         if: runner.os != 'Windows'
         run: tar -czf viewer.tgz -C build viewer viewer-serve plugins
+      # upload-artifact v6 / download-artifact v7 are the Node 24-native pairs
+      # (the major numbers differ by one across the two actions); v5 of each
+      # still declared node20 and warned on every run.
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binpath }}
@@ -116,7 +119,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           path: dist
       - name: Assemble the binaries branch
