@@ -58,6 +58,7 @@
 #include <sstream>
 #include <string>
 #include <chrono>
+#include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
 
@@ -184,6 +185,9 @@ struct App {
     bool fitRequested = false;
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     std::unique_ptr<pfd::save_file> saveDlg;
+    std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    std::string pendingCsv;                    // built at click time: the results may
+                                               // change while the OS dialog is open
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
@@ -267,10 +271,23 @@ struct App {
         };
         std::vector<Series> series;
         std::string err;
+        // provenance, built once per run: where measured, on what, over which
+        // target, when, and how long it took. A screenshot of the panel must
+        // answer all of that without the surrounding session.
+        std::string prov;
+        float runMs = 0;
+        // presentation metadata, derived once per run (never in the draw loop):
+        std::vector<int> colColor;             // ANN palette per column; -1 = neutral
+        std::vector<std::string> units;        // per row; "" for text rows
+        std::vector<char> headline;            // per row: the number the user came for
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
     bool anaRunRequest = false;       // set by the Measure menu; consumed by the panel
+    // user-set reference line on the curve plots (a spec limit, a pass line):
+    // one horizontal y = value across every analysis plot, session-persisted
+    bool anaRefOn = false;
+    float anaRef = 0.5f;              // 0.5 = the MTF50 line on an SFR plot
     // host-built-in histogram cache (ROI-aware, CFA-split)
     struct HistState {
         const ImageDoc* img = nullptr;
@@ -1344,13 +1361,48 @@ static void splitAnalyzerName(const std::string& full, std::string& cat, std::st
     if (s == std::string::npos) { cat = "misc"; item = full; }
     else { cat = full.substr(0, s); item = full.substr(s + 1); }
 }
-// precondition hints; ABI v2 moves this into a plugin-declared description field
-static const char* analyzerHint(const std::string& name) {
-    if (name == "stats/moments")       return "any image / ROI";
-    if (name == "noise/floor")         return "flat-ish ROI";
-    if (name == "uniformity/prnu-fpn") return "bright flat field";
-    if (name == "sharpness/gradient")  return "same-scene compare";
-    return "";
+// The Measure menu groups by the QUESTION being asked, not by the plugin file:
+// nobody opens the menu thinking "iso12233", they think "is the resolution
+// there?". The mapping is host knowledge (tiny, additive); unknown categories
+// from third-party plugins fall through and keep their own name as a heading.
+struct MeasureGroup { const char* cat; const char* group; };
+static const MeasureGroup MEASURE_GROUPS[] = {
+    { "noise",      "Noise / SNR" },
+    { "iso12233",   "Resolution / Focus" },
+    { "sharpness",  "Resolution / Focus" },
+    { "uniformity", "Uniformity / Flat field" },
+    { "stats",      "Statistics / Sanity" },
+};
+static const char* measureGroupOf(const std::string& cat) {
+    for (const auto& g : MEASURE_GROUPS)
+        if (cat == g.cat) return g.group;
+    return nullptr;
+}
+
+// Machine-checkable preconditions only. The host must never guess about scene
+// content - it cannot tell a flat field from a portrait, so "wants a flat
+// field" stays a tooltip and the plugin's own error does the talking. What it
+// CAN prove (no image at all, a mosaic the plugin is documented to reject) is
+// worth a disabled item: the reason appears where the click would have been.
+static const char* analyzerDisabledReason(const AnalyzerPluginInfo& a, const ImageDoc* im) {
+    if (!im) return "open an image first";
+    if (a.name == "iso12233/e-sfr" && im->ch == 1 && im->cfa != 0)
+        return "CFA mosaic input - run Process > demosaic (bilinear) first";
+    return nullptr;
+}
+
+// Running a measurement and showing its result are one gesture: the Measure
+// menu (and the M key) must never leave the numbers in a hidden or buried
+// panel. Reveal is half of it - a docked Analysis tab sitting behind
+// Histogram would still swallow the result, hence the explicit focus.
+static void revealAnalysis() {
+    app.showAnalysis = true;
+    ImGui::SetWindowFocus("Analysis");
+}
+static void requestMeasure(int sel) {
+    app.anaSel = sel;
+    app.anaRunRequest = true;   // consumed by the Analysis panel this frame
+    revealAnalysis();
 }
 
 // Set while the background queue loads: newly arrived images must never steal
@@ -2134,7 +2186,8 @@ static void writeSessionTo(std::ostream& f) {
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
-    f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << "\n";
+    f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
+      << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
     // must precede the image lines: it decides whether (F,H,W) reloads as a stack
     f << "npyaxis " << app.npyAxis << "\n";
@@ -2420,7 +2473,13 @@ static std::string loadSession(const std::string& path) {
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
                                            >> app.projYHi >> h >> v;
                                         app.showProjH = h != 0; app.showProjV = v != 0; }
-        else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
+        else if (key == "analysis") {
+            int a = 0, r = 0;
+            float rv = 0.5f;
+            ls >> app.anaSel >> a;
+            app.anaAuto = a != 0;
+            if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
+        }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
         else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
         else if (key == "compare") { int ab = 0, fa = 0;
@@ -4149,6 +4208,17 @@ static void pollFileDialog() {           // called once per frame from the main 
         if (!p.empty()) saveSession(p);
         app.saveDlg.reset();
     }
+    if (app.csvDlg && app.csvDlg->ready(0)) {
+        std::string p = app.csvDlg->result();
+        if (!p.empty()) {
+            if (p.find('.') == std::string::npos) p += ".csv";
+            std::ofstream f(pathFromUtf8(p), std::ios::binary);
+            if (f) { f << app.pendingCsv; toast("curves exported: " + baseName(p)); }
+            else toast("cannot write: " + baseName(p), true);
+        }
+        app.csvDlg.reset();
+        app.pendingCsv.clear();
+    }
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
@@ -5104,6 +5174,12 @@ static void drawAnalysisPlots() {
             }
         }
         if (!first || xmin > xmax || ymin > ymax) continue;
+        // the user's reference line is part of the picture: keep it in range
+        // instead of silently clipping the one line they asked to see
+        if (app.anaRefOn && std::isfinite(app.anaRef)) {
+            ymin = std::min(ymin, app.anaRef);
+            ymax = std::max(ymax, app.anaRef);
+        }
         ImGui::TextDisabled("%s", nm.c_str());
         bool xInt = true;                     // integer axis when the plugin sends no x
         for (const auto& s : S)
@@ -5127,6 +5203,59 @@ static void drawAnalysisPlots() {
                 ImVec2 pt = pr.at(xv, yv);
                 if (has) dl->AddLine(prev, pt, col, 1.5f);
                 prev = pt; has = true;
+            }
+        }
+        // reference line, dashed: data and reference must never read as one
+        // curve. Amber, like the frame markers on the temporal plots.
+        if (app.anaRefOn && std::isfinite(app.anaRef) &&
+            app.anaRef >= pr.ymin && app.anaRef <= pr.ymax) {
+            float y = pr.at(pr.xmin, app.anaRef).y;
+            ImU32 rc = IM_COL32(255, 184, 77, 220);
+            float dash = 6.0f * app.uiScale;
+            for (float x = pr.p0.x; x < pr.p1.x; x += dash * 2)
+                dl->AddLine(ImVec2(x, y), ImVec2(std::min(x + dash, pr.p1.x), y), rc);
+            char rb[32];
+            snprintf(rb, sizeof rb, "ref %.4g", app.anaRef);
+            ImVec2 rts = ImGui::CalcTextSize(rb);
+            dl->AddText(ImVec2(pr.p1.x - rts.x - 4 * app.uiScale,
+                               y - rts.y - 2 * app.uiScale), rc, rb);
+        }
+        // hover readout: crosshair snapped to the nearest sample, values for
+        // every curve in a tooltip. Nobody should eyeball numbers off a plot
+        // in a measurement tool - the curve is the shape, the tooltip is the
+        // number. (A tooltip, so the layout never moves.)
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        if (ImGui::IsWindowHovered() && mp.x >= pr.p0.x && mp.x <= pr.p1.x &&
+            mp.y >= pr.p0.y && mp.y <= pr.p1.y) {
+            float fx = pr.xmin + (mp.x - pr.p0.x) / (pr.p1.x - pr.p0.x) * (pr.xmax - pr.xmin);
+            int best = -1;
+            float bd = FLT_MAX;
+            for (size_t i = 0; i < first->ys.size(); i++) {
+                float xv = first->xs.empty() ? (float)i : first->xs[i];
+                float d = fabsf(xv - fx);
+                if (d < bd) { bd = d; best = (int)i; }
+            }
+            if (best >= 0) {
+                float sx = first->xs.empty() ? (float)best : first->xs[best];
+                float lx = pr.at(sx, pr.ymin).x;
+                dl->AddLine(ImVec2(lx, pr.p0.y), ImVec2(lx, pr.p1.y),
+                            IM_COL32(150, 160, 170, 120));
+                ImGui::BeginTooltip();
+                // quantity + unit on the readout too: the tooltip may end up
+                // in a screenshot without the axes that explain it
+                ImGui::TextDisabled("%s = %.5g   (y: %s)",
+                                    first->xLabel.empty() ? "x" : first->xLabel.c_str(), sx,
+                                    first->yLabel.empty() ? nm.c_str() : first->yLabel.c_str());
+                for (const auto& s : S) {
+                    if (s.name != nm || (size_t)best >= s.ys.size()) continue;
+                    ImU32 col = s.colorIdx >= 0 ? ANN_COLORS[s.colorIdx & 7]
+                                                : IM_COL32(200, 205, 210, 255);
+                    const char* lbl = s.col >= 0 && s.col < (int)app.ana.cols.size()
+                                    ? app.ana.cols[s.col].c_str() : "?";
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col),
+                                       "%s  %.5g", lbl, s.ys[best]);
+                }
+                ImGui::EndTooltip();
             }
         }
         dl->PopClipRect();
@@ -6531,6 +6660,48 @@ static void drawPanelRois() {
     ImGui::EndChild();
 }
 
+// Unit resolution for grid rows: every numeric row gets a unit column entry.
+// Keys that can know their unit carry it in the name ("snr_db", "*_pct",
+// "mtf50 (cy/px)" - the documented plugin convention); image-value rows are in
+// the FILE's units, which only integer dtypes let us name honestly (DN). For
+// float data the dtype itself is shown instead of a unit we would be inventing
+// - a float .npy may hold reflectance, electrons, or anything (same rule the
+// Inspector applies to its value columns).
+static std::string unitForAnalysisKey(const std::string& key, const std::string& dtype) {
+    auto ends = [&](const char* s) {
+        size_t n = strlen(s);
+        return key.size() >= n && key.compare(key.size() - n, n, s) == 0;
+    };
+    bool isInt = !dtype.empty() && (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
+    std::string img = isInt ? "DN" : dtype;            // the file's own value unit
+    if (ends("snr_db"))                              return "dB";
+    if (ends("_pct"))                                return "%";
+    if (key.find("(cy/px)") != std::string::npos)    return "cy/px";
+    if (key == "sfr@nyquist" || key == "finite ratio") return "ratio";
+    if (ends("_deg"))                                return "deg";
+    if (key == "lines_used")                         return "lines";
+    if (key == "pixels")                             return "px";
+    if (ends(".entropy"))                            return "bit";
+    if (ends(".var"))                                return img + "^2";
+    if (key == "varlap" || key == "tenengrad" || key == "grad_mean")
+        return "a.u.";                               // relative-only metrics
+    if (ends(".mean") || ends(".std") || ends(".noise") || ends(".min") ||
+        ends(".max") || ends(".p1") || ends(".p50") || ends(".p99"))
+        return img;
+    return "";     // text rows (method / note) and keys we cannot vouch for
+}
+
+// The number the user came for, per analyzer: mtf50, prnu%, the noise floor.
+// Host knowledge until an ABI v3 lets plugins declare it - same trade-off as
+// the question groups in the Measure menu, and just as additive.
+static const char* analyzerHeadlineSuffix(const std::string& name) {
+    if (name == "noise/floor")         return ".noise";
+    if (name == "uniformity/prnu-fpn") return ".prnu_pct";
+    if (name == "sharpness/gradient")  return "tenengrad";
+    if (name == "iso12233/e-sfr")      return "mtf50 (cy/px)";
+    return nullptr;                    // stats/moments: all rows are peers
+}
+
 static void drawPanelAnalysis() {
     ImageDoc* im = cur();
     if (im && !plugin_host::analyzers().empty()) {
@@ -6587,6 +6758,10 @@ static void drawPanelAnalysis() {
         app.anaRunRequest = false;
         ImGui::SameLine();
         ImGui::Checkbox("auto", &app.anaAuto);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("re-run when the image, ROI set, display range or CFA layout\n"
+                              "changes. Off: results keep the run they came from and the\n"
+                              "status line says so when the inputs have moved on.");
         ImGui::SameLine();
         ImGui::TextDisabled("%s", tgt);
 
@@ -6597,8 +6772,11 @@ static void drawPanelAnalysis() {
                      ana.dataRev != im->dataRev || ana.black != effBlack(*im) ||
                      ana.white != effWhite(*im) || ana.cfa != im->cfa ||
                      ana.cfaPattern != im->cfaPattern;
-        if (runClicked || (app.anaAuto && stale && !app.annBusy)) {
+        bool ranNow = runClicked || (app.anaAuto && stale && !app.annBusy);
+        if (ranNow) {
+            double runT0 = glfwGetTime();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
+            ana.colColor.clear(); ana.units.clear(); ana.headline.clear();
             ana.img = im; ana.uid = im->uid; ana.plugin = app.anaSel; ana.rev = app.annRev;
             ana.dataRev = im->dataRev; ana.black = effBlack(*im); ana.white = effWhite(*im);
             ana.cfa = im->cfa; ana.cfaPattern = im->cfaPattern;
@@ -6620,6 +6798,7 @@ static void drawPanelAnalysis() {
                     rows.clear();
                 }
                 ana.cols.push_back(colLabel);
+                ana.colColor.push_back(colorIdx);   // header wears the ROI's color
                 for (auto& r : ana.vals) r.resize(ana.cols.size());
                 for (const auto& kv : rows) {
                     if (kv.first == "roi") continue;        // grid header already says which ROI
@@ -6646,6 +6825,7 @@ static void drawPanelAnalysis() {
                     int rh = std::clamp(a->h, 0, im->h - ry);
                     if (rw < 1 || rh < 1) {
                         ana.cols.push_back(a->label + " (off)");
+                        ana.colColor.push_back(a->color & 7);
                         for (auto& r : ana.vals) r.resize(ana.cols.size());
                         continue;
                     }
@@ -6653,38 +6833,216 @@ static void drawPanelAnalysis() {
                     runOne(&rr, a->label, a->color & 7);
                 }
             }
+            ana.runMs = (float)((glfwGetTime() - runT0) * 1000.0);
+            // per-row presentation, derived once here so the draw loop below
+            // only reads cached strings (no per-frame string building)
+            {
+                const char* hl = analyzerHeadlineSuffix(anas[app.anaSel].name);
+                size_t hn = hl ? strlen(hl) : 0;
+                for (const auto& k : ana.keys) {
+                    ana.units.push_back(unitForAnalysisKey(k, im->dtype));
+                    ana.headline.push_back(hl && k.size() >= hn &&
+                                           k.compare(k.size() - hn, hn, hl) == 0);
+                }
+            }
+            {   // Provenance, built once per run and shown verbatim until the
+                // next one: where this ran, on what, over which target, when,
+                // and how long. [local] is a promise, not decoration - numbers
+                // in this grid are never quietly recomputed anywhere else.
+                char ts[32] = "";
+                time_t now = time(nullptr);
+                if (struct tm* lt = localtime(&now))
+                    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+                char fi[40] = "";
+                if (im->seqId != 0) {
+                    std::vector<int> fr = framesOfSeq(im->seqId);
+                    int pos = 0;
+                    for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
+                    snprintf(fi, sizeof fi, "  frame %d/%d", pos + 1, (int)fr.size());
+                }
+                char pv[384];
+                snprintf(pv, sizeof pv,
+                         "[local] %s%s  %dx%d %s  |  %s  |  range %g..%g  |  %s  |  %.1f ms",
+                         im->name.c_str(), fi, im->w, im->h, im->dtype.c_str(),
+                         rois.empty() ? "whole image" : tgt + 2,   // tgt = "| N ROI(s)"
+                         ana.black, ana.white, ts, ana.runMs);
+                ana.prov = pv;
+            }
         }
+        // Run-state line: one line, every state, constant height - the grid
+        // below must not jump when a result appears or goes stale.
+        if (ana.img != im || ana.prov.empty()) {
+            ImGui::TextDisabled("not measured yet  -  Run, M, or the Measure menu");
+        } else {
+            ImGui::TextDisabled("%s", ana.prov.c_str());
+            if (stale && !ranNow && !app.anaAuto) {
+                // amber, matching the temporal panel's partial-data warning:
+                // old numbers are still shown (they were true when measured),
+                // but they must not be read as describing the current inputs
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                   "|  inputs changed - Run (M)");
+            }
+        }
+        // results toolbar: a constant row (disabled while empty, never absent,
+        // so the grid below sits at a fixed height in every state)
+        ImGui::BeginDisabled(ana.img != im || ana.keys.empty());
+        if (ImGui::Button("Copy table (TSV)")) {
+            // provenance rides along as a # comment: a pasted grid must carry
+            // the same evidence as a screenshot of the panel
+            std::string tsv = "# " + ana.prov + "\n";
+            tsv += "metric\tunit";
+            for (const auto& cn : ana.cols) tsv += "\t" + cn;
+            tsv += "\n";
+            for (int k = 0; k < (int)ana.keys.size(); k++) {
+                tsv += ana.keys[k] + "\t" + (k < (int)ana.units.size() ? ana.units[k] : "");
+                for (int c = 0; c < (int)ana.cols.size(); c++)
+                    tsv += "\t" + (c < (int)ana.vals[k].size() ? ana.vals[k][c] : std::string());
+                tsv += "\n";
+            }
+            ImGui::SetClipboardText(tsv.c_str());
+            toast("result grid copied as TSV (provenance included)");
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(ana.img != im || ana.series.empty() || app.csvDlg != nullptr);
+        if (ImGui::Button("Export curves (CSV)...")) {
+            // wide per series name - x, then one column per measured target -
+            // so a spreadsheet plots it without reshaping. Column labels are
+            // the same ROI labels the grid and canvas use; provenance rides
+            // along as # comment rows. Built NOW: the results may change
+            // while the OS dialog is open.
+            std::string csv = "# " + ana.prov + "\n";
+            std::vector<std::string> names;
+            for (const auto& s : ana.series) {
+                bool seen = false;
+                for (const auto& n2 : names) if (n2 == s.name) { seen = true; break; }
+                if (!seen) names.push_back(s.name);
+            }
+            char b[64];
+            for (const auto& nm : names) {
+                const App::AnalysisState::Series* first = nullptr;
+                size_t maxN = 0;
+                for (const auto& s : ana.series) {
+                    if (s.name != nm) continue;
+                    if (!first) first = &s;
+                    maxN = std::max(maxN, s.ys.size());
+                }
+                if (!first) continue;
+                csv += "# series: " + nm +
+                       (first->yLabel.empty() ? "" : "  (y: " + first->yLabel + ")") + "\n";
+                csv += first->xLabel.empty() ? "index" : first->xLabel;
+                for (const auto& s : ana.series)
+                    if (s.name == nm)
+                        csv += "," + (s.col >= 0 && s.col < (int)ana.cols.size()
+                                      ? ana.cols[s.col] : std::string("?"));
+                csv += "\n";
+                // x comes from the first curve: ROIs measured by one analyzer
+                // share the sample grid; shorter curves leave trailing blanks
+                for (size_t i = 0; i < maxN; i++) {
+                    float xv = first->xs.empty() ? (float)i
+                             : (i < first->xs.size() ? first->xs[i] : 0.0f);
+                    snprintf(b, sizeof b, "%.6g", xv);
+                    csv += b;
+                    for (const auto& s : ana.series) {
+                        if (s.name != nm) continue;
+                        csv += ",";
+                        if (i < s.ys.size()) { snprintf(b, sizeof b, "%.6g", s.ys[i]); csv += b; }
+                    }
+                    csv += "\n";
+                }
+            }
+            if (!pfd::settings::available()) {
+                toast("no file-dialog backend found (install zenity or kdialog)", true);
+            } else {
+                app.pendingCsv = std::move(csv);
+                app.csvDlg = std::make_unique<pfd::save_file>("Export curves (CSV)",
+                    "curves.csv", std::vector<std::string>{ "CSV (*.csv)", "*.csv" });
+            }
+        }
+        ImGui::EndDisabled();
+        // reference line: a spec limit the curves must clear reads instantly
+        // off the plot; typing it beats remembering it
+        ImGui::SameLine();
+        ImGui::Checkbox("ref", &app.anaRefOn);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("horizontal reference line on the plots below\n"
+                              "(a spec value / pass line; saved with the session)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
+        ImGui::BeginDisabled(!app.anaRefOn);
+        ImGui::DragFloat("##anaref", &app.anaRef, 0.005f, -FLT_MAX, FLT_MAX, "%.3g");
+        ImGui::EndDisabled();
         if (ana.img == im) {
             if (!ana.err.empty()) {
                 ImGui::PushTextWrapPos(0.0f);       // plugin errors carry paths
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", ana.err.c_str());
                 ImGui::PopTextWrapPos();
             }
-            int nCols = 1 + (int)ana.cols.size();
+            int nCols = 2 + (int)ana.cols.size();       // metric + unit + one per target
             // SizingFixedFit + explicit inner width: with StretchProp, ScrollX never
             // scrolled and simply clipped the numbers (hence the old 16-column cap)
             float colW = ImGui::GetFontSize() * 7.0f;
+            float unitW = ImGui::GetFontSize() * 3.0f;
+            float pad = ImGui::GetStyle().CellPadding.x * 2;
             if (!ana.keys.empty() &&
                 ImGui::BeginTable("anagrid", nCols,
                                   ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_BordersInnerV,
                                   ImVec2(0, 0),
-                                  nCols * (colW + ImGui::GetStyle().CellPadding.x * 2) + nCols + 1)) {
-                ImGui::TableSetupScrollFreeze(1, 1);   // keep the metric names in view
-                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, colW);
+                                  (nCols - 1) * (colW + pad) + unitW + pad + nCols + 1)) {
+                ImGui::TableSetupScrollFreeze(2, 1);   // metric + unit stay in view
+                ImGui::TableSetupColumn("metric", ImGuiTableColumnFlags_WidthFixed, colW);
+                ImGui::TableSetupColumn("unit", ImGuiTableColumnFlags_WidthFixed, unitW);
                 for (const auto& cn : ana.cols)
                     ImGui::TableSetupColumn(cn.c_str(), ImGuiTableColumnFlags_WidthFixed, colW);
-                ImGui::TableHeadersRow();
+                // custom header row so each target column wears its ROI's
+                // color: the frame on the canvas, the curve in the plot and
+                // the column in the grid identify each other without a legend
+                ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+                ImGui::TableNextColumn(); ImGui::TableHeader("metric");
+                ImGui::TableNextColumn(); ImGui::TableHeader("unit");
+                for (int c = 0; c < (int)ana.cols.size(); c++) {
+                    ImGui::TableNextColumn();
+                    int ci = c < (int)ana.colColor.size() ? ana.colColor[c] : -1;
+                    if (ci >= 0)
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImGui::ColorConvertU32ToFloat4(ANN_COLORS[ci & 7]));
+                    ImGui::TableHeader(ana.cols[c].c_str());
+                    if (ci >= 0) ImGui::PopStyleColor();
+                }
+                // headline rows (mtf50, prnu%, noise floor) wear the theme
+                // accent + a tinted row: the grid keeps every number, the
+                // emphasis says which one the analyzer exists to produce
+                ImVec4 acc = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+                ImU32 accBg = ImGui::GetColorU32(ImVec4(acc.x, acc.y, acc.z, 0.14f));
                 for (int k = 0; k < (int)ana.keys.size(); k++) {
+                    bool hl = k < (int)ana.headline.size() && ana.headline[k];
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", ana.keys[k].c_str());
+                    if (hl) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, accBg);
+                    ImGui::TableNextColumn();
+                    if (hl) ImGui::TextUnformatted(ana.keys[k].c_str());
+                    else    ImGui::TextDisabled("%s", ana.keys[k].c_str());
+                    ImGui::TableNextColumn();
+                    if (k < (int)ana.units.size() && !ana.units[k].empty())
+                        ImGui::TextDisabled("%s", ana.units[k].c_str());
                     for (int c = 0; c < (int)ana.cols.size(); c++) {
                         ImGui::TableNextColumn();
-                        if (c < (int)ana.vals[k].size() && !ana.vals[k][c].empty())
-                            ImGui::TextUnformatted(ana.vals[k][c].c_str());
-                        else
+                        if (c >= (int)ana.vals[k].size() || ana.vals[k][c].empty()) {
                             ImGui::TextDisabled("-");
+                            continue;
+                        }
+                        const std::string& v = ana.vals[k][c];
+                        // numbers right-aligned in their fixed column (textNum
+                        // rule: digits keep their place across runs); text rows
+                        // (method / note) stay left-aligned prose
+                        bool num = v[0] == '-' || v[0] == '+' || v[0] == '.' ||
+                                   (v[0] >= '0' && v[0] <= '9');
+                        if (hl) ImGui::PushStyleColor(ImGuiCol_Text, acc);
+                        if (num) textNumStr(v);
+                        else     ImGui::TextUnformatted(v.c_str());
+                        if (hl) ImGui::PopStyleColor();
                     }
                 }
                 ImGui::EndTable();
@@ -7187,21 +7545,73 @@ static void drawMenuBar(GLFWwindow* win) {
     }
     if (!plugin_host::analyzers().empty() && ImGui::BeginMenu("Measure")) {
         const auto& anas = plugin_host::analyzers();
-        std::string lastCat;
-        for (int i = 0; i < (int)anas.size(); i++) {
-            std::string c, n;
-            splitAnalyzerName(anas[i].name, c, n);
-            if (c != lastCat) {
-                if (!lastCat.empty()) ImGui::Separator();
-                ImGui::TextDisabled("%s", c.c_str());
-                lastCat = c;
+        ImageDoc* im = cur();
+        app.anaSel = std::clamp(app.anaSel, 0, (int)anas.size() - 1);
+        // Rerun accelerator first: stepping through frames/images and pressing
+        // M is the comparison loop, and the menu is where M gets discovered.
+        std::string again = "Measure again: " + anas[app.anaSel].name;
+        if (ImGui::MenuItem(again.c_str(), "M", false, im != nullptr))
+            requestMeasure(app.anaSel);
+        if (ImGui::MenuItem("Auto re-run on change", nullptr, app.anaAuto))
+            app.anaAuto = !app.anaAuto;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("re-measure whenever the image, ROI set,\n"
+                              "display range or CFA layout changes");
+        ImGui::Separator();
+        // one pass per question group so co-answering plugins sit together
+        // regardless of registration order; then unknown categories verbatim
+        std::vector<std::string> headers;
+        for (const auto& g : MEASURE_GROUPS) {
+            bool present = false, seen = false;
+            for (const auto& a : anas) {
+                std::string c, n;
+                splitAnalyzerName(a.name, c, n);
+                if (c == g.cat) present = true;
             }
-            const char* hint = !anas[i].desc.empty() ? anas[i].desc.c_str()
-                                                     : analyzerHint(anas[i].name);
-            if (ImGui::MenuItem(n.c_str(), hint[0] ? hint : nullptr,
-                                app.anaSel == i, cur() != nullptr)) {
-                app.anaSel = i;
-                app.anaRunRequest = true;   // panel runs it this frame
+            for (const auto& h : headers) if (h == g.group) seen = true;
+            if (present && !seen) headers.push_back(g.group);
+        }
+        for (const auto& a : anas) {
+            std::string c, n;
+            splitAnalyzerName(a.name, c, n);
+            if (measureGroupOf(c)) continue;
+            bool seen = false;
+            for (const auto& h : headers) if (h == c) seen = true;
+            if (!seen) headers.push_back(c);
+        }
+        for (size_t hi = 0; hi < headers.size(); hi++) {
+            if (hi) ImGui::Separator();
+            ImGui::TextDisabled("%s", headers[hi].c_str());
+            for (int i = 0; i < (int)anas.size(); i++) {
+                std::string c, n;
+                splitAnalyzerName(anas[i].name, c, n);
+                const char* grp = measureGroupOf(c);
+                if ((grp ? grp : c.c_str()) != headers[hi]) continue;
+                const char* reason = analyzerDisabledReason(anas[i], im);
+                // the right column keeps the plugin's identity (the category is
+                // the standard number for iso* measurements); the precondition
+                // moved into the tooltip, where there is room to say it fully
+                if (ImGui::MenuItem(n.c_str(), c.c_str(), app.anaSel == i, !reason))
+                    requestMeasure(i);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (reason) ImGui::SetTooltip("%s", reason);
+                    else if (!anas[i].desc.empty()) ImGui::SetTooltip("%s", anas[i].desc.c_str());
+                }
+            }
+            // Temporal noise is the stack half of the noise question. It is
+            // host-computed (Temporal panel), not a frame analyzer, but the
+            // user asking "how noisy?" must find it HERE, not by knowing the
+            // implementation boundary.
+            if (headers[hi] == "Noise / SNR") {
+                bool inStack = im && im->seqId != 0;
+                if (ImGui::MenuItem("temporal (Temporal panel)", nullptr, false, inStack)) {
+                    app.showTemporal = true;
+                    ImGui::SetWindowFocus("Temporal");
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(inStack
+                        ? "sigma_t / sigma_fpn over the loaded stack (whole frames or the selected ROI)"
+                        : "needs a stack: load a numbered sequence first");
             }
         }
         ImGui::EndMenu();
@@ -7379,6 +7789,7 @@ static void drawHelpAbout() {
                 row("Shift+B",       "pin this frame as B (then move A: frame vs frame)");
                 row("[ / ]",         "move the divider 1% (Shift: 10%)");
                 row("G",             "pixel grid (zoom >= 8x)");
+                row("M",             "measure again (rerun the selected analyzer, focus Analysis)");
                 row("H",             "this help");
                 ImGui::EndTable();
             }
@@ -8094,6 +8505,12 @@ int main(int argc, char** argv) {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
+            // M = measure again: rerun the selected analyzer on the current
+            // image and ROI set, and bring the Analysis panel forward. This is
+            // the whole multi-image comparison loop: arrow key, M, read.
+            if (ImGui::IsKeyPressed(ImGuiKey_M, false) && cur() &&
+                !plugin_host::analyzers().empty())
+                requestMeasure(app.anaSel);
             // P drops a pin at the pixel under the cursor - no click, no modifier
             if (ImGui::IsKeyPressed(ImGuiKey_P, false) && app.hoverX >= 0 &&
                 !annBlockedOnPreview())

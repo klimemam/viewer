@@ -3,6 +3,20 @@
 命名規約: `category/name`。規格由来の測定は規格番号をカテゴリにする(例: `iso12233/e-sfr`)。
 すべて ROI 対応で、複数 ROI があれば「ROI × 指標」の比較グリッドに出力される。
 各アナライザは `method` 行に手法と制約を1行で明示する。
+同梱アナライザはすべて ABI v2 登録で、`description`(前提条件1行)を自己申告する。
+Measure メニューはそれをツールチップに出す(UX 設計は [measure-ux.md](measure-ux.md))。
+
+## 出力キーの規約(単位・見出し)
+
+- **単位はキー名が自己申告する**: `snr_db`(dB)、`*_pct`(%)、`mtf50 (cy/px)`、
+  `edge_angle_deg`。ホストはこれを unit 列に展開する
+- 画像値系のキー(`.mean` `.std` `.noise` `.min/.max/.p1/.p50/.p99` `.var`)は
+  **ファイルの単位**: ホストが dtype から決める(整数 → DN、float → dtype 名。
+  float ファイルの物理単位はファイルに書かれていないので断定しない)
+- 相対指標(`varlap` `tenengrad` `grad_mean`)は a.u.(絶対値に意味なし)
+- **見出し数値**(そのアナライザの主目的の数値)はホスト側の対応表で
+  アクセント強調される: `.noise` / `.prnu_pct` / `tenengrad` / `mtf50 (cy/px)`。
+  ABI v3 でプラグイン申告に移す予定
 
 ## stats/moments
 
