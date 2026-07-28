@@ -570,6 +570,8 @@ struct App {
     int pickBatchMode = 0;
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
+    int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+                                      // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
         int seqId = -1;
@@ -2845,6 +2847,12 @@ static std::string loadSession(const std::string& path) {
                 while (!l2.empty() && (l2.back() == '\r' || l2.back() == '\n')) l2.pop_back();
                 ini += l2;
                 ini += "\n";
+            }
+            {   // sessions saved before the "Remote" -> "Browse###Remote"
+                // rename: migrate the window entry or the panel undocks
+                size_t p;
+                while ((p = ini.find("[Window][Remote]")) != std::string::npos)
+                    ini.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
             }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);
@@ -5235,7 +5243,28 @@ static void openFolderDialog() {
         return;
     }
     if (app.folderDlg) return;
+    app.folderDlgMode = 0;
     app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+}
+// The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
+// folder opens in the Browse panel through the LOCAL peer - the same listing,
+// grouping, filters and server stats a remote machine gets, on this disk.
+static void browseLocalFolder(std::string p) {
+    if (p.empty()) return;
+    std::replace(p.begin(), p.end(), '\\', '/');
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    startRemote("local://" + p);
+    app.showRemote = true;
+    app.focusRemote = true;
+}
+static void browseFolderDialog() {
+    if (!pfd::settings::available()) {
+        toast("no file-dialog backend found (install zenity or kdialog)", true);
+        return;
+    }
+    if (app.folderDlg) return;
+    app.folderDlgMode = 1;
+    app.folderDlg = std::make_unique<pfd::select_folder>("Browse folder (local)");
 }
 static void saveSessionDialog() {
     if (app.images.empty()) { toast("nothing to save - no images loaded", true); return; }
@@ -5270,7 +5299,10 @@ static void pollFileDialog() {           // called once per frame from the main 
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
-        if (!p.empty()) openFolder(p);
+        if (!p.empty()) {
+            if (app.folderDlgMode == 1) browseLocalFolder(p);   // Browse panel
+            else openFolder(p);                                 // load stacks
+        }
     }
 }
 
@@ -8413,6 +8445,11 @@ static void drawRemotePlacesCombo() {
     if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
                            ImGuiComboFlags_HeightLarge))
         return;
+    // display only: a local place reads better as "[local] path" than as the
+    // url scheme (the stored prefs string stays the url)
+    auto placeLabel = [](const std::string& u) {
+        return u.rfind("local://", 0) == 0 ? "[local] " + u.substr(8) : u;
+    };
     int rm = -1;
     if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");
     for (int i = 0; i < (int)app.rbBookmarks.size(); i++) {
@@ -8420,7 +8457,8 @@ static void drawRemotePlacesCombo() {
         if (ImGui::SmallButton("x")) rm = i;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
         ImGui::SameLine();
-        if (ImGui::Selectable(app.rbBookmarks[i].c_str())) goToPlace(app.rbBookmarks[i]);
+        if (ImGui::Selectable(placeLabel(app.rbBookmarks[i]).c_str()))
+            goToPlace(app.rbBookmarks[i]);
         ImGui::PopID();
     }
     if (rm >= 0) {
@@ -8431,7 +8469,8 @@ static void drawRemotePlacesCombo() {
     if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
         ImGui::PushID(1000 + i);
-        if (ImGui::Selectable(app.rbRecents[i].c_str())) goToPlace(app.rbRecents[i]);
+        if (ImGui::Selectable(placeLabel(app.rbRecents[i]).c_str()))
+            goToPlace(app.rbRecents[i]);
         ImGui::PopID();
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
@@ -9323,6 +9362,13 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // The local mirror of browsing a server: look around, preview, use the
+        // server-side stats - without loading anything. Same Browse panel, the
+        // peer just runs on this machine.
+        if (ImGui::MenuItem("Browse Folder (Local)...")) browseFolderDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("open a folder in the Browse panel: list, preview\n"
+                              "and measure without loading anything");
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
@@ -9522,7 +9568,7 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
-            ImGui::MenuItem("Remote", nullptr, &app.showRemote);
+            ImGui::MenuItem("Browse", nullptr, &app.showRemote);
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
@@ -9836,6 +9882,7 @@ static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut +
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
+static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
 
 static void printUsage() {
     printf(
@@ -9964,6 +10011,8 @@ static void parseCli(int argc, char** argv) {
             g_batchSelftest = next();              // handled in main()
         } else if (a == "--rtemporal-selftest") {
             g_rtemporalSelftest = next();          // handled in main()
+        } else if (a == "--localbrowse-selftest") {
+            g_localbrowseSelftest = next();        // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -10613,6 +10662,21 @@ int main(int argc, char** argv) {
         }
         if (iniPath.empty()) { io.IniFilename = nullptr; app.resetLayout = true; }
     }
+    // One-time migration: the browser window was renamed "Remote" ->
+    // "Browse###Remote". ImHashStr treats the ### part as the whole identity,
+    // so a saved [Window][Remote] entry no longer matches and the panel would
+    // silently lose its docked place. Rewrite the ini before ImGui reads it.
+    if (!iniPath.empty()) {
+        std::string txt;
+        if (readWholeFile(iniPath, txt) &&
+            txt.find("[Window][Remote]") != std::string::npos) {
+            size_t p;
+            while ((p = txt.find("[Window][Remote]")) != std::string::npos)
+                txt.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+            std::ofstream mf(pathFromUtf8(iniPath), std::ios::binary);
+            if (mf) mf << txt;
+        }
+    }
 
     float xs = 1, ys = 1;
     glfwGetWindowContentScale(win, &xs, &ys);
@@ -10795,6 +10859,34 @@ int main(int argc, char** argv) {
             }
         }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // The local-browse entry, verifiable without a human: the function behind
+    // File > Browse Folder (Local)... must land the picked folder in the Browse
+    // panel through the LOCAL peer - connected, empty host, entries listed.
+    if (!g_localbrowseSelftest.empty()) {
+        browseLocalFolder(g_localbrowseSelftest);   // exactly what the menu does
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const App::RemoteBrowse& B = app.rbrowse;
+        bool ok = B.connected && B.host.empty() && !B.entries.empty() &&
+                  app.showRemote;
+        fprintf(stderr, "localbrowseselftest: connected=%d host='%s' dir=%s "
+                        "entries=%d showBrowse=%d%s%s\n",
+                B.connected ? 1 : 0, B.host.c_str(), B.dir.c_str(),
+                (int)B.entries.size(), app.showRemote ? 1 : 0,
+                B.err.empty() ? "" : " err=", B.err.c_str());
+        fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopRemoteFetcher();
+        stopMeasureWorker();
         stopSequenceLoader();
         return ok ? 0 : 1;
     }
@@ -11246,7 +11338,7 @@ int main(int argc, char** argv) {
             // the filter box there), so frame-stepping must yield to it.
             ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
             bool remoteFocused = nav && nav->RootWindow &&
-                                 strcmp(nav->RootWindow->Name, "Remote") == 0;
+                                 strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
             if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
@@ -11351,7 +11443,7 @@ int main(int argc, char** argv) {
             right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
             bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.28f, nullptr, &center);
             ImGui::DockBuilderDockWindow("Files", left);
-            ImGui::DockBuilderDockWindow("Remote", left);   // tabbed with Files
+            ImGui::DockBuilderDockWindow("Browse###Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
@@ -11370,7 +11462,10 @@ int main(int argc, char** argv) {
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         if (app.showRemote) {
             if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
-            if (ImGui::Begin("Remote", &app.showRemote)) drawPanelRemote();
+            // Renamed "Browse" (it browses local folders too, via the local
+            // peer), with the ImGui ID pinned by the ### suffix so the title
+            // can change again without orphaning docked layouts.
+            if (ImGui::Begin("Browse###Remote", &app.showRemote)) drawPanelRemote();
             ImGui::End();
         }
         if (app.showMessages) {
