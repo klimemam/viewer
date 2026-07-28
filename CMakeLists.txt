@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(pixelscope_native C CXX)   # C: bundled plugins are pure C
+if(WIN32)
+  enable_language(RC)              # core/viewer.rc.in: exe icon + version block
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,7 +68,7 @@ add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
-                      core/serve.cpp core/remote.cpp
+                      core/serve.cpp core/remote.cpp core/app_icon.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # third-party: do not police its warnings. MINIZ_NO_STDIO drops the archive
 # file-I/O layer we never use (only the in-memory codec is called), which also
@@ -81,6 +84,38 @@ target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
+endif()
+
+# ---- application icon --------------------------------------------------------
+# The mark is drawn by core/app_icon.cpp, so the repository carries a
+# description instead of a folder of bitmaps. A host tool renders it into the
+# formats each desktop wants; the window icon itself is set at runtime from the
+# same code (and retinted when a remote session is up).
+set(VIEWER_ICON_DIR ${CMAKE_BINARY_DIR}/icons)
+if(CMAKE_CROSSCOMPILING)
+  # a host tool cannot be run from a cross build; the exe just keeps the default
+  # shell icon there, and the window icon still works (it is drawn at runtime)
+  message(STATUS "cross-compiling: skipping the generated app icon files")
+else()
+  add_executable(mkicon tools/mkicon.cpp core/app_icon.cpp ${miniz_SOURCE_DIR}/miniz.c)
+  target_include_directories(mkicon PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
+  add_custom_command(
+    OUTPUT ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png
+    BYPRODUCTS ${VIEWER_ICON_DIR}/viewer-remote.png
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${VIEWER_ICON_DIR}
+    COMMAND mkicon ${VIEWER_ICON_DIR}
+    DEPENDS mkicon
+    COMMENT "generating the application icon (ico + png)")
+  add_custom_target(viewer_icons
+                    DEPENDS ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png)
+  add_dependencies(viewer viewer_icons)
+  if(WIN32)
+    set(VIEWER_ICO "${VIEWER_ICON_DIR}/viewer.ico")
+    configure_file(core/viewer.rc.in ${CMAKE_BINARY_DIR}/viewer.rc @ONLY)
+    target_sources(viewer PRIVATE ${CMAKE_BINARY_DIR}/viewer.rc)
+    set_source_files_properties(${CMAKE_BINARY_DIR}/viewer.rc PROPERTIES
+                                OBJECT_DEPENDS "${VIEWER_ICO}")
+  endif()
 endif()
 
 # The remote peer as its own binary. A compute server typically has no OpenGL and

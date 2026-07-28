@@ -226,7 +226,7 @@ viewer/
   plugins/         # 同梱プラグイン (描画系 / 解析系 / Processor, すべて純 C)
   include/ps/      # 公開 C ABI ヘッダ (これが契約のすべて)
   docs/            # マニュアル, アナライザ仕様, UI デザインスタディ
-  tools/           # テストデータ生成など補助スクリプト
+  tools/           # テストデータ生成, アイコン生成 (mkicon), ショートカット導入スクリプト
   pixelscope.html  # Web 版プロトタイプ (UI リファレンス / 将来のリモート UI)
   (予定) python/   # 埋め込み Python ランタイム + デコレータ API
 ```

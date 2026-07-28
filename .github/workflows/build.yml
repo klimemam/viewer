@@ -97,11 +97,20 @@ jobs:
           Copy-Item build/Release/viewer.exe stage/
           Copy-Item build/Release/viewer-serve.exe stage/
           Copy-Item -Recurse build/plugins stage/plugins
+          # desktop shortcut installer, and the generated icon it can point at
+          Copy-Item tools/install_shortcut.cmd stage/
+          Copy-Item tools/install_shortcut.ps1 stage/
+          Copy-Item build/icons/viewer.ico stage/
+          Copy-Item build/icons/viewer.png stage/
       # viewer-serve is what you copy to a compute server: it links no GL and no
       # X11, so it starts on a headless box where the GUI binary would not load.
       - name: Package (preserve executable bit)
         if: runner.os != 'Windows'
-        run: tar -czf viewer.tgz -C build viewer viewer-serve plugins
+        run: |
+          # install_shortcut.sh writes the .desktop entry / .app bundle and wants
+          # icons/viewer.png next to it, so both travel with the binaries
+          cp tools/install_shortcut.sh build/
+          tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh
       # upload-artifact v6 / download-artifact v7 are the Node 24-native pairs
       # (the major numbers differ by one across the two actions); v5 of each
       # still declared node20 and warned on every run.
@@ -162,9 +171,20 @@ jobs:
           - win64/viewer.exe            - the GUI (Windows)
           - win64/viewer-serve.exe      - the headless peer (Windows)
           - win64/plugins/              - analyzers (keep next to the exe)
+          - win64/install_shortcut.cmd  - put it on the desktop / Start menu
           - linux-x64/viewer            - the GUI (Linux)
           - linux-x64/viewer-serve      - the headless peer for a compute server
-          - macos-arm64/                - the same pair for macOS
+          - linux-x64/install_shortcut.sh - the same, as a .desktop entry
+          - macos-arm64/                - the same set for macOS (.app bundle)
+
+          Starting it from an icon instead of a shell:
+
+              win64\install_shortcut.cmd                 (Windows)
+              ./linux-x64/install_shortcut.sh            (Linux / macOS)
+
+          Add `-RemoteHost user@server` / `--host user@server` for a second
+          shortcut that connects to that machine on startup. The shortcuts point
+          at the binary in place, so `update.cmd` keeps them current.
 
           See docs/startup.md on main for how ssh:// viewing fits together.
           EOF

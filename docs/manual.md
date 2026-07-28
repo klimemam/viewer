@@ -11,6 +11,11 @@
 配置は自動保存され(`%APPDATA%/viewer/layout.ini`、Linux/macOS は `~/.config/viewer/`)、
 `View > Panels` で表示切替、`View > Panels > Reset layout` で既定配置に戻せます。
 
+**ウィンドウ自体の見分け**: タイトルは `画像名 - viewer`、リモートを見ているときは
+`画像名 - viewer [user@server]`。タスクバー/ウィンドウのアイコンも**枠の色が青=ローカル /
+緑=リモート接続中**に変わります(ステータスバー左端のリンク表示と同じ色)。
+デスクトップからの起動については [startup.md](startup.md#0-2-デスクトップ--スタートメニューから起動する)。
+
 | パネル | 役割 | 既定位置 |
 |---|---|---|
 | **Files** | 画像・塊(連番)の一覧、フレームスライダ | 左 |
@@ -350,6 +355,8 @@ viewer [options] [files...]
   --compare <off|wipe|split|diff>  先頭2枚を A/B 比較で開く
   --sequence <ask|always|never>  連番の裏読み込み
   --npy-axis <auto|frames>   (F,H,W) の解釈
+  ssh://user@host/path.npy   リモートのファイルを開く
+  ssh://user@host/~/dir      リモートに接続してそのフォルダを表示(ホストだけでも可)
 ```
 例: `viewer --raw-dtype f32 --raw-interp bayer --bayer-pattern rggb --raw-size 4096x3072 dump.raw`
 
