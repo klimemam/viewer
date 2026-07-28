@@ -27,6 +27,7 @@
 #include "remote_proto.h"
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cctype>
 #include <cfloat>
@@ -346,14 +347,18 @@ struct App {
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
-    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2 };
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3 };
     struct RbJob { int kind = RbConnect; std::string host, dir; int port = 0; };
+    // one numbered .npy sequence found by a scan: files are full remote paths
+    struct RbGroup { std::string name; std::vector<std::string> files; };
     struct RbResult {
         int kind = RbConnect;
         bool ok = false;
         std::string err, host, dir, info;
         int port = 0;
         std::vector<remote::Entry> entries;
+        std::vector<RbGroup> groups;      // RbScan only
+        int scanSingles = 0;              // loose .npy left unopened by the scan
     };
     std::thread rbThread;
     std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
@@ -542,7 +547,8 @@ static App app;
 static const char* REMOTE_HOME = "~/.viewer";
 #define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
 static void openRemote(const std::string& url);
-static void openRemoteStack(const std::string& host, const std::vector<std::string>& files);
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
+                            const std::string& name = std::string());
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
@@ -2128,7 +2134,8 @@ static void restoreFull() {
 }
 
 static void openRemote(const std::string& url);   // fwd: sessions can hold ssh:// images
-static void openRemoteStack(const std::string& host, const std::vector<std::string>& files);
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
+                            const std::string& name);   // default lives on the first decl
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
@@ -3825,6 +3832,66 @@ static void rbSetPhase(const std::string& p) {
     app.rbPhase = p;
 }
 
+// The remote Open Folder: walk the subtree over the existing LIST request and
+// collect numbered .npy sequences, one group per (directory, pattern) - the
+// same "folder of folders, one stack per level" shape openFolder() handles
+// locally. Runs on the rb worker; sesMtx is taken PER LISTING, not for the
+// whole walk, so a click in the UI (which also needs the session) waits tens
+// of milliseconds, not the whole scan.
+static void rbScanTree(const std::string& root, App::RbResult& r) {
+    const int MAX_DEPTH = 5, MAX_DIRS = 256, MAX_GROUPS = 64;
+    std::vector<std::pair<std::string, int>> todo = { { root, 0 } };
+    int dirs = 0;
+    while (!todo.empty() && dirs < MAX_DIRS && (int)r.groups.size() < MAX_GROUPS) {
+        auto [dir, depth] = todo.front();
+        todo.erase(todo.begin());
+        dirs++;
+        rbSetPhase("scanning " + dir + "...");
+        std::vector<remote::Entry> es;
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lk(app.sesMtx);
+            if (!app.remoteSession || !app.remoteSession->list(dir, es, err)) continue;
+        }
+        // group numbered .npy siblings by their pattern (digits before the
+        // extension stripped); >= 2 frames = a stack worth opening
+        std::map<std::string, std::vector<std::string>> pat;
+        for (const auto& e : es) {
+            std::string joined = dir == "/" ? "/" + e.name : dir + "/" + e.name;
+            if (e.dir) {
+                if (depth < MAX_DEPTH) todo.push_back({ joined, depth + 1 });
+                continue;
+            }
+            if (!isNpyName(e.name)) continue;
+            size_t end = e.name.rfind('.');
+            size_t i = end;
+            while (i > 0 && isdigit((unsigned char)e.name[i - 1])) i--;
+            std::string key = i < end ? e.name.substr(0, i) + "#" + e.name.substr(end)
+                                      : std::string();   // un-numbered: no sequence
+            if (key.empty()) { r.scanSingles++; continue; }
+            pat[key].push_back(joined);
+        }
+        for (auto& [key, files] : pat) {
+            if ((int)files.size() < 2) { r.scanSingles += (int)files.size(); continue; }
+            App::RbGroup g;
+            // name the stack like the local scanner does: path relative to the
+            // scan root, so "10lx/frame_#.npy" reads as the level it is
+            std::string rel = dir.size() > root.size() && dir.compare(0, root.size(), root) == 0
+                              ? dir.substr(root.size() + (root.back() == '/' ? 0 : 1)) : "";
+            g.name = (rel.empty() ? "" : rel + "/") + key;
+            sortFramesNumerically(files);
+            g.files = std::move(files);
+            r.groups.push_back(std::move(g));
+        }
+    }
+    std::sort(r.groups.begin(), r.groups.end(),
+              [](const App::RbGroup& a, const App::RbGroup& b) { return a.name < b.name; });
+    if (!todo.empty() || dirs >= MAX_DIRS)
+        r.info = "scan capped (depth " + std::to_string(MAX_DEPTH) + ", " +
+                 std::to_string(MAX_DIRS) + " dirs) - narrow the folder";
+    r.ok = true;
+}
+
 static void rbWorker() {
     while (!app.rbStop) {
         App::RbJob job;
@@ -3857,6 +3924,15 @@ static void rbWorker() {
             r.ok = deployPeer(job.host, job.port, true, log);
             r.info = log;
             r.err = r.ok ? "" : log;
+        } else if (job.kind == App::RbScan) {
+            bool alive;
+            {
+                std::lock_guard<std::mutex> lk(app.sesMtx);
+                alive = app.remoteSession && app.remoteSession->alive() &&
+                        app.remoteSession->host() == job.host;
+            }
+            if (!alive) r.err = "not connected";   // scans start from a live browse
+            else rbScanTree(job.dir, r);
         } else {
             std::lock_guard<std::mutex> lk(app.sesMtx);
             if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
@@ -3930,6 +4006,25 @@ static void pumpRemoteBrowse() {
             g_bootstrapLog = r.info;
             toast(r.ok ? "remote peer updated on " + r.host
                        : "remote update failed: " + r.err, !r.ok);
+            continue;
+        }
+        if (r.kind == App::RbScan) {
+            if (!r.ok) { toast("remote scan: " + r.err, true); continue; }
+            if (r.groups.empty()) {
+                toast("no stacks (2+ numbered .npy) under " + r.dir, true);
+                continue;
+            }
+            // Every group opens; each stack's frame fetches are budgeted as it
+            // opens, so a huge scan degrades to previews + partial stacks, not
+            // to an allocation failure.
+            for (const auto& g : r.groups)
+                openRemoteStack(r.host, g.files, g.name);
+            char msg[160];
+            snprintf(msg, sizeof msg, "opened %d stack(s)%s%s", (int)r.groups.size(),
+                     r.scanSingles ? " (loose single .npy skipped)" : "",
+                     r.info.empty() ? "" : " - scan capped");
+            toast(msg);
+            if (!r.info.empty()) app.seqNote = r.info;
             continue;
         }
         if (!r.ok) {
@@ -4099,7 +4194,8 @@ static void openRemote(const std::string& url) {
 // A remote folder of numbered .npy files, opened as one stack: the first file
 // shows immediately, the rest arrive in the background and slot in as ordinary
 // local frames. Processing never moves - the pixels do, once each.
-static void openRemoteStack(const std::string& host, const std::vector<std::string>& files) {
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
+                            const std::string& name) {
     if (files.empty()) return;
     size_t before = app.images.size();
     openRemote(makeRemoteUrl(host, files[0]));
@@ -4108,7 +4204,11 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     if (first->seqId != 0) return;                // it was a frame-axis file: done
     App::SeqInfo si;
     si.id = app.nextSeqId++;
-    si.name = baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
+    // A scan names the stack by its folder ("10lx/frame_#.npy"): seven stacks
+    // all called frame_000.npy would be indistinguishable in every panel, and
+    // the linearity Auto-levels reads the level from exactly this name.
+    si.name = !name.empty() ? name + " [remote x" + std::to_string(files.size()) + "]"
+              : baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
     si.remoteHost = host;             // folder stack: one file per frame
     si.expectedFrames = (int)files.size();
     for (const auto& f : files) si.remoteFiles.push_back(f);
@@ -7125,15 +7225,35 @@ static void drawPanelRemote() {
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
             if (ImGui::Selectable(lb.c_str()) && servable) {
-                std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
                 if (e.dir) remoteBrowseTo(joined);
                 else       openRemote(makeRemoteUrl(B.host, joined));
             }
-            if (!servable) {
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("only .npy is served remotely");
+            if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
+            if (ImGui::BeginPopupContextItem()) {
+                if (e.dir) {
+                    if (ImGui::MenuItem("Open folder (all stacks below)")) {
+                        App::RbJob j; j.kind = App::RbScan;
+                        j.host = B.host; j.port = B.port; j.dir = joined;
+                        rbEnqueue(std::move(j));
+                        toast("scanning " + e.name + " for stacks...");
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Find every numbered .npy sequence below this\n"
+                                          "folder and open each as a stack - one per\n"
+                                          "subfolder, like a local Open Folder.");
+                } else if (servable && ImGui::MenuItem("Open")) {
+                    openRemote(makeRemoteUrl(B.host, joined));
+                }
+                if (ImGui::MenuItem("Copy path")) {
+                    ImGui::SetClipboardText(makeRemoteUrl(B.host, joined).c_str());
+                    toast("copied");
+                }
+                ImGui::EndPopup();
             }
+            if (!servable && ImGui::IsItemHovered())
+                ImGui::SetTooltip("only .npy is served remotely");
             if (!e.dir && e.size) {
                 ImGui::SameLine();
                 ImGui::TextDisabled(e.size >= (1u << 30) ? "%.1f GB" : "%.1f MB",
@@ -7351,6 +7471,27 @@ static void drawMenuBar(GLFWwindow* win) {
             app.focusRemote = true;
             if (!app.rbrowse.connected) app.remoteDlgOpen = true;
         }
+        // The remote Open Folder: scan the folder being browsed, open every
+        // numbered sequence below it as a stack (one per subfolder - the
+        // linearity capture layout). Not connected yet: connect first, exactly
+        // like Open File (Remote).
+        if (ImGui::MenuItem("Open Folder (Remote)...")) {
+            app.showRemote = true;
+            app.focusRemote = true;
+            if (!app.rbrowse.connected) {
+                app.remoteDlgOpen = true;
+            } else {
+                App::RbJob j; j.kind = App::RbScan;
+                j.host = app.rbrowse.host; j.port = app.rbrowse.port;
+                j.dir = app.rbrowse.dir;
+                rbEnqueue(std::move(j));
+                toast("scanning " + app.rbrowse.dir + " for stacks...");
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Opens every numbered .npy sequence under the folder\n"
+                              "currently shown in the Remote panel (browse there\n"
+                              "first, or right-click a folder in the panel).");
         if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
             App::RbJob j; j.kind = App::RbUpdatePeer;
             j.host = app.rbrowse.host; j.port = app.rbrowse.port;
@@ -7811,6 +7952,7 @@ static void drawHelpAbout() {
 
 // ---------------------------------------------------------------- CLI
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
+static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 
 static void printUsage() {
     printf(
@@ -7924,6 +8066,8 @@ static void parseCli(int argc, char** argv) {
             app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
+        } else if (a == "--scan-selftest") {
+            g_scanSelftest = next();               // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -8394,6 +8538,39 @@ int main(int argc, char** argv) {
         });
 
     parseCli(argc, argv);
+
+    // Remote Open Folder, verifiable without a human or a second machine: connect
+    // to the local peer, scan a folder-of-folders, and count what opened. Goes
+    // through the REAL path - rb worker, LIST protocol, grouping, stack open.
+    if (!g_scanSelftest.empty()) {
+        std::string dir = g_scanSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        bool scanSent = false;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpSequenceAndQueue();
+            if (app.rbrowse.connected && !scanSent) {
+                App::RbJob j; j.kind = App::RbScan;
+                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = dir;
+                rbEnqueue(std::move(j));
+                scanSent = true;
+            }
+            if (scanSent && !app.rbBusy && !app.seqs.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        for (const auto& si : app.seqs)
+            fprintf(stderr, "scanselftest: stack '%s' expected=%d\n",
+                    si.name.c_str(), si.expectedFrames);
+        bool ok = !app.seqs.empty() && app.rbrowse.err.empty();
+        fprintf(stderr, "scanselftest: %d stack(s): %s\n", (int)app.seqs.size(),
+                ok ? "ok" : ("FAILED " + app.rbrowse.err).c_str());
+        stopRbWorker();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
 
     // Linearity, verifiable without a human: load everything, fit, print the
     // numbers. A synthetic set with a known sensitivity and a known gain has to
