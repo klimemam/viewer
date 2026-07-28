@@ -559,6 +559,11 @@ struct App {
     // * and ? wildcards, matched anywhere in FolderPick::rel (see applyPickFilter)
     char pickFilter[256] = "";
     int pickMerge = 0;                // 0 = one stack per group, 1 = ONE merged stack
+    // batch assignment for the accepted selection: 0 = the whole Open is ONE
+    // batch (the canon's default), 1 = one batch per top-level folder of the
+    // scanned root. Ignored under pickMerge (a merged stack is one batch).
+    int pickBatchMode = 0;
+    std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
@@ -695,6 +700,21 @@ static int newBatch(const std::string& name) {
 static int batchReuse(const std::string& name) {
     for (const auto& b : app.batches) if (b.name == name) return b.id;
     return newBatch(name);
+}
+// Batch names must be UNIQUE (docs/terminology.md): sessions restore batches BY
+// NAME (imgbatch -> batchReuse), so two batches sharing one name silently merge
+// on the next load. Collisions get " (2)", " (3)", ...
+static std::string uniqueBatchName(std::string base) {
+    if (base.empty()) base = "opened";
+    auto taken = [](const std::string& n) {
+        for (const auto& b : app.batches) if (b.name == n) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int k = 2;; k++) {
+        std::string n = base + " (" + std::to_string(k) + ")";
+        if (!taken(n)) return n;
+    }
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
@@ -1154,11 +1174,13 @@ static void pumpRemoteFetch() {
             doc->seqId = d.seqId; doc->seqIndex = d.seqIndex;
             doc->uid = app.nextUid++;
             doc->texDirty = true;
-            // frames of one stack share the display range, like the local loader
+            // frames of one stack share the display range (like the local
+            // loader) and its batch (frame ⊂ stack ⊂ batch)
             bool ranged = false;
             for (const auto& q : app.images)
                 if (q->seqId == d.seqId) {
                     doc->black = q->black; doc->white = q->white;
+                    doc->batchId = q->batchId;
                     ranged = true;
                     break;
                 }
@@ -3226,6 +3248,9 @@ static void pumpSequence() {
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
             doc->cfaColorize = ref->cfaColorize;
             doc->displayLut = ref->displayLut;
+            // frame ⊂ stack ⊂ batch: every frame carries its stack's batch, or
+            // "close batch" / "move to batch" sees only the head frame
+            doc->batchId = ref->batchId;
         } else {
             defaultRange(*doc);
         }
@@ -3683,6 +3708,13 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.folderPickHost = host;
     app.pickFilter[0] = 0;                 // a leftover filter would silently cut
     app.pickMerge = 0;                     // the new scan - start every scan clean
+    app.pickBatchMode = 0;                 // batch layout too: one batch is the canon
+    {   // batch names stem from the scanned root's leaf ("batchset", "scanroot")
+        std::string leaf = rootN;
+        size_t sl = leaf.find_last_of('/');
+        if (sl != std::string::npos && sl + 1 < leaf.size()) leaf = leaf.substr(sl + 1);
+        app.folderPickBatchBase = leaf.empty() ? "opened" : leaf;
+    }
     applyPickFilter();
     app.folderPickOpen = true;
 }
@@ -3698,10 +3730,9 @@ static void openFolder(const std::string& path) {
     // a single sequence), and "Always load folder" no longer mutes it: that
     // setting keeps its original job - loading a single FILE's numbered
     // siblings without asking. Headless callers auto-accept via pickerAccept().
-    {   // one fresh batch per Open Folder, named for the root (rename later)
-        int b = newBatch(baseName(path));
-        for (auto& g : groups) g.batchId = b;
-    }
+    // Batches are created at ACCEPT time (pickerAccept), not here: creating one
+    // per scan left an empty batch behind on Cancel, and the picker's batch
+    // mode (one / per top folder) is only known once the user answers.
     openPickerWith(std::move(groups), path, path, false, "");
 }
 
@@ -3766,9 +3797,33 @@ static void pickerAccept() {
     std::vector<App::PendingGroup> sel = pickerSelection(&err);
     bool remote = app.folderPickRemote;
     std::string host = app.folderPickHost;
+    int batchMode = app.pickMerge == 1 ? 0 : app.pickBatchMode;
+    std::string batchBase = app.folderPickBatchBase;
     app.folderPick.clear();
     app.folderPickOpen = false;
     if (sel.empty()) { toast(err.empty() ? "nothing selected" : err, true); return; }
+    // Batches are created HERE, on accept - Cancel used to leave an empty one
+    // behind. Mode 0 (default): the whole Open is one batch named for the root.
+    // Mode 1: one batch per TOP folder of the group name, "root/00" style, so
+    // per-condition folders open as ready-made analysis groupings.
+    if (batchMode == 1) {
+        std::vector<std::pair<std::string, int>> made;   // top folder -> batchId
+        for (auto& g : sel) {
+            size_t sl = g.name.find('/');
+            std::string top = sl == std::string::npos ? std::string() : g.name.substr(0, sl);
+            int id = 0;
+            for (const auto& m : made) if (m.first == top) id = m.second;
+            if (!id) {
+                id = newBatch(uniqueBatchName(top.empty() ? batchBase
+                                                          : batchBase + "/" + top));
+                made.emplace_back(top, id);
+            }
+            g.batchId = id;
+        }
+    } else {
+        int id = newBatch(uniqueBatchName(batchBase));
+        for (auto& g : sel) g.batchId = id;
+    }
     if (remote) {
         // remote groups: through the open queue, one stack at a time, so the
         // memory budget is applied against reality
@@ -3854,7 +3909,7 @@ static void drawFolderPickModal() {
         mixedRawNpy = anyRaw && anyNpy;
     }
     bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
-    float footer = ImGui::GetFrameHeightWithSpacing() * 2 +
+    float footer = ImGui::GetFrameHeightWithSpacing() * 3 +
                    ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
@@ -3953,6 +4008,41 @@ static void drawFolderPickModal() {
             ImGui::SetTooltip("ALL checked files merge into a single stack,\n"
                               "frames in natural (numeric) order - for a capture\n"
                               "split across folders, or a filtered subset");
+    }
+    // batch row: how the accepted selection is GROUPED in the Files panel.
+    // One batch per Open is the canon's default; per-top-folder splits a root
+    // of condition folders into ready-made analysis groupings. Merge wins over
+    // this (a single merged stack is one batch by construction).
+    {
+        int topFolders = 0;
+        {
+            std::vector<std::string> tops;
+            for (const auto& e : app.folderPick) {
+                if (!e.selected || e.nMatch == 0) continue;
+                size_t sl = e.g.name.find('/');
+                std::string top = sl == std::string::npos ? std::string()
+                                                          : e.g.name.substr(0, sl);
+                bool dup = false;
+                for (const auto& t : tops) if (t == top) { dup = true; break; }
+                if (!dup) tops.push_back(top);
+            }
+            topFolders = (int)tops.size();
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("batch:");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(app.pickMerge == 1);
+        ImGui::RadioButton("one batch###batch0", &app.pickBatchMode, 0);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("everything from this Open lands under ONE Files heading");
+        ImGui::SameLine();
+        char b1[80];
+        snprintf(b1, sizeof b1, "%d batches (one per top folder)###batch1", topFolders);
+        ImGui::RadioButton(b1, &app.pickBatchMode, 1);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("each top-level folder of the scanned root becomes\n"
+                              "its own batch (its own Files heading)");
+        ImGui::EndDisabled();
     }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
@@ -4567,17 +4657,13 @@ static void pumpRemoteBrowse() {
                 return a == "/" ? "/" + b : a + "/" + b;
             };
             std::vector<App::PendingGroup> groups;
-            std::string broot = r.dir;
-            while (broot.size() > 1 && broot.back() == '/') broot.pop_back();
-            size_t bsl = broot.find_last_of('/');
-            int scanBatch = newBatch(bsl == std::string::npos || bsl + 1 >= broot.size()
-                                     ? broot : broot.substr(bsl + 1));
+            // batchId stays 0 here: batches are made at ACCEPT time in
+            // pickerAccept (Cancel must not leave an empty batch behind)
             for (const auto& g : r.scanGroups) {
                 App::PendingGroup pg;
                 pg.name = g.dir.empty() ? g.entry.name : g.dir + "/" + g.entry.name;
                 std::string base = joinR(r.dir, g.dir);
                 for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
-                pg.batchId = scanBatch;
                 if (g.entry.hasMeta && g.entry.ndim > 0) {   // v3 metadata -> the
                     for (int d = 0; d < g.entry.ndim; d++)   // picker's shape column
                         pg.shape += (d ? "x" : "") + std::to_string(g.entry.dims[d]);
@@ -10379,6 +10465,62 @@ int main(int argc, char** argv) {
         } else if (mgot != mwant[0].files || (int)mgot.size() != total) {
             fprintf(stderr, "pickerselftest: UC2 FAILED - merged stack != union in natural order\n");
             ok = false;
+        }
+        // ---- UC5: batch mode "one per top folder" -> N batches, unique names
+        {
+            std::string bsdir;
+            {   // fixture: batchset/ next to the given folder, else testdata
+                std::string d2 = g_pickerSelftest;
+                std::replace(d2.begin(), d2.end(), '\\', '/');
+                size_t sl = d2.find_last_of('/');
+                bsdir = (sl == std::string::npos ? std::string(".") : d2.substr(0, sl))
+                      + "/batchset";
+                std::error_code ec;
+                if (!std::filesystem::is_directory(pathFromUtf8(bsdir), ec))
+                    bsdir = "tools/testdata/batchset";
+            }
+            size_t imagesBefore = app.images.size();
+            openFolder(bsdir);
+            if (!app.folderPickOpen) {
+                fprintf(stderr, "pickerselftest: UC5 FAILED - picker did not open\n");
+                ok = false;
+            } else {
+                app.pickBatchMode = 1;             // the new footer radio
+                pickerAccept();
+                loadAll();
+                std::vector<int> bids;             // distinct batches actually used
+                for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                    int b = app.images[i]->batchId;
+                    if (std::find(bids.begin(), bids.end(), b) == bids.end())
+                        bids.push_back(b);
+                }
+                bool stacksOneBatch = true;        // a stack never straddles batches
+                for (const auto& si : app.seqs) {
+                    int b0 = -1;
+                    for (size_t i = imagesBefore; i < app.images.size(); i++) {
+                        if (app.images[i]->seqId != si.id) continue;
+                        if (b0 < 0) b0 = app.images[i]->batchId;
+                        else if (app.images[i]->batchId != b0) stacksOneBatch = false;
+                    }
+                }
+                bool namesUnique = true;           // sessions restore by NAME
+                for (size_t a2 = 0; a2 < app.batches.size(); a2++)
+                    for (size_t b2 = a2 + 1; b2 < app.batches.size(); b2++)
+                        if (app.batches[a2].name == app.batches[b2].name)
+                            namesUnique = false;
+                std::string names;
+                for (int b : bids)
+                    for (const auto& bb : app.batches)
+                        if (bb.id == b) names += (names.empty() ? "" : ",") + bb.name;
+                fprintf(stderr, "pickerselftest: UC5 batch-per-top-folder -> %d batch(es) "
+                                "[%s], stacks one-batch=%d, names unique=%d\n",
+                        (int)bids.size(), names.c_str(), stacksOneBatch ? 1 : 0,
+                        namesUnique ? 1 : 0);
+                if (bids.size() != 3 || !stacksOneBatch || !namesUnique) {
+                    fprintf(stderr, "pickerselftest: UC5 FAILED - batches wrong\n");
+                    ok = false;
+                }
+            }
         }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();

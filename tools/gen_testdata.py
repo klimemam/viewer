@@ -87,6 +87,18 @@ for lv in ("10lx", "20lx", "40lx"):
     for k in range(8):
         np.save(d / f"frame_{k:03d}.npy", (rng3.random((32, 32)) * 4095).astype(np.float32))
 
+# picker batch-mode fixture (--picker-selftest UC5): three top-level condition
+# folders, each a numbered stack plus a single representative average.npy -
+# "one batch per top folder" must make three batches, stacks intact
+bs = out / "batchset"
+rng4 = np.random.default_rng(21)
+for sub in ("00", "01", "02"):
+    d = bs / sub
+    d.mkdir(parents=True, exist_ok=True)
+    for k in range(3):
+        np.save(d / f"frame_{k:03d}.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
+    np.save(d / "average.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     print(" ", p.name, p.stat().st_size, "bytes")
