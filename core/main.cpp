@@ -58,6 +58,7 @@
 #include <sstream>
 #include <string>
 #include <chrono>
+#include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
 
@@ -267,6 +268,11 @@ struct App {
         };
         std::vector<Series> series;
         std::string err;
+        // provenance, built once per run: where measured, on what, over which
+        // target, when, and how long it took. A screenshot of the panel must
+        // answer all of that without the surrounding session.
+        std::string prov;
+        float runMs = 0;
     } ana;
     bool anaAuto = false;
     int anaSel = 0;
@@ -6140,6 +6146,10 @@ static void drawPanelAnalysis() {
         app.anaRunRequest = false;
         ImGui::SameLine();
         ImGui::Checkbox("auto", &app.anaAuto);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("re-run when the image, ROI set, display range or CFA layout\n"
+                              "changes. Off: results keep the run they came from and the\n"
+                              "status line says so when the inputs have moved on.");
         ImGui::SameLine();
         ImGui::TextDisabled("%s", tgt);
 
@@ -6150,7 +6160,9 @@ static void drawPanelAnalysis() {
                      ana.dataRev != im->dataRev || ana.black != effBlack(*im) ||
                      ana.white != effWhite(*im) || ana.cfa != im->cfa ||
                      ana.cfaPattern != im->cfaPattern;
-        if (runClicked || (app.anaAuto && stale && !app.annBusy)) {
+        bool ranNow = runClicked || (app.anaAuto && stale && !app.annBusy);
+        if (ranNow) {
+            double runT0 = glfwGetTime();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
             ana.img = im; ana.uid = im->uid; ana.plugin = app.anaSel; ana.rev = app.annRev;
             ana.dataRev = im->dataRev; ana.black = effBlack(*im); ana.white = effWhite(*im);
@@ -6205,6 +6217,45 @@ static void drawPanelAnalysis() {
                     psRect rr = { (uint32_t)rx, (uint32_t)ry, (uint32_t)rw, (uint32_t)rh };
                     runOne(&rr, a->label, a->color & 7);
                 }
+            }
+            ana.runMs = (float)((glfwGetTime() - runT0) * 1000.0);
+            {   // Provenance, built once per run and shown verbatim until the
+                // next one: where this ran, on what, over which target, when,
+                // and how long. [local] is a promise, not decoration - numbers
+                // in this grid are never quietly recomputed anywhere else.
+                char ts[32] = "";
+                time_t now = time(nullptr);
+                if (struct tm* lt = localtime(&now))
+                    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+                char fi[40] = "";
+                if (im->seqId != 0) {
+                    std::vector<int> fr = framesOfSeq(im->seqId);
+                    int pos = 0;
+                    for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
+                    snprintf(fi, sizeof fi, "  frame %d/%d", pos + 1, (int)fr.size());
+                }
+                char pv[384];
+                snprintf(pv, sizeof pv,
+                         "[local] %s%s  %dx%d %s  |  %s  |  range %g..%g  |  %s  |  %.1f ms",
+                         im->name.c_str(), fi, im->w, im->h, im->dtype.c_str(),
+                         rois.empty() ? "whole image" : tgt + 2,   // tgt = "| N ROI(s)"
+                         ana.black, ana.white, ts, ana.runMs);
+                ana.prov = pv;
+            }
+        }
+        // Run-state line: one line, every state, constant height - the grid
+        // below must not jump when a result appears or goes stale.
+        if (ana.img != im || ana.prov.empty()) {
+            ImGui::TextDisabled("not measured yet  -  Run, M, or the Measure menu");
+        } else {
+            ImGui::TextDisabled("%s", ana.prov.c_str());
+            if (stale && !ranNow && !app.anaAuto) {
+                // amber, matching the temporal panel's partial-data warning:
+                // old numbers are still shown (they were true when measured),
+                // but they must not be read as describing the current inputs
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                   "|  inputs changed - Run (M)");
             }
         }
         if (ana.img == im) {
