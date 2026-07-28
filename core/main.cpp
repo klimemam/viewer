@@ -494,6 +494,10 @@ struct App {
     // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
     // so the toggle costs no round trip. Persisted: it is a way of working.
     bool rbFlat = false;
+    // Browse header: false = just the path bar and the toolbar (the common
+    // case), true = also the connection row and the server-side search. Also
+    // persisted - "I always search" and "I never do" are both ways of working.
+    bool rbAdvanced = false;
     bool focusRemote = false;         // bring it forward when a menu item asks
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
@@ -2738,6 +2742,7 @@ static void savePrefs() {
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
+    f << "rbadv " << (app.rbAdvanced ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -2773,6 +2778,7 @@ static void loadPrefs() {
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
+        else if (key == "rbadv")       { ls >> v; app.rbAdvanced = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
             std::string s;
@@ -8730,38 +8736,29 @@ static void drawPanelRemote() {
         ImGui::PopID();
         return;
     }
-    // Where we are, and how to leave: host row first, path row under it.
-    ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("disconnect")) { B = App::RemoteBrowse{}; ImGui::PopID(); return; }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("home")) remoteBrowseTo("~");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
-    if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
-    {   // star = bookmark the place being looked at; the combo recalls them
-        std::string curUrl = placeUrl(B.host, B.port, B.dir);
-        bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
-                                 curUrl) != app.rbBookmarks.end();
-        if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
-        if (ImGui::SmallButton("*")) {
-            if (starred)
-                app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
-                                                  app.rbBookmarks.end(), curUrl),
-                                      app.rbBookmarks.end());
-            else
-                app.rbBookmarks.push_back(curUrl);
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (starred) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
-                              curUrl.c_str());
-        ImGui::SameLine();
-        drawRemotePlacesCombo();
-    }
-    // ---- path bar: breadcrumbs, or one text field while editing ----
+    // The panel used to stack FIVE things above the listing: a host row with
+    // three buttons, the breadcrumb bar, the filter, the server-search row, and
+    // (when a preview was alive) the scrub bar. Four of them were there for the
+    // rare case. What is left permanently on screen is what browsing actually
+    // needs - where am I (breadcrumbs) and narrow it down (toolbar + filter) -
+    // and everything else is one click away under "more", with nothing removed.
+    bool& rbAdvanced = app.rbAdvanced;
+    // Server-side search: a different thing from the filter (which only narrows
+    // what is already listed). Declared up here because the path bar's context
+    // menu can aim it at a folder.
+    static char rbSearchBuf[256] = "";
+    static bool rbSearchFocus = false;
+    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
+    // where we are, and how to leave
+    bool atRoot = B.dir == "~" || B.dir == "/";
+    auto rbGoParent = [&]() {
+        if (atRoot) return;
+        std::string d = B.dir;
+        size_t s = d.find_last_of('/');
+        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                        : d.substr(0, s));
+    };
+    // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     static char rbPathEdit[1024];
     static bool rbPathEditing = false, rbPathFocus = false;
     if (!rbPathEditing) {
@@ -8795,15 +8792,44 @@ static void drawPanelRemote() {
                     ImGui::NewLine();
             }
             if (ImGui::SmallButton(segs[k].label.c_str())) remoteBrowseTo(segs[k].path);
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) editReq = true;
+            // Right-click used to jump straight into path editing. It is a menu
+            // now: the actions that take a FOLDER as their subject all belong on
+            // the bar that names the folder.
+            if (ImGui::BeginPopupContextItem("crumbctx")) {
+                const std::string& target = segs[k].path;
+                if (ImGui::MenuItem("Search under here")) {
+                    rbSearchRoot = target;
+                    rbSearchFocus = true;
+                    rbAdvanced = true;          // the search row lives under "more"
+                }
+                if (ImGui::MenuItem("Bookmark")) {
+                    std::string u = placeUrl(B.host, B.port, target);
+                    if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
+                        app.rbBookmarks.end()) {
+                        app.rbBookmarks.push_back(u);
+                        app.prefsDirty = true;
+                        savePrefs();
+                    }
+                    toast("bookmarked " + u);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Copy path")) {
+                    ImGui::SetClipboardText(target.c_str());
+                    toast("copied " + target);
+                }
+                if (ImGui::MenuItem("Edit path...")) editReq = true;
+                ImGui::EndPopup();
+            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\n(right-click to edit the path)", segs[k].path.c_str());
+                ImGui::SetTooltip("%s\n(right-click for what can be done to this folder)",
+                                  segs[k].path.c_str());
             ImGui::PopID();
         }
         if (!segs.empty()) ImGui::SameLine();
         if (ImGui::SmallButton("edit##path")) editReq = true;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("type or paste a path (right-clicking the bar works too)");
+            ImGui::SetTooltip("type or paste a path (right-clicking a crumb works too)");
+        if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
         if (editReq) {
             snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
             rbPathEditing = true;
@@ -8917,6 +8943,129 @@ static void drawPanelRemote() {
         for (const auto& di : app.images)
             if (di->uid == app.previewUid && di->preview) promotePreview(di.get());
     };
+    // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
+    // narrow it down. Everything else is behind "more".
+    static char rbFilter[256] = "";
+    {
+        ImGui::BeginDisabled(atRoot);
+        if (ImGui::SmallButton("up")) rbGoParent();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("parent folder (Backspace)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("home")) remoteBrowseTo("~");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("list this folder again");
+        ImGui::SameLine();
+        // Grouped <-> flat. No round trip: the peer already sent every member.
+        if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
+            app.rbFlat = !app.rbFlat;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(app.rbFlat
+                ? "flat: every frame is its own row.\nclick to collapse numbered "
+                  "sequences back into one row each.\n(per-frame size and date are "
+                  "not in the listing reply - those cells stay blank)"
+                : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
+                  "individually (no request to the server).");
+        ImGui::SameLine();
+        // Filter what is already listed - no round trip. Substring by default,
+        // glob when * or ? appears (globListMatch's contract), because a capture
+        // dump directory holds hundreds of entries and one condition matters.
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+            ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
+                                 rbFilter, sizeof rbFilter);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("filters the listing below without asking the server\n"
+                              "bare text matches anywhere; * and ? make it a glob;\n"
+                              "comma separates alternatives");
+    }
+    // filtered view, by row index (the clipper needs random access)
+    std::vector<int> shown;
+    shown.reserve(view.size());
+    for (int i = 0; i < (int)view.size(); i++)
+        if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
+            shown.push_back(i);
+    if (rbFilter[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
+        rbAdvanced = !rbAdvanced;
+        app.prefsDirty = true;
+        savePrefs();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the connection, the places list and the server-side\n"
+                          "recursive search - the things a browse does not need\n"
+                          "every minute");
+    // ---- row 3, on request: the connection and the server-side search ----
+    if (rbAdvanced) {
+        ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("disconnect")) { B = App::RemoteBrowse{}; ImGui::PopID(); return; }
+        ImGui::SameLine();
+        {   // star = bookmark the place being looked at; the combo recalls them
+            std::string curUrl = placeUrl(B.host, B.port, B.dir);
+            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                     curUrl) != app.rbBookmarks.end();
+            if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
+            if (ImGui::SmallButton("*")) {
+                if (starred)
+                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                      app.rbBookmarks.end(), curUrl),
+                                          app.rbBookmarks.end());
+                else
+                    app.rbBookmarks.push_back(curUrl);
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            if (starred) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
+                                  curUrl.c_str());
+            ImGui::SameLine();
+            drawRemotePlacesCombo();
+        }
+        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        bool go = ImGui::InputTextWithHint("##rbsearch",
+                                           "search server (recursive): frame_* or **/dark.npy",
+                                           rbSearchBuf, sizeof rbSearchBuf,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
+                              "bare text matches anywhere in the relative path;\n"
+                              "* and ? glob across '/'");
+        ImGui::SameLine();
+        if (app.rbSearch.running) {
+            if (ImGui::SmallButton("Stop##rbsearch")) {
+                app.rbSearch.gen++;               // in-flight result becomes stale
+                app.rbSearch.running = false;
+            }
+        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
+            remoteStartSearch(rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
+        }
+        if (!rbSearchRoot.empty()) {
+            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
+        }
+    } else if (!rbSearchRoot.empty() || app.rbSearch.running) {
+        // a search aimed or running is state the user set: never silently
+        // hidden by a fold, even though the row that made it is folded away
+        if (app.rbSearch.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
+        else ImGui::TextDisabled("search aimed at: %s  (\"more\")", rbSearchRoot.c_str());
+    }
     {   // "Open N selected as stack" - enabled only when the v3 metadata proves
         // the frames can actually stack, BEFORE any pixel is transferred
         int nSel = 0;
@@ -8999,78 +9148,6 @@ static void drawPanelRemote() {
             if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
         }
     }
-    // Filter what is already listed - no round-trip to the server. Substring by
-    // default, glob when * or ? appears (globListMatch's contract), because a
-    // capture dump directory holds hundreds of entries and one condition matters.
-    static char rbFilter[256] = "";
-    {
-        // Grouped <-> flat. No round trip: the peer already sent every member.
-        if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
-            app.rbFlat = !app.rbFlat;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(app.rbFlat
-                ? "flat: every frame is its own row.\nclick to collapse numbered "
-                  "sequences back into one row each.\n(per-frame size and date are "
-                  "not in the listing reply - those cells stay blank)"
-                : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
-                  "individually (no request to the server).");
-        ImGui::SameLine();
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
-            ImGui::SetKeyboardFocusHere();
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
-        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
-                                 rbFilter, sizeof rbFilter);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("filters the listing below without asking the server\n"
-                              "bare text matches anywhere; * and ? make it a glob;\n"
-                              "comma separates alternatives");
-    }
-    // filtered view, by row index (the clipper needs random access)
-    std::vector<int> shown;
-    shown.reserve(view.size());
-    for (int i = 0; i < (int)view.size(); i++)
-        if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
-            shown.push_back(i);
-    if (rbFilter[0]) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)view.size());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
-    }
-    // Server-side search - a different thing from the filter above (which only
-    // narrows what is already listed), so it gets its own labelled row.
-    static char rbSearchBuf[256] = "";
-    static bool rbSearchFocus = false;
-    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
-    {
-        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
-        bool go = ImGui::InputTextWithHint("##rbsearch",
-                                           "search server (recursive): frame_* or **/dark.npy",
-                                           rbSearchBuf, sizeof rbSearchBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
-                              "bare text matches anywhere in the relative path;\n"
-                              "* and ? glob across '/'");
-        ImGui::SameLine();
-        if (app.rbSearch.running) {
-            if (ImGui::SmallButton("Stop##rbsearch")) {
-                app.rbSearch.gen++;               // in-flight result becomes stale
-                app.rbSearch.running = false;
-            }
-        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
-            remoteStartSearch(rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
-        }
-        if (!rbSearchRoot.empty()) {
-            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
-        }
-    }
     // The metadata columns exist from protocol 3 on. Say so once, up here - a
     // "-" in every row of every column explains nothing.
     {
@@ -9142,15 +9219,9 @@ static void drawPanelRemote() {
         ImGui::PopID();
         return;
     }
-    bool atRoot = B.dir == "~" || B.dir == "/";
-    auto rbGoParent = [&]() {
-        if (atRoot) return;
-        std::string d = B.dir;
-        size_t s = d.find_last_of('/');
-        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                        : d.substr(0, s));
-    };
-    if (!atRoot && ImGui::Selectable("[..]")) rbGoParent();
+    // The "[..]" row that used to sit here is gone: the toolbar's "up" button
+    // and Backspace both do it, and a row that exists only outside the home
+    // directory shifted every listing row by one line on the way in and out.
     // ---- keyboard navigation of the listing --------------------------------
     // Up / Down walk the rows and preview as they go (what a plain click does),
     // Enter opens for real (what a double-click does), Backspace leaves for the
