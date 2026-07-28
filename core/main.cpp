@@ -345,6 +345,7 @@ struct App {
     std::string rbPhase;              // what the worker is doing, for the UI
     std::atomic<bool> rbBusy{ false };
     std::atomic<bool> rbStop{ false };
+    std::string pendingRemoteOpen;    // opened once the session is up
     std::mutex sesMtx;                // app.remoteSession is shared with that worker
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
@@ -3698,6 +3699,11 @@ static void pumpRemoteBrowse() {
             B.connected = true;
             toast("connected to " + (r.host.empty() ? std::string("local peer") : r.host));
         }
+        if (!app.pendingRemoteOpen.empty()) {   // a url was pasted with the host
+            std::string u = app.pendingRemoteOpen;
+            app.pendingRemoteOpen.clear();
+            openRemote(u);
+        }
     }
 }
 
@@ -3732,9 +3738,9 @@ static void startRemote(const std::string& hostSpec) {
         App::RbJob j;
         j.kind = App::RbConnect; j.host = host; j.port = port; j.dir = parent;
         rbEnqueue(std::move(j));
-        // the open itself still needs the session; it will exist by the time the
-        // user can click, and the CLI path keeps its synchronous behavior
-        openRemote(makeRemoteUrl(host, dir));
+        // opened once the worker has the session; opening it here would put the
+        // ssh handshake back on the UI thread
+        app.pendingRemoteOpen = makeRemoteUrl(host, dir);
         return;
     }
     app.rbrowse = App::RemoteBrowse{};
@@ -7651,7 +7657,12 @@ int main(int argc, char** argv) {
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = glfwGetTime();
         // work that must keep animating even without input
+        // rbBusy / mPending: a connect, a peer install or a server measurement is
+        // in flight. Without these the idle path draws NOTHING while they run -
+        // the window stops repainting and Windows paints it white and calls it
+        // "not responding", which is exactly what a spinner is supposed to deny.
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
+                    app.rbBusy || app.mPending > 0 ||
                     app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // auto blink alternates on a timer, so it needs frames with
@@ -7705,9 +7716,12 @@ int main(int argc, char** argv) {
             // returns early on VK_PROCESSKEY). Skipping the frame there means the
             // window does not repaint for as long as the user is composing.
             bool typing = ImGui::GetIO().WantTextInput;
-            glfwWaitEventsTimeout(1.0);
+            // A worker that starts between the busy check above and this wait
+            // must not leave the window unpainted: re-check before skipping.
+            glfwWaitEventsTimeout(app.rbBusy || app.mPending > 0 ? 0.05 : 1.0);
+            bool working = app.rbBusy || app.mPending > 0 || app.rfPending > 0 || app.seqRunning;
             // (--crash-test counts frames, so it must not be skipped)
-            if (g_inputSeq == before && !typing && !crashAfter) continue;   // nothing happened
+            if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
             app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
         }
         lastFrameEnd = glfwGetTime();
