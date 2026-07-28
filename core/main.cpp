@@ -9142,11 +9142,70 @@ static void drawPanelRemote() {
         ImGui::PopID();
         return;
     }
-    if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
+    bool atRoot = B.dir == "~" || B.dir == "/";
+    auto rbGoParent = [&]() {
+        if (atRoot) return;
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
         remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
                                                         : d.substr(0, s));
+    };
+    if (!atRoot && ImGui::Selectable("[..]")) rbGoParent();
+    // ---- keyboard navigation of the listing --------------------------------
+    // Up / Down walk the rows and preview as they go (what a plain click does),
+    // Enter opens for real (what a double-click does), Backspace leaves for the
+    // parent. Gated on IsAnyItemActive so the filter box, the path field and
+    // the search field keep every key they type; disjoint from the , / . frame
+    // stepping under the listing, which owns different keys entirely.
+    static int rbCursor = -1;            // row index, or -1 = no cursor yet
+    static bool rbCursorScroll = false;  // bring it into view this frame
+    {
+        static std::string curSig;
+        static bool curFlat = false;
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        if (sig != curSig) { curSig = sig; rbCursor = -1; }
+        else if (curFlat != app.rbFlat) {
+            // follow the row across a grouped/flat toggle, like the selection
+            std::vector<RbRow> old = rbBuildView(B.entries, curFlat);
+            const remote::Entry* was = rbCursor >= 0 && rbCursor < (int)old.size()
+                                     ? old[rbCursor].e : nullptr;
+            rbCursor = -1;
+            if (was)
+                for (size_t i = 0; i < view.size(); i++)
+                    if (view[i].e == was) { rbCursor = (int)i; break; }
+            rbCursorScroll = rbCursor >= 0;
+        }
+        curFlat = app.rbFlat;
+        if (rbCursor >= (int)view.size()) rbCursor = -1;
+    }
+    int rbCursorPos = -1;                // ...where it sits on SCREEN
+    for (int k = 0; k < (int)shown.size(); k++) if (shown[k] == rbCursor) rbCursorPos = k;
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        int want = rbCursorPos;
+        int last = (int)shown.size() - 1;
+        if (!shown.empty()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+                want = rbCursorPos < 0 ? 0 : std::min(rbCursorPos + 1, last);
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))
+                want = rbCursorPos < 0 ? last : std::max(rbCursorPos - 1, 0);
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) want = 0;
+            if (ImGui::IsKeyPressed(ImGuiKey_End, false))  want = last;
+        }
+        if (want != rbCursorPos && want >= 0) {
+            rbCursorPos = want;
+            rbCursor = shown[want];
+            rbCursorScroll = true;
+            // moving onto a FOLDER must not enter it - walking a list of
+            // folders would then dive into the first one and never come back
+            if (!view[rbCursor].isDir()) rbActivateRow(view[rbCursor]);
+        }
+        if (rbCursor >= 0 && rbCursor < (int)view.size() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
+            rbOpenRow(view[rbCursor]);
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) rbGoParent();
     }
     // The listing scrolls on its own so the header above never leaves the view.
     // Properties target: a snapshot, because the row may scroll out of the
@@ -9202,6 +9261,9 @@ static void drawPanelRemote() {
             });
         }
         ImGuiListClipper clip;
+        // the cursor row must be SUBMITTED even when it is scrolled out, or
+        // there is no item for SetScrollHereY to scroll to
+        if (rbCursorScroll && rbCursorPos >= 0) clip.IncludeItemByIndex(rbCursorPos);
         clip.Begin((int)shown.size());
         while (clip.Step())
         for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
@@ -9222,6 +9284,14 @@ static void drawPanelRemote() {
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            if (shown[row] == rbCursor) {
+                // the keyboard cursor: an outline, not a fill - the fill means
+                // "selected for a multi-file action" and the two are not the same
+                if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
+                                                    ImGui::GetItemRectMax(),
+                                                    IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
+            }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
                 ImVec2 p = ImGui::GetItemRectMin();
@@ -9261,6 +9331,7 @@ static void drawPanelRemote() {
                     rbActivateRow(r);
                     rbSelAnchor = ei;
                 }
+                rbCursor = ei;          // the keyboard picks up where the mouse left off
             }
             // Double-click = a registered open (the VSCode pinning gesture).
             // The first of the two clicks already made the preview; this
@@ -10279,6 +10350,16 @@ static void drawHelpAbout() {
                 row("G",             "pixel grid (zoom >= 8x)");
                 row("M",             "measure again (rerun the selected analyzer, focus Analysis)");
                 row("H",             "this help");
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("--- Browse panel (when it has focus) ---");
+                row("up / down",     "walk the listing, previewing as it goes");
+                row("Home / End",    "first / last row");
+                row("Enter",         "open for real (the double-click: a stack opens whole)");
+                row("Backspace",     "up to the parent folder");
+                row(SC_MOD "+F",     "focus the filter box");
+                row(", / .",         "step the previewed sequence");
                 ImGui::EndTable();
             }
         }
