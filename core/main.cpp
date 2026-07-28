@@ -6592,11 +6592,111 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     return true;
 }
 
+// Per-frame S1 stats of a stack as TSV on the clipboard, one row per frame:
+// file, path, per-plane spatial mean/sigma, and the H/V projection non-
+// uniformity (sigma of the column-mean / row-mean profile, as % of the plane
+// mean - shading and banding in one number each). Deliberately NO temporal
+// columns: sigma_t is a property of the stack, not of a frame (a per-frame
+// "temporal noise" would be a category error - see docs/stats-taxonomy.md).
+static void copyPerFrameStats(int seqId) {
+    // the ROI convention every other measurement uses: selected rect, else full
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    bool roiUsed = false;
+    if (App::Ann* a = findAnn(app.selectedAnn))
+        if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; roiUsed = true; }
+    std::vector<int> fr = framesOfSeq(seqId);
+    int nPl = 0, skipped = 0;
+    bool cfa = false;
+    std::string out;
+    char b[512];
+    for (int idx : fr) {
+        const ImageDoc* d = app.images[idx].get();
+        if (d->data.empty() || d->remoteStep > 1) { skipped++; continue; }   // previews lie
+        int W = d->w, H = d->h, C = d->ch;
+        int x0 = std::clamp(rx, 0, W - 1), y0 = std::clamp(ry, 0, H - 1);
+        int ww = rw <= 0 ? W - x0 : std::min(rw, W - x0);
+        int hh = rh <= 0 ? H - y0 : std::min(rh, H - y0);
+        if (!nPl) {                                    // header from the first frame
+            cfa = d->cfa != 0;
+            nPl = cfa ? 4 : std::min(C, 4);
+            out = "file\tpath\tframe";
+            for (int p = 0; p < nPl; p++) {
+                static const char* CHN[4] = { "ch0", "ch1", "ch2", "ch3" };
+                const char* pn = cfa ? CFA_CH_NAMES[p] : (C > 1 ? CHN[p] : "");
+                std::string sfx = *pn ? std::string("_") + pn : std::string();
+                snprintf(b, sizeof b,
+                         "\tmean%s [DN]\tsigma%s [DN]\tHproj sigma%s [%%]\tVproj sigma%s [%%]",
+                         sfx.c_str(), sfx.c_str(), sfx.c_str(), sfx.c_str());
+                out += b;
+            }
+            out += "\n";
+        }
+        double sum[4] = {}, sum2[4] = {};
+        size_t cnt[4] = {};
+        // projection profiles per plane; mean per column/row of that plane only
+        std::vector<double> colS((size_t)ww * nPl, 0.0), rowS((size_t)hh * nPl, 0.0);
+        std::vector<uint32_t> colN((size_t)ww * nPl, 0), rowN((size_t)hh * nPl, 0);
+        for (int y = 0; y < hh; y++) {
+            const float* row = &d->data[((size_t)(y0 + y) * W + x0) * C];
+            for (int x = 0; x < ww; x++)
+                for (int c = 0; c < C; c++) {
+                    int p = cfa ? cfaChannelAt(*d, x0 + x, y0 + y) : std::min(c, nPl - 1);
+                    double v = row[(size_t)x * C + c];
+                    if (!std::isfinite(v)) continue;
+                    sum[p] += v; sum2[p] += v * v; cnt[p]++;
+                    colS[(size_t)p * ww + x] += v; colN[(size_t)p * ww + x]++;
+                    rowS[(size_t)p * hh + y] += v; rowN[(size_t)p * hh + y]++;
+                }
+        }
+        snprintf(b, sizeof b, "%s\t%s\t%d", d->name.c_str(),
+                 d->path.empty() ? "-" : d->path.c_str(), d->seqIndex);
+        out += b;
+        for (int p = 0; p < nPl; p++) {
+            double m = cnt[p] ? sum[p] / (double)cnt[p] : 0.0;
+            double var = cnt[p] > 1
+                ? std::max(0.0, sum2[p] / (double)cnt[p] - m * m) * (cnt[p] / (cnt[p] - 1.0)) : 0.0;
+            auto profCv = [&](const std::vector<double>& S, const std::vector<uint32_t>& N,
+                              size_t off, int n) {
+                double ps = 0, ps2 = 0; int pc = 0;
+                for (int i = 0; i < n; i++) {
+                    if (!N[off + i]) continue;
+                    double pm = S[off + i] / N[off + i];
+                    ps += pm; ps2 += pm * pm; pc++;
+                }
+                if (pc < 2 || fabs(m) < 1e-12) return 0.0;
+                double pmn = ps / pc;
+                double pv = std::max(0.0, ps2 / pc - pmn * pmn) * (pc / (pc - 1.0));
+                return sqrt(pv) / fabs(m) * 100.0;
+            };
+            snprintf(b, sizeof b, "\t%.6g\t%.6g\t%.4g\t%.4g", m, sqrt(var),
+                     profCv(colS, colN, (size_t)p * ww, ww),
+                     profCv(rowS, rowN, (size_t)p * hh, hh));
+            out += b;
+        }
+        out += "\n";
+    }
+    if (out.empty()) { toast("no resident frames to tabulate", true); return; }
+    ImGui::SetClipboardText(out.c_str());
+    snprintf(b, sizeof b, "copied %d frame row(s) (%s)%s%s",
+             (int)fr.size() - skipped, roiUsed ? "selected ROI" : "whole frame",
+             skipped ? " - " : "", skipped ? (std::to_string(skipped) + " not resident").c_str() : "");
+    toast(b, skipped != 0);
+}
+
 static void drawPanelTemporal() {
     ImageDoc* im = cur();
     if (im && im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
-        if (drawServerTemporal(si)) return;   // remote stack, computed on the server
+        if (drawServerTemporal(si)) {         // remote stack, computed on the server
+            // the per-frame table still works here - over the frames that are
+            // resident locally; the copy says how many that is
+            if (ImGui::SmallButton("Copy per-frame stats"))
+                copyPerFrameStats(im->seqId);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("One row per RESIDENT frame (fetched so far),\n"
+                                  "tab-separated for Excel.");
+            return;
+        }
         recomputeTemporalIfNeeded();
         const App::TemporalState& T = app.temporal;
         ImGui::Text("Temporal");
@@ -6610,6 +6710,14 @@ static void drawPanelTemporal() {
         else
             ImGui::TextDisabled("[local, %d frames, %s]", T.frames,
                                 T.roiUsed ? "selected ROI" : "whole image");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy per-frame stats"))
+            copyPerFrameStats(im->seqId);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("One row per resident frame, tab-separated for Excel:\n"
+                              "file, path, per-plane mean and sigma [DN], and the\n"
+                              "H/V projection non-uniformity [%% of mean].\n"
+                              "Uses the selected ROI if there is one.");
         ImGui::Separator();
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
@@ -8538,6 +8646,7 @@ static void drawHelpAbout() {
 
 // ---------------------------------------------------------------- CLI
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
+static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 
 static void printUsage() {
@@ -8652,6 +8761,8 @@ static void parseCli(int argc, char** argv) {
             app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
+        } else if (a == "--framestats-selftest") {
+            g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--remote-selftest") {
@@ -9322,6 +9433,25 @@ int main(int argc, char** argv) {
         stopRbWorker();
         stopSequenceLoader();
         return ok ? 0 : 1;
+    }
+
+    // The per-frame table, verifiable without a human: load the stack given on
+    // the command line, run the exact clipboard path, print the TSV to stdout.
+    // An independent numpy implementation must reproduce every number.
+    if (g_fstatSelftest) {
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 600.0) {
+            pumpSequenceAndQueue();
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (app.seqs.empty()) { fprintf(stderr, "fstatselftest: no stack loaded\n"); return 1; }
+        copyPerFrameStats(app.seqs[0].id);
+        const char* clip = ImGui::GetClipboardText();
+        if (!clip || !*clip) { fprintf(stderr, "fstatselftest: empty clipboard\n"); return 1; }
+        fputs(clip, stdout);
+        if (app.seqThread.joinable()) app.seqThread.join();
+        return 0;
     }
 
     // Linearity, verifiable without a human: load everything, fit, print the
