@@ -185,6 +185,9 @@ struct App {
     bool fitRequested = false;
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     std::unique_ptr<pfd::save_file> saveDlg;
+    std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    std::string pendingCsv;                    // built at click time: the results may
+                                               // change while the OS dialog is open
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
@@ -281,6 +284,10 @@ struct App {
     bool anaAuto = false;
     int anaSel = 0;
     bool anaRunRequest = false;       // set by the Measure menu; consumed by the panel
+    // user-set reference line on the curve plots (a spec limit, a pass line):
+    // one horizontal y = value across every analysis plot, session-persisted
+    bool anaRefOn = false;
+    float anaRef = 0.5f;              // 0.5 = the MTF50 line on an SFR plot
     // host-built-in histogram cache (ROI-aware, CFA-split)
     struct HistState {
         const ImageDoc* img = nullptr;
@@ -2134,7 +2141,8 @@ static void writeSessionTo(std::ostream& f) {
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
-    f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << "\n";
+    f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
+      << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
     // must precede the image lines: it decides whether (F,H,W) reloads as a stack
     f << "npyaxis " << app.npyAxis << "\n";
@@ -2418,7 +2426,13 @@ static std::string loadSession(const std::string& path) {
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
                                            >> app.projYHi >> h >> v;
                                         app.showProjH = h != 0; app.showProjV = v != 0; }
-        else if (key == "analysis") { int a = 0; ls >> app.anaSel >> a; app.anaAuto = a != 0; }
+        else if (key == "analysis") {
+            int a = 0, r = 0;
+            float rv = 0.5f;
+            ls >> app.anaSel >> a;
+            app.anaAuto = a != 0;
+            if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
+        }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
         else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
         else if (key == "compare") { int ab = 0, fa = 0;
@@ -4106,6 +4120,17 @@ static void pollFileDialog() {           // called once per frame from the main 
         if (!p.empty()) saveSession(p);
         app.saveDlg.reset();
     }
+    if (app.csvDlg && app.csvDlg->ready(0)) {
+        std::string p = app.csvDlg->result();
+        if (!p.empty()) {
+            if (p.find('.') == std::string::npos) p += ".csv";
+            std::ofstream f(pathFromUtf8(p), std::ios::binary);
+            if (f) { f << app.pendingCsv; toast("curves exported: " + baseName(p)); }
+            else toast("cannot write: " + baseName(p), true);
+        }
+        app.csvDlg.reset();
+        app.pendingCsv.clear();
+    }
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
@@ -5061,6 +5086,12 @@ static void drawAnalysisPlots() {
             }
         }
         if (!first || xmin > xmax || ymin > ymax) continue;
+        // the user's reference line is part of the picture: keep it in range
+        // instead of silently clipping the one line they asked to see
+        if (app.anaRefOn && std::isfinite(app.anaRef)) {
+            ymin = std::min(ymin, app.anaRef);
+            ymax = std::max(ymax, app.anaRef);
+        }
         ImGui::TextDisabled("%s", nm.c_str());
         bool xInt = true;                     // integer axis when the plugin sends no x
         for (const auto& s : S)
@@ -5084,6 +5115,56 @@ static void drawAnalysisPlots() {
                 ImVec2 pt = pr.at(xv, yv);
                 if (has) dl->AddLine(prev, pt, col, 1.5f);
                 prev = pt; has = true;
+            }
+        }
+        // reference line, dashed: data and reference must never read as one
+        // curve. Amber, like the frame markers on the temporal plots.
+        if (app.anaRefOn && std::isfinite(app.anaRef) &&
+            app.anaRef >= pr.ymin && app.anaRef <= pr.ymax) {
+            float y = pr.at(pr.xmin, app.anaRef).y;
+            ImU32 rc = IM_COL32(255, 184, 77, 220);
+            float dash = 6.0f * app.uiScale;
+            for (float x = pr.p0.x; x < pr.p1.x; x += dash * 2)
+                dl->AddLine(ImVec2(x, y), ImVec2(std::min(x + dash, pr.p1.x), y), rc);
+            char rb[32];
+            snprintf(rb, sizeof rb, "ref %.4g", app.anaRef);
+            ImVec2 rts = ImGui::CalcTextSize(rb);
+            dl->AddText(ImVec2(pr.p1.x - rts.x - 4 * app.uiScale,
+                               y - rts.y - 2 * app.uiScale), rc, rb);
+        }
+        // hover readout: crosshair snapped to the nearest sample, values for
+        // every curve in a tooltip. Nobody should eyeball numbers off a plot
+        // in a measurement tool - the curve is the shape, the tooltip is the
+        // number. (A tooltip, so the layout never moves.)
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        if (ImGui::IsWindowHovered() && mp.x >= pr.p0.x && mp.x <= pr.p1.x &&
+            mp.y >= pr.p0.y && mp.y <= pr.p1.y) {
+            float fx = pr.xmin + (mp.x - pr.p0.x) / (pr.p1.x - pr.p0.x) * (pr.xmax - pr.xmin);
+            int best = -1;
+            float bd = FLT_MAX;
+            for (size_t i = 0; i < first->ys.size(); i++) {
+                float xv = first->xs.empty() ? (float)i : first->xs[i];
+                float d = fabsf(xv - fx);
+                if (d < bd) { bd = d; best = (int)i; }
+            }
+            if (best >= 0) {
+                float sx = first->xs.empty() ? (float)best : first->xs[best];
+                float lx = pr.at(sx, pr.ymin).x;
+                dl->AddLine(ImVec2(lx, pr.p0.y), ImVec2(lx, pr.p1.y),
+                            IM_COL32(150, 160, 170, 120));
+                ImGui::BeginTooltip();
+                ImGui::TextDisabled("%s = %.5g",
+                                    first->xLabel.empty() ? "x" : first->xLabel.c_str(), sx);
+                for (const auto& s : S) {
+                    if (s.name != nm || (size_t)best >= s.ys.size()) continue;
+                    ImU32 col = s.colorIdx >= 0 ? ANN_COLORS[s.colorIdx & 7]
+                                                : IM_COL32(200, 205, 210, 255);
+                    const char* lbl = s.col >= 0 && s.col < (int)app.ana.cols.size()
+                                    ? app.ana.cols[s.col].c_str() : "?";
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col),
+                                       "%s  %.5g", lbl, s.ys[best]);
+                }
+                ImGui::EndTooltip();
             }
         }
         dl->PopClipRect();
@@ -6337,6 +6418,75 @@ static void drawPanelAnalysis() {
             ImGui::SetClipboardText(tsv.c_str());
             toast("result grid copied as TSV (provenance included)");
         }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(ana.img != im || ana.series.empty() || app.csvDlg != nullptr);
+        if (ImGui::Button("Export curves (CSV)...")) {
+            // wide per series name - x, then one column per measured target -
+            // so a spreadsheet plots it without reshaping. Column labels are
+            // the same ROI labels the grid and canvas use; provenance rides
+            // along as # comment rows. Built NOW: the results may change
+            // while the OS dialog is open.
+            std::string csv = "# " + ana.prov + "\n";
+            std::vector<std::string> names;
+            for (const auto& s : ana.series) {
+                bool seen = false;
+                for (const auto& n2 : names) if (n2 == s.name) { seen = true; break; }
+                if (!seen) names.push_back(s.name);
+            }
+            char b[64];
+            for (const auto& nm : names) {
+                const App::AnalysisState::Series* first = nullptr;
+                size_t maxN = 0;
+                for (const auto& s : ana.series) {
+                    if (s.name != nm) continue;
+                    if (!first) first = &s;
+                    maxN = std::max(maxN, s.ys.size());
+                }
+                if (!first) continue;
+                csv += "# series: " + nm +
+                       (first->yLabel.empty() ? "" : "  (y: " + first->yLabel + ")") + "\n";
+                csv += first->xLabel.empty() ? "index" : first->xLabel;
+                for (const auto& s : ana.series)
+                    if (s.name == nm)
+                        csv += "," + (s.col >= 0 && s.col < (int)ana.cols.size()
+                                      ? ana.cols[s.col] : std::string("?"));
+                csv += "\n";
+                // x comes from the first curve: ROIs measured by one analyzer
+                // share the sample grid; shorter curves leave trailing blanks
+                for (size_t i = 0; i < maxN; i++) {
+                    float xv = first->xs.empty() ? (float)i
+                             : (i < first->xs.size() ? first->xs[i] : 0.0f);
+                    snprintf(b, sizeof b, "%.6g", xv);
+                    csv += b;
+                    for (const auto& s : ana.series) {
+                        if (s.name != nm) continue;
+                        csv += ",";
+                        if (i < s.ys.size()) { snprintf(b, sizeof b, "%.6g", s.ys[i]); csv += b; }
+                    }
+                    csv += "\n";
+                }
+            }
+            if (!pfd::settings::available()) {
+                toast("no file-dialog backend found (install zenity or kdialog)", true);
+            } else {
+                app.pendingCsv = std::move(csv);
+                app.csvDlg = std::make_unique<pfd::save_file>("Export curves (CSV)",
+                    "curves.csv", std::vector<std::string>{ "CSV (*.csv)", "*.csv" });
+            }
+        }
+        ImGui::EndDisabled();
+        // reference line: a spec limit the curves must clear reads instantly
+        // off the plot; typing it beats remembering it
+        ImGui::SameLine();
+        ImGui::Checkbox("ref", &app.anaRefOn);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("horizontal reference line on the plots below\n"
+                              "(a spec value / pass line; saved with the session)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.5f);
+        ImGui::BeginDisabled(!app.anaRefOn);
+        ImGui::DragFloat("##anaref", &app.anaRef, 0.005f, -FLT_MAX, FLT_MAX, "%.3g");
         ImGui::EndDisabled();
         if (ana.img == im) {
             if (!ana.err.empty()) {
