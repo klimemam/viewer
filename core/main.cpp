@@ -328,6 +328,11 @@ struct App {
         const char* seriesNames[4] = {};
     } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
     bool histLog = true;
+    // Which plane the histogram draws: -1 = all, else the series index. Four
+    // CFA planes times two sides is eight curves on one axis; the selector is
+    // what makes a CFA overlay readable at all. Presentation only - the bins
+    // are computed for every plane either way.
+    int histPlane = -1;
 
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
     struct SeqInfo {
@@ -718,6 +723,23 @@ static void setCompareB(const ImageDoc* d) {
     app.compareBUid = d ? d->uid : 0;
     app.compareB = d ? d->name : std::string();
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
+}
+
+// The B side FOR THE STATISTICS PANELS: the compare partner, but only when it
+// has pixels to measure - a remote preview placeholder has none.
+static ImageDoc* abStatsB() {
+    ImageDoc* b = cmpB();
+    if (!b || b->w < 1 || b->h < 1 || b->data.empty()) return nullptr;
+    return b;
+}
+
+// Side by side, or overlaid? One answer for every panel (App::abStatsLayout).
+// Auto mirrors the IMAGE: CmpSplit puts A and B left/right, so the plots go
+// left/right too; wipe / blink / difference have one image area, so they overlay.
+static bool abSideBySide() {
+    if (app.abStatsLayout == App::AbOverlay) return false;
+    if (app.abStatsLayout == App::AbSide) return true;
+    return app.compareMode == App::CmpSplit;
 }
 
 // Slot 1 of every statistics cache belongs to the B side and is filled only
@@ -2574,6 +2596,7 @@ static void writeSessionTo(std::ostream& f) {
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeScope << "\n";
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
+    f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2879,6 +2902,9 @@ static std::string loadSession(const std::string& path) {
                                        app.linkRange = on != 0; }
         else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
+        else if (key == "abstats") { ls >> app.abStatsLayout >> app.histPlane;
+                                     app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
+                                     app.histPlane = std::clamp(app.histPlane, -1, 3); }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -6235,7 +6261,17 @@ static void drawCanvas(ImVec2 avail) {
 
 // The cache slot is a parameter (slot 0 = A, slot 1 = compare B). Everything
 // below is the previous body with `app.hist` replaced by `H`.
-static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H) {
+//
+// binBlack / binWhite: the value range the 256 bins span. NaN (the default, and
+// what A always passes) means the image's own display range. The B slot is
+// handed A's range instead: two histograms sharing one x axis have to be BINNED
+// alike or the overlay is a lie - and it keeps the axis A's, which is what the
+// user set. It is a cache key, so changing A's range re-bins B.
+static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
+                                       float binBlack = std::numeric_limits<float>::quiet_NaN(),
+                                       float binWhite = std::numeric_limits<float>::quiet_NaN()) {
+    const float wantBlack = std::isfinite(binBlack) ? binBlack : effBlack(*im);
+    const float wantWhite = std::isfinite(binWhite) ? binWhite : effWhite(*im);
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
@@ -6247,13 +6283,13 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H) {
             if (cw > 0 && ch2 > 0) { rx = cx; ry = cy; rw = cw; rh = ch2; roiUsed = true; }
         }
     }
-    if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == effBlack(*im) &&
-        H.white == effWhite(*im) && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
+    if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == wantBlack &&
+        H.white == wantWhite && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
         H.rx == rx && H.ry == ry && H.rw == rw && H.rh == rh)
         return;
     if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
     H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
-    H.black = effBlack(*im); H.white = effWhite(*im);
+    H.black = wantBlack; H.white = wantWhite;
     H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
     H.rx = rx; H.ry = ry; H.rw = rw; H.rh = rh; H.roiUsed = roiUsed;
     memset(H.bins, 0, sizeof H.bins);
@@ -6355,6 +6391,12 @@ static void addDashedPolyline(ImDrawList* dl, const ImVec2* pts, int n, ImU32 co
     }
 }
 
+// Long file names would push the legend off the plot; elide the FRONT, because
+// the tail ("_gain10_000.npy") is the part that tells two captures apart.
+static std::string elideFront(const std::string& s, size_t keep) {
+    return s.size() <= keep ? s : ("..." + s.substr(s.size() - keep));
+}
+
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
     if (integer) snprintf(buf, n, "%.0f", v);
     else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
@@ -6428,6 +6470,64 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
     ImGui::Dummy(ImVec2(wid, height + marginT + marginB));
     pr.ok = true;
     return pr;
+}
+
+// A/B legend for an overlaid plot, drawn straight after beginPlot. It shows a
+// SAMPLE of each stroke - solid for A, dashed for B - because a text-only "A"
+// and "B" leaves the reader matching words to lines. The swatches are neutral
+// grey on purpose: every hue on these plots already means a CFA plane, and the
+// legend must not claim one.
+static void drawABLegend(const PlotRect& pr, const std::string& aName,
+                         const std::string& bName) {
+    if (!pr.ok) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float s = app.uiScale, fh = ImGui::GetFontSize();
+    std::string la = "A: " + elideFront(aName, 26);
+    std::string lb = "B: " + elideFront(bName, 26);
+    const float sw = 24 * s, gap = 6 * s, pad = 6 * s;
+    float tw = std::max(ImGui::CalcTextSize(la.c_str()).x, ImGui::CalcTextSize(lb.c_str()).x);
+    float w = sw + gap + tw + pad * 2;
+    float h = fh * 2 + pad * 2 + 2 * s;
+    if (w > pr.p1.x - pr.p0.x || h > pr.p1.y - pr.p0.y) return;   // no room: skip it
+    ImVec2 q0(pr.p1.x - w - 4 * s, pr.p0.y + 4 * s);
+    ImVec2 q1(q0.x + w, q0.y + h);
+    dl->PushClipRect(pr.p0, pr.p1, true);
+    dl->AddRectFilled(q0, q1, IM_COL32(18, 21, 24, 215), 3 * s);
+    dl->AddRect(q0, q1, IM_COL32(70, 78, 86, 255), 3 * s);
+    const ImU32 ink = IM_COL32(215, 222, 228, 255);
+    float yA = q0.y + pad + fh * 0.5f, yB = yA + fh + 2 * s;
+    dl->AddLine(ImVec2(q0.x + pad, yA), ImVec2(q0.x + pad + sw, yA), ink, 1.6f);
+    ImVec2 dash[2] = { ImVec2(q0.x + pad, yB), ImVec2(q0.x + pad + sw, yB) };
+    addDashedPolyline(dl, dash, 2, ink, 1.6f, 4 * s, 3 * s);
+    dl->AddText(ImVec2(q0.x + pad + sw + gap, yA - fh * 0.5f), ink, la.c_str());
+    dl->AddText(ImVec2(q0.x + pad + sw + gap, yB - fh * 0.5f), ink, lb.c_str());
+    dl->PopClipRect();
+}
+
+// The heading strip over one half of a side-by-side pair. Neutral colour: which
+// side you are looking at is the message, not which channel.
+static void drawABBand(const char* side, const std::string& name) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float s = app.uiScale;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    float h = ImGui::GetTextLineHeight() + 4 * s;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(52, 58, 66, 255), 3 * s);
+    std::string t = std::string(side) + "   " + elideFront(name, 34);
+    dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);
+    dl->AddText(ImVec2(p.x + 6 * s, p.y + 2 * s), IM_COL32(225, 230, 236, 255), t.c_str());
+    dl->PopClipRect();
+    ImGui::Dummy(ImVec2(w, h + 2 * s));
+}
+
+// A and B series correspond BY NAME (R <-> R), never by index: the canon says
+// CFA planes are never mixed, and ch0 is not R. -1 = this series exists on one
+// side only, and is drawn as such.
+static int abSeriesMatch(const char* const* names, int n, const char* want) {
+    if (!want) return -1;
+    for (int i = 0; i < n; i++)
+        if (names[i] && strcmp(names[i], want) == 0) return i;
+    return -1;
 }
 
 // L2 host service: line plot for analyzer curve output (the only curve UI —
@@ -6863,11 +6963,21 @@ static void drawInspector() {
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
+        ImageDoc* Bim = abStatsB();
         recomputeHistogramIfNeeded(im, app.hist[0]);
+        // B is binned on A's black/white: one x axis, one bin grid, or the two
+        // curves are not comparable. Sizes may differ freely - the y axis below
+        // normalises that away.
+        if (Bim) recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
+        const App::HistState& HB = app.hist[1];
         ImGui::Text("Statistics");
         ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
+        // with a B on screen, an unlabelled table of numbers is ambiguous:
+        // say whose numbers these are
+        if (Bim) ImGui::TextDisabled("A: %s   (%s)", elideFront(im->name, 26).c_str(),
+                                     H.roiUsed ? "selected ROI" : "whole image");
+        else     ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
         // fixed widths + right-aligned numbers: columns must not reflow while
         // stepping through frames, otherwise values are impossible to compare
@@ -6901,41 +7011,183 @@ static void drawPanelHistogram() {
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
         static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 150), IM_COL32(79, 221, 107, 150),
                                            IM_COL32(92, 155, 255, 150) };
+        const ImU32 ODD_COL = IM_COL32(185, 192, 200, 190);   // a series only one side has
         bool cfaHist = im->ch == 1 && im->cfa != 0;
-        double logMax = log1p((double)H.maxBin);
-        char yl[64];
-        snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)" : "pixel count (max %u)",
-                 H.maxBin);
-        char xl[80];
-        snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+
+        // ---- plane selector: four CFA planes times two sides is eight curves
+        // on one axis. Same control as the ROI table's, and it filters BOTH
+        // sides, so a comparison is always plane against the same plane.
+        app.histPlane = std::clamp(app.histPlane, -1, std::max(H.nSeries - 1, -1));
+        if (H.nSeries > 1) {
+            const char* selName = app.histPlane < 0 ? "all" : H.seriesNames[app.histPlane];
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            if (ImGui::BeginCombo("plane##hist", selName)) {
+                if (ImGui::Selectable("all", app.histPlane < 0)) app.histPlane = -1;
+                for (int s = 0; s < H.nSeries; s++)
+                    if (ImGui::Selectable(H.seriesNames[s], app.histPlane == s)) app.histPlane = s;
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Which plane the curves show. The bins are computed for\n"
+                                  "all of them either way - this only chooses what is drawn.");
+        }
+        auto drawn = [&](int s) { return app.histPlane < 0 || app.histPlane == s; };
+        int nDrawn = 0;
+        for (int s = 0; s < H.nSeries; s++) if (drawn(s)) nDrawn++;
+
+        // ---- y axis. Without a B: pixel counts, exactly as before. With a B:
+        // a share of each side's OWN sampled pixels, because two images of
+        // different size put incomparable bar heights on one axis.
+        const bool norm = Bim != nullptr;
+        const double scA = 100.0 / (double)std::max<size_t>(H.sampled, 1);
+        const double scB = 100.0 / (double)std::max<size_t>(HB.sampled, 1);
+        double yTop = 0;
+        for (int s = 0; s < H.nSeries; s++) {
+            if (!drawn(s)) continue;
+            for (int b = 0; b < 256; b++)
+                yTop = std::max(yTop, H.bins[s][b] * (norm ? scA : 1.0));
+        }
+        if (norm)
+            for (int s = 0; s < HB.nSeries; s++) {
+                int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                for (int b = 0; b < 256; b++) yTop = std::max(yTop, HB.bins[s][b] * scB);
+            }
+        if (!(yTop > 0)) yTop = 1;
+        const double logTop = log1p(yTop);
+        char yl[96];
+        if (norm)
+            snprintf(yl, sizeof yl, app.histLog ? "share of sampled px [%%] (log, max %.3g %%)"
+                                                : "share of sampled px [%%] (max %.3g %%)", yTop);
+        else
+            snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)"
+                                                : "pixel count (max %u)", H.maxBin);
+        char xl[176];
+        if (Bim && Bim->dtype != im->dtype)
+            snprintf(xl, sizeof xl, "pixel value (A %s / B %s - DTYPE MISMATCH; "
+                                    "A's black-white range bins both)",
+                     im->dtype.c_str(), Bim->dtype.c_str());
+        else if (Bim)
+            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range)", im->dtype.c_str());
+        else
+            snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+
+        // one curve, one way to draw it: filled bars, solid outline, dashed
+        // outline. The staircase is built once and reused by all three.
+        auto plotSeries = [&](const PlotRect& pr, const uint32_t bins[256], double sc,
+                              ImU32 col, int style) {          // 0 fill, 1 solid, 2 dashed
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            float pw = pr.p1.x - pr.p0.x, ph = pr.p1.y - pr.p0.y;
+            auto yOf = [&](uint32_t v) {
+                double u = v * sc;
+                double f = app.histLog ? (logTop > 0 ? log1p(u) / logTop : 0.0) : u / yTop;
+                return pr.p1.y - (float)std::clamp(f, 0.0, 1.0) * ph;
+            };
+            if (style == 0) {
+                for (int b = 0; b < 256; b++) {
+                    if (!bins[b]) continue;
+                    float bx0 = pr.p0.x + (float)b / 256.0f * pw;
+                    dl->AddRectFilled(ImVec2(bx0, yOf(bins[b])),
+                                      ImVec2(bx0 + pw / 256.0f + 0.5f, pr.p1.y), col);
+                }
+                return;
+            }
+            std::vector<ImVec2> pts;
+            pts.reserve(512);
+            for (int b = 0; b < 256; b++) {
+                float bx0 = pr.p0.x + (float)b / 256.0f * pw;
+                float bx1 = pr.p0.x + (float)(b + 1) / 256.0f * pw;
+                float y = yOf(bins[b]);
+                pts.push_back(ImVec2(bx0, y));
+                pts.push_back(ImVec2(bx1, y));
+            }
+            if (style == 1) dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, 1.4f);
+            else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, 1.4f,
+                                   5 * app.uiScale, 4 * app.uiScale);
+        };
+        // Four CFA planes (or three RGB ones) as eight filled areas is unreadable,
+        // so at three drawn curves or more BOTH sides become outlines. Below that
+        // A keeps its fill and only B is an outline.
+        const bool outlineA = Bim && nDrawn >= 3;
+        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantB) {
+            if (!pr.ok) return;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(pr.p0, pr.p1, true);
+            if (wantA)
+                for (int s = 0; s < H.nSeries; s++) {
+                    if (!drawn(s)) continue;
+                    ImU32 col = cfaHist ? CFA_COLS[s]
+                              : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
+                    plotSeries(pr, H.bins[s], norm ? scA : 1.0, col, outlineA ? 1 : 0);
+                }
+            if (wantB && Bim)
+                for (int s = 0; s < HB.nSeries; s++) {
+                    // matched by NAME; a series only B has is drawn neutral, and
+                    // never coloured as if it were one of A's planes
+                    int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+                    if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                    ImU32 col = a < 0 ? ODD_COL
+                              : (cfaHist ? CFA_COLS[a]
+                                         : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200)
+                                                           : RGB_COLS[a]));
+                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 2);
+                }
+            dl->PopClipRect();
+        };
+
+        const float minSide = 320.0f * app.uiScale;
+        bool side = Bim && abSideBySide();
+        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+        if (tooNarrow) side = false;
         // fill the rest of the panel: a fixed height overflowed the bottom dock
+        float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
+                      + (tooNarrow ? ImGui::GetTextLineHeightWithSpacing() : 0.0f);
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
-                     - ImGui::GetTextLineHeightWithSpacing();
-        PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f, false, false,
-                                std::max(hAvail, 70.0f * app.uiScale));
-        if (hp.ok) {
-            ImDrawList* hdl = ImGui::GetWindowDrawList();
-            hdl->PushClipRect(hp.p0, hp.p1, true);
-            float pw2 = hp.p1.x - hp.p0.x;
-            for (int s = 0; s < H.nSeries; s++) {
-                ImU32 col = cfaHist ? CFA_COLS[s]
-                                    : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
-                for (int b = 0; b < 256; b++) {
-                    uint32_t v = H.bins[s][b];
-                    if (!v) continue;
-                    float f = app.histLog ? (float)(log1p((double)v) / logMax)
-                                          : (float)v / (float)H.maxBin;
-                    float bx0 = hp.p0.x + (float)b / 256.0f * pw2;
-                    hdl->AddRectFilled(ImVec2(bx0, hp.p1.y - f * (hp.p1.y - hp.p0.y)),
-                                       ImVec2(bx0 + pw2 / 256.0f + 0.5f, hp.p1.y), col);
-                }
-            }
-            hdl->PopClipRect();
+                     - footerH;
+        if (side) hAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // heading band
+        float plotH = std::max(hAvail, 70.0f * app.uiScale);
+
+        if (!side) {
+            PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                                    false, false, plotH);
+            drawAll(hp, true, true);
+            if (Bim) drawABLegend(hp, im->name, Bim->name);
+        } else {
+            // Always 50/50, never splitFrac: comparing two shapes needs two
+            // plots of the SAME width. What the layout copies from the image is
+            // the ORDER (A on the left), not the divider position.
+            const ImGuiStyle& st = ImGui::GetStyle();
+            float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+            float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
+                         + ImGui::GetTextLineHeight() + 8 * app.uiScale;
+            ImGui::BeginChild("##histA", ImVec2(half, childH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand("A", im->name);
+            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                              false, false, plotH), true, false);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("##histB", ImVec2(half, childH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand("B", Bim->name);
+            // identical axis ranges by construction: same xl/yl, same limits
+            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+                              false, false, plotH), false, true);
+            ImGui::EndChild();
         }
-        ImGui::TextDisabled("%zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
+        if (tooNarrow)
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                               "panel narrower than %.0f px: overlaid instead of side by side",
+                               minSide);
+        // the real pixel counts survive the normalised axis
+        ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
                             H.clipLo * 100.0, H.clipHi * 100.0,
                             cfaHist ? " | R/Gr/Gb/B" : "");
+        if (Bim)
+            ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
+                                HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
+                                Bim->name.c_str());
     }
 
 }
@@ -9755,6 +10007,27 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C", false, cmpB() != nullptr))
                 swapCompare();
             ImGui::Separator();
+            // ONE setting for every statistics panel: "same arrangement as the
+            // image" is a property of the comparison, not of the histogram.
+            ImGui::TextDisabled("Statistics panels");
+            if (ImGui::MenuItem("  Auto (follow the image layout)", nullptr,
+                                app.abStatsLayout == App::AbAuto))
+                app.abStatsLayout = App::AbAuto;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Side by side images (split) -> side by side plots.\n"
+                                  "Wipe / blink / difference have one image area,\n"
+                                  "so their plots overlay.");
+            if (ImGui::MenuItem("  Overlay (A solid, B dashed)", nullptr,
+                                app.abStatsLayout == App::AbOverlay))
+                app.abStatsLayout = App::AbOverlay;
+            if (ImGui::MenuItem("  Side by side (A on the left)", nullptr,
+                                app.abStatsLayout == App::AbSide))
+                app.abStatsLayout = App::AbSide;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Always 50/50 and always A on the left: two shapes\n"
+                                  "can only be compared on plots of equal width.\n"
+                                  "Narrow panels fall back to the overlay.");
+            ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a
             // 120-frame stack must not produce a 120-row menu
@@ -12111,6 +12384,57 @@ int main(int argc, char** argv) {
                   "A4 temporal[1] unchanged by a frame step (keyed on the stack)");
         }
 
+        // ---- P1: the histogram's own rules ----
+        {
+            ImageDoc* b4 = cmpB();
+            // B gets a deliberately DIFFERENT display range; the bins must still
+            // be A's, or the two curves share an x axis they were not binned on
+            float bBlack0 = b4->black, bWhite0 = b4->white;
+            b4->black = bBlack0 - 137.5f; b4->white = bWhite0 + 211.25f;
+            recomputeHistogramIfNeeded(b4, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            fprintf(stderr, "abstatsselftest: P1 bin axis: A black/white %.6g/%.6g, "
+                            "B's own %.6g/%.6g, hist[1] binned on %.6g/%.6g\n",
+                    effBlack(*cur()), effWhite(*cur()), effBlack(*b4), effWhite(*b4),
+                    app.hist[1].black, app.hist[1].white);
+            check(effBlack(*b4) != effBlack(*cur()) || effWhite(*b4) != effWhite(*cur()),
+                  "P1 fixture: B's own range really differs");
+            check(app.hist[1].black == effBlack(*cur()) &&
+                  app.hist[1].white == effWhite(*cur()),
+                  "P1 B is binned on A's black/white, not its own");
+            b4->black = bBlack0; b4->white = bWhite0;
+            recomputeHistogramIfNeeded(b4, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+        }
+        {   // the plane selector is presentation only: it must not touch a bin
+            App::HistState hA = app.hist[0], hB = app.hist[1];
+            int keep = app.histPlane;
+            bool same = true;
+            for (int p = -1; p < 4; p++) {
+                app.histPlane = p;
+                recomputeHistogramIfNeeded(cur(), app.hist[0]);
+                recomputeHistogramIfNeeded(cmpB(), app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+                if (!histSame(hA, app.hist[0]) || !histSame(hB, app.hist[1])) same = false;
+            }
+            app.histPlane = keep;
+            check(same, "P1 plane selector changes nothing that was measured");
+        }
+        {   // Auto mirrors the image; an explicit choice overrides it both ways
+            int keep = app.abStatsLayout;
+            app.abStatsLayout = App::AbAuto;
+            app.compareMode = App::CmpSplit; bool autoSplit = abSideBySide();
+            app.compareMode = App::CmpWipe;  bool autoWipe = abSideBySide();
+            app.abStatsLayout = App::AbSide; bool forcedSide = abSideBySide();
+            app.abStatsLayout = App::AbOverlay;
+            app.compareMode = App::CmpSplit; bool forcedOver = abSideBySide();
+            fprintf(stderr, "abstatsselftest: P1 layout: auto/split=%d auto/wipe=%d "
+                            "forced-side/wipe=%d forced-overlay/split=%d\n",
+                    autoSplit, autoWipe, forcedSide, forcedOver);
+            check(autoSplit && !autoWipe && forcedSide && !forcedOver,
+                  "P1 Auto follows the image layout, explicit overrides it");
+            app.abStatsLayout = keep;
+            app.compareMode = App::CmpSplit;
+        }
+
         // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
         app.compareMode = App::CmpOff;
         abStatsFrame();
@@ -12592,6 +12916,23 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("Put %s on the A side and %s on the B side"
                                           "   (Shift+\\ or Shift+C)",
                                           b->name.c_str(), cur() ? cur()->name.c_str() : "");
+                    // how the STATISTICS panels show the same pair, next to the
+                    // divider setting they belong with (also in View > Compare A/B)
+                    static const char* ABL[3] = { "stats: auto", "stats: overlay",
+                                                  "stats: side by side" };
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(ImGui::CalcTextSize(ABL[2]).x +
+                                            ImGui::GetFrameHeight() * 1.4f);
+                    int alv = std::clamp(app.abStatsLayout, 0, 2);
+                    if (ImGui::BeginCombo("##abstatslayout", ABL[alv])) {
+                        for (int i = 0; i < 3; i++)
+                            if (ImGui::Selectable(ABL[i], alv == i)) app.abStatsLayout = i;
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Histogram / Projection / Temporal layout for this\n"
+                                          "comparison. Auto follows the image: split -> side by\n"
+                                          "side, wipe / blink / difference -> overlay.");
                 }
             }
             if (app.showFps) {
@@ -12853,6 +13194,7 @@ int main(int argc, char** argv) {
                              (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
                              (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
                              (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
+                             (uint64_t)(app.abStatsLayout * 8192 + (app.histPlane + 1) * 65536) +
                              (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
                                         app.projMode * 64 + app.projYMode * 256 +
                                         app.roiChannel * 1024 + app.selectedAnn * 4096) +
