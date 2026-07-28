@@ -650,6 +650,12 @@ struct App {
         std::string label;            // what was measured ("10lx/frame_???.npy")
         std::vector<std::string> files;   // detached only: for "Open as stack"
         int frames = 0;
+        // The REGION the server actually measured. requestServerTemporal sends
+        // no ROI, so this is the whole frame - and it has to be recorded rather
+        // than assumed, because the panel used to label these numbers with the
+        // LOCAL side's roiUsed flag and so claimed a region they never had.
+        int rx = 0, ry = 0, rw = 0, rh = 0;   // rw/rh 0 = whole frame
+        bool roiUsed = false;
         // Per CFA plane, because the peer answers per plane when it was told
         // the mosaic (serve.cpp planeKey). nPl == 1 means the reply was pooled
         // - which the panel then has to SAY, not hide.
@@ -5805,6 +5811,11 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     S.seqId = seqId;
     S.token = g_measureToken++;
     S.pending = true;
+    // whole-frame: no ROI is put on the wire (mWorker only sends one when
+    // rw > 0). Recorded so the labels can say so instead of borrowing the
+    // local side's ROI state.
+    S.rx = S.ry = S.rw = S.rh = 0;
+    S.roiUsed = false;
     App::MJob j;
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
@@ -9865,8 +9876,9 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
                             "switch to local computation once enough are here.");
         return false;                 // fall through to the local path
     }
-    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames, %s]",
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames, %s, %s]",
                        S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.roiUsed ? "selected ROI" : "whole image",
                        S.nPl > 1 ? "CFA planes" : "plane=all (no CFA split)");
     ImGui::Separator();
     if (ImGui::BeginTable("srvtemporal", 1 + S.nPl,
@@ -9891,7 +9903,11 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
         for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
         float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
         float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
-        PlotRect tp = beginPlot("frame number", "ROI mean value [DN]",
+        // the axis names the region that was actually measured. It said "ROI"
+        // unconditionally while requestServerTemporal never puts a rect on the
+        // wire - and the detached view one screen down already says "frame".
+        PlotRect tp = beginPlot("frame number",
+                                S.roiUsed ? "ROI mean value [DN]" : "frame mean value [DN]",
                                 fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
         if (tp.ok) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -10090,6 +10106,10 @@ static void copyPerFrameStats(int seqId) {
 // stated reason instead of a blank.
 struct AbTemporal {
     bool valid = false, isStack = false, fromServer = false;
+    // the REGION this side measured. A delta between a whole-frame A and an
+    // ROI-restricted B is a difference of two different measurements.
+    bool roiUsed = false;
+    int rx = 0, ry = 0, rw = 0, rh = 0;
     int nPl = 1;                      // CFA planes are never mixed, on either side
     double sigT[4] = {}, sigS[4] = {}, sigTot[4] = {};
     int frames = 0, expected = 0;
@@ -10106,6 +10126,8 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
     if (S.valid && S.seqId == d->seqId) {          // server-measured wins: it saw
         o.valid = true; o.fromServer = true;       // every frame, not the resident ones
         o.nPl = S.nPl;
+        o.roiUsed = S.roiUsed;
+        o.rx = S.rx; o.ry = S.ry; o.rw = S.rw; o.rh = S.rh;
         for (int p = 0; p < S.nPl; p++) {
             o.sigT[p] = S.tempNoise[p]; o.sigS[p] = S.fixedPattern[p];
             o.sigTot[p] = S.totalNoise[p];
@@ -10117,6 +10139,8 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
     if (T.valid && T.seqId == d->seqId) {
         o.valid = true;
         o.nPl = T.nPl;
+        o.roiUsed = T.roiUsed;
+        o.rx = T.rx; o.ry = T.ry; o.rw = T.roiUsed ? T.rw : 0; o.rh = T.roiUsed ? T.rh : 0;
         for (int p = 0; p < T.nPl; p++) {
             o.sigT[p] = T.tempNoise[p]; o.sigS[p] = T.fixedPattern[p];
             o.sigTot[p] = T.totalNoise[p];
@@ -10155,12 +10179,25 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     const std::string unit = uA == uB ? uA : (uA + "/" + uB);
     // ...and a four-plane sigma_t minus a pooled one is not a difference of
     // anything, so the plane split joins the channel count in the test
-    const bool canDelta = abDeltaMeaningful(im, Bim) && A.nPl == B.nPl;
+    // ...and a four-plane sigma_t minus a pooled one, or a whole-frame A minus
+    // an ROI-restricted B, is not a difference of anything: the plane split and
+    // the REGION join the channel count in the test the panel already applies
+    const bool sameRegion = A.roiUsed == B.roiUsed && A.rx == B.rx && A.ry == B.ry &&
+                            A.rw == B.rw && A.rh == B.rh;
+    const bool canDelta = abDeltaMeaningful(im, Bim) && A.nPl == B.nPl && sameRegion;
 
+    auto regionOf = [](const AbTemporal& s) {
+        return s.roiUsed ? "selected ROI" : "whole image";
+    };
     ImGui::Text("Temporal");
     ImGui::SameLine();
-    ImGui::TextDisabled("[%s, %s]", app.temporal[0].roiUsed ? "selected ROI" : "whole image",
-                        A.fromServer || B.fromServer ? "server + local" : "local");
+    if (sameRegion)
+        ImGui::TextDisabled("[%s, %s]", regionOf(A),
+                            A.fromServer || B.fromServer ? "server + local" : "local");
+    else
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[A: %s, B: %s - %s]",
+                           regionOf(A), regionOf(B),
+                           A.fromServer || B.fromServer ? "server + local" : "local");
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
     if (ImGui::IsItemHovered())
@@ -10258,7 +10295,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                            "dtype mismatch (A %s, B %s): both sides are DN, but the "
                            "delta spans two storage classes", im->dtype.c_str(),
                            Bim->dtype.c_str());
-    if (!canDelta)
+    if (!sameRegion)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "regions differ (A %s, B %s): no delta - the two columns "
+                           "are not the same quantity", regionOf(A), regionOf(B));
+    else if (!canDelta && im->ch != Bim->ch)
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
                            "channel counts differ (A %dch, B %dch): no delta - the two "
                            "columns are not the same quantity", im->ch, Bim->ch);
@@ -10279,10 +10320,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     span(A); span(B);
     if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
     char yl[128];
+    const char* rlab = sameRegion && !A.roiUsed ? "frame" : "ROI";
     if (im->dtype != Bim->dtype)
-        snprintf(yl, sizeof yl, "ROI mean value (%s)  -  A %s / B %s, DTYPE MISMATCH",
-                 unit.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
-    else snprintf(yl, sizeof yl, "ROI mean value (%s)", unit.c_str());
+        snprintf(yl, sizeof yl, "%s mean value (%s)  -  A %s / B %s, DTYPE MISMATCH",
+                 rlab, unit.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
+    else snprintf(yl, sizeof yl, "%s mean value (%s)", rlab, unit.c_str());
     const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
 
     auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool dashed) {
@@ -17098,6 +17140,37 @@ int main(int argc, char** argv) {
                   "P3 local stacks come from the local computation");
             check(dAbs == TA.sigT[0] - TB.sigT[0] && !TA.fromServer,
                   "P3 delta is A - B (the difference image's sign)");
+            {   // REGION. The server aggregate is unconditionally whole-frame
+                // (requestServerTemporal puts no rect on the wire, and mWorker
+                // only sends one when rw > 0), while the local side honours the
+                // selected ROI. The panel used to label BOTH with A's local
+                // roiUsed flag and then subtract them. Each side must now carry
+                // the region it actually measured, and a mismatch must blank
+                // the delta the same way a channel-count mismatch does.
+                App::ServerTemporal fake;      // as requestServerTemporal fills it
+                fake.valid = true;
+                fake.seqId = cur()->seqId;
+                fake.frames = TA.frames;
+                fake.nPl = app.temporal[0].nPl;
+                fake.rw = fake.rh = 0;
+                fake.roiUsed = false;          // whole frame, always
+                AbTemporal SA = abTemporalOf(cur(), app.temporal[0], fake);
+                App::TemporalState roiT = app.temporal[0];
+                roiT.roiUsed = true;           // a local side restricted to an ROI
+                roiT.rx = 1; roiT.ry = 1; roiT.rw = 8; roiT.rh = 8;
+                AbTemporal RB = abTemporalOf(b7, roiT, app.srvTemporalB);
+                roiT.seqId = b7->seqId;
+                RB = abTemporalOf(b7, roiT, app.srvTemporalB);
+                bool mixed = SA.fromServer && !SA.roiUsed && RB.roiUsed;
+                fprintf(stderr, "abstatsselftest: P3b region: server A roiUsed=%d "
+                                "(rw=%d), local B roiUsed=%d (rw=%d), same region=%d\n",
+                        SA.roiUsed ? 1 : 0, SA.rw, RB.roiUsed ? 1 : 0, RB.rw,
+                        (SA.roiUsed == RB.roiUsed && SA.rw == RB.rw) ? 1 : 0);
+                check(mixed && !(SA.roiUsed == RB.roiUsed && SA.rw == RB.rw),
+                      "P3b a server whole-frame A and an ROI B are not one region");
+                check(!TA.roiUsed && TA.rw == 0 && !TB.roiUsed,
+                      "P3b with no ROI both sides say whole image");
+            }
             check(abDeltaMeaningful(cur(), b7), "P3 equal channel counts allow a delta");
             // B's server aggregate must never have been fired on its own
             check(app.srvTemporalB.token == 0 && !app.srvTemporalB.pending &&
