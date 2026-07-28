@@ -17,7 +17,11 @@
 namespace rp {
 
 static const uint32_t MAGIC = 0x56525031;   // "VRP1"
-static const uint32_t VERSION = 2;          // 1 = LIST/META/TILE; 2 adds MEASURE
+// 1 = LIST/META/TILE; 2 adds MEASURE; 3 extends the LIST reply (mtime, npy
+// header peek, synthetic stack-group entries) and adds GLOB/SCAN. The server
+// answers LIST in the v2 shape when the client's HELLO said 2, so either end
+// may lag the other by one protocol without breaking the session.
+static const uint32_t VERSION = 3;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -25,8 +29,25 @@ enum MsgType : uint32_t {
     MSG_META       = 3,   // -> (path)                     <- shape/dtype/frames
     MSG_TILE       = 4,   // -> (path, frame, rect, step)  <- pixels
     MSG_MEASURE    = 5,   // -> (op, frames, rois, name)   <- emitted results only
+    MSG_GLOB       = 6,   // -> (root, pattern, depth, cap) <- matching rel paths
+    MSG_SCAN       = 7,   // -> (root, depth, cap)         <- stack groups per subdir
     MSG_OK         = 128,
     MSG_ERR        = 129,
+};
+
+// LIST reply, v3. v2 was: [u32 n] then per entry [str name][u32 dir][u32 szLo]
+// [u32 szHi]. v3 is:      [u32 n] then per entry
+//   [str name][u32 flags][u32 szLo][u32 szHi][u32 mtimeLo][u32 mtimeHi]
+//   flags & LE_META : [u32 dtype][u32 ndim][u32 dims[4]] declaration order,
+//                     0-padded  [u32 fortran]           (.npy header peek)
+//   flags & LE_GROUP: [u32 frameCount][frameCount * str memberName]
+// mtime is unix seconds (64-bit as lo/hi like the size: 2038 is within the
+// service life of a lab tool). A group entry's size is the sum over members,
+// its mtime the newest member, its META fields those of the first frame.
+enum ListEntryFlags : uint32_t {
+    LE_DIR   = 1,   // directory
+    LE_META  = 2,   // npy header fields follow
+    LE_GROUP = 4,   // synthetic entry for a numbered .npy sequence
 };
 
 // MEASURE: run analysis where the data lives. A 300-frame statistic crosses the

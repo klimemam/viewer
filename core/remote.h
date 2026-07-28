@@ -12,7 +12,34 @@
 
 namespace remote {
 
-struct Entry { std::string name; bool dir = false; uint64_t size = 0; };
+struct Entry {
+    std::string name;
+    bool dir = false;
+    uint64_t size = 0;
+    // Protocol v3 listing extras. A v2 peer never sends them, so the defaults
+    // double as the "unknown" values the UI renders as "-".
+    int64_t mtime = 0;                 // unix seconds; 0 = unknown
+    bool hasMeta = false;              // the server peeked this .npy's header
+    std::string dtype;                 // "u16", "f32", ...; empty = unknown
+    int ndim = 0;
+    uint32_t dims[4] = { 0, 0, 0, 0 }; // numpy declaration order, 0-padded
+    bool fortran = false;
+    bool group = false;                // synthetic row for a numbered sequence
+    uint32_t frames = 0;               // member count when group
+    std::vector<std::string> members;  // member file names (no directory part)
+};
+
+// LIST reply payload -> entries, in the shape `peerVersion` promises. Split out
+// of Session so the v2-compat path stays testable without a live v2 peer.
+bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
+                      std::vector<Entry>& out, std::string& err);
+
+// One stack found by SCAN: where it lives (relative to the scanned root, "" =
+// the root itself) and its group entry (pattern, members, meta).
+struct ScanGroup { std::string dir; Entry entry; };
+
+// One GLOB result: path relative to the searched root ('/' separators).
+struct GlobHit { std::string rel; bool dir = false; };
 
 struct Meta {
     int w = 0, h = 0, ch = 1, frames = 1;
@@ -62,6 +89,17 @@ public:
     void stop();
 
     bool list(const std::string& path, std::vector<Entry>& out, std::string& err);
+    // Walk the subtree under `root` server-side and return every stack below
+    // it (the remote openFolder). depth/maxGroups bound the walk; truncated
+    // reports the cap being hit, skippedDirs the unreadable directories.
+    bool scan(const std::string& root, int depth, int maxGroups,
+              std::vector<ScanGroup>& out, bool& truncated, int& skippedDirs,
+              std::string& err);
+    // Recursive find under `root`. Pattern: glob (* and ? cross '/'), or a
+    // case-insensitive substring when it has no wildcard.
+    bool glob(const std::string& root, const std::string& pattern, int depth,
+              int maxResults, std::vector<GlobHit>& out, bool& truncated,
+              int& skippedDirs, std::string& err);
     bool meta(const std::string& path, Meta& out, std::string& err);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
     // (converted from the source dtype) plus the decimated dimensions.

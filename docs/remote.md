@@ -123,14 +123,19 @@ rsync も git も同じ方式で動いています(`rsync --server`, `git-upload
 ## 4. 何がネットワークを流れるのか
 
 プロトコルは [core/remote_proto.h](../core/remote_proto.h)。フレーミングは
-`[magic][type][len][payload]` の 12 バイトヘッダのみ。要求は 4 種類です。
+`[magic][type][len][payload]` の 12 バイトヘッダのみ。要求は 6 種類です。
 
 | メッセージ | 要求 | 返答 | 典型サイズ |
 |---|---|---|---|
-| `MSG_LIST` | パス | ディレクトリ項目(名前 / dir か / サイズ) | 数百 B 〜 数十 KB |
+| `MSG_LIST` | パス | ディレクトリ項目(名前 / dir / サイズ / mtime / npy ヘッダの形状・dtype、連番は 1 グループ行に集約) | 数百 B 〜 数十 KB |
 | `MSG_META` | パス | `w, h, ch, dtype, frames` | **24 バイト** |
 | `MSG_TILE` | パス + frame + 矩形 + `step` | 間引き済み画素(**元の dtype のまま**) | 下記 |
-| `MSG_MEASURE` | パス + ROI + アナライザ名 | 測定結果の数値 | 数十バイト(未実装) |
+| `MSG_MEASURE` | パス + ROI + アナライザ名 | 測定結果の数値 | 数十バイト〜数十 KB |
+| `MSG_GLOB` | ルート + パターン + 深さ/件数上限 | 一致した相対パス(打ち切りフラグ付き) | 数 KB |
+| `MSG_SCAN` | ルート + 深さ/件数上限 | サブフォルダごとのスタック一覧(リモート版 Open Folder) | 数 KB |
+
+LIST の拡張・GLOB・SCAN はプロトコル 3。相手が 2 のときはサーバが v2 形式で
+LIST を返し、クライアントは形状・日時列を「-」表示にしてブラウズ自体は続く。
 
 ### TILE の `step` が肝
 

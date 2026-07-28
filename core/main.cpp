@@ -347,18 +347,27 @@ struct App {
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
-    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3 };
-    struct RbJob { int kind = RbConnect; std::string host, dir; int port = 0; };
-    // one numbered .npy sequence found by a scan: files are full remote paths
-    struct RbGroup { std::string name; std::vector<std::string> files; };
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4 };
+    struct RbJob {
+        int kind = RbConnect;
+        std::string host, dir;
+        int port = 0;
+        std::string pattern;          // RbGlob only
+        uint32_t gen = 0;             // RbGlob: Stop bumps it, stale results drop
+    };
     struct RbResult {
         int kind = RbConnect;
         bool ok = false;
         std::string err, host, dir, info;
         int port = 0;
         std::vector<remote::Entry> entries;
-        std::vector<RbGroup> groups;      // RbScan only
-        int scanSingles = 0;              // loose .npy left unopened by the scan
+        // RbScan payload: every stack under dir, plus how the walk ended
+        std::vector<remote::ScanGroup> scanGroups;
+        bool truncated = false;
+        int skippedDirs = 0;
+        // RbGlob payload
+        std::vector<remote::GlobHit> hits;
+        uint32_t gen = 0;
     };
     std::thread rbThread;
     std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
@@ -368,6 +377,31 @@ struct App {
     std::atomic<bool> rbBusy{ false };
     std::atomic<bool> rbStop{ false };
     std::string pendingRemoteOpen;    // opened once the session is up
+    // Stacks a remote folder scan decided to open, one at a time: the next
+    // stack starts only when the fetcher is idle, so the memory budget each
+    // openRemoteStack computes reflects what the previous one actually loaded.
+    // name: folder-qualified stack name ("10lx/frame_###.npy") - seven stacks
+    // all called frame_000.npy would be indistinguishable, and the linearity
+    // Auto-levels reads the level from exactly this folder prefix.
+    struct RemoteOpen { std::string host; std::vector<std::string> files; std::string name; };
+    std::vector<RemoteOpen> rbOpenQueue;
+    // Places: starred host+path urls, and the last ~10 visited (most recent
+    // first). Both persist in prefs - a lab machine's data layout outlives any
+    // one session.
+    std::vector<std::string> rbBookmarks;
+    std::vector<std::string> rbRecents;
+    // Server-side recursive find (GLOB). gen is the cancel token: Stop bumps
+    // it and the worker's result is dropped on arrival (the walk itself is
+    // bounded by depth and result caps, so there is nothing to interrupt).
+    struct RemoteSearch {
+        bool active = false;          // results view instead of the listing
+        bool running = false;
+        uint32_t gen = 0;
+        std::string root, pattern;
+        std::vector<remote::GlobHit> hits;
+        bool truncated = false;
+        int skippedDirs = 0;
+    } rbSearch;
     bool showRemoteError = false;     // the full failure text, on demand
     std::mutex sesMtx;                // app.remoteSession is shared with that worker
     // where analysis runs. auto: remote data -> server, local -> local. server:
@@ -486,6 +520,10 @@ struct App {
     std::vector<FolderPick> folderPick;
     bool folderPickOpen = false;
     std::string folderPickRoot;
+    // remote variant: the same picker, but accepted groups go through
+    // rbOpenQueue / openRemoteStack instead of the local sequence loader
+    bool folderPickRemote = false;
+    std::string folderPickHost;
     char pickInclude[128] = "";       // glob applied to "folder/pattern" (empty = all)
     char pickExclude[128] = "";
     std::unique_ptr<pfd::select_folder> folderDlg;
@@ -552,6 +590,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
+static std::string placeUrl(const std::string& host, int port, const std::string& path);
 static void rbEnqueue(App::RbJob job);
 static void pumpRemoteBrowse();
 static void stopRbWorker();
@@ -2332,6 +2371,8 @@ static void savePrefs() {
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
+    for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
+    for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
 }
 
 static void loadPrefs() {
@@ -2361,12 +2402,17 @@ static void loadPrefs() {
                                          app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
-        else if (key == "remoteexe" || key == "remoteurl") {
+        else if (key == "remoteexe" || key == "remoteurl" ||
+                 key == "rbookmark" || key == "rbrecent") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
             while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
-            if (!s.empty()) (key == "remoteexe" ? app.remoteExe : app.lastRemoteUrl) = s;
+            if (s.empty()) continue;
+            if      (key == "remoteexe") app.remoteExe = s;
+            else if (key == "remoteurl") app.lastRemoteUrl = s;
+            else if (key == "rbookmark") app.rbBookmarks.push_back(s);
+            else if (app.rbRecents.size() < 10) app.rbRecents.push_back(s);
         }
     }
     app.themeVariant = std::clamp(app.themeVariant, 0, 1);
@@ -3230,6 +3276,7 @@ static void openFolder(const std::string& path) {
     app.folderPick.clear();
     for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
     app.folderPickRoot = path;
+    app.folderPickRemote = false;      // a stale remote flag would misroute these
     app.folderPickOpen = true;
 }
 
@@ -3392,8 +3439,20 @@ static void drawFolderPickModal() {
         app.folderPick.clear();
         app.folderPickOpen = false;
         ImGui::CloseCurrentPopup();
-        if (sel.empty()) toast("nothing selected", true);
-        else enqueueGroups(std::move(sel));
+        if (sel.empty()) {
+            toast("nothing selected", true);
+        } else if (app.folderPickRemote) {
+            // remote groups: through the open queue, one stack at a time, so
+            // the memory budget is applied against reality
+            int frames = 0;
+            for (const auto& g : sel) frames += (int)g.files.size();
+            toast("opening " + std::to_string(sel.size()) + " remote stack(s), " +
+                  std::to_string(frames) + " frames");
+            for (auto& g : sel)
+                app.rbOpenQueue.push_back({ app.folderPickHost, std::move(g.files), g.name });
+        } else {
+            enqueueGroups(std::move(sel));
+        }
     }
     ImGui::EndPopup();
 }
@@ -3832,66 +3891,6 @@ static void rbSetPhase(const std::string& p) {
     app.rbPhase = p;
 }
 
-// The remote Open Folder: walk the subtree over the existing LIST request and
-// collect numbered .npy sequences, one group per (directory, pattern) - the
-// same "folder of folders, one stack per level" shape openFolder() handles
-// locally. Runs on the rb worker; sesMtx is taken PER LISTING, not for the
-// whole walk, so a click in the UI (which also needs the session) waits tens
-// of milliseconds, not the whole scan.
-static void rbScanTree(const std::string& root, App::RbResult& r) {
-    const int MAX_DEPTH = 5, MAX_DIRS = 256, MAX_GROUPS = 64;
-    std::vector<std::pair<std::string, int>> todo = { { root, 0 } };
-    int dirs = 0;
-    while (!todo.empty() && dirs < MAX_DIRS && (int)r.groups.size() < MAX_GROUPS) {
-        auto [dir, depth] = todo.front();
-        todo.erase(todo.begin());
-        dirs++;
-        rbSetPhase("scanning " + dir + "...");
-        std::vector<remote::Entry> es;
-        std::string err;
-        {
-            std::lock_guard<std::mutex> lk(app.sesMtx);
-            if (!app.remoteSession || !app.remoteSession->list(dir, es, err)) continue;
-        }
-        // group numbered .npy siblings by their pattern (digits before the
-        // extension stripped); >= 2 frames = a stack worth opening
-        std::map<std::string, std::vector<std::string>> pat;
-        for (const auto& e : es) {
-            std::string joined = dir == "/" ? "/" + e.name : dir + "/" + e.name;
-            if (e.dir) {
-                if (depth < MAX_DEPTH) todo.push_back({ joined, depth + 1 });
-                continue;
-            }
-            if (!isNpyName(e.name)) continue;
-            size_t end = e.name.rfind('.');
-            size_t i = end;
-            while (i > 0 && isdigit((unsigned char)e.name[i - 1])) i--;
-            std::string key = i < end ? e.name.substr(0, i) + "#" + e.name.substr(end)
-                                      : std::string();   // un-numbered: no sequence
-            if (key.empty()) { r.scanSingles++; continue; }
-            pat[key].push_back(joined);
-        }
-        for (auto& [key, files] : pat) {
-            if ((int)files.size() < 2) { r.scanSingles += (int)files.size(); continue; }
-            App::RbGroup g;
-            // name the stack like the local scanner does: path relative to the
-            // scan root, so "10lx/frame_#.npy" reads as the level it is
-            std::string rel = dir.size() > root.size() && dir.compare(0, root.size(), root) == 0
-                              ? dir.substr(root.size() + (root.back() == '/' ? 0 : 1)) : "";
-            g.name = (rel.empty() ? "" : rel + "/") + key;
-            sortFramesNumerically(files);
-            g.files = std::move(files);
-            r.groups.push_back(std::move(g));
-        }
-    }
-    std::sort(r.groups.begin(), r.groups.end(),
-              [](const App::RbGroup& a, const App::RbGroup& b) { return a.name < b.name; });
-    if (!todo.empty() || dirs >= MAX_DIRS)
-        r.info = "scan capped (depth " + std::to_string(MAX_DEPTH) + ", " +
-                 std::to_string(MAX_DIRS) + " dirs) - narrow the folder";
-    r.ok = true;
-}
-
 static void rbWorker() {
     while (!app.rbStop) {
         App::RbJob job;
@@ -3924,15 +3923,6 @@ static void rbWorker() {
             r.ok = deployPeer(job.host, job.port, true, log);
             r.info = log;
             r.err = r.ok ? "" : log;
-        } else if (job.kind == App::RbScan) {
-            bool alive;
-            {
-                std::lock_guard<std::mutex> lk(app.sesMtx);
-                alive = app.remoteSession && app.remoteSession->alive() &&
-                        app.remoteSession->host() == job.host;
-            }
-            if (!alive) r.err = "not connected";   // scans start from a live browse
-            else rbScanTree(job.dir, r);
         } else {
             std::lock_guard<std::mutex> lk(app.sesMtx);
             if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
@@ -3959,6 +3949,31 @@ static void rbWorker() {
             }
             if (!alive) {
                 r.err = err.empty() ? "connection failed" : err;
+            } else if (job.kind == App::RbScan) {
+                rbSetPhase("scanning " + job.dir + " for stacks...");
+                bool trunc = false;
+                int skipped = 0;
+                if (app.remoteSession->scan(job.dir, 6, 256, r.scanGroups,
+                                            trunc, skipped, err)) {
+                    r.ok = true;
+                    r.truncated = trunc;
+                    r.skippedDirs = skipped;
+                } else {
+                    r.err = err;
+                }
+            } else if (job.kind == App::RbGlob) {
+                rbSetPhase("searching " + job.pattern + " under " + job.dir + "...");
+                r.gen = job.gen;
+                bool trunc = false;
+                int skipped = 0;
+                if (app.remoteSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
+                                            trunc, skipped, err)) {
+                    r.ok = true;
+                    r.truncated = trunc;
+                    r.skippedDirs = skipped;
+                } else {
+                    r.err = err;
+                }
             } else {
                 rbSetPhase("listing " + job.dir + "...");
                 std::vector<remote::Entry> got;
@@ -4008,23 +4023,57 @@ static void pumpRemoteBrowse() {
                        : "remote update failed: " + r.err, !r.ok);
             continue;
         }
+        if (r.kind == App::RbGlob) {
+            App::RemoteSearch& S = app.rbSearch;
+            if (r.gen != S.gen) continue;          // stopped or superseded: drop
+            S.running = false;
+            if (!r.ok) { toast("remote search: " + r.err, true); continue; }
+            S.hits = std::move(r.hits);
+            S.truncated = r.truncated;
+            S.skippedDirs = r.skippedDirs;
+            S.active = true;
+            continue;
+        }
         if (r.kind == App::RbScan) {
             if (!r.ok) { toast("remote scan: " + r.err, true); continue; }
-            if (r.groups.empty()) {
-                toast("no stacks (2+ numbered .npy) under " + r.dir, true);
-                continue;
+            auto joinR = [](const std::string& a, const std::string& b) {
+                if (b.empty()) return a;
+                return a == "/" ? "/" + b : a + "/" + b;
+            };
+            std::vector<App::PendingGroup> groups;
+            for (const auto& g : r.scanGroups) {
+                App::PendingGroup pg;
+                pg.name = g.dir.empty() ? g.entry.name : g.dir + "/" + g.entry.name;
+                std::string base = joinR(r.dir, g.dir);
+                for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
+                groups.push_back(std::move(pg));
             }
-            // Every group opens; each stack's frame fetches are budgeted as it
-            // opens, so a huge scan degrades to previews + partial stacks, not
-            // to an allocation failure.
-            for (const auto& g : r.groups)
-                openRemoteStack(r.host, g.files, g.name);
-            char msg[160];
-            snprintf(msg, sizeof msg, "opened %d stack(s)%s%s", (int)r.groups.size(),
-                     r.scanSingles ? " (loose single .npy skipped)" : "",
-                     r.info.empty() ? "" : " - scan capped");
-            toast(msg);
-            if (!r.info.empty()) app.seqNote = r.info;
+            if (r.truncated)
+                toast("scan stopped at 256 stacks - open a narrower folder", true);
+            if (r.skippedDirs)
+                toast(std::to_string(r.skippedDirs) +
+                      " unreadable folder(s) skipped in the scan", true);
+            if (groups.empty()) { toast("no .npy stacks under " + r.dir, true); continue; }
+            // One group opens outright; several ALWAYS go through the picker,
+            // even under "Always load folder". Unlike the local scan, every
+            // frame here is a transfer, and the include/exclude filters in
+            // that modal are how a big capture tree gets narrowed to the
+            // levels actually wanted (asked for explicitly).
+            if (groups.size() == 1) {
+                int frames = 0;
+                for (const auto& g : groups) frames += (int)g.files.size();
+                toast("opening " + std::to_string(groups.size()) + " remote stack(s), " +
+                      std::to_string(frames) + " frames");
+                for (auto& g : groups)
+                    app.rbOpenQueue.push_back({ r.host, std::move(g.files), g.name });
+            } else {
+                app.folderPick.clear();
+                for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
+                app.folderPickRoot = makeRemoteUrl(r.host, r.dir);
+                app.folderPickRemote = true;
+                app.folderPickHost = r.host;
+                app.folderPickOpen = true;
+            }
             continue;
         }
         if (!r.ok) {
@@ -4042,6 +4091,14 @@ static void pumpRemoteBrowse() {
         B.port = r.port;
         B.dir = r.dir;
         B.entries = std::move(r.entries);
+        {   // every directory actually listed becomes the newest "recent place"
+            std::string u = placeUrl(r.host, r.port, r.dir);
+            auto& v = app.rbRecents;
+            v.erase(std::remove(v.begin(), v.end(), u), v.end());
+            v.insert(v.begin(), u);
+            if (v.size() > 10) v.resize(10);
+            app.prefsDirty = true;
+        }
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
             // a listing nobody can see is not a connection anyone believes in
@@ -4066,6 +4123,86 @@ static void remoteBrowseTo(const std::string& dir) {
     j.port = app.rbrowse.port;
     j.dir = dir;
     rbEnqueue(std::move(j));
+}
+
+// One canonical url for "this directory on this host", used by the places list
+// (bookmarks / recents). Unlike makeRemoteUrl it keeps a non-default port, and
+// "~" travels as git's /~/ extension so parseUrl round-trips it.
+static std::string placeUrl(const std::string& host, int port, const std::string& path) {
+    if (host.empty()) return "local://" + path;
+    std::string p = path;
+    if (!p.empty() && p[0] != '/') p = "/" + p;
+    return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
+}
+
+// Navigate to a places url. Same host and a live session: just browse there.
+// Anything else goes through the normal async connect - never a handshake on
+// the UI thread.
+static void goToPlace(const std::string& url) {
+    std::string host, path;
+    int port = 0;
+    if (!remote::parseUrl(url, host, path, &port)) {
+        toast("cannot parse place: " + url, true);
+        return;
+    }
+    if (app.rbrowse.connected && app.rbrowse.host == host && app.rbrowse.port == port) {
+        remoteBrowseTo(path);
+        return;
+    }
+    app.rbrowse = App::RemoteBrowse{};
+    app.rbrowse.host = host;
+    app.rbrowse.port = port;
+    App::RbJob j;
+    j.kind = App::RbConnect;
+    j.host = host;
+    j.port = port;
+    j.dir = path;
+    rbEnqueue(std::move(j));
+}
+
+// Kick a server-side recursive find; the result lands in app.rbSearch through
+// the browse worker. Any previous search is superseded by the gen bump.
+static void remoteStartSearch(const std::string& root, const std::string& pattern) {
+    App::RemoteSearch& S = app.rbSearch;
+    S.gen++;
+    S.running = true;
+    S.active = true;
+    S.root = root;
+    S.pattern = pattern;
+    S.hits.clear();
+    S.truncated = false;
+    S.skippedDirs = 0;
+    App::RbJob j;
+    j.kind = App::RbGlob;
+    j.host = app.rbrowse.host;
+    j.port = app.rbrowse.port;
+    j.dir = root;
+    j.pattern = pattern;
+    j.gen = S.gen;
+    rbEnqueue(std::move(j));
+}
+
+// The remote openFolder(): the worker asks the server to walk the subtree and
+// report every stack below it; the result feeds the picker / open queue on
+// the UI thread (pumpRemoteBrowse).
+static void remoteScanFolder(const std::string& root) {
+    App::RbJob j;
+    j.kind = App::RbScan;
+    j.host = app.rbrowse.host;
+    j.port = app.rbrowse.port;
+    j.dir = root;
+    rbEnqueue(std::move(j));
+}
+
+// Chained opens from a folder scan: the next stack starts only when the remote
+// fetcher is idle, so the memory budget openRemoteStack applies reflects what
+// the previous stack actually loaded.
+static void pumpRemoteOpenQueue() {
+    if (app.rbOpenQueue.empty() || app.rfPending > 0 || app.seqRunning) return;
+    App::RemoteOpen ro = std::move(app.rbOpenQueue.front());
+    app.rbOpenQueue.erase(app.rbOpenQueue.begin());
+    sortFramesNumerically(ro.files);
+    openRemoteStack(ro.host, ro.files, ro.name);
 }
 
 // File > Start Remote: connect (installing the peer if needed), then browse.
@@ -7156,12 +7293,80 @@ static void drawPanelAnalysis() {
 // Files, but the two do different jobs: Files lists what is already OPEN (and
 // closes it), this one BROWSES a machine and decides what to open next. Sharing
 // a window made both harder to read once a server had more than a few folders.
+// ---- remote listing row formatting ----
+static std::string fmtBytesHuman(uint64_t n) {
+    char b[32];
+    if (n >= (1ull << 30))      snprintf(b, sizeof b, "%.1f GB", n / 1073741824.0);
+    else if (n >= (1ull << 20)) snprintf(b, sizeof b, "%.1f MB", n / 1048576.0);
+    else if (n >= 1024)         snprintf(b, sizeof b, "%.1f KB", n / 1024.0);
+    else                        snprintf(b, sizeof b, "%llu B", (unsigned long long)n);
+    return b;
+}
+static std::string fmtUnixTime(int64_t t) {
+    if (t <= 0) return "-";                    // v2 peer / unreadable: unknown
+    time_t tt = (time_t)t;
+    struct tm tmv {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char b[32];
+    strftime(b, sizeof b, "%Y-%m-%d %H:%M", &tmv);
+    return b;
+}
+// "(3000,4000) u16" - the file's declared shape, so what the browser promises is
+// what META will later confirm.
+static std::string fmtEntryShape(const remote::Entry& e) {
+    if (!e.hasMeta) return "-";
+    std::string s = "(";
+    for (int i = 0; i < e.ndim; i++)
+        s += (i ? "," : "") + std::to_string(e.dims[i]);
+    s += ") " + e.dtype;
+    if (e.fortran) s += " F";                  // Fortran order: rare enough to flag
+    return s;
+}
+
+// Bookmarks + recents in one dropdown. Available connected or not: picking a
+// place while disconnected is exactly how a session starts next morning.
+static void drawRemotePlacesCombo() {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
+                           ImGuiComboFlags_HeightLarge))
+        return;
+    int rm = -1;
+    if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");
+    for (int i = 0; i < (int)app.rbBookmarks.size(); i++) {
+        ImGui::PushID(i);
+        if (ImGui::SmallButton("x")) rm = i;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
+        ImGui::SameLine();
+        if (ImGui::Selectable(app.rbBookmarks[i].c_str())) goToPlace(app.rbBookmarks[i]);
+        ImGui::PopID();
+    }
+    if (rm >= 0) {
+        app.rbBookmarks.erase(app.rbBookmarks.begin() + rm);
+        app.prefsDirty = true;
+        savePrefs();
+    }
+    if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
+    for (int i = 0; i < (int)app.rbRecents.size(); i++) {
+        ImGui::PushID(1000 + i);
+        if (ImGui::Selectable(app.rbRecents[i].c_str())) goToPlace(app.rbRecents[i]);
+        ImGui::PopID();
+    }
+    if (app.rbBookmarks.empty() && app.rbRecents.empty())
+        ImGui::TextDisabled("nothing yet - the * button bookmarks the open folder");
+    ImGui::EndCombo();
+}
+
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     ImGui::PushID("remotetree");
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
+        drawRemotePlacesCombo();
         if (!B.err.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
             ImGui::PushTextWrapPos(0.0f);
@@ -7182,10 +7387,95 @@ static void drawPanelRemote() {
     if (ImGui::SmallButton("home")) remoteBrowseTo("~");
     ImGui::SameLine();
     if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("%s", B.dir.c_str());
-    ImGui::PopTextWrapPos();
     if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+    {   // star = bookmark the place being looked at; the combo recalls them
+        std::string curUrl = placeUrl(B.host, B.port, B.dir);
+        bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                 curUrl) != app.rbBookmarks.end();
+        if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
+        if (ImGui::SmallButton("*")) {
+            if (starred)
+                app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                  app.rbBookmarks.end(), curUrl),
+                                      app.rbBookmarks.end());
+            else
+                app.rbBookmarks.push_back(curUrl);
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (starred) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
+                              curUrl.c_str());
+        ImGui::SameLine();
+        drawRemotePlacesCombo();
+    }
+    // ---- path bar: breadcrumbs, or one text field while editing ----
+    static char rbPathEdit[1024];
+    static bool rbPathEditing = false, rbPathFocus = false;
+    if (!rbPathEditing) {
+        struct Seg { std::string label, path; };
+        std::vector<Seg> segs;
+        const std::string& d = B.dir;
+        size_t i = 0;
+        if (!d.empty() && d[0] == '/')      { segs.push_back({ "/", "/" }); i = 1; }
+        else if (!d.empty() && d[0] == '~') { segs.push_back({ "~", "~" });
+                                              i = d.size() > 1 && d[1] == '/' ? 2 : 1; }
+        while (i < d.size()) {
+            size_t s = d.find('/', i);
+            std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
+            if (!part.empty()) {
+                std::string prefix = segs.empty() ? part
+                                   : segs.back().path == "/" ? "/" + part
+                                   : segs.back().path + "/" + part;
+                segs.push_back({ part, prefix });
+            }
+            if (s == std::string::npos) break;
+            i = s + 1;
+        }
+        bool editReq = false;
+        for (size_t k = 0; k < segs.size(); k++) {
+            ImGui::PushID((int)k);
+            if (k) {
+                ImGui::SameLine(0, 2);
+                // capture paths run long: wrap instead of clipping the tail off
+                if (ImGui::GetContentRegionAvail().x <
+                    ImGui::CalcTextSize(segs[k].label.c_str()).x + ImGui::GetFontSize())
+                    ImGui::NewLine();
+            }
+            if (ImGui::SmallButton(segs[k].label.c_str())) remoteBrowseTo(segs[k].path);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) editReq = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n(right-click to edit the path)", segs[k].path.c_str());
+            ImGui::PopID();
+        }
+        if (!segs.empty()) ImGui::SameLine();
+        if (ImGui::SmallButton("edit##path")) editReq = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("type or paste a path (right-clicking the bar works too)");
+        if (editReq) {
+            snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
+            rbPathEditing = true;
+            rbPathFocus = true;
+        }
+    } else {
+        if (rbPathFocus) { ImGui::SetKeyboardFocusHere(); rbPathFocus = false; }
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 4);
+        bool entered = ImGui::InputText("##rbpath", rbPathEdit, sizeof rbPathEdit,
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        if (entered) {
+            std::string p = rbPathEdit;
+            while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(0, 1);
+            while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
+            while (p.size() > 1 && p.back() == '/') p.pop_back();
+            rbPathEditing = false;
+            remoteBrowseTo(p.empty() ? "~" : p);
+        } else if (ImGui::IsItemDeactivated()) {
+            rbPathEditing = false;    // Esc (ImGui reverts the text) or focus loss
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("cancel##path")) rbPathEditing = false;
+    }
     if (!B.err.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
         ImGui::PushTextWrapPos(0.0f);
@@ -7198,71 +7488,370 @@ static void drawPanelRemote() {
             toast("copied");
         }
     }
-    int nNpy = 0;
-    for (const auto& e : B.entries) if (!e.dir && isNpyName(e.name)) nNpy++;
-    if (nNpy >= 2) {
-        char lb[80];
-        snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
-        if (ImGui::Button(lb)) {
-            std::vector<std::string> files;
-            for (const auto& e : B.entries)
-                if (!e.dir && isNpyName(e.name))
-                    files.push_back(B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name);
-            sortFramesNumerically(files);
-            openRemoteStack(B.host, files);
+    // full remote path of a listed name
+    auto joined = [&B](const std::string& n) {
+        return B.dir == "/" ? "/" + n : B.dir + "/" + n;
+    };
+    // Multi-select (Ctrl / Shift + click on file rows). Selection is keyed to
+    // the exact listing: a navigation or a refresh invalidates the indices, so
+    // it resets rather than pointing at different rows.
+    static std::vector<char> rbSel;
+    static int rbSelAnchor = -1;               // entry index of the last click
+    {
+        static std::string selSig;
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        if (sig != selSig) {
+            selSig = sig;
+            rbSel.assign(B.entries.size(), 0);
+            rbSelAnchor = -1;
         }
     }
-    ImGui::Separator();
-    // The listing scrolls on its own so the header above never leaves the view.
-    if (ImGui::BeginChild("entries", ImVec2(0, 0), ImGuiChildFlags_None)) {
-        if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
-            std::string d = B.dir;
-            size_t s = d.find_last_of('/');
-            remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                            : d.substr(0, s));
+    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
+        // the frames can actually stack, BEFORE any pixel is transferred
+        int nSel = 0;
+        const remote::Entry* first = nullptr;
+        std::string reason;
+        for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+            if (!rbSel[i]) continue;
+            const remote::Entry& e = B.entries[i];
+            nSel++;
+            if (!isNpyName(e.name)) { reason = "only .npy files can form a stack"; continue; }
+            if (!e.hasMeta) {
+                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
+                continue;
+            }
+            if (!first) { first = &e; continue; }
+            if (e.ndim != first->ndim || e.dtype != first->dtype ||
+                memcmp(e.dims, first->dims, sizeof e.dims) != 0)
+                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
+                         fmtEntryShape(e);
         }
-        for (const auto& e : B.entries) {
+        if (nSel >= 2) {
+            char lb[64];
+            snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
+            if (!reason.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button(lb)) {
+                std::vector<std::string> files;
+                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                    if (!rbSel[i]) continue;
+                    const remote::Entry& e = B.entries[i];
+                    if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
+                    else files.push_back(joined(e.name));
+                }
+                sortFramesNumerically(files);
+                openRemoteStack(B.host, files);
+                rbSel.assign(B.entries.size(), 0);
+            }
+            if (!reason.empty()) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", reason.empty()
+                    ? "frames stack in numeric name order" : reason.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
+        }
+    }
+    // Filter what is already listed - no round-trip to the server. Substring by
+    // default, glob when * or ? appears (globListMatch's contract), because a
+    // capture dump directory holds hundreds of entries and one condition matters.
+    static char rbFilter[256] = "";
+    {
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+            ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
+                                 rbFilter, sizeof rbFilter);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("filters the listing below without asking the server\n"
+                              "bare text matches anywhere; * and ? make it a glob;\n"
+                              "comma separates alternatives");
+    }
+    // filtered view of B.entries, by index (the clipper needs random access)
+    std::vector<int> shown;
+    shown.reserve(B.entries.size());
+    for (int i = 0; i < (int)B.entries.size(); i++)
+        if (!rbFilter[0] || globListMatch(rbFilter, B.entries[i].name))
+            shown.push_back(i);
+    if (rbFilter[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
+    }
+    // Server-side search - a different thing from the filter above (which only
+    // narrows what is already listed), so it gets its own labelled row.
+    static char rbSearchBuf[256] = "";
+    static bool rbSearchFocus = false;
+    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
+    {
+        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        bool go = ImGui::InputTextWithHint("##rbsearch",
+                                           "search server (recursive): frame_* or **/dark.npy",
+                                           rbSearchBuf, sizeof rbSearchBuf,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
+                              "bare text matches anywhere in the relative path;\n"
+                              "* and ? glob across '/'");
+        ImGui::SameLine();
+        if (app.rbSearch.running) {
+            if (ImGui::SmallButton("Stop##rbsearch")) {
+                app.rbSearch.gen++;               // in-flight result becomes stale
+                app.rbSearch.running = false;
+            }
+        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
+            remoteStartSearch(rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
+        }
+        if (!rbSearchRoot.empty()) {
+            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
+        }
+    }
+    // The metadata columns exist from protocol 3 on. Say so once, up here - a
+    // "-" in every row of every column explains nothing.
+    {
+        int pv = 0;
+        {
+            std::lock_guard<std::mutex> lk(app.sesMtx);
+            if (app.remoteSession) pv = app.remoteSession->peerVersion();
+        }
+        if (pv > 0 && pv < 3)
+            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
+                               "peer is protocol %d - File > Update remote peer "
+                               "enables shape / date columns", pv);
+    }
+    ImGui::Separator();
+    if (app.rbSearch.active) {         // search results stand in for the listing
+        App::RemoteSearch& S = app.rbSearch;
+        auto joinS = [&S](const std::string& rel) {
+            return S.root == "/" ? "/" + rel : S.root + "/" + rel;
+        };
+        if (S.running) {
+            ImGui::TextDisabled("searching %s under %s ...", S.pattern.c_str(), S.root.c_str());
+        } else {
+            ImGui::Text("%d result(s) for %s under %s%s", (int)S.hits.size(),
+                        S.pattern.c_str(), S.root.c_str(),
+                        S.truncated ? "  (first 2000 - narrow the pattern)" : "");
+            if (S.skippedDirs)
+                ImGui::TextDisabled("%d unreadable folder(s) skipped", S.skippedDirs);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("close results")) S.active = false;
+        if (ImGui::BeginChild("searchhits", ImVec2(0, 0), ImGuiChildFlags_None)) {
+            ImGuiListClipper clip;
+            clip.Begin((int)S.hits.size());
+            while (clip.Step())
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                const remote::GlobHit& h = S.hits[row];
+                ImGui::PushID(row);
+                std::string lb = h.dir ? "[" + h.rel + "]" : h.rel;
+                if (ImGui::Selectable(lb.c_str())) {
+                    std::string full = joinS(h.rel);
+                    if (h.dir) {
+                        remoteBrowseTo(full);
+                    } else if (isNpyName(h.rel)) {
+                        openRemote(makeRemoteUrl(B.host, full));
+                    } else {
+                        // not servable: at least go where it lives
+                        size_t sl = full.find_last_of('/');
+                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                          : full.substr(0, sl));
+                    }
+                }
+                if (ImGui::BeginPopupContextItem("sctx")) {
+                    std::string full = joinS(h.rel);
+                    if (!h.dir && ImGui::MenuItem("Go to containing folder")) {
+                        size_t sl = full.find_last_of('/');
+                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                          : full.substr(0, sl));
+                    }
+                    if (ImGui::MenuItem("Copy path")) {
+                        ImGui::SetClipboardText(full.c_str());
+                        toast("copied " + full);
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopID();
+        return;
+    }
+    if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
+        std::string d = B.dir;
+        size_t s = d.find_last_of('/');
+        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                        : d.substr(0, s));
+    }
+    // The listing scrolls on its own so the header above never leaves the view.
+    // Properties target: a snapshot, because the row may scroll out of the
+    // clipper (or the listing may refresh) while the popup is up.
+    static remote::Entry rbPropsEntry;
+    static std::string rbPropsPath;
+    static bool rbPropsOpen = false;
+    enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+    if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
+                                       ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                                       ImGuiTableFlags_SortTristate)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
+                                        ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
+        ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
+                                                 ImGuiTableColumnFlags_NoSort, 0.0f, RB_COL_SHAPE);
+        ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed |
+                                        ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_SIZE);
+        ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
+                                            ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
+        ImGui::TableHeadersRow();
+        // `shown` is rebuilt every frame, so sorting it here honors a changed
+        // sort spec, a fresh listing and the filter in one place. Directories
+        // sort before files no matter the key - this is a browser, not a table
+        // of numbers.
+        if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
+            std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+                const remote::Entry& a = B.entries[ia];
+                const remote::Entry& b = B.entries[ib];
+                if (a.dir != b.dir) return a.dir;
+                for (int s = 0; s < sp->SpecsCount; s++) {
+                    const ImGuiTableColumnSortSpecs& c = sp->Specs[s];
+                    int cmp = 0;
+                    switch (c.ColumnUserID) {
+                        case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
+                        case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
+                        default:           cmp = a.name.compare(b.name); break;
+                    }
+                    if (cmp) return c.SortDirection == ImGuiSortDirection_Descending ? cmp > 0
+                                                                                     : cmp < 0;
+                }
+                return false;
+            });
+        }
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        while (clip.Step())
+        for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+            const remote::Entry& e = B.entries[shown[row]];
+            ImGui::PushID(shown[row]);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
+            if (e.group) lb += "  [" + std::to_string(e.frames) + " frames]";
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
-            if (ImGui::Selectable(lb.c_str()) && servable) {
-                if (e.dir) remoteBrowseTo(joined);
-                else       openRemote(makeRemoteUrl(B.host, joined));
+            int ei = shown[row];
+            bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
+            if (ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns) && servable) {
+                ImGuiIO& sio = ImGui::GetIO();
+                bool canSel = !e.dir && ei < (int)rbSel.size();
+                if (sio.KeyCtrl && canSel) {
+                    rbSel[ei] ^= 1;                    // toggle, plain click still opens
+                    rbSelAnchor = ei;
+                } else if (sio.KeyShift && canSel) {
+                    // range in the order on SCREEN (sorted + filtered), anchor kept
+                    int a = -1;
+                    for (int k = 0; k < (int)shown.size(); k++)
+                        if (shown[k] == rbSelAnchor) a = k;
+                    if (a < 0) a = row;
+                    for (int k = std::min(a, row); k <= std::max(a, row); k++)
+                        if (!B.entries[shown[k]].dir && (size_t)shown[k] < rbSel.size())
+                            rbSel[shown[k]] = 1;
+                } else if (e.dir) {
+                    remoteBrowseTo(joined(e.name));
+                } else if (e.group) {
+                    // one row = one stack; members arrive numerically sorted
+                    std::vector<std::string> files;
+                    for (const auto& m : e.members) files.push_back(joined(m));
+                    openRemoteStack(B.host, files);
+                    rbSelAnchor = ei;
+                } else {
+                    openRemote(makeRemoteUrl(B.host, joined(e.name)));
+                    rbSelAnchor = ei;
+                }
             }
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
-            if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::BeginPopupContextItem("ctx")) {
+                std::string full = joined(e.name);
                 if (e.dir) {
-                    if (ImGui::MenuItem("Open folder (all stacks below)")) {
-                        App::RbJob j; j.kind = App::RbScan;
-                        j.host = B.host; j.port = B.port; j.dir = joined;
-                        rbEnqueue(std::move(j));
-                        toast("scanning " + e.name + " for stacks...");
+                    if (ImGui::MenuItem("Open folder (all stacks below)"))
+                        remoteScanFolder(full);
+                    if (ImGui::MenuItem("Search under here")) {
+                        rbSearchRoot = full;      // the search row shows and clears it
+                        rbSearchFocus = true;
                     }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Find every numbered .npy sequence below this\n"
-                                          "folder and open each as a stack - one per\n"
-                                          "subfolder, like a local Open Folder.");
-                } else if (servable && ImGui::MenuItem("Open")) {
-                    openRemote(makeRemoteUrl(B.host, joined));
+                    if (ImGui::MenuItem("Bookmark")) {
+                        std::string u = placeUrl(B.host, B.port, full);
+                        if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
+                            app.rbBookmarks.end()) {
+                            app.rbBookmarks.push_back(u);
+                            app.prefsDirty = true;
+                            savePrefs();
+                        }
+                        toast("bookmarked " + u);
+                    }
+                    ImGui::Separator();
+                } else if (e.group) {
+                    if (ImGui::MenuItem("Open as stack")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(joined(m));
+                        openRemoteStack(B.host, files);
+                    }
+                    ImGui::Separator();
+                } else if (isNpyName(e.name)) {
+                    if (ImGui::MenuItem("Open"))
+                        openRemote(makeRemoteUrl(B.host, full));
+                    // one file as a stack: a frame-axis file becomes its frames
+                    if (ImGui::MenuItem("Open as stack"))
+                        openRemoteStack(B.host, { full });
+                    ImGui::Separator();
                 }
                 if (ImGui::MenuItem("Copy path")) {
-                    ImGui::SetClipboardText(makeRemoteUrl(B.host, joined).c_str());
-                    toast("copied");
+                    ImGui::SetClipboardText(full.c_str());
+                    toast("copied " + full);
+                }
+                if (!e.dir && ImGui::MenuItem("Properties...")) {
+                    rbPropsEntry = e;
+                    rbPropsPath = full;
+                    rbPropsOpen = true;
                 }
                 ImGui::EndPopup();
             }
-            if (!servable && ImGui::IsItemHovered())
-                ImGui::SetTooltip("only .npy is served remotely");
-            if (!e.dir && e.size) {
-                ImGui::SameLine();
-                ImGui::TextDisabled(e.size >= (1u << 30) ? "%.1f GB" : "%.1f MB",
-                                    e.size >= (1u << 30) ? e.size / 1073741824.0
-                                                         : e.size / 1048576.0);
-            }
+            ImGui::TableNextColumn();
+            if (!e.dir && isNpyName(e.name)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
+            ImGui::TableNextColumn();
+            if (!e.dir) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
+            ImGui::TableNextColumn();
+            if (e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            else if (!e.dir) ImGui::TextDisabled("-");
+            ImGui::PopID();
         }
+        ImGui::EndTable();
     }
-    ImGui::EndChild();
+    if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
+    if (ImGui::BeginPopup("Remote properties")) {
+        const remote::Entry& e = rbPropsEntry;
+        // the path is the thing people need to paste into scripts: selectable
+        char pathBuf[1024];
+        snprintf(pathBuf, sizeof pathBuf, "%s", rbPropsPath.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 24);
+        ImGui::InputText("##proppath", pathBuf, sizeof pathBuf, ImGuiInputTextFlags_ReadOnly);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("copy")) {
+            ImGui::SetClipboardText(rbPropsPath.c_str());
+            toast("copied " + rbPropsPath);
+        }
+        if (e.group)
+            ImGui::Text("stack: %u frames (%s)", e.frames, e.name.c_str());
+        ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
+                    (unsigned long long)e.size, e.group ? "  - all frames" : "");
+        ImGui::Text("modified  %s (this machine's timezone)", fmtUnixTime(e.mtime).c_str());
+        ImGui::Text("shape     %s%s", fmtEntryShape(e).c_str(),
+                    e.hasMeta && e.group ? "  - per frame" : "");
+        if (!e.hasMeta)
+            ImGui::TextDisabled("shape/dtype need a protocol 3 peer (File > Update remote peer)");
+        ImGui::EndPopup();
+    }
     ImGui::PopID();
 }
 
@@ -7292,6 +7881,7 @@ static void drawFileList() {
         // the ONLY way to cancel a remote fetch used to be quitting the app
         if (ImGui::SmallButton("Stop##rf")) {
             app.rfGen++;
+            app.rbOpenQueue.clear();   // or the queue would just start the next stack
             std::lock_guard<std::mutex> lk(app.rfMtx);
             app.rfQueue.clear();
             app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0;
@@ -7299,6 +7889,11 @@ static void drawFileList() {
     }
     if (app.rfPending > 0)
         ImGui::TextDisabled("remote: fetching %d/%d", app.rfFetched.load(), app.rfTotal.load());
+    if (!app.rbOpenQueue.empty()) {   // stacks a folder scan has still to open
+        ImGui::TextDisabled("remote: %d stack(s) queued", (int)app.rbOpenQueue.size());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##rq")) app.rbOpenQueue.clear();
+    }
     if (!app.seqNote.empty()) {          // why the stack is short, kept in view
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
         ImGui::PushTextWrapPos(0.0f);
@@ -7471,27 +8066,18 @@ static void drawMenuBar(GLFWwindow* win) {
             app.focusRemote = true;
             if (!app.rbrowse.connected) app.remoteDlgOpen = true;
         }
-        // The remote Open Folder: scan the folder being browsed, open every
-        // numbered sequence below it as a stack (one per subfolder - the
-        // linearity capture layout). Not connected yet: connect first, exactly
-        // like Open File (Remote).
+        // The remote mirror of Open Folder: every stack below the current
+        // browse directory, one stack per subfolder. Not connected yet: ask
+        // for the host first - the same two steps as Open File (Remote).
         if (ImGui::MenuItem("Open Folder (Remote)...")) {
             app.showRemote = true;
             app.focusRemote = true;
-            if (!app.rbrowse.connected) {
-                app.remoteDlgOpen = true;
-            } else {
-                App::RbJob j; j.kind = App::RbScan;
-                j.host = app.rbrowse.host; j.port = app.rbrowse.port;
-                j.dir = app.rbrowse.dir;
-                rbEnqueue(std::move(j));
-                toast("scanning " + app.rbrowse.dir + " for stacks...");
-            }
+            if (app.rbrowse.connected) remoteScanFolder(app.rbrowse.dir);
+            else app.remoteDlgOpen = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Opens every numbered .npy sequence under the folder\n"
-                              "currently shown in the Remote panel (browse there\n"
-                              "first, or right-click a folder in the panel).");
+        if (app.rbrowse.connected && ImGui::IsItemHovered())
+            ImGui::SetTooltip("scans %s - browse to the folder you want first",
+                              app.rbrowse.dir.c_str());
         if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
             App::RbJob j; j.kind = App::RbUpdatePeer;
             j.host = app.rbrowse.host; j.port = app.rbrowse.port;
@@ -8162,6 +8748,162 @@ static int remoteSelfTest(const char* exe, const char* path) {
         return 1;
     }
     const ImageDoc& ref = *cur();
+    int bad = 0;
+    std::string dir = path, base = path;       // the test file's folder and name
+    {
+        size_t sl = dir.find_last_of("/\\");
+        if (sl == std::string::npos) dir = ".";
+        else { dir = dir.substr(0, sl); base = base.substr(sl + 1); }
+    }
+    {   // LIST v3: the listing's metadata must agree with the local loader
+        std::vector<remote::Entry> ents;
+        if (!s.list(dir, ents, err)) {
+            fprintf(stderr, "selftest LIST: %s\n", err.c_str());
+            return 1;
+        }
+        const remote::Entry* me = nullptr;
+        for (const auto& e : ents) if (e.name == base) me = &e;
+        for (const auto& e : ents)                 // grouping may have folded it
+            if (!me && e.group)
+                for (const auto& mm : e.members) if (mm == base) me = &e;
+        size_t bad0 = 0;
+        if (!me) {
+            fprintf(stderr, "selftest LIST: %s not in the listing of %s\n",
+                    base.c_str(), dir.c_str());
+            bad0++;
+        } else {
+            uint64_t px = 1;
+            for (int i = 0; i < me->ndim; i++) px *= me->dims[i];
+            uint64_t refPx = (uint64_t)m.frames * ref.w * ref.h * ref.ch;
+            if (!me->hasMeta || me->dtype != m.dtype || px != refPx) {
+                fprintf(stderr, "selftest LIST: meta mismatch (dtype %s vs %s, "
+                                "%llu vs %llu samples)\n",
+                        me->dtype.c_str(), m.dtype.c_str(),
+                        (unsigned long long)px, (unsigned long long)refPx);
+                bad0++;
+            }
+            if (me->mtime <= 0) {
+                fprintf(stderr, "selftest LIST: mtime missing (%lld unix s)\n",
+                        (long long)me->mtime);
+                bad0++;
+            }
+        }
+        fprintf(stderr, "selftest: LIST v3 %s: %s  %s  mtime %lld unix s : %s\n",
+                base.c_str(), me ? fmtEntryShape(*me).c_str() : "?",
+                me ? fmtBytesHuman(me->size).c_str() : "?",
+                me ? (long long)me->mtime : 0, bad0 ? "FAIL" : "ok");
+        bad += bad0 ? 1 : 0;
+    }
+    {   // A v2 peer's LIST reply must parse into "unknown" metadata, not into an
+        // error - this is the compatibility contract, tested without a v2 binary.
+        std::vector<uint8_t> pl;
+        auto pu32 = [&](uint32_t v) { pl.insert(pl.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
+        auto pstr = [&](const std::string& t) { pu32((uint32_t)t.size());
+                                                pl.insert(pl.end(), t.begin(), t.end()); };
+        pu32(2);
+        pstr("a.npy"); pu32(0); pu32(5); pu32(0);      // file, 5 bytes
+        pstr("sub");   pu32(1); pu32(0); pu32(0);      // directory
+        std::vector<remote::Entry> v2;
+        std::string perr;
+        bool ok = remote::parseListPayload(pl, 2, v2, perr) && v2.size() == 2 &&
+                  !v2[0].dir && v2[0].size == 5 && !v2[0].hasMeta &&
+                  v2[0].mtime == 0 && !v2[0].group && v2[1].dir;
+        fprintf(stderr, "selftest: LIST v2-compat parse (missing fields -> unknown): %s\n",
+                ok ? "ok" : "FAIL");
+        bad += ok ? 0 : 1;
+    }
+    {   // Grouping: 24 numbered frames fold into ONE synthetic row; the loose
+        // .npy and the .txt stay plain. Fixture from tools/gen_testdata.py.
+        std::string rb = dir + "/rb";
+        std::vector<remote::Entry> ents;
+        if (!s.list(rb, ents, err)) {
+            fprintf(stderr, "selftest: LIST grouping: skipped (%s: %s)\n",
+                    rb.c_str(), err.c_str());
+        } else {
+            int nGroups = 0, nPlain = 0;
+            const remote::Entry* g = nullptr;
+            for (const auto& e : ents) {
+                if (e.dir) continue;                   // scanroot/ lives here too
+                if (e.group) { nGroups++; g = &e; }
+                else nPlain++;
+            }
+            bool ok = nGroups == 1 && nPlain == 3 && g && g->frames == 24 &&
+                      g->members.size() == 24 && g->hasMeta && g->dtype == "f32" &&
+                      g->name.find('#') != std::string::npos;
+            // the member names must lead back to real files, or the row is a lie
+            remote::Meta gm;
+            if (ok && !s.meta(rb + "/" + g->members[0], gm, err)) {
+                fprintf(stderr, "selftest LIST grouping: member META: %s\n", err.c_str());
+                ok = false;
+            }
+            fprintf(stderr, "selftest: LIST grouping %s: %d group(s), %d single(s), "
+                            "%u frames %s: %s\n",
+                    g ? g->name.c_str() : "?", nGroups, nPlain,
+                    g ? g->frames : 0, g ? fmtEntryShape(*g).c_str() : "?",
+                    ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // SCAN (the remote openFolder): 3 illumination folders -> 3 stacks
+        std::string sroot = dir + "/rb/scanroot";
+        std::vector<remote::ScanGroup> gs;
+        bool trunc = false;
+        int skipped = 0;
+        if (!s.scan(sroot, 6, 256, gs, trunc, skipped, err)) {
+            fprintf(stderr, "selftest: SCAN: skipped (%s: %s)\n", sroot.c_str(), err.c_str());
+        } else {
+            bool ok = gs.size() == 3 && !trunc;
+            std::string dirsSeen;
+            for (const auto& g : gs) {
+                dirsSeen += (dirsSeen.empty() ? "" : ",") + g.dir;
+                if (g.entry.frames != 8 || g.entry.members.size() != 8 ||
+                    !g.entry.hasMeta || g.dir.empty())
+                    ok = false;
+            }
+            fprintf(stderr, "selftest: SCAN %s -> %d stack(s) [%s], 8 frames each, "
+                            "truncated=%d, %d dir(s) skipped: %s\n",
+                    sroot.c_str(), (int)gs.size(), dirsSeen.c_str(),
+                    trunc ? 1 : 0, skipped, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // GLOB: recursive find - full count, cap-5 truncation, bare substring
+        std::string groot = dir + "/rb";
+        std::vector<remote::GlobHit> hits;
+        bool trunc = false;
+        int skipped = 0;
+        if (!s.glob(groot, "**/frame_*.npy", 6, 2000, hits, trunc, skipped, err)) {
+            fprintf(stderr, "selftest: GLOB: skipped (%s: %s)\n", groot.c_str(), err.c_str());
+        } else {
+            // 24 in rb/ itself + 3 x 8 under scanroot/
+            bool ok = hits.size() == 48 && !trunc;
+            for (const auto& h : hits) if (h.dir) ok = false;
+            fprintf(stderr, "selftest: GLOB **/frame_*.npy under %s -> %d hit(s), "
+                            "truncated=%d: %s\n",
+                    groot.c_str(), (int)hits.size(), trunc ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+
+            if (!s.glob(groot, "**/frame_*.npy", 6, 5, hits, trunc, skipped, err)) {
+                fprintf(stderr, "selftest GLOB cap: %s\n", err.c_str());
+                bad++;
+            } else {
+                bool ok2 = hits.size() == 5 && trunc;
+                fprintf(stderr, "selftest: GLOB cap 5 -> %d hit(s), truncated=%d: %s\n",
+                        (int)hits.size(), trunc ? 1 : 0, ok2 ? "ok" : "FAIL");
+                bad += ok2 ? 0 : 1;
+            }
+            if (!s.glob(groot, "dark", 6, 2000, hits, trunc, skipped, err)) {
+                fprintf(stderr, "selftest GLOB substring: %s\n", err.c_str());
+                bad++;
+            } else {
+                bool ok3 = hits.size() == 1 && hits[0].rel == "dark.npy";
+                fprintf(stderr, "selftest: GLOB substring 'dark' -> %d hit(s) (%s): %s\n",
+                        (int)hits.size(), hits.empty() ? "?" : hits[0].rel.c_str(),
+                        ok3 ? "ok" : "FAIL");
+                bad += ok3 ? 0 : 1;
+            }
+        }
+    }
     struct Case { int x, y, w, h, step; };
     const Case cases[] = {
         { 0, 0, ref.w, ref.h, 1 },                              // whole frame
@@ -8169,7 +8911,6 @@ static int remoteSelfTest(const char* exe, const char* path) {
         { ref.w / 4, ref.h / 4, ref.w / 2, ref.h / 2, 1 },      // zoomed-in crop
         { 1, 1, 17, 13, 2 },                                    // odd rect, odd stride
     };
-    int bad = 0;
     for (const Case& c : cases) {
         std::vector<float> got;
         int gw = 0, gh = 0, gch = 0;
@@ -8550,6 +9291,8 @@ int main(int argc, char** argv) {
         bool scanSent = false;
         while (glfwGetTime() - t0 < 120.0) {
             pumpRemoteBrowse();
+            pumpRemoteFetch();
+            pumpRemoteOpenQueue();
             pumpSequenceAndQueue();
             if (app.rbrowse.connected && !scanSent) {
                 App::RbJob j; j.kind = App::RbScan;
@@ -8557,7 +9300,16 @@ int main(int argc, char** argv) {
                 rbEnqueue(std::move(j));
                 scanSent = true;
             }
-            if (scanSent && !app.rbBusy && !app.seqs.empty()) break;
+            // headless "Load selected": accept the picker with everything checked,
+            // exactly what the Load button does with the default selection
+            if (app.folderPickOpen && app.folderPickRemote) {
+                for (auto& e : app.folderPick)
+                    app.rbOpenQueue.push_back({ app.folderPickHost, std::move(e.g.files), e.g.name });
+                app.folderPick.clear();
+                app.folderPickOpen = false;
+            }
+            if (scanSent && !app.rbBusy && !app.seqs.empty() &&
+                app.rbOpenQueue.empty() && app.rfPending == 0) break;
             if (!app.rbrowse.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -8645,8 +9397,13 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
-            // sequence start/end = C-a/C-e (always Ctrl, also on macOS)
-            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
+            // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
+            // Ctrl+F is "find" while the Remote browser owns focus (it jumps to
+            // the filter box there), so frame-stepping must yield to it.
+            ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
+            bool remoteFocused = nav && nav->RootWindow &&
+                                 strcmp(nav->RootWindow->Name, "Remote") == 0;
+            if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_P)) gotoStack(-1);
@@ -9096,6 +9853,7 @@ int main(int argc, char** argv) {
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpMeasure();                // integrate server-side measurement results
         pumpRemoteBrowse();           // connect/list results from the browse worker
+        pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
