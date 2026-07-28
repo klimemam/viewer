@@ -4073,6 +4073,11 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     App::SeqInfo info;
     info.id = app.nextSeqId++;
     info.name = pattern.empty() ? ref->name : pattern;
+    // docs/terminology.md: "部分ロードされた stack の集計は「何枚中何枚か」を
+    // 必ず併記する". expectedFrames was a REMOTE-only field, so a mid-load local
+    // stack could not state the ratio even in principle - the A/B header
+    // printed "n=5/5" while the loader was still decoding frames 6..24.
+    info.expectedFrames = (int)files.size();
     info.lastImageIdx = imageIdx;
     app.seqs.push_back(info);
     ref->seqId = info.id;
@@ -9715,7 +9720,14 @@ static void drawPanelLinearity() {
             if (std::isfinite(m.value)) textNum("%.6g", m.value);
             else ImGui::TextDisabled("unset");
             ImGui::TableNextColumn();
-            if (row && row->valid) ImGui::Text("%d", row->frames);
+            // used/expected whenever the total is known: Compute derives
+            // sigma_t, K, LEmax and read noise from whatever is RESIDENT, and a
+            // bare "60" beside a [server, 300 frames] figure for the same stack
+            // is the difference the canon requires to be stated
+            if (row && row->valid && si->expectedFrames > row->frames)
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%d/%d",
+                                   row->frames, si->expectedFrames);
+            else if (row && row->valid) ImGui::Text("%d", row->frames);
             else ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
             int tp = row ? std::clamp(L.tablePlane, 0, std::max(0, row->nPl - 1)) : 0;
@@ -12602,8 +12614,16 @@ static void drawFileList() {
           } else {
               snprintf(lb, sizeof lb, "  %s", sname);
           }
-          char frames[24];
-          snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
+          char frames[32];
+          {   // "8f" for an 8-of-300 stack states nothing; say the ratio while
+              // the total is known and the load is short of it
+              const App::SeqInfo* fsi = seqInfo(head.seqId);
+              int exp = fsi ? fsi->expectedFrames : 0;
+              if (exp > (int)stack.size())
+                  snprintf(frames, sizeof frames, "  %d/%df", (int)stack.size(), exp);
+              else
+                  snprintf(frames, sizeof frames, "  %df", (int)stack.size());
+          }
           const ImageDoc* bnow = cmpB();
           bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
           if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
@@ -16657,6 +16677,32 @@ int main(int argc, char** argv) {
             check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
                   "V10 the mosaic is part of the cache key");
             closeAll();
+        }
+
+        {   // ---- V12: a LOCAL stack knows how many frames it expects -------
+            // docs/terminology.md requires a partially loaded stack's
+            // aggregates to state "how many of how many". expectedFrames was
+            // populated only on the three REMOTE open paths, so for a local
+            // folder stack it stayed 0: `expected > frames` was false, and the
+            // A/B temporal header printed "A (n=5/5)" - complete - while the
+            // loader was still decoding frames 6..24.
+            reload();
+            int lack = 0, mismatch = 0;
+            for (const auto& si : app.seqs) {
+                if (si.expectedFrames <= 0) lack++;
+                else if (si.expectedFrames != (int)framesOfSeq(si.id).size()) mismatch++;
+            }
+            selectImage(framesOfSeq(app.seqs.front().id).front());
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            AbTemporal TA = abTemporalOf(cur(), app.temporal[0], app.srvTemporal);
+            fprintf(stderr, "verifyselftest: V12 %d local stack(s): %d without an "
+                            "expected count, %d disagreeing with what is resident; "
+                            "A/B header would read n=%d/%d\n",
+                    (int)app.seqs.size(), lack, mismatch, TA.frames, TA.expected);
+            check(lack == 0 && mismatch == 0,
+                  "V12 a local folder stack records its expected frame count");
+            check(TA.expected == TA.frames && TA.expected > 0,
+                  "V12 a fully loaded stack states n=N/N truthfully");
         }
 
         {   // ---- V11: a pixel value is [DN] whatever its storage dtype -----
