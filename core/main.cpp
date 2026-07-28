@@ -266,6 +266,9 @@ struct App {
     // records whether it still holds anything, so compare-off invalidates it
     // exactly once and then costs nothing at all.
     bool abSlot1Live = false;
+    // While frames are being stepped faster than a person reads them, the B
+    // caches are NOT recomputed (see selectImage). glfwGetTime() deadline.
+    double abStepBusyUntil = 0;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -740,6 +743,24 @@ static bool abSideBySide() {
     if (app.abStatsLayout == App::AbOverlay) return false;
     if (app.abStatsLayout == App::AbSide) return true;
     return app.compareMode == App::CmpSplit;
+}
+
+// Can A's and B's profiles be drawn on ONE axis? Only when both sampled the
+// same range - same origin and same length. Anything else would have to be
+// stretched to line up, and stretching invents a correspondence between two
+// captures that nothing in the data supports. False means: side by side, and
+// say why (docs/ab-stats-plan.md 5).
+static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) {
+    return A.rx == B.rx && A.rw == B.rw && A.ry == B.ry && A.rh == B.rh;
+}
+
+// --no-ab-throttle: developer flag, so the cost the throttle removes can be
+// measured on the same binary instead of quoted from an older one.
+static bool g_abNoThrottle = false;
+// True while frames are being stepped continuously. The B slots skip their
+// recompute then; whoever draws B must say "stale" (docs/ab-stats-plan.md 1).
+static bool abStepBusy() {
+    return !g_abNoThrottle && app.abStepBusyUntil > glfwGetTime();
 }
 
 // Slot 1 of every statistics cache belongs to the B side and is filled only
@@ -3518,6 +3539,17 @@ static void selectImage(int idx) {
     }
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
+    // Held-down frame stepping: B's caches cost real milliseconds per step
+    // (measured, see the A/B stats commits), so a key repeat would drag the
+    // whole UI down for as long as the key is held. Two switches inside 300 ms
+    // means "still stepping"; the B slots then hold their last result and say
+    // so, and refresh once the stepping stops. Same shape as annBusy.
+    {
+        static double lastSwitch = -1e9;
+        double now = glfwGetTime();
+        if (now - lastSwitch < 0.30) app.abStepBusyUntil = now + 0.30;
+        lastSwitch = now;
+    }
     app.current = idx;
     ImageDoc* d = app.images[idx].get();
     // Value-range scope. The stack default (frames inherit the reference
@@ -6967,10 +6999,15 @@ static void drawPanelHistogram() {
         recomputeHistogramIfNeeded(im, app.hist[0]);
         // B is binned on A's black/white: one x axis, one bin grid, or the two
         // curves are not comparable. Sizes may differ freely - the y axis below
-        // normalises that away.
-        if (Bim) recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
+        // normalises that away. Skipped while frames are being stepped: an
+        // empty slot is always filled, a filled one waits for the stepping to
+        // stop and is labelled stale until then.
+        if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
+            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
+        const bool bStale = Bim && HB.uid != Bim->uid;
+        const std::string bLabel = Bim ? Bim->name + (bStale ? "   [stale]" : "") : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
         // with a B on screen, an unlabelled table of numbers is ambiguous:
@@ -7152,7 +7189,7 @@ static void drawPanelHistogram() {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegend(hp, im->name, Bim->name);
+            if (Bim) drawABLegend(hp, im->name, bLabel);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -7170,7 +7207,7 @@ static void drawPanelHistogram() {
             ImGui::SameLine();
             ImGui::BeginChild("##histB", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand("B", Bim->name);
+            drawABBand("B", bLabel);
             // identical axis ranges by construction: same xl/yl, same limits
             drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                               false, false, plotH), false, true);
@@ -7187,7 +7224,7 @@ static void drawPanelHistogram() {
         if (Bim)
             ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
                                 HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
-                                Bim->name.c_str());
+                                bLabel.c_str());
     }
 
 }
@@ -7314,10 +7351,20 @@ static void drawPanelProjection() {
     }
     ImGui::SameLine(); ImGui::Checkbox("H", &app.showProjH);
     ImGui::SameLine(); ImGui::Checkbox("V", &app.showProjV);
+    ImageDoc* Bim = abStatsB();
     recomputeProjectionIfNeeded(im, app.proj[0]);
+    // skipped while frames are being stepped (see abStepBusy), except on the
+    // first fill - an empty B plot would be worse than a stale one
+    if (Bim && (!abStepBusy() || app.proj[1].uid == 0))
+        recomputeProjectionIfNeeded(Bim, app.proj[1]);
     const App::ProjState& P = app.proj[0];
+    const App::ProjState& PB = app.proj[1];
+    const bool bStale = Bim && PB.uid != Bim->uid;
+    const std::string bLabel = Bim ? Bim->name + (bStale ? "   [stale]" : "") : std::string();
     ImGui::SameLine();
-    ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
+    if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
+                                 P.roiUsed ? "ROI" : "whole image");
+    else     ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
 
     // value axis: a rescaling y axis makes profiles impossible to compare
     const char* ymodes[3] = { "auto", "display range", "fixed" };
@@ -7341,7 +7388,13 @@ static void drawPanelProjection() {
     float yLo, yHi;
     if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
     else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
-    else { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }   // shared H/V
+    else {                                   // shared across H, V - and A and B
+        yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax);
+        if (Bim) {
+            yLo = std::min(yLo, std::min(PB.hMin, PB.vMin));
+            yHi = std::max(yHi, std::max(PB.hMax, PB.vMax));
+        }
+    }
     if (app.projYMode == 2) {
         ImGui::SameLine();
         // shadow buffer: committing per keystroke would re-project the image on
@@ -7361,88 +7414,189 @@ static void drawPanelProjection() {
                                        IM_COL32(60, 180, 140, 220), IM_COL32(92, 155, 255, 220) };
     static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 210), IM_COL32(79, 221, 107, 210),
                                        IM_COL32(92, 155, 255, 210) };
+    const ImU32 ODD_COL = IM_COL32(185, 192, 200, 210);   // a series only one side has
     bool cfa = im->ch == 1 && im->cfa != 0;
     int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
     if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
+
+    // Overlay is only honest when the two profiles are the SAME axis: same
+    // length and same origin. Different lengths cannot be aligned without
+    // knowing the physical mapping between the two captures, and stretching one
+    // to fit the other would invent a correspondence that does not exist. So:
+    // fall back to side by side and say why.
+    const bool canOverlay = !Bim || abProjOverlayable(P, PB);
+    const float minSide = 320.0f * app.uiScale;
+    bool side = Bim && (abSideBySide() || !canOverlay);
+    // the narrow-panel fallback yields to correctness: mismatched profiles are
+    // never overlaid, however little room there is
+    bool tooNarrow = side && canOverlay && ImGui::GetContentRegionAvail().x < minSide;
+    if (tooNarrow) side = false;
+
     // reserve the statistics table first: the plots must not push it off-panel
-    int statRows = P.nSeries * plots;
+    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0)) * plots;
     float lineH = ImGui::GetTextLineHeightWithSpacing();
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
                  + lineH;                                  // footnote
+    if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
+    if (tooNarrow) statsH += lineH;
     float avail = ImGui::GetContentRegionAvail().y - statsH;
+    if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
-    auto plotSeries = [&](bool horizontal) {
-        const std::vector<float>* series = horizontal ? P.h : P.v;
-        float lo = yLo, hi = yHi;      // one value axis for H, V and every image
-        int n = horizontal ? P.rw : P.rh;
-        int origin = horizontal ? P.rx : P.ry;
-        char yl[80];
-        snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
-                 im->dtype.c_str());
-        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
-                                (float)origin, (float)(origin + std::max(n - 1, 1)),
-                                lo, hi, true, false, each);
-        if (!pr.ok) return;
+    // x range: the UNION of A's and B's sample ranges, so both plots (side by
+    // side or overlaid) carry the same axis and neither is rescaled to fit.
+    auto xRange = [&](bool horizontal, float& x0, float& x1) {
+        int o = horizontal ? P.rx : P.ry, n = horizontal ? P.rw : P.rh;
+        x0 = (float)o; x1 = (float)(o + std::max(n - 1, 1));
+        if (Bim) {
+            int ob = horizontal ? PB.rx : PB.ry, nb = horizontal ? PB.rw : PB.rh;
+            x0 = std::min(x0, (float)ob);
+            x1 = std::max(x1, (float)(ob + std::max(nb - 1, 1)));
+        }
+    };
+    // Stroke one side's profiles. dashed = this is B. bars = draw the min-max
+    // range of a decimated bucket; A only, per the plan - two sets of range
+    // bars on one plot is noise, and the reader needs one reference.
+    auto stroke = [&](const PlotRect& pr, const App::ProjState& S, bool horizontal,
+                      bool dashed, bool bars) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->PushClipRect(pr.p0, pr.p1, true);
-        for (int s = 0; s < P.nSeries; s++) {
-            ImU32 col = cfa ? CFA_COLS[s]
-                            : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[s]);
+        const std::vector<float>* series = horizontal ? S.h : S.v;
+        int origin = horizontal ? S.rx : S.ry;
+        for (int s = 0; s < S.nSeries; s++) {
+            // colour follows A's series OF THE SAME NAME (R is always R); a
+            // series only one side has gets a neutral stroke, never a plane hue
+            int a = dashed ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            ImU32 col = a < 0 ? ODD_COL
+                      : (cfa ? CFA_COLS[a]
+                             : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
             const std::vector<float>& d = series[s];
             // decimate to the plot's pixel width: 4000 samples into 400 px was
             // 4000 line segments per series per frame
             int px = std::max(1, (int)(pr.p1.x - pr.p0.x));
             int stride = std::max(1, (int)d.size() / px);
-            ImVec2 prev(0, 0); bool has = false;
+            std::vector<ImVec2> run;
+            auto flush = [&]() {
+                if (run.size() >= 2) {
+                    if (dashed) addDashedPolyline(dl, run.data(), (int)run.size(), col, 1.2f,
+                                                  5 * app.uiScale, 4 * app.uiScale);
+                    else dl->AddPolyline(run.data(), (int)run.size(), col, 0, 1.2f);
+                }
+                run.clear();
+            };
             for (int i = 0; i < (int)d.size(); i += stride) {
                 float lo = FLT_MAX, hi = -FLT_MAX;
                 for (int k = i; k < std::min(i + stride, (int)d.size()); k++)
                     if (std::isfinite(d[k])) { lo = std::min(lo, d[k]); hi = std::max(hi, d[k]); }
-                if (lo > hi) { has = false; continue; }
-                ImVec2 a = pr.at((float)(origin + i), lo), b = pr.at((float)(origin + i), hi);
-                if (stride > 1 && b.y != a.y) dl->AddLine(a, b, col, 1.2f);   // min-max bar
-                ImVec2 pt = pr.at((float)(origin + i), (lo + hi) * 0.5f);
-                if (has) dl->AddLine(prev, pt, col, 1.2f);
-                prev = pt; has = true;
+                if (lo > hi) { flush(); continue; }
+                if (bars && stride > 1) {
+                    ImVec2 a2 = pr.at((float)(origin + i), lo), b2 = pr.at((float)(origin + i), hi);
+                    if (b2.y != a2.y) dl->AddLine(a2, b2, col, 1.2f);   // min-max bar
+                }
+                run.push_back(pr.at((float)(origin + i), (lo + hi) * 0.5f));
             }
+            flush();
         }
-        // "There is a spike - WHICH column is it?" The readout answers with the
-        // exact index and the values under the cursor, without decimation: the
-        // marker snaps to the true sample, not to the plotted min-max bucket.
-        if (ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) {
-            float mx = ImGui::GetMousePos().x;
-            float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
-            int i = std::clamp((int)(t * (float)(n - 1) + 0.5f), 0, std::max(n - 1, 0));
-            dl->AddLine(pr.at((float)(origin + i), lo), pr.at((float)(origin + i), hi),
-                        IM_COL32(230, 200, 90, 140), 1.0f);
-            char tip[256];
-            int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y",
-                               origin + i);
-            static const char* CFA_N[4] = { "R", "Gr", "Gb", "B" };
-            static const char* RGB_N[4] = { "R", "G", "B", "A" };
-            for (int s2 = 0; s2 < P.nSeries; s2++) {
-                if (i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
-                const char* nm = P.nSeries == 1 ? "" : (cfa ? CFA_N[s2] : RGB_N[s2]);
-                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%.6g %s",
-                                nm, *nm ? ": " : "", series[s2][i], im->dtype.c_str());
-                dl->AddCircleFilled(pr.at((float)(origin + i), series[s2][i]), 3.0f,
+    };
+    // "There is a spike - WHICH column is it?" The readout answers with the
+    // exact index and the values under the cursor, without decimation: the
+    // marker snaps to the true sample, not to the plotted min-max bucket.
+    auto hoverReadout = [&](const PlotRect& pr, bool horizontal, bool wantA, bool wantB) {
+        if (!ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float mx = ImGui::GetMousePos().x;
+        float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
+        int at = (int)(pr.xmin + t * (pr.xmax - pr.xmin) + 0.5f);
+        dl->AddLine(pr.at((float)at, pr.ymin), pr.at((float)at, pr.ymax),
+                    IM_COL32(230, 200, 90, 140), 1.0f);
+        char tip[512];
+        int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y", at);
+        auto one = [&](const App::ProjState& S, const char* side2, const std::string& dt) {
+            const std::vector<float>* series = horizontal ? S.h : S.v;
+            int origin = horizontal ? S.rx : S.ry;
+            int i = at - origin;
+            for (int s2 = 0; s2 < S.nSeries; s2++) {
+                if (i < 0 || i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
+                const char* nm = S.nSeries == 1 ? "" : S.seriesNames[s2];
+                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%s%.6g %s",
+                                side2, nm, *nm ? ": " : "", series[s2][i], dt.c_str());
+                dl->AddCircleFilled(pr.at((float)at, series[s2][i]), 3.0f,
                                     IM_COL32(230, 200, 90, 230));
             }
-            ImGui::SetTooltip("%s", tip);
-        }
-        dl->PopClipRect();
+        };
+        if (wantA) one(P, Bim ? "A " : "", im->dtype);
+        if (wantB && Bim) one(PB, "B ", Bim->dtype);
+        ImGui::SetTooltip("%s", tip);
     };
-    if (app.showProjH) plotSeries(true);
-    if (app.showProjV) plotSeries(false);
+    auto onePlot = [&](bool horizontal, bool wantA, bool wantB) {
+        float x0, x1;
+        xRange(horizontal, x0, x1);
+        char yl[128];
+        if (Bim && Bim->dtype != im->dtype)
+            snprintf(yl, sizeof yl, "%s value (A %s / B %s - DTYPE MISMATCH)",
+                     modes[std::clamp(app.projMode, 0, 2)], im->dtype.c_str(),
+                     Bim->dtype.c_str());
+        else
+            snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
+                     im->dtype.c_str());
+        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
+                                x0, x1, yLo, yHi, true, false, each);
+        if (!pr.ok) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pr.p0, pr.p1, true);
+        if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
+        if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
+        dl->PopClipRect();
+        if (wantA && wantB && Bim) drawABLegend(pr, im->name, bLabel);
+        hoverReadout(pr, horizontal, wantA, wantB);
+    };
+
+    if (!side) {
+        if (app.showProjH) onePlot(true, true, true);
+        if (app.showProjV) onePlot(false, true, true);
+    } else {
+        // always 50/50 and always A on the left (docs/ab-stats-plan.md 3)
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        float childH = ImGui::GetTextLineHeight() + 8 * app.uiScale
+                     + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        ImGui::BeginChild("##projA", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("A", im->name);
+        if (app.showProjH) onePlot(true, true, false);
+        if (app.showProjV) onePlot(false, true, false);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("##projB", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("B", bLabel);
+        if (app.showProjH) onePlot(true, false, true);
+        if (app.showProjV) onePlot(false, false, true);
+        ImGui::EndChild();
+    }
+    if (Bim && !canOverlay)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "profiles do not share an axis (A x %d..%d, y %d..%d px; "
+                           "B x %d..%d, y %d..%d px): shown side by side, never stretched",
+                           P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
+                           PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
+    if (tooNarrow)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "panel narrower than %.0f px: overlaid instead of side by side",
+                           minSide);
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
-    int nCols = 2 + 4;
+    int nCols = (Bim ? 3 : 2) + 4;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+        // one row per (side, axis, plane). The table's axis is the QUANTITY, so
+        // A and B cannot be a column pair here - they are rows, and the side
+        // column says which is which (docs/ab-stats-plan.md 4).
+        if (Bim)
+            ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::GetFontSize() * 1.6f);
         ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -7450,21 +7604,22 @@ static void drawPanelProjection() {
         ImGui::TableSetupColumn("sigma %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
-        auto rows = [&](bool horizontal) {
-            for (int s = 0; s < P.nSeries; s++) {
-                const App::ProjState::Stats& st = horizontal ? P.hStat[s] : P.vStat[s];
+        auto rows = [&](const App::ProjState& S, const char* sideName, bool horizontal) {
+            for (int s = 0; s < S.nSeries; s++) {
+                const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
                 if (!st.valid) continue;
                 ImGui::TableNextRow();
+                if (Bim) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", P.seriesNames[s]);
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
                 ImGui::TableNextColumn(); textNum("%.6g", st.mean);
                 ImGui::TableNextColumn(); textNum("%.6g", st.sd);
                 ImGui::TableNextColumn(); textNum("%.3f", st.pct);
                 ImGui::TableNextColumn(); textNum("%.6g", st.pp);
             }
         };
-        if (app.showProjH) rows(true);
-        if (app.showProjV) rows(false);
+        if (app.showProjH) { rows(P, "A", true);  if (Bim) rows(PB, "B", true); }
+        if (app.showProjV) { rows(P, "A", false); if (Bim) rows(PB, "B", false); }
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
@@ -10423,6 +10578,7 @@ static void printUsage() {
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
+        "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
@@ -10505,6 +10661,8 @@ static void parseCli(int argc, char** argv) {
             next();                                // consumed in main(), not an error
         } else if (a == "--bench-step") {
             /* consumed in main(): no value */
+        } else if (a == "--no-ab-throttle") {
+            g_abNoThrottle = true;     // measure what the B-slot throttle saves
         } else if (a == "--cfa") {                 // none | bayer | quad
             std::string v = next();
             app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
@@ -12433,6 +12591,86 @@ int main(int argc, char** argv) {
                   "P1 Auto follows the image layout, explicit overrides it");
             app.abStatsLayout = keep;
             app.compareMode = App::CmpSplit;
+        }
+
+        // ---- P2: a B that does not share A's axis must never be overlaid ----
+        {
+            check(abProjOverlayable(app.proj[0], app.proj[1]),
+                  "P2 same-size B shares A's profile axis");
+            std::string root = g_abstatsSelftest;
+            std::replace(root.begin(), root.end(), '\\', '/');
+            while (!root.empty() && root.back() == '/') root.pop_back();
+            size_t sl = root.find_last_of('/');
+            root = sl == std::string::npos ? std::string(".") : root.substr(0, sl);
+            size_t before = app.images.size();
+            openPath(root + "/grad_u16.npy");           // 640x480 against A's 80x64
+            loadAll();
+            if (app.images.size() > before) {
+                ImageDoc* odd = app.images.back().get();
+                selectImage(frA.front());
+                setCompareB(odd);
+                app.compareMode = App::CmpSplit;
+                abStatsFrame();
+                ImageDoc* b5 = cmpB();
+                recomputeProjectionIfNeeded(cur(), app.proj[0]);
+                recomputeProjectionIfNeeded(b5, app.proj[1]);
+                bool over = abProjOverlayable(app.proj[0], app.proj[1]);
+                fprintf(stderr, "abstatsselftest: P2 odd B '%s' %dx%d vs A %dx%d: "
+                                "profile A x %d..%d / B x %d..%d, overlayable=%d\n",
+                        b5->name.c_str(), b5->w, b5->h, cur()->w, cur()->h,
+                        app.proj[0].rx, app.proj[0].rx + app.proj[0].rw - 1,
+                        app.proj[1].rx, app.proj[1].rx + app.proj[1].rw - 1, over ? 1 : 0);
+                check(b5->w != cur()->w || b5->h != cur()->h,
+                      "P2 fixture: the odd B really is a different size");
+                check(!over, "P2 size-mismatched B is refused the overlay");
+                // and the channel counts differ too, which P3's delta columns use
+                check(app.proj[0].nSeries != app.proj[1].nSeries ||
+                      cur()->ch == b5->ch, "P2 series count reflects the channel count");
+                closeCurrent(true);                     // drop the extra image again
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                abStatsFrame();
+            } else {
+                fprintf(stderr, "abstatsselftest: P2 skipped (%s/grad_u16.npy not there)\n",
+                        root.c_str());
+            }
+        }
+
+        // ---- P2b: held-down stepping holds B's slots instead of recomputing ----
+        {
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            app.abStepBusyUntil = 0;
+            abStatsFrame();
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            recomputeHistogramIfNeeded(cmpB(), app.hist[1],
+                                       effBlack(*cur()), effWhite(*cur()));
+            uint64_t held = app.hist[1].uid;
+            gotoFrame(1); gotoFrame(1);            // two switches inside 300 ms
+            bool armed = abStepBusy();
+            ImageDoc* b6 = cmpB();
+            // exactly what the panel does
+            if (b6 && (!abStepBusy() || app.hist[1].uid == 0))
+                recomputeHistogramIfNeeded(b6, app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+            bool heldStale = b6 && app.hist[1].uid == held && app.hist[1].uid != b6->uid;
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+            bool released = !abStepBusy();
+            if (b6 && (!abStepBusy() || app.hist[1].uid == 0))
+                recomputeHistogramIfNeeded(b6, app.hist[1],
+                                           effBlack(*cur()), effWhite(*cur()));
+            fprintf(stderr, "abstatsselftest: P2b throttle: armed=%d held uid=%llu vs B "
+                            "uid=%llu, released=%d, after release uid=%llu\n",
+                    armed ? 1 : 0, (unsigned long long)held,
+                    (unsigned long long)(b6 ? b6->uid : 0), released ? 1 : 0,
+                    (unsigned long long)app.hist[1].uid);
+            check(armed, "P2b rapid stepping arms the B throttle");
+            check(heldStale, "P2b B slot holds its last result while stepping (stale)");
+            check(released && b6 && app.hist[1].uid == b6->uid,
+                  "P2b B refreshes once the stepping stops");
+            selectImage(frA.front());
+            app.abStepBusyUntil = 0;
         }
 
         // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
