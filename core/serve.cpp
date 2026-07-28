@@ -504,6 +504,90 @@ static void handleList(Buf& in) {
     sendMsg(MSG_OK, out);
 }
 
+// SCAN: the server-side half of "open this folder as stacks". Walks the
+// subtree (depth- and count-limited), groups numbered .npy per directory, and
+// returns ONE reply the client turns into open-as-stack jobs - the remote
+// mirror of the local openFolder() scan. Loose .npy become single-member
+// groups so a folder of unnumbered files still opens, exactly like locally.
+//   -> [str root][u32 depthLimit][u32 maxGroups]
+//   <- [u32 flags bit0=truncated][u32 skippedDirs][u32 n]
+//      n * ([str dirRel]  [group entry, v3 LIST encoding])
+static void handleScan(Buf& in) {
+    std::string root;
+    uint32_t depth = 6, cap = 256;
+    if (!in.getStr(root) || !in.getU32(depth) || !in.getU32(cap)) {
+        sendErr("bad SCAN");
+        return;
+    }
+    depth = std::min(depth, 32u);
+    cap = std::min(cap ? cap : 256u, 10000u);
+    std::error_code ec;
+    std::filesystem::path rootP = std::filesystem::u8path(root);
+    if (!std::filesystem::is_directory(rootP, ec)) {
+        sendErr("not a directory: " + root);
+        return;
+    }
+    uint32_t skipped = 0;
+    bool trunc = false;
+    struct Found { std::string rel; NpyGroup g; };
+    std::vector<Found> found;
+    // Manual walk: recursive_directory_iterator aborts everything on one
+    // unreadable entry, and symlinks are not followed at all - a cycle must
+    // cost nothing, not hang a session.
+    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
+    while (!todo.empty() && !trunc) {
+        auto cur = todo.back();
+        todo.pop_back();
+        std::error_code dec;
+        std::filesystem::directory_iterator it(cur.first, dec), end;
+        if (dec) { skipped++; continue; }
+        std::vector<std::pair<std::string, std::filesystem::path>> files;
+        for (; it != end; it.increment(dec)) {
+            if (dec) { dec.clear(); skipped++; break; }
+            std::error_code fec;
+            if (it->is_symlink(fec)) continue;
+            if (it->is_directory(fec)) {
+                if (cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
+            } else if (it->is_regular_file(fec) &&
+                       isNpySuffix(it->path().filename().u8string())) {
+                files.push_back({ it->path().filename().u8string(), it->path() });
+            }
+        }
+        if (files.empty()) continue;
+        std::sort(files.begin(), files.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<NpyGroup> gs;
+        std::vector<size_t> singles;
+        groupNumberedNpy(files, gs, singles);
+        for (size_t i : singles) {
+            NpyGroup g;
+            g.pattern = files[i].first;
+            g.names = { files[i].first };
+            std::error_code e2;
+            g.bytes = (uint64_t)std::filesystem::file_size(files[i].second, e2);
+            g.mtime = unixMtime(files[i].second);
+            g.first = files[i].second;
+            gs.push_back(std::move(g));
+        }
+        std::string rel = cur.first.lexically_relative(rootP).generic_u8string();
+        if (rel == ".") rel.clear();
+        for (auto& g : gs) {
+            if (found.size() >= cap) { trunc = true; break; }
+            found.push_back({ rel, std::move(g) });
+        }
+    }
+    Buf out;
+    out.putU32(trunc ? 1u : 0u);
+    out.putU32(skipped);
+    out.putU32((uint32_t)found.size());
+    int peekBudget = 512;
+    for (auto& f : found) {
+        out.putStr(f.rel);
+        putGroupEntryV3(out, f.g, peekBudget);
+    }
+    sendMsg(MSG_OK, out);
+}
+
 static void handleMeta(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad META"); return; }
@@ -1016,6 +1100,7 @@ void handleRequest(uint32_t type, Buf& in) {
             break;
         }
         case MSG_LIST: handleList(in); break;
+        case MSG_SCAN: handleScan(in); break;
         case MSG_META: handleMeta(in); break;
         case MSG_TILE: handleTile(in); break;
         case MSG_MEASURE: handleMeasure(in); break;
