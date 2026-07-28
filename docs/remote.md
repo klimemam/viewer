@@ -305,11 +305,31 @@ viewer ssh://user@host/data/run42
 | **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
 | **Fortran order の .npy** | サーバは明示的に拒否(`"fortran-order .npy is not served (open it locally)"`)。行 seek が成立しないため |
 | **`MSG_MEASURE`** | **未実装**。enum に予約枠があるだけ。今は解析結果ではなくタイルを引いて手元で測る |
-| **先読み(prefetch)** | **未実装**。`Session` はスレッドセーフではなく、要求は UI スレッドが直列に投げる。連番送りは 1 枚ずつ往復待ちになる |
+| **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
 | **`ssh://` の CLI 配線** | `remote::parseUrl` はあるが、起動パスへの接続はこれから(`--serve` 側は `main.cpp` に配線済み) |
 | **LIST のファイルサイズ** | 32 bit にクランプされる(4 GB 超は頭打ち表示) |
 | **圧縮** | deflate(miniz)固定、level 6。クライアントは常に要求し、縮まなかったときだけ生で返る |
 | **並列・キャンセル** | なし。1 要求 1 返答の同期往復。パン中に古い要求を捨てる仕組みはまだない |
+
+### `Session` の所有(鉄則)
+
+`rp::Header` には**要求 ID が無い**。`Session::recv` は「次に届いたヘッダ」を
+そのまま消費するので、2 スレッドが 1 本の ssh の stdin にフレームを書けば
+返答が食い違い、ストリームは**恒久的に**ずれる。加えて `stop()` は `Pipe` を
+`delete` するので、読んでいる最中の相手は use-after-free になる。
+したがって **1 `Session` = 1 所有スレッド**:
+
+| Session | 所有者 | 用途 |
+|---|---|---|
+| `app.rbSession` | `rbWorker` | CONNECT / LIST / SCAN / GLOB / 木の展開 / 切断 |
+| `app.uiSession` | UI スレッド | `openRemote` の META + TILE(プレビューと最初の 1 枚) |
+| `rfWorker` のローカル `Session` | `rfWorker` | 全解像度 TILE の先読み |
+| `mWorker` のローカル `Session` | `mWorker` | MEASURE(サーバ側集計) |
+
+所有者以外は `Session` に**触れない**。UI が必要とする値(`peerVersion` /
+`bytesReceived` / 生死)は所有スレッドが `RbResult` に載せて返し、UI は
+`App::RemoteBrowse` の**ただの値**を読む。ホストあたり ssh チャネルは
+最大 4 本になるが、これは競合と UI フリーズの両方を同時に消す唯一の形。
 
 **次にやること**(優先順):
 

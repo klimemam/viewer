@@ -425,8 +425,19 @@ struct App {
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
     int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
-    // remote viewing: one peer process per host, reached over ssh
-    std::unique_ptr<remote::Session> remoteSession;
+    // remote viewing: one peer process per host, reached over ssh.
+    // OWNERSHIP - remote::Session is documented not-thread-safe (remote.h), so
+    // every Session in this program has exactly ONE thread that touches it:
+    //   rbSession  -> the browse worker (rbWorker), and nobody else. Not even a
+    //                 read: peerVersion / bytesReceived / alive are PUBLISHED
+    //                 into App::RemoteBrowse by the worker (RbResult) and the
+    //                 UI reads those plain values.
+    //   uiSession  -> the UI thread (openRemote's meta+tile), and nobody else.
+    //   rfWorker / mWorker each hold their own function-local Session.
+    // A mutex only one of two racing parties takes protects nothing, which is
+    // what the old shared app.remoteSession + app.sesMtx amounted to.
+    std::unique_ptr<remote::Session> rbSession;    // rbWorker's, exclusively
+    remote::Session uiSession;                     // the UI thread's, exclusively
     std::string remoteExe;            // empty = ~/.viewer/viewer-serve (self-installed)
     std::string exePath;              // argv[0], for the local:// test peer
     bool remoteDlgOpen = false;       // File > Start Remote (ssh)...
@@ -439,14 +450,21 @@ struct App {
         std::string host, dir = "~", err;
         int port = 0;
         std::vector<remote::Entry> entries;
+        // Published by the worker with every result (RbResult), so no draw-path
+        // code ever names the Session. peerVersion gates the metadata columns
+        // and the MEASURE button; rxBytes feeds the status-bar tooltip.
+        int peerVersion = 0;
+        uint64_t rxBytes = 0;
     } rbrowse;
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
     // RbTreeList is an ordinary LIST whose answer lands in the tree cache
     // instead of replacing the listing: expanding a node must not navigate.
+    // RbDisconnect stops the session on the thread that OWNS it: the status bar
+    // must never call stop() on the worker's Session from the UI thread.
     enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4,
-                  RbTreeList = 5 };
+                  RbTreeList = 5, RbDisconnect = 6 };
     struct RbJob {
         int kind = RbConnect;
         std::string host, dir;
@@ -467,7 +485,11 @@ struct App {
         // RbGlob payload
         std::vector<remote::GlobHit> hits;
         uint32_t gen = 0;
+        // Everything the UI would otherwise have to ask the Session for, read
+        // by the thread that OWNS it and carried home as plain values.
         int peerVersion = 0;              // what the peer answered in HELLO
+        bool alive = false;               // is the session still up AFTER this job?
+        uint64_t rx = 0;                  // bytes received so far
     };
     std::thread rbThread;
     std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
@@ -504,7 +526,8 @@ struct App {
         int skippedDirs = 0;
     } rbSearch;
     bool showRemoteError = false;     // the full failure text, on demand
-    std::mutex sesMtx;                // app.remoteSession is shared with that worker
+    // (there is deliberately no session mutex here any more: see the ownership
+    // note on rbSession/uiSession above. Nothing is shared, so nothing locks.)
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
     // batch). local-fetch: never use the server for compute (today's behavior).
@@ -828,7 +851,7 @@ static void openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string());
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
-static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
+static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
 static void rbTreeForget();       // drop the tree's cached children
 static std::string placeUrl(const std::string& host, int port, const std::string& path);
@@ -5562,32 +5585,24 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
 }
 
 
-static bool ensureRemoteSession(const std::string& host, std::string& err, int port) {
-    if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
-    if (app.remoteSession->alive() && app.remoteSession->host() == host) return true;
+// The UI thread's OWN connection to a host, used only by openRemote's meta+tile.
+// It deliberately does NOT install the peer: deployPeer is minutes of ssh and
+// the browse worker already owns that job (rbWorker's connect path). The most
+// this can cost the window is one ssh handshake, bounded by ConnectTimeout=10.
+static bool ensureUiSession(const std::string& host, std::string& err, int port) {
+    if (app.uiSession.alive() && app.uiSession.host() == host &&
+        app.uiSession.port() == port)
+        return true;
     // the peer is the same binary: ~/.viewer/viewer-serve over ssh, or this very
     // executable when testing through local:// (--remote-exe overrides both,
     // which is how the standalone viewer-serve peer gets exercised)
     std::string exe = (host.empty() && app.remoteExe.empty()) ? app.exePath
                     : (app.remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
                                              : app.remoteExe);
-    if (app.remoteSession->startOn(host, port, exe, err)) {
-        toast("connected to " + (host.empty() ? std::string("local peer") : host));
-        return true;
-    }
-    if (host.empty()) return false;                 // nothing to bootstrap locally
-    // Not there (or too old to answer): install it, then try once more. The user
-    // never copies a binary or types a path.
-    toast("installing the viewer peer on " + host + "...");
-    std::string log;
-    if (!deployPeer(host, port, false, log)) {
-        g_bootstrapLog = log;
-        err = "could not install the peer on " + host + ":\n" + log;
-        return false;
-    }
-    if (!app.remoteSession->startOn(host, port, exe, err)) return false;
-    toast("installed and connected to " + host);
-    return true;
+    if (app.uiSession.startOn(host, port, exe, err)) return true;
+    if (!host.empty())
+        err += "\n(the browse panel installs the peer; connect there first)";
+    return false;
 }
 
 static std::string makeRemoteUrl(const std::string& host, const std::string& path) {
@@ -5703,22 +5718,23 @@ static void rbWorker() {
             : app.remoteExe;
         if (job.kind == App::RbUpdatePeer) {
             rbSetPhase("updating the peer on " + job.host + " (git)...");
-            {
-                std::lock_guard<std::mutex> lk(app.sesMtx);
-                if (app.remoteSession) app.remoteSession->stop();
-            }
+            if (app.rbSession) app.rbSession->stop();
             std::string log;
             r.ok = deployPeer(job.host, job.port, true, log);
             r.info = log;
             r.err = r.ok ? "" : log;
+        } else if (job.kind == App::RbDisconnect) {
+            // stop() runs on the thread that owns the Session, never on the UI
+            // thread that merely clicked the status bar
+            if (app.rbSession) app.rbSession->stop();
+            r.ok = true;
         } else {
-            std::lock_guard<std::mutex> lk(app.sesMtx);
-            if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
+            if (!app.rbSession) app.rbSession.reset(new remote::Session());
             std::string err;
-            bool alive = app.remoteSession->alive() && app.remoteSession->host() == job.host;
+            bool alive = app.rbSession->alive() && app.rbSession->host() == job.host;
             if (!alive) {
                 rbSetPhase("connecting to " + (job.host.empty() ? "local peer" : job.host) + "...");
-                alive = app.remoteSession->startOn(job.host, job.port, exe, err);
+                alive = app.rbSession->startOn(job.host, job.port, exe, err);
                 if (!alive && !job.host.empty()) {
                     // not there: the server installs its own peer from the
                     // binaries branch. This is the multi-second step that used
@@ -5726,10 +5742,10 @@ static void rbWorker() {
                     rbSetPhase("installing the peer on " + job.host + "...");
                     std::string log;
                     bool got = deployPeer(job.host, job.port, false, log);
-                    g_bootstrapLog = log;
+                    r.info = log;    // the UI thread owns g_bootstrapLog, not us
                     if (got) {
                         rbSetPhase("connecting to " + job.host + "...");
-                        alive = app.remoteSession->startOn(job.host, job.port, exe, err);
+                        alive = app.rbSession->startOn(job.host, job.port, exe, err);
                     } else {
                         err = "could not install the peer on " + job.host + ":\n" + log;
                     }
@@ -5741,8 +5757,8 @@ static void rbWorker() {
                 rbSetPhase("scanning " + job.dir + " for stacks...");
                 bool trunc = false;
                 int skipped = 0;
-                if (app.remoteSession->scan(job.dir, 6, 256, r.scanGroups,
-                                            trunc, skipped, err)) {
+                if (app.rbSession->scan(job.dir, 6, 256, r.scanGroups,
+                                        trunc, skipped, err)) {
                     r.ok = true;
                     r.truncated = trunc;
                     r.skippedDirs = skipped;
@@ -5754,8 +5770,8 @@ static void rbWorker() {
                 r.gen = job.gen;
                 bool trunc = false;
                 int skipped = 0;
-                if (app.remoteSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
-                                            trunc, skipped, err)) {
+                if (app.rbSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
+                                        trunc, skipped, err)) {
                     r.ok = true;
                     r.truncated = trunc;
                     r.skippedDirs = skipped;
@@ -5765,14 +5781,20 @@ static void rbWorker() {
             } else {
                 rbSetPhase("listing " + job.dir + "...");
                 std::vector<remote::Entry> got;
-                if (app.remoteSession->list(job.dir, got, err)) {
+                if (app.rbSession->list(job.dir, got, err)) {
                     r.ok = true;
                     r.entries = std::move(got);
                 } else {
                     r.err = err;
                 }
             }
-            if (app.remoteSession) r.peerVersion = app.remoteSession->peerVersion();
+        }
+        // Published from the owning thread with EVERY job kind: the UI reads
+        // these plain values instead of ever naming the Session.
+        if (app.rbSession) {
+            r.peerVersion = app.rbSession->peerVersion();
+            r.alive = app.rbSession->alive();
+            r.rx = app.rbSession->bytesReceived();
         }
         rbSetPhase("");
         {
@@ -5806,8 +5828,17 @@ static void pumpRemoteBrowse() {
     }
     for (auto& r : batch) {
         App::RemoteBrowse& B = app.rbrowse;
+        // What the worker saw of ITS session, applied for every job kind. The
+        // old code cleared B.connected only for RbConnect, so a LIST that died
+        // with the peer left the status bar showing a green link over a corpse.
+        if (r.kind != App::RbUpdatePeer && r.kind != App::RbDisconnect) {
+            B.peerVersion = r.peerVersion;
+            B.rxBytes = r.rx;
+            if (B.connected && !r.alive) B.connected = false;
+        }
+        if (r.kind == App::RbDisconnect) continue;
         if (r.kind == App::RbUpdatePeer) {
-            g_bootstrapLog = r.info;
+            if (!r.info.empty()) g_bootstrapLog = r.info;
             toast(r.ok ? "remote peer updated on " + r.host
                        : "remote update failed: " + r.err, !r.ok);
             // The update stopped the session; reconnect to where the user was,
@@ -5892,6 +5923,10 @@ static void pumpRemoteBrowse() {
         }
         if (!r.ok) {
             B.err = r.err;
+            // the install log comes home in r.info and is assigned HERE, on the
+            // UI thread that owns g_bootstrapLog - the two windows that print it
+            // read it every frame
+            if (!r.info.empty()) g_bootstrapLog = r.info;
             if (r.kind == App::RbConnect) {
                 B.connected = false;
                 app.showRemote = true;    // so the failure text has somewhere to live
@@ -5900,6 +5935,7 @@ static void pumpRemoteBrowse() {
             }
             continue;
         }
+        if (!r.info.empty()) g_bootstrapLog = r.info;   // installed, then connected
         B.err.clear();
         B.host = r.host;
         B.port = r.port;
@@ -6148,15 +6184,19 @@ static void stepPreviewFrame(int delta) {
 
 static void openRemote(const std::string& url, bool asPreview) {
     std::string host, rpath;
-    if (!remote::parseUrl(url, host, rpath)) {
+    int port = 0;
+    if (!remote::parseUrl(url, host, rpath, &port)) {
         toast("expected ssh://user@host/path/to/file.npy", true);
         return;
     }
     if (asPreview) dropPreview();          // ONE slot: the next look replaces it
     std::string err;
-    if (!ensureRemoteSession(host, err)) { toast("remote: " + err, true); return; }
+    // app.uiSession, never the browse worker's: two threads framing requests
+    // into one ssh stdin desynchronise the stream permanently, and the worker's
+    // stop() would free the pipe under this thread's blocking read.
+    if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return; }
     remote::Meta m;
-    if (!app.remoteSession->meta(rpath, m, err)) { toast("remote: " + err, true); return; }
+    if (!app.uiSession.meta(rpath, m, err)) { toast("remote: " + err, true); return; }
 
     // First view: the whole frame decimated to something a screen can show. A
     // zoom or a pan asks for a better tile; nothing else on screen costs a byte.
@@ -6164,7 +6204,7 @@ static void openRemote(const std::string& url, bool asPreview) {
     std::vector<float> px;
     int tw = 0, th = 0, tch = 0;
     std::string dt;
-    if (!app.remoteSession->tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
+    if (!app.uiSession.tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
         toast("remote: " + err, true);
         return;
     }
@@ -11395,6 +11435,10 @@ static void drawPanelRemote() {
         ImGui::SameLine();
         if (ImGui::SmallButton("disconnect")) {
             rbDefer([] {                 // another machine, other children
+                app.uiSession.stop();    // ours to stop; the worker's is a job
+                App::RbJob j;
+                j.kind = App::RbDisconnect;
+                rbEnqueue(std::move(j));
                 app.rbrowse = App::RemoteBrowse{};
                 rbTreeForget();
             });
@@ -11498,11 +11542,7 @@ static void drawPanelRemote() {
             {   // the server aggregate for the selection, without opening it.
                 // MEASURE exists from protocol 2, but v2 has no hasMeta to
                 // pre-validate shapes - a mismatch falls to [server failed].
-                int pv2 = 0;
-                {
-                    std::lock_guard<std::mutex> lk(app.sesMtx);
-                    if (app.remoteSession) pv2 = app.remoteSession->peerVersion();
-                }
+                int pv2 = B.peerVersion;      // published by the worker; no lock
                 bool tempOk = pv2 >= 2;
                 for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
                     if (rbSel[i] && !isNpyName(view[i].name())) tempOk = false;
@@ -11539,11 +11579,7 @@ static void drawPanelRemote() {
     // The metadata columns exist from protocol 3 on. Say so once, up here - a
     // "-" in every row of every column explains nothing.
     {
-        int pv = 0;
-        {
-            std::lock_guard<std::mutex> lk(app.sesMtx);
-            if (app.remoteSession) pv = app.remoteSession->peerVersion();
-        }
+        int pv = B.peerVersion;              // published by the worker; no lock
         if (pv > 0 && pv < 3)
             ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
                                "peer is protocol %d - File > Update remote peer "
@@ -14480,6 +14516,49 @@ int main(int argc, char** argv) {
             app.folderPick.clear();          // Cancel: nothing must be opened
             app.folderPickOpen = false;
         }
+        {   // SESSION OWNERSHIP. openRemote must talk over the UI thread's OWN
+            // remote::Session, never the browse worker's - two threads framing
+            // requests into one ssh stdin desynchronise the stream permanently
+            // (rp::Header has no request id), and the worker's stop() frees the
+            // pipe under a UI-thread read. The proof is on the wire: the open
+            // moves bytes on app.uiSession and NOT ONE byte on the worker's.
+            std::string file;
+            for (const auto& e : B.entries) {
+                if (e.dir) continue;
+                if (e.group && !e.members.empty()) { file = e.members[0]; break; }
+                if (isNpyName(e.name)) { file = e.name; break; }
+            }
+            if (file.empty()) {
+                fprintf(stderr, "browseselftest: sessions: no .npy under %s to open\n",
+                        B.dir.c_str());
+                ok = false;
+            } else {
+                bool uiIdle0 = !app.uiSession.alive() && app.uiSession.bytesReceived() == 0;
+                // safe to read the worker's session directly HERE and only
+                // here: the selftest drives the pump by hand and the queue is
+                // drained, so rbWorker is parked in its 50 ms sleep
+                uint64_t rb0 = app.rbSession ? app.rbSession->bytesReceived() : 0;
+                size_t nimg0 = app.images.size();
+                openRemote("local://" + B.dir + "/" + file, true);
+                pumpRemoteBrowse();          // pick up anything the worker said
+                uint64_t uiRx = app.uiSession.bytesReceived();
+                uint64_t rbRx = app.rbSession ? app.rbSession->bytesReceived() : 0;
+                bool sepOk = uiIdle0 && app.uiSession.alive() && uiRx > 0 &&
+                             rbRx == rb0 && app.images.size() == nimg0 + 1 &&
+                             (void*)app.rbSession.get() != (void*)&app.uiSession;
+                fprintf(stderr, "browseselftest: session ownership: ui session idle "
+                                "before=%d, open %s -> ui rx %llu B (alive=%d), browse "
+                                "worker rx %llu -> %llu B (unmoved=%d), distinct "
+                                "objects=%d: %s\n",
+                        uiIdle0 ? 1 : 0, file.c_str(), (unsigned long long)uiRx,
+                        app.uiSession.alive() ? 1 : 0, (unsigned long long)rb0,
+                        (unsigned long long)rbRx, rbRx == rb0 ? 1 : 0,
+                        (void*)app.rbSession.get() != (void*)&app.uiSession ? 1 : 0,
+                        sepOk ? "ok" : "FAIL");
+                if (!sepOk) ok = false;
+                dropPreview();
+            }
+        }
         fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
@@ -16995,16 +17074,18 @@ int main(int argc, char** argv) {
                     ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s  %s",
                                        ICON_LINK, B.host.empty() ? "local peer" : B.host.c_str());
                     if (ImGui::IsItemHovered()) {
-                        uint64_t rx = app.remoteSession ? app.remoteSession->bytesReceived() : 0;
+                        // published counters plus this thread's own session: no
+                        // draw-path code touches the worker's Session
+                        uint64_t rx = B.rxBytes + app.uiSession.bytesReceived();
                         ImGui::SetTooltip("connected  -  %s\npeer protocol v%d, %.1f MB received\n"
                                           "click to disconnect",
-                                          B.dir.c_str(),
-                                          app.remoteSession ? app.remoteSession->peerVersion() : 0,
-                                          rx / 1048576.0);
+                                          B.dir.c_str(), B.peerVersion, rx / 1048576.0);
                     }
                     if (ImGui::IsItemClicked()) {
-                        std::lock_guard<std::mutex> lk(app.sesMtx);
-                        if (app.remoteSession) app.remoteSession->stop();
+                        app.uiSession.stop();     // ours to stop
+                        App::RbJob j;             // the worker's is the worker's
+                        j.kind = App::RbDisconnect;
+                        rbEnqueue(std::move(j));
                         app.rbrowse = App::RemoteBrowse{};
                     }
                     ImGui::SameLine();
