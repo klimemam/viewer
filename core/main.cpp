@@ -1900,6 +1900,59 @@ static void moveStackToBatch(int seqId, int batchId) {
     app.imagesRev++;
     pruneEmptyBatches();
 }
+// ---- what the Files panel's series row does (docs/series-plan.md §4) --------
+// Move a SERIES between batches: every member goes with it and so does the
+// series itself, so strict containment holds at every instant. The series'
+// batchId is set FIRST on purpose - moveStackToBatch drops a member whose
+// series stays behind, which is the right rule for a lone stack and exactly
+// the wrong one here.
+static void moveSeriesToBatch(int seriesId, int batchId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || batchId == 0 || S->batchId == batchId) return;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    S->batchId = batchId;
+    for (int s : ids) moveStackToBatch(s, batchId);
+    app.imagesRev++;
+}
+// UNGROUP (解散): take the fence away and leave everything standing. This is
+// NOT Close - nothing is discarded, every stack stays open exactly where it is
+// and merely stops being part of a sweep. The canon lists the two side by side
+// because they are different operations, not two words for one.
+static void ungroupSeries(int seriesId) {
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            std::string n = it->name;
+            int members = (int)it->members.size();
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            toast("ungrouped \"" + n + "\": " + std::to_string(members) +
+                  " stack(s) stay open");
+            break;
+        }
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+}
+// Close a series: the canon's Close, which discards the CONTENTS. Each member's
+// closeStack removes it from the series, and the last one takes the series with
+// it (pruneEmptySeries) - the erase below is only for a series whose members
+// were all gone already.
+static void closeSeries(int seriesId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S) return;
+    std::string n = S->name;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    for (int s : ids) closeStack(s);
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            break;
+        }
+    toast("closed series \"" + n + "\": " + std::to_string(ids.size()) + " stack(s)");
+}
 // A standalone frame (no stack) hangs off the batch directly and moves alone.
 static void moveImageToBatch(int imageIdx, int batchId) {
     if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
@@ -11314,9 +11367,15 @@ static void drawFileList() {
     // Context-menu closes and moves are DEFERRED to the end of the walk:
     // closing erases images mid-iteration while the row loop still holds
     // indices into the pre-close stacksCached() snapshot, and a move prunes
-    // app.batches while the submenu is iterating it.
+    // app.batches while the submenu is iterating it. Every series command is
+    // deferred for the same reason squared - the walk is iterating app.series
+    // itself, and one join would resize it under the loop drawing it.
     int pendingCloseSeq = 0, pendingCloseBatch = 0;
     int pendingMoveSeq = 0, pendingMoveImg = -1, pendingMoveTarget = 0;
+    int pendingSerEdit = 0, pendingSerMove = 0, pendingSerMoveTo = 0;
+    int pendingSerUngroup = 0, pendingSerClose = 0, pendingSerRename = 0;
+    std::string pendingSerName;
+    int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -11430,10 +11489,7 @@ static void drawFileList() {
               ImGui::EndPopup();
           }
       }
-      if (open)
-      for (const auto& stackPtr : group.stacks) {
-        const auto& stack = *stackPtr;
-        const ImageDoc& head = *app.images[stack.front()];
+      if (open) {
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
                               const char* extra = nullptr, bool isB = false) -> bool {
@@ -11475,7 +11531,14 @@ static void drawFileList() {
             if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
             return clicked;
         };
-        if (head.seqId == 0) {
+        // One row. mem != nullptr means the row is being drawn INSIDE a series
+        // node: it is indented by the node and the member's VALUE leads the
+        // label. Everything else about the row is identical - a member is not
+        // a different kind of stack, it is a stack that is also in a sweep.
+        auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
+                                const App::Series::Member* mem) {
+          const ImageDoc& head = *app.images[stack.front()];
+          if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
             snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
@@ -11501,30 +11564,47 @@ static void drawFileList() {
                 ImGui::EndPopup();
             }
             ImGui::PopID();
-            continue;
-        }
-        App::SeqInfo* si = seqInfo(head.seqId);
-        int pos = 0;
-        bool active = false;
-        for (int k = 0; k < (int)stack.size(); k++)
-            if (stack[k] == app.current) { pos = k; active = true; }
-        ImGui::PushID(head.seqId);
-        char lb[512];
-        snprintf(lb, 512, "  %s", si ? si->name.c_str() : "sequence");
-        char frames[24];
-        snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
-        const ImageDoc* bnow = cmpB();
-        bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
-        if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
-        if (rowWithMeta(head, lb, active, frames, stackHasB)) {
-            selectImage(stack[pos]);
-            if (app.fitOnSwitch) app.fitRequested = true;
-        }
-        // The stack is the unit measurements attach to, so it earns a name of
-        // its own: "the 25C dark set", not whatever the capture script called
-        // the folder. F2 / right-click renames; the folder name is only the
-        // starting value.
-        if (si && ImGui::BeginPopupContextItem("seqctx")) {
+            return;
+          }
+          App::SeqInfo* si = seqInfo(head.seqId);
+          int pos = 0;
+          bool active = false;
+          for (int k = 0; k < (int)stack.size(); k++)
+              if (stack[k] == app.current) { pos = k; active = true; }
+          ImGui::PushID(head.seqId);
+          char lb[600];
+          const char* sname = si ? si->name.c_str() : "sequence";
+          if (mem) {
+              // The value LEADS the label. It is the reason the row is in this
+              // series at all, and it is not metadata: an unset one has to be
+              // readable as unset, not inferable from a blank column at the
+              // right edge. "##" fixes the id, so a stack named "a##b" still
+              // reads as "a##b" here.
+              char vb[64];
+              if (std::isfinite(mem->value)) {
+                  if (ser->unit[0]) snprintf(vb, sizeof vb, "%.6g %s", mem->value, ser->unit);
+                  else snprintf(vb, sizeof vb, "%.6g", mem->value);
+              } else {
+                  snprintf(vb, sizeof vb, "value unset");
+              }
+              snprintf(lb, sizeof lb, "%s · %s##m%d", vb, sname, head.seqId);
+          } else {
+              snprintf(lb, sizeof lb, "  %s", sname);
+          }
+          char frames[24];
+          snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
+          const ImageDoc* bnow = cmpB();
+          bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
+          if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
+          if (rowWithMeta(head, lb, active, frames, stackHasB)) {
+              selectImage(stack[pos]);
+              if (app.fitOnSwitch) app.fitRequested = true;
+          }
+          // The stack is the unit measurements attach to, so it earns a name of
+          // its own: "the 25C dark set", not whatever the capture script called
+          // the folder. F2 / right-click renames; the folder name is only the
+          // starting value.
+          if (si && ImGui::BeginPopupContextItem("seqctx")) {
             static char renameBuf[256];
             if (ImGui::IsWindowAppearing())
                 snprintf(renameBuf, sizeof renameBuf, "%s", si->name.c_str());
@@ -11552,20 +11632,160 @@ static void drawFileList() {
                 }
             }
             ImGui::Separator();
+            // The series (系列) this stack is in, or could be. Multi-select is
+            // a later phase; until then this menu is how a stack joins a sweep
+            // without going through the Linearity panel.
+            if (ImGui::BeginMenu("Series")) {
+                const App::Series* mine = seriesOfStack(si->id);
+                int listed = 0;
+                for (const auto& s : app.series) {
+                    bool same = s.batchId == head.batchId;
+                    bool isMine = mine && mine->id == s.id;
+                    char lb2[352];
+                    snprintf(lb2, sizeof lb2, "%s###addser%d", s.name.c_str(), s.id);
+                    if (ImGui::MenuItem(lb2, nullptr, isMine, same && !isMine)) {
+                        pendingJoinSeq = si->id;
+                        pendingJoinSer = s.id;
+                    }
+                    // A series cannot widen to reach another batch: the answer
+                    // is to move the stack first, and the menu says so instead
+                    // of leaving a dead item with no reason.
+                    if (!same && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("\"%s\" is in batch \"%s\".\n"
+                                          "A series lives in ONE batch - use Move to batch\n"
+                                          "first, then add it here.",
+                                          s.name.c_str(), batchNameOf(s.batchId).c_str());
+                    listed++;
+                }
+                if (!listed) ImGui::TextDisabled("(no series yet)");
+                ImGui::Separator();
+                if (ImGui::MenuItem("New series...")) pendingNewSerBatch = head.batchId;
+                if (mine && ImGui::MenuItem("Remove from this series"))
+                    pendingLeaveSeq = si->id;
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
             {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+                if (const App::Series* mine = seriesOfStack(si->id))
+                    ImGui::TextDisabled("in series \"%s\": moving it alone leaves it",
+                                        mine->name.c_str());
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveSeq = si->id; pendingMoveTarget = t; }
             }
             if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
                 pendingCloseSeq = si->id;
             ImGui::EndPopup();
+          }
+          if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+              ImGui::OpenPopup("seqctx");
+          // No frame slider here: it used to appear under the active row, and a
+          // row that grows on selection makes the whole list jump - the scrub bar
+          // lives at the bottom of the Image View now, where the frames are.
+          ImGui::PopID();
+        };
+        // The stack of one seqId, out of this batch's cached list (members are
+        // named by seqId; the panel walks by stack).
+        auto stackOfSeq = [&](int seqId) -> const std::vector<int>* {
+            for (const auto* sp : group.stacks)
+                if (app.images[sp->front()]->seqId == seqId) return sp;
+            return nullptr;
+        };
+        // ---- the batch's series come FIRST, each with its members inside -----
+        // Non-member stacks keep their place and their indentation below: a
+        // sweep appearing must not push everything else down a level.
+        for (const auto& S : app.series) {
+            if (S.batchId != group.batch) continue;
+            ImGui::PushID(S.id);
+            const ImGuiStyle& st = ImGui::GetStyle();
+            char smeta[96];
+            // the unit is the series', and "not set" is a state to read, not a
+            // blank to guess at (the panel says the same thing the same way)
+            if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
+                                    (int)S.members.size());
+            else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
+            float avail = ImGui::GetContentRegionAvail().x;
+            float mw = ImGui::CalcTextSize(smeta).x;
+            bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            // same rule as the stack rows: ONE item spanning the row, the unit
+            // and the count PAINTED on it. A second widget on the right is what
+            // made a context menu unreachable on the name once already.
+            if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
+                                                     p0.y + ImGui::GetFrameHeight()), true);
+            bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
+                                                    ImGuiTreeNodeFlags_SpanAvailWidth,
+                                           "%s", S.name.c_str());
+            if (room) ImGui::PopClipRect();
+            if (room) {
+                ImVec2 m = ImGui::GetItemRectMin();
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
+                                                    ImGui::GetTextLineHeight()) * 0.5f),
+                    S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                              : IM_COL32(255, 184, 90, 255), smeta);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+                                  "(right-click: rename, edit, move, ungroup, close)",
+                                  (int)S.members.size(),
+                                  S.paramName.empty() ? "parameter" : S.paramName.c_str());
+            if (ImGui::BeginPopupContextItem("serctx")) {
+                static char sbuf[256];
+                if (ImGui::IsWindowAppearing())
+                    snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+                bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                done |= ImGui::SmallButton("rename");
+                if (done && sbuf[0]) {
+                    pendingSerRename = S.id;
+                    pendingSerName = sbuf;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                // the same modal creation uses: members, values, order, unit
+                if (ImGui::MenuItem("Edit series...")) {
+                    pendingSerEdit = S.id;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                {   // the SERIES moves - every member with it, so that
+                    // series ⊂ batch never stops being true on the way
+                    int t = moveToBatchMenu(S.batchId);
+                    if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
+                    ImGui::TextDisabled("   (all %d member(s) move with it)",
+                                        (int)S.members.size());
+                }
+                ImGui::Separator();
+                // Two DIFFERENT operations, spelled out rather than one word
+                // with a modifier: one keeps the data, the other destroys it.
+                if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                                      "exactly where they are - they just stop being a sweep.",
+                                      (int)S.members.size());
+                if (ImGui::MenuItem("Close series (discard its stacks)"))
+                    pendingSerClose = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                                      (int)S.members.size());
+                ImGui::EndPopup();
+            }
+            if (sopen) {
+                for (const auto& m : S.members)
+                    if (const std::vector<int>* sp = stackOfSeq(m.seqId))
+                        drawStackRow(*sp, &S, &m);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
         }
-        if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-            ImGui::OpenPopup("seqctx");
-        // No frame slider here: it used to appear under the active row, and a
-        // row that grows on selection makes the whole list jump - the scrub bar
-        // lives at the bottom of the Image View now, where the frames are.
-        ImGui::PopID();
+        // ---- then everything this batch holds that is NOT in a series -------
+        for (const auto& stackPtr : group.stacks) {
+            const ImageDoc& head = *app.images[stackPtr->front()];
+            if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
+            drawStackRow(*stackPtr, nullptr, nullptr);
+        }
       }
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
@@ -11574,6 +11794,57 @@ static void drawFileList() {
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
+    // ---- the series commands, after the walk that drew them -----------------
+    if (pendingSerRename)
+        if (App::Series* S = seriesById(pendingSerRename)) {
+            S->name = pendingSerName;
+            app.imagesRev++;
+            app.lin.rev++;                // the panel's selector shows this name
+        }
+    if (pendingSerEdit)
+        if (App::Series* S = seriesById(pendingSerEdit)) openSeriesModal(S->batchId, S->id);
+    if (pendingSerMove && pendingSerMoveTo) moveSeriesToBatch(pendingSerMove, pendingSerMoveTo);
+    if (pendingSerUngroup) ungroupSeries(pendingSerUngroup);
+    if (pendingSerClose) closeSeries(pendingSerClose);
+    if (pendingNewSerBatch) openSeriesModal(pendingNewSerBatch, 0);
+    if (pendingLeaveSeq) {
+        App::Series* S = seriesOfStack(pendingLeaveSeq);
+        App::SeqInfo* si = seqInfo(pendingLeaveSeq);
+        if (S) {
+            std::string n = S->name;
+            removeFromSeries(pendingLeaveSeq);
+            pruneEmptySeries();
+            toast((si ? si->name : std::string("stack")) + " left series \"" + n + "\"");
+        }
+    }
+    if (pendingJoinSeq && pendingJoinSer) {
+        // The value the stack's NAME suggests, said out loud. A number that
+        // appears by itself is indistinguishable from one a human checked, so
+        // the toast names it and where it was read - and an unreadable name
+        // joins UNSET rather than at 0 (Edit... is where values are typed).
+        std::string from;
+        double v = extractLevelFromName(seqInfo(pendingJoinSeq)
+                                        ? seqInfo(pendingJoinSeq)->name : std::string(), &from);
+        App::Series* S = seriesById(pendingJoinSer);
+        App::SeqInfo* si = seqInfo(pendingJoinSeq);
+        if (S && si) {
+            if (addToSeries(S->id, si->id, v)) {
+                std::string msg = si->name + " joined series \"" + S->name + "\"";
+                if (std::isfinite(v)) {
+                    char b[96];
+                    snprintf(b, sizeof b, " at %.6g%s%s", v, S->unit[0] ? " " : "", S->unit);
+                    msg += b;
+                    if (!from.empty()) msg += " (read from \"" + from + "\")";
+                } else {
+                    msg += " with NO value yet - set it in Edit...";
+                }
+                toast(msg);
+            } else {
+                toast(si->name + " is not in batch \"" + batchNameOf(S->batchId) +
+                      "\" - Move to batch first", true);
+            }
+        }
+    }
 }
 
 static void drawSequenceModal() {
@@ -14019,6 +14290,79 @@ int main(int argc, char** argv) {
                     (int)app.seqs.size());
             check("a single levelled stack makes NO series", app.series.empty() &&
                                                             !app.seqs.empty());
+        }
+
+        // ---- phase 4: what the Files panel's series row actually does ---------
+        // The rows themselves are ImGui, but every command behind them is a
+        // function, and these are the three that can lose data if they are
+        // wrong: a move that drops members, an ungroup that closes something,
+        // a Close that leaves stacks behind.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int b = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sid = selftestMakeSeries(b, "lx");
+            App::Series* P = seriesById(sid);
+            int nStacks = (int)app.seqs.size();
+            check("phase 4 fixture: one series over the whole batch",
+                  P && (int)P->members.size() == nStacks && nStacks >= 4);
+            if (!P) { fprintf(stderr, "seriesselftest: phase 4 fixture failed\n"); return 1; }
+            // Move the SERIES: unlike a lone member, it takes everything with it
+            // and stays whole (the row's "Move to batch (all members move)").
+            {
+                int dest = newBatch(uniqueBatchName("moved"));
+                std::vector<int> was;
+                for (const auto& m : P->members) was.push_back(m.seqId);
+                app.toast.clear();
+                moveSeriesToBatch(sid, dest);
+                P = seriesById(sid);
+                bool kept = P && P->members.size() == was.size() && P->batchId == dest;
+                if (kept)
+                    for (size_t i = 0; i < was.size(); i++)
+                        if (P->members[i].seqId != was[i] || batchOfStack(was[i]) != dest)
+                            kept = false;
+                fprintf(stderr, "seriesselftest: moveSeriesToBatch -> batch '%s', "
+                                "%d member(s), toast \"%s\"\n", batchNameOf(dest).c_str(),
+                        P ? (int)P->members.size() : -1, app.toast.c_str());
+                check("a series moved to another batch keeps every member", kept);
+                check("...and nothing was told it 'left the series'",
+                      app.toast.find("left series") == std::string::npos);
+                check("invariant 1: audit after the series move", audit());
+            }
+            // UNGROUP: the fence goes, the data stays. This is the operation
+            // that must NOT be confused with Close.
+            {
+                int stacksBefore = (int)app.seqs.size();
+                size_t imagesBefore = app.images.size();
+                app.toast.clear();
+                ungroupSeries(sid);
+                fprintf(stderr, "seriesselftest: ungroup -> %d series, %d stack(s), "
+                                "%d frame(s), toast \"%s\"\n", (int)app.series.size(),
+                        (int)app.seqs.size(), (int)app.images.size(), app.toast.c_str());
+                check("ungroup removes the series", seriesById(sid) == nullptr);
+                check("...and keeps every stack and frame",
+                      (int)app.seqs.size() == stacksBefore &&
+                      app.images.size() == imagesBefore);
+                check("invariant 1: audit after ungroup", audit());
+            }
+            // Close series: the canon's Close, which discards the CONTENTS.
+            {
+                int b2 = app.images.empty() ? 0 : app.images[0]->batchId;
+                int sid2 = selftestMakeSeries(b2, "lx");
+                App::Series* Q = seriesById(sid2);
+                int members = Q ? (int)Q->members.size() : 0;
+                int stacksBefore = (int)app.seqs.size();
+                app.toast.clear();
+                closeSeries(sid2);
+                fprintf(stderr, "seriesselftest: close series (%d member(s)) -> %d series, "
+                                "%d stack(s) left, toast \"%s\"\n", members,
+                        (int)app.series.size(), (int)app.seqs.size(), app.toast.c_str());
+                check("Close series discards its stacks",
+                      seriesById(sid2) == nullptr &&
+                      (int)app.seqs.size() == stacksBefore - members);
+                check("invariant 1: audit after Close series", audit());
+            }
         }
         fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
