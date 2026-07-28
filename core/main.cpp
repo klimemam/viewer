@@ -5153,8 +5153,11 @@ static void drawAnalysisPlots() {
                 dl->AddLine(ImVec2(lx, pr.p0.y), ImVec2(lx, pr.p1.y),
                             IM_COL32(150, 160, 170, 120));
                 ImGui::BeginTooltip();
-                ImGui::TextDisabled("%s = %.5g",
-                                    first->xLabel.empty() ? "x" : first->xLabel.c_str(), sx);
+                // quantity + unit on the readout too: the tooltip may end up
+                // in a screenshot without the axes that explain it
+                ImGui::TextDisabled("%s = %.5g   (y: %s)",
+                                    first->xLabel.empty() ? "x" : first->xLabel.c_str(), sx,
+                                    first->yLabel.empty() ? nm.c_str() : first->yLabel.c_str());
                 for (const auto& s : S) {
                     if (s.name != nm || (size_t)best >= s.ys.size()) continue;
                     ImU32 col = s.colorIdx >= 0 ? ANN_COLORS[s.colorIdx & 7]
