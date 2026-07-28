@@ -540,6 +540,12 @@ struct App {
     struct PendingGroup { std::string name; std::vector<std::string> files;
                           bool isRaw = false; int batchId = 0; std::string shape; };
     std::vector<PendingGroup> seqQueue;
+    // Sibling loads a session asked for, drained one at a time.
+    // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
+    // calling it N times in the parse loop cancelled every load but the last:
+    // a 3-stack session came back with 7 of its 15 frames.
+    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
+    std::vector<SeqRestore> seqRestore;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -1458,6 +1464,14 @@ static void closeCurrent(bool frameOnly = false) {
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
     app.fitRequested = true;
+    app.imagesRev++;
+    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
+    // same-named frame of another stack (every stack has a frame_001.npy).
+    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
+    // this path duplicates closeImages' body and inherited the omission.
+    if (!resolveB()) {
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
     // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
     // too, or a zero-frame stack haunts the linearity table
     if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
@@ -2894,7 +2908,9 @@ static std::string loadSession(const std::string& path) {
             if (on && lastImageOk && cur() && !cur()->path.empty() && cur()->seqId == 0) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
-                if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
+                // queued, not started: see App::seqRestore
+                if (files.size() >= 2)
+                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat });
             }
         }
         else if (key == "ann") {
@@ -3344,6 +3360,17 @@ static bool seqReadyPending() {
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
+    // one restore at a time, matched by uid: indices shift as frames land
+    if (!app.seqRestore.empty() && !app.seqRunning && !seqReadyPending()) {
+        App::SeqRestore r = std::move(app.seqRestore.front());
+        app.seqRestore.erase(app.seqRestore.begin());
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
+                startSequenceLoad(i, r.files, r.pattern);
+                break;
+            }
+        return;                 // let it start before chaining anything else
+    }
     if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
 }
 
@@ -12186,6 +12213,7 @@ int main(int argc, char** argv) {
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
+                working |= !app.seqRestore.empty();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
