@@ -9704,6 +9704,43 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
     }
 }
 
+// ---- deferred panel actions -------------------------------------------------
+// Every row the listing draws is an RbRow: RAW POINTERS into app.rbrowse.entries
+// and into the tree cache, held in a `view` vector that is rebuilt each frame
+// and read from the moment it is built until the table ends. An action that
+// REPLACES either container therefore cannot run where it is clicked - the rest
+// of the frame would read freed memory.
+//
+// The tree cache knew this ("a mid-frame clear would dangle every row below the
+// refresh button") and hand-rolled a one-flag deferral. The Places combo did
+// not: picking a bookmark on another host runs goToPlace, which assigns a fresh
+// App::RemoteBrowse over the live one, and the table below then dereferenced
+// nine destroyed entries - reproduced as a SIGSEGV inside strlen, one click
+// after connecting.
+//
+// So it is a rule now instead of three careful call sites: navigation, the tree
+// cache and the connection state are QUEUED here and run once `view` is dead.
+// A new button inherits the rule instead of having to remember it.
+static std::vector<std::function<void()>> g_rbDeferred;
+static void rbDefer(std::function<void()> f) { g_rbDeferred.push_back(std::move(f)); }
+static size_t rbDeferredPending() { return g_rbDeferred.size(); }
+// RAII, so the panel's early returns run the queue too. Declared BEFORE `view`
+// in drawPanelRemote: reverse destruction order is what guarantees the rows are
+// already gone when the queue runs.
+struct RbDeferredActions {
+    ~RbDeferredActions() {
+        std::vector<std::function<void()>> q;
+        q.swap(g_rbDeferred);          // an action may queue another
+        for (auto& f : q) f();
+    }
+};
+// Every navigation the panel offers. remoteBrowseTo only enqueues a job today,
+// so this changes nothing that can be seen - it makes "the panel never
+// navigates mid-draw" true by construction rather than by inspection.
+static void rbGoTo(const std::string& dir) {
+    rbDefer([dir] { remoteBrowseTo(dir); });
+}
+
 // Bookmarks + recents in one dropdown. Available connected or not: picking a
 // place while disconnected is exactly how a session starts next morning.
 static void drawRemotePlacesCombo() {
@@ -9724,7 +9761,7 @@ static void drawRemotePlacesCombo() {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
         ImGui::SameLine();
         if (ImGui::Selectable(placeLabel(app.rbBookmarks[i]).c_str()))
-            goToPlace(app.rbBookmarks[i]);
+            rbDefer([u = app.rbBookmarks[i]] { goToPlace(u); });   // see rbDefer
         ImGui::PopID();
     }
     if (rm >= 0) {
@@ -9736,7 +9773,7 @@ static void drawRemotePlacesCombo() {
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
         ImGui::PushID(1000 + i);
         if (ImGui::Selectable(placeLabel(app.rbRecents[i]).c_str()))
-            goToPlace(app.rbRecents[i]);
+            rbDefer([u = app.rbRecents[i]] { goToPlace(u); });
         ImGui::PopID();
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
@@ -9746,12 +9783,12 @@ static void drawRemotePlacesCombo() {
 
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
+    // FIRST, so it is destroyed LAST - after `view` and after every row that
+    // points into the browse state. Anything that replaces that state is queued
+    // through rbDefer and runs here. (This replaces a one-flag "forget the tree
+    // next frame" deferral that covered the tree cache and nothing else.)
+    RbDeferredActions rbActions;
     ImGui::PushID("remotetree");
-    // Dropping the tree cache is DEFERRED to the top of a frame: the row list
-    // built below holds pointers into it, so clearing it from a button drawn
-    // half way down would leave every row after that button dangling.
-    static bool rbForgetTree = false;
-    if (rbForgetTree) { rbTreeForget(); rbForgetTree = false; }
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
@@ -9787,8 +9824,8 @@ static void drawPanelRemote() {
         if (atRoot) return;
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
-        remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                        : d.substr(0, s));
+        rbGoTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                : d.substr(0, s));
     };
     // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     static char rbPathEdit[1024];
@@ -9823,7 +9860,7 @@ static void drawPanelRemote() {
                     ImGui::CalcTextSize(segs[k].label.c_str()).x + ImGui::GetFontSize())
                     ImGui::NewLine();
             }
-            if (ImGui::SmallButton(segs[k].label.c_str())) remoteBrowseTo(segs[k].path);
+            if (ImGui::SmallButton(segs[k].label.c_str())) rbGoTo(segs[k].path);
             // Right-click used to jump straight into path editing. It is a menu
             // now: the actions that take a FOLDER as their subject all belong on
             // the bar that names the folder.
@@ -9882,7 +9919,7 @@ static void drawPanelRemote() {
             while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
             while (p.size() > 1 && p.back() == '/') p.pop_back();
             rbPathEditing = false;
-            remoteBrowseTo(p.empty() ? "~" : p);
+            rbGoTo(p.empty() ? "~" : p);
         } else if (ImGui::IsItemDeactivated()) {
             rbPathEditing = false;    // Esc (ImGui reverts the text) or focus loss
         }
@@ -9945,7 +9982,7 @@ static void drawPanelRemote() {
             if (app.rbTree) {
                 if (rbHas(app.rbExpanded, r.full())) rbTreeCollapse(r.full());
                 else rbTreeExpand(r.full());
-            } else remoteBrowseTo(r.full());
+            } else rbGoTo(r.full());
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -9983,7 +10020,7 @@ static void drawPanelRemote() {
     // opens the whole stack; a frame promotes the preview it just made.
     auto rbOpenRow = [&](const RbRow& r) {
         if (r.ph) return;
-        if (r.isDir()) { remoteBrowseTo(r.full()); return; }
+        if (r.isDir()) { rbGoTo(r.full()); return; }
         if (!isNpyName(r.name())) return;
         if (r.isGroup()) {
             dropPreview();                   // the poster frame did its job
@@ -10005,10 +10042,13 @@ static void drawPanelRemote() {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("parent folder (Backspace)");
         ImGui::SameLine();
-        if (ImGui::SmallButton("home")) remoteBrowseTo("~");
+        if (ImGui::SmallButton("home")) rbGoTo("~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
         ImGui::SameLine();
-        if (ImGui::SmallButton("refresh")) { rbForgetTree = true; remoteBrowseTo(B.dir); }
+        if (ImGui::SmallButton("refresh")) {
+            rbDefer([] { rbTreeForget(); });        // in order: forget, then list
+            rbGoTo(B.dir);
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
         ImGui::SameLine();
@@ -10134,8 +10174,10 @@ static void drawPanelRemote() {
         ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("disconnect")) {
-            B = App::RemoteBrowse{};
-            rbForgetTree = true;         // another machine, other children
+            rbDefer([] {                 // another machine, other children
+                app.rbrowse = App::RemoteBrowse{};
+                rbTreeForget();
+            });
             ImGui::PopID();
             return;
         }
@@ -10315,22 +10357,22 @@ static void drawPanelRemote() {
                 if (ImGui::Selectable(lb.c_str())) {
                     std::string full = joinS(h.rel);
                     if (h.dir) {
-                        remoteBrowseTo(full);
+                        rbGoTo(full);
                     } else if (isNpyName(h.rel)) {
                         openRemote(makeRemoteUrl(B.host, full));
                     } else {
                         // not servable: at least go where it lives
                         size_t sl = full.find_last_of('/');
-                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
-                                                                          : full.substr(0, sl));
+                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                 : full.substr(0, sl));
                     }
                 }
                 if (ImGui::BeginPopupContextItem("sctx")) {
                     std::string full = joinS(h.rel);
                     if (!h.dir && ImGui::MenuItem("Go to containing folder")) {
                         size_t sl = full.find_last_of('/');
-                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
-                                                                          : full.substr(0, sl));
+                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                 : full.substr(0, sl));
                     }
                     if (ImGui::MenuItem("Copy path")) {
                         ImGui::SetClipboardText(full.c_str());
@@ -11637,7 +11679,7 @@ static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPref
 static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
-    "left,end,home,up,down,back";
+    "left,end,home,up,down,more,down,back";
 
 static void printUsage() {
     printf(
@@ -12863,6 +12905,34 @@ int main(int argc, char** argv) {
                      memberCells) ? "ok" : "FAIL");
             if (!(sizes && gRows == nGroups && nGroups >= 1 && same && nogroups && memberCells))
                 ok = false;
+        }
+        {   // The deferred-action invariant. Every row the listing draws is a
+            // pair of raw pointers into B.entries; the Places combo used to
+            // replace the whole browse state from inside the draw, and the
+            // table below it then read nine destroyed entries (SIGSEGV in
+            // strlen). Nothing that replaces that state may run while a row
+            // list is alive - it is queued and runs when the rows are gone.
+            int ranAt = -1, marker = 0;
+            bool queued = false, aliveOk = false;
+            size_t pend0 = rbDeferredPending();
+            {
+                RbDeferredActions guard;
+                std::vector<RbRow> rows = rbBuildView(&B.dir, B.entries, false, false);
+                rbDefer([&] { ranAt = marker; });     // what picking a place queues
+                marker = 1;
+                queued = rbDeferredPending() == pend0 + 1 && ranAt == -1;
+                // ...and the rows are still readable, which is the whole point
+                aliveOk = !rows.empty() && rows[0].e == &B.entries[0] &&
+                          rows[0].e->name == B.entries[0].name;
+                marker = 2;                            // the row list dies here
+            }
+            bool defOk = queued && aliveOk && ranAt == 2 && rbDeferredPending() == 0;
+            fprintf(stderr, "browseselftest: deferred actions: queued while the rows "
+                            "were alive=%d, rows valid throughout=%d, ran only after "
+                            "they died=%d, queue drained=%d: %s\n",
+                    queued ? 1 : 0, aliveOk ? 1 : 0, ranAt == 2 ? 1 : 0,
+                    rbDeferredPending() == 0 ? 1 : 0, defOk ? "ok" : "FAIL");
+            if (!defOk) ok = false;
         }
         {   // Tree mode, lazily: expanding a node issues exactly ONE LIST, on
             // the worker; the children appear under the folder at depth+1;
@@ -15098,7 +15168,8 @@ int main(int argc, char** argv) {
                             (int)app.rbrowse.entries.size(),
                             app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
                     fflush(stderr);
-                    if (a == "flat")       app.rbFlat = !app.rbFlat;
+                    if (a == "more")       app.rbAdvanced = !app.rbAdvanced;
+                    else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
