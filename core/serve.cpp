@@ -339,22 +339,6 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 }
 
 // ---- numbered-sequence grouping ------------------------------------------
-// The grouping key is the name with its trailing digit run (the run just
-// before ".npy") removed - the same axis the client's numeric frame sort
-// orders by, so both ends agree on what a sequence is, and uneven zero-padding
-// (frame_9, frame_10) still lands in one group.
-static bool splitNumberedNpy(const std::string& name, std::string& pre,
-                             long long& num, int& width) {
-    if (!isNpySuffix(name)) return false;
-    size_t end = name.size() - 4;
-    size_t i = end;
-    while (i > 0 && isdigit((unsigned char)name[i - 1])) i--;
-    if (i == end) return false;                 // no digits before .npy
-    pre = name.substr(0, i);
-    num = atoll(name.c_str() + i);
-    width = (int)(end - i);
-    return true;
-}
 
 struct NpyGroup {
     std::string pattern;                // frame_###.npy - display name
@@ -364,38 +348,62 @@ struct NpyGroup {
     std::filesystem::path first;        // header peek target
 };
 
+// The grouping key: the stem with every digit RUN collapsed to one marker.
+// "00_A" and "01_A" share a key, "00_B" does not - the digits may sit
+// ANYWHERE in the name, which is what real capture scripts produce. The
+// trailing-digits-only version filed every 00_A/01_A set under "no sequence",
+// and the *.npy fold then swallowed the lot into one stack (verbatim
+// complaint). Matches the client's segment-based sibling scan in spirit;
+// '?' in the pattern because the client renders it in ImGui labels.
+static bool npySegKey(const std::string& name, std::string& key, std::string& pattern) {
+    if (!isNpySuffix(name)) return false;
+    std::string stem = name.substr(0, name.size() - 4);
+    bool anyDigit = false;
+    key.clear(); pattern.clear();
+    for (size_t i = 0; i < stem.size();) {
+        if (isdigit((unsigned char)stem[i])) {
+            size_t j = i;
+            while (j < stem.size() && isdigit((unsigned char)stem[j])) j++;
+            key += '\x01';                       // one marker per digit run
+            pattern += std::string(j - i, '?');
+            anyDigit = true;
+            i = j;
+        } else { key += stem[i]; pattern += stem[i]; i++; }
+    }
+    key += ".npy"; pattern += ".npy";
+    return anyDigit;
+}
+
 // Partition one directory's files into numbered groups (>= 2 members) and the
 // indices of everything else. `files` are (name, path) of regular files only.
 static void groupNumberedNpy(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
                              std::vector<NpyGroup>& groups, std::vector<size_t>& singles) {
-    struct Member { long long num; int width; size_t idx; };
-    struct Bucket { std::string pre; std::vector<Member> m; };
+    struct Bucket { std::string key, pattern; std::vector<size_t> m; };
     std::vector<Bucket> buckets;
     std::vector<char> used(files.size(), 0);
     for (size_t i = 0; i < files.size(); i++) {
-        std::string pre; long long num; int width;
-        if (!splitNumberedNpy(files[i].first, pre, num, width)) continue;
+        std::string key, pat;
+        if (!npySegKey(files[i].first, key, pat)) continue;
         Bucket* b = nullptr;
-        for (auto& q : buckets) if (q.pre == pre) { b = &q; break; }
-        if (!b) { buckets.push_back({ pre, {} }); b = &buckets.back(); }
-        b->m.push_back({ num, width, i });
+        for (auto& q : buckets) if (q.key == key) { b = &q; break; }
+        if (!b) { buckets.push_back({ key, pat, {} }); b = &buckets.back(); }
+        b->m.push_back(i);
     }
     for (auto& b : buckets) {
         if (b.m.size() < 2) continue;
-        std::sort(b.m.begin(), b.m.end(),
-                  [](const Member& a, const Member& c) { return a.num < c.num; });
+        std::sort(b.m.begin(), b.m.end(), [&](size_t x, size_t y) {
+            return rp::naturalLess(files[x].first, files[y].first);
+        });
         NpyGroup g;
-        // '?' and not '#': the client renders this in ImGui labels, and ImGui
-        // truncates any label at "##" - all-digit names would show as blank
-        g.pattern = b.pre + std::string((size_t)b.m.front().width, '?') + ".npy";
-        for (const auto& m : b.m) {
-            g.names.push_back(files[m.idx].first);
-            used[m.idx] = 1;
+        g.pattern = b.pattern;
+        for (size_t i : b.m) {
+            g.names.push_back(files[i].first);
+            used[i] = 1;
             std::error_code ec;
-            g.bytes += (uint64_t)std::filesystem::file_size(files[m.idx].second, ec);
-            g.mtime = std::max(g.mtime, unixMtime(files[m.idx].second));
+            g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, ec);
+            g.mtime = std::max(g.mtime, unixMtime(files[i].second));
         }
-        g.first = files[b.m.front().idx].second;
+        g.first = files[b.m.front()].second;
         groups.push_back(std::move(g));
     }
     for (size_t i = 0; i < files.size(); i++)
