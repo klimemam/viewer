@@ -1549,6 +1549,14 @@ static void closeAll() {
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.seqs.clear();
+    // The batches go with their contents: an empty batch that survives Close
+    // All keeps its NAME reserved, so reopening the same folder came back as
+    // "multi (2)" - the uniquifier colliding with a ghost.
+    app.batches.clear();
+    app.loadBatchId = 0;
+    app.previewUid = 0;
+    app.previewFiles.clear();
+    app.previewLabel.clear();
     app.current = -1;
     // compare state refers to docs that no longer exist; leaving it would let a
     // later file with the same name silently become B again
@@ -9359,14 +9367,29 @@ static void drawFileList() {
                      extra ? extra : "");
             float avail = ImGui::GetContentRegionAvail().x;
             float metaW = ImGui::CalcTextSize(meta).x;
-            // one source of truth for the split, so the two halves cannot overlap
+            // The row is ONE item spanning the full width, and the metadata is
+            // painted onto it rather than being a second item. It used to be a
+            // name-width Selectable followed by a TextDisabled, which made the
+            // metadata the "last item" - so right-clicking a stack opened the
+            // context menu only over that dim strip on the right, and never on
+            // the name, where everyone aims.
             float nameW = std::max(avail - metaW - st.ItemSpacing.x, ImGui::GetFontSize() * 4.0f);
-            bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowOverlap,
-                                             ImVec2(nameW, 0));
-            bool hov = ImGui::IsItemHovered();     // the NAME, not the dimmed metadata
-            ImGui::SameLine(nameW + st.ItemSpacing.x);
-            ImGui::TextDisabled("%s", meta);
-            if (hov) ImGui::SetTooltip("%s", d.path.c_str());
+            bool room = avail > metaW + ImGui::GetFontSize() * 6.0f;   // else: name only
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::PushClipRect(p0, ImVec2(p0.x + (room ? nameW : avail),
+                                           p0.y + ImGui::GetFrameHeight()), true);
+            bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_SpanAllColumns,
+                                             ImVec2(avail, 0));
+            ImGui::PopClipRect();
+            bool hov = ImGui::IsItemHovered();
+            if (room) {   // draw-list, not an item: the row must stay the last item
+                ImVec2 m = ImGui::GetItemRectMin();
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(m.x + avail - metaW, m.y + (ImGui::GetItemRectSize().y -
+                                                       ImGui::GetTextLineHeight()) * 0.5f),
+                    ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
+            }
+            if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
             return clicked;
         };
         if (head.seqId == 0) {
