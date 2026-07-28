@@ -7112,6 +7112,33 @@ static void drawPanelRemote() {
             openRemoteStack(B.host, files);
         }
     }
+    // Filter what is already listed - no round-trip to the server. Substring by
+    // default, glob when * or ? appears (globListMatch's contract), because a
+    // capture dump directory holds hundreds of entries and one condition matters.
+    static char rbFilter[256] = "";
+    {
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+            ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
+                                 rbFilter, sizeof rbFilter);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("filters the listing below without asking the server\n"
+                              "bare text matches anywhere; * and ? make it a glob;\n"
+                              "comma separates alternatives");
+    }
+    // filtered view of B.entries, by index (the clipper needs random access)
+    std::vector<int> shown;
+    shown.reserve(B.entries.size());
+    for (int i = 0; i < (int)B.entries.size(); i++)
+        if (!rbFilter[0] || globListMatch(rbFilter, B.entries[i].name))
+            shown.push_back(i);
+    if (rbFilter[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
+    }
     ImGui::Separator();
     // The listing scrolls on its own so the header above never leaves the view.
     if (ImGui::BeginChild("entries", ImVec2(0, 0), ImGuiChildFlags_None)) {
@@ -7121,7 +7148,12 @@ static void drawPanelRemote() {
             remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
                                                             : d.substr(0, s));
         }
-        for (const auto& e : B.entries) {
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        while (clip.Step())
+        for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+            const remote::Entry& e = B.entries[shown[row]];
+            ImGui::PushID(shown[row]);
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -7140,6 +7172,7 @@ static void drawPanelRemote() {
                                     e.size >= (1u << 30) ? e.size / 1073741824.0
                                                          : e.size / 1048576.0);
             }
+            ImGui::PopID();
         }
     }
     ImGui::EndChild();
@@ -8468,8 +8501,13 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
-            // sequence start/end = C-a/C-e (always Ctrl, also on macOS)
-            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
+            // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
+            // Ctrl+F is "find" while the Remote browser owns focus (it jumps to
+            // the filter box there), so frame-stepping must yield to it.
+            ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
+            bool remoteFocused = nav && nav->RootWindow &&
+                                 strcmp(nav->RootWindow->Name, "Remote") == 0;
+            if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_P)) gotoStack(-1);
