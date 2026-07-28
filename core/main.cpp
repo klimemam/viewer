@@ -10203,6 +10203,64 @@ static int remoteSelfTest(const char* exe, const char* path) {
             bad += ok ? 0 : 1;
         }
     }
+    {   // Grouping stage 2: '?' covers ONLY the varying digit run. gainset has
+        // a constant gain digit next to the frame counter - the pattern must
+        // keep it literal (gain10_???.npy), or two gains read as one stack.
+        std::string gd = dir + "/rb/gainset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(gd, ents, err)) {
+            fprintf(stderr, "selftest: LIST gainset: skipped (%s: %s)\n",
+                    gd.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames8 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames8 &= e.frames == 8; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames8 &&
+                      pats[0] == "gain10_???.npy" && pats[1] == "gain20_???.npy";
+            fprintf(stderr, "selftest: LIST grouping gainset -> %d group(s) [%s], "
+                            "8 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames8 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Grouping stage 2, split: expset varies TWO digit runs. One stack per
+        // condition (g00_e??.npy / g01_e??.npy), never a second '?' run - a
+        // condition-mixed stack has a meaningless sigma_t.
+        std::string ed = dir + "/rb/expset";
+        std::vector<remote::Entry> ents;
+        if (!s.list(ed, ents, err)) {
+            fprintf(stderr, "selftest: LIST expset: skipped (%s: %s)\n",
+                    ed.c_str(), err.c_str());
+        } else {
+            std::vector<std::string> pats;
+            bool frames4 = true;
+            int nPlain = 0;
+            for (const auto& e : ents) {
+                if (e.dir) continue;
+                if (e.group) { pats.push_back(e.name); frames4 &= e.frames == 4; }
+                else nPlain++;
+            }
+            std::sort(pats.begin(), pats.end());
+            bool ok = pats.size() == 2 && nPlain == 0 && frames4 &&
+                      pats[0] == "g00_e??.npy" && pats[1] == "g01_e??.npy";
+            fprintf(stderr, "selftest: LIST grouping expset (2 varying runs) -> "
+                            "%d group(s) [%s], 4 frames each=%d: %s\n",
+                    (int)pats.size(),
+                    (pats.empty() ? std::string("?")
+                                  : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
+                    frames4 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
     {   // SCAN (the remote openFolder): 3 illumination folders -> 3 stacks
         std::string sroot = dir + "/rb/scanroot";
         std::vector<remote::ScanGroup> gs;
