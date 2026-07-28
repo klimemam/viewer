@@ -367,6 +367,35 @@ struct App {
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
+    // Linearity: one row per stack (level in, response out), fits per CFA plane.
+    // Recomputed only on demand - this walks hundreds of frames.
+    struct LinState {
+        struct Row {
+            int seqId = 0;
+            std::string name;
+            double level = std::numeric_limits<double>::quiet_NaN();
+            bool include = true, valid = false, pending = false;
+            int frames = 0, nPl = 1;
+            double mean[4] = {}, sigmaT[4] = {};
+            std::string err;
+        };
+        std::vector<Row> rows;
+        char unit[16] = "lx";
+        int tablePlane = 0;               // which CFA plane the per-stack table shows
+        bool fitValid = false, roiUsed = false;
+        bool readFromDark = false;        // read noise measured, not extrapolated
+        int nPl = 1, nPts = 0;
+        double slope[4] = {}, offs[4] = {}, r2[4] = {}, leMax[4] = {};
+        double ptcK[4] = {}, ptcRead2[4] = {}, readDN[4] = {};
+        uint64_t rev = 0, computedRev = 0;
+    } lin;
+    bool showLinearity = false;
+    int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
+    bool showRemote = false;          // the server browser, its own panel
+    bool focusRemote = false;         // bring it forward when a menu item asks
+    struct Msg { std::string text; bool err; };
+    std::vector<Msg> msgLog;          // every toast, kept so it can be copied
+    bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
         int seqId = -1;
@@ -506,7 +535,7 @@ static void stopRbWorker();
 static std::string bootstrapScript();
 static std::string updateScript();
 static void startRemote(const std::string& hostSpec);
-static void drawRemoteTree();
+static void drawPanelRemote();
 static bool deployPeer(const std::string& host, int port, bool force, std::string& log);
 static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
@@ -544,6 +573,14 @@ static void setCompareB(const ImageDoc* d) {
 static void toast(const std::string& msg, bool err = false) {
     app.toast = msg; app.toastErr = err;
     app.toastUntil = ImGui::GetTime() + (err ? 6.0 : 2.5);
+    // A toast fades after six seconds, which is not long enough to paste it into
+    // a bug report. Every message is kept here and shown, selectable, in the
+    // Messages panel.
+    if (app.msgLog.empty() || app.msgLog.back().text != msg) {
+        app.msgLog.push_back({ msg, err });
+        if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
+        if (err) app.msgUnreadErr = true;
+    }
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
@@ -1321,6 +1358,13 @@ static const char* analyzerHint(const std::string& name) {
 static bool g_quietLoad = false;
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
+    // --cfa says "this dump is mosaiced" for formats that carry no such flag (an
+    // .npy of a sensor read is exactly that). The Inspector can still change it
+    // per image; this only sets what a file arrives as.
+    if (app.forceCfa >= 0 && im->ch == 1 && im->cfa == 0) {
+        im->cfa = app.forceCfa;
+        im->cfaPattern = app.forceCfaPattern & 3;
+    }
     im->uid = app.nextUid++;
     app.imagesRev++;
     computeMinMax(*im);
@@ -2104,7 +2148,8 @@ static void writeSessionTo(std::ostream& f) {
     f << "panels " << (app.showFiles ? 1 : 0) << " " << (app.showInspector ? 1 : 0) << " "
       << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
-      << (app.showProjection ? 1 : 0) << "\n";
+      << (app.showProjection ? 1 : 0) << " " << (app.showLinearity ? 1 : 0) << " "
+      << (app.showRemote ? 1 : 0) << "\n";
     // the whole dock arrangement, so a session reopens looking like it did
     if (const char* ini = ImGui::SaveIniSettingsToMemory()) {
         f << "layout_begin\n";
@@ -2221,6 +2266,7 @@ static void savePrefs() {
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
     f << "membudget " << app.memBudgetGB << "\n";
     f << "procpolicy " << app.procPolicy << "\n";
+    f << "linunit " << app.lin.unit << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
@@ -2394,11 +2440,13 @@ static std::string loadSession(const std::string& path) {
             app.compareBUid = 0;        // resolved by name+frame on first use
         }
         else if (key == "panels") {
-            int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0;
-            ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2;
+            // trailing fields are optional: sessions written before a panel
+            // existed keep their meaning, and its default stays put
+            int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0, h2 = 0, i2 = 0;
+            ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2 >> h2 >> i2;
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
-            app.showProjection = g2 != 0;
+            app.showProjection = g2 != 0; app.showLinearity = h2 != 0; app.showRemote = i2 != 0;
         }
         else if (key == "layout_begin") {
             std::string ini, l2;
@@ -2416,6 +2464,13 @@ static std::string loadSession(const std::string& path) {
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
         else if (key == "selann") ls >> selAnnIndex;
+        else if (key == "seqlevel") {   // the exposure level of the stack above
+            double lv = 0; ls >> lv;
+            if (lastImageOk && cur() && cur()->seqId != 0)
+                if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->level = lv;
+        }
+        else if (key == "linunit") { std::string u = restOfLine(ls);
+                                     snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
         else if (key == "seqframe") {   // select the frame this stack was left on
             int want = 0; ls >> want;
             if (lastImageOk && cur() && cur()->seqId != 0) {
@@ -2864,10 +2919,18 @@ static void pumpSequence() {
 
 static void startNextQueuedGroup();   // defined with the folder-open code below
 
+// Frames decoded but not yet integrated. They are stamped with seqLoadingId when
+// they land, so the next stack must NOT start while any are still waiting - it
+// would move seqLoadingId and file the tail of one stack under another.
+static bool seqReadyPending() {
+    std::lock_guard<std::mutex> lk(app.seqMtx);
+    return !app.seqReady.empty();
+}
+
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
-    if (!app.seqRunning && !app.seqQueue.empty()) startNextQueuedGroup();
+    if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -3651,7 +3714,15 @@ static bool ensureRemoteSession(const std::string& host, std::string& err, int p
 }
 
 static std::string makeRemoteUrl(const std::string& host, const std::string& path) {
-    return host.empty() ? "local://" + path : "ssh://" + host + path;
+    if (host.empty()) return "local://" + path;
+    // A home-relative path ("~/data/x.npy") pasted straight after the host would
+    // read as part of the HOST ("ssh://trc2~/data/..."), and the mis-split host
+    // then looks like a machine we have never connected to - which is what made
+    // picking a file in the browser answer "could not install the peer".
+    // git's ssh:// extension spells it /~/rel, and parseUrl unwraps that.
+    std::string p = path;
+    if (!p.empty() && p[0] != '/') p = "/" + p;
+    return "ssh://" + host + p;
 }
 
 // Does analysis of this stack run on the server? Yes for remote data unless the
@@ -3806,6 +3877,8 @@ static void pumpRemoteBrowse() {
             B.err = r.err;
             if (r.kind == App::RbConnect) {
                 B.connected = false;
+                app.showRemote = true;    // so the failure text has somewhere to live
+                app.focusRemote = true;
                 toast("remote: " + r.err, true);
             }
             continue;
@@ -3817,6 +3890,9 @@ static void pumpRemoteBrowse() {
         B.entries = std::move(r.entries);
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
+            // a listing nobody can see is not a connection anyone believes in
+            app.showRemote = true;
+            app.focusRemote = true;
             toast("connected to " + (r.host.empty() ? std::string("local peer") : r.host));
         }
         if (!app.pendingRemoteOpen.empty()) {   // a url was pasted with the host
@@ -5692,6 +5768,400 @@ static void drawPanelProjection() {
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
 }
 
+// ---- linearity ---------------------------------------------------------------
+// The folder structure IS the experiment: each stack was captured at one
+// exposure level, so level comes from the stack (auto-read from its name,
+// editable), the response comes from the frames, and the fit answers the two
+// questions a sensor evaluation starts with - is the response linear, and what
+// is the conversion gain. CFA planes stay separate throughout: mixing them
+// turns channel sensitivity differences into fake nonlinearity.
+
+// "100lx/frame_###.npy" -> 100; "00/f_###" -> 0; "run42_200ms.npy [remote]" -> 42.
+// Rule: the first number in the FOLDER part when there is one, else in the whole
+// name. Deliberately simple - the field is editable, this is only the default.
+static double extractLevelFromName(const std::string& name) {
+    std::string part = name;
+    size_t slash = part.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
+    for (size_t i = 0; i < part.size(); i++) {
+        if (isdigit((unsigned char)part[i])) {
+            // avoid the "###" pattern placeholder and sizes like 640x480
+            return atof(part.c_str() + i);
+        }
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+struct StackStats {
+    bool valid = false;
+    int frames = 0, nPl = 1;
+    double mean[4] = {}, sigmaT[4] = {};
+    std::string err;
+};
+
+// Per-plane mean and temporal sigma of one stack's resident frames, over the
+// given ROI. The same statistic the server aggregate computes, evaluated on
+// whatever is local - which covers NAS data and fully fetched remote stacks.
+static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
+    StackStats out;
+    std::vector<int> fr = framesOfSeq(seqId);
+    const ImageDoc* first = nullptr;
+    std::vector<const ImageDoc*> use;
+    for (int idx : fr) {
+        const ImageDoc* d = app.images[idx].get();
+        if (d->remoteStep > 1 || d->data.empty()) continue;   // previews lie
+        if (!first) first = d;
+        if (d->w != first->w || d->h != first->h || d->ch != first->ch) continue;
+        use.push_back(d);
+    }
+    if (use.size() < 2) { out.err = "needs >= 2 loaded frames"; return out; }
+    int W = first->w, H = first->h, C = first->ch;
+    rx = std::clamp(rx, 0, W - 1); ry = std::clamp(ry, 0, H - 1);
+    rw = rw <= 0 ? W - rx : std::min(rw, W - rx);
+    rh = rh <= 0 ? H - ry : std::min(rh, H - ry);
+    size_t samples = (size_t)rw * rh * C;
+    if (samples > (size_t)32 << 20) { out.err = "ROI too large (max 32M samples)"; return out; }
+    std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+    for (const ImageDoc* d : use)
+        for (int y = 0; y < rh; y++) {
+            const float* row = &d->data[((size_t)(ry + y) * W + rx) * C];
+            double* s1 = &sum[(size_t)y * rw * C];
+            double* s2 = &sum2[(size_t)y * rw * C];
+            for (size_t i = 0; i < (size_t)rw * C; i++) {
+                double v = row[i];
+                if (!std::isfinite(v)) continue;   // counted as N anyway: rare
+                s1[i] += v; s2[i] += v * v;
+            }
+        }
+    const double N = (double)use.size();
+    out.nPl = first->cfa ? 4 : 1;
+    double plM[4] = {}, plV[4] = {};
+    size_t plC[4] = {};
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            int p = first->cfa ? cfaChannelAt(*first, rx + x, ry + y) : 0;
+            for (int c = 0; c < C; c++) {
+                size_t i = ((size_t)y * rw + x) * C + c;
+                double m = sum[i] / N;
+                double var = std::max(0.0, sum2[i] / N - m * m) * (N / (N - 1.0));
+                plM[p] += m; plV[p] += var; plC[p]++;
+            }
+        }
+    for (int p = 0; p < out.nPl; p++) {
+        if (!plC[p]) continue;
+        out.mean[p] = plM[p] / (double)plC[p];
+        out.sigmaT[p] = sqrt(plV[p] / (double)plC[p]);
+    }
+    out.frames = (int)use.size();
+    out.valid = true;
+    return out;
+}
+
+// least squares y = a*x + b; returns false with fewer than 2 distinct points
+static bool linFit(const std::vector<double>& xs, const std::vector<double>& ys,
+                   double& a, double& b, double& r2) {
+    size_t n = xs.size();
+    if (n < 2) return false;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    for (size_t i = 0; i < n; i++) {
+        sx += xs[i]; sy += ys[i];
+        sxx += xs[i] * xs[i]; sxy += xs[i] * ys[i]; syy += ys[i] * ys[i];
+    }
+    double d = n * sxx - sx * sx;
+    if (fabs(d) < 1e-12) return false;
+    a = (n * sxy - sx * sy) / d;
+    b = (sy - a * sx) / n;
+    double sst = syy - sy * sy / n;
+    double ssr = 0;
+    for (size_t i = 0; i < n; i++) {
+        double e = ys[i] - (a * xs[i] + b);
+        ssr += e * e;
+    }
+    r2 = sst > 1e-12 ? 1.0 - ssr / sst : 1.0;
+    return true;
+}
+
+static const char* LIN_PLANES[4] = { "R", "Gr", "Gb", "B" };
+static const ImU32 LIN_COLS[4] = {
+    IM_COL32(255, 92, 92, 255), IM_COL32(79, 221, 107, 255),
+    IM_COL32(90, 200, 190, 255), IM_COL32(96, 156, 255, 255),
+};
+
+// Everything the panel shows, recomputed only when Compute is pressed: this is
+// a measurement action over potentially hundreds of frames, not a per-frame UI.
+static void linRecompute() {
+    App::LinState& L = app.lin;
+    // the ROI is shared with everything else: the selected rect, or whole frame
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    L.roiUsed = false;
+    if (App::Ann* a = findAnn(app.selectedAnn))
+        if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; L.roiUsed = true; }
+    std::vector<std::pair<int, bool>> keepInc;
+    for (const auto& r : L.rows) keepInc.push_back({ r.seqId, r.include });
+    L.rows.clear();
+    for (const auto& si : app.seqs) {
+        std::vector<int> fr = framesOfSeq(si.id);
+        if (fr.size() < 2 && si.expectedFrames < 2) continue;
+        App::LinState::Row r;
+        r.seqId = si.id;
+        r.name = si.name;
+        r.level = si.level;
+        StackStats st = computeStackStats(si.id, rx, ry, rw, rh);
+        r.valid = st.valid;
+        r.err = st.err;
+        r.frames = st.frames;
+        r.nPl = st.nPl;
+        for (int p = 0; p < 4; p++) { r.mean[p] = st.mean[p]; r.sigmaT[p] = st.sigmaT[p]; }
+        for (const auto& k : keepInc) if (k.first == si.id) r.include = k.second;
+        L.rows.push_back(std::move(r));
+    }
+    // fits, per plane, over rows that have both a level and a measurement
+    L.fitValid = false;
+    L.nPl = 1;
+    for (const auto& r : L.rows) if (r.valid) L.nPl = std::max(L.nPl, r.nPl);
+    int fitted = 0;
+    for (int p = 0; p < L.nPl; p++) {
+        std::vector<double> lx, ly, pm, pv;
+        for (const auto& r : L.rows) {
+            if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+            lx.push_back(r.level);
+            ly.push_back(r.mean[p]);
+            pm.push_back(r.mean[p]);
+            pv.push_back(r.sigmaT[p] * r.sigmaT[p]);
+        }
+        L.nPts = (int)lx.size();
+        if (!linFit(lx, ly, L.slope[p], L.offs[p], L.r2[p])) continue;
+        fitted++;
+        // linearity error: worst deviation from the fit, relative to the fit
+        double worst = 0;
+        for (size_t i = 0; i < lx.size(); i++) {
+            double fit = L.slope[p] * lx[i] + L.offs[p];
+            if (fabs(fit) > 1e-9)
+                worst = std::max(worst, fabs((ly[i] - fit) / fit) * 100.0);
+        }
+        L.leMax[p] = worst;
+        // photon transfer: sigma_t^2 vs mean; the slope is the system gain K
+        double kr2;
+        if (!linFit(pm, pv, L.ptcK[p], L.ptcRead2[p], kr2)) { L.ptcK[p] = 0; L.ptcRead2[p] = 0; }
+        // Read noise is the noise left at ZERO SIGNAL, and zero signal sits at
+        // the black level - not at mean = 0 DN. Extrapolating the PTC to 0 DN
+        // lands K*offset below that, which for any sensor with an offset is a
+        // large negative number and reads out as "0".
+        //
+        // Even corrected, the extrapolation is a difference of two large numbers
+        // (verified: injecting 3.0 DN of read noise comes back as 0-3.4 DN when
+        // the lowest level is already 80 DN above black). So it is only reported
+        // as a measurement when there is a DARK stack to measure it in; from a
+        // lit-only series it is marked as an extrapolation.
+        L.readDN[p] = sqrt(std::max(0.0, L.ptcRead2[p] + L.ptcK[p] * L.offs[p]));
+        L.readFromDark = false;
+        for (const auto& r : L.rows) {
+            if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+            if (fabs(r.level) > 1e-9) continue;             // not a dark stack
+            L.readDN[p] = r.sigmaT[p];                      // measured, not fitted
+            L.readFromDark = true;
+            break;
+        }
+    }
+    L.fitValid = fitted > 0;
+    L.computedRev = ++L.rev;
+}
+
+static void drawPanelLinearity() {
+    App::LinState& L = app.lin;
+    int nStacks = 0;
+    for (const auto& si : app.seqs)
+        if (framesOfSeq(si.id).size() >= 2 || si.expectedFrames >= 2) nStacks++;
+    if (nStacks < 2) {
+        ImGui::TextDisabled("linearity needs several stacks, one per exposure level");
+        ImGui::TextDisabled("(open a folder of folders: each subfolder = one level)");
+        return;
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::InputText("level unit", L.unit, sizeof L.unit);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... whatever the x axis of\n"
+                          "your experiment is. Written on every axis and column.");
+    ImGui::SameLine();
+    if (ImGui::Button("Auto levels")) {
+        for (auto& si : app.seqs)
+            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("read the level from each stack's folder name\n(first number; only fills empty fields)");
+    ImGui::SameLine();
+    if (ImGui::Button("Compute")) linRecompute();
+    ImGui::SameLine();
+    ImGui::TextDisabled(L.roiUsed ? "| selected ROI" : "| whole frame");
+    // The per-stack table has room for ONE response column. Averaging the CFA
+    // planes into it would be a different measurement, so it shows the plane you
+    // pick and says which one; the fits and the plots stay per-plane.
+    if (L.nPl > 1) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        ImGui::Combo("table plane", &L.tablePlane, "R\0Gr\0Gb\0B\0");
+        L.tablePlane = std::clamp(L.tablePlane, 0, L.nPl - 1);
+    }
+
+    // one row per stack: level in, response out
+    const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
+    char lvlHdr[48], meanHdr[32], sigHdr[32];
+    snprintf(lvlHdr, sizeof lvlHdr, "level [%s]", L.unit);
+    const char* pl = L.nPl > 1 ? LIN_PLANES[std::clamp(L.tablePlane, 0, 3)] : "";
+    snprintf(meanHdr, sizeof meanHdr, "mean %s [DN]", pl);
+    snprintf(sigHdr, sizeof sigHdr, "sigma_t %s [DN]", pl);
+    float tableH = ImGui::GetFontSize() * std::min(10, nStacks + 2) * 1.6f;
+    if (ImGui::BeginTable("lintab", 5 + (L.fitValid && L.nPl > 1 ? 2 : 2), TF, ImVec2(0, tableH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
+        ImGui::TableSetupColumn(lvlHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("frames", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3.2f);
+        ImGui::TableSetupColumn(meanHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(sigHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2);
+        ImGui::TableHeadersRow();
+        for (auto& si : app.seqs) {
+            if (framesOfSeq(si.id).size() < 2 && si.expectedFrames < 2) continue;
+            ImGui::PushID(si.id);
+            const App::LinState::Row* row = nullptr;
+            for (const auto& r : L.rows) if (r.seqId == si.id) { row = &r; break; }
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            bool inc = true;
+            for (auto& r : L.rows) if (r.seqId == si.id) inc = r.include;
+            if (ImGui::Checkbox("##inc", &inc))
+                for (auto& r : L.rows) if (r.seqId == si.id) r.include = inc;
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(si.name.c_str());
+            ImGui::TableNextColumn();
+            double lv = std::isfinite(si.level) ? si.level : 0.0;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputDouble("##lv", &lv, 0, 0, "%.6g")) si.level = lv;
+            ImGui::TableNextColumn();
+            if (row && row->valid) ImGui::Text("%d", row->frames);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            int tp = row ? std::clamp(L.tablePlane, 0, std::max(0, row->nPl - 1)) : 0;
+            if (row && row->valid) textNum("%.6g", row->mean[tp]);
+            else ImGui::TextDisabled(row ? row->err.c_str() : "-");
+            ImGui::TableNextColumn();
+            if (row && row->valid) textNum("%.6g", row->sigmaT[tp]);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (!L.fitValid) {
+        ImGui::TextDisabled("set levels (Auto levels or type them), then Compute.");
+        ImGui::TextDisabled("3+ stacks with levels give a fit; CFA planes stay separate.");
+        return;
+    }
+
+    // ---- the answers ----
+    ImGui::SeparatorText("fit  (response = sensitivity * level + offset)");
+    if (ImGui::BeginTable("linfit", 7, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        char sensHdr[64];
+        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", L.unit);
+        ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
+        ImGui::TableSetupColumn(sensHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("offset [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("R^2", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("LE max [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("K [DN/e-]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(L.readFromDark ? "read noise [DN]" : "read noise [DN] (extrap.)",
+                                ImGuiTableColumnFlags_WidthFixed, numColW() * 1.3f);
+        ImGui::TableHeadersRow();
+        for (int p = 0; p < L.nPl; p++) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(LIN_COLS[p]));
+            ImGui::TextUnformatted(L.nPl > 1 ? LIN_PLANES[p] : "all");
+            ImGui::PopStyleColor();
+            ImGui::TableNextColumn(); textNum("%.6g", L.slope[p]);
+            ImGui::TableNextColumn(); textNum("%.6g", L.offs[p]);
+            ImGui::TableNextColumn(); textNum("%.5f", L.r2[p]);
+            ImGui::TableNextColumn(); textNum("%.3f", L.leMax[p]);
+            ImGui::TableNextColumn(); textNum("%.5g", L.ptcK[p]);
+            ImGui::TableNextColumn();
+            if (L.readFromDark) textNum("%.4g", L.readDN[p]);
+            else {                        // an extrapolation is not a measurement
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+                textNum("%.4g", L.readDN[p]);
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Extrapolated from the photon transfer fit to the black\n"
+                                      "level, so it is a difference of two large numbers and\n"
+                                      "can be off by several DN.\n"
+                                      "Add a dark stack (level 0) to MEASURE it instead.");
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("%d points | K from photon transfer (sigma_t^2 vs mean); "
+                        "LE = worst deviation from the fit | read noise %s", L.nPts,
+                        L.readFromDark ? "measured in the level-0 stack"
+                                       : "extrapolated (no dark stack)");
+
+    // ---- plots: the response, and the part of it that is NOT linear ----
+    struct Pt { double x, y; int p; };
+    std::vector<Pt> pts;
+    double x0 = DBL_MAX, x1 = -DBL_MAX, y0 = DBL_MAX, y1 = -DBL_MAX, e1 = 0;
+    for (const auto& r : L.rows) {
+        if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+        for (int p = 0; p < r.nPl; p++) {
+            pts.push_back({ r.level, r.mean[p], p });
+            x0 = std::min(x0, r.level); x1 = std::max(x1, r.level);
+            y0 = std::min(y0, r.mean[p]); y1 = std::max(y1, r.mean[p]);
+            double fit = L.slope[p] * r.level + L.offs[p];
+            if (fabs(fit) > 1e-9)
+                e1 = std::max(e1, fabs((r.mean[p] - fit) / fit) * 100.0);
+        }
+    }
+    if (pts.empty()) return;
+    char xl[64];
+    snprintf(xl, sizeof xl, "level [%s]", L.unit);
+    float half = std::max((ImGui::GetContentRegionAvail().y - ImGui::GetFontSize() * 5) * 0.5f,
+                          70.0f * app.uiScale);
+    {
+        PlotRect pr = beginPlot(xl, "ROI mean [DN]", (float)x0, (float)x1,
+                                (float)y0, (float)y1, false, false, half);
+        if (pr.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(pr.p0, pr.p1, true);
+            for (int p = 0; p < L.nPl; p++) {   // the fit first, under the points
+                ImVec2 a = pr.at((float)x0, (float)(L.slope[p] * x0 + L.offs[p]));
+                ImVec2 b = pr.at((float)x1, (float)(L.slope[p] * x1 + L.offs[p]));
+                dl->AddLine(a, b, (LIN_COLS[p] & 0x00FFFFFF) | 0x60000000, 1.5f);
+            }
+            for (const auto& q : pts)
+                dl->AddCircleFilled(pr.at((float)q.x, (float)q.y), 3.5f, LIN_COLS[q.p]);
+            dl->PopClipRect();
+        }
+    }
+    {
+        float lim = (float)std::max(e1 * 1.2, 0.1);
+        PlotRect pr = beginPlot(xl, "deviation from fit [%]", (float)x0, (float)x1,
+                                -lim, lim, false, false, half);
+        if (pr.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(pr.p0, pr.p1, true);
+            ImVec2 z0 = pr.at((float)x0, 0), z1 = pr.at((float)x1, 0);
+            dl->AddLine(z0, z1, IM_COL32(140, 150, 160, 160));
+            for (const auto& q : pts) {
+                double fit = L.slope[q.p] * q.x + L.offs[q.p];
+                if (fabs(fit) < 1e-9) continue;
+                double res = (q.y - fit) / fit * 100.0;
+                dl->AddCircleFilled(pr.at((float)q.x, (float)res), 3.5f, LIN_COLS[q.p]);
+            }
+            dl->PopClipRect();
+        }
+    }
+}
+
 // Server-computed temporal stats: shown for a remote stack under a policy that
 // lets the server compute. The numbers come over the wire in seconds; they are
 // never quietly recomputed locally (that would change a displayed measurement,
@@ -6224,32 +6694,75 @@ static void drawPanelAnalysis() {
     }
 }
 
-// The connected server, browsable in place next to the local files - the point
-// of connecting first is that nobody has to know whether a path is absolute or
-// home-relative before they can look.
-static void drawRemoteTree() {
+// The connected server, in its own panel. It used to hang off the bottom of
+// Files, but the two do different jobs: Files lists what is already OPEN (and
+// closes it), this one BROWSES a machine and decides what to open next. Sharing
+// a window made both harder to read once a server had more than a few folders.
+static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
-    if (!B.connected) return;
-    ImGui::Separator();
     ImGui::PushID("remotetree");
-    std::string label = (B.host.empty() ? "local peer" : B.host) + "   [" + B.dir + "]";
-    bool open = ImGui::TreeNodeEx("##host", ImGuiTreeNodeFlags_DefaultOpen |
-                                            ImGuiTreeNodeFlags_SpanAvailWidth,
-                                  "%s", label.c_str());
+    if (!B.connected) {
+        if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
+        if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
+        if (!B.err.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(B.err.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            if (ImGui::SmallButton("details / copy")) app.showRemoteError = true;
+        }
+        ImGui::TextDisabled("Connect to a machine, then pick the file here.");
+        ImGui::PopID();
+        return;
+    }
+    // Where we are, and how to leave: host row first, path row under it.
+    ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
     ImGui::SameLine();
-    if (ImGui::SmallButton("x")) { B = App::RemoteBrowse{}; ImGui::TreePop(); ImGui::PopID(); return; }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("disconnect this server");
-    if (open) {
-        if (!B.err.empty())
-            ImGui::TextColored(ImVec4(1, 0.55f, 0.4f, 1), "%s", B.err.c_str());
+    if (ImGui::SmallButton("disconnect")) { B = App::RemoteBrowse{}; ImGui::PopID(); return; }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("home")) remoteBrowseTo("~");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("%s", B.dir.c_str());
+    ImGui::PopTextWrapPos();
+    if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+    if (!B.err.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(B.err.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("copy##rberr")) {
+            ImGui::SetClipboardText(B.err.c_str());
+            toast("copied");
+        }
+    }
+    int nNpy = 0;
+    for (const auto& e : B.entries) if (!e.dir && isNpyName(e.name)) nNpy++;
+    if (nNpy >= 2) {
+        char lb[80];
+        snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
+        if (ImGui::Button(lb)) {
+            std::vector<std::string> files;
+            for (const auto& e : B.entries)
+                if (!e.dir && isNpyName(e.name))
+                    files.push_back(B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name);
+            sortFramesNumerically(files);
+            openRemoteStack(B.host, files);
+        }
+    }
+    ImGui::Separator();
+    // The listing scrolls on its own so the header above never leaves the view.
+    if (ImGui::BeginChild("entries", ImVec2(0, 0), ImGuiChildFlags_None)) {
         if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
             std::string d = B.dir;
             size_t s = d.find_last_of('/');
             remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
                                                             : d.substr(0, s));
         }
-        int nNpy = 0;
-        for (const auto& e : B.entries) if (!e.dir && isNpyName(e.name)) nNpy++;
         for (const auto& e : B.entries) {
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
             bool servable = e.dir || isNpyName(e.name);
@@ -6270,20 +6783,8 @@ static void drawRemoteTree() {
                                                          : e.size / 1048576.0);
             }
         }
-        if (nNpy >= 2) {
-            char lb[80];
-            snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
-            if (ImGui::Button(lb)) {
-                std::vector<std::string> files;
-                for (const auto& e : B.entries)
-                    if (!e.dir && isNpyName(e.name))
-                        files.push_back(B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name);
-                sortFramesNumerically(files);
-                openRemoteStack(B.host, files);
-            }
-        }
-        ImGui::TreePop();
     }
+    ImGui::EndChild();
     ImGui::PopID();
 }
 
@@ -6438,7 +6939,6 @@ static void drawFileList() {
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
     }
-    drawRemoteTree();
 }
 
 static void drawSequenceModal() {
@@ -6485,6 +6985,14 @@ static void drawMenuBar(GLFWwindow* win) {
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
         if (ImGui::MenuItem("Start Remote (ssh)...")) app.remoteDlgOpen = true;
+        // Where the muscle memory goes looking. Connected: raise the browser.
+        // Not connected: there is nothing to browse yet, so ask for the host -
+        // the same two steps either way, just entered from the familiar place.
+        if (ImGui::MenuItem("Open File (Remote)...")) {
+            app.showRemote = true;
+            app.focusRemote = true;
+            if (!app.rbrowse.connected) app.remoteDlgOpen = true;
+        }
         if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
             App::RbJob j; j.kind = App::RbUpdatePeer;
             j.host = app.rbrowse.host; j.port = app.rbrowse.port;
@@ -6637,12 +7145,15 @@ static void drawMenuBar(GLFWwindow* win) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
+            ImGui::MenuItem("Remote", nullptr, &app.showRemote);
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
             ImGui::MenuItem("Temporal", nullptr, &app.showTemporal);
             ImGui::MenuItem("Projection (H/V)", nullptr, &app.showProjection);
+            ImGui::MenuItem("Linearity", nullptr, &app.showLinearity);
+            if (ImGui::MenuItem("Messages", nullptr, &app.showMessages)) app.msgUnreadErr = false;
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) {
                 app.showFiles = app.showInspector = app.showRois = true;
@@ -6790,23 +7301,45 @@ static void drawRemoteErrorWindow() {
                             ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Remote connection details", &app.showRemoteError)) {
         const App::RemoteBrowse& B = app.rbrowse;
-        ImGui::Text("host: %s", B.host.empty() ? "(none)" : B.host.c_str());
+        std::string all = "host: " + (B.host.empty() ? std::string("(none)") : B.host) + "\n";
+        if (!B.err.empty()) all += B.err + "\n";
+        if (!g_bootstrapLog.empty()) all += "\ninstall log:\n" + g_bootstrapLog;
         if (ImGui::Button("copy to clipboard")) {
-            std::string all = "host: " + B.host + "\n" + B.err + "\n" + g_bootstrapLog;
             ImGui::SetClipboardText(all.c_str());
             toast("copied");
         }
+        ImGui::SameLine();
+        ImGui::TextDisabled("or select any part of it below and press %s+C", SC_MOD);
         ImGui::Separator();
-        ImGui::PushTextWrapPos(0.0f);
-        if (!B.err.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.5f, 1), "%s", B.err.c_str());
-        if (!g_bootstrapLog.empty()) {
-            ImGui::Separator();
-            ImGui::TextDisabled("install log:");
-            ImGui::TextUnformatted(g_bootstrapLog.c_str());
-        }
-        ImGui::PopTextWrapPos();
+        // selectable, because this text exists to be pasted somewhere else
+        ImGui::InputTextMultiline("##rberrtext", all.data(), all.size() + 1,
+                                  ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
     }
     ImGui::End();
+}
+
+// Everything the app has said, as text you can select with the mouse and copy
+// with Ctrl+C. ImGui's Text() is painted, not selectable - so a read-only
+// InputTextMultiline is what makes an error message quotable.
+static void drawMessagesPanel() {
+    static std::string flat;          // rebuilt only when the log changes
+    static size_t builtFrom = (size_t)-1;
+    if (builtFrom != app.msgLog.size()) {
+        builtFrom = app.msgLog.size();
+        flat.clear();
+        for (const auto& m : app.msgLog) {
+            flat += m.err ? "[error] " : "        ";
+            flat += m.text;
+            flat += "\n";
+        }
+    }
+    if (ImGui::Button("copy all")) { ImGui::SetClipboardText(flat.c_str()); toast("copied"); }
+    ImGui::SameLine();
+    if (ImGui::Button("clear")) { app.msgLog.clear(); builtFrom = (size_t)-1; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("select any part and press %s+C", SC_MOD);
+    ImGui::InputTextMultiline("##msgs", flat.data(), flat.size() + 1,
+                              ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
 }
 
 static void drawHelpAbout() {
@@ -6866,6 +7399,8 @@ static void drawHelpAbout() {
 }
 
 // ---------------------------------------------------------------- CLI
+static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
+
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
@@ -6882,6 +7417,7 @@ static void printUsage() {
         "  --big-endian                raw byte order (default little endian)\n"
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
+        "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
         "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
         "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
@@ -6890,6 +7426,7 @@ static void printUsage() {
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
+        "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -6968,6 +7505,14 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--sequence expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test") {
             next();                                // consumed in main(), not an error
+        } else if (a == "--cfa") {                 // none | bayer | quad
+            std::string v = next();
+            app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
+                         : v == "none" ? 0 : -1;
+            if (app.forceCfa < 0) fprintf(stderr, "--cfa expects none|bayer|quad\n");
+            app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
+        } else if (a == "--lin-selftest") {
+            g_linSelftest = true;                  // handled in main() after loading
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -7439,6 +7984,36 @@ int main(int argc, char** argv) {
 
     parseCli(argc, argv);
 
+    // Linearity, verifiable without a human: load everything, fit, print the
+    // numbers. A synthetic set with a known sensitivity and a known gain has to
+    // come back out of this, or the panel is showing decoration.
+    if (g_linSelftest) {
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 600.0) {       // wall clock: the loader is a thread
+            pumpSequenceAndQueue();
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        for (auto& si : app.seqs)
+            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
+        linRecompute();
+        const App::LinState& L = app.lin;
+        for (const auto& r : L.rows)
+            fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
+                            "mean=%.6g sigma_t=%.6g %s\n",
+                    r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
+                    r.valid ? "" : ("ERR:" + r.err).c_str());
+        for (int p = 0; p < L.nPl; p++)
+            fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
+                            "LEmax=%.4f K=%.6g read=%.5g\n",
+                    L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
+                    L.leMax[p], L.ptcK[p], L.readDN[p]);
+        fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
+                L.fitValid ? "ok" : "FAILED");
+        if (app.seqThread.joinable()) app.seqThread.join();
+        return L.fitValid ? 0 : 1;
+    }
+
     std::vector<double> benchMs;
     int benchLeft = benchFrames;
     if (benchFrames) {                 // exercise every panel, not just the defaults
@@ -7581,6 +8156,7 @@ int main(int argc, char** argv) {
             right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
             bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.28f, nullptr, &center);
             ImGui::DockBuilderDockWindow("Files", left);
+            ImGui::DockBuilderDockWindow("Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
@@ -7597,6 +8173,16 @@ int main(int argc, char** argv) {
         }
 
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
+        if (app.showRemote) {
+            if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
+            if (ImGui::Begin("Remote", &app.showRemote)) drawPanelRemote();
+            ImGui::End();
+        }
+        if (app.showMessages) {
+            ImGui::SetNextWindowSize(ImVec2(720 * uiScale, 300 * uiScale), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Messages", &app.showMessages)) drawMessagesPanel();
+            ImGui::End();
+        }
         if (ImGui::Begin("Image View", nullptr, ImGuiWindowFlags_NoScrollbar |
                                                 ImGuiWindowFlags_NoScrollWithMouse))
             drawCanvas(ImGui::GetContentRegionAvail());
@@ -7615,6 +8201,11 @@ int main(int argc, char** argv) {
         }
         if (app.showProjection) {
             if (ImGui::Begin("Projection", &app.showProjection)) drawPanelProjection();
+            ImGui::End();
+        }
+        if (app.showLinearity) {
+            ImGui::SetNextWindowSize(ImVec2(760 * uiScale, 520 * uiScale), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Linearity", &app.showLinearity)) drawPanelLinearity();
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small
@@ -7762,6 +8353,22 @@ int main(int argc, char** argv) {
                                       "input = event -> the frame answering it.\n"
                                       "Click to reset the maximum.");
                 if (ImGui::IsItemClicked()) app.inputLagMaxMs = 0;
+            }
+            // A toast fades; the place to go read it afterwards has to be visible,
+            // or "what did that error say?" has no answer.
+            if (!app.msgLog.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("   |");
+                ImGui::SameLine();
+                if (app.msgUnreadErr) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.5f, 0.4f, 1));
+                if (ImGui::SmallButton(app.msgUnreadErr ? "messages (!)" : "messages")) {
+                    app.showMessages = true;
+                    app.msgUnreadErr = false;
+                }
+                if (app.msgUnreadErr) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s\n\n(everything the app has said, copyable)",
+                                      app.msgLog.back().text.c_str());
             }
             static std::string lastTitle;
             std::string title = im ? im->name + " - viewer" : "viewer v0.1";
