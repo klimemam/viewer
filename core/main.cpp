@@ -745,14 +745,22 @@ struct App {
     // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
     // calling it N times in the parse loop cancelled every load but the last:
     // a 3-stack session came back with 7 of its 15 frames.
-    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
+    // `name` is the user-given stack name from the session's seqname line.
+    // seqload only QUEUES the rescan, so when seqname is parsed the SeqInfo
+    // does not exist yet and the reader's `cur()->seqId != 0` guard dropped the
+    // rename with no message - the stack came back under its folder-derived
+    // pattern. It travels with the restore entry and is applied when the stack
+    // is actually created.
+    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern;
+                        std::string name; };
     std::vector<SeqRestore> seqRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the
-    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because seqname is
-    // dropped on restore for exactly this reason (cur()->seqId is still 0 when
-    // the line is parsed; verified in loadSession).
+    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because a name is
+    // renameable and not unique (two folders can hold the same stack name, and
+    // the user may change it between save and load), while a path is what the
+    // image lines themselves already round-trip.
     struct SeriesRestore {
         std::string name, batchName, paramName, unit;
         int kind = 0;
@@ -3342,11 +3350,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // session with no block as zero series. Nothing else in the format moves.
     //
     // Members travel by the PATH OF THEIR FIRST FRAME. A stack NAME would be
-    // the obvious choice and is the wrong one: seqname is written but silently
-    // dropped on restore for folder stacks (when the line is parsed the stack
-    // does not exist yet - the frames arrive from a queued rescan), so half the
-    // members would resolve to nothing. A path is what the session already
-    // proves it can round-trip: it is how the image lines themselves work.
+    // the obvious choice and is the wrong one: names are renameable and not
+    // unique, so two members could resolve to one stack or to none. A path is
+    // what the session already proves it can round-trip: it is how the image
+    // lines themselves work. (seqname itself DOES survive now - it rides on
+    // the queued App::SeqRestore entry - but that does not make it a key.)
     int lostSeries = 0, lostMembers = 0;
     for (const auto& S : app.series) {
         std::string bn = batchNameOf(S.batchId);
@@ -3701,8 +3709,17 @@ static std::string loadSession(const std::string& path) {
         }
         else if (key == "seqname") {    // user-given stack name (may contain spaces)
             std::string nm = restOfLine(ls);
-            if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
+            if (nm.empty() || !lastImageOk || !cur()) continue;
+            if (cur()->seqId != 0) {
                 if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
+            } else {
+                // a FOLDER stack: seqload queued a rescan and the SeqInfo will
+                // not exist for many frames. Attach the name to that queued
+                // entry instead of dropping it (which is what used to happen,
+                // silently, for every renamed folder stack).
+                for (auto it = app.seqRestore.rbegin(); it != app.seqRestore.rend(); ++it)
+                    if (it->uid == cur()->uid) { it->name = nm; break; }
+            }
         }
         // MIGRATION of the old per-stack level. saveSession has never written
         // this key (verified over the whole history: no commit ever emitted
@@ -3770,7 +3787,7 @@ static std::string loadSession(const std::string& path) {
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
                 // queued, not started: see App::seqRestore
                 if (files.size() >= 2)
-                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat });
+                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat, {} });
             }
         }
         else if (key == "ann") {
@@ -4493,6 +4510,10 @@ static void pumpSequenceAndQueue() {
         for (int i = 0; i < (int)app.images.size(); i++)
             if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
                 startSequenceLoad(i, r.files, r.pattern);
+                // the session's seqname, applied now that the stack exists
+                if (!r.name.empty() && app.images[i]->seqId != 0)
+                    if (App::SeqInfo* si2 = seqInfo(app.images[i]->seqId))
+                        si2->name = r.name;
                 break;
             }
         return;                 // let it start before chaining anything else
@@ -15572,16 +15593,19 @@ int main(int argc, char** argv) {
             check("the excluded member came back excluded",
                   R && R->members.size() > 3 && !R->members[3].include);
             check("invariant 1: audit after restore", audit());
-            // Why members are keyed by PATH and not by stack name: the name of a
-            // FOLDER stack does not survive at all. seqname is written, but when
-            // it is parsed the stack does not exist yet (the frames come from a
-            // queued rescan), so the line lands on nothing.
+            // Members are keyed by PATH and not by stack name because a NAME is
+            // renameable and not unique - two folders can hold the same stack
+            // name, and the user may change it between save and load. (The
+            // older reason, "seqname does not survive at all for a folder
+            // stack", was a BUG and is fixed: it now travels on the queued
+            // App::SeqRestore entry and is applied when the rescan creates the
+            // stack. terminology.md says stack renames are session-saved.)
             bool nameSurvived = false;
             for (const auto& si : app.seqs) if (si.name == RENAMED) nameSurvived = true;
             fprintf(stderr, "seriesselftest: the renamed stack's name after restore: %s\n",
-                    nameSurvived ? "SURVIVED" : "lost (folder stack: seqname lands on nothing)");
-            check("stack names do NOT survive for folder stacks (hence path keys)",
-                  !nameSurvived);
+                    nameSurvived ? "survived" : "LOST");
+            check("a folder stack's user-given name survives the session",
+                  nameSurvived);
         }
         // everything below works on what came back: the reload minted new ids
         if (app.series.empty() || app.images.empty() || app.series.front().members.size() < 4) {
@@ -16837,6 +16861,44 @@ int main(int argc, char** argv) {
             check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
                   "V10 the mosaic is part of the cache key");
             closeAll();
+        }
+
+        {   // ---- V15: a folder stack's user-given name survives a session ---
+            // The save side deliberately writes seqname AFTER seqload, but
+            // seqload only QUEUES the rescan, so at parse time cur()->seqId is
+            // still 0 and the reader dropped the rename with no message: the
+            // stack came back under its folder-derived pattern. terminology.md
+            // says stack renames are session-saved.
+            reload();
+            int sid = app.seqs.front().id;
+            std::string given = "25C dark";
+            seqInfo(sid)->name = given;                    // F2 rename
+            std::error_code vec2;
+            std::string sess2 = (std::filesystem::temp_directory_path(vec2) /
+                                 "viewer_seqname.vsession").u8string();
+            saveSession(sess2, true);
+            std::string lerr2 = loadSession(sess2);
+            loadAll();
+            double tn = glfwGetTime();
+            while (glfwGetTime() - tn < 60.0 &&
+                   (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            loadAll();
+            int found = 0;
+            std::string names;
+            for (const auto& si : app.seqs) {
+                if (si.name == given) found++;
+                if (names.size() < 120) names += (names.empty() ? "" : ", ") + si.name;
+            }
+            fprintf(stderr, "verifyselftest: V15 renamed a folder stack '%s', saved and "
+                            "reloaded: %d stack(s) [%s]%s\n",
+                    given.c_str(), (int)app.seqs.size(), names.c_str(),
+                    lerr2.empty() ? "" : (" load err: " + lerr2).c_str());
+            check(lerr2.empty() && found == 1,
+                  "V15 seqname survives the restore of a folder stack");
+            std::filesystem::remove(std::filesystem::u8path(sess2), vec2);
         }
 
         {   // ---- V14: the memory budget counts what is COMMITTED ------------
