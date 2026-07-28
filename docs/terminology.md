@@ -9,7 +9,7 @@
 |---|---|---|---|
 | **frame** | 画素の入った1枚。測定の最小単位 | `ImageDoc` | ファイル名（変更不可） |
 | **stack** | 同一条件で撮られた frame の並び。**時間軸**を持つので σ_t/FPN 分離・per-frame 表が意味を持つ | `SeqInfo` (`ImageDoc::seqId`) | 初期値=フォルダ/パターン、**リネーム可** |
-| **series (系列)** | **条件を1つ振った** stack / frame の並び。**パラメータ軸**を持つのでフィット・カーブが意味を持つ | `App::Series` (`SeqInfo::seriesId`) | 人間が付ける（例「25℃ 照度掃引」）、**リネーム可** |
+| **series (系列)** | **条件を1つ振った** stack / frame の並び。**パラメータ軸**を持つのでフィット・カーブが意味を持つ | `App::Series` (`Series::members` が唯一の真実) | 人間が付ける（例「25℃ 照度掃引」）、**リネーム可** |
 | **batch (塊)** | 開いたものを人間が管理するための入れ物。**構造の主張を一切しない** | `App::Batch` (`ImageDoc::batchId`) | 初期値=フォルダ名、**リネーム可** |
 
 包含関係は frame ⊂ stack ⊂ series ⊂ batch。**厳密**で、例外を作らない
@@ -56,7 +56,7 @@ Yes なら series、No なら batch。
 
 | 操作 | frame | stack | series | batch |
 |---|---|---|---|---|
-| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | 含む stack / frame を破棄（series 自体は空になれば消える） | 含む stack / frame をすべて破棄 |
+| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 含む stack / frame をすべて破棄 |
 | **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
 | **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — | 同 = everything（全体で共有） |
 | **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） | — （条件混在は平均に意味がない） |
@@ -93,6 +93,12 @@ Yes なら series、No なら batch。
 - **series は自動で作らない**（フォルダ構造から推測すると外れたときに黙って嘘の
   掃引ができる）。picker の「照度掃引として開く」か、Files で stack を選んで
   「Group as series」か、リニアリティパネルで作る。
+- 1つの stack は**高々1つ**の series に属する。
+- メンバの stack を単独で別 batch へ移すと、その stack は series から**外れる**
+  （禁止はしない。外れたことを画面で告げる）。
+- **単位の既定は未設定（空）**。単位を仮定しない — 空のままでは fit できない、
+  が正しい振る舞い。既定 `lx` は新規作成ダイアログのプリフィルに格下げ。
+- series の既定名は「<batch名> 掃引」（人が付けるまでの初期値）。
 - **series は1つの batch の中に収まる。** またぐ必要が出たら、メンバを同じ
   batch へ移してから series を作る（柵の付け替えであって、複製ではない）。
 - **batch 名は一意**。セッションは batch を名前で復元するため、衝突には ` (2)` を付す。
