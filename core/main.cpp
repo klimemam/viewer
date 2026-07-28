@@ -8823,34 +8823,6 @@ static void drawPanelRemote() {
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
     }
-    // Frame stepping for the previewed sequence, right here in the browser: a
-    // group row previews frame 0, and this walks the rest without opening the
-    // stack (one frame of transfer per step). Only shown while a preview from a
-    // group row is alive.
-    if (app.previewFiles.size() >= 2) {
-        int n = (int)app.previewFiles.size();
-        ImGui::PushID("pvstep");
-        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
-        ImGui::SameLine();
-        int slider = app.previewIndex;
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
-        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
-            stepPreviewFrame(slider - app.previewIndex);
-        ImGui::SameLine();
-        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
-                              app.previewLabel.c_str());
-        // , and . while the browser has focus: the same keys the image view uses
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            !ImGui::IsAnyItemActive()) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
-        }
-        ImGui::PopID();
-    }
     // filtered view of B.entries, by index (the clipper needs random access)
     std::vector<int> shown;
     shown.reserve(B.entries.size());
@@ -8977,9 +8949,14 @@ static void drawPanelRemote() {
     static std::string rbPropsPath;
     static bool rbPropsOpen = false;
     enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+    // footer space for the preview scrub bar: RESERVED even when no preview is
+    // alive, so starting one never shifts the rows under the cursor (a bar
+    // that appeared above the list moved every row mid-double-click)
+    float rbFootH = ImGui::GetFrameHeightWithSpacing();
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                                       ImGuiTableFlags_SortTristate)) {
+                                       ImGuiTableFlags_SortTristate,
+                                       ImVec2(0, -rbFootH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
@@ -9182,6 +9159,32 @@ static void drawPanelRemote() {
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    // Preview scrub bar lives BELOW the listing, in space reserved above:
+    // appearing must never move the rows (double-click depends on it).
+    if (app.previewFiles.size() >= 2) {
+        int n = (int)app.previewFiles.size();
+        ImGui::PushID("pvstep");
+        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
+        ImGui::SameLine();
+        int slider = app.previewIndex;
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
+            stepPreviewFrame(slider - app.previewIndex);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
+                              app.previewLabel.c_str());
+        // , and . while the browser has focus: the same keys the image view uses
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            !ImGui::IsAnyItemActive()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+        }
+        ImGui::PopID();
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
     if (ImGui::BeginPopup("Remote properties")) {
