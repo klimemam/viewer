@@ -4,10 +4,10 @@
 「画像と同じ並びで横に並べる」の**両方**を入れるための仕様。
 
 ## 1. キャッシュ — 2 スロット化
-- `App::HistState hist[2]` / `ProjState proj[2]` / `TemporalState temporal[2]`。0=A、1=B。
-  **struct 自体は変えない**(最小差分)。`recomputeHistogramIfNeeded(ImageDoc*)` →
-  `(ImageDoc*, HistState&)`、projection も同様、`recomputeTemporalIfNeeded()` →
-  `(const ImageDoc*, TemporalState&)`。中身は `app.hist` 参照を引数に置換するだけ。
+- `App::HistState hist[2]` / `ProjState proj[2]` / `TemporalState temporal[2]`。0=A、1=B。**struct
+  自体は変えない**(最小差分)。`recomputeHistogramIfNeeded(ImageDoc*)` → `(ImageDoc*, HistState&)`、
+  projection も同様、`recomputeTemporalIfNeeded()` → `(const ImageDoc*, TemporalState&)`。
+  中身は `app.hist` 参照を引数に置換するだけ。
 - 参照は少ない: main.cpp 1057/1543/6204/6799(hist)、1058/6879/6998(proj)、
   1059/1449/1545/3376/4212/7801(temporal)。`forgetImage`/`closeAll` は**両スロット**を潰す。
 - **slot 1 は `cmpB() != nullptr` のときだけ埋める**。compare off の 1 フレーム目で
@@ -25,9 +25,9 @@
 
 ## 2. 重ねる (overlay) の描き分け
 色相は CFA plane に割当済(`CFA_COLS`/`RGB_COLS`)なので **B に別色相は使えない**。
-- **A は現行のまま**。**B は同色相・同線幅・破線**、塗りなし。alpha を落とすと暗い plane が
-  消えるので据え置き、区別は破線と塗りの有無で付ける。L2 に `addDashedPolyline()` を追加
-  (ImDrawList に破線がない)。
+- **A は現行のまま**。**B は同色相・同線幅・破線**、塗りなし。alpha を落とすと暗い plane が消える
+  ので据え置き、区別は破線と塗りの有無で付ける。L2 に `addDashedPolyline()` を追加(ImDrawList
+  に破線がない)。
 - **凡例**: `beginPlot` 直後に `drawABLegend(pr, aName, bName)` —— 実線見本 + `A: <name>`、
   破線見本 + `B: <name>`(テキストだけの凡例にしない)。
 - **Histogram**: A は塗り、B は**階段状アウトラインのみ**を上に重ねる。`nSeries >= 3`
@@ -36,8 +36,7 @@
   実用にするには事実上必須)。y 軸は compare 中のみ **sampled px に対する割合 [%] に正規化**
   (`H.sampled` が A/B で違えば bar 高は比較不能)。軸ラベルに明記しフッタに実 px 数を残す。
   `bins` は触らない = A の数値は不変。
-- **Projection**: B は破線。デシメーションの min-max バーは **A だけ**(破線のバーは判読不能)。
-  compare 中は y レンジを A∪B で共有。
+- **Projection**: B は破線、min-max バーは **A だけ**、y レンジは A∪B で共有。
 
 ## 3. 横並び (Side by Side) — 画像の並びを写す
 - 設定は**グローバルに 1 つ**: `app.abStatsLayout` = `Auto / Overlay / Side by side`。置き場所は
@@ -48,9 +47,8 @@
   → **重ね**。どちらのモードでも明示選択で他方に切り替えられる(両方残す)。
 - **横並びは常に 50/50**、`splitFrac` に追従しない。形を比べるには両者のプロット幅が同一で
   ある必要があるため。写すのは**順序と向き(A が左)**であって分割比ではない。
-- **左が必ず A**。各半分の上に見出し帯 `A  <name>` / `B  <name>`(plane 色と衝突しない中立色)。
-  x/y 軸レンジは強制的に同一。パネル幅が `320 * uiScale` 未満なら重ねに退避し
-  `幅不足のため重ね表示` と明記(黙って崩れた 2 枚を出さない)。
+- **左が必ず A**。各半分の上に見出し帯 `A  <name>` / `B  <name>`(中立色)、x/y 軸レンジは強制的に
+  同一。パネル幅が `320 * uiScale` 未満なら重ねに退避し `幅不足のため重ね表示` と明記する。
 
 ## 4. 数値表 — 横並びは「列の対」
 - **Temporal**: 行 = 量、列 = `A | B | Δ (A−B) | Δ [%]`。符号は画像側の `A-B` に合わせる。
@@ -59,23 +57,23 @@
   常駐フレーム数の差は頻出なので列見出しに `A (n=12/12)` `B (n=8/300)` を併記。B が stack で
   なければ B 列は `—(stack ではない)`、Δ は空。`app.srvTemporal` は **B 側を自動発火しない**
   (remote job が倍になる)。`Measure B` ボタンで明示実行し同じ 4 列表に流す。
-- **ROI stats 表**: 行 = ROI、列 = 量なので A/B を列対にできない。**1 ROI = 2 行**
-  (A 行 / B 行、B 行はインデント+行頭 `B`)。Δ 行は既定オフのトグル(行数 3 倍)。annotation は
-  全画像共有なので、B のサイズが違えば矩形を clamp し `(clipped)` を付す。
+- **ROI stats 表**: 行 = ROI、列 = 量なので A/B を列対にできない。**1 ROI = 2 行**(A 行 / B 行、
+  B 行はインデント+行頭 `B`)。Δ 行は既定オフのトグル(行数 3 倍)。annotation は全画像共有なので
+  B のサイズが違えば矩形を clamp し `(clipped)` を付す。
 - **Analysis グリッドは A のみのまま**。列軸が既に ROI で埋まり、実行コストが実測で存在し
-  (`ana.runMs`、e-SFR は重い)、provenance が run 単位に紐づくため。代わりに `Run on B` を追加し
-  押されたときだけ `B: <name>` 列群と **B 専用 provenance 行**を足す。`anaAuto` では走らせない。
+  (`ana.runMs`、e-SFR は重い)、provenance が run 単位に紐づくため。代わりに `Run on B` を追加し、
+  押されたときだけ `B: <name>` 列群と **B 専用 provenance 行**を足す(`anaAuto` では走らせない)。
 
 ## 5. やってはいけないこと / 不一致時の退避
-- **A と B を平均・合成した系列を作らない**(差は Δ 列と Diff モードだけの仕事)。
-  **B の数値を「B」と書かずに出さない**(凡例・見出し帯・列見出しのいずれかが必ず言う)。
-  **B のキャッシュが A を無効化しない**(別オブジェクトで構造的に保証、潰すのは slot 1 のみ)。
+- **A と B を平均・合成した系列を作らない**(差は Δ 列と Diff モードの仕事)。**B の数値を「B」と
+  書かずに出さない**(凡例・見出し帯・列見出しのどれかが必ず言う)。**B のキャッシュが A を
+  無効化しない**(別オブジェクトで構造的に保証、潰すのは slot 1 のみ)。
 - **サイズ違い**: histogram は A の black/white を bin 軸に固定して B を投げ込む(画素数差は
   正規化 y で吸収済み)。projection は**長さか原点が違えば重ねない** —— 自動で横並びに落とし
   `profile 長が違う (A=1600, B=1200) ため重ねない` と表示。**伸縮して合わせるのは禁止**。
-- **dtype 違い**: 軸ラベルに両 dtype を書き `dtype 不一致` を明示、Δ は注記付きで出す。
-  **CFA 違い**: 系列は**名前で対応付ける**(R↔R)。片側だけの系列は片側だけ描いて印を付け、
-  `ch0` を `R` に対応させない(canon: plane は混ぜない)。ch 数が違えば Δ 列は出さない。
+- **dtype 違い**: 軸ラベルに両 dtype を書き `dtype 不一致` を明示、Δ は注記付きで出す。**CFA
+  違い**: 系列は**名前で対応付ける**(R↔R)。片側だけの系列は片側だけ描いて印を付け、`ch0` を
+  `R` に対応させない(canon: plane は混ぜない)。ch 数が違えば Δ 列は出さない。
 
 ## 6. 検証
 `--abstats-selftest <dir>`(既存 `--verify-selftest` と同じ `check()` 形式、GUI なし):
@@ -87,24 +85,23 @@
 (5) サイズ違いの B で projection が「重ね不可」フラグを立て、ch 数違いで Δ 列が出ない。
 (6) `CmpOff` で slot 1 が無効化され、B を close 後 slot 1 の `img` が dangling でない。
 
-GUI(パネル×モードで各 1 枚): Histogram 重ね = 塗り(A)+破線階段(B)+凡例に 2 ファイル名 +
-y 軸が `% of sampled px`。Histogram 横並び = 左 `A <name>` 帯 / 右 `B <name>` 帯、x 軸目盛り同一。
+GUI(パネル×モードで各 1 枚): Histogram 重ね = 塗り(A)+破線階段(B)+凡例に 2 ファイル名 + y 軸が
+`% of sampled px`。Histogram 横並び = 左 `A <name>` 帯 / 右 `B <name>` 帯、x 軸目盛り同一。
 Projection 重ね = 破線が A の実線に沿い min-max バーは A のみ。Temporal = 4 列表、全ヘッダに
-`[DN]`、Δ の符号が A−B。ROI = 各 ROI が 2 行で B 行に `B`。
+`[DN]` で Δ の符号が A−B。ROI = 各 ROI が 2 行で B 行に `B`。
 
-**再測定**: (a) follow-frame ステップの draw 時間(bench にフレーム送りが必要)、
-(b) ROI 表の `1.35 ms/frame @ 400 ROI` は行数 2 倍で測り直し、(c) CFA 4 系列 × 2 side の描画。
+**再測定**: (a) follow-frame ステップの draw 時間(bench にフレーム送りが必要)、(b) ROI 表の
+`1.35 ms/frame @ 400 ROI` は行数 2 倍で測り直し、(c) CFA 4 系列 × 2 side の描画。
 
 ## 7. フェーズ
 - **P0 基盤** — キャッシュ `[2]` 化、recompute の引数化、`forgetImage`/`closeAll` の両スロット、
   `app.abStatsLayout`、`drawABLegend`、`addDashedPolyline`。UI 無変化、bench 不変を確認。
-- **P1 Histogram** — 重ね、正規化 y、plane セレクタ、横並び。一番安く(≤1M サンプル)一番
-  見られるパネルなので最初。
+- **P1 Histogram** — 重ね、正規化 y、plane セレクタ、横並び。一番安く一番見られるので最初。
 - **P2 Projection** — 重ねの判読性、y レンジ共有、長さ不一致の退避、横並び。
 - **P3 Temporal** — `A|B|Δ|Δ%` 表、B が stack でない場合、server temporal は手動。
 - **P4 ROI 表** — 1 ROI = 2 行、clamp 表示、Δ 行トグル。描画コスト再測定。
 - **P5 Analysis** — `Run on B` のみ(自動実行なし)、B 専用 provenance。
-- 各フェーズ末で `--abstats-selftest` に該当 check を追加。
+  各フェーズ末で `--abstats-selftest` に該当 check を追加する。
 
 **リスク**: (1) follow-frame の二重再計算 —— P0 の測定次第で throttle 追加。
 (2) CFA 4 系列 × 2 = 8 系列は重ねでは読めず、plane セレクタ(新 UI)が事実上の前提。

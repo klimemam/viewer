@@ -9410,6 +9410,14 @@ static void drawFileList() {
             // a standalone frame hangs off the batch directly, so it gets the
             // move menu itself (stacks move via seqctx below)
             if (ImGui::BeginPopupContextItem("imgctx")) {
+                // by IDENTITY, not by name: the B-image menu lists names, and
+                // two batches full of frame_001.npy made it a coin toss
+                if (ImGui::MenuItem("Set as compare B", nullptr, false,
+                                    app.images[i].get() != cur())) {
+                    setCompareB(app.images[i].get());
+                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+                }
+                ImGui::Separator();
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
                 ImGui::EndPopup();
@@ -9448,6 +9456,19 @@ static void drawFileList() {
                 si->name = renameBuf;
                 app.lin.rev++;            // linearity rows show stack names
                 ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            {   // by identity, not name - same reason as the frame row's item.
+                // B = the frame this stack is showing; with "B follows A's
+                // frame number" on, it tracks A from there anyway.
+                ImageDoc* bpick = app.images[stack.front()].get();
+                if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
+                    app.images[si->lastImageIdx]->seqId == si->id)
+                    bpick = app.images[si->lastImageIdx].get();
+                if (ImGui::MenuItem("Set as compare B", nullptr, false, bpick != cur())) {
+                    setCompareB(bpick);
+                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+                }
             }
             ImGui::Separator();
             {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
