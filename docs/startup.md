@@ -218,8 +218,11 @@ stack も batch も右クリック(stack は F2 でも)でリネームでき、�
   同名スタックだらけでも取り違えません)。選ばれている行には青い **B** が付きます
 - 両方 stack なら **A を送ると B も同じフレーム番号に追従**します(`Compare A/B > B follows A's frame number`)
 - **表示レンジの関係**は 3 通り(Inspector か Compare メニュー):
-  `each keeps its own` / `B uses A's range` / **`auto over both (union)`**。
-  露出が違うもの同士は union にすると**どちらも飽和せず**に比べられます
+  `each keeps its own` / `B uses A's range` / **`auto over both (union)`(既定)**。
+  露出が違うもの同士は union にすると**どちらも飽和せず**に比べられます。
+  既定が union なのは、`B uses A's range` だと露出違いの B が飽和して
+  (実測 `>white 99.69%`)ヒストグラムが右端の 1 本になってしまうためです
+  (union では同じデータで `0.02%`)。一度選んだ設定は `cmprange` として保存されます
 
 ## 現在の制限(実装中)
 

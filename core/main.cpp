@@ -264,7 +264,15 @@ struct App {
     //   2 union auto - both sides re-fit to min/max ACROSS A and B at the
     //                  current frame pair, so neither clips and neither is
     //                  favoured. This is "auto, but the same auto for both".
-    int compareRangeMode = 1;
+    // The DEFAULT is 2. It used to be 1, and on two stacks captured at
+    // different levels that renders B at >white 99.69%: B's whole histogram
+    // collapses into one dashed line against the right edge of the plot, and
+    // its half of a side-by-side pair is empty. A mode whose purpose is "see B
+    // against A's reference" is not doing that when B saturates. The union
+    // shows both distributions on identical bins, and clipping drops to 0.02%
+    // on the same data. The cmprange pref persists a CHOSEN value, so only the
+    // out-of-the-box one moves.
+    int compareRangeMode = 2;
     // A/B statistics panels: how the two sides are laid out. ONE global setting,
     // not one per panel - "the same arrangement as the image" is a property of
     // the comparison, not of the histogram, and per-panel state would multiply
@@ -3007,7 +3015,8 @@ static std::string loadSession(const std::string& path) {
         else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
         else if (key == "cmprange") { ls >> app.compareRangeMode; }
-        // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own"
+        // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own".
+        // NOT onto the new default - it records a choice somebody actually made.
         else if (key == "cmpshare") { int on = 1; ls >> on; app.compareRangeMode = on ? 1 : 0; }
         else if (key == "abstats") { ls >> app.abStatsLayout >> app.histPlane;
                                      app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
@@ -7008,11 +7017,18 @@ static void drawInspector() {
                     b->texDirty = true; im->texDirty = true;
                 }
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("B is displayed with A's black/white while comparing.\n"
-                                      "Display only - B keeps its own numbers and gets them\n"
-                                      "back when compare ends.\n"
-                                      "Turn it off to let each side keep its own stretch\n"
-                                      "(comparing SHAPES at very different exposures).");
+                    ImGui::SetTooltip(
+                        "How the two sides are STRETCHED while comparing. Display only -\n"
+                        "both keep their own numbers and get them back when compare ends.\n"
+                        "  auto over both (union), the default: both re-fit to min/max\n"
+                        "    across A and B, so neither side clips and neither is\n"
+                        "    favoured. Two stacks at different exposures need this - B\n"
+                        "    against A's range alone saturates into a single bin.\n"
+                        "  B uses A's range: one range, A's, and it does not move while\n"
+                        "    you step A. Right when B really is measured against A.\n"
+                        "  each keeps its own: comparing SHAPES at wildly different\n"
+                        "    exposures - the one case where the two are not directly\n"
+                        "    comparable, and it says so.");
                 if (app.compareRangeMode == 0 &&
                     (b->black != im->black || b->white != im->white)) {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
@@ -11561,6 +11577,7 @@ static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats c
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
 // left, right, enter, home, end, back, flat, tree.
+static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
@@ -12425,6 +12442,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-step")) benchStep = true;
     app.exePath = argv[0];
+    // the out-of-the-box A/B range mode, read before anything can override it:
+    // --range-selftest checks it, and prefs on the machine running the test
+    // would otherwise decide what "the default" is
+    g_abRangeDefault = app.compareRangeMode;
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
@@ -14147,6 +14168,16 @@ int main(int argc, char** argv) {
                     la.c_str(), lb.c_str(), cur()->name.c_str(), cmpB()->name.c_str(),
                     la != lb ? "DISTINCT" : "AMBIGUOUS");
             if (la == lb) bad++;
+        }
+        {   // The out-of-the-box display-range mode. "B uses A's range" renders
+            // a B captured at another level at >white 99.7% - one dashed line
+            // jammed against the right edge, and an empty half in side by side.
+            // Union bins both sides identically and clips neither.
+            fprintf(stderr, "rangeselftest: default compareRangeMode at startup = %d (%s)%s\n",
+                    g_abRangeDefault,
+                    g_abRangeDefault >= 0 && g_abRangeDefault < 3 ? SHARE[g_abRangeDefault] : "?",
+                    g_abRangeDefault == 2 ? "" : "  <- EXPECTED 2 (union-auto)");
+            if (g_abRangeDefault != 2) bad++;
         }
         for (int m = 0; m < 3; m++) {
             app.rangeScope = m == 0 ? 0 : 1;
