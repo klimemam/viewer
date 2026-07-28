@@ -816,6 +816,8 @@ struct App {
         // plane-mixed answer back.
         int cfa = -1, cfaPattern = -1;
         int nPl = 1;                              // 4 when the frame is mosaiced
+        uint64_t nonFinite = 0;                   // samples EXCLUDED, and said so
+        size_t dropped = 0;                       // samples with < 2 valid frames
         std::vector<float> idx, frameMean, frameStd;
         double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {};
         bool valid = false;
@@ -5461,7 +5463,12 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
                 }
     }
     if (offs.empty()) return;
+    // per-SAMPLE valid counts, as computeStackStats and serve.cpp keep them:
+    // a NaN is excluded from its pixel's population, never folded into the
+    // divisor (which would understate the noise and look plausible doing it)
     std::vector<double> sum(offs.size(), 0), sum2(offs.size(), 0);
+    std::vector<uint32_t> cnt(offs.size(), 0);
+    uint64_t nonFinite = 0;
     int used = 0;
     for (int fi : f) {
         const ImageDoc& fr = *app.images[fi];
@@ -5470,8 +5477,8 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         size_t n = 0;
         for (size_t k = 0; k < offs.size(); k++) {
             float v = fr.data[offs[k]];
-            if (!std::isfinite(v)) continue;
-            sum[k] += v; sum2[k] += (double)v * v;
+            if (!std::isfinite(v)) { nonFinite++; continue; }
+            sum[k] += v; sum2[k] += (double)v * v; cnt[k]++;
             s += v; s2 += (double)v * v; n++;
         }
         if (!n) continue;
@@ -5490,12 +5497,16 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     size_t plc[4] = {};
     for (size_t k = 0; k < offs.size(); k++) {
         int p = plane[k];
-        double m = sum[k] / used;
-        double v = sum2[k] / used - m * m;
+        double n = (double)cnt[k];
+        if (n < 2) continue;                    // not enough valid frames here
+        double m = sum[k] / n;
+        double v = sum2[k] / n - m * m;
         tvarSum[p] += v > 0 ? v : 0;
         pmSum[p] += m; pmSum2[p] += m * m;
         plc[p]++;
     }
+    T.nonFinite = nonFinite;
+    T.dropped = offs.size() - (plc[0] + plc[1] + plc[2] + plc[3]);
     for (int p = 0; p < T.nPl; p++) {
         if (!plc[p]) continue;
         double n = (double)plc[p];
@@ -9105,6 +9116,8 @@ struct StackStats {
     bool valid = false;
     int frames = 0, nPl = 1;
     double mean[4] = {}, sigmaT[4] = {};
+    uint64_t nonFinite = 0;       // samples EXCLUDED, reported not hidden
+    size_t dropped = 0;           // pixels with fewer than 2 valid frames
     std::string err;
 };
 
@@ -9130,19 +9143,27 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
     rh = rh <= 0 ? H - ry : std::min(rh, H - ry);
     size_t samples = (size_t)rw * rh * C;
     if (samples > (size_t)32 << 20) { out.err = "ROI too large (max 32M samples)"; return out; }
+    // Per-sample valid counts. A NaN must be EXCLUDED, not folded in: skipping
+    // it in the accumulator while keeping N as the divisor pulls the mean
+    // toward 0 by (N-k)/N and corrupts the variance in the same direction -
+    // understated noise that looks perfectly plausible. serve.cpp has done it
+    // this way since it was written ("Silent optimism is the worst failure");
+    // this is the same arithmetic, so the two sides now agree in VALUE and in
+    // what they state.
     std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+    std::vector<uint32_t> cnt(samples, 0);
     for (const ImageDoc* d : use)
         for (int y = 0; y < rh; y++) {
             const float* row = &d->data[((size_t)(ry + y) * W + rx) * C];
             double* s1 = &sum[(size_t)y * rw * C];
             double* s2 = &sum2[(size_t)y * rw * C];
+            uint32_t* cn = &cnt[(size_t)y * rw * C];
             for (size_t i = 0; i < (size_t)rw * C; i++) {
                 double v = row[i];
-                if (!std::isfinite(v)) continue;   // counted as N anyway: rare
-                s1[i] += v; s2[i] += v * v;
+                if (!std::isfinite(v)) { out.nonFinite++; continue; }
+                s1[i] += v; s2[i] += v * v; cn[i]++;
             }
         }
-    const double N = (double)use.size();
     out.nPl = first->cfa ? 4 : 1;
     double plM[4] = {}, plV[4] = {};
     size_t plC[4] = {};
@@ -9151,8 +9172,10 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
             int p = first->cfa ? cfaChannelAt(*first, rx + x, ry + y) : 0;
             for (int c = 0; c < C; c++) {
                 size_t i = ((size_t)y * rw + x) * C + c;
-                double m = sum[i] / N;
-                double var = std::max(0.0, sum2[i] / N - m * m) * (N / (N - 1.0));
+                double nI = (double)cnt[i];
+                if (nI < 2) { out.dropped++; continue; }   // no variance to speak of
+                double m = sum[i] / nI;
+                double var = std::max(0.0, sum2[i] / nI - m * m) * (nI / (nI - 1.0));
                 plM[p] += m; plV[p] += var; plC[p]++;
             }
         }
@@ -10491,6 +10514,14 @@ static void drawPanelTemporal() {
                 row("total (quadrature)", T.totalNoise);
                 ImGui::EndTable();
             }
+            // the same row the server emits: excluded, and how many. A silent
+            // exclusion is only half of not folding them in.
+            if (T.nonFinite || T.dropped)
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                   "non-finite samples (excluded) = %llu"
+                                   "%s%zu sample(s) had < 2 valid frames",
+                                   (unsigned long long)T.nonFinite,
+                                   T.dropped ? ";  " : "", T.dropped);
             // per-frame mean over time
             float mn = FLT_MAX, mx = -FLT_MAX;
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
@@ -16676,6 +16707,52 @@ int main(int argc, char** argv) {
                     app.temporal[0].nPl, pooled);
             check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
                   "V10 the mosaic is part of the cache key");
+            closeAll();
+        }
+
+        {   // ---- V13: a non-finite sample is EXCLUDED, not folded into N ---
+            // The fixture is exact: a perfectly constant 100 DN stack of four
+            // frames with ONE pixel NaN in two of them. The truth is sigma_t =
+            // 0 and sigma_fpn = 0 - that pixel simply has two valid frames.
+            // Skipping the NaN in the accumulator while keeping N = 4 as the
+            // divisor makes that pixel read 50 DN with a variance of 2500, and
+            // pooling gives sigma_t = sigma_fpn = 1.5625 DN out of nowhere.
+            closeAll();
+            const int W = 32, H = 32, NF = 4;
+            App::SeqInfo si;
+            si.id = app.nextSeqId++;
+            si.name = "nan fixture";
+            si.expectedFrames = NF;
+            app.seqs.push_back(si);
+            for (int f = 0; f < NF; f++) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "nan_" + std::to_string(f) + ".npy";
+                d->w = W; d->h = H; d->ch = 1;
+                d->dtype = "f32";
+                d->data.assign((size_t)W * H, 100.0f);
+                if (f < 2) d->data[0] = std::numeric_limits<float>::quiet_NaN();
+                d->uid = app.nextUid++;
+                d->seqId = si.id;
+                d->seqIndex = f;
+                app.images.push_back(std::move(d));
+            }
+            app.current = 0;
+            app.selectedAnn = 0;
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            const App::TemporalState& T = app.temporal[0];
+            StackStats st = computeStackStats(si.id, 0, 0, W, H);
+            fprintf(stderr, "verifyselftest: V13 constant-100 stack with 1 pixel NaN in "
+                            "2 of 4 frames: local temporal sigma_t=%.6g sigma_fpn=%.6g "
+                            "(excluded %llu); computeStackStats mean=%.6g sigma_t=%.6g "
+                            "(excluded %llu, dropped %zu)\n",
+                    T.tempNoise[0], T.fixedPattern[0], (unsigned long long)T.nonFinite,
+                    st.mean[0], st.sigmaT[0], (unsigned long long)st.nonFinite, st.dropped);
+            check(T.valid && T.nonFinite == 2 && fabs(T.tempNoise[0]) < 1e-9 &&
+                  fabs(T.fixedPattern[0]) < 1e-9,
+                  "V13 the Temporal panel excludes NaN instead of folding it in");
+            check(st.valid && st.nonFinite == 2 && st.dropped == 0 &&
+                  fabs(st.mean[0] - 100.0) < 1e-9 && fabs(st.sigmaT[0]) < 1e-9,
+                  "V13 computeStackStats agrees, and reports what it excluded");
             closeAll();
         }
 
