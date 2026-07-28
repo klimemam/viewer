@@ -69,6 +69,7 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
+                      core/window_frame.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # third-party: do not police its warnings. MINIZ_NO_STDIO drops the archive
 # file-I/O layer we never use (only the in-memory codec is called), which also
@@ -135,7 +136,23 @@ else()
   target_compile_options(viewer-serve PRIVATE -Wall -Wextra)
 endif()
 if(WIN32)
-  target_link_libraries(viewer PRIVATE comdlg32 ole32 shell32)
+  # dwmapi: the integrated window frame asks DWM for the drop shadow and the
+  # Windows 11 rounded corners a borderless window would otherwise lose
+  target_link_libraries(viewer PRIVATE comdlg32 ole32 shell32 dwmapi)
+endif()
+# The integrated frame hands the drag and the resize back to the window manager
+# through _NET_WM_MOVERESIZE, which needs the X11 handle GLFW is holding. A
+# Wayland-only GLFW has no such handle (and Wayland has no such protocol for
+# clients), so the frame stays a system frame there.
+if(UNIX AND NOT APPLE AND GLFW_BUILD_X11)
+  find_package(X11)                 # GLFW links it privately; this needs XSendEvent
+  if(X11_FOUND)
+    target_compile_definitions(viewer PRIVATE VIEWER_X11)
+    target_link_libraries(viewer PRIVATE X11::X11)
+  else()
+    message(STATUS "no X11 development files: the integrated window frame will "
+                   "fall back to moving the window by hand")
+  endif()
 endif()
 if(MSVC)
   target_compile_options(viewer PRIVATE /W3 /utf-8)

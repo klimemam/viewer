@@ -26,6 +26,7 @@
 #include "remote.h"
 #include "remote_proto.h"
 #include "app_icon.h"
+#include "window_frame.h"
 
 #include <algorithm>
 #include <map>
@@ -606,6 +607,9 @@ struct App {
     bool lowBandwidth = false;        // remote/ssh: draw the minimum, not a tail
     bool showFps = false;
     bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
+    // window frame: 1 = the title bar lives in our menu bar (see window_frame.h),
+    // 0 = the desktop draws one above us. Persisted; --frame overrides for one run.
+    int frameMode = 1;
 };
 static const ImU32 ANN_COLORS[8] = {
     IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
@@ -2461,6 +2465,7 @@ static void savePrefs() {
     f << "linunit " << app.lin.unit << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+    f << "frame " << app.frameMode << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -2495,6 +2500,8 @@ static void loadPrefs() {
                                          app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
+        else if (key == "frame")       { ls >> app.frameMode;
+                                         app.frameMode = std::clamp(app.frameMode, 0, 1); }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
             std::string s;
@@ -8841,6 +8848,121 @@ static void drawSequenceModal() {
   #define SC_MOD "Ctrl"
 #endif
 
+// Is what we are looking at somewhere else? The session being up counts, and so
+// does an image that came from one: a dropped connection does not make the
+// pixels local. Drives the icon variant and the "[host]" in the title.
+static bool viewingRemote() {
+    const ImageDoc* im = cur();
+    return app.rbrowse.connected || (im && !im->remoteUrl.empty());
+}
+
+// One title, three places: the OS title bar (when there is one), the taskbar
+// button, and the integrated title bar this app draws for itself.
+static std::string windowTitleText() {
+    const ImageDoc* im = cur();
+    std::string t = im ? im->name + " - viewer" : "viewer v0.1";
+    if (viewingRemote()) {
+        std::string host = app.rbrowse.host;
+        if (host.empty() && im && !im->remoteUrl.empty()) {
+            std::string rp;
+            remote::parseUrl(im->remoteUrl, host, rp);
+        }
+        t += "  [" + (host.empty() ? std::string("local peer") : host) + "]";
+    }
+    return t;
+}
+
+// The integrated title bar, drawn into the menu bar the app already has: the
+// window title in the middle, the three window buttons on the right, and
+// everything else registered as "drag here to move the window".
+//
+// Called from inside BeginMainMenuBar, after the last menu, so the menus'
+// right edge is simply where the cursor has got to.
+static void drawTitleBarExtras() {
+    if (window_frame::mode() != window_frame::Integrated) return;
+    const float s = app.uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 vpPos = ImGui::GetMainViewport()->Pos;   // screen -> window coords
+    const ImVec2 barPos = ImGui::GetWindowPos();
+    const ImVec2 barSize = ImGui::GetWindowSize();
+    const float menusEnd = ImGui::GetCursorScreenPos().x;
+    const float bw = std::floor(46 * s), bh = barSize.y;
+    const float btnX0 = barPos.x + barSize.x - bw * 3;
+
+    // everything but the menus and the buttons drags the window
+    window_frame::addCaption(barPos.x - vpPos.x, barPos.y - vpPos.y,
+                             barPos.x + barSize.x - vpPos.x, barPos.y + bh - vpPos.y);
+    window_frame::addExclusion(barPos.x - vpPos.x, barPos.y - vpPos.y,
+                               menusEnd - vpPos.x, barPos.y + bh - vpPos.y);
+    window_frame::addExclusion(btnX0 - vpPos.x, barPos.y - vpPos.y,
+                               barPos.x + barSize.x - vpPos.x, barPos.y + bh - vpPos.y);
+
+    // Title, centred in the bar but never under the menus or the buttons: it is
+    // the only place the file name appears once the system title bar is gone.
+    {
+        const std::string title = windowTitleText();
+        const ImVec2 ts = ImGui::CalcTextSize(title.c_str());
+        const float pad = 12 * s;
+        const float lo = menusEnd + pad, hi = btnX0 - pad;
+        if (hi - lo > 40 * s) {
+            float tx = barPos.x + (barSize.x - ts.x) * 0.5f;
+            tx = std::clamp(tx, lo, std::max(lo, hi - ts.x));
+            dl->PushClipRect(ImVec2(lo, barPos.y), ImVec2(hi, barPos.y + bh), true);
+            dl->AddText(ImVec2(tx, barPos.y + (bh - ts.y) * 0.5f),
+                        ImGui::GetColorU32(ImGuiCol_TextDisabled), title.c_str());
+            dl->PopClipRect();
+        }
+    }
+
+    // Minimize / maximize / close. Drawn rather than typed: a glyph font would
+    // have to be shipped and would still not match at every UI scale.
+    const bool isMax = window_frame::maximized();
+    const char* ids[3] = {"##wf_min", "##wf_max", "##wf_close"};
+    for (int i = 0; i < 3; i++) {
+        const ImVec2 p(btnX0 + bw * i, barPos.y);
+        ImGui::SetCursorScreenPos(p);
+        ImGui::InvisibleButton(ids[i], ImVec2(bw, bh));
+        const bool clicked = ImGui::IsItemClicked();
+        // On Windows the OS owns the maximize button (it opens Snap Layouts on
+        // hover), so its hover state has to come from there - no mouse message
+        // for that rectangle ever reaches us.
+        const bool hovered = ImGui::IsItemHovered() ||
+                             (i == 1 && window_frame::maximizeButtonHot());
+        if (hovered)
+            dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + bh),
+                              i == 2 ? IM_COL32(232, 72, 72, 255)
+                                     : ImGui::GetColorU32(ImGuiCol_HeaderHovered));
+        const ImU32 fg = ImGui::GetColorU32(i == 2 && hovered ? ImVec4(1, 1, 1, 1)
+                                                              : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+        const ImVec2 c(p.x + bw * 0.5f, p.y + bh * 0.5f);
+        const float g = std::floor(5 * s), th = std::max(1.0f, std::floor(s));
+        if (i == 0) {
+            dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), fg, th);
+        } else if (i == 1 && !isMax) {
+            dl->AddRect(ImVec2(c.x - g, c.y - g), ImVec2(c.x + g, c.y + g), fg, 0, 0, th);
+        } else if (i == 1) {                       // restore: the "behind" pane too
+            dl->AddRect(ImVec2(c.x - g, c.y - g + 2 * th), ImVec2(c.x + g - 2 * th, c.y + g),
+                        fg, 0, 0, th);
+            dl->AddLine(ImVec2(c.x - g + 2 * th, c.y - g), ImVec2(c.x + g, c.y - g), fg, th);
+            dl->AddLine(ImVec2(c.x + g, c.y - g), ImVec2(c.x + g, c.y + g - 2 * th), fg, th);
+        } else {
+            dl->AddLine(ImVec2(c.x - g, c.y - g), ImVec2(c.x + g, c.y + g), fg, th);
+            dl->AddLine(ImVec2(c.x + g, c.y - g), ImVec2(c.x - g, c.y + g), fg, th);
+        }
+        if (i == 1)
+            window_frame::setMaximizeButton(p.x - vpPos.x, p.y - vpPos.y,
+                                            p.x + bw - vpPos.x, p.y + bh - vpPos.y);
+        if (clicked) {
+            if (i == 0) window_frame::minimize();
+            else if (i == 1) window_frame::toggleMaximize();
+            else window_frame::requestClose();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", i == 0 ? "Minimize"
+                                           : i == 1 ? (isMax ? "Restore" : "Maximize") : "Close");
+    }
+}
+
 static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
@@ -9031,6 +9153,23 @@ static void drawMenuBar(GLFWwindow* win) {
                               "at ~32 ms of extra latency while dragging or scrolling\n"
                               "(0.4 ms otherwise). Locally, leave this off.");
         ImGui::MenuItem("Fit view when switching images", nullptr, &app.fitOnSwitch);
+        {   // the title bar: ours (in this menu bar) or the desktop's, above us
+            const bool can = window_frame::available();
+            bool integrated = app.frameMode != 0;
+            if (ImGui::MenuItem("Integrated title bar", nullptr, &integrated, can)) {
+                app.frameMode = integrated ? 1 : 0;
+                window_frame::setMode(integrated ? window_frame::Integrated
+                                                 : window_frame::System);
+                app.prefsDirty = true;
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(can ? "Menus, title and window buttons in one bar,\n"
+                                        "with no system title bar above the app.\n"
+                                        "(--frame system starts with the system one,\n"
+                                        "in case a window manager makes a mess of it.)"
+                                      : "Not available here: %s",
+                                  window_frame::unavailableReason());
+        }
         ImGui::Separator();
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
@@ -9158,6 +9297,7 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("About viewer")) app.showAbout = true;
         ImGui::EndMenu();
     }
+    drawTitleBarExtras();
     ImGui::EndMainMenuBar();
 }
 
@@ -9375,6 +9515,8 @@ static void printUsage() {
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
+        "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
+        "                              in the menu bar (default: last used)\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -9451,7 +9593,7 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
-        } else if (a == "--bench" || a == "--crash-test") {
+        } else if (a == "--bench" || a == "--crash-test" || a == "--frame") {
             next();                                // consumed in main(), not an error
         } else if (a == "--cfa") {                 // none | bayer | quad
             std::string v = next();
@@ -9998,6 +10140,9 @@ static void installWakeCallbacks(GLFWwindow* win) {
     // these two fire from inside the OS resize/move modal loop: draw right here,
     // or the window stays frozen for as long as the user holds the edge
     glfwSetWindowSizeCallback(win, [](GLFWwindow*, int, int) { wakeUi(4); redrawNow(); });
+    // ... and so does a move: with an integrated frame the OS runs the drag in
+    // its own modal loop, and without this the window content freezes mid-drag
+    glfwSetWindowPosCallback(win, [](GLFWwindow*, int, int) { wakeUi(2); redrawNow(); });
     glfwSetWindowRefreshCallback(win, [](GLFWwindow*) { wakeUi(2); redrawNow(); });
 }
 
@@ -10052,14 +10197,17 @@ int main(int argc, char** argv) {
     }
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
-    int benchFrames = 0, crashAfter = 0;
+    int benchFrames = 0, crashAfter = 0, cliFrame = -1;
     for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--bench")) benchFrames = std::max(1, atoi(argv[i + 1]));
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
+        // the window frame has to be decided before the window exists
+        if (!strcmp(argv[i], "--frame")) cliFrame = !strcmp(argv[i + 1], "system") ? 0 : 1;
     }
     app.exePath = argv[0];
     loadPrefs();       // before the theme is applied and before the CLI is parsed
+    if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -10083,6 +10231,12 @@ int main(int argc, char** argv) {
     GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
     applyWindowIcon(win, false);
+    // The frame comes up before the first frame is drawn, so the window never
+    // flashes a system title bar it is about to lose. --frame on the command
+    // line wins over the preference for this run and is not written back: it is
+    // the way out if a window manager makes a mess of the integrated one.
+    window_frame::init(win);
+    window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
     glfwMakeContextCurrent(win);
     glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
     installWakeCallbacks(win);        // before ImGui's backend: it chains to these
@@ -10467,6 +10621,9 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) fr = std::clamp(fr - 0.10f, 0.03f, 0.97f);
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) fr = std::clamp(fr + 0.10f, 0.03f, 0.97f);
         }
+        // the caption / exclusion rectangles are rebuilt every frame: menus grow
+        // and shrink with the plugins that are loaded
+        window_frame::beginFrame(uiScale);
         drawMenuBar(win);
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -10711,17 +10868,12 @@ int main(int argc, char** argv) {
             // Title bar and taskbar icon both carry "this window is looking at
             // another machine": the title for the window list and the tooltip,
             // the icon (green frame instead of blue) for the button itself.
-            // Either the session is up, or the image on screen came from one -
-            // a dropped connection does not make the pixels local.
-            const bool remoteNow = app.rbrowse.connected || (im && !im->remoteUrl.empty());
-            std::string rhost = app.rbrowse.host;
-            if (rhost.empty() && im && !im->remoteUrl.empty()) {
-                std::string rp;
-                remote::parseUrl(im->remoteUrl, rhost, rp);
-            }
+            // With an integrated frame there is no system title bar to read the
+            // title off - it is drawn in the menu bar instead - but it is still
+            // what the taskbar button and the window list show.
+            const bool remoteNow = viewingRemote();
             static std::string lastTitle;
-            std::string title = im ? im->name + " - viewer" : "viewer v0.1";
-            if (remoteNow) title += "  [" + (rhost.empty() ? std::string("local peer") : rhost) + "]";
+            std::string title = windowTitleText();
             if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
             static int lastIconVariant = -1;
             if ((int)remoteNow != lastIconVariant) {
@@ -10750,6 +10902,9 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+        // after every panel has had its say about the mouse: drag, resize and
+        // the cursor shape along the window edges
+        window_frame::endFrame();
         ImGui::Render();
         int dw, dh;
         glfwGetFramebufferSize(win, &dw, &dh);
