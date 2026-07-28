@@ -74,6 +74,10 @@ set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
                             COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>"
                             COMPILE_DEFINITIONS "MINIZ_NO_STDIO")
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
+# where the server pulls its own peer binary from (binaries branch)
+set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
+    "repository the remote peer bootstraps itself from")
+target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen

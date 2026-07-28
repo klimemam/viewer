@@ -311,10 +311,18 @@ struct App {
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
     // remote viewing: one peer process per host, reached over ssh
     std::unique_ptr<remote::Session> remoteSession;
-    std::string remoteExe = "viewer";  // how the peer is invoked on the far side
+    std::string remoteExe;            // empty = ~/.viewer/viewer-serve (self-installed)
     std::string exePath;              // argv[0], for the local:// test peer
-    bool remoteDlgOpen = false;       // File > Open Remote (ssh://)...
-    std::string lastRemoteUrl;        // last opened, prefilled next time (prefs)
+    bool remoteDlgOpen = false;       // File > Start Remote (ssh)...
+    std::string lastRemoteUrl;        // last host, prefilled next time (prefs)
+    // A connected server, browsable in the Files panel. Connect first, then look
+    // around - which is why nobody has to know the path shape up front.
+    struct RemoteBrowse {
+        bool connected = false;
+        std::string host, dir = "~", err;
+        int port = 0;
+        std::vector<remote::Entry> entries;
+    } rbrowse;
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
     // batch). local-fetch: never use the server for compute (today's behavior).
@@ -458,6 +466,19 @@ static const ImU32 ANN_COLORS[8] = {
     IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
 };
 static App app;
+
+// ---- remote viewing: declared here, defined further down ----
+static const char* REMOTE_HOME = "~/.viewer";
+static void openRemote(const std::string& url);
+static void openRemoteStack(const std::string& host, const std::vector<std::string>& files);
+static std::string makeRemoteUrl(const std::string& host, const std::string& path);
+static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
+static void remoteBrowseTo(const std::string& dir);
+static void startRemote(const std::string& hostSpec);
+static void updateRemotePeer();
+static void drawRemoteTree();
+static bool isNpyName(const std::string& n);
+static void sortFramesNumerically(std::vector<std::string>& files);
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
 
@@ -864,7 +885,9 @@ static void rfEnqueue(App::RFetchJob job) {
     // how the peer is invoked, frozen NOW: the UI thread edits remoteExe freely
     std::string host, rpath;
     remote::parseUrl(job.url, host, rpath);
-    job.exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath : app.remoteExe;
+    job.exe = app.remoteExe.empty() ? (host.empty() ? app.exePath
+                                                : std::string(REMOTE_HOME) + "/viewer-serve")
+                               : app.remoteExe;
     {
         // counters BEFORE the push, under the lock: the worker could finish job 1
         // while jobs 2..N are still being enqueued, and the pending==0 reset would
@@ -1001,8 +1024,9 @@ static void mWorker() {
         else {
             d.host = host;
             if (!ses.alive() || sesHost != host) {
-                std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
-                                                                              : app.remoteExe;
+                std::string exe = app.remoteExe.empty()
+                    ? (host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
+                    : app.remoteExe;
                 if (!ses.start(host, exe, err)) d.err = err;
                 else sesHost = host;
             }
@@ -1979,7 +2003,6 @@ static void restoreFull() {
 static void openRemote(const std::string& url);   // fwd: sessions can hold ssh:// images
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files);
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
-static bool ensureRemoteSession(const std::string& host, std::string& err);
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
@@ -3362,16 +3385,113 @@ static void openRawDialogFor(const std::string& path) {
 
 // ssh://user@host/path - the UI stays here, the pixels stay there. What arrives is
 // the region being looked at, at the resolution it is being looked at.
-static bool ensureRemoteSession(const std::string& host, std::string& err) {
+// Numeric frame order: frame_1, frame_10, frame_100, frame_2 must not become the
+// time axis. Shared by the browser and anything else that builds a stack.
+static void sortFramesNumerically(std::vector<std::string>& files) {
+    std::sort(files.begin(), files.end(), [](const std::string& a, const std::string& b) {
+        auto key = [](const std::string& s) {
+            size_t end = s.size();
+            size_t dot = s.rfind('.');
+            if (dot != std::string::npos) end = dot;
+            size_t i = end;
+            while (i > 0 && isdigit((unsigned char)s[i - 1])) i--;
+            long long v = i < end ? atoll(s.c_str() + i) : -1;
+            return std::make_pair(s.substr(0, i), v);
+        };
+        auto ka = key(a), kb = key(b);
+        return ka.first != kb.first ? ka.first < kb.first : ka.second < kb.second;
+    });
+}
+
+// Put the peer on the server without the user copying anything: check
+// ~/.viewer/viewer-serve, and if it is missing, have the SERVER pull the
+// prebuilt binary from the repository's binaries branch (it has git and network;
+// this machine may not even be the same OS). Everything lives under ~/.viewer,
+// so uninstalling is one rm -rf.
+static std::string g_bootstrapLog;
+
+static std::string bootstrapScript() {
+    // POSIX sh, delivered over stdin so no quoting layer can mangle it.
+    // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
+    return
+        "set -e\n"
+        "d=$HOME/.viewer\n"
+        "mkdir -p \"$d\"\n"
+        "if [ -x \"$d/viewer-serve\" ]; then echo VIEWER_SERVE_OK; exit 0; fi\n"
+        "if ! command -v git >/dev/null 2>&1; then\n"
+        "  echo 'no git on the server: copy viewer-serve to ~/.viewer/ manually'; exit 1\n"
+        "fi\n"
+        "if [ -d \"$d/bin/.git\" ]; then\n"
+        "  git -C \"$d/bin\" fetch --depth 1 origin binaries >/dev/null 2>&1\n"
+        "  git -C \"$d/bin\" reset --hard origin/binaries >/dev/null 2>&1\n"
+        "else\n"
+        "  git clone --depth 1 -b binaries " VIEWER_REPO_URL " \"$d/bin\" >/dev/null 2>&1\n"
+        "fi\n"
+        "u=$(uname -s)\n"
+        "case \"$u\" in\n"
+        "  Linux)  src=\"$d/bin/linux-x64\" ;;\n"
+        "  Darwin) src=\"$d/bin/macos-arm64\" ;;\n"
+        "  *)      echo \"unsupported server OS: $u\"; exit 1 ;;\n"
+        "esac\n"
+        "[ -f \"$src/viewer-serve\" ] || { echo 'binaries branch has no viewer-serve'; exit 1; }\n"
+        "cp \"$src/viewer-serve\" \"$d/viewer-serve\"\n"
+        "chmod +x \"$d/viewer-serve\"\n"
+        "rm -rf \"$d/plugins\"; [ -d \"$src/plugins\" ] && cp -r \"$src/plugins\" \"$d/plugins\"\n"
+        "echo VIEWER_SERVE_OK\n";
+}
+
+// Update an already-installed peer (menu action): same script, forced refresh.
+static std::string updateScript() {
+    std::string s = bootstrapScript();
+    size_t p = s.find("if [ -x \"$d/viewer-serve\" ]");
+    if (p != std::string::npos) s.erase(p, s.find('\n', p) + 1 - p);   // skip the early-out
+    return s;
+}
+
+static void updateRemotePeer() {
+    const App::RemoteBrowse& B = app.rbrowse;
+    if (!B.connected || B.host.empty()) return;
+    std::string out, err;
+    if (app.remoteSession) app.remoteSession->stop();     // release the running peer
+    if (!remote::runSshCommand(B.host, B.port, updateScript(), out, err)) {
+        toast("remote update: " + err, true);
+        return;
+    }
+    g_bootstrapLog = out;
+    toast(out.find("VIEWER_SERVE_OK") != std::string::npos
+              ? "remote peer updated on " + B.host
+              : "remote update failed: " + out, out.find("VIEWER_SERVE_OK") == std::string::npos);
+}
+
+static bool ensureRemoteSession(const std::string& host, std::string& err, int port) {
     if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
     if (app.remoteSession->alive() && app.remoteSession->host() == host) return true;
-    // the peer is the same binary: found on the remote PATH over ssh, or this
-    // very executable when testing through local:// (--remote-exe overrides both,
+    // the peer is the same binary: ~/.viewer/viewer-serve over ssh, or this very
+    // executable when testing through local:// (--remote-exe overrides both,
     // which is how the standalone viewer-serve peer gets exercised)
-    std::string exe = (host.empty() && app.remoteExe == "viewer") ? app.exePath
-                                                                  : app.remoteExe;
-    if (!app.remoteSession->start(host, exe, err)) return false;
-    toast("connected to " + (host.empty() ? std::string("local peer") : host));
+    std::string exe = (host.empty() && app.remoteExe.empty()) ? app.exePath
+                    : (app.remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
+                                             : app.remoteExe);
+    if (app.remoteSession->startOn(host, port, exe, err)) {
+        toast("connected to " + (host.empty() ? std::string("local peer") : host));
+        return true;
+    }
+    if (host.empty()) return false;                 // nothing to bootstrap locally
+    // Not there (or too old to answer): install it, then try once more. The user
+    // never copies a binary or types a path.
+    toast("installing the viewer peer on " + host + "...");
+    std::string out, berr;
+    if (!remote::runSshCommand(host, port, bootstrapScript(), out, berr)) {
+        err = berr.empty() ? err : berr;
+        return false;
+    }
+    g_bootstrapLog = out;
+    if (out.find("VIEWER_SERVE_OK") == std::string::npos) {
+        err = "could not install the peer on " + host + ":\n" + out;
+        return false;
+    }
+    if (!app.remoteSession->startOn(host, port, exe, err)) return false;
+    toast("installed and connected to " + host);
     return true;
 }
 
@@ -3412,6 +3532,52 @@ static void maybeRequestServerTemporal(int seqId) {
         j.url = si->remoteUrl;
     }
     mEnqueue(std::move(j));
+}
+
+// Browse one directory on the connected server.
+static void remoteBrowseTo(const std::string& dir) {
+    App::RemoteBrowse& B = app.rbrowse;
+    std::string err;
+    std::vector<remote::Entry> got;
+    if (!ensureRemoteSession(B.host, err, B.port) ||
+        !app.remoteSession->list(dir, got, err)) {
+        B.err = err;                  // keep the last good listing on screen
+        return;
+    }
+    B.err.clear();
+    B.entries = std::move(got);
+    B.dir = dir;
+}
+
+// File > Start Remote: connect (installing the peer if needed), then browse.
+static void startRemote(const std::string& hostSpec) {
+    std::string host = hostSpec, dir = "~";
+    int port = 0;
+    // accept a full url here too, so a pasted path still works
+    if (hostSpec.find("://") != std::string::npos || hostSpec.find(':') != std::string::npos) {
+        std::string h, p;
+        if (remote::parseUrl(hostSpec, h, p, &port)) { host = h; dir = p; }
+    }
+    while (host.size() > 1 && host.back() == '/') host.pop_back();
+    App::RemoteBrowse& B = app.rbrowse;
+    B = App::RemoteBrowse{};
+    B.host = host;
+    B.port = port;
+    std::string err;
+    if (!ensureRemoteSession(host, err, port)) {
+        toast("remote: " + err, true);
+        B.err = err;
+        return;
+    }
+    B.connected = true;
+    // a file path connects and opens it; a directory just browses
+    if (dir.size() > 4 && isNpyName(dir)) {
+        size_t s = dir.find_last_of('/');
+        remoteBrowseTo(s == std::string::npos ? "~" : dir.substr(0, s));
+        openRemote(makeRemoteUrl(host, dir));
+    } else {
+        remoteBrowseTo(dir);
+    }
 }
 
 static void openRemote(const std::string& url) {
@@ -5764,6 +5930,69 @@ static void drawPanelAnalysis() {
     }
 }
 
+// The connected server, browsable in place next to the local files - the point
+// of connecting first is that nobody has to know whether a path is absolute or
+// home-relative before they can look.
+static void drawRemoteTree() {
+    App::RemoteBrowse& B = app.rbrowse;
+    if (!B.connected) return;
+    ImGui::Separator();
+    ImGui::PushID("remotetree");
+    std::string label = (B.host.empty() ? "local peer" : B.host) + "   [" + B.dir + "]";
+    bool open = ImGui::TreeNodeEx("##host", ImGuiTreeNodeFlags_DefaultOpen |
+                                            ImGuiTreeNodeFlags_SpanAvailWidth,
+                                  "%s", label.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x")) { B = App::RemoteBrowse{}; ImGui::TreePop(); ImGui::PopID(); return; }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("disconnect this server");
+    if (open) {
+        if (!B.err.empty())
+            ImGui::TextColored(ImVec4(1, 0.55f, 0.4f, 1), "%s", B.err.c_str());
+        if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
+            std::string d = B.dir;
+            size_t s = d.find_last_of('/');
+            remoteBrowseTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                            : d.substr(0, s));
+        }
+        int nNpy = 0;
+        for (const auto& e : B.entries) if (!e.dir && isNpyName(e.name)) nNpy++;
+        for (const auto& e : B.entries) {
+            std::string lb = e.dir ? "[" + e.name + "]" : e.name;
+            bool servable = e.dir || isNpyName(e.name);
+            if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::Selectable(lb.c_str()) && servable) {
+                std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
+                if (e.dir) remoteBrowseTo(joined);
+                else       openRemote(makeRemoteUrl(B.host, joined));
+            }
+            if (!servable) {
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("only .npy is served remotely");
+            }
+            if (!e.dir && e.size) {
+                ImGui::SameLine();
+                ImGui::TextDisabled(e.size >= (1u << 30) ? "%.1f GB" : "%.1f MB",
+                                    e.size >= (1u << 30) ? e.size / 1073741824.0
+                                                         : e.size / 1048576.0);
+            }
+        }
+        if (nNpy >= 2) {
+            char lb[80];
+            snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
+            if (ImGui::Button(lb)) {
+                std::vector<std::string> files;
+                for (const auto& e : B.entries)
+                    if (!e.dir && isNpyName(e.name))
+                        files.push_back(B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name);
+                sortFramesNumerically(files);
+                openRemoteStack(B.host, files);
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
 static void drawFileList() {
     if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
@@ -5915,6 +6144,7 @@ static void drawFileList() {
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
     }
+    drawRemoteTree();
 }
 
 static void drawSequenceModal() {
@@ -5960,7 +6190,9 @@ static void drawMenuBar(GLFWwindow* win) {
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
-        if (ImGui::MenuItem("Open Remote (ssh://)...")) app.remoteDlgOpen = true;
+        if (ImGui::MenuItem("Start Remote (ssh)...")) app.remoteDlgOpen = true;
+        if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected))
+            updateRemotePeer();
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
         {   // recovery: the autosave is written on exit, on crash and every 60 s
             std::string ap = autosavePath();
@@ -6190,155 +6422,63 @@ static bool isNpyName(const std::string& n) {   // FRAME_001.NPY is still a .npy
     return ext == ".npy";
 }
 
+// File > Start Remote: ask for a host, not a path. Connecting first is what
+// removes the guesswork - once the session is up, the Files panel browses the
+// server and nobody has to know whether their data is under ~ or /data.
 static void drawRemoteOpenModal() {
-    if (app.remoteDlgOpen && !ImGui::IsPopupOpen("Open remote (ssh)")) {
-        ImGui::OpenPopup("Open remote (ssh)");
+    if (app.remoteDlgOpen && !ImGui::IsPopupOpen("Start remote (ssh)")) {
+        ImGui::OpenPopup("Start remote (ssh)");
         app.remoteDlgOpen = false;
     }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal("Open remote (ssh)", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal("Start remote (ssh)", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
-    static char url[512];
-    static char exe[256];
+    static char hostbuf[512];
+    static bool advanced = false;
+    static char exebuf[256];
     if (ImGui::IsWindowAppearing()) {
-        snprintf(url, sizeof url, "%s",
-                 app.lastRemoteUrl.empty() ? "ssh://user@host/path/to/file.npy"
-                                           : app.lastRemoteUrl.c_str());
-        snprintf(exe, sizeof exe, "%s", app.remoteExe.c_str());
+        snprintf(hostbuf, sizeof hostbuf, "%s",
+                 app.lastRemoteUrl.empty() ? "user@host" : app.lastRemoteUrl.c_str());
+        snprintf(exebuf, sizeof exebuf, "%s", app.remoteExe.c_str());
         ImGui::SetKeyboardFocusHere();
     }
-    static std::vector<remote::Entry> entries;
-    static std::string browseHost, browseDir, browseErr;
     ImGui::TextDisabled("The window stays here; only the pixels being looked at travel.");
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
-    bool go = ImGui::InputText("url", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
-    ImGui::InputText("peer on that machine", exe, sizeof exe);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26);
+    bool go = ImGui::InputText("host", hostbuf, sizeof hostbuf,
+                               ImGuiInputTextFlags_EnterReturnsTrue);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Path of viewer-serve (or viewer) on the remote machine.\n"
-                          "Public-key ssh authentication is required - there is no\n"
-                          "password prompt on this pipe.");
-
-    // Browsing THAT machine is the point - an OS dialog can only ever list this
-    // one. LIST is served by the same peer that serves the pixels.
-    auto listDir = [&](std::string dir) {
-        std::string host, p, err;
-        app.remoteExe = exe;                       // the connect may need it
-        // "C:" is not listable on a Windows-served peer; "C:/" is
-        if (dir.size() == 2 && dir[1] == ':') dir += '/';
-        if (!remote::parseUrl(makeRemoteUrl(browseHost, dir), host, p)) return;
-        std::vector<remote::Entry> got;
-        browseErr.clear();
-        if (!ensureRemoteSession(host, err) || !app.remoteSession->list(p, got, err)) {
-            browseErr = err;   // keep the last GOOD listing: a failed [..] must
-            return;            // not blank the pane and strand the user
-        }
-        entries = std::move(got);
-        browseDir = dir;
-    };
-    if (ImGui::Button("Browse")) {
-        std::string host, p;
-        if (remote::parseUrl(url, host, p)) {
-            browseHost = host;
-            // a file path browses its folder; a folder path browses itself
-            size_t dot = p.find_last_of('.');
-            size_t slash = p.find_last_of('/');
-            listDir(dot != std::string::npos && dot > slash && slash != std::string::npos
-                        ? p.substr(0, slash) : p);
-        } else {
-            browseErr = "enter ssh://user@host/some/path first";
-        }
+        ImGui::SetTooltip("user@host, or a Host alias from ~/.ssh/config.\n"
+                          "A full ssh://host/path or host:~/path works too.\n"
+                          "Public-key authentication is required - this pipe has\n"
+                          "no way to ask for a password.");
+    ImGui::TextDisabled("the peer installs itself into ~/.viewer on first connect");
+    if (ImGui::TreeNode("advanced")) {
+        advanced = true;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26);
+        ImGui::InputTextWithHint("peer path", "~/.viewer/viewer-serve (default)",
+                                 exebuf, sizeof exebuf);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Override where viewer-serve lives on that machine.\n"
+                              "Leave empty to use ~/.viewer/viewer-serve.");
+        ImGui::TreePop();
     }
-    if (!browseErr.empty())
-        ImGui::TextColored(ImVec4(1, 0.55f, 0.4f, 1), "%s", browseErr.c_str());
-    if (!browseDir.empty() && browseErr.empty()) {
-        ImGui::TextDisabled("%s", browseDir.c_str());
-        int nNpy = 0;
-        for (const auto& e : entries)
-            if (!e.dir && isNpyName(e.name)) nNpy++;
-        if (ImGui::BeginChild("rbrowse", ImVec2(ImGui::GetFontSize() * 32,
-                                                ImGui::GetFontSize() * 14), true)) {
-            if (browseDir != "/" && ImGui::Selectable("[..]")) {
-                size_t slash = browseDir.find_last_of('/');
-                listDir(slash == 0 || slash == std::string::npos ? "/" : browseDir.substr(0, slash));
-            }
-            for (const auto& e : entries) {
-                std::string label = (e.dir ? "[" + e.name + "]" : e.name);
-                if (ImGui::Selectable(label.c_str())) {
-                    std::string joined = browseDir == "/" ? "/" + e.name
-                                                          : browseDir + "/" + e.name;
-                    if (e.dir) listDir(joined);
-                    else snprintf(url, sizeof url, "%s",
-                                  makeRemoteUrl(browseHost, joined).c_str());
-                }
-                if (!e.dir && e.size) {
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("%.1f MB", e.size / 1048576.0);
-                }
-            }
-        }
-        ImGui::EndChild();
-        // a folder of numbered .npy files IS a stack: open it as one
-        if (nNpy >= 2) {
-            char lb[64];
-            snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
-            if (ImGui::Button(lb)) {
-                std::vector<std::string> files;
-                for (const auto& e : entries)
-                    if (!e.dir && isNpyName(e.name))
-                        files.push_back(browseDir == "/" ? "/" + e.name
-                                                         : browseDir + "/" + e.name);
-                // NUMERIC order, not lexicographic: frame_1, frame_10, frame_100,
-                // frame_2 ... would assign scrambled seqIndex, and every temporal
-                // statistic and frame axis would silently lie about time
-                std::sort(files.begin(), files.end(),
-                          [](const std::string& a, const std::string& b) {
-                              auto key = [](const std::string& s) {
-                                  // last run of digits before the extension
-                                  size_t end = s.rfind(".npy");
-                                  if (end == std::string::npos) end = s.size();
-                                  size_t i = end;
-                                  while (i > 0 && isdigit((unsigned char)s[i - 1])) i--;
-                                  long long v = i < end ? atoll(s.c_str() + i) : -1;
-                                  return std::make_pair(s.substr(0, i), v);
-                              };
-                              auto ka = key(a), kb = key(b);
-                              return ka.first != kb.first ? ka.first < kb.first
-                                                          : ka.second < kb.second;
-                          });
-                app.lastRemoteUrl = makeRemoteUrl(browseHost, files[0]);
-                app.prefsDirty = true;
-                savePrefs();
-                ImGui::CloseCurrentPopup();
-                openRemoteStack(browseHost, files);
-            }
-        }
+    if (!g_bootstrapLog.empty() && g_bootstrapLog.find("VIEWER_SERVE_OK") == std::string::npos) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30);
+        ImGui::TextColored(ImVec4(1, 0.55f, 0.4f, 1), "%s", g_bootstrapLog.c_str());
+        ImGui::PopTextWrapPos();
     }
     ImGui::Separator();
-    if (ImGui::Button("Open") || go) {
-        app.remoteExe = exe;
-        app.lastRemoteUrl = url;
+    if (ImGui::Button("Connect") || go) {
+        if (advanced) app.remoteExe = exebuf;
+        app.lastRemoteUrl = hostbuf;
         app.prefsDirty = true;
         savePrefs();
-        // "Open" on a folder means "show me what's there", not an error: you
-        // rarely know the exact filename before you have looked at the folder
-        std::string h2, p2;
-        bool looksDir = remote::parseUrl(url, h2, p2) &&
-                        (p2.empty() || p2.back() == '/' ||
-                         p2.find_last_of('.') == std::string::npos ||
-                         p2.find_last_of('.') < p2.find_last_of('/'));
-        if (looksDir) {
-            browseHost = h2;
-            while (p2.size() > 1 && p2.back() == '/') p2.pop_back();
-            listDir(p2.empty() ? "/" : p2);       // stay in the dialog and browse
-        } else {
-            ImGui::CloseCurrentPopup();
-            openRemote(url);          // errors arrive as toasts
-        }
+        ImGui::CloseCurrentPopup();
+        startRemote(hostbuf);         // errors arrive as toasts and in the panel
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
 

@@ -55,8 +55,9 @@ class Session {
 public:
     ~Session();
     // host empty -> run `exe --serve` locally (testing); otherwise
-    // `ssh <host> <exe> --serve`.
+    // `ssh [-p port] <host> <exe> --serve`.
     bool start(const std::string& host, const std::string& exe, std::string& err);
+    bool startOn(const std::string& host, int port, const std::string& exe, std::string& err);
     bool alive() const { return alive_; }
     void stop();
 
@@ -71,6 +72,7 @@ public:
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
 
     const std::string& host() const { return host_; }
+    int port() const { return port_; }
     uint64_t bytesReceived() const { return rx_; }
     int peerVersion() const { return peerVersion_; }   // from HELLO; gates MEASURE
 
@@ -82,10 +84,23 @@ private:
     bool alive_ = false;
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
+    int port_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles
 };
 
-// "ssh://user@host/path/to/file" -> host="user@host", path="/path/to/file".
-bool parseUrl(const std::string& url, std::string& host, std::string& path);
+// Run one shell command on the host (or locally when host is empty) and collect
+// its combined output. The script travels over stdin, so no quoting layer can
+// mangle it. Success = exit-style sentinel handled by the caller's script.
+bool runSshCommand(const std::string& host, int port, const std::string& script,
+                   std::string& output, std::string& err);
+
+// Accepted forms, in order of standards-conformance:
+//   ssh://user@host[:port]/abs/path   RFC 3986: after the colon comes a PORT,
+//                                     and the path is always absolute
+//   ssh://user@host[:port]/~/rel      git's extension for a home-relative path
+//   user@host:~/rel , user@host:/abs  scp/rsync convention (what fingers type)
+//   local://path                      run the peer here; testing
+// port is 0 when unspecified.
+bool parseUrl(const std::string& url, std::string& host, std::string& path, int* port = nullptr);
 
 }  // namespace remote

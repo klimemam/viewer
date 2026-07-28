@@ -170,6 +170,56 @@ static void pipeClose(Pipe& p) {
 #endif
 }
 
+static void closeWriteEnd(Pipe& p) {
+#if defined(_WIN32)
+    if (p.inW) { CloseHandle(p.inW); p.inW = nullptr; }
+#else
+    if (p.inW >= 0) { close(p.inW); p.inW = -1; }
+#endif
+}
+
+// One shell command on the host, script over stdin (immune to every quoting
+// layer between here and the remote sh), combined output back. This is how the
+// peer gets bootstrapped into ~/.viewer without the user copying anything.
+bool runSshCommand(const std::string& host, int port, const std::string& script,
+                   std::string& output, std::string& err) {
+    Pipe p;
+    std::vector<std::string> argv;
+    if (host.empty()) {
+#if defined(_WIN32)
+        err = "no local shell bootstrap on Windows";   // local:// needs no deploy
+        return false;
+#else
+        argv = { "sh" };
+#endif
+    } else {
+        argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10" };
+        if (port > 0) { argv.push_back("-p"); argv.push_back(std::to_string(port)); }
+        argv.push_back(host);
+        argv.push_back("sh");
+    }
+    if (!spawn(p, argv, err)) return false;
+    std::string body = script + "\n";
+    bool wroteOk = pipeWrite(p, body.data(), body.size());
+    closeWriteEnd(p);                     // EOF: sh runs what it has
+    output.clear();
+    char buf[4096];
+    for (;;) {
+#if defined(_WIN32)
+        DWORD got = 0;
+        if (!ReadFile(p.outR, buf, sizeof buf, &got, nullptr) || !got) break;
+#else
+        ssize_t got = read(p.outR, buf, sizeof buf);
+        if (got <= 0) break;
+#endif
+        output.append(buf, (size_t)got);
+        if (output.size() > (1u << 20)) break;   // no script needs a MB of output
+    }
+    pipeClose(p);
+    if (!wroteOk) { err = "could not reach the host"; return false; }
+    return true;
+}
+
 // ---------------------------------------------------------------- payload codec
 struct W {
     std::vector<uint8_t> b;
@@ -195,6 +245,15 @@ struct R {
     bool blob(void* p, size_t n) { if (rd + n > b.size()) return false; memcpy(p, b.data() + rd, n); rd += n; return true; }
 };
 
+// The peer's working directory is the login home (that is where ssh starts an
+// exec command), so "~" becomes "." and "~/x" becomes "x" - the server never
+// sees a literal tilde, which std::filesystem would treat as a real name.
+static std::string serverPath(const std::string& p) {
+    if (p == "~" || p == "~/") return ".";
+    if (p.compare(0, 2, "~/") == 0) return p.substr(2);
+    return p;
+}
+
 // ---------------------------------------------------------------- session
 Session::~Session() { stop(); }
 
@@ -204,8 +263,13 @@ void Session::stop() {
 }
 
 bool Session::start(const std::string& host, const std::string& exe, std::string& err) {
+    return startOn(host, 0, exe, err);
+}
+
+bool Session::startOn(const std::string& host, int port, const std::string& exe, std::string& err) {
     stop();
     host_ = host;
+    port_ = port;
     Pipe* p = new Pipe();
     impl_ = p;
     std::vector<std::string> argv;
@@ -216,8 +280,11 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
         // terminal. ConnectTimeout/ServerAlive: a black-holed route or a dead
         // sshd must become an error in seconds, not a UI frozen forever.
         argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                 host, exe, "--serve" };
+                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3" };
+        if (port > 0) { argv.push_back("-p"); argv.push_back(std::to_string(port)); }
+        argv.push_back(host);
+        argv.push_back(exe);
+        argv.push_back("--serve");
     }
     if (!spawn(*p, argv, err)) { stop(); return false; }
     alive_ = true;
@@ -276,7 +343,7 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
 }
 
 bool Session::list(const std::string& path, std::vector<Entry>& out, std::string& err) {
-    W w; w.str(path);
+    W w; w.str(serverPath(path));
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_LIST, w.b, err) || !recv(type, reply, err)) return false;
@@ -298,7 +365,7 @@ bool Session::list(const std::string& path, std::vector<Entry>& out, std::string
 }
 
 bool Session::meta(const std::string& path, Meta& out, std::string& err) {
-    W w; w.str(path);
+    W w; w.str(serverPath(path));
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -333,7 +400,7 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
                    std::string& err) {
     W wr;
-    wr.str(path);
+    wr.str(serverPath(path));
     rp::TileReq q{};
     q.frame = (uint32_t)std::max(0, frame);
     q.x = (uint32_t)std::max(0, x); q.y = (uint32_t)std::max(0, y);
@@ -392,7 +459,7 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     head.nPaths = (uint32_t)q.paths.size();
     head.nRois = (uint32_t)q.rois.size();
     w.blob(&head, sizeof head);
-    for (const auto& p : q.paths) w.str(p);
+    for (const auto& p : q.paths) w.str(serverPath(p));
     w.str(q.analyzer);
     w.str(q.params);
     for (const auto& r : q.rois) {
@@ -439,7 +506,8 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     return true;
 }
 
-bool parseUrl(const std::string& url, std::string& host, std::string& path) {
+bool parseUrl(const std::string& url, std::string& host, std::string& path, int* port) {
+    if (port) *port = 0;
     // local://<path> runs the peer on this machine: the whole remote path exercised
     // end to end, minus ssh. That is how it is tested, and how someone can check
     // the protocol without a second machine.
@@ -452,13 +520,30 @@ bool parseUrl(const std::string& url, std::string& host, std::string& path) {
     const std::string pre = "ssh://";
     if (url.compare(0, pre.size(), pre) == 0) {
         std::string rest = url.substr(pre.size());
-        // ssh://host/abs/path and ssh://host:~/rel or ssh://host:/abs - the colon
-        // form is what fingers trained on scp will type
         size_t cut = rest.find_first_of("/:");
-        if (cut == std::string::npos) return false;
+        if (cut == std::string::npos) { host = rest; path = "~"; return !host.empty(); }
         host = rest.substr(0, cut);
-        path = rest[cut] == ':' ? rest.substr(cut + 1) : rest.substr(cut);
+        if (rest[cut] == ':') {
+            // RFC 3986: what follows the colon is a PORT. A non-standard ssh port
+            // is common enough that mis-parsing it as a path is a real bug.
+            size_t slash = rest.find('/', cut + 1);
+            std::string p = rest.substr(cut + 1, slash == std::string::npos
+                                                     ? std::string::npos : slash - cut - 1);
+            bool numeric = !p.empty() &&
+                           p.find_first_not_of("0123456789") == std::string::npos;
+            if (numeric) {
+                if (port) *port = atoi(p.c_str());
+                path = slash == std::string::npos ? "~" : rest.substr(slash);
+            } else {
+                path = rest.substr(cut + 1);   // tolerate the scp-ish ssh://host:~/x
+            }
+        } else {
+            path = rest.substr(cut);
+        }
         if (path.empty()) return false;
+        // git's extension: /~/rel and /~user/rel mean home-relative, not a
+        // directory literally called "~" at the root
+        if (path.compare(0, 2, "/~") == 0) path = path.substr(1);
         return !host.empty();
     }
     // Bare scp form: host:path or user@host:path. Not a URL, but it is what the
