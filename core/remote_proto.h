@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string>
+#include <vector>
 
 namespace rp {
 
@@ -30,7 +31,14 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // closes: a peer updated mid-way through those changes grouped a linearity
 // folder differently than the same folder opened locally, with nothing
 // anywhere saying why. If the answers can differ, the versions must.
-static const uint32_t VERSION = 4;
+//
+// 5: same story again - the DISPLAYED pattern of a sequence group now carries
+// its extent ("frame_000..023.npy", not "frame_???.npy"). Wire format
+// unchanged, but a stale peer sends the old text while the local scanner
+// produces the new one, so the same folder reads differently depending on
+// which side listed it. Versioning the meaning is what makes the peer update
+// itself on connect.
+static const uint32_t VERSION = 5;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -166,6 +174,73 @@ inline bool naturalLess(const std::string& a, const std::string& b) {
         }
     }
     return a.size() - i < b.size() - j;
+}
+
+// The DISPLAYED form of a sequence pattern: the frame-axis '?' run replaced by
+// the range it actually covers.
+//
+//   "????.npy"      over 0000.npy .. 0003.npy    -> "0000..0003.npy"
+//   "frame_???.npy" over frame_000 .. frame_023  -> "frame_000..023.npy"
+//   "f_?.npy"       over f_9, f_10, f_11         -> "f_9..11.npy"
+//
+// (with U+2025 TWO DOT LEADER, not two periods, where this comment writes "..")
+//
+// A folder of 0000.npy .. 0003.npy groups as "????.npy": correct by the rule -
+// every digit varies - and it says nothing at all. The extent says what the
+// stack IS, and it is exactly as cheap: the member names are already in hand
+// wherever a pattern is built.
+//
+// Lives HERE, inline, because both ends produce patterns and both ends must
+// agree character for character: the peer names the LIST / SCAN group row, the
+// client names the stack it opens from a local folder, and a capture opened
+// both ways has to read the same in the Files panel and in the session file.
+// Only the frame-axis run is touched; every other digit stays literal, so
+// "gain10_???.npy" becomes "gain10_000..007.npy" and never loses the gain.
+inline std::string patternWithExtent(const std::string& pattern,
+                                     const std::vector<std::string>& members) {
+    size_t qs = pattern.find('?');
+    if (qs == std::string::npos || members.size() < 2) return pattern;
+    size_t qe = qs;
+    while (qe < pattern.size() && pattern[qe] == '?') qe++;
+    // more than one '?' run means a degenerate grouping the caller could not
+    // analyse; rewriting one of the two runs would claim a frame axis it never
+    // decided on, so the pattern is left exactly as it came.
+    if (pattern.find('?', qe) != std::string::npos) return pattern;
+    auto isDig = [](char c) { return c >= '0' && c <= '9'; };
+    // which digit run of a member name the '?' run stands for
+    size_t runIdx = 0;
+    for (size_t i = 0; i < qs; i++)
+        if (isDig(pattern[i]) && (i == 0 || !isDig(pattern[i - 1]))) runIdx++;
+    std::vector<std::string> vals;
+    vals.reserve(members.size());
+    for (const std::string& m : members) {
+        size_t run = 0, i = 0;
+        bool found = false;
+        while (i < m.size()) {
+            if (!isDig(m[i])) { i++; continue; }
+            size_t j = i;
+            while (j < m.size() && isDig(m[j])) j++;
+            if (run++ == runIdx) { vals.push_back(m.substr(i, j - i)); found = true; break; }
+            i = j;
+        }
+        if (!found) return pattern;          // member structure differs: give up
+    }
+    // by VALUE, not by string: frame_9 and frame_10 are not lexicographic, and
+    // the zero padding of the winning member is kept as it is on disk
+    size_t loI = 0, hiI = 0;
+    unsigned long long loV = ~0ull, hiV = 0;
+    for (size_t k = 0; k < vals.size(); k++) {
+        unsigned long long n = 0;
+        for (char c : vals[k]) {
+            if (n > 1000000000000000ull) break;      // absurd run: stop accumulating
+            n = n * 10 + (unsigned long long)(c - '0');
+        }
+        if (n < loV) { loV = n; loI = k; }
+        if (n > hiV) { hiV = n; hiI = k; }
+    }
+    if (vals[loI] == vals[hiI]) return pattern;
+    return pattern.substr(0, qs) + vals[loI] + "\xE2\x80\xA5" + vals[hiI] +
+           pattern.substr(qe);
 }
 
 // META reply: what the client needs to lay out the image before any pixel moves.

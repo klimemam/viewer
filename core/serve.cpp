@@ -441,6 +441,10 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
             g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, ec);
             g.mtime = std::max(g.mtime, unixMtime(files[i].second));
         }
+        // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
+        // client applies the SAME function to the patterns it builds locally -
+        // see rp::patternWithExtent for why it has to be the same one.
+        if (frameAxis >= 0) g.pattern = rp::patternWithExtent(g.pattern, g.names);
         g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
     };
