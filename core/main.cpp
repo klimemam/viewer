@@ -125,6 +125,7 @@ struct ImageDoc {
     float black = 0, white = 255;     // display range
     GLuint tex = 0;
     bool texDirty = true;
+    float texBlack = 0, texWhite = 0;   // the range this texture was built with
     bool texNearest = true;
     // CFA (Bayer) metadata
     int batchId = 0;                  // which 塊 (Files header) this belongs to
@@ -254,6 +255,11 @@ struct App {
     // it was on and every step compares against a stale image. Off when B is a
     // single reference image (a dark, a golden sample) - then B must not move.
     bool compareFollowFrame = true;
+    // While comparing, B is DISPLAYED with A's range unless this is off. Two
+    // images stretched differently cannot be compared - any difference you see
+    // is the stretch, not the pixels. Non-destructive: B keeps its own numbers
+    // and gets them back when compare ends (the same contract as linkRange).
+    bool compareShareRange = true;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -954,6 +960,7 @@ static void rebuildTexture(ImageDoc& im) {
     static std::vector<uint8_t> rgba;
     rgba.resize((size_t)im.w * im.h * 4);
     const float ib = effBlack(im), iw = effWhite(im);
+    im.texBlack = ib; im.texWhite = iw;
     float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
@@ -1036,8 +1043,20 @@ static void markAllTexDirty() {
 }
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
-static float effBlack(const ImageDoc& im) { return app.linkRange ? app.linkBlack : im.black; }
-static float effWhite(const ImageDoc& im) { return app.linkRange ? app.linkWhite : im.white; }
+static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
+static float effBlack(const ImageDoc& im) {
+    if (app.linkRange) return app.linkBlack;
+    // B borrows A's range; cur() is never B, so this cannot recurse
+    if (app.compareShareRange && &im != cur() && cmpB() == &im && cur())
+        return cur()->black;
+    return im.black;
+}
+static float effWhite(const ImageDoc& im) {
+    if (app.linkRange) return app.linkWhite;
+    if (app.compareShareRange && &im != cur() && cmpB() == &im && cur())
+        return cur()->white;
+    return im.white;
+}
 
 static void setRange(ImageDoc& im, float black, float white) {
     if (!(white > black)) return;
@@ -2542,6 +2561,7 @@ static void writeSessionTo(std::ostream& f) {
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeScope << "\n";
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
+    f << "cmpshare " << (app.compareShareRange ? 1 : 0) << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2847,6 +2867,7 @@ static std::string loadSession(const std::string& path) {
                                        app.linkRange = on != 0; }
         else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
+        else if (key == "cmpshare") { int on = 1; ls >> on; app.compareShareRange = on != 0; }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -5551,6 +5572,11 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
+    // sharing means B is DISPLAYED with A's range: rebuild its texture whenever
+    // that range moves (dragging A's slider, stepping to a frame with another
+    // reference range), or B would keep the stretch it was last built with
+    if (imB && (imB->texBlack != effBlack(*imB) || imB->texWhite != effWhite(*imB)))
+        imB->texDirty = true;
     const bool split = imB && app.compareMode == App::CmpSplit;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
     const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
@@ -6578,15 +6604,26 @@ static void drawInspector() {
                                    b->w, b->h);
             // Two images auto-ranged to their own min/max look different even when
             // the pixels are identical - the fastest way to a wrong conclusion.
-            if (!app.linkRange && (effBlack(*b) != effBlack(*im) || effWhite(*b) != effWhite(*im))) {
-                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
-                ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(effBlack(*im), im->dtype).c_str(),
-                                    fmtVal(effWhite(*im), im->dtype).c_str(),
-                                    fmtVal(effBlack(*b), b->dtype).c_str(),
-                                    fmtVal(effWhite(*b), b->dtype).c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("match B to A")) {
-                    b->black = effBlack(*im); b->white = effWhite(*im); b->texDirty = true;
+            if (!app.linkRange) {
+                // Sharing is the default because two images stretched
+                // differently cannot be compared: the difference you see would
+                // be the stretch. When it is off, SAY the numbers differ - that
+                // is the case where a reading can mislead.
+                if (ImGui::Checkbox("A/B share A's range", &app.compareShareRange))
+                    b->texDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("B is displayed with A's black/white while comparing.\n"
+                                      "Display only - B keeps its own numbers and gets them\n"
+                                      "back when compare ends.\n"
+                                      "Turn it off to let each side keep its own stretch\n"
+                                      "(comparing SHAPES at very different exposures).");
+                if (!app.compareShareRange &&
+                    (b->black != im->black || b->white != im->white)) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
+                    ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(im->black, im->dtype).c_str(),
+                                        fmtVal(im->white, im->dtype).c_str(),
+                                        fmtVal(b->black, b->dtype).c_str(),
+                                        fmtVal(b->white, b->dtype).c_str());
                 }
             }
             if (b->dtype != im->dtype)
@@ -9326,16 +9363,36 @@ static void drawFileList() {
             }
             g->stacks.push_back(&stack);
         }
+        // The transient preview is PINNED LAST and never reorders the rest.
+        // It used to sort in wherever its batch was created, so glancing at a
+        // file in the browser inserted a heading in the middle of the list and
+        // pushed everything the user was working with down a row - the opposite
+        // of what a throwaway look should cost.
+        for (size_t i = 0; i + 1 < groups.size(); i++)
+            if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
+                                                            groups.begin() + i + 1,
+                                                            groups.end()); break; }
     }
-    // one file open needs no header
-    bool showHeaders = groups.size() > 1 || (groups.size() == 1 && stacks.size() > 1);
+    // The batch heading is ALWAYS drawn. It used to appear only once there was
+    // more than one thing open, so opening a second folder made a heading
+    // materialise above rows that had none - and a batch you can rename and
+    // move things into cannot be a thing that exists only sometimes.
+    const bool showHeaders = !groups.empty();
     for (const auto& group : groups) {
       ImGui::PushID(group.batch);
       bool open = true;
       if (showHeaders) {
-          open = ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                            ImGuiTreeNodeFlags_SpanAvailWidth,
-                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+          bool isPreview = group.label == "preview";
+          if (isPreview) ImGui::PushStyleColor(ImGuiCol_Text,
+                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+          open = isPreview
+              ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                           ImGuiTreeNodeFlags_SpanAvailWidth,
+                                  "preview (transient)   (%d)", (int)group.stacks.size())
+              : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                           ImGuiTreeNodeFlags_SpanAvailWidth,
+                                  "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+          if (isPreview) ImGui::PopStyleColor();
           if (ImGui::IsItemHovered() && !group.dir.empty())
               ImGui::SetTooltip("%s\n\n(right-click to rename this batch)", group.dir.c_str());
           // the batch is the user's grouping, so its name is theirs to change
@@ -9680,6 +9737,14 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::Separator();
             if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
                 app.compareFollowFrame = !app.compareFollowFrame;
+            if (ImGui::MenuItem("A/B share A's display range", nullptr, app.compareShareRange)) {
+                app.compareShareRange = !app.compareShareRange;
+                if (ImageDoc* bb = cmpB()) bb->texDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Two images stretched differently cannot be compared -\n"
+                                  "what you would be looking at is the stretch. Display\n"
+                                  "only: B keeps its own black/white.");
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Two stacks: stepping A steps B to the SAME frame number,\n"
                                   "so frame 42 is compared against frame 42.\n"
