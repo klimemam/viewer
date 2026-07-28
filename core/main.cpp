@@ -3469,9 +3469,9 @@ static void selectImage(int idx) {
     //   1 per stack  - the inherited behavior (default, unchanged)
     //   2 everything - the range follows you across stacks too
     if (prev && d != prev) {
-        if (app.rangeScope == 0) defaultRange(*d);
-        else if (app.rangeScope == 2) { d->black = prev->black; d->white = prev->white; }
-        if (app.rangeScope != 1) d->texDirty = true;
+        // linked mode overlays one range non-destructively (effBlack/effWhite),
+        // so only auto-per-frame touches the image's own numbers here
+        if (app.rangeScope == 0 && !app.linkRange) { defaultRange(*d); d->texDirty = true; }
     }
     if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
         app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
@@ -6720,29 +6720,32 @@ static void drawInspector() {
         }
 
         ImGui::SeparatorText("Range (black / white)");
-        {   // link: one range for every open image, so frames/files stay comparable
-            bool wasLinked = app.linkRange;
-            if (ImGui::Checkbox("link across all images", &app.linkRange)) {
+        {   // ONE mode control. It used to be a "link across all images"
+            // checkbox PLUS an on-switch combo whose third entry re-implemented
+            // linking destructively (copying the range into each image instead
+            // of overlaying one) - two mechanisms for the same intent, spotted
+            // as such immediately. Modes:
+            //   0 auto per frame - every frame re-fits to its own min..max
+            //   1 per stack      - frames of a stack share the reference range
+            //   2 linked         - one display range overlays every open image
+            int mode = app.linkRange ? 2 : (app.rangeScope == 0 ? 0 : 1);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##rangemode", &mode,
+                             "Auto per frame\0Per stack (default)\0Linked across all images\0")) {
+                bool wasLinked = app.linkRange;
+                app.linkRange = mode == 2;
+                app.rangeScope = mode == 0 ? 0 : 1;
                 if (app.linkRange && !wasLinked) {      // seed from what is on screen
                     app.linkBlack = im->black; app.linkWhite = im->white;
                 }
-                markAllTexDirty();                      // unlink -> each image returns to its own
+                if (app.linkRange != wasLinked) markAllTexDirty();
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("shared range for display only - each image keeps its own,\n"
-                                  "unlink to get them back");
-        }
-        {   // What happens to the range when you STEP to another frame. It lived
-            // in the View menu, which is nowhere near the numbers it governs -
-            // this is the panel where the range is actually set.
-            ImGui::SetNextItemWidth(-1);
-            ImGui::Combo("on switch##rangescope", &app.rangeScope,
-                         "Auto per frame\0Keep within a stack\0Keep everywhere\0");
-            if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
-                                  "Keep within a stack: frames of one stack share the\n"
-                                  "  reference frame's range, so they compare directly (default)\n"
-                                  "Keep everywhere: the current range follows you across stacks");
+                                  "Per stack: frames of one stack share the reference\n"
+                                  "  frame's range, so they compare directly\n"
+                                  "Linked: one display range for every open image - display\n"
+                                  "  only, each image keeps its own and gets it back on unlink");
         }
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
