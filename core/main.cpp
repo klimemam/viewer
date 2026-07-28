@@ -1114,6 +1114,7 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
 }
 
 // UI thread: swap arrived frames in. After this an ex-preview is a local image.
+static App::SeqInfo* seqInfo(int id);   // fwd: closed-stack results are dropped
 static void pumpRemoteFetch() {
     std::vector<App::RFetchDone> batch;
     {
@@ -1131,6 +1132,11 @@ static void pumpRemoteFetch() {
             app.rfFetched = 0;
         }
         if (d.uid == 0) {                        // a new frame of a remote stack
+            // Closed while this fetch was in flight: closeStack swept the QUEUE,
+            // but the one job the worker was already running could not be
+            // removed there - its result lands here and must be dropped, or a
+            // closed stack regrows one orphan frame at a time.
+            if (d.seqId != 0 && !seqInfo(d.seqId)) continue;
             if (!d.err.empty()) {
                 if (app.seqNote.empty())         // first error explains the gap
                     app.seqNote = "remote: " + d.err;
@@ -1308,14 +1314,121 @@ static void pumpMeasure() {
     }
 }
 
-static void closeCurrent() {
+// ---- close, per layer (docs/terminology.md) -----------------------------------
+// The canon: Close on a stack member closes the STACK - frames vanishing one at
+// a time from a measurement set was the reported bug. Ctrl+Alt+W stays as the
+// one-frame escape hatch.
+static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below)
+static App::SeqInfo* seqInfo(int id);             // fwd
+static void stopSequenceLoader();                 // fwd
+
+// Close a set of images by index: erase in descending order so the indices stay
+// valid, one forget per cache that can name them, current re-picked at the end.
+static void closeImages(std::vector<int> idxs) {
+    if (idxs.empty()) return;
+    std::sort(idxs.begin(), idxs.end());
+    idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+    uint64_t curUid = cur() ? cur()->uid : 0;
+    bool closedCur = false;
+    for (int i = (int)idxs.size() - 1; i >= 0; i--) {
+        int idx = idxs[i];
+        if (idx < 0 || idx >= (int)app.images.size()) continue;
+        ImageDoc* im = app.images[idx].get();
+        if (im->uid == curUid) closedCur = true;
+        if (im->uid == app.previewUid) app.previewUid = 0;
+        forgetImage(im);
+        if (im->tex) glDeleteTextures(1, &im->tex);
+        app.images.erase(app.images.begin() + idx);
+    }
+    if (curUid) {                     // re-point current: same doc if it survived
+        if (!closedCur) {
+            app.current = -1;
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i]->uid == curUid) { app.current = i; break; }
+        }
+        if (closedCur || app.current < 0) {
+            app.current = app.images.empty() ? -1
+                        : std::min(idxs.front(), (int)app.images.size() - 1);
+            app.fitRequested = true;
+        }
+    } else if (app.current >= (int)app.images.size()) {
+        app.current = (int)app.images.size() - 1;
+    }
+    app.imagesRev++;
+    if (!resolveB()) {   // B went with them: a later same-name file must not
+        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    }
+}
+
+// Close every frame of a stack plus its SeqInfo, and stop everything that
+// would quietly regrow it: the sequence loader (pumpSequence stamps
+// seqLoadingId on frames as they land), the remote prefetch queue, the
+// linearity row, the server temporal result.
+static void closeStack(int seqId) {
+    if (seqId == 0) return;
+    if (app.seqLoadingId == seqId) { stopSequenceLoader(); app.seqLoadingId = 0; }
+    {   // queued remote prefetches. The ONE job the worker may be running right
+        // now cannot be removed here - pumpRemoteFetch drops its result on
+        // arrival instead (seqInfo(d.seqId) == nullptr). Both are needed.
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        int removed = 0;
+        for (auto it = app.rfQueue.begin(); it != app.rfQueue.end();)
+            if (it->seqId == seqId) { it = app.rfQueue.erase(it); removed++; }
+            else ++it;
+        app.rfPending -= removed;
+        if (app.rfPending <= 0) { app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; }
+    }
+    // rbOpenQueue entries carry no seqId yet, so a stack whose FOLDER is still
+    // queued may open later regardless - accepted; closeBatch removes those by
+    // batchId, which the queue does know.
+    closeImages(framesOfSeq(seqId));
+    for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+        if (it->id == seqId) { app.seqs.erase(it); break; }
+    for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
+        if (it->seqId == seqId) it = app.lin.rows.erase(it);
+        else ++it;
+    app.lin.rev++;
+    app.temporal.seqId = -1;
+    if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
+}
+
+// Close a batch: every stack and loose frame in it, plus the queued opens that
+// would resurrect it the moment the fetcher goes idle.
+static void closeBatch(int batchId) {
+    std::vector<int> seqIds;
+    for (const auto& d : app.images)
+        if (d->batchId == batchId && d->seqId != 0 &&
+            std::find(seqIds.begin(), seqIds.end(), d->seqId) == seqIds.end())
+            seqIds.push_back(d->seqId);
+    for (int s : seqIds) closeStack(s);
+    std::vector<int> loose;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->batchId == batchId) loose.push_back(i);
+    closeImages(loose);
+    for (auto it = app.rbOpenQueue.begin(); it != app.rbOpenQueue.end();)
+        if (it->batchId == batchId) it = app.rbOpenQueue.erase(it);
+        else ++it;
+    for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
+        if (it->batchId == batchId) it = app.seqQueue.erase(it);
+        else ++it;
+    if (app.loadBatchId == batchId) app.loadBatchId = 0;
+}
+
+// Ctrl+W: the stack when the frame is in one (the canon), the image otherwise.
+// frameOnly = the Ctrl+Alt+W escape hatch: just this one frame.
+static void closeCurrent(bool frameOnly = false) {
     ImageDoc* im = cur();
     if (!im) return;
+    if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
+    int seqId = im->seqId;
     forgetImage(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
     app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
     app.fitRequested = true;
+    // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
+    // too, or a zero-frame stack haunts the linearity table
+    if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
 }
 static void closeAll() {
     app.ana.img = nullptr;
@@ -8667,6 +8780,10 @@ static void drawFileList() {
         if (ImGui::SmallButton("dismiss##seqnote")) app.seqNote.clear();
     }
     ImGui::Separator();
+    // Context-menu closes are DEFERRED to the end of the walk: closing here
+    // erases images mid-iteration while the row loop still holds indices into
+    // the pre-close stacksCached() snapshot.
+    int pendingCloseSeq = 0, pendingCloseBatch = 0;
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
     // produced a flat list of bare filenames with nothing saying where each came
@@ -8724,6 +8841,9 @@ static void drawFileList() {
                   app.imagesRev++;               // rebuild the cached labels
                   ImGui::CloseCurrentPopup();
               }
+              ImGui::Separator();
+              if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
+                  pendingCloseBatch = group.batch;
               ImGui::EndPopup();
           }
       }
@@ -8792,6 +8912,9 @@ static void drawFileList() {
                 app.lin.rev++;            // linearity rows show stack names
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
+                pendingCloseSeq = si->id;
             ImGui::EndPopup();
         }
         if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
@@ -8804,6 +8927,8 @@ static void drawFileList() {
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
     }
+    if (pendingCloseSeq) closeStack(pendingCloseSeq);
+    if (pendingCloseBatch) closeBatch(pendingCloseBatch);
 }
 
 static void drawSequenceModal() {
@@ -8884,7 +9009,18 @@ static void drawMenuBar(GLFWwindow* win) {
             if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Close Image", SC_MOD "+W", false, cur() != nullptr)) closeCurrent();
+        {   // Close follows the layer canon (docs/terminology.md): Ctrl+W closes
+            // the STACK when the current frame is in one, the image otherwise.
+            // Ctrl+Alt+W is the one-frame escape hatch; Ctrl+Shift+W the batch.
+            bool inStack = cur() && cur()->seqId != 0;
+            if (ImGui::MenuItem(inStack ? "Close Stack" : "Close Image", SC_MOD "+W",
+                                false, cur() != nullptr))
+                closeCurrent();
+            if (ImGui::MenuItem("Close Frame", SC_MOD "+Alt+W", false, inStack))
+                closeCurrent(true);
+            if (ImGui::MenuItem("Close Batch", SC_MOD "+Shift+W", false, cur() != nullptr))
+                closeBatch(cur()->batchId);
+        }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
         if (ImGui::BeginMenu("Sequence loading")) {
@@ -9345,6 +9481,7 @@ static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
+static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 
 static void printUsage() {
     printf(
@@ -9467,6 +9604,8 @@ static void parseCli(int argc, char** argv) {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
             g_pickerSelftest = next();             // handled in main()
+        } else if (a == "--close-selftest") {
+            g_closeSelftest = next();              // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -10246,6 +10385,124 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // Close per layer, verifiable without a human (docs/terminology.md): Ctrl+W's
+    // closeCurrent() on a stack member removes the WHOLE stack and every trace of
+    // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
+    if (!g_closeSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_closeSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "closeselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        linRecompute();                    // rows exist, so residue is detectable
+        int imagesBefore = (int)app.images.size(), seqsBefore = (int)app.seqs.size();
+        if (seqsBefore < 3) {
+            fprintf(stderr, "closeselftest: expected 3 stacks under %s, got %d\n",
+                    g_closeSelftest.c_str(), seqsBefore);
+            return 1;
+        }
+        int sid = app.seqs[seqsBefore / 2].id;
+        std::vector<int> fr = framesOfSeq(sid);
+        int stackFrames = (int)fr.size();
+        selectImage(fr[fr.size() / 2]);    // a MIDDLE frame: the reported bug
+        closeCurrent();                    // Ctrl+W's path: must close the stack
+        bool linResidue = false;
+        for (const auto& r : app.lin.rows) if (r.seqId == sid) linResidue = true;
+        fprintf(stderr, "closeselftest: closeCurrent on mid frame of stack %d: "
+                        "images %d->%d, seqs %d->%d, frames(seq)=%d, "
+                        "temporal.seqId=%d, lin rows for seq: %s\n",
+                sid, imagesBefore, (int)app.images.size(), seqsBefore,
+                (int)app.seqs.size(), (int)framesOfSeq(sid).size(),
+                app.temporal.seqId, linResidue ? "RESIDUE" : "none");
+        if ((int)app.images.size() != imagesBefore - stackFrames ||
+            (int)app.seqs.size() != seqsBefore - 1 || !framesOfSeq(sid).empty() ||
+            app.temporal.seqId != -1 || linResidue) {
+            fprintf(stderr, "closeselftest: FAILED - stack close left residue\n");
+            ok = false;
+        }
+        // ---- a stack closed while its remote prefetch is still in flight ----
+        std::string scanroot = g_closeSelftest;
+        std::replace(scanroot.begin(), scanroot.end(), '\\', '/');
+        {
+            size_t sl = scanroot.find_last_of('/');
+            scanroot = (sl == std::string::npos ? std::string(".")
+                                                : scanroot.substr(0, sl)) + "/rb/scanroot";
+        }
+        int seqsNow = (int)app.seqs.size();
+        startRemote("local://" + scanroot);
+        double t0 = glfwGetTime();
+        bool scanSent = false, closed = false;
+        int rsid = 0, rfLeft = -1;
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            pumpRemoteFetch();
+            pumpRemoteOpenQueue();
+            pumpSequenceAndQueue();
+            if (app.rbrowse.connected && !scanSent) {
+                App::RbJob j;
+                j.kind = App::RbScan;
+                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
+                rbEnqueue(std::move(j));
+                scanSent = true;
+            }
+            if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
+            if (!closed && (int)app.seqs.size() > seqsNow && app.rfPending > 0) {
+                rsid = app.seqs.back().id;     // the stack the fetcher is filling
+                closeStack(rsid);
+                closed = true;
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                rfLeft = 0;
+                for (const auto& jj : app.rfQueue) if (jj.seqId == rsid) rfLeft++;
+                break;
+            }
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!closed) {
+            fprintf(stderr, "closeselftest: FAILED - never caught a stack mid-fetch (%s)\n",
+                    app.rbrowse.err.c_str());
+            ok = false;
+        } else {
+            // the in-flight job (and the rest of the queue) gets 2 s to land;
+            // nothing of the closed stack may grow back
+            double t1 = glfwGetTime();
+            while (glfwGetTime() - t1 < 2.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            int orphans = 0;
+            for (const auto& d : app.images) if (d->seqId == rsid) orphans++;
+            fprintf(stderr, "closeselftest: closeStack(%d) mid-fetch: %d queued job(s) "
+                            "for it left, %d frame(s) regrew after 2 s pump\n",
+                    rsid, rfLeft, orphans);
+            if (rfLeft != 0 || orphans != 0) {
+                fprintf(stderr, "closeselftest: FAILED - closed stack regrew\n");
+                ok = false;
+            }
+        }
+        fprintf(stderr, "closeselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
     if (!g_scanSelftest.empty()) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
@@ -10382,6 +10639,11 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
+            // the layer variants (docs/terminology.md): frame-only escape hatch
+            // and whole-batch close
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Alt | ImGuiKey_W)) closeCurrent(true);
+            if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_W) && cur())
+                closeBatch(cur()->batchId);
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_S)) saveSessionDialog();
             // Emacs-style navigation: time axis = C-f/C-b, stack axis = C-n/C-p,
             // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
