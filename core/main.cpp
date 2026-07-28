@@ -10474,6 +10474,20 @@ int main(int argc, char** argv) {
             // must not leave the window unpainted: re-check before skipping.
             glfwWaitEventsTimeout(app.rbBusy || app.mPending > 0 ? 0.05 : 1.0);
             bool working = app.rbBusy || app.mPending > 0 || app.rfPending > 0 || app.seqRunning;
+            // Results a worker has FINISHED but no frame has integrated yet, and
+            // modals waiting for a frame to open them. Without these the remote
+            // scan's picker never appeared: the worker went idle (working=false),
+            // no input arrived, every frame was skipped - and the pumps live
+            // inside the frame, so the result that would have opened the dialog
+            // sat in rbDone until the user happened to move the mouse. Twice.
+            if (!working) {
+                { std::lock_guard<std::mutex> lk(app.rbMtx); working |= !app.rbDone.empty(); }
+                { std::lock_guard<std::mutex> lk(app.rfMtx); working |= !app.rfDone.empty(); }
+                { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
+                working |= seqReadyPending();
+                working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
+            }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
             app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
