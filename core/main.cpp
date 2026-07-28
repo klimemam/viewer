@@ -6321,8 +6321,21 @@ static void drawRemoteOpenModal() {
         app.lastRemoteUrl = url;
         app.prefsDirty = true;
         savePrefs();
-        ImGui::CloseCurrentPopup();
-        openRemote(url);              // errors arrive as toasts
+        // "Open" on a folder means "show me what's there", not an error: you
+        // rarely know the exact filename before you have looked at the folder
+        std::string h2, p2;
+        bool looksDir = remote::parseUrl(url, h2, p2) &&
+                        (p2.empty() || p2.back() == '/' ||
+                         p2.find_last_of('.') == std::string::npos ||
+                         p2.find_last_of('.') < p2.find_last_of('/'));
+        if (looksDir) {
+            browseHost = h2;
+            while (p2.size() > 1 && p2.back() == '/') p2.pop_back();
+            listDir(p2.empty() ? "/" : p2);       // stay in the dialog and browse
+        } else {
+            ImGui::CloseCurrentPopup();
+            openRemote(url);          // errors arrive as toasts
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
