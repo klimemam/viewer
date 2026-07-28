@@ -249,6 +249,11 @@ struct App {
     uint64_t compareBUid = 0;
     std::string compareB;             // B's name, for the session file
     int compareBSeq = -1;             // ...and its frame index, when B is in a stack
+    // Stack-vs-stack compare: step A and B follows to the same frame NUMBER.
+    // Without this, comparing two 300-frame captures pins B to whatever frame
+    // it was on and every step compares against a stale image. Off when B is a
+    // single reference image (a dark, a golden sample) - then B must not move.
+    bool compareFollowFrame = true;
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -338,6 +343,12 @@ struct App {
     int nextBatchId = 1;
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
+    // Where that preview came from, so the browser can step through the
+    // sequence without opening it: the group's member paths and the index
+    // currently shown. Cleared with the preview.
+    std::vector<std::string> previewFiles;
+    int previewIndex = 0;
+    std::string previewLabel;
     int nextSeqId = 1;
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
@@ -660,10 +671,20 @@ static void promotePreview(ImageDoc* d);   // fwd: preview -> registered open
 // The B side of an A/B compare, or null when compare is off / B is gone / B is A.
 static ImageDoc* resolveB() {
     if (app.compareBUid) {
+        ImageDoc* b = nullptr;
         for (const auto& d : app.images)
-            if (d->uid == app.compareBUid) return d.get() == cur() ? nullptr : d.get();
-        app.compareBUid = 0;                     // B was closed
-        return nullptr;
+            if (d->uid == app.compareBUid) { b = d.get(); break; }
+        if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
+        // B tracks A's frame number when BOTH sides are stacks. A single-image
+        // B (a dark frame, a golden sample) has no frame axis and stays put -
+        // which is the other half of what stack comparison has to support.
+        ImageDoc* a = cur();
+        if (app.compareFollowFrame && a && b->seqId != 0 && a->seqId != 0 &&
+            b->seqId != a->seqId && b->seqIndex != a->seqIndex) {
+            for (const auto& d : app.images)
+                if (d->seqId == b->seqId && d->seqIndex == a->seqIndex) { b = d.get(); break; }
+        }
+        return b == cur() ? nullptr : b;
     }
     if (app.compareB.empty()) return nullptr;
     // session fallback: match the saved name (and frame, for a stack), then latch
@@ -2512,6 +2533,7 @@ static void writeSessionTo(std::ostream& f) {
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeScope << "\n";
+    f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2816,6 +2838,7 @@ static std::string loadSession(const std::string& path) {
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
         else if (key == "rangescope") { ls >> app.rangeScope; }
+        else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -5012,6 +5035,29 @@ static void dropPreview() {
             break;
         }
     app.previewUid = 0;
+    // the sequence it belonged to goes with it (stepPreviewFrame restores its
+    // own copy across the openRemote inside a step)
+    app.previewFiles.clear();
+    app.previewIndex = 0;
+    app.previewLabel.clear();
+}
+
+// Walk the previewed sequence without opening it. Each step replaces the one
+// preview slot, so browsing a 300-frame capture costs one frame of transfer at
+// a time - the whole point of previewing rather than opening.
+static void stepPreviewFrame(int delta) {
+    if (app.previewFiles.size() < 2) return;
+    int n = (int)app.previewFiles.size();
+    int want = std::clamp(app.previewIndex + delta, 0, n - 1);
+    if (want == app.previewIndex) return;
+    std::string host = app.rbrowse.host;
+    std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
+    std::string label = app.previewLabel;
+    app.previewIndex = want;
+    openRemote(makeRemoteUrl(host, files[want]), true);
+    app.previewFiles = std::move(files);
+    app.previewIndex = want;
+    app.previewLabel = std::move(label);
 }
 
 static void openRemote(const std::string& url, bool asPreview) {
@@ -8766,6 +8812,34 @@ static void drawPanelRemote() {
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
     }
+    // Frame stepping for the previewed sequence, right here in the browser: a
+    // group row previews frame 0, and this walks the rest without opening the
+    // stack (one frame of transfer per step). Only shown while a preview from a
+    // group row is alive.
+    if (app.previewFiles.size() >= 2) {
+        int n = (int)app.previewFiles.size();
+        ImGui::PushID("pvstep");
+        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
+        ImGui::SameLine();
+        int slider = app.previewIndex;
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
+            stepPreviewFrame(slider - app.previewIndex);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
+                              app.previewLabel.c_str());
+        // , and . while the browser has focus: the same keys the image view uses
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            !ImGui::IsAnyItemActive()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
+            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+        }
+        ImGui::PopID();
+    }
     // filtered view of B.entries, by index (the clipper needs random access)
     std::vector<int> shown;
     shown.reserve(B.entries.size());
@@ -8990,6 +9064,11 @@ static void drawPanelRemote() {
                     // opens the stack for real.
                     openRemote(makeRemoteUrl(B.host, joined(e.members.empty()
                                              ? e.name : e.members[0])), true);
+                    app.previewFiles.clear();
+                    for (const auto& m : e.members)
+                        app.previewFiles.push_back(joined(m));
+                    app.previewIndex = 0;
+                    app.previewLabel = e.name;
                     rbSelAnchor = ei;
                 } else {
                     // idempotent: clicking the same file again re-shows the
@@ -9549,6 +9628,14 @@ static void drawMenuBar(GLFWwindow* win) {
                     app.diffAbs = !app.diffAbs;
             }
             ImGui::Separator();
+            if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
+                app.compareFollowFrame = !app.compareFollowFrame;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Two stacks: stepping A steps B to the SAME frame number,\n"
+                                  "so frame 42 is compared against frame 42.\n"
+                                  "Turn it off to hold B still - which is what you want when\n"
+                                  "B is one reference image (a dark, a golden sample).\n"
+                                  "A single-image B never moves either way.");
             if (ImGui::MenuItem("Pin this frame as B", "Shift+B", false, cur() != nullptr)) pinCurrentAsB();
             if (ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C", false, cmpB() != nullptr))
                 swapCompare();
