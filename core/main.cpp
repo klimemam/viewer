@@ -6725,6 +6725,32 @@ static void drawABBand(const char* side, const std::string& name) {
     ImGui::Dummy(ImVec2(w, h + 2 * s));
 }
 
+// Why the side-by-side layout fell back to an overlay. Two things it has to get
+// right and did not: it must WRAP (Text does not, and at exactly the width that
+// triggers it the line was cut mid-word - "panel narrower than 480 px: overlaid
+// ins..."), and it must quote the LOGICAL threshold. It used to print the
+// DPI-scaled minSide, so a 150% display was told to widen past 480 px while the
+// code compares against 320 logical ones - a number the user cannot act on.
+static const char* AB_NARROW_MSG =
+    "panel narrower than 320 px (logical width, before display scaling): "
+    "overlaid instead of side by side";
+static const float AB_MIN_SIDE = 320.0f;
+// The height it will take at the current width, so the plot layout can reserve
+// exactly what the wrapped text uses. A note that appears and pushes the plot
+// down is the same defect as the browser's scrub bar and the preview row.
+static float abNarrowNoteH() {
+    return ImGui::CalcTextSize(AB_NARROW_MSG, nullptr, false,
+                               ImGui::GetContentRegionAvail().x).y +
+           ImGui::GetStyle().ItemSpacing.y;
+}
+static void abNarrowNote() {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1));
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(AB_NARROW_MSG);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
 // A and B series correspond BY NAME (R <-> R), never by index: the canon says
 // CFA planes are never mixed, and ch0 is not R. -1 = this series exists on one
 // side only, and is drawn as such.
@@ -7385,13 +7411,13 @@ static void drawPanelHistogram() {
             dl->PopClipRect();
         };
 
-        const float minSide = 320.0f * app.uiScale;
+        const float minSide = AB_MIN_SIDE * app.uiScale;
         bool side = Bim && abSideBySide();
         bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
         if (tooNarrow) side = false;
         // fill the rest of the panel: a fixed height overflowed the bottom dock
         float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
-                      + (tooNarrow ? ImGui::GetTextLineHeightWithSpacing() : 0.0f);
+                      + (tooNarrow ? abNarrowNoteH() : 0.0f);
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
                      - footerH;
@@ -7426,10 +7452,7 @@ static void drawPanelHistogram() {
                               false, false, plotH), false, true);
             ImGui::EndChild();
         }
-        if (tooNarrow)
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                               "panel narrower than %.0f px: overlaid instead of side by side",
-                               minSide);
+        if (tooNarrow) abNarrowNote();
         // the real pixel counts survive the normalised axis
         ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
                             H.clipLo * 100.0, H.clipHi * 100.0,
@@ -7639,7 +7662,7 @@ static void drawPanelProjection() {
     // to fit the other would invent a correspondence that does not exist. So:
     // fall back to side by side and say why.
     const bool canOverlay = !Bim || abProjOverlayable(P, PB);
-    const float minSide = 320.0f * app.uiScale;
+    const float minSide = AB_MIN_SIDE * app.uiScale;
     bool side = Bim && (abSideBySide() || !canOverlay);
     // the narrow-panel fallback yields to correctness: mismatched profiles are
     // never overlaid, however little room there is
@@ -7653,7 +7676,7 @@ static void drawPanelProjection() {
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
                  + lineH;                                  // footnote
     if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
-    if (tooNarrow) statsH += lineH;
+    if (tooNarrow) statsH += abNarrowNoteH();
     float avail = ImGui::GetContentRegionAvail().y - statsH;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
@@ -7795,10 +7818,7 @@ static void drawPanelProjection() {
                            "B x %d..%d, y %d..%d px): shown side by side, never stretched",
                            P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
                            PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
-    if (tooNarrow)
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "panel narrower than %.0f px: overlaid instead of side by side",
-                           minSide);
+    if (tooNarrow) abNarrowNote();
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
@@ -8672,13 +8692,13 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         float mxp = tp.at((float)d->seqIndex, tp.ymin).x;
         dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
     };
-    const float minSide = 320.0f * app.uiScale;
+    const float minSide = AB_MIN_SIDE * app.uiScale;
     bool side = abSideBySide();
     bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
     if (tooNarrow) side = false;
     float tAvail = ImGui::GetContentRegionAvail().y
                  - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
-                 - (tooNarrow ? ImGui::GetTextLineHeightWithSpacing() : 0.0f);
+                 - (tooNarrow ? abNarrowNoteH() : 0.0f);
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
     const char* xlab = "frame number (index in sequence)";
@@ -8726,10 +8746,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         }
         ImGui::EndChild();
     }
-    if (tooNarrow)
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "panel narrower than %.0f px: overlaid instead of side by side",
-                           minSide);
+    if (tooNarrow) abNarrowNote();
 }
 
 static void drawPanelTemporal() {
