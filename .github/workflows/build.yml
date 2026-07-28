@@ -67,6 +67,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
+            # archive.ubuntu.com is flaky from Actions runners (two runs in a
+            # row died on "Connection failed" here); the Azure mirror is what
+            # the runner images themselves use, and retries cover the rest
+            sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
+            echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
             apt-get update -qq >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
             # miniz.c is C: compiling it as C++ turns its tentative definitions
