@@ -368,9 +368,10 @@ struct App {
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
-        // linearity: the exposure level this stack was captured at (lux, ms,
-        // photons - the unit lives in App::lin.unit). NaN = not set.
-        double level = std::numeric_limits<double>::quiet_NaN();
+        // NO level here. The value a stack was captured at is meaningless
+        // without the parameter's NAME and UNIT, and both of those belong to
+        // the series - so the value does too (Series::Member::value). Keeping
+        // it on the stack is what forced "one unit for the whole application".
     };
     std::vector<SeqInfo> seqs;
     // A batch is the unit the Files panel groups by: created per OPEN ACTION
@@ -380,6 +381,36 @@ struct App {
     struct Batch { int id; std::string name; };
     std::vector<Batch> batches;
     int nextBatchId = 1;
+    // ---- series (系列): the stacks of ONE swept parameter (docs/terminology.md) --
+    // A batch makes no structural claim; a series does. Its members carry a
+    // PARAMETER VALUE and an ORDER, and the whole run is one measurement - so
+    // the parameter's name, its unit and the kind of fit live HERE, not on the
+    // stack and not once per application.
+    //
+    // Series::members is the ONLY truth about membership. There is deliberately
+    // no SeqInfo::seriesId: two places holding the same fact drift apart, and
+    // the reverse lookup (seriesOfStack) is a walk over a handful of series.
+    struct Series {
+        enum { KLinearity = 0, KPtc = 1, KTemperature = 2, KOther = 3 };
+        int id = 0, batchId = 0;      // the batch it lives in - strictly ONE
+        std::string name;             // "<batch> 掃引" until a human names it
+        std::string paramName;        // "illuminance" / "exposure" / ...
+        // Empty = NOT SET, and that is the default: assuming "lx" would put a
+        // unit on an axis nobody chose. No unit, no fit (see seriesCanFit).
+        char unit[16] = "";
+        int kind = KLinearity;
+        // value NaN = not set. NEVER treated as 0 - it is left out of the fit
+        // and reads as "unset" on screen.
+        struct Member {
+            int seqId = 0;
+            double value = std::numeric_limits<double>::quiet_NaN();
+            bool include = true;
+        };
+        std::vector<Member> members;  // order = display order (sorting is a button)
+    };
+    std::vector<Series> series;
+    int nextSeriesId = 1;
+    int curSeriesId = 0;              // which series the Linearity panel shows
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
     // Where that preview came from, so the browser can step through the
@@ -493,8 +524,8 @@ struct App {
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
-    // Linearity: one row per stack (level in, response out), fits per CFA plane.
-    // Recomputed only on demand - this walks hundreds of frames.
+    // Linearity: one row per MEMBER of one series (value in, response out), fits
+    // per CFA plane. Recomputed only on demand - this walks hundreds of frames.
     struct LinState {
         struct Row {
             int seqId = 0;
@@ -506,6 +537,11 @@ struct App {
             std::string err;
         };
         std::vector<Row> rows;
+        int seriesId = 0;                 // the series these rows describe
+        // NOT the unit of any measurement: the PREFILL a newly created series
+        // starts from (prefs key linunit, unchanged). What gets printed on an
+        // axis comes from Series::unit, and empty there means "not set" - it
+        // never silently becomes "lx".
         char unit[16] = "lx";
         int tablePlane = 0;               // which CFA plane the per-stack table shows
         bool fitValid = false, roiUsed = false;
@@ -516,6 +552,38 @@ struct App {
         uint64_t rev = 0, computedRev = 0;
     } lin;
     bool showLinearity = false;
+    // Create / edit a series. ONE modal for both: the fields are identical and
+    // "edit" is only "create with the boxes already ticked". The value column
+    // is a SUGGESTION the user confirms - see drawSeriesModal.
+    struct SeriesEdit {
+        bool open = false;
+        int editId = 0;                   // 0 = creating a new one
+        int batchId = 0;
+        char name[128] = "";
+        char param[64] = "";
+        char unit[16] = "";
+        int kind = Series::KLinearity;
+        struct Row {
+            int seqId = 0;
+            bool check = true;
+            // TEXT, not a double: "" has to stay distinguishable from 0, and a
+            // numeric box cannot be empty. Parsed on accept; empty = NaN = unset.
+            char value[32] = "";
+            bool suggested = false;       // still extractLevelFromName's proposal
+            // An EXISTING member's value, kept as the double it is. The box shows
+            // it as "%.6g" and a Save that never touched the box must give the
+            // member back UNCHANGED - re-parsing the display text would quietly
+            // round 1234567.89 to 1234570 on every visit to the dialog.
+            double orig = std::numeric_limits<double>::quiet_NaN();
+            bool haveOrig = false;        // this row is already a member
+            bool touched = false;         // a human typed in the box
+            // extractLevelFromName's proposal when it is NOT in the box: offered
+            // in the "read from" column, where it cannot be committed by accident.
+            double guess = std::numeric_limits<double>::quiet_NaN();
+            std::string name, from;       // from = the text the number was read out of
+        };
+        std::vector<Row> rows;
+    } seriesEdit;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
     // Browse listing view: false = the collapsed group rows the peer sends,
@@ -624,6 +692,41 @@ struct App {
     // a 3-stack session came back with 7 of its 15 frames.
     struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
     std::vector<SeqRestore> seqRestore;
+    // Series a session asked for, resolved LAZILY for the same reason: at parse
+    // time the stacks do not exist yet (a folder stack is one loose image plus a
+    // queued rescan), so a member cannot be looked up. Members are named by the
+    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because seqname is
+    // dropped on restore for exactly this reason (cur()->seqId is still 0 when
+    // the line is parsed; verified in loadSession).
+    struct SeriesRestore {
+        std::string name, batchName, paramName, unit;
+        int kind = 0;
+        int badValues = 0;                // value fields the parser could not read
+        struct M { double value; bool include; std::string path; };
+        std::vector<M> members;
+    };
+    std::vector<SeriesRestore> seriesRestore;
+    // MIGRATION of the old per-stack level, also by path. saveSession has never
+    // written "seqlevel" (verified over the whole history), so this is normally
+    // empty - it exists for hand-written and third-party files, and it creates
+    // a series only where the file actually says there was a sweep.
+    std::vector<std::pair<std::string, double>> seqLevelLegacy;
+    // A sweep the PICKER was told to make ("open as a sweep"), resolved once
+    // its stacks are open - the same lateness as seriesRestore and for the same
+    // reason. Members are named by their GROUP name, which becomes the stack's
+    // name (PendingGroup::name / RemoteOpen::name -> SeqInfo::name): the remote
+    // queue holds no seqId, so a name is the only handle there is.
+    struct SeriesPending {
+        int batchId = 0;
+        std::string name, paramName, unit;
+        int kind = Series::KLinearity;
+        std::vector<std::pair<std::string, double>> byName;   // stack name -> value
+    };
+    // A QUEUE, not a slot. Resolution waits for every load to drain, which for a
+    // folder-of-folders is seconds and for a remote sweep much longer, and File >
+    // Open Folder is available throughout - a single slot meant the second sweep
+    // silently threw the first one's ticked box, typed parameter and unit away.
+    std::vector<SeriesPending> seriesPending;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -652,6 +755,14 @@ struct App {
     // batch (the canon's default), 1 = one batch per top-level folder of the
     // scanned root. Ignored under pickMerge (a merged stack is one batch).
     int pickBatchMode = 0;
+    // "open as a sweep": the accepted groups also become ONE series. Not
+    // persisted and cleared on accept - a sticky box would create a sweep on
+    // some later Open that nobody asked for, which is the one thing series are
+    // never allowed to do. Exclusive with pickBatchMode (a series lives in one
+    // batch); the parameter name and unit are the series', typed here.
+    bool pickSweep = false;
+    char pickSweepParam[64] = "";
+    char pickSweepUnit[16] = "";
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
@@ -1533,6 +1644,197 @@ static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below
 static App::SeqInfo* seqInfo(int id);             // fwd
 static void stopSequenceLoader();                 // fwd
 static void pruneEmptyBatches();                  // fwd (defined with the moves)
+// The value a stack's NAME suggests, and the text it was read out of. Declared
+// here because the picker proposes one per group long before the linearity
+// code that defines it (the default argument lives on this declaration only).
+static double extractLevelFromName(const std::string& name, std::string* srcOut = nullptr);
+
+// ---- series (系列), the model (docs/terminology.md, docs/series-plan.md) -------
+// No UI here on purpose: the invariants have to hold before anything can draw
+// them. Series are few and members are tens, so every lookup is a plain walk.
+static App::Series* seriesById(int id) {
+    for (auto& s : app.series) if (s.id == id) return &s;
+    return nullptr;
+}
+// Reverse membership. The canon: a stack belongs to AT MOST ONE series, so the
+// first hit is the only hit (seriesAudit proves it, addToSeries maintains it).
+static App::Series* seriesOfStack(int seqId) {
+    if (seqId == 0) return nullptr;
+    for (auto& s : app.series)
+        for (const auto& m : s.members)
+            if (m.seqId == seqId) return &s;
+    return nullptr;
+}
+// The batch a stack is in, read off its frames (the frames own batchId).
+// 0 = the stack has no frames resident, so it claims no batch.
+static int batchOfStack(int seqId) {
+    for (const auto& d : app.images) if (d->seqId == seqId) return d->batchId;
+    return 0;
+}
+static std::string batchNameOf(int batchId) {
+    for (const auto& b : app.batches) if (b.id == batchId) return b.name;
+    return {};
+}
+// Default name until a human gives it one (docs/terminology.md).
+static int newSeries(int batchId, const std::string& name) {
+    App::Series s;
+    s.id = app.nextSeriesId++;
+    s.batchId = batchId;
+    s.name = name.empty() ? batchNameOf(batchId) + " 掃引" : name;
+    app.series.push_back(std::move(s));
+    app.imagesRev++;                  // the Files grouping caches on this
+    return app.series.back().id;
+}
+// Drop one stack from whatever series holds it. Returns the series' id, or 0.
+static int removeFromSeries(int seqId) {
+    for (auto& s : app.series)
+        for (auto it = s.members.begin(); it != s.members.end(); ++it)
+            if (it->seqId == seqId) {
+                s.members.erase(it);
+                app.imagesRev++;
+                return s.id;
+            }
+    return 0;
+}
+// Add a stack to a series. Fails (false) when the stack is not in the series'
+// batch - the canon's strict containment, enforced rather than papered over:
+// the caller's answer is "Move to batch first", never "we widened the series".
+// Adding a stack that already sits in another series MOVES it (at most one).
+static bool addToSeries(int seriesId, int seqId, double value, bool include = true) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || seqId == 0 || !seqInfo(seqId)) return false;
+    int b = batchOfStack(seqId);
+    if (b != S->batchId) return false;
+    for (auto& m : S->members)
+        if (m.seqId == seqId) { m.value = value; m.include = include; return true; }
+    removeFromSeries(seqId);
+    S->members.push_back({ seqId, value, include });
+    app.imagesRev++;
+    return true;
+}
+// A series with nothing in it is not a work in progress, it is litter: the
+// creation path leaves one member behind, closes take the rest away.
+static void pruneEmptySeries() {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->members.empty()) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+}
+// Text -> a parameter value, and NOTHING ELSE to a number. atof() answers 0 for
+// every string it cannot read, and 0 in a series is not a missing point: it is
+// the dark stack the offset is anchored to and the read noise is MEASURED in
+// (linRecompute). "-", "", "1e", "notanumber" and a truncated write all mean the
+// same thing here - UNSET, which the whole layer already knows how to show and
+// how to keep out of a fit.
+static double parseSeriesValue(const char* s) {
+    const double NOTSET = std::numeric_limits<double>::quiet_NaN();
+    if (!s) return NOTSET;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s || (s[0] == '-' && s[1] == '\0')) return NOTSET;   // "-" = unset
+    char* end = nullptr;
+    double v = strtod(s, &end);
+    if (end == s) return NOTSET;                     // nothing numeric at all
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end) return NOTSET;                         // trailing junk: "1e", "12x"
+    return std::isfinite(v) ? v : NOTSET;            // inf/nan are not measurements
+}
+// A double as text that reads back as the SAME double. The session file is
+// written at setprecision(9), which is right for a view offset and wrong for the
+// axis a fit is taken against: 1234567.89 comes back as 1234570. Nine digits
+// first, so every value that already round-tripped keeps its old spelling.
+static std::string fmtExact(double v) {
+    char b[48];
+    for (int p = 9; p < 17; p++) {
+        snprintf(b, sizeof b, "%.*g", p, v);
+        if (strtod(b, nullptr) == v) return b;
+    }
+    snprintf(b, sizeof b, "%.17g", v);
+    return b;
+}
+// The Linearity panel's numbers describe ONE set of members with ONE set of
+// values on the axis, and every label around them is read live off the series.
+// Change the series and a fit left standing is not merely old, it is relabelled:
+// lux measurements headed "DN/ms". linFitStale keeps the per-stack MEASUREMENTS
+// (they are DN whatever the axis says) and drops only the fit; linInvalidate
+// drops the rows too, for when the membership itself moved.
+static void linFitStale() { app.lin.fitValid = false; app.lin.rev++; }
+static void linInvalidate() {
+    app.lin.rows.clear();
+    app.lin.seriesId = 0;
+    app.lin.nPts = 0;
+    linFitStale();
+}
+// Points a fit would actually use: included, value SET (NaN is "unset", never
+// 0), and the stack still there.
+static int seriesFitPoints(const App::Series& S) {
+    int n = 0;
+    for (const auto& m : S.members)
+        if (m.include && std::isfinite(m.value) && seqInfo(m.seqId)) n++;
+    return n;
+}
+static const char* seriesKindName(int k) {
+    switch (k) {
+        case App::Series::KPtc:         return "PTC";
+        case App::Series::KTemperature: return "temperature";
+        case App::Series::KOther:       return "other";
+        default:                        return "linearity";
+    }
+}
+// Whether the Linearity panel's EQUATIONS are the ones this series asked for.
+// The canon (docs/terminology.md: 測定の種類 ... fit の式と出す量が決まる) makes
+// the kind decide that, and this panel knows exactly two: a straight response
+// against the swept parameter, and the photon transfer taken alongside it. A
+// temperature run pushed through them comes out as a "sensitivity" in DN per
+// degree, a system gain K read off stacks that differ in temperature rather
+// than in signal, and a read noise "measured in the level-0 stack" - meaning
+// whichever stack happened to sit at 0 degrees.
+static bool seriesFitKind(const App::Series& S) {
+    return S.kind == App::Series::KLinearity || S.kind == App::Series::KPtc;
+}
+// Two points, a named unit, and a kind whose equation this is. A series of one
+// is perfectly legal (it is being built); it just cannot be fitted yet. An unset
+// unit is the same kind of "not yet" - fitting without one would print numbers
+// per nothing.
+static bool seriesCanFit(const App::Series& S) {
+    return seriesFitKind(S) && S.unit[0] != '\0' && seriesFitPoints(S) >= 2;
+}
+// Every invariant the canon states, checked exhaustively. Used by
+// --series-selftest after every mutation; cheap enough to call from anywhere.
+static bool seriesAudit(std::string& why) {
+    std::vector<int> seen;
+    for (const auto& S : app.series) {
+        if (S.members.empty()) { why = "series '" + S.name + "' has no members"; return false; }
+        bool haveBatch = false;
+        for (const auto& b : app.batches) if (b.id == S.batchId) haveBatch = true;
+        if (!haveBatch) { why = "series '" + S.name + "' points at a dead batch"; return false; }
+        for (const auto& m : S.members) {
+            if (!seqInfo(m.seqId)) {
+                why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                      " does not exist";
+                return false;
+            }
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId != S.batchId) {
+                    why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                          " has a frame in batch " + std::to_string(d->batchId) +
+                          " (series batch " + std::to_string(S.batchId) + ")";
+                    return false;
+                }
+            for (int s : seen)
+                if (s == m.seqId) {
+                    why = "stack " + std::to_string(m.seqId) + " is in two series";
+                    return false;
+                }
+            seen.push_back(m.seqId);
+        }
+    }
+    why.clear();
+    return true;
+}
 
 // Close a set of images by index: erase in descending order so the indices stay
 // valid, one forget per cache that can name them, current re-picked at the end.
@@ -1597,18 +1899,35 @@ static void closeStack(int seqId) {
     closeImages(framesOfSeq(seqId));
     for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
         if (it->id == seqId) { app.seqs.erase(it); break; }
+    // the stack is gone, so it is not a member of anything anymore; a series
+    // that held nothing else goes with it (docs/series-plan.md invariant 3)
+    removeFromSeries(seqId);
+    pruneEmptySeries();
     for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
         if (it->seqId == seqId) it = app.lin.rows.erase(it);
         else ++it;
-    app.lin.rev++;
+    // ...and the fit that row was part of goes with it: dropping the dot while
+    // the line and the "%d points" count still include it is worse than saying
+    // "press Compute".
+    linFitStale();
     app.temporal[0].seqId = app.temporal[1].seqId = -1;
     if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
     if (app.srvTemporalB.seqId == seqId) app.srvTemporalB = App::ServerTemporal{};
 }
 
 // Close a batch: every stack and loose frame in it, plus the queued opens that
-// would resurrect it the moment the fetcher goes idle.
+// would resurrect it the moment the fetcher goes idle. A series lives in
+// exactly one batch, so the batch's series go too - Close on a batch is the
+// canon's "discard the contents", not "ungroup".
 static void closeBatch(int batchId) {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->batchId == batchId) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
     std::vector<int> seqIds;
     for (const auto& d : app.images)
         if (d->batchId == batchId && d->seqId != 0 &&
@@ -1682,10 +2001,116 @@ static void pruneEmptyBatches() {
 
 // Move a STACK between batches - the whole stack, per the canon's containment
 // (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
+// A member moved out ALONE leaves its series: series ⊂ batch is strict, and the
+// canon says say so rather than forbid it. Moving the series itself is a
+// different operation (it carries every member and its own batchId along).
 static void moveStackToBatch(int seqId, int batchId) {
+    if (App::Series* S = seriesOfStack(seqId))
+        if (S->batchId != batchId) {
+            std::string sn = S->name;
+            App::SeqInfo* si = seqInfo(seqId);
+            removeFromSeries(seqId);
+            pruneEmptySeries();
+            toast((si ? si->name : std::string("stack")) + " left series \"" + sn +
+                  "\" (moved to another batch)");
+        }
     for (int idx : framesOfSeq(seqId)) app.images[idx]->batchId = batchId;
     app.imagesRev++;
     pruneEmptyBatches();
+}
+// ---- what the Files panel's series row does (docs/series-plan.md §4) --------
+// Move a SERIES between batches: every member goes with it and so does the
+// series itself, so strict containment holds at every instant. The series'
+// batchId is set FIRST on purpose - moveStackToBatch drops a member whose
+// series stays behind, which is the right rule for a lone stack and exactly
+// the wrong one here.
+static void moveSeriesToBatch(int seriesId, int batchId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || batchId == 0 || S->batchId == batchId) return;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    S->batchId = batchId;
+    for (int s : ids) moveStackToBatch(s, batchId);
+    app.imagesRev++;
+}
+// UNGROUP (解散): take the fence away and leave everything standing. This is
+// NOT Close - nothing is discarded, every stack stays open exactly where it is
+// and merely stops being part of a sweep. The canon lists the two side by side
+// because they are different operations, not two words for one.
+static void ungroupSeries(int seriesId) {
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            std::string n = it->name;
+            int members = (int)it->members.size();
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            toast("ungrouped \"" + n + "\": " + std::to_string(members) +
+                  " stack(s) stay open");
+            break;
+        }
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+}
+// Close a series: the canon's Close, which discards the CONTENTS. Each member's
+// closeStack removes it from the series, and the last one takes the series with
+// it (pruneEmptySeries) - the erase below is only for a series whose members
+// were all gone already.
+static void closeSeries(int seriesId) {
+    App::Series* S = seriesById(seriesId);
+    if (!S) return;
+    std::string n = S->name;
+    std::vector<int> ids;
+    for (const auto& m : S->members) ids.push_back(m.seqId);
+    for (int s : ids) closeStack(s);
+    for (auto it = app.series.begin(); it != app.series.end(); ++it)
+        if (it->id == seriesId) {
+            if (app.curSeriesId == seriesId) app.curSeriesId = 0;
+            app.series.erase(it);
+            app.imagesRev++;
+            break;
+        }
+    toast("closed series \"" + n + "\": " + std::to_string(ids.size()) + " stack(s)");
+}
+// "seqctx > Series > <name>": the one join that does not go through the modal.
+// A function like every other command behind a Files row, so the selftest can
+// press it. Returns false (and a reason) when strict containment refuses.
+//
+// The value comes from the stack's NAME and is said out loud - the menu item
+// showed it before the click, and the toast repeats both the number and the text
+// it was read out of. A name with nothing numeric in it joins UNSET, never at 0.
+static bool seriesJoinFromMenu(int seriesId, int seqId, std::string* msgOut) {
+    App::Series* S = seriesById(seriesId);
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!S || !si) return false;
+    std::string from;
+    double v = extractLevelFromName(si->name, &from);
+    // the series it is LEAVING: taking the last member out of one empties it
+    const App::Series* was = seriesOfStack(seqId);
+    int wasId = was && was->id != S->id ? was->id : 0;
+    std::string wasName = wasId ? was->name : std::string();
+    if (!addToSeries(S->id, seqId, v)) {
+        if (msgOut)
+            *msgOut = si->name + " is not in batch \"" + batchNameOf(S->batchId) +
+                      "\" - Move to batch first";
+        return false;
+    }
+    std::string msg = si->name + " joined series \"" + S->name + "\"";
+    if (std::isfinite(v)) {
+        char b[96];
+        snprintf(b, sizeof b, " at %.6g%s%s", v, S->unit[0] ? " " : "", S->unit);
+        msg += b;
+        if (!from.empty()) msg += " (read from \"" + from + "\")";
+    } else {
+        msg += " with NO value yet - set it in Edit...";
+    }
+    // Every other caller of addToSeries prunes; this one did not, so joining the
+    // sole member of one series into another left the first behind with zero
+    // members - the state plan §1 invariant 3 forbids and seriesAudit rejects.
+    pruneEmptySeries();
+    if (wasId && !seriesById(wasId)) msg += "; series \"" + wasName + "\" is now empty and gone";
+    linFitStale();          // the fit below was measured over the old membership
+    if (msgOut) *msgOut = msg;
+    return true;
 }
 // A standalone frame (no stack) hangs off the batch directly and moves alone.
 static void moveImageToBatch(int imageIdx, int batchId) {
@@ -1708,6 +2133,14 @@ static void closeAll() {
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.seqs.clear();
+    // Series name stacks that no longer exist; they go with them (and with the
+    // batches below - a series cannot outlive its batch). Pending restores name
+    // stacks of the list being thrown away, so they go too.
+    app.series.clear();
+    app.curSeriesId = 0;
+    app.seriesRestore.clear();
+    app.seqLevelLegacy.clear();
+    app.seriesPending.clear();                  // they named stacks being thrown away
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
@@ -2659,7 +3092,8 @@ static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 // Rendering is separate from writing so the crash handler can keep a pre-rendered
 // copy and never has to build one while the process is already dying.
-static void writeSessionTo(std::ostream& f) {
+static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
+                           int* lostMembersOut = nullptr) {
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << app.dispGamma << "\n";
@@ -2776,6 +3210,48 @@ static void writeSessionTo(std::ostream& f) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
         }
     }
+    // ---- series (系列), after the image lines -------------------------------
+    // A FLAT block with unique keys, on purpose: an older viewer skips every
+    // line it does not know and still opens the session, and this one opens a
+    // session with no block as zero series. Nothing else in the format moves.
+    //
+    // Members travel by the PATH OF THEIR FIRST FRAME. A stack NAME would be
+    // the obvious choice and is the wrong one: seqname is written but silently
+    // dropped on restore for folder stacks (when the line is parsed the stack
+    // does not exist yet - the frames arrive from a queued rescan), so half the
+    // members would resolve to nothing. A path is what the session already
+    // proves it can round-trip: it is how the image lines themselves work.
+    int lostSeries = 0, lostMembers = 0;
+    for (const auto& S : app.series) {
+        std::string bn = batchNameOf(S.batchId);
+        // no batch, nothing to restore it into - and nothing silently: the load
+        // side counts every member it cannot resolve, so the save side owes the
+        // same. A series that leaves the file is a sweep's worth of hand-typed
+        // parameter values gone.
+        if (bn.empty()) { lostSeries++; lostMembers += (int)S.members.size(); continue; }
+        f << "series " << S.name << "\n";              // name last on its line: spaces
+        f << "seriesbatch " << bn << "\n";             // by NAME, like imgbatch
+        f << "seriesparam " << S.paramName << "\n";
+        f << "seriesunit " << S.unit << "\n";          // empty line = unit not set
+        f << "serieskind " << S.kind << "\n";
+        for (const auto& m : S.members) {
+            std::vector<int> fr = framesOfSeq(m.seqId);
+            if (fr.empty()) { lostMembers++; continue; }
+            f << "seriesmember ";
+            // EXACTLY, not to the file-wide 9 digits: this is the axis a fit is
+            // taken against, and the modal no longer rounds it either.
+            if (std::isfinite(m.value)) f << fmtExact(m.value);
+            else f << "-";                             // "-" = unset, NOT zero
+            f << " " << (m.include ? 1 : 0) << " "
+              << app.images[fr.front()]->path << "\n";   // path last: spaces
+        }
+        f << "seriesend\n";
+    }
+    if (lostSeries || lostMembers)
+        fprintf(stderr, "series: NOT saved: %d series and %d member(s) had nothing to "
+                        "restore them from\n", lostSeries, lostMembers);
+    if (lostSeriesOut) *lostSeriesOut = lostSeries;
+    if (lostMembersOut) *lostMembersOut = lostMembers;
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " "
@@ -2795,8 +3271,15 @@ static void saveSession(std::string path, bool quiet = false) {
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
-    writeSessionTo(f);
-    if (!quiet) toast("session saved: " + baseName(path));
+    int lostSeries = 0, lostMembers = 0;
+    writeSessionTo(f, &lostSeries, &lostMembers);
+    if (quiet) return;
+    std::string msg = "session saved: " + baseName(path);
+    // the load side counts what it could not restore; so does this one now
+    if (lostSeries || lostMembers)
+        msg += " (" + std::to_string(lostSeries) + " series and " +
+               std::to_string(lostMembers) + " series member(s) could NOT be saved)";
+    toast(msg, lostSeries > 0 || lostMembers > 0);
 }
 
 static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
@@ -2991,6 +3474,7 @@ static std::string loadSession(const std::string& path) {
     // whole stack, so resolve it to a real index once that line is fully applied
     // (seqframe, which picks the frame, comes after the image line).
     int lineOrd = -1, wantCurrent = -1, resolvedCurrent = -1;
+    int curSeries = -1;               // index into app.seriesRestore, -1 = outside a block
     bool capturing = false;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
@@ -3094,10 +3578,53 @@ static std::string loadSession(const std::string& path) {
             if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
                 if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
         }
-        else if (key == "seqlevel") {   // the exposure level of the stack above
+        // MIGRATION of the old per-stack level. saveSession has never written
+        // this key (verified over the whole history: no commit ever emitted
+        // it), so it fires only for hand-written or third-party files. Note the
+        // old reader also required cur()->seqId != 0, which is FALSE for a
+        // folder stack at parse time - it could only ever have worked for an
+        // in-file frame axis. This one keys on the PATH, which works for both,
+        // and turns into a series only where there is a sweep to speak of.
+        else if (key == "seqlevel") {
             double lv = 0; ls >> lv;
-            if (lastImageOk && cur() && cur()->seqId != 0)
-                if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->level = lv;
+            if (lastImageOk && cur() && !cur()->path.empty() && std::isfinite(lv))
+                app.seqLevelLegacy.push_back({ cur()->path, lv });
+        }
+        // ---- series (系列) block: collected here, RESOLVED later -------------
+        // Nothing can be looked up yet - a folder stack is still one loose image
+        // with a queued rescan behind it. See resolveSeriesRestore.
+        else if (key == "series") {
+            App::SeriesRestore r;
+            r.name = restOfLine(ls);
+            app.seriesRestore.push_back(std::move(r));
+            curSeries = (int)app.seriesRestore.size() - 1;
+        }
+        else if (key == "seriesend") curSeries = -1;
+        else if (key == "seriesbatch") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].batchName = restOfLine(ls);
+        }
+        else if (key == "seriesparam") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].paramName = restOfLine(ls);
+        }
+        else if (key == "seriesunit") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].unit = restOfLine(ls);
+        }
+        else if (key == "serieskind") {
+            if (curSeries >= 0) { int k = 0; ls >> k; app.seriesRestore[curSeries].kind = k; }
+        }
+        else if (key == "seriesmember") {   // "<value|-> <0|1> <path of frame 0>"
+            // Both fields as TEXT. A value this program cannot read is UNSET,
+            // not 0: atof() turns "notanumber", "1e" or a half-written line into
+            // a hard measurement at zero, which the fit then treats as the dark
+            // stack. A loader is exactly where that must not be assumed.
+            std::string v, inc;
+            ls >> v >> inc;
+            std::string p = restOfLine(ls);
+            if (curSeries >= 0 && !p.empty()) {
+                double val = parseSeriesValue(v.c_str());
+                if (v != "-" && !std::isfinite(val)) app.seriesRestore[curSeries].badValues++;
+                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p });
+            }
         }
         else if (key == "linunit") { std::string u = restOfLine(ls);
                                      snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
@@ -3576,6 +4103,189 @@ static bool seqReadyPending() {
     return !app.seqReady.empty();
 }
 
+// The stack a session's series member names, found by the path of its FIRST
+// frame. 0 = that frame is not open (or is not part of a stack).
+//
+// preferBatch disambiguates the case the canon explicitly blesses: reopening
+// the same folder makes a NEW batch, so one file is legitimately resident in two
+// stacks at once. Taking "the first one" then hands every member of the second
+// copy's series a stack in the wrong batch, strict containment rejects them all,
+// and the whole series is lost - permanently, at the next autosave.
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0) {
+    int any = 0;
+    for (const auto& d : app.images) {
+        if (d->seqId == 0 || d->path != path) continue;
+        if (preferBatch && d->batchId == preferBatch) return d->seqId;
+        if (!any) any = d->seqId;
+    }
+    return any;
+}
+
+// Turn what the session file said into real series. Runs once, when every
+// stack the file asked for exists - a member cannot be looked up before then.
+// Members that cannot be found are COUNTED and reported: silently dropping
+// points out of a measurement is the one thing this must not do.
+static void resolveSeriesRestore() {
+    int made = 0, lost = 0, lostSeries = 0, badValues = 0;
+    for (const auto& R : app.seriesRestore) {
+        badValues += R.badValues;
+        int bid = 0;
+        for (const auto& b : app.batches) if (b.name == R.batchName) bid = b.id;
+        if (!bid) { lostSeries++; lost += (int)R.members.size(); continue; }
+        std::vector<App::Series::Member> ms;
+        for (const auto& m : R.members) {
+            int sid = seqIdOfFirstFramePath(m.path, bid);
+            // strict containment survives the round trip too, or not at all
+            if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
+            bool dup = false;
+            for (const auto& x : ms) if (x.seqId == sid) dup = true;
+            if (dup) continue;
+            ms.push_back({ sid, m.value, m.include });
+        }
+        if (ms.empty()) { lostSeries++; continue; }
+        int id = newSeries(bid, R.name);
+        for (const auto& m : ms) {           // at most one series per stack
+            App::Series* other = seriesOfStack(m.seqId);
+            if (other && other->id != id) removeFromSeries(m.seqId);
+        }
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = R.paramName;
+            snprintf(S->unit, sizeof S->unit, "%s", R.unit.c_str());
+            S->kind = std::clamp(R.kind, 0, 3);
+            S->members = std::move(ms);
+            made++;
+        }
+    }
+    app.seriesRestore.clear();
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made || lost || lostSeries || badValues) {
+        std::string msg = "restored " + std::to_string(made) + " series";
+        if (lost || lostSeries)
+            msg += "; " + std::to_string(lost) + " member(s) and " +
+                   std::to_string(lostSeries) + " series could not be resolved";
+        // a value the file states but this program cannot read is left UNSET,
+        // and that is a fit point fewer than the file claims - say so
+        if (badValues)
+            msg += "; " + std::to_string(badValues) +
+                   " unreadable value(s) left unset (never 0)";
+        toast(msg, lost > 0 || lostSeries > 0 || badValues > 0);
+        fprintf(stderr, "series: %s\n", msg.c_str());
+    }
+}
+
+// Old sessions that carried a per-stack "seqlevel": one series per BATCH that
+// actually has two or more levelled stacks, named "<batch> 掃引", unit = the
+// prefill, kind = linearity. A batch with fewer gets NOTHING - guessing a sweep
+// out of the folder structure is precisely what the canon forbids.
+static void migrateLegacyLevels() {
+    std::vector<std::pair<int, double>> lvl;      // seqId -> level
+    for (const auto& p : app.seqLevelLegacy) {
+        int sid = seqIdOfFirstFramePath(p.first);
+        if (!sid || seriesOfStack(sid)) continue;   // an explicit series wins
+        bool dup = false;
+        for (const auto& q : lvl) if (q.first == sid) dup = true;
+        if (!dup) lvl.emplace_back(sid, p.second);
+    }
+    app.seqLevelLegacy.clear();
+    std::vector<int> batches;
+    for (const auto& q : lvl) {
+        int b = batchOfStack(q.first);
+        if (!b) continue;
+        bool seen = false;
+        for (int x : batches) if (x == b) seen = true;
+        if (!seen) batches.push_back(b);
+    }
+    int made = 0;
+    for (int b : batches) {
+        int n = 0;
+        for (const auto& q : lvl) if (batchOfStack(q.first) == b) n++;
+        if (n < 2) continue;                        // not a sweep, do not invent one
+        int id = newSeries(b, "");
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = "level";
+            snprintf(S->unit, sizeof S->unit, "%s", app.lin.unit);
+            S->kind = App::Series::KLinearity;
+        }
+        for (const auto& q : lvl)
+            if (batchOfStack(q.first) == b) addToSeries(id, q.first, q.second);
+        made++;
+    }
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made) {
+        toast("migrated " + std::to_string(made) +
+              " series from an old session's stack levels");
+        fprintf(stderr, "series: migrated %d from seqlevel\n", made);
+    }
+}
+
+// The picker's "open as a sweep", once its stacks exist. Matching is BY NAME:
+// the group name the picker accepted becomes the stack's name, and for a remote
+// stack it is that name plus " [remote xN]" (openRemoteStack). The remote queue
+// carries no seqId at all, so there is nothing else to match on.
+//
+// Nothing here invents anything: the values were read from the group names and
+// shown in the picker before Load was pressed, and a group whose stack never
+// opened is COUNTED and said out loud rather than dropped.
+static void resolveOnePendingSeries(const App::SeriesPending& P) {
+    std::vector<int> used;
+    int id = 0, made = 0, lost = 0;
+    for (const auto& e : P.byName) {
+        int seqId = 0;
+        for (const auto& si : app.seqs) {
+            if (batchOfStack(si.id) != P.batchId) continue;
+            if (std::find(used.begin(), used.end(), si.id) != used.end()) continue;
+            bool same = si.name == e.first ||
+                        (si.name.size() > e.first.size() + 10 &&
+                         si.name.compare(0, e.first.size(), e.first) == 0 &&
+                         si.name.compare(e.first.size(), 10, " [remote x") == 0);
+            if (same) { seqId = si.id; break; }
+        }
+        if (!seqId) { lost++; continue; }
+        used.push_back(seqId);
+        if (!id) {                       // the first member that resolves makes it
+            id = newSeries(P.batchId, P.name);
+            if (App::Series* S = seriesById(id)) {
+                S->paramName = P.paramName;
+                snprintf(S->unit, sizeof S->unit, "%s", P.unit.c_str());
+                S->kind = P.kind;
+            }
+        }
+        if (addToSeries(id, seqId, e.second)) made++;
+        else lost++;
+    }
+    // In VALUE order, not the order the folders happened to sort in: the groups
+    // arrive as 0,10,160,20,320,40,80 (lexicographic), and a sweep is a
+    // parameter axis - reading it out of order is reading it wrong. Unset
+    // values keep their relative order and go last (they are not "before 0").
+    // The modal's arrows and "Sort by value" still own the order after this.
+    if (App::Series* S = seriesById(id))
+        std::stable_sort(S->members.begin(), S->members.end(),
+                         [](const App::Series::Member& a, const App::Series::Member& b) {
+                             bool fa = std::isfinite(a.value), fb = std::isfinite(b.value);
+                             if (fa != fb) return fa;          // set before unset
+                             return fa && a.value < b.value;
+                         });
+    pruneEmptySeries();
+    if (id && seriesById(id)) app.curSeriesId = id;
+    const App::Series* S = seriesById(id);
+    std::string msg = "sweep: " + std::to_string(made) + " stack(s) in series \"" +
+                      (S ? S->name : std::string("(none)")) + "\"";
+    if (lost) msg += "; " + std::to_string(lost) + " could not be matched";
+    toast(msg, lost > 0);
+    fprintf(stderr, "series: %s\n", msg.c_str());
+}
+// Every sweep the picker was told to open, in the order it was told. They all
+// wait for the same drain (a member cannot be looked up before its stack
+// exists), so they all resolve here - none of them is thrown away because a
+// second Open happened while the first was still loading.
+static void resolvePendingSeries() {
+    std::vector<App::SeriesPending> queue;
+    queue.swap(app.seriesPending);
+    for (const auto& P : queue) resolveOnePendingSeries(P);
+}
+
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
@@ -3591,6 +4301,17 @@ static void pumpSequenceAndQueue() {
         return;                 // let it start before chaining anything else
     }
     if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
+    // Series LAST, and only once everything a member could name is open: the
+    // stacks arrive over many frames, and a lookup one frame too early would
+    // report perfectly good members as missing.
+    if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty() ||
+         !app.seriesPending.empty()) &&
+        !app.seqRunning && app.seqQueue.empty() && app.seqRestore.empty() &&
+        app.rbOpenQueue.empty() && !seqReadyPending()) {
+        if (!app.seriesRestore.empty()) resolveSeriesRestore();
+        if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
+        if (!app.seriesPending.empty()) resolvePendingSeries();
+    }
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -3855,10 +4576,18 @@ static void startNextQueuedGroup() {
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
     if (groups.empty()) return;
     app.folderRecipeValid = false;
-    app.seqQueue = std::move(groups);
-    int frames = 0;
-    for (const auto& g : app.seqQueue) frames += (int)g.files.size();
-    toast("opening " + std::to_string(app.seqQueue.size()) + " stack(s), " +
+    // APPEND. This used to be `app.seqQueue = std::move(groups)`, so a second
+    // Open while the first was still loading silently CANCELLED every stack the
+    // first Open had not started yet - the second Open's folder came up looking
+    // complete while most of the first one was simply gone. startNextQueuedGroup
+    // already refuses to start while one is running, so the queue just gets
+    // longer. (Found while reproducing the series pending-slot finding: fixing
+    // the slot alone still left the first sweep with one stack out of seven.)
+    int added = (int)groups.size(), frames = 0;
+    for (const auto& g : groups) frames += (int)g.files.size();
+    app.seqQueue.insert(app.seqQueue.end(), std::make_move_iterator(groups.begin()),
+                        std::make_move_iterator(groups.end()));
+    toast("opening " + std::to_string(added) + " stack(s), " +
           std::to_string(frames) + " files");
     startNextQueuedGroup();
 }
@@ -4023,6 +4752,13 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.pickFilter[0] = 0;                 // a leftover filter would silently cut
     app.pickMerge = 0;                     // the new scan - start every scan clean
     app.pickBatchMode = 0;                 // batch layout too: one batch is the canon
+    // ...and the sweep, which is the one that could invent a measurement: a
+    // parameter name and a unit left over from the last Open would be applied to
+    // a folder that has nothing to do with it, and "単位を仮定しない" means not
+    // assuming the PREVIOUS one either.
+    app.pickSweep = false;
+    app.pickSweepParam[0] = '\0';
+    app.pickSweepUnit[0] = '\0';
     {   // batch names stem from the scanned root's leaf ("batchset", "scanroot")
         std::string leaf = rootN;
         size_t sl = leaf.find_last_of('/');
@@ -4111,7 +4847,13 @@ static void pickerAccept() {
     std::vector<App::PendingGroup> sel = pickerSelection(&err);
     bool remote = app.folderPickRemote;
     std::string host = app.folderPickHost;
-    int batchMode = app.pickMerge == 1 ? 0 : app.pickBatchMode;
+    // "as a sweep" is exclusive with batch-per-top-folder HERE, not only in the
+    // dialog: a series lives in one batch, and that has to hold for every
+    // caller, headless ones included.
+    bool sweep = app.pickSweep && app.pickMerge == 0;
+    int batchMode = (app.pickMerge == 1 || sweep) ? 0 : app.pickBatchMode;
+    std::string swParam = app.pickSweepParam, swUnit = app.pickSweepUnit;
+    app.pickSweep = false;            // a per-Open choice, never sticky
     std::string batchBase = app.folderPickBatchBase;
     app.folderPick.clear();
     app.folderPickOpen = false;
@@ -4137,6 +4879,19 @@ static void pickerAccept() {
     } else {
         int id = newBatch(uniqueBatchName(batchBase));
         for (auto& g : sel) g.batchId = id;
+    }
+    // The sweep is only a NOTE here - the stacks do not exist yet, and half of
+    // them will arrive over the next several seconds. Built before sel is moved
+    // away below; two groups minimum, because one point is not a sweep.
+    if (sweep && sel.size() >= 2) {
+        App::SeriesPending P;
+        P.batchId = sel.front().batchId;
+        P.paramName = swParam;
+        P.unit = swUnit;                       // may be empty: then no fit, and
+        P.kind = App::Series::KLinearity;      // the panel says exactly that
+        for (const auto& g : sel)
+            P.byName.emplace_back(g.name, extractLevelFromName(g.name));
+        app.seriesPending.push_back(std::move(P));   // QUEUED, never overwritten
     }
     if (remote) {
         // remote groups: through the open queue, one stack at a time, so the
@@ -4223,8 +4978,14 @@ static void drawFolderPickModal() {
         mixedRawNpy = anyRaw && anyNpy;
     }
     bool mergeWarn = app.pickMerge == 1 && (mixedRawNpy || shapes.size() > 1);
-    float footer = ImGui::GetFrameHeightWithSpacing() * 3 +
-                   ImGui::GetTextLineHeightWithSpacing() * (mergeWarn ? 2 : 1);
+    // The sweep row exists only where a sweep could: separate stacks, two or
+    // more of them. Hidden, the box is FORCED OFF - a control nobody can see
+    // must not be able to create a series (docs/terminology.md: never auto).
+    const bool sweepRow = app.pickMerge == 0 && selGroups >= 2;
+    if (!sweepRow) app.pickSweep = false;
+    float footer = ImGui::GetFrameHeightWithSpacing() * (sweepRow ? 4 : 3) +
+                   ImGui::GetTextLineHeightWithSpacing() *
+                       ((mergeWarn ? 2 : 1) + (app.pickSweep ? 1 : 0));
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
     std::vector<std::string> folders;
@@ -4285,6 +5046,26 @@ static void drawFolderPickModal() {
                              e.g.shape.empty() ? "" : "  ", e.g.shape.c_str());
                 ImGui::TextUnformatted(lb);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
+                // the sweep preview: the value this group's NAME suggests, on
+                // the row it was read from, BEFORE Load is pressed. A proposal
+                // nobody looked at is not a confirmation.
+                if (app.pickSweep && e.selected) {
+                    std::string from;
+                    double v = extractLevelFromName(e.g.name, &from);
+                    ImGui::SameLine();
+                    if (std::isfinite(v))   // a number per NOTHING says so, here too
+                        ImGui::TextDisabled("-> %.6g %s", v,
+                                            app.pickSweepUnit[0] ? app.pickSweepUnit
+                                                                 : "[unit not set]");
+                    else
+                        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "-> no value in the name");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(std::isfinite(v)
+                            ? "read from \"%s\" - correct it later in Edit series..."
+                            : "nothing numeric in \"%s\": this stack joins UNSET,\n"
+                              "and an unset value never enters a fit as 0.",
+                            from.empty() ? e.g.name.c_str() : from.c_str());
+                }
                 if (open) {
                     std::vector<int> vis;          // files the filter keeps
                     vis.reserve(e.nMatch);
@@ -4345,7 +5126,7 @@ static void drawFolderPickModal() {
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("batch:");
         ImGui::SameLine();
-        ImGui::BeginDisabled(app.pickMerge == 1);
+        ImGui::BeginDisabled(app.pickMerge == 1 || app.pickSweep);
         ImGui::RadioButton("one batch###batch0", &app.pickBatchMode, 0);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("everything from this Open lands under ONE Files heading");
@@ -4354,9 +5135,56 @@ static void drawFolderPickModal() {
         snprintf(b1, sizeof b1, "%d batches (one per top folder)###batch1", topFolders);
         ImGui::RadioButton(b1, &app.pickBatchMode, 1);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("each top-level folder of the scanned root becomes\n"
-                              "its own batch (its own Files heading)");
+            ImGui::SetTooltip(app.pickSweep
+                ? "not while \"open as a sweep\" is on: a series lives in ONE\n"
+                  "batch, so one batch is the only grouping that can hold it"
+                : "each top-level folder of the scanned root becomes\n"
+                  "its own batch (its own Files heading)");
         ImGui::EndDisabled();
+    }
+    // ---- row 3: open as a sweep (docs/series-plan.md §5) --------------------
+    // The one place in the program that creates a series without the modal, and
+    // it does it because a human ticked a box that says so. Unticked, NOTHING
+    // is created - a sweep guessed from a folder tree is a lie that fits.
+    if (sweepRow) {
+        ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+                              "the value read from its name, and linearity / PTC measure the\n"
+                              "series as a whole.\n"
+                              "Nothing is created unless this is ticked.", selGroups);
+        if (app.pickSweep) {
+            app.pickBatchMode = 0;              // series ⊂ batch, strictly
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+            ImGui::InputTextWithHint("##swparam", "parameter", app.pickSweepParam,
+                                     sizeof app.pickSweepParam);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            ImGui::InputTextWithHint("##swunit", "unit", app.pickSweepUnit,
+                                     sizeof app.pickSweepUnit);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("lx, ms, photons/px ... LEAVE IT EMPTY if you do not\n"
+                                  "know yet: an unset unit means no fit, which is the\n"
+                                  "honest answer, and Edit series... sets it later.");
+        }
+    }
+    if (app.pickSweep) {
+        int valued = 0;
+        for (const auto& e : app.folderPick)
+            if (e.selected && e.nMatch && std::isfinite(extractLevelFromName(e.g.name)))
+                valued++;
+        if (valued < selGroups)
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                               "%d of %d have a value in their name; the rest join UNSET "
+                               "(never 0)", valued, selGroups);
+        else if (!app.pickSweepUnit[0])
+            ImGui::TextDisabled("all %d have a value. No unit yet - the series opens, "
+                                "the fit waits for one.", valued);
+        else
+            ImGui::TextDisabled("all %d have a value, in %s", valued, app.pickSweepUnit);
     }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
@@ -4371,13 +5199,16 @@ static void drawFolderPickModal() {
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
         ImGui::TextDisabled("check the shape column above to see which sequences differ");
     ImGui::BeginDisabled(!loadable);
-    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack" : "Load selected",
+    bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
+                              : app.pickSweep   ? "Load as a sweep"
+                                                : "Load selected",
                               ImVec2(150 * app.uiScale, 0));
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         app.folderPick.clear();
         app.folderPickOpen = false;
+        app.pickSweep = false;         // Cancel decides nothing, here least of all
         ImGui::CloseCurrentPopup();
     }
     if (load) {
@@ -7960,8 +8791,10 @@ static void drawPanelProjection() {
 
 // "100lx/frame_###.npy" -> 100; "00/f_###" -> 0; "run42_200ms.npy [remote]" -> 42.
 // Rule: the first number in the FOLDER part when there is one, else in the whole
-// name. Deliberately simple - the field is editable, this is only the default.
-static double extractLevelFromName(const std::string& name) {
+// name. Deliberately simple - this is only a SUGGESTION a human confirms, and
+// srcOut reports the text it was read out of so the modal can show its work.
+// (the default for srcOut is on the forward declaration, with the model.)
+static double extractLevelFromName(const std::string& name, std::string* srcOut) {
     std::string part = name;
     size_t slash = part.find_last_of('/');
     if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
@@ -7979,9 +8812,11 @@ static double extractLevelFromName(const std::string& name) {
             part.erase(a, b - a);
         }
     }
+    if (srcOut) srcOut->clear();
     for (size_t i = 0; i < part.size(); i++) {
         if (isdigit((unsigned char)part[i])) {
             // avoid the "###" pattern placeholder and sizes like 640x480
+            if (srcOut) *srcOut = part;
             return atof(part.c_str() + i);
         }
     }
@@ -8085,37 +8920,59 @@ static const ImU32 LIN_COLS[4] = {
 
 // Everything the panel shows, recomputed only when Compute is pressed: this is
 // a measurement action over potentially hundreds of frames, not a per-frame UI.
-static void linRecompute() {
+//
+// ONE SERIES, not "every open stack". The old walk over app.seqs meant two
+// sweeps open at the same time were silently fitted as one curve, and the
+// parameter values had nowhere to live but the stacks themselves. The rows are
+// the series' members, in the series' order; include and value come straight
+// off Series::Member, so a table row IS members[i] and there is nothing to
+// carry across a recompute.
+static void linRecompute(int seriesId) {
     App::LinState& L = app.lin;
+    L.seriesId = seriesId;
     // the ROI is shared with everything else: the selected rect, or whole frame
     int rx = 0, ry = 0, rw = 0, rh = 0;
     L.roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn))
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; L.roiUsed = true; }
-    std::vector<std::pair<int, bool>> keepInc;
-    for (const auto& r : L.rows) keepInc.push_back({ r.seqId, r.include });
     L.rows.clear();
-    for (const auto& si : app.seqs) {
-        std::vector<int> fr = framesOfSeq(si.id);
-        if (fr.size() < 2 && si.expectedFrames < 2) continue;
+    App::Series* S = seriesById(seriesId);
+    if (!S) {
+        L.fitValid = false;
+        L.nPl = 1; L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
+    for (const auto& m : S->members) {
+        App::SeqInfo* si = seqInfo(m.seqId);
+        if (!si) continue;              // seriesAudit says this cannot happen
         App::LinState::Row r;
-        r.seqId = si.id;
-        r.name = si.name;
-        r.level = si.level;
-        StackStats st = computeStackStats(si.id, rx, ry, rw, rh);
+        r.seqId = m.seqId;
+        r.name = si->name;
+        r.level = m.value;
+        r.include = m.include;
+        StackStats st = computeStackStats(m.seqId, rx, ry, rw, rh);
         r.valid = st.valid;
         r.err = st.err;
         r.frames = st.frames;
         r.nPl = st.nPl;
         for (int p = 0; p < 4; p++) { r.mean[p] = st.mean[p]; r.sigmaT[p] = st.sigmaT[p]; }
-        for (const auto& k : keepInc) if (k.first == si.id) r.include = k.second;
         L.rows.push_back(std::move(r));
     }
-    // fits, per plane, over rows that have both a level and a measurement
+    // fits, per plane, over rows that have both a value and a measurement
     L.fitValid = false;
     L.nPl = 1;
     for (const auto& r : L.rows) if (r.valid) L.nPl = std::max(L.nPl, r.nPl);
     int fitted = 0;
+    // No unit, no fit - and no fit for a kind these equations do not describe.
+    // The per-stack MEANS above are DN either way and stay on screen; a
+    // sensitivity is DN per SOMETHING measured by a KNOWN law, and inventing
+    // either is exactly the assumption the series layer exists to stop.
+    if (S->unit[0] == '\0' || !seriesFitKind(*S)) {
+        L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
     for (int p = 0; p < L.nPl; p++) {
         std::vector<double> lx, ly, pm, pv;
         for (const auto& r : L.rows) {
@@ -8163,30 +9020,373 @@ static void linRecompute() {
     L.computedRev = ++L.rev;
 }
 
+// SELFTEST ONLY - the one place in the program that creates a series without a
+// human. The canon forbids auto-creation because a guessed sweep is a lie that
+// fits; a headless test has nobody to press Create, so it presses it here, in
+// the open: ONE series over every stack of one batch, values from
+// extractLevelFromName (exactly the proposal the Create modal puts on screen),
+// unit = the same prefill that modal starts from. Called only from --*-selftest
+// branches in main(); returns 0 when the batch held no stacks.
+static int selftestMakeSeries(int batchId, const char* unitPrefill) {
+    if (!batchId) return 0;
+    int id = newSeries(batchId, "");
+    if (App::Series* S = seriesById(id)) {
+        S->paramName = "level";
+        snprintf(S->unit, sizeof S->unit, "%s",
+                 unitPrefill && *unitPrefill ? unitPrefill : "lx");
+    }
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != batchId) continue;
+        addToSeries(id, si.id, extractLevelFromName(si.name));
+    }
+    App::Series* S = seriesById(id);
+    if (!S || S->members.empty()) { pruneEmptySeries(); return 0; }
+    return id;
+}
+
+static const char* SERIES_KINDS = "linearity\0PTC\0temperature\0other\0";
+
+// What one row of the create/edit table means as a number. An untouched row of
+// an existing member is its stored double, not a re-read of the six digits the
+// box happens to be showing; anything else is the text, and text the program
+// cannot read is UNSET, never 0 (parseSeriesValue).
+static double seriesEditRowValue(const App::SeriesEdit::Row& r) {
+    if (r.haveOrig && !r.touched) return r.orig;
+    return parseSeriesValue(r.value);
+}
+
+// Fill the create/edit modal. Creating: every stack of the batch, all ticked,
+// each with extractLevelFromName's proposal ALREADY in its value box and marked
+// as a proposal. Editing: the members first, in their order, with their own
+// values, then the batch's non-members, unticked.
+//
+// The proposal is the whole point of the old "Auto levels" button, moved to
+// where it belongs: the user sees the numbers and the text they were read out
+// of BEFORE pressing Create, so pressing it is a confirmation. Nothing here
+// runs by itself - series are never auto-created (docs/terminology.md).
+static void openSeriesModal(int batchId, int editId) {
+    App::SeriesEdit& E = app.seriesEdit;
+    E = App::SeriesEdit{};
+    E.editId = editId;
+    E.batchId = batchId;
+    const App::Series* S = editId ? seriesById(editId) : nullptr;
+    if (S) {
+        E.batchId = S->batchId;
+        snprintf(E.name, sizeof E.name, "%s", S->name.c_str());
+        snprintf(E.param, sizeof E.param, "%s", S->paramName.c_str());
+        snprintf(E.unit, sizeof E.unit, "%s", S->unit);
+        E.kind = S->kind;
+    } else {
+        snprintf(E.name, sizeof E.name, "%s 掃引", batchNameOf(batchId).c_str());
+        // the prefill, and only that: an empty box stays empty (prefs linunit)
+        snprintf(E.unit, sizeof E.unit, "%s", app.lin.unit);
+    }
+    auto addRow = [&](int seqId, bool checked, double value, bool haveValue) {
+        App::SeriesEdit::Row r;
+        r.seqId = seqId;
+        r.check = checked;
+        App::SeqInfo* si = seqInfo(seqId);
+        r.name = si ? si->name : std::string();
+        double guess = extractLevelFromName(r.name, &r.from);
+        if (haveValue) {
+            // An EXISTING member. Its value is the user's - INCLUDING the
+            // decision not to set one. A guess proposed over that is a proposal
+            // on a row nobody came here to look at (Edit... is mostly opened to
+            // rename), and Save would commit it: "value unset" becomes a fit
+            // point with zero keystrokes. Creating is where a proposal belongs
+            // (docs/series-plan.md §2: 見た上で Create を押させる); here it is
+            // offered in the column beside the box instead of inside it.
+            r.orig = value;
+            r.haveOrig = true;
+            if (std::isfinite(value)) snprintf(r.value, sizeof r.value, "%.6g", value);
+            else r.guess = guess;
+        } else if (std::isfinite(guess)) {
+            snprintf(r.value, sizeof r.value, "%.6g", guess);
+            r.suggested = true;           // dim + "(guess)" until it is touched
+        }
+        E.rows.push_back(std::move(r));
+    };
+    if (S)
+        for (const auto& m : S->members) addRow(m.seqId, true, m.value, true);
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != E.batchId) continue;
+        bool already = false;
+        for (const auto& r : E.rows) if (r.seqId == si.id) already = true;
+        if (!already) addRow(si.id, S == nullptr, 0, false);
+    }
+    E.open = true;
+}
+
+// The modal's Save / Create button, as a plain function. Every other command in
+// this layer already is one (that is what let the selftest drive them); this one
+// was inline in the draw call, which is exactly why "open Edit... and press Save
+// without touching anything" had to be found by hand instead of by a test.
+// Returns the series' id, or 0 when nothing was accepted.
+static int seriesModalAccept() {
+    App::SeriesEdit& E = app.seriesEdit;
+    // Build the member list in TABLE ORDER: the row order is the series
+    // order, which is why the arrows exist.
+    std::vector<App::Series::Member> ms;
+    for (const auto& r : E.rows) {
+        if (!r.check || !seqInfo(r.seqId)) continue;
+        if (batchOfStack(r.seqId) != E.batchId) continue;   // strict containment
+        App::Series::Member m;
+        m.seqId = r.seqId;
+        m.value = seriesEditRowValue(r);
+        m.include = true;
+        if (const App::Series* old = seriesById(E.editId))   // keep the fit flag
+            for (const auto& om : old->members)
+                if (om.seqId == r.seqId) m.include = om.include;
+        ms.push_back(m);
+    }
+    if (ms.empty()) return 0;
+    int id = E.editId ? E.editId : newSeries(E.batchId, E.name);
+    // a stack belongs to AT MOST ONE series: taking one in takes it out of
+    // wherever it was
+    for (const auto& m : ms) {
+        App::Series* other = seriesOfStack(m.seqId);
+        if (other && other->id != id) removeFromSeries(m.seqId);
+    }
+    if (App::Series* S = seriesById(id)) {
+        S->name = E.name[0] ? E.name : batchNameOf(E.batchId) + " 掃引";
+        S->paramName = E.param;
+        snprintf(S->unit, sizeof S->unit, "%s", E.unit);
+        S->kind = std::clamp(E.kind, 0, 3);
+        S->members = std::move(ms);
+    }
+    // the next new series starts from the unit this one ended with
+    if (E.unit[0]) snprintf(app.lin.unit, sizeof app.lin.unit, "%s", E.unit);
+    app.prefsDirty = true;
+    pruneEmptySeries();
+    if (seriesById(id)) app.curSeriesId = id;
+    // Whatever was on screen measured the series as it WAS. The panel reads its
+    // labels live off the series, so a fit left standing here does not merely go
+    // stale - it gets relabelled with the new unit and the new parameter name.
+    linInvalidate();
+    app.imagesRev++;
+    return seriesById(id) ? id : 0;
+}
+
+static void drawSeriesModal() {
+    App::SeriesEdit& E = app.seriesEdit;
+    // "###" fixes the popup's identity while the title changes: ImGui hashes
+    // only what follows it, so create and edit really are one modal.
+    const char* POPUP = "Series###seriesmodal";
+    char title[64];
+    snprintf(title, sizeof title, "%s###seriesmodal",
+             E.editId ? "Edit series" : "Create series");
+    if (E.open && !ImGui::IsPopupOpen(POPUP)) ImGui::OpenPopup(POPUP);
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(640 * app.uiScale, 480 * app.uiScale), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_None)) return;
+    if (!E.open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+
+    ImGui::Text("batch: %s", batchNameOf(E.batchId).c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(a series lives in exactly one batch)");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+    ImGui::InputText("name", E.name, sizeof E.name);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+    ImGui::InputText("parameter", E.param, sizeof E.param);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::InputText("unit", E.unit, sizeof E.unit);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... printed on every axis and\n"
+                          "column. LEAVE IT EMPTY if you do not know it yet: an\n"
+                          "unset unit means no fit, which is the honest answer.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+    ImGui::Combo("kind", &E.kind, SERIES_KINDS);
+    if (!E.unit[0])
+        ImGui::TextDisabled("unit not set - members and means still show, the fit will not.");
+
+    ImGui::SeparatorText("members  (value = the parameter this stack was captured at)");
+    if (ImGui::SmallButton("Sort by value")) {
+        std::stable_sort(E.rows.begin(), E.rows.end(),
+                         [](const App::SeriesEdit::Row& a, const App::SeriesEdit::Row& b) {
+                             double av = seriesEditRowValue(a), bv = seriesEditRowValue(b);
+                             if (!std::isfinite(av)) av = HUGE_VAL;   // unset goes last
+                             if (!std::isfinite(bv)) bv = HUGE_VAL;
+                             return av < bv;
+                         });
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("All")) for (auto& r : E.rows) r.check = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) for (auto& r : E.rows) r.check = false;
+    ImGui::SameLine();
+    int nChecked = 0, nValued = 0;
+    for (const auto& r : E.rows) {
+        if (!r.check) continue;
+        nChecked++;
+        // what the row would BE, not whether the box has characters in it: a box
+        // holding "-" or "1e" is an unset member, and the count has to say so
+        if (std::isfinite(seriesEditRowValue(r))) nValued++;
+    }
+    ImGui::TextDisabled("| %d of %d stacks, %d with a value", nChecked,
+                        (int)E.rows.size(), nValued);
+
+    const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
+    float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
+    int moveFrom = -1, moveTo = -1;
+    if (ImGui::BeginTable("sermembers", 5, TF, ImVec2(0, std::max(tableH, 80.0f * app.uiScale)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("read from", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 9);
+        ImGui::TableSetupColumn("order", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFrameHeight() * 2.4f);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)E.rows.size(); i++) {
+            App::SeriesEdit::Row& r = E.rows[i];
+            ImGui::PushID(r.seqId);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("##m", &r.check);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-1);
+            if (r.suggested)      // a proposal reads as one until it is confirmed
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::InputText("##v", r.value, sizeof r.value,
+                                 ImGuiInputTextFlags_CharsScientific)) {
+                r.suggested = false;
+                r.touched = true;         // from here the TEXT is the value
+            }
+            if (r.suggested) ImGui::PopStyleColor();
+            if (r.value[0] && !std::isfinite(seriesEditRowValue(r)) &&
+                ImGui::IsItemHovered())
+                ImGui::SetTooltip("\"%s\" is not a number - this member saves as UNSET,\n"
+                                  "which is left out of the fit. It is never read as 0.",
+                                  r.value);
+            ImGui::TableNextColumn();
+            if (r.suggested) ImGui::TextDisabled("(guess) %s", r.from.c_str());
+            else if (!r.value[0] && std::isfinite(r.guess)) {
+                // offered, NOT filled in: this member's value is deliberately
+                // unset and only a human may change that
+                ImGui::TextDisabled("guess: %.6g", r.guess);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("\"%s\" suggests %.6g. The box is empty because this\n"
+                                      "member has NO value set - type it in to use the\n"
+                                      "suggestion; saving as it is keeps it unset.",
+                                      r.from.c_str(), r.guess);
+            }
+            else if (r.from.empty() && !r.value[0]) ImGui::TextDisabled("-");
+            else ImGui::TextDisabled("%s", r.from.c_str());
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::SmallButton("^")) { moveFrom = i; moveTo = i - 1; }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(i == (int)E.rows.size() - 1);
+            if (ImGui::SmallButton("v")) { moveFrom = i; moveTo = i + 1; }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (moveFrom >= 0) std::swap(E.rows[moveFrom], E.rows[moveTo]);
+
+    ImGui::Separator();
+    bool canAccept = nChecked > 0;
+    ImGui::BeginDisabled(!canAccept);
+    if (ImGui::Button(E.editId ? "Save" : "Create", ImVec2(140 * app.uiScale, 0))) {
+        seriesModalAccept();
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110 * app.uiScale, 0))) {
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!canAccept) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("tick at least one stack");
+    }
+    ImGui::EndPopup();
+}
+
 static void drawPanelLinearity() {
     App::LinState& L = app.lin;
-    int nStacks = 0;
-    for (const auto& si : app.seqs)
-        if (framesOfSeq(si.id).size() >= 2 || si.expectedFrames >= 2) nStacks++;
-    if (nStacks < 2) {
-        ImGui::TextDisabled("linearity needs several stacks, one per exposure level");
-        ImGui::TextDisabled("(open a folder of folders: each subfolder = one level)");
+    // ---- which series? Nothing here creates one on its own -------------------
+    if (app.series.empty()) {
+        ImGui::TextWrapped("No series yet. Linearity is measured over a SERIES: the stacks "
+                           "of one swept parameter, each with its value, and the parameter's "
+                           "name and unit belong to that series - not to the application.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("A sweep is never guessed from the folder tree. One wrong");
+        ImGui::TextDisabled("guess would quietly fit data that was never a sweep.");
+        ImGui::Spacing();
+        int b = cur() ? cur()->batchId : 0;
+        ImGui::BeginDisabled(b == 0);
+        if (ImGui::Button("Create a series from this batch's stacks..."))
+            openSeriesModal(b, 0);
+        ImGui::EndDisabled();
+        if (b == 0) ImGui::TextDisabled("(nothing is open yet)");
+        else ImGui::TextDisabled("batch: %s", batchNameOf(b).c_str());
         return;
     }
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
-    ImGui::InputText("level unit", L.unit, sizeof L.unit);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... whatever the x axis of\n"
-                          "your experiment is. Written on every axis and column.");
-    ImGui::SameLine();
-    if (ImGui::Button("Auto levels")) {
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
+    if (!seriesById(app.curSeriesId)) app.curSeriesId = app.series.front().id;
+    App::Series* S = seriesById(app.curSeriesId);
+    {
+        char label[320];
+        snprintf(label, sizeof label, "%s / %s", batchNameOf(S->batchId).c_str(),
+                 S->name.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 17);
+        if (ImGui::BeginCombo("##series", label)) {
+            for (const auto& s : app.series) {
+                char it[384];
+                // "##" would cut a batch or series name in half: give every row
+                // an explicit id and let the visible part be whatever it is.
+                // The KIND is on the row because this panel cannot measure them
+                // all: picking a temperature run here has to be a visible choice.
+                snprintf(it, sizeof it, "%s / %s%s%s##ser%d", batchNameOf(s.batchId).c_str(),
+                         s.name.c_str(), seriesFitKind(s) ? "" : "   ",
+                         seriesFitKind(s) ? "" : seriesKindName(s.kind), s.id);
+                if (ImGui::Selectable(it, s.id == app.curSeriesId)) app.curSeriesId = s.id;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Edit...")) openSeriesModal(S->batchId, S->id);
+        ImGui::SameLine();
+        if (ImGui::Button("New...")) openSeriesModal(cur() ? cur()->batchId : S->batchId, 0);
+        S = seriesById(app.curSeriesId);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("read the level from each stack's folder name\n(first number; only fills empty fields)");
+    const bool haveUnit = S->unit[0] != '\0';
+    const bool fitKind = seriesFitKind(*S);
+    if (S->paramName.empty()) ImGui::TextDisabled("(parameter unnamed)");
+    else ImGui::TextUnformatted(S->paramName.c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Compute")) linRecompute();
+    if (haveUnit) ImGui::Text("[%s]", S->unit);
+    else ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "[unit not set]");
+    if (!haveUnit && ImGui::IsItemHovered())
+        ImGui::SetTooltip("A sensitivity is DN per SOMETHING. Set the unit in\n"
+                          "Edit... - it is not assumed for you.");
+    if (!fitKind) {   // the kind picks the equation; this panel knows two of them
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "[%s series]",
+                           seriesKindName(S->kind));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This panel fits a linearity / PTC sweep. A %s series\n"
+                              "is a different measurement with a different equation,\n"
+                              "so no fit is printed for it - the per-stack means are\n"
+                              "measured either way.\n"
+                              "Change the kind in Edit... if this really is a sweep.",
+                              seriesKindName(S->kind));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Compute")) linRecompute(S->id);
     ImGui::SameLine();
     ImGui::TextDisabled(L.roiUsed ? "| selected ROI" : "| whole frame");
     // The per-stack table has room for ONE response column. Averaging the CFA
@@ -8198,17 +9398,18 @@ static void drawPanelLinearity() {
         ImGui::Combo("table plane", &L.tablePlane, "R\0Gr\0Gb\0B\0");
         L.tablePlane = std::clamp(L.tablePlane, 0, L.nPl - 1);
     }
+    const bool fresh = L.seriesId == S->id;
 
-    // one row per stack: level in, response out
+    // one row per MEMBER, in the series' order: value in, response out
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
-    char lvlHdr[48], meanHdr[32], sigHdr[32];
-    snprintf(lvlHdr, sizeof lvlHdr, "level [%s]", L.unit);
+    char lvlHdr[64], meanHdr[32], sigHdr[32];
+    snprintf(lvlHdr, sizeof lvlHdr, "value [%s]", haveUnit ? S->unit : "unit not set");
     const char* pl = L.nPl > 1 ? LIN_PLANES[std::clamp(L.tablePlane, 0, 3)] : "";
     snprintf(meanHdr, sizeof meanHdr, "mean %s [DN]", pl);
     snprintf(sigHdr, sizeof sigHdr, "sigma_t %s [DN]", pl);
-    float tableH = ImGui::GetFontSize() * std::min(10, nStacks + 2) * 1.6f;
-    if (ImGui::BeginTable("lintab", 5 + (L.fitValid && L.nPl > 1 ? 2 : 2), TF, ImVec2(0, tableH))) {
+    float tableH = ImGui::GetFontSize() * std::min<int>(10, (int)S->members.size() + 2) * 1.6f;
+    if (ImGui::BeginTable("lintab", 7, TF, ImVec2(0, tableH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
         ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
@@ -8218,23 +9419,28 @@ static void drawPanelLinearity() {
         ImGui::TableSetupColumn(sigHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2);
         ImGui::TableHeadersRow();
-        for (auto& si : app.seqs) {
-            if (framesOfSeq(si.id).size() < 2 && si.expectedFrames < 2) continue;
-            ImGui::PushID(si.id);
+        for (auto& m : S->members) {
+            App::SeqInfo* si = seqInfo(m.seqId);
+            if (!si) continue;
+            ImGui::PushID(m.seqId);
             const App::LinState::Row* row = nullptr;
-            for (const auto& r : L.rows) if (r.seqId == si.id) { row = &r; break; }
+            if (fresh)
+                for (const auto& r : L.rows) if (r.seqId == m.seqId) { row = &r; break; }
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            bool inc = true;
-            for (auto& r : L.rows) if (r.seqId == si.id) inc = r.include;
-            if (ImGui::Checkbox("##inc", &inc))
-                for (auto& r : L.rows) if (r.seqId == si.id) r.include = inc;
+            if (ImGui::Checkbox("##inc", &m.include)) {
+                for (auto& r : L.rows) if (r.seqId == m.seqId) r.include = m.include;
+                // the fit below was measured WITH this point (or without it):
+                // it is now describing a set of points that is not on screen
+                linFitStale();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("include this point in the fit");
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(si.name.c_str());
+            ImGui::TextUnformatted(si->name.c_str());
             ImGui::TableNextColumn();
-            double lv = std::isfinite(si.level) ? si.level : 0.0;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputDouble("##lv", &lv, 0, 0, "%.6g")) si.level = lv;
+            // NEVER 0 for "not set": the whole reason values live on the member
+            if (std::isfinite(m.value)) textNum("%.6g", m.value);
+            else ImGui::TextDisabled("unset");
             ImGui::TableNextColumn();
             if (row && row->valid) ImGui::Text("%d", row->frames);
             else ImGui::TextDisabled("-");
@@ -8250,18 +9456,28 @@ static void drawPanelLinearity() {
         }
         ImGui::EndTable();
     }
+    ImGui::TextDisabled("values are edited in Edit... - a blank one is UNSET, not zero");
 
-    if (!L.fitValid) {
-        ImGui::TextDisabled("set levels (Auto levels or type them), then Compute.");
-        ImGui::TextDisabled("3+ stacks with levels give a fit; CFA planes stay separate.");
+    if (!L.fitValid || !fresh) {
+        if (!haveUnit)
+            ImGui::TextDisabled("no unit: set one in Edit... and the fit follows.");
+        else if (!fitKind)
+            ImGui::TextDisabled("kind is \"%s\": the linearity / PTC equations are not the "
+                                "ones this series asked for.", seriesKindName(S->kind));
+        else if (seriesFitPoints(*S) < 2)
+            ImGui::TextDisabled("a fit needs 2+ members with a value (3+ to see linearity).");
+        else if (!fresh)
+            ImGui::TextDisabled("press Compute to measure this series.");
+        else
+            ImGui::TextDisabled("press Compute; CFA planes stay separate throughout.");
         return;
     }
 
     // ---- the answers ----
-    ImGui::SeparatorText("fit  (response = sensitivity * level + offset)");
+    ImGui::SeparatorText("fit  (response = sensitivity * value + offset)");
     if (ImGui::BeginTable("linfit", 7, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         char sensHdr[64];
-        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", L.unit);
+        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", S->unit);
         ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn(sensHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("offset [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -8318,8 +9534,12 @@ static void drawPanelLinearity() {
         }
     }
     if (pts.empty()) return;
-    char xl[64];
-    snprintf(xl, sizeof xl, "level [%s]", L.unit);
+    // A plotted axis states the quantity AND the unit, and the unit is the
+    // series' - there is no fit without one, and editing the series drops the
+    // fit (linInvalidate), so it cannot have been emptied out from under this.
+    char xl[96];
+    snprintf(xl, sizeof xl, "%s [%s]",
+             S->paramName.empty() ? "value" : S->paramName.c_str(), S->unit);
     float half = std::max((ImGui::GetContentRegionAvail().y - ImGui::GetFontSize() * 5) * 0.5f,
                           70.0f * app.uiScale);
     {
@@ -10795,9 +12015,15 @@ static void drawFileList() {
     // Context-menu closes and moves are DEFERRED to the end of the walk:
     // closing erases images mid-iteration while the row loop still holds
     // indices into the pre-close stacksCached() snapshot, and a move prunes
-    // app.batches while the submenu is iterating it.
+    // app.batches while the submenu is iterating it. Every series command is
+    // deferred for the same reason squared - the walk is iterating app.series
+    // itself, and one join would resize it under the loop drawing it.
     int pendingCloseSeq = 0, pendingCloseBatch = 0;
     int pendingMoveSeq = 0, pendingMoveImg = -1, pendingMoveTarget = 0;
+    int pendingSerEdit = 0, pendingSerMove = 0, pendingSerMoveTo = 0;
+    int pendingSerUngroup = 0, pendingSerClose = 0, pendingSerRename = 0;
+    std::string pendingSerName;
+    int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -10911,10 +12137,7 @@ static void drawFileList() {
               ImGui::EndPopup();
           }
       }
-      if (open)
-      for (const auto& stackPtr : group.stacks) {
-        const auto& stack = *stackPtr;
-        const ImageDoc& head = *app.images[stack.front()];
+      if (open) {
         // name and format share one row: the dim/format part is right-aligned and dimmed
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
                               const char* extra = nullptr, bool isB = false) -> bool {
@@ -10956,7 +12179,14 @@ static void drawFileList() {
             if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
             return clicked;
         };
-        if (head.seqId == 0) {
+        // One row. mem != nullptr means the row is being drawn INSIDE a series
+        // node: it is indented by the node and the member's VALUE leads the
+        // label. Everything else about the row is identical - a member is not
+        // a different kind of stack, it is a stack that is also in a sweep.
+        auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
+                                const App::Series::Member* mem) {
+          const ImageDoc& head = *app.images[stack.front()];
+          if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
             snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
@@ -10982,30 +12212,49 @@ static void drawFileList() {
                 ImGui::EndPopup();
             }
             ImGui::PopID();
-            continue;
-        }
-        App::SeqInfo* si = seqInfo(head.seqId);
-        int pos = 0;
-        bool active = false;
-        for (int k = 0; k < (int)stack.size(); k++)
-            if (stack[k] == app.current) { pos = k; active = true; }
-        ImGui::PushID(head.seqId);
-        char lb[512];
-        snprintf(lb, 512, "  %s", si ? si->name.c_str() : "sequence");
-        char frames[24];
-        snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
-        const ImageDoc* bnow = cmpB();
-        bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
-        if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
-        if (rowWithMeta(head, lb, active, frames, stackHasB)) {
-            selectImage(stack[pos]);
-            if (app.fitOnSwitch) app.fitRequested = true;
-        }
-        // The stack is the unit measurements attach to, so it earns a name of
-        // its own: "the 25C dark set", not whatever the capture script called
-        // the folder. F2 / right-click renames; the folder name is only the
-        // starting value.
-        if (si && ImGui::BeginPopupContextItem("seqctx")) {
+            return;
+          }
+          App::SeqInfo* si = seqInfo(head.seqId);
+          int pos = 0;
+          bool active = false;
+          for (int k = 0; k < (int)stack.size(); k++)
+              if (stack[k] == app.current) { pos = k; active = true; }
+          ImGui::PushID(head.seqId);
+          char lb[600];
+          const char* sname = si ? si->name.c_str() : "sequence";
+          if (mem) {
+              // The value LEADS the label. It is the reason the row is in this
+              // series at all, and it is not metadata: an unset one has to be
+              // readable as unset, not inferable from a blank column at the
+              // right edge. The "##m<seqId>" suffix is the row's ID, so renaming
+              // the stack does not reset its widget state - it does NOT protect
+              // the text: ImGui cuts a label at the FIRST "##", so a stack the
+              // user renames to "a##b" renders as "a" in either shape of row.
+              char vb[64];
+              if (std::isfinite(mem->value)) {
+                  if (ser->unit[0]) snprintf(vb, sizeof vb, "%.6g %s", mem->value, ser->unit);
+                  else snprintf(vb, sizeof vb, "%.6g", mem->value);
+              } else {
+                  snprintf(vb, sizeof vb, "value unset");
+              }
+              snprintf(lb, sizeof lb, "%s · %s##m%d", vb, sname, head.seqId);
+          } else {
+              snprintf(lb, sizeof lb, "  %s", sname);
+          }
+          char frames[24];
+          snprintf(frames, sizeof frames, "  %df", (int)stack.size());   // frame count
+          const ImageDoc* bnow = cmpB();
+          bool stackHasB = false;      // B is a FRAME; mark the stack it lives in
+          if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
+          if (rowWithMeta(head, lb, active, frames, stackHasB)) {
+              selectImage(stack[pos]);
+              if (app.fitOnSwitch) app.fitRequested = true;
+          }
+          // The stack is the unit measurements attach to, so it earns a name of
+          // its own: "the 25C dark set", not whatever the capture script called
+          // the folder. F2 / right-click renames; the folder name is only the
+          // starting value.
+          if (si && ImGui::BeginPopupContextItem("seqctx")) {
             static char renameBuf[256];
             if (ImGui::IsWindowAppearing())
                 snprintf(renameBuf, sizeof renameBuf, "%s", si->name.c_str());
@@ -11033,20 +12282,173 @@ static void drawFileList() {
                 }
             }
             ImGui::Separator();
+            // The series (系列) this stack is in, or could be. Multi-select is
+            // a later phase; until then this menu is how a stack joins a sweep
+            // without going through the Linearity panel.
+            if (ImGui::BeginMenu("Series")) {
+                const App::Series* mine = seriesOfStack(si->id);
+                // The value joining would give this stack, BEFORE the click. The
+                // modal shows its proposal and the picker paints one per row;
+                // this was the one place a number entered a measurement without
+                // having been on screen first (docs/series-plan.md §2 = 確認).
+                std::string jfrom;
+                double jv = extractLevelFromName(si->name, &jfrom);
+                if (std::isfinite(jv)) ImGui::TextDisabled("joins at %.6g (from \"%s\")",
+                                                           jv, jfrom.c_str());
+                else ImGui::TextDisabled("joins with NO value (nothing numeric in the name)");
+                int listed = 0;
+                for (const auto& s : app.series) {
+                    bool same = s.batchId == head.batchId;
+                    bool isMine = mine && mine->id == s.id;
+                    char lb2[416];
+                    if (std::isfinite(jv) && same && !isMine)
+                        snprintf(lb2, sizeof lb2, "%s   -> %.6g %s###addser%d", s.name.c_str(),
+                                 jv, s.unit[0] ? s.unit : "[unit not set]", s.id);
+                    else
+                        snprintf(lb2, sizeof lb2, "%s###addser%d", s.name.c_str(), s.id);
+                    if (ImGui::MenuItem(lb2, nullptr, isMine, same && !isMine)) {
+                        pendingJoinSeq = si->id;
+                        pendingJoinSer = s.id;
+                    }
+                    // A series cannot widen to reach another batch: the answer
+                    // is to move the stack first, and the menu says so instead
+                    // of leaving a dead item with no reason.
+                    if (!same && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("\"%s\" is in batch \"%s\".\n"
+                                          "A series lives in ONE batch - use Move to batch\n"
+                                          "first, then add it here.",
+                                          s.name.c_str(), batchNameOf(s.batchId).c_str());
+                    listed++;
+                }
+                if (!listed) ImGui::TextDisabled("(no series yet)");
+                ImGui::Separator();
+                if (ImGui::MenuItem("New series...")) pendingNewSerBatch = head.batchId;
+                if (mine && ImGui::MenuItem("Remove from this series"))
+                    pendingLeaveSeq = si->id;
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
             {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+                if (const App::Series* mine = seriesOfStack(si->id))
+                    ImGui::TextDisabled("in series \"%s\": moving it alone leaves it",
+                                        mine->name.c_str());
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveSeq = si->id; pendingMoveTarget = t; }
             }
             if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
                 pendingCloseSeq = si->id;
             ImGui::EndPopup();
+          }
+          if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+              ImGui::OpenPopup("seqctx");
+          // No frame slider here: it used to appear under the active row, and a
+          // row that grows on selection makes the whole list jump - the scrub bar
+          // lives at the bottom of the Image View now, where the frames are.
+          ImGui::PopID();
+        };
+        // The stack of one seqId, out of this batch's cached list (members are
+        // named by seqId; the panel walks by stack).
+        auto stackOfSeq = [&](int seqId) -> const std::vector<int>* {
+            for (const auto* sp : group.stacks)
+                if (app.images[sp->front()]->seqId == seqId) return sp;
+            return nullptr;
+        };
+        // ---- the batch's series come FIRST, each with its members inside -----
+        // Non-member stacks keep their place and their indentation below: a
+        // sweep appearing must not push everything else down a level.
+        for (const auto& S : app.series) {
+            if (S.batchId != group.batch) continue;
+            ImGui::PushID(S.id);
+            const ImGuiStyle& st = ImGui::GetStyle();
+            char smeta[96];
+            // the unit is the series', and "not set" is a state to read, not a
+            // blank to guess at (the panel says the same thing the same way)
+            if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
+                                    (int)S.members.size());
+            else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
+            float avail = ImGui::GetContentRegionAvail().x;
+            float mw = ImGui::CalcTextSize(smeta).x;
+            bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            // same rule as the stack rows: ONE item spanning the row, the unit
+            // and the count PAINTED on it. A second widget on the right is what
+            // made a context menu unreachable on the name once already.
+            if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
+                                                     p0.y + ImGui::GetFrameHeight()), true);
+            bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
+                                                    ImGuiTreeNodeFlags_SpanAvailWidth,
+                                           "%s", S.name.c_str());
+            if (room) ImGui::PopClipRect();
+            if (room) {
+                ImVec2 m = ImGui::GetItemRectMin();
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
+                                                    ImGui::GetTextLineHeight()) * 0.5f),
+                    S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                              : IM_COL32(255, 184, 90, 255), smeta);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+                                  "(right-click: rename, edit, move, ungroup, close)",
+                                  (int)S.members.size(),
+                                  S.paramName.empty() ? "parameter" : S.paramName.c_str());
+            if (ImGui::BeginPopupContextItem("serctx")) {
+                static char sbuf[256];
+                if (ImGui::IsWindowAppearing())
+                    snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+                bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                done |= ImGui::SmallButton("rename");
+                if (done && sbuf[0]) {
+                    pendingSerRename = S.id;
+                    pendingSerName = sbuf;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                // the same modal creation uses: members, values, order, unit
+                if (ImGui::MenuItem("Edit series...")) {
+                    pendingSerEdit = S.id;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                {   // the SERIES moves - every member with it, so that
+                    // series ⊂ batch never stops being true on the way
+                    int t = moveToBatchMenu(S.batchId);
+                    if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
+                    ImGui::TextDisabled("   (all %d member(s) move with it)",
+                                        (int)S.members.size());
+                }
+                ImGui::Separator();
+                // Two DIFFERENT operations, spelled out rather than one word
+                // with a modifier: one keeps the data, the other destroys it.
+                if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                                      "exactly where they are - they just stop being a sweep.",
+                                      (int)S.members.size());
+                if (ImGui::MenuItem("Close series (discard its stacks)"))
+                    pendingSerClose = S.id;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                                      (int)S.members.size());
+                ImGui::EndPopup();
+            }
+            if (sopen) {
+                for (const auto& m : S.members)
+                    if (const std::vector<int>* sp = stackOfSeq(m.seqId))
+                        drawStackRow(*sp, &S, &m);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
         }
-        if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-            ImGui::OpenPopup("seqctx");
-        // No frame slider here: it used to appear under the active row, and a
-        // row that grows on selection makes the whole list jump - the scrub bar
-        // lives at the bottom of the Image View now, where the frames are.
-        ImGui::PopID();
+        // ---- then everything this batch holds that is NOT in a series -------
+        for (const auto& stackPtr : group.stacks) {
+            const ImageDoc& head = *app.images[stackPtr->front()];
+            if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
+            drawStackRow(*stackPtr, nullptr, nullptr);
+        }
       }
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
@@ -11055,6 +12457,35 @@ static void drawFileList() {
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
+    // ---- the series commands, after the walk that drew them -----------------
+    if (pendingSerRename)
+        if (App::Series* S = seriesById(pendingSerRename)) {
+            S->name = pendingSerName;
+            app.imagesRev++;
+            app.lin.rev++;                // the panel's selector shows this name
+        }
+    if (pendingSerEdit)
+        if (App::Series* S = seriesById(pendingSerEdit)) openSeriesModal(S->batchId, S->id);
+    if (pendingSerMove && pendingSerMoveTo) moveSeriesToBatch(pendingSerMove, pendingSerMoveTo);
+    if (pendingSerUngroup) ungroupSeries(pendingSerUngroup);
+    if (pendingSerClose) closeSeries(pendingSerClose);
+    if (pendingNewSerBatch) openSeriesModal(pendingNewSerBatch, 0);
+    if (pendingLeaveSeq) {
+        App::Series* S = seriesOfStack(pendingLeaveSeq);
+        App::SeqInfo* si = seqInfo(pendingLeaveSeq);
+        if (S) {
+            std::string n = S->name;
+            removeFromSeries(pendingLeaveSeq);
+            pruneEmptySeries();
+            linFitStale();          // the fit below counted this point
+            toast((si ? si->name : std::string("stack")) + " left series \"" + n + "\"");
+        }
+    }
+    if (pendingJoinSeq && pendingJoinSer) {
+        std::string msg;
+        bool joined = seriesJoinFromMenu(pendingJoinSer, pendingJoinSeq, &msg);
+        if (!msg.empty()) toast(msg, !joined);
+    }
 }
 
 static void drawSequenceModal() {
@@ -11665,6 +13096,7 @@ static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Brows
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
+static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -11714,6 +13146,7 @@ static void printUsage() {
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
+        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -11830,6 +13263,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
+        } else if (a == "--series-selftest") {
+            g_seriesSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -13234,6 +14669,800 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // The series (系列) layer - the MODEL, with no UI behind it (phase 1 draws
+    // nothing at all). Every invariant docs/terminology.md and docs/series-plan.md
+    // state, checked exhaustively (seriesAudit) after every mutation, on the real
+    // load path: Open Folder -> picker -> stacks.
+    if (!g_seriesSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 600.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](const char* what, bool cond) {
+            fprintf(stderr, "seriesselftest: %-62s %s\n", what, cond ? "ok" : "FAILED");
+            if (!cond) ok = false;
+        };
+        auto audit = [&]() {
+            std::string why;
+            if (seriesAudit(why)) return true;
+            fprintf(stderr, "seriesselftest: AUDIT: %s\n", why.c_str());
+            return false;
+        };
+        openFolder(g_seriesSelftest);
+        loadAll();
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        if (sids.size() < 4 || app.images.empty()) {
+            fprintf(stderr, "seriesselftest: need >= 4 stacks under %s, got %d\n",
+                    g_seriesSelftest.c_str(), (int)sids.size());
+            return 1;
+        }
+        int b0 = app.images[0]->batchId;
+
+        // ---- 1. build one series out of every stack of one batch --------------
+        int S1 = newSeries(b0, "");                 // "" = the canon's default name
+        {
+            App::Series* S = seriesById(S1);
+            S->paramName = "illuminance";
+            snprintf(S->unit, sizeof S->unit, "lx");
+        }
+        int added = 0;
+        for (int s : sids)
+            if (addToSeries(S1, s, extractLevelFromName(seqInfo(s)->name))) added++;
+        App::Series* S = seriesById(S1);
+        int valued = 0, batchOk = 0;
+        for (const auto& m : S->members) {
+            if (std::isfinite(m.value)) valued++;
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId == S->batchId) { batchOk++; break; }
+        }
+        fprintf(stderr, "seriesselftest: created series '%s' in batch '%s': %d member(s), "
+                        "%d valued, param '%s' unit '%s' kind %d\n",
+                S->name.c_str(), batchNameOf(b0).c_str(), (int)S->members.size(), valued,
+                S->paramName.c_str(), S->unit, S->kind);
+        check("every stack of the batch joined", added == (int)sids.size() &&
+                                                 S->members.size() == sids.size());
+        check("every member's value came from its name", valued == (int)S->members.size());
+        check("every member's frames are in the series' batch", batchOk == (int)S->members.size());
+        check("default name is \"<batch> 掃引\"", S->name == batchNameOf(b0) + " 掃引");
+        check("invariant 1: audit after create", audit());
+        check("N members + a unit -> seriesCanFit", seriesCanFit(*S));
+        {   // the unit is never assumed: without one there is no fit, ever
+            char keep[16];
+            snprintf(keep, sizeof keep, "%s", S->unit);
+            S->unit[0] = '\0';
+            check("unit unset -> no fit (never assumed)", !seriesCanFit(*S));
+            snprintf(S->unit, sizeof S->unit, "%s", keep);
+        }
+
+        // ---- persistence: save -> load -> lazy resolve ------------------------
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_seriesselftest.vsession").u8string();
+        std::string legacy = (std::filesystem::temp_directory_path(tec) /
+                              "viewer_serieslegacy.vsession").u8string();
+        int legacyCount = 0;
+        {   // an OLD-format session, written now while the paths are known. It
+            // has to be built by hand because saveSession has NEVER emitted
+            // "seqlevel" - which is the honest reason the migration below is
+            // nearly always a no-op.
+            std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+            lf << "viewer-session 1\n" << std::setprecision(9);
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                if (fr.empty() || !std::isfinite(m.value)) continue;
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << app.images[fr.front()]->path << "\n";
+                lf << "imgbatch legacyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel " << m.value << "\n";
+                legacyCount++;
+            }
+        }
+        const char* RENAMED = "renamed member stack";
+        {
+            // Doctor the series first, so the round trip has something to lose:
+            // a renamed stack, an UNSET value, an excluded member, and a value
+            // with more significant digits than the file's default precision -
+            // the axis of a fit is the last place to accept a rounded number.
+            seqInfo(S->members[1].seqId)->name = RENAMED;
+            S->members[2].value = std::numeric_limits<double>::quiet_NaN();
+            S->members[3].include = false;
+            S->members[4].value = 1234567.891234;
+            struct Want { std::string path; double value; bool include; };
+            std::vector<Want> want;
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                want.push_back({ fr.empty() ? std::string() : app.images[fr.front()]->path,
+                                 m.value, m.include });
+            }
+            std::string wantName = S->name, wantParam = S->paramName, wantUnit = S->unit;
+            std::string wantBatch = batchNameOf(S->batchId);
+            int wantKind = S->kind;
+            saveSession(sess, true);
+            std::string lerr = loadSession(sess);       // closeAll happens inside
+            check("session reloaded", lerr.empty());
+            loadAll();                                  // stacks come back first
+            double tr = glfwGetTime();                  // ...the series after them
+            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            App::Series* R = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: round trip: %d series; '%s' param '%s' "
+                            "unit '%s' kind %d, %d member(s), batch '%s'\n",
+                    (int)app.series.size(), R ? R->name.c_str() : "",
+                    R ? R->paramName.c_str() : "", R ? R->unit : "", R ? R->kind : -1,
+                    R ? (int)R->members.size() : -1,
+                    R ? batchNameOf(R->batchId).c_str() : "");
+            check("exactly one series came back", app.series.size() == 1);
+            check("name / parameter / unit / kind survive",
+                  R && R->name == wantName && R->paramName == wantParam &&
+                  wantUnit == R->unit && R->kind == wantKind);
+            check("the series is in its batch, restored BY NAME",
+                  R && batchNameOf(R->batchId) == wantBatch);
+            bool memOk = R && R->members.size() == want.size();
+            if (memOk)
+                for (size_t i = 0; i < want.size(); i++) {
+                    std::vector<int> fr = framesOfSeq(R->members[i].seqId);
+                    std::string p = fr.empty() ? std::string() : app.images[fr.front()]->path;
+                    double a = want[i].value, b = R->members[i].value;
+                    bool vOk = std::isfinite(a) == std::isfinite(b) &&
+                               (!std::isfinite(a) ||
+                                fabs(a - b) <= 1e-9 * std::max(1.0, fabs(a)));
+                    if (p != want[i].path || !vOk ||
+                        R->members[i].include != want[i].include) memOk = false;
+                }
+            check("members: order, first-frame path, value and include all survive", memOk);
+            check("a value with more digits than the file's precision survives EXACTLY",
+                  R && R->members.size() > 4 && R->members[4].value == 1234567.891234);
+            check("the unset member came back UNSET, not 0",
+                  R && R->members.size() > 2 && !std::isfinite(R->members[2].value));
+            check("the excluded member came back excluded",
+                  R && R->members.size() > 3 && !R->members[3].include);
+            check("invariant 1: audit after restore", audit());
+            // Why members are keyed by PATH and not by stack name: the name of a
+            // FOLDER stack does not survive at all. seqname is written, but when
+            // it is parsed the stack does not exist yet (the frames come from a
+            // queued rescan), so the line lands on nothing.
+            bool nameSurvived = false;
+            for (const auto& si : app.seqs) if (si.name == RENAMED) nameSurvived = true;
+            fprintf(stderr, "seriesselftest: the renamed stack's name after restore: %s\n",
+                    nameSurvived ? "SURVIVED" : "lost (folder stack: seqname lands on nothing)");
+            check("stack names do NOT survive for folder stacks (hence path keys)",
+                  !nameSurvived);
+        }
+        // everything below works on what came back: the reload minted new ids
+        if (app.series.empty() || app.images.empty() || app.series.front().members.size() < 4) {
+            fprintf(stderr, "seriesselftest: nothing usable survived the round trip\n");
+            return 1;
+        }
+        S1 = app.series.front().id;
+        S = seriesById(S1);
+        b0 = S->batchId;
+        sids.clear();
+        for (const auto& m : S->members) sids.push_back(m.seqId);
+        // Undo the exclusion; the value deliberately left UNSET stays unset - it
+        // is the point of the next block. (It cannot be re-derived from the name
+        // either: a restored folder stack is called "frame_000‥023.npy", with no
+        // folder part to read a level out of. That is the same seqname hole,
+        // seen from the other side.)
+        for (auto& m : S->members) m.include = true;
+
+        // ---- invariant 6: an unset value is UNSET, never 0 --------------------
+        int ptsAll = seriesFitPoints(*S);
+        {
+            double keep = S->members[0].value;
+            S->members[0].value = std::numeric_limits<double>::quiet_NaN();
+            int nanPts = seriesFitPoints(*S);
+            S->members[0].value = keep;
+            S->members[0].include = false;
+            int excPts = seriesFitPoints(*S);
+            S->members[0].include = true;
+            fprintf(stderr, "seriesselftest: fit points %d -> %d with one value unset, "
+                            "%d with one excluded\n", ptsAll, nanPts, excPts);
+            check("invariant 6: an unset value leaves the fit", nanPts == ptsAll - 1);
+            check("an excluded member leaves the fit", excPts == ptsAll - 1);
+            check("both are reversible", seriesFitPoints(*S) == ptsAll);
+        }
+
+        // ---- invariant 2: a stack is in AT MOST ONE series --------------------
+        int S2 = newSeries(b0, "second");
+        {
+            int moved = sids[0];
+            bool didMove = addToSeries(S2, moved, 1.0);
+            S = seriesById(S1);
+            App::Series* T = seriesById(S2);
+            fprintf(stderr, "seriesselftest: stack %d added to '%s': '%s' now %d member(s), "
+                            "'%s' %d\n", moved, T->name.c_str(), S->name.c_str(),
+                    (int)S->members.size(), T->name.c_str(), (int)T->members.size());
+            check("invariant 2: adding elsewhere MOVES the stack",
+                  didMove && T->members.size() == 1 && S->members.size() == sids.size() - 1 &&
+                  seriesOfStack(moved) == T);
+            check("invariant 5: a single member cannot be fitted", !seriesCanFit(*T));
+            check("invariant 1: audit after the move", audit());
+            addToSeries(S1, moved, extractLevelFromName(seqInfo(moved)->name));
+            pruneEmptySeries();
+            check("emptied series is pruned", seriesById(S2) == nullptr &&
+                  seriesById(S1)->members.size() == sids.size());
+        }
+
+        // ---- invariant 4: a member moved out alone LEAVES the series ----------
+        {
+            int other = newBatch(uniqueBatchName("other"));
+            int mv = sids[1];
+            size_t before = seriesById(S1)->members.size();
+            app.toast.clear();
+            moveStackToBatch(mv, other);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: moveStackToBatch(%d -> '%s'): %d -> %d member(s), "
+                            "toast \"%s\"\n", mv, "other", (int)before,
+                    (int)S->members.size(), app.toast.c_str());
+            check("invariant 4: the moved stack left the series",
+                  S->members.size() == before - 1 && seriesOfStack(mv) == nullptr);
+            check("...and the screen was told", app.toast.find("left series") != std::string::npos);
+            check("invariant 1: audit after the move-to-batch", audit());
+            bool crossed = addToSeries(S1, mv, 1.0);
+            fprintf(stderr, "seriesselftest: addToSeries across batches returned %d\n",
+                    crossed ? 1 : 0);
+            check("a stack of another batch cannot join", !crossed && seriesOfStack(mv) == nullptr);
+        }
+
+        // ---- invariant 3: closeStack removes the member ----------------------
+        {
+            int cl = seriesById(S1)->members.front().seqId;
+            size_t before = seriesById(S1)->members.size();
+            closeStack(cl);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: closeStack(%d): %d -> %d member(s)\n",
+                    cl, (int)before, S ? (int)S->members.size() : -1);
+            check("invariant 3: closeStack drops the member",
+                  S && S->members.size() == before - 1 && seriesOfStack(cl) == nullptr);
+            check("invariant 1: audit after closeStack", audit());
+        }
+
+        // ---- invariant 5: one member is legal, just not fittable --------------
+        while (seriesById(S1) && seriesById(S1)->members.size() > 1)
+            removeFromSeries(seriesById(S1)->members.back().seqId);
+        S = seriesById(S1);
+        check("a one-member series is legal", S != nullptr && S->members.size() == 1);
+        check("invariant 5: ...and seriesCanFit() is false", S && !seriesCanFit(*S));
+
+        // ---- invariant 3: closeBatch takes its series with it -----------------
+        {
+            int before = (int)app.series.size();
+            closeBatch(b0);
+            fprintf(stderr, "seriesselftest: closeBatch(%d): %d -> %d series\n",
+                    b0, before, (int)app.series.size());
+            check("invariant 3: closeBatch discards its series",
+                  seriesById(S1) == nullptr && app.series.empty());
+            check("invariant 1: audit after closeBatch", audit());
+        }
+
+        // ---- migration: an OLD session that carried per-stack levels -----------
+        {
+            std::string lerr = loadSession(legacy);
+            check("legacy (seqlevel) session loaded", lerr.empty());
+            loadAll();
+            double tm = glfwGetTime();
+            while (glfwGetTime() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* M = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: seqlevel migration: %d series, %d member(s), "
+                            "name '%s' unit '%s' kind %d (%d levelled stacks in the file)\n",
+                    (int)app.series.size(), M ? (int)M->members.size() : -1,
+                    M ? M->name.c_str() : "", M ? M->unit : "", M ? M->kind : -1,
+                    legacyCount);
+            check("one series migrated out of the levels", app.series.size() == 1);
+            check("...holding every levelled stack",
+                  M && (int)M->members.size() == legacyCount);
+            check("...named \"<batch> 掃引\", kind linearity",
+                  M && M->name == "legacyset 掃引" && M->kind == App::Series::KLinearity);
+            check("invariant 1: audit after migration", audit());
+            // The negative half of the same rule: ONE levelled stack is not a
+            // sweep, and nothing may be invented from it.
+            std::string onePath;
+            if (M && !M->members.empty()) {
+                std::vector<int> fr = framesOfSeq(M->members.front().seqId);
+                if (!fr.empty()) onePath = app.images[fr.front()]->path;
+            }
+            {
+                std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+                lf << "viewer-session 1\n";
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << onePath << "\n";
+                lf << "imgbatch lonelyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel 42\n";
+            }
+            loadSession(legacy);
+            loadAll();
+            double tm2 = glfwGetTime();
+            while (glfwGetTime() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: one levelled stack alone -> %d series, "
+                            "%d stack(s) open\n", (int)app.series.size(),
+                    (int)app.seqs.size());
+            check("a single levelled stack makes NO series", app.series.empty() &&
+                                                            !app.seqs.empty());
+        }
+
+        // ---- the create/edit modal, pressed the way a human presses it --------
+        // A number that nobody chose is the failure this whole layer exists to
+        // prevent, and the modal is the shortest path to one: it is opened to
+        // rename a series, and its Save rebuilds every member from the boxes.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int b = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sid = selftestMakeSeries(b, "lx");
+            App::Series* M = seriesById(sid);
+            if (!M || M->members.size() < 4) {
+                fprintf(stderr, "seriesselftest: modal fixture failed\n");
+                return 1;
+            }
+            // one member deliberately UNSET, one carrying more digits than the
+            // box can show. Pick the unset one where the NAME does suggest a
+            // number, so the guess has something to fabricate.
+            int unsetIdx = -1;
+            for (int i = 0; i < (int)M->members.size(); i++) {
+                double g = extractLevelFromName(seqInfo(M->members[i].seqId)->name);
+                if (std::isfinite(g) && fabs(g) > 1e-9) { unsetIdx = i; break; }
+            }
+            const double PRECISE = 1234567.89;
+            int preciseIdx = unsetIdx == 0 ? 1 : 0;
+            if (unsetIdx < 0) { fprintf(stderr, "seriesselftest: no named level\n"); return 1; }
+            int unsetSeq = M->members[unsetIdx].seqId;
+            std::string unsetName = seqInfo(unsetSeq)->name;
+            double guess = extractLevelFromName(unsetName);
+            M->members[unsetIdx].value = std::numeric_limits<double>::quiet_NaN();
+            M->members[preciseIdx].value = PRECISE;
+            int preciseSeq = M->members[preciseIdx].seqId;
+            // "Edit series..." and then "Save", with NOTHING touched between.
+            openSeriesModal(b, sid);
+            const App::SeriesEdit::Row* r0 = nullptr;
+            for (const auto& r : app.seriesEdit.rows) if (r.seqId == unsetSeq) r0 = &r;
+            int nValued = 0;
+            for (const auto& r : app.seriesEdit.rows)
+                if (r.check && std::isfinite(seriesEditRowValue(r))) nValued++;
+            fprintf(stderr, "seriesselftest: Edit... on '%s' (value unset, name suggests "
+                            "%.6g): box \"%s\", %d of %d rows have a value\n",
+                    unsetName.c_str(), guess, r0 ? r0->value : "?", nValued,
+                    (int)app.seriesEdit.rows.size());
+            check("Edit... leaves an unset member's box EMPTY (no re-guess)",
+                  r0 && r0->value[0] == '\0' && std::isfinite(guess));
+            check("...and the modal's counter does not claim it has a value",
+                  nValued == (int)app.seriesEdit.rows.size() - 1);
+            seriesModalAccept();
+            M = seriesById(sid);
+            double vu = 0, vp = 0;
+            for (const auto& m : M->members) {
+                if (m.seqId == unsetSeq) vu = m.value;
+                if (m.seqId == preciseSeq) vp = m.value;
+            }
+            fprintf(stderr, "seriesselftest: after a Save that touched nothing: unset "
+                            "member %s, %.11g -> %.11g\n",
+                    std::isfinite(vu) ? "HAS A VALUE NOW" : "still unset", PRECISE, vp);
+            check("a Save that edited nothing leaves the unset member UNSET",
+                  !std::isfinite(vu));
+            check("...and does not round the values it never touched", vp == PRECISE);
+            check("invariant 1: audit after the no-op Save", audit());
+
+            // Text the program cannot read is UNSET, not 0. 0 is not "missing":
+            // it is the dark stack the offset is anchored to and the read noise
+            // is measured in (linRecompute), so a typo lands on the one value
+            // that changes the answer most.
+            openSeriesModal(b, sid);
+            const char* JUNK[] = { "-", "1e", "12x", "" };
+            std::vector<int> junkSeq;
+            for (int i = 0; i < 4 && i < (int)app.seriesEdit.rows.size(); i++) {
+                App::SeriesEdit::Row& r = app.seriesEdit.rows[i];
+                snprintf(r.value, sizeof r.value, "%s", JUNK[i]);
+                r.touched = true;
+                junkSeq.push_back(r.seqId);
+            }
+            seriesModalAccept();
+            M = seriesById(sid);
+            int zeroed = 0, unset = 0;
+            for (const auto& m : M->members)
+                if (std::find(junkSeq.begin(), junkSeq.end(), m.seqId) != junkSeq.end()) {
+                    if (!std::isfinite(m.value)) unset++;
+                    else if (fabs(m.value) < 1e-9) zeroed++;
+                }
+            fprintf(stderr, "seriesselftest: value boxes \"-\" \"1e\" \"12x\" \"\" -> "
+                            "%d unset, %d at 0\n", unset, zeroed);
+            check("a value box that is not a number saves as UNSET, never 0",
+                  unset == (int)junkSeq.size() && zeroed == 0);
+
+            // Editing a series makes the fit on screen a measurement of a series
+            // that no longer exists - and the panel reads its LABELS live, so a
+            // fit left standing gets relabelled with the new unit.
+            for (auto& m : M->members) m.value = extractLevelFromName(seqInfo(m.seqId)->name);
+            linRecompute(sid);
+            bool wasFit = app.lin.fitValid;
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "ms");
+            seriesModalAccept();
+            fprintf(stderr, "seriesselftest: fit before the unit edit %s, after %s\n",
+                    wasFit ? "valid" : "invalid", app.lin.fitValid ? "STILL VALID" : "dropped");
+            check("a fit exists before the edit", wasFit);
+            check("editing the series drops the fit it no longer describes",
+                  !app.lin.fitValid && app.lin.seriesId == 0);
+            // ...and with the unit CLEARED there is no fit at all, which is the
+            // one rule this layer was built to enforce.
+            openSeriesModal(b, sid);
+            app.seriesEdit.unit[0] = '\0';
+            seriesModalAccept();
+            linRecompute(sid);
+            fprintf(stderr, "seriesselftest: unit cleared -> fit %s, %d point(s)\n",
+                    app.lin.fitValid ? "PRINTED" : "refused", app.lin.nPts);
+            check("a series whose unit was cleared cannot be fitted",
+                  !app.lin.fitValid && !seriesCanFit(*seriesById(sid)));
+
+            // The KIND decides the equation (docs/terminology.md). This panel
+            // knows linearity and photon transfer; a temperature run pushed
+            // through them prints a "sensitivity" in DN per degree.
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "degC");
+            app.seriesEdit.kind = App::Series::KTemperature;
+            seriesModalAccept();
+            linRecompute(sid);
+            fprintf(stderr, "seriesselftest: kind=temperature -> canFit %d, fit %s\n",
+                    seriesCanFit(*seriesById(sid)) ? 1 : 0,
+                    app.lin.fitValid ? "PRINTED" : "refused");
+            check("a temperature series is not fitted as linearity",
+                  !seriesCanFit(*seriesById(sid)) && !app.lin.fitValid);
+            openSeriesModal(b, sid);
+            snprintf(app.seriesEdit.unit, sizeof app.seriesEdit.unit, "lx");
+            app.seriesEdit.kind = App::Series::KLinearity;
+            seriesModalAccept();
+            linRecompute(sid);
+            check("...and putting the kind back brings the fit back",
+                  app.lin.fitValid && seriesCanFit(*seriesById(sid)));
+
+            // seqctx > Series > <name>: joining the SOLE member of one series
+            // into another empties the first, and an empty series is the state
+            // the audit rejects (plan §1 invariant 3).
+            int lone = newSeries(b, "lone");
+            if (App::Series* L2 = seriesById(lone))
+                snprintf(L2->unit, sizeof L2->unit, "lx");
+            int moved = seriesById(sid)->members.front().seqId;
+            addToSeries(lone, moved, 1.0);
+            std::string jmsg;
+            bool joined = seriesJoinFromMenu(sid, moved, &jmsg);
+            fprintf(stderr, "seriesselftest: join -> %d, \"%s\"; %d series left\n",
+                    joined ? 1 : 0, jmsg.c_str(), (int)app.series.size());
+            check("the menu join reports the value and the text it read it from",
+                  joined && jmsg.find("read from") != std::string::npos);
+            check("...and does not leave the emptied series behind",
+                  seriesById(lone) == nullptr);
+            check("invariant 1: audit after the menu join", audit());
+        }
+
+        // ---- sessions this program did not write ------------------------------
+        // The writer honours "unset is not 0"; the reader is where a hand-made,
+        // third-party or half-written file gets to claim otherwise.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            std::vector<std::string> paths;
+            for (const auto& si : app.seqs) {
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (!fr.empty()) paths.push_back(app.images[fr.front()]->path);
+            }
+            std::string bn = batchNameOf(app.images.empty() ? 0 : app.images[0]->batchId);
+            std::string hostile = (std::filesystem::temp_directory_path(tec) /
+                                   "viewer_serieshostile.vsession").u8string();
+            {
+                std::ofstream hf(pathFromUtf8(hostile), std::ios::binary);
+                hf << "viewer-session 1\n";
+                for (const auto& p : paths)
+                    hf << "image 0 1 npy3 0 0 0 0 0 0 0 " << p << "\n"
+                       << "imgbatch " << bn << "\n" << "seqload 1\n";
+                hf << "series hostile\nseriesbatch " << bn << "\n"
+                   << "seriesparam illuminance\nseriesunit lx\nserieskind 0\n";
+                const char* VALS[] = { "notanumber", "-", "1e", "nan", "12x", "160", "320" };
+                for (size_t i = 0; i < paths.size(); i++)
+                    hf << "seriesmember " << VALS[std::min<size_t>(i, 6)] << " 1 "
+                       << paths[i] << "\n";
+                hf << "seriesend\n";
+            }
+            loadSession(hostile);
+            loadAll();
+            double th = glfwGetTime();
+            while (glfwGetTime() - th < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* H = app.series.empty() ? nullptr : &app.series.front();
+            std::string got;
+            int atZero = 0;
+            if (H)
+                for (const auto& m : H->members) {
+                    char bb[32];
+                    snprintf(bb, sizeof bb, "%.6g", m.value);
+                    got += (got.empty() ? "" : ",");
+                    got += std::isfinite(m.value) ? bb : "unset";
+                    if (std::isfinite(m.value) && fabs(m.value) < 1e-9) atZero++;
+                }
+            fprintf(stderr, "seriesselftest: hostile values -> [%s]\n", got.c_str());
+            check("one series came back from the hostile file", app.series.size() == 1);
+            check("no unreadable value became 0", atZero == 0);
+            check("...they are UNSET, and the readable ones survived",
+                  H && H->members.size() == paths.size() &&
+                  std::isfinite(H->members.back().value));
+            check("invariant 1: audit after the hostile file", audit());
+            std::filesystem::remove(std::filesystem::u8path(hostile), tec);
+
+            // The same folder open TWICE is two batches (the canon blesses it),
+            // so one path names two stacks. A restore that takes "the first one"
+            // rejects every member of the second copy's series on containment
+            // and loses the whole series - permanently, at the next autosave.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bA = app.images.empty() ? 0 : app.images[0]->batchId;
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bB = 0;
+            for (const auto& bt : app.batches) if (bt.id != bA) bB = bt.id;
+            int sA = selftestMakeSeries(bA, "lx"), sB = selftestMakeSeries(bB, "ms");
+            size_t nA = seriesById(sA) ? seriesById(sA)->members.size() : 0;
+            size_t nB = seriesById(sB) ? seriesById(sB)->members.size() : 0;
+            std::string dup = (std::filesystem::temp_directory_path(tec) /
+                               "viewer_seriesdup.vsession").u8string();
+            saveSession(dup, true);
+            loadSession(dup);
+            loadAll();
+            double td = glfwGetTime();
+            while (glfwGetTime() - td < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::vector<int> sbatch;
+            for (const auto& s : app.series)
+                if (std::find(sbatch.begin(), sbatch.end(), s.batchId) == sbatch.end())
+                    sbatch.push_back(s.batchId);
+            fprintf(stderr, "seriesselftest: same folder in two batches: saved %d + %d "
+                            "member(s), restored %d series in %d batch(es)\n",
+                    (int)nA, (int)nB, (int)app.series.size(), (int)sbatch.size());
+            check("both series survive when one folder is open in two batches",
+                  app.series.size() == 2 && nA > 0 && nB > 0 &&
+                  app.series[0].members.size() == nA &&
+                  app.series[1].members.size() == nB);
+            check("...each in its own batch", app.series.size() == 2 &&
+                  app.series[0].batchId != app.series[1].batchId);
+            check("invariant 1: audit after the two-batch restore", audit());
+            std::filesystem::remove(std::filesystem::u8path(dup), tec);
+        }
+
+        // ---- phase 4: what the Files panel's series row actually does ---------
+        // The rows themselves are ImGui, but every command behind them is a
+        // function, and these are the three that can lose data if they are
+        // wrong: a move that drops members, an ungroup that closes something,
+        // a Close that leaves stacks behind.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int b = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sid = selftestMakeSeries(b, "lx");
+            App::Series* P = seriesById(sid);
+            int nStacks = (int)app.seqs.size();
+            check("phase 4 fixture: one series over the whole batch",
+                  P && (int)P->members.size() == nStacks && nStacks >= 4);
+            if (!P) { fprintf(stderr, "seriesselftest: phase 4 fixture failed\n"); return 1; }
+            // Move the SERIES: unlike a lone member, it takes everything with it
+            // and stays whole (the row's "Move to batch (all members move)").
+            {
+                int dest = newBatch(uniqueBatchName("moved"));
+                std::vector<int> was;
+                for (const auto& m : P->members) was.push_back(m.seqId);
+                app.toast.clear();
+                moveSeriesToBatch(sid, dest);
+                P = seriesById(sid);
+                bool kept = P && P->members.size() == was.size() && P->batchId == dest;
+                if (kept)
+                    for (size_t i = 0; i < was.size(); i++)
+                        if (P->members[i].seqId != was[i] || batchOfStack(was[i]) != dest)
+                            kept = false;
+                fprintf(stderr, "seriesselftest: moveSeriesToBatch -> batch '%s', "
+                                "%d member(s), toast \"%s\"\n", batchNameOf(dest).c_str(),
+                        P ? (int)P->members.size() : -1, app.toast.c_str());
+                check("a series moved to another batch keeps every member", kept);
+                check("...and nothing was told it 'left the series'",
+                      app.toast.find("left series") == std::string::npos);
+                check("invariant 1: audit after the series move", audit());
+            }
+            // UNGROUP: the fence goes, the data stays. This is the operation
+            // that must NOT be confused with Close.
+            {
+                int stacksBefore = (int)app.seqs.size();
+                size_t imagesBefore = app.images.size();
+                app.toast.clear();
+                ungroupSeries(sid);
+                fprintf(stderr, "seriesselftest: ungroup -> %d series, %d stack(s), "
+                                "%d frame(s), toast \"%s\"\n", (int)app.series.size(),
+                        (int)app.seqs.size(), (int)app.images.size(), app.toast.c_str());
+                check("ungroup removes the series", seriesById(sid) == nullptr);
+                check("...and keeps every stack and frame",
+                      (int)app.seqs.size() == stacksBefore &&
+                      app.images.size() == imagesBefore);
+                check("invariant 1: audit after ungroup", audit());
+            }
+            // Close series: the canon's Close, which discards the CONTENTS.
+            {
+                int b2 = app.images.empty() ? 0 : app.images[0]->batchId;
+                int sid2 = selftestMakeSeries(b2, "lx");
+                App::Series* Q = seriesById(sid2);
+                int members = Q ? (int)Q->members.size() : 0;
+                int stacksBefore = (int)app.seqs.size();
+                app.toast.clear();
+                closeSeries(sid2);
+                fprintf(stderr, "seriesselftest: close series (%d member(s)) -> %d series, "
+                                "%d stack(s) left, toast \"%s\"\n", members,
+                        (int)app.series.size(), (int)app.seqs.size(), app.toast.c_str());
+                check("Close series discards its stacks",
+                      seriesById(sid2) == nullptr &&
+                      (int)app.seqs.size() == stacksBefore - members);
+                check("invariant 1: audit after Close series", audit());
+            }
+        }
+
+        // ---- phase 5: the picker's "open as a sweep" --------------------------
+        // Both halves. Ticked: one series, values off the group names, one
+        // batch even though batch-per-top-folder was asked for. UNTICKED: the
+        // same Open, and NOTHING is created - that half is the whole point.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);          // local scan: synchronous
+            check("phase 5: the picker opened", app.folderPickOpen);
+            app.pickSweep = true;
+            app.pickBatchMode = 1;                 // ...and gets overridden
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the box is cleared on accept (a sweep is never sticky)",
+                  !app.pickSweep);
+            loadAll();
+            double t5 = glfwGetTime();
+            while (glfwGetTime() - t5 < 120.0 && !app.seriesPending.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* W = app.series.empty() ? nullptr : &app.series.front();
+            std::vector<int> bids;                 // batches that actually hold data
+            for (const auto& d : app.images)
+                if (std::find(bids.begin(), bids.end(), d->batchId) == bids.end())
+                    bids.push_back(d->batchId);
+            bool valuesOk = W != nullptr && !W->members.empty();
+            std::string vals;
+            if (W)
+                for (const auto& m : W->members) {
+                    App::SeqInfo* si = seqInfo(m.seqId);
+                    double want = si ? extractLevelFromName(si->name) : 0;
+                    char b[32];
+                    snprintf(b, sizeof b, "%.6g", m.value);
+                    vals += (vals.empty() ? "" : ",");
+                    vals += std::isfinite(m.value) ? b : "unset";
+                    if (!si || !std::isfinite(m.value) || !std::isfinite(want) ||
+                        fabs(m.value - want) > 1e-9 * std::max(1.0, fabs(want)))
+                        valuesOk = false;
+                }
+            fprintf(stderr, "seriesselftest: sweep -> %d series '%s' param '%s' unit '%s' "
+                            "kind %d, %d member(s) [%s], %d batch(es), %d stack(s)\n",
+                    (int)app.series.size(), W ? W->name.c_str() : "",
+                    W ? W->paramName.c_str() : "", W ? W->unit : "", W ? W->kind : -1,
+                    W ? (int)W->members.size() : -1, vals.c_str(), (int)bids.size(),
+                    (int)app.seqs.size());
+            check("open as a sweep makes exactly ONE series", app.series.size() == 1);
+            check("...over every stack the picker loaded",
+                  W && W->members.size() == app.seqs.size() && app.seqs.size() >= 4);
+            check("...with the parameter and unit typed in the picker",
+                  W && W->paramName == "illuminance" && std::string(W->unit) == "lx" &&
+                  W->kind == App::Series::KLinearity);
+            check("...named \"<batch> 掃引\"",
+                  W && W->name == batchNameOf(W->batchId) + " 掃引");
+            check("...each member at the value its NAME gave", valuesOk);
+            {   // a sweep is a parameter axis: it comes out in value order, not
+                // in the folders' lexicographic order (0,10,160,20,320,40,80)
+                bool asc = true;
+                for (size_t i = 1; W && i < W->members.size(); i++)
+                    if (W->members[i - 1].value > W->members[i].value) asc = false;
+                check("...and the members are in VALUE order", W && asc);
+            }
+            check("a sweep forces ONE batch (series ⊂ batch beats the batch radio)",
+                  bids.size() == 1 && W && W->batchId == bids.front());
+            check("invariant 1: audit after the sweep", audit());
+            // ...and the half that must NOT happen.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            check("phase 5: the picker opened again", app.folderPickOpen);
+            check("the sweep box came up UNTICKED", !app.pickSweep);
+            pickerAccept();
+            loadAll();
+            double t6 = glfwGetTime();             // give a late resolve every chance
+            while (glfwGetTime() - t6 < 1.0) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: sweep unticked -> %d series, %d stack(s)\n",
+                    (int)app.series.size(), (int)app.seqs.size());
+            check("unticked: the same Open creates NO series",
+                  app.series.empty() && !app.seqs.empty());
+            app.pickBatchMode = 0;
+
+            // A second Open before the first sweep has resolved. Resolution
+            // waits for every load to drain, which is seconds locally and much
+            // longer over the wire, and File > Open Folder is available the
+            // whole time: a single pending slot threw the first sweep away -
+            // its ticked box, its typed parameter and its unit - in silence.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the first sweep is pending, not applied yet",
+                  app.seriesPending.size() == 1);
+            openFolder(g_seriesSelftest);       // ...while the first is still loading
+            // the picker starts clean on every scan, the sweep boxes included:
+            // a unit left over from the last Open would be applied to a folder
+            // that has nothing to do with it
+            fprintf(stderr, "seriesselftest: second scan's sweep row: box %d, param \"%s\", "
+                            "unit \"%s\"\n", app.pickSweep ? 1 : 0, app.pickSweepParam,
+                    app.pickSweepUnit);
+            check("a new scan resets the sweep box, its parameter and its unit",
+                  !app.pickSweep && !app.pickSweepParam[0] && !app.pickSweepUnit[0]);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "exposure");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "ms");
+            pickerAccept();
+            check("the second does not overwrite it - both are queued",
+                  app.seriesPending.size() == 2);
+            loadAll();
+            double t7 = glfwGetTime();
+            while (glfwGetTime() - t7 < 240.0 && !app.seriesPending.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::string units;
+            for (const auto& s : app.series)
+                units += std::string(s.unit) + "x" + std::to_string(s.members.size()) + " ";
+            fprintf(stderr, "seriesselftest: two sweeps opened back to back -> %d series "
+                            "[%s], %d stack(s)\n", (int)app.series.size(), units.c_str(),
+                    (int)app.seqs.size());
+            check("a sweep opened while another is loading is NOT thrown away",
+                  app.series.size() == 2);
+            check("...and neither Open loses the stacks it had queued",
+                  app.series.size() == 2 && app.series[0].members.size() == 7 &&
+                  app.series[1].members.size() == 7);
+            check("...and each keeps the parameter and unit it was given",
+                  app.series.size() == 2 && app.series[0].paramName == "illuminance" &&
+                  std::string(app.series[0].unit) == "lx" &&
+                  app.series[1].paramName == "exposure" &&
+                  std::string(app.series[1].unit) == "ms");
+            check("invariant 1: audit after two queued sweeps", audit());
+        }
+        fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        std::filesystem::remove(std::filesystem::u8path(legacy), tec);
+        return ok ? 0 : 1;
+    }
+
     // Close per layer, verifiable without a human (docs/terminology.md): Ctrl+W's
     // closeCurrent() on a stack member removes the WHOLE stack and every trace of
     // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
@@ -13255,7 +15484,10 @@ int main(int argc, char** argv) {
         }
         pickerAccept();
         loadAll();
-        linRecompute();                    // rows exist, so residue is detectable
+        // rows exist, so residue is detectable - and the stack being closed is a
+        // series member, so closeStack's series hook is on the hook too
+        linRecompute(selftestMakeSeries(app.images.empty() ? 0 : app.images[0]->batchId,
+                                        app.lin.unit));
         int imagesBefore = (int)app.images.size(), seqsBefore = (int)app.seqs.size();
         if (seqsBefore < 3) {
             fprintf(stderr, "closeselftest: expected 3 stacks under %s, got %d\n",
@@ -14418,24 +16650,42 @@ int main(int argc, char** argv) {
                 !app.folderPickOpen) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
-        linRecompute();
-        const App::LinState& L = app.lin;
-        for (const auto& r : L.rows)
-            fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
-                            "mean=%.6g sigma_t=%.6g %s\n",
-                    r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
-                    r.valid ? "" : ("ERR:" + r.err).c_str());
-        for (int p = 0; p < L.nPl; p++)
-            fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
-                            "LEmax=%.4f K=%.6g read=%.5g\n",
-                    L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
-                    L.leMax[p], L.ptcK[p], L.readDN[p]);
-        fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
-                L.fitValid ? "ok" : "FAILED");
+        // The fit is per SERIES now, and the application never creates one by
+        // itself (docs/terminology.md) - so this selftest creates it, in the
+        // open, through selftestMakeSeries: one series per BATCH over that
+        // batch's stacks, member values from extractLevelFromName (the same
+        // proposal the Create modal shows a human), unit = the prefill
+        // (prefs linunit, "lx" unless the user changed it). That is the ONLY
+        // auto-creation in the program and it lives behind this flag.
+        bool fitOk = false;
+        std::vector<int> bids;
+        for (const auto& b : app.batches) bids.push_back(b.id);
+        for (int bid : bids) {
+            int sid = selftestMakeSeries(bid, app.lin.unit);
+            if (!sid) continue;
+            linRecompute(sid);
+            const App::LinState& L = app.lin;
+            const App::Series* S = seriesById(sid);
+            fprintf(stderr, "linselftest: series '%s' (batch '%s') unit '%s': %d member(s)\n",
+                    S->name.c_str(), batchNameOf(bid).c_str(), S->unit,
+                    (int)S->members.size());
+            for (const auto& r : L.rows)
+                fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
+                                "mean=%.6g sigma_t=%.6g %s\n",
+                        r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
+                        r.valid ? "" : ("ERR:" + r.err).c_str());
+            for (int p = 0; p < L.nPl; p++)
+                fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
+                                "LEmax=%.4f K=%.6g read=%.5g\n",
+                        L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
+                        L.leMax[p], L.ptcK[p], L.readDN[p]);
+            fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
+                    L.fitValid ? "ok" : "FAILED");
+            fitOk |= L.fitValid;
+        }
+        if (!fitOk) fprintf(stderr, "linselftest: no series could be fitted\n");
         if (app.seqThread.joinable()) app.seqThread.join();
-        return L.fitValid ? 0 : 1;
+        return fitOk ? 0 : 1;
     }
 
     // --browse-keys-selftest: connect the local peer and open the panel; the
@@ -14463,6 +16713,7 @@ int main(int argc, char** argv) {
     if (benchFrames) {                 // exercise every panel, not just the defaults
         app.showFiles = app.showInspector = app.showRois = app.showAnalysis = true;
         app.showHistogram = app.showTemporal = app.showProjection = true;
+        app.showLinearity = true;      // ...which now includes the series selector
         benchMs.reserve(benchFrames);
     }
     double lastFrameEnd = glfwGetTime();
@@ -14878,6 +17129,7 @@ int main(int argc, char** argv) {
 
         drawRawModal();
         drawSequenceModal();
+        drawSeriesModal();
         drawFolderPickModal();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
@@ -15015,8 +17267,12 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
+                // a session's series wait for their stacks, then need one frame
+                working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
+                working |= !app.seriesPending.empty();   // ...and so do the picker's
                 working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
