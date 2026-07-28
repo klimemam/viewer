@@ -22,7 +22,7 @@ jobs:
             binpath: viewer.tgz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux deps (GLFW X11 + Wayland)
         if: runner.os == 'Linux'
         run: |
@@ -72,7 +72,7 @@ jobs:
         if: runner.os != 'Windows'
         run: tar -czf viewer.tgz -C build viewer viewer-serve plugins
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.binpath }}
@@ -89,8 +89,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: dist
       - name: Assemble the binaries branch
