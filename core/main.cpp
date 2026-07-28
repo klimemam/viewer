@@ -7162,6 +7162,20 @@ static void drawInspector() {
 
 }
 
+// The unit a PIXEL VALUE is quoted in, anywhere one is labelled: DN, always.
+// A float .npy is still a digital number - f32 is how the value is STORED, not
+// what it measures, and an axis reading "pixel value (f32)" states a storage
+// class where a unit belongs. The per-frame TSV has always written [DN]
+// unconditionally. Lives here, above the first plot, because every axis label
+// below goes through it; the dtype argument is kept so the rule has one place
+// to change if a file ever carries a real unit.
+// (Statements ABOUT the file - the Inspector's "1920x1080 1ch f32", the browse
+// listing's shape column, a dtype-mismatch warning - are not this: they say how
+// the data is stored, which is exactly what they mean.)
+static std::string abValueUnit(const std::string&) {
+    return "DN";
+}
+
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
@@ -7270,14 +7284,15 @@ static void drawPanelHistogram() {
             snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)"
                                                 : "pixel count (max %u)", H.maxBin);
         char xl[176];
+        const std::string xu = abValueUnit(im->dtype);
         if (Bim && Bim->dtype != im->dtype)
-            snprintf(xl, sizeof xl, "pixel value (A %s / B %s - DTYPE MISMATCH; "
-                                    "A's black-white range bins both)",
-                     im->dtype.c_str(), Bim->dtype.c_str());
+            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range bins both) "
+                                    " -  A %s / B %s, DTYPE MISMATCH",
+                     xu.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
         else if (Bim)
-            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range)", im->dtype.c_str());
+            snprintf(xl, sizeof xl, "pixel value (%s, A's black-white range)", xu.c_str());
         else
-            snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", im->dtype.c_str());
+            snprintf(xl, sizeof xl, "pixel value (%s, black-white range)", xu.c_str());
 
         // one curve, one way to draw it: filled bars, solid outline, dashed
         // outline. The staircase is built once and reused by all three.
@@ -7700,8 +7715,8 @@ static void drawPanelProjection() {
                                     IM_COL32(230, 200, 90, 230));
             }
         };
-        if (wantA) one(P, Bim ? "A " : "", im->dtype);
-        if (wantB && Bim) one(PB, "B ", Bim->dtype);
+        if (wantA) one(P, Bim ? "A " : "", abValueUnit(im->dtype));
+        if (wantB && Bim) one(PB, "B ", abValueUnit(Bim->dtype));
         ImGui::SetTooltip("%s", tip);
     };
     auto onePlot = [&](bool horizontal, bool wantA, bool wantB) {
@@ -7709,12 +7724,12 @@ static void drawPanelProjection() {
         xRange(horizontal, x0, x1);
         char yl[128];
         if (Bim && Bim->dtype != im->dtype)
-            snprintf(yl, sizeof yl, "%s value (A %s / B %s - DTYPE MISMATCH)",
-                     modes[std::clamp(app.projMode, 0, 2)], im->dtype.c_str(),
-                     Bim->dtype.c_str());
+            snprintf(yl, sizeof yl, "%s value (%s)  -  A %s / B %s, DTYPE MISMATCH",
+                     modes[std::clamp(app.projMode, 0, 2)], abValueUnit(im->dtype).c_str(),
+                     im->dtype.c_str(), Bim->dtype.c_str());
         else
             snprintf(yl, sizeof yl, "%s value (%s)", modes[std::clamp(app.projMode, 0, 2)],
-                     im->dtype.c_str());
+                     abValueUnit(im->dtype).c_str());
         PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
                                 x0, x1, yLo, yHi, true, false, each);
         if (!pr.ok) return;
@@ -8488,17 +8503,6 @@ static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
     return a && b && a->ch == b->ch;
 }
 
-// "DN" is only true for integer sensor data; a float .npy may hold reflectance,
-// electrons or anything else, so its unit is stated as the storage type rather
-// than asserted to be DN (same rule as the Inspector's).
-static std::string abValueUnit(const std::string&) {
-    // DN, always. A float .npy is still a digital number - f32 is how the value
-    // is STORED, not what it measures, and a header reading "sigma_t [f32]"
-    // states a storage class where a unit belongs. The per-frame TSV has always
-    // written [DN] unconditionally; this used to disagree with it.
-    return "DN";
-}
-
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
 // (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
@@ -8510,8 +8514,10 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     AbTemporal B = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
 
     const std::string uA = abValueUnit(im->dtype), uB = abValueUnit(Bim->dtype);
-    const bool dtypeMix = uA != uB;
-    const std::string unit = dtypeMix ? (uA + "/" + uB) : uA;
+    // the UNIT is DN on both sides; the STORAGE can still differ, and a delta
+    // between an f32 and a u16 stack is worth a warning even so
+    const bool dtypeMix = im->dtype != Bim->dtype;
+    const std::string unit = uA == uB ? uA : (uA + "/" + uB);
     const bool canDelta = abDeltaMeaningful(im, Bim);
 
     ImGui::Text("Temporal");
@@ -8594,8 +8600,9 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                            A.valid ? "ok" : A.note, B.valid ? "ok" : B.note);
     if (dtypeMix)
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "dtype mismatch (A %s, B %s): the delta mixes units",
-                           im->dtype.c_str(), Bim->dtype.c_str());
+                           "dtype mismatch (A %s, B %s): both sides are DN, but the "
+                           "delta spans two storage classes", im->dtype.c_str(),
+                           Bim->dtype.c_str());
     if (!canDelta)
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
                            "channel counts differ (A %dch, B %dch): no delta - the two "
@@ -8617,9 +8624,10 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     span(A); span(B);
     if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
     char yl[128];
-    if (dtypeMix) snprintf(yl, sizeof yl, "ROI mean value (A %s / B %s - DTYPE MISMATCH)",
-                           im->dtype.c_str(), Bim->dtype.c_str());
-    else snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+    if (im->dtype != Bim->dtype)
+        snprintf(yl, sizeof yl, "ROI mean value (%s)  -  A %s / B %s, DTYPE MISMATCH",
+                 unit.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
+    else snprintf(yl, sizeof yl, "ROI mean value (%s)", unit.c_str());
     const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
 
     auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool dashed) {
@@ -8769,7 +8777,7 @@ static void drawPanelTemporal() {
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
             float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
             char yl[64];
-            snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+            snprintf(yl, sizeof yl, "ROI mean value (%s)", abValueUnit(im->dtype).c_str());
             float tAvail = ImGui::GetContentRegionAvail().y
                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
             PlotRect tp = beginPlot("frame number (index in sequence)", yl,
