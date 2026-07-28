@@ -2932,7 +2932,9 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
     std::sort(found.begin(), found.end());
     patternOut.clear();
     for (size_t k = 0; k < segs.size(); k++)
-        patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '#') : segs[k].s;
+        // '?' and not '#': ImGui truncates any label at "##", which blanked
+        // every all-digit sequence name in the picker ('?' also reads as glob)
+        patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
     patternOut += ext;
     for (auto& f : found) out.push_back(f.second);
     return out;
@@ -3448,8 +3450,11 @@ static void applyPickFilters() {
 
 // Tree of what the scan found, with per-folder / per-sequence checkboxes.
 static void drawFolderPickModal() {
-    if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences"))
+    if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences")) {
+        fprintf(stderr, "picker: OpenPopup (remote=%d, %d groups)\n",
+                app.folderPickRemote ? 1 : 0, (int)app.folderPick.size());
         ImGui::OpenPopup("Select sequences");
+    }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
@@ -3541,7 +3546,9 @@ static void drawFolderPickModal() {
                 char lb[320];
                 snprintf(lb, sizeof lb, "%s   %d file(s)%s", leaf.c_str(), (int)e.g.files.size(),
                          e.g.isRaw ? "  [raw]" : "");
-                ImGui::Checkbox(lb, &e.selected);
+                ImGui::Checkbox("##sel", &e.selected);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(lb);   // not a label: '#' in names stays visible
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.g.files.front().c_str());
                 ImGui::PopID();
             }
@@ -4186,25 +4193,22 @@ static void pumpRemoteBrowse() {
                 toast(std::to_string(r.skippedDirs) +
                       " unreadable folder(s) skipped in the scan", true);
             if (groups.empty()) { toast("no .npy stacks under " + r.dir, true); continue; }
-            // One group opens outright; several ALWAYS go through the picker,
-            // even under "Always load folder". Unlike the local scan, every
-            // frame here is a transfer, and the include/exclude filters in
-            // that modal are how a big capture tree gets narrowed to the
-            // levels actually wanted (asked for explicitly).
-            if (groups.size() == 1) {
-                int frames = 0;
-                for (const auto& g : groups) frames += (int)g.files.size();
-                toast("opening " + std::to_string(groups.size()) + " remote stack(s), " +
-                      std::to_string(frames) + " frames");
-                for (auto& g : groups)
-                    app.rbOpenQueue.push_back({ r.host, std::move(g.files), g.name, g.batchId });
-            } else {
+            // A remote scan ALWAYS goes through the picker - one group included.
+            // Every frame here is a transfer, the modal is where the filters
+            // live, and the "1 group -> just open it" shortcut turned every
+            // scan STARTED INSIDE a leaf folder into "it opened everything
+            // without asking" (verbatim, reported three times).
+            {
                 app.folderPick.clear();
                 for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
                 app.folderPickRoot = makeRemoteUrl(r.host, r.dir);
                 app.folderPickRemote = true;
                 app.folderPickHost = r.host;
                 app.folderPickOpen = true;
+                // the picker "not appearing" has now been reported three times
+                // with three different causes; the trail stays in
+                fprintf(stderr, "remote scan: %d groups -> picker requested\n",
+                        (int)groups.size());
             }
             continue;
         }
@@ -9342,7 +9346,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
             }
             bool ok = nGroups == 1 && nPlain == 3 && g && g->frames == 24 &&
                       g->members.size() == 24 && g->hasMeta && g->dtype == "f32" &&
-                      g->name.find('#') != std::string::npos;
+                      g->name.find('?') != std::string::npos;
             // the member names must lead back to real files, or the row is a lie
             remote::Meta gm;
             if (ok && !s.meta(rb + "/" + g->members[0], gm, err)) {

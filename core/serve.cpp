@@ -385,7 +385,9 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         std::sort(b.m.begin(), b.m.end(),
                   [](const Member& a, const Member& c) { return a.num < c.num; });
         NpyGroup g;
-        g.pattern = b.pre + std::string((size_t)b.m.front().width, '#') + ".npy";
+        // '?' and not '#': the client renders this in ImGui labels, and ImGui
+        // truncates any label at "##" - all-digit names would show as blank
+        g.pattern = b.pre + std::string((size_t)b.m.front().width, '?') + ".npy";
         for (const auto& m : b.m) {
             g.names.push_back(files[m.idx].first);
             used[m.idx] = 1;
