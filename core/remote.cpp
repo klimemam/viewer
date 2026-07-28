@@ -181,8 +181,20 @@ static void closeWriteEnd(Pipe& p) {
 // One shell command on the host, script over stdin (immune to every quoting
 // layer between here and the remote sh), combined output back. This is how the
 // peer gets bootstrapped into ~/.viewer without the user copying anything.
-bool runSshCommand(const std::string& host, int port, const std::string& script,
-                   std::string& output, std::string& err) {
+// Wall clock, monotonic enough for a timeout.
+static double nowSeconds() {
+#if defined(_WIN32)
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
+
+bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
+                   const std::string& stdinData, std::string& output, std::string& err,
+                   double timeoutSec) {
     Pipe p;
     std::vector<std::string> argv;
     if (host.empty()) {
@@ -190,25 +202,37 @@ bool runSshCommand(const std::string& host, int port, const std::string& script,
         err = "no local shell bootstrap on Windows";   // local:// needs no deploy
         return false;
 #else
-        argv = { "sh" };
+        argv = { "sh", "-c", remoteCmd };
 #endif
     } else {
         argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10" };
         if (port > 0) { argv.push_back("-p"); argv.push_back(std::to_string(port)); }
         argv.push_back(host);
-        argv.push_back("sh");
+        argv.push_back(remoteCmd);
     }
     if (!spawn(p, argv, err)) return false;
-    std::string body = script + "\n";
-    bool wroteOk = pipeWrite(p, body.data(), body.size());
-    closeWriteEnd(p);                     // EOF: sh runs what it has
+    bool wroteOk = stdinData.empty() || pipeWrite(p, stdinData.data(), stdinData.size());
+    closeWriteEnd(p);                     // EOF: the remote command runs
     output.clear();
+    const double deadline = nowSeconds() + timeoutSec;
     char buf[4096];
+    bool timedOut = false;
     for (;;) {
+        if (nowSeconds() > deadline) { timedOut = true; break; }
 #if defined(_WIN32)
+        // PeekNamedPipe first: ReadFile on a pipe blocks with no way out, and a
+        // hung git clone on the far side would otherwise wedge this thread until
+        // the process exits.
+        DWORD avail = 0;
+        if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) break;
+        if (avail == 0) { Sleep(50); continue; }
         DWORD got = 0;
         if (!ReadFile(p.outR, buf, sizeof buf, &got, nullptr) || !got) break;
 #else
+        struct pollfd pf { p.outR, POLLIN, 0 };
+        int pr = poll(&pf, 1, 50);
+        if (pr == 0) continue;
+        if (pr < 0) break;
         ssize_t got = read(p.outR, buf, sizeof buf);
         if (got <= 0) break;
 #endif
@@ -216,8 +240,17 @@ bool runSshCommand(const std::string& host, int port, const std::string& script,
         if (output.size() > (1u << 20)) break;   // no script needs a MB of output
     }
     pipeClose(p);
+    if (timedOut) {
+        err = "timed out after " + std::to_string((int)timeoutSec) + "s";
+        return false;
+    }
     if (!wroteOk) { err = "could not reach the host"; return false; }
     return true;
+}
+
+bool runSshScript(const std::string& host, int port, const std::string& script,
+                  std::string& output, std::string& err, double timeoutSec) {
+    return runSshCommand(host, port, "sh", script + "\n", output, err, timeoutSec);
 }
 
 // ---------------------------------------------------------------- payload codec

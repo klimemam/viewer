@@ -89,10 +89,15 @@ private:
 };
 
 // Run one shell command on the host (or locally when host is empty) and collect
-// its combined output. The script travels over stdin, so no quoting layer can
-// mangle it. Success = exit-style sentinel handled by the caller's script.
-bool runSshCommand(const std::string& host, int port, const std::string& script,
-                   std::string& output, std::string& err);
+// its combined output. `stdinData` is fed to it verbatim - a script for `sh`, or
+// the bytes of a file for `cat > path`. Returns false on spawn failure or when
+// timeoutSec elapses (a hung git clone must not wedge the caller forever).
+bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
+                   const std::string& stdinData, std::string& output, std::string& err,
+                   double timeoutSec = 60.0);
+// convenience: feed a script to `sh`
+bool runSshScript(const std::string& host, int port, const std::string& script,
+                  std::string& output, std::string& err, double timeoutSec = 60.0);
 
 // Accepted forms, in order of standards-conformance:
 //   ssh://user@host[:port]/abs/path   RFC 3986: after the colon comes a PORT,

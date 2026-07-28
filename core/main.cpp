@@ -505,8 +505,8 @@ static void stopRbWorker();
 static std::string bootstrapScript();
 static std::string updateScript();
 static void startRemote(const std::string& hostSpec);
-static void updateRemotePeer();
 static void drawRemoteTree();
+static bool deployPeer(const std::string& host, int port, bool force, std::string& log);
 static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
 
@@ -3440,6 +3440,40 @@ static void sortFramesNumerically(std::vector<std::string>& files) {
 // so uninstalling is one rm -rf.
 static std::string g_bootstrapLog;
 
+// The Linux/macOS peer, found on THIS machine. A binaries-branch checkout has
+// every platform side by side, and the source tree has the built one - so the
+// client can hand the server its peer directly. That path works when the server
+// has no internet and when the repository is private, which is the normal case
+// for a lab compute box; server-side git is only the fallback.
+static std::string findLocalPeer(const std::string& unameOut) {
+    std::string plat = unameOut.find("Darwin") != std::string::npos ? "macos-arm64" : "linux-x64";
+    std::error_code ec;
+    std::filesystem::path exe = std::filesystem::u8path(app.exePath);
+    std::filesystem::path dir = exe.has_parent_path() ? exe.parent_path()
+                                                      : std::filesystem::current_path(ec);
+    std::vector<std::filesystem::path> cand;
+    for (int up = 0; up < 4 && !dir.empty(); up++) {
+        cand.push_back(dir / plat / "viewer-serve");              // binaries checkout
+        cand.push_back(dir / "binaries" / plat / "viewer-serve");
+        cand.push_back(dir / "viewer-serve");                     // same-dir build
+        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+        dir = dir.parent_path();
+    }
+    for (const auto& c : cand)
+        if (std::filesystem::exists(c, ec) && std::filesystem::is_regular_file(c, ec))
+            return c.u8string();
+    return {};
+}
+
+static bool readWholeFile(const std::string& path, std::string& out) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    out = ss.str();
+    return !out.empty();
+}
+
 static std::string bootstrapScript() {
     // POSIX sh, delivered over stdin so no quoting layer can mangle it.
     // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
@@ -3451,11 +3485,16 @@ static std::string bootstrapScript() {
         "if ! command -v git >/dev/null 2>&1; then\n"
         "  echo 'no git on the server: copy viewer-serve to ~/.viewer/ manually'; exit 1\n"
         "fi\n"
+        // A private repo would sit forever on a credential prompt, and an
+        // offline box would sit on a TCP connect. Both must fail, loudly.
+        "export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo SSH_ASKPASS=/bin/echo\n"
+        "export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=20\n"
+        "T=''; command -v timeout >/dev/null 2>&1 && T='timeout 45'\n"
         "if [ -d \"$d/bin/.git\" ]; then\n"
-        "  git -C \"$d/bin\" fetch --depth 1 origin binaries >/dev/null 2>&1\n"
+        "  $T git -C \"$d/bin\" fetch --depth 1 origin binaries 2>&1 || { echo \"git fetch failed\"; exit 1; }\n"
         "  git -C \"$d/bin\" reset --hard origin/binaries >/dev/null 2>&1\n"
         "else\n"
-        "  git clone --depth 1 -b binaries " VIEWER_REPO_URL " \"$d/bin\" >/dev/null 2>&1\n"
+        "  $T git clone --depth 1 -b binaries " VIEWER_REPO_URL " \"$d/bin\" 2>&1 || { echo \"git clone failed (private repo or no network on this server?)\"; exit 1; }\n"
         "fi\n"
         "u=$(uname -s)\n"
         "case \"$u\" in\n"
@@ -3478,20 +3517,72 @@ static std::string updateScript() {
     return s;
 }
 
-static void updateRemotePeer() {
-    const App::RemoteBrowse& B = app.rbrowse;
-    if (!B.connected || B.host.empty()) return;
+// Install the peer, best method first. Returns a human-readable log either way.
+static bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
     std::string out, err;
-    if (app.remoteSession) app.remoteSession->stop();     // release the running peer
-    if (!remote::runSshCommand(B.host, B.port, updateScript(), out, err)) {
-        toast("remote update: " + err, true);
-        return;
+    // 1. what OS is over there, and is the peer already in place?
+    if (!remote::runSshScript(host, port,
+            "uname -s\n"
+            "[ -x \"$HOME/.viewer/viewer-serve\" ] && echo HAVE_PEER || echo NO_PEER\n",
+            out, err, 20.0)) {
+        log = "cannot reach " + host + ": " + err;
+        return false;
     }
-    g_bootstrapLog = out;
-    toast(out.find("VIEWER_SERVE_OK") != std::string::npos
-              ? "remote peer updated on " + B.host
-              : "remote update failed: " + out, out.find("VIEWER_SERVE_OK") == std::string::npos);
+    if (!force && out.find("HAVE_PEER") != std::string::npos) { log = "peer already installed"; return true; }
+
+    // 2. hand it our own copy - no network and no credentials needed on the far
+    //    side, which is what a lab compute box usually has
+    std::string local = findLocalPeer(out);
+    if (!local.empty()) {
+        std::string bytes;
+        if (readWholeFile(local, bytes)) {
+            std::string o2, e2;
+            bool ok = remote::runSshCommand(host, port,
+                "sh -c 'mkdir -p ~/.viewer && cat > ~/.viewer/viewer-serve.new && "
+                "chmod +x ~/.viewer/viewer-serve.new && "
+                "mv ~/.viewer/viewer-serve.new ~/.viewer/viewer-serve && echo VIEWER_SERVE_OK'",
+                bytes, o2, e2, 120.0);
+            if (ok && o2.find("VIEWER_SERVE_OK") != std::string::npos) {
+                // plugins too, so server-side MEASURE has the same analyzers
+                std::filesystem::path pdir = std::filesystem::u8path(local).parent_path() / "plugins";
+                std::error_code ec;
+                if (std::filesystem::exists(pdir, ec)) {
+                    for (auto& e : std::filesystem::directory_iterator(pdir, ec)) {
+                        std::string pb;
+                        if (!e.is_regular_file(ec) || !readWholeFile(e.path().u8string(), pb)) continue;
+                        std::string o3, e3;
+                        remote::runSshCommand(host, port,
+                            "sh -c 'mkdir -p ~/.viewer/plugins && cat > ~/.viewer/plugins/" +
+                                e.path().filename().u8string() + "'",
+                            pb, o3, e3, 60.0);
+                    }
+                }
+                log = "sent the peer from this machine (" + local + ")";
+                return true;
+            }
+            log = "could not copy the peer to " + host + ": " + (e2.empty() ? o2 : e2);
+            // fall through and let the server try git
+        }
+    }
+
+    // 3. last resort: the server fetches it itself (needs git + network + access)
+    std::string o4, e4;
+    if (!remote::runSshScript(host, port, force ? updateScript() : bootstrapScript(),
+                              o4, e4, 90.0)) {
+        log += (log.empty() ? "" : "\n") + std::string("server-side install: ") +
+               (e4.empty() ? "failed" : e4);
+        if (local.empty())
+            log += "\nno local viewer-serve to send either - looked next to " + app.exePath;
+        return false;
+    }
+    if (o4.find("VIEWER_SERVE_OK") == std::string::npos) {
+        log += (log.empty() ? "" : "\n") + o4;
+        return false;
+    }
+    log = "the server installed its own peer";
+    return true;
 }
+
 
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port) {
     if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
@@ -3510,14 +3601,10 @@ static bool ensureRemoteSession(const std::string& host, std::string& err, int p
     // Not there (or too old to answer): install it, then try once more. The user
     // never copies a binary or types a path.
     toast("installing the viewer peer on " + host + "...");
-    std::string out, berr;
-    if (!remote::runSshCommand(host, port, bootstrapScript(), out, berr)) {
-        err = berr.empty() ? err : berr;
-        return false;
-    }
-    g_bootstrapLog = out;
-    if (out.find("VIEWER_SERVE_OK") == std::string::npos) {
-        err = "could not install the peer on " + host + ":\n" + out;
+    std::string log;
+    if (!deployPeer(host, port, false, log)) {
+        g_bootstrapLog = log;
+        err = "could not install the peer on " + host + ":\n" + log;
         return false;
     }
     if (!app.remoteSession->startOn(host, port, exe, err)) return false;
@@ -3598,11 +3685,10 @@ static void rbWorker() {
                 std::lock_guard<std::mutex> lk(app.sesMtx);
                 if (app.remoteSession) app.remoteSession->stop();
             }
-            std::string out, err;
-            r.ok = remote::runSshCommand(job.host, job.port, updateScript(), out, err) &&
-                   out.find("VIEWER_SERVE_OK") != std::string::npos;
-            r.info = out;
-            r.err = r.ok ? "" : (err.empty() ? out : err);
+            std::string log;
+            r.ok = deployPeer(job.host, job.port, true, log);
+            r.info = log;
+            r.err = r.ok ? "" : log;
         } else {
             std::lock_guard<std::mutex> lk(app.sesMtx);
             if (!app.remoteSession) app.remoteSession.reset(new remote::Session());
@@ -3615,19 +3701,15 @@ static void rbWorker() {
                     // not there: the server installs its own peer from the
                     // binaries branch. This is the multi-second step that used
                     // to freeze the window.
-                    rbSetPhase("installing the peer on " + job.host + " (git clone)...");
-                    std::string out, berr;
-                    if (remote::runSshCommand(job.port ? job.host : job.host, job.port,
-                                              bootstrapScript(), out, berr)) {
-                        g_bootstrapLog = out;
-                        if (out.find("VIEWER_SERVE_OK") != std::string::npos) {
-                            rbSetPhase("connecting to " + job.host + "...");
-                            alive = app.remoteSession->startOn(job.host, job.port, exe, err);
-                        } else {
-                            err = "could not install the peer:\n" + out;
-                        }
-                    } else if (!berr.empty()) {
-                        err = berr;
+                    rbSetPhase("installing the peer on " + job.host + "...");
+                    std::string log;
+                    bool got = deployPeer(job.host, job.port, false, log);
+                    g_bootstrapLog = log;
+                    if (got) {
+                        rbSetPhase("connecting to " + job.host + "...");
+                        alive = app.remoteSession->startOn(job.host, job.port, exe, err);
+                    } else {
+                        err = "could not install the peer on " + job.host + ":\n" + log;
                     }
                 }
             }
