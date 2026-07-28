@@ -386,7 +386,10 @@ struct App {
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
-    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4 };
+    // RbTreeList is an ordinary LIST whose answer lands in the tree cache
+    // instead of replacing the listing: expanding a node must not navigate.
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4,
+                  RbTreeList = 5 };
     struct RbJob {
         int kind = RbConnect;
         std::string host, dir;
@@ -498,6 +501,17 @@ struct App {
     // case), true = also the connection row and the server-side search. Also
     // persisted - "I always search" and "I never do" are both ways of working.
     bool rbAdvanced = false;
+    // Tree mode: a directory expands IN PLACE instead of replacing the listing,
+    // so a folder of folders can be compared without losing your place. LAZY -
+    // expanding a node costs exactly one LIST, issued on the browse worker and
+    // never on the UI thread, and collapsing KEEPS the answer: re-expanding is
+    // free. Cache keyed by absolute path, so it survives navigation; dropped
+    // when the machine changes or on an explicit refresh.
+    bool rbTree = false;                                        // persisted
+    std::map<std::string, std::vector<remote::Entry>> rbTreeCache;
+    std::vector<std::string> rbExpanded;      // absolute dirs currently open
+    std::vector<std::string> rbTreePending;   // ...and those still being listed
+    int rbTreeLists = 0;                      // node LISTs issued (selftest)
     bool focusRemote = false;         // bring it forward when a menu item asks
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
@@ -674,6 +688,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
+static void rbTreeForget();       // drop the tree's cached children
 static std::string placeUrl(const std::string& host, int port, const std::string& path);
 static void rbEnqueue(App::RbJob job);
 static void pumpRemoteBrowse();
@@ -2743,6 +2758,7 @@ static void savePrefs() {
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
     f << "rbadv " << (app.rbAdvanced ? 1 : 0) << "\n";
+    f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -2779,6 +2795,7 @@ static void loadPrefs() {
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
         else if (key == "rbadv")       { ls >> v; app.rbAdvanced = v != 0; }
+        else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
             std::string s;
@@ -4909,6 +4926,22 @@ static void pumpRemoteBrowse() {
             }
             continue;
         }
+        if (r.kind == App::RbTreeList) {
+            // A node's children. It must NOT touch B.dir / B.entries / recents:
+            // expanding a folder in the tree is not a navigation.
+            app.rbTreePending.erase(std::remove(app.rbTreePending.begin(),
+                                                app.rbTreePending.end(), r.dir),
+                                    app.rbTreePending.end());
+            if (r.ok) app.rbTreeCache[r.dir] = std::move(r.entries);
+            else {
+                // an unreadable folder collapses again, with a reason
+                app.rbExpanded.erase(std::remove(app.rbExpanded.begin(),
+                                                 app.rbExpanded.end(), r.dir),
+                                     app.rbExpanded.end());
+                toast(r.dir + ": " + r.err, true);
+            }
+            continue;
+        }
         if (!r.ok) {
             B.err = r.err;
             if (r.kind == App::RbConnect) {
@@ -4934,6 +4967,7 @@ static void pumpRemoteBrowse() {
         }
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
+            rbTreeForget();               // another machine: other children entirely
             // a listing nobody can see is not a connection anyone believes in
             app.showRemote = true;
             app.focusRemote = true;
@@ -4962,6 +4996,37 @@ static void pumpRemoteBrowse() {
             openRemote(u);
         }
     }
+}
+
+// ---- tree mode: expand / collapse one node ------------------------------------
+// Expanding is LAZY and asynchronous: the LIST goes to the browse worker, and
+// the node shows "(listing...)" until the answer lands in the cache. Collapsing
+// keeps the cache, so opening the same node again costs nothing at all - which
+// is the whole reason a tree is usable over ssh.
+static bool rbHas(const std::vector<std::string>& v, const std::string& s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+}
+static void rbTreeExpand(const std::string& dir) {
+    if (!rbHas(app.rbExpanded, dir)) app.rbExpanded.push_back(dir);
+    if (app.rbTreeCache.count(dir) || rbHas(app.rbTreePending, dir)) return;
+    app.rbTreePending.push_back(dir);
+    app.rbTreeLists++;
+    App::RbJob j;
+    j.kind = App::RbTreeList;
+    j.host = app.rbrowse.host;
+    j.port = app.rbrowse.port;
+    j.dir = dir;
+    rbEnqueue(std::move(j));
+}
+static void rbTreeCollapse(const std::string& dir) {
+    app.rbExpanded.erase(std::remove(app.rbExpanded.begin(), app.rbExpanded.end(), dir),
+                         app.rbExpanded.end());
+}
+// A different machine, or "list this again": the cached children are stale.
+static void rbTreeForget() {
+    app.rbTreeCache.clear();
+    app.rbExpanded.clear();
+    app.rbTreePending.clear();
 }
 
 // Browse one directory on the connected server (async: a dead link hangs the
@@ -8655,26 +8720,91 @@ static std::string fmtEntryShape(const remote::Entry& e) {
 // repeating the group's numbers on 24 rows, which would be a lie 24 times.
 // shape/dtype are shared by construction (the peer only groups files that
 // agree), so they are shown.
+// In TREE mode rows no longer all come from one directory, so a row carries the
+// directory it was listed from. `dir` points at a string that outlives the
+// frame: either App::RemoteBrowse::dir or a key of App::rbTreeCache (std::map
+// nodes do not move).
 struct RbRow {
     const remote::Entry* e = nullptr;
+    const std::string* dir = nullptr;
     int member = -1;
+    int depth = 0;                 // tree indent level; 0 = the listed folder
+    bool ph = false;               // "(listing...)": a node whose LIST is in flight
     const std::string& name() const { return member < 0 ? e->name : e->members[member]; }
-    bool isDir()   const { return member < 0 && e->dir; }
-    bool isGroup() const { return member < 0 && e->group; }
+    bool isDir()   const { return !ph && member < 0 && e->dir; }
+    bool isGroup() const { return !ph && member < 0 && e->group; }
     bool ownFile() const { return member < 0; }   // has its own size / mtime
+    // absolute path of this row, and of one of its members
+    std::string join(const std::string& n) const {
+        return *dir == "/" ? "/" + n : *dir + "/" + n;
+    }
+    std::string full() const { return join(name()); }
 };
-// Grouped or flat, from the same entries. Free function so the headless
-// selftest drives exactly what the panel draws.
-static std::vector<RbRow> rbBuildView(const std::vector<remote::Entry>& entries, bool flat) {
+// The listing table's columns, and the sort the tree builder has to honour.
+// Stashed from the table (TableGetSortSpecs only exists between Begin/EndTable,
+// and a tree has to be sorted per LEVEL while it is being built, one frame
+// earlier). A sort change therefore lands on the next frame - invisible, and
+// far cheaper than building the view twice.
+enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+static int  g_rbSortCol = RB_COL_NAME;
+static bool g_rbSortDesc = false;
+
+static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+                      bool flat, bool tree, int depth, std::vector<RbRow>& out);
+
+// Grouped or flat, listing or tree, from the same entries. Free function so the
+// headless selftest drives exactly what the panel draws.
+static std::vector<RbRow> rbBuildView(const std::string* dir,
+                                      const std::vector<remote::Entry>& entries,
+                                      bool flat, bool tree) {
     std::vector<RbRow> v;
     v.reserve(entries.size());
-    for (const auto& e : entries) {
-        if (flat && e.group && !e.members.empty())
-            for (int m = 0; m < (int)e.members.size(); m++) v.push_back({ &e, m });
-        else
-            v.push_back({ &e, -1 });
-    }
+    rbAddRows(dir, entries, flat, tree, 0, v);
     return v;
+}
+static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+                      bool flat, bool tree, int depth, std::vector<RbRow>& out) {
+    if (depth > 24) return;                    // a symlink loop is not a tree
+    std::vector<int> order(ents.size());
+    for (int i = 0; i < (int)ents.size(); i++) order[i] = i;
+    if (tree) {
+        // Per LEVEL: a global sort over a flattened tree would tear children
+        // away from their parents. Directories first, as in the flat listing.
+        std::stable_sort(order.begin(), order.end(), [&](int ia, int ib) {
+            const remote::Entry& a = ents[ia];
+            const remote::Entry& b = ents[ib];
+            if (a.dir != b.dir) return a.dir;
+            int cmp = 0;
+            switch (g_rbSortCol) {
+                case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
+                case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
+                default:           cmp = a.name.compare(b.name); break;
+            }
+            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+        });
+    }
+    for (int oi : order) {
+        const remote::Entry& e = ents[oi];
+        if (flat && e.group && !e.members.empty()) {
+            for (int m = 0; m < (int)e.members.size(); m++)
+                out.push_back({ &e, dir, m, depth, false });
+            continue;
+        }
+        out.push_back({ &e, dir, -1, depth, false });
+        if (!tree || !e.dir) continue;
+        std::string sub = *dir == "/" ? "/" + e.name : *dir + "/" + e.name;
+        if (!rbHas(app.rbExpanded, sub)) continue;
+        auto it = app.rbTreeCache.find(sub);
+        if (it != app.rbTreeCache.end())
+            rbAddRows(&it->first, it->second, flat, tree, depth + 1, out);
+        else {
+            // the LIST is still in flight: say so where the children will be
+            static const remote::Entry busy = [] {
+                remote::Entry b; b.name = "(listing...)"; return b;
+            }();
+            out.push_back({ &busy, dir, -1, depth + 1, true });
+        }
+    }
 }
 
 // Bookmarks + recents in one dropdown. Available connected or not: picking a
@@ -8720,6 +8850,11 @@ static void drawRemotePlacesCombo() {
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     ImGui::PushID("remotetree");
+    // Dropping the tree cache is DEFERRED to the top of a frame: the row list
+    // built below holds pointers into it, so clearing it from a button drawn
+    // half way down would leave every row after that button dangling.
+    static bool rbForgetTree = false;
+    if (rbForgetTree) { rbTreeForget(); rbForgetTree = false; }
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
@@ -8869,13 +9004,9 @@ static void drawPanelRemote() {
             toast("copied");
         }
     }
-    // full remote path of a listed name
-    auto joined = [&B](const std::string& n) {
-        return B.dir == "/" ? "/" + n : B.dir + "/" + n;
-    };
     // The listing as ROWS: grouped (one row per sequence) or flat (one row per
-    // frame). Rebuilt every frame from the same reply - see rbBuildView.
-    std::vector<RbRow> view = rbBuildView(B.entries, app.rbFlat);
+    // frame), listing or tree. Rebuilt every frame - see rbBuildView.
+    std::vector<RbRow> view = rbBuildView(&B.dir, B.entries, app.rbFlat, app.rbTree);
     // Multi-select (Ctrl / Shift + click on file rows), indexed by ROW. A
     // navigation or a refresh invalidates the indices, so it resets rather
     // than pointing at different rows. A grouped/flat TOGGLE does not: the
@@ -8884,6 +9015,7 @@ static void drawPanelRemote() {
     static std::vector<char> rbSel;
     static int rbSelAnchor = -1;               // row index of the last click
     static bool rbSelFlat = false;             // which view rbSel was built for
+    static bool rbSelTree = false;
     {
         static std::string selSig;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
@@ -8891,8 +9023,8 @@ static void drawPanelRemote() {
             selSig = sig;
             rbSel.assign(view.size(), 0);
             rbSelAnchor = -1;
-        } else if (rbSelFlat != app.rbFlat) {
-            std::vector<RbRow> old = rbBuildView(B.entries, rbSelFlat);
+        } else if (rbSelFlat != app.rbFlat || rbSelTree != app.rbTree) {
+            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, rbSelFlat, rbSelTree);
             std::vector<const remote::Entry*> sel;
             for (size_t i = 0; i < old.size() && i < rbSel.size(); i++)
                 if (rbSel[i]) sel.push_back(old[i].e);
@@ -8902,21 +9034,31 @@ static void drawPanelRemote() {
             rbSelAnchor = -1;
         }
         rbSelFlat = app.rbFlat;
+        rbSelTree = app.rbTree;
+        // an expand or a collapse moved every row below it: start clean
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
     // What a plain click does: enter a folder, or show a throwaway PREVIEW of
     // a file / of a sequence's poster frame. Nothing is registered. Factored
     // out because the keyboard (arrow keys) has to do exactly the same thing.
     auto rbActivateRow = [&](const RbRow& r) {
-        if (r.isDir()) { remoteBrowseTo(joined(r.name())); return; }
+        if (r.ph) return;
+        if (r.isDir()) {
+            // In a TREE a folder opens where it is; the listing still enters it.
+            if (app.rbTree) {
+                if (rbHas(app.rbExpanded, r.full())) rbTreeCollapse(r.full());
+                else rbTreeExpand(r.full());
+            } else remoteBrowseTo(r.full());
+            return;
+        }
         if (!isNpyName(r.name())) return;
         // stepping context for the scrub bar / , and . : the whole sequence
         // when the row belongs to one, so a flat row still steps its siblings
         const std::vector<std::string>* seq = (r.isGroup() || r.member >= 0) &&
                                               !r.e->members.empty() ? &r.e->members : nullptr;
         std::string target = r.isGroup()
-            ? joined(r.e->members.empty() ? r.e->name : r.e->members[0])
-            : joined(r.name());
+            ? r.join(r.e->members.empty() ? r.e->name : r.e->members[0])
+            : r.full();
         // idempotent: clicking the same file again re-shows the preview
         // instead of re-fetching it
         ImageDoc* pv = nullptr;
@@ -8927,7 +9069,7 @@ static void drawPanelRemote() {
         else openRemote(u, true);
         app.previewFiles.clear();
         if (seq) {
-            for (const auto& m : *seq) app.previewFiles.push_back(joined(m));
+            for (const auto& m : *seq) app.previewFiles.push_back(r.join(m));
             app.previewIndex = r.member >= 0 ? r.member : 0;
             app.previewLabel = r.e->name;
         }
@@ -8935,12 +9077,13 @@ static void drawPanelRemote() {
     // What a double-click (and Enter) does: a REGISTERED open. A sequence row
     // opens the whole stack; a frame promotes the preview it just made.
     auto rbOpenRow = [&](const RbRow& r) {
-        if (r.isDir()) { remoteBrowseTo(joined(r.name())); return; }
+        if (r.ph) return;
+        if (r.isDir()) { remoteBrowseTo(r.full()); return; }
         if (!isNpyName(r.name())) return;
         if (r.isGroup()) {
             dropPreview();                   // the poster frame did its job
             std::vector<std::string> files;
-            for (const auto& m : r.e->members) files.push_back(joined(m));
+            for (const auto& m : r.e->members) files.push_back(r.join(m));
             openRemoteStack(B.host, files);
             return;
         }
@@ -8960,8 +9103,9 @@ static void drawPanelRemote() {
         if (ImGui::SmallButton("home")) remoteBrowseTo("~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
         ImGui::SameLine();
-        if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("list this folder again");
+        if (ImGui::SmallButton("refresh")) { rbForgetTree = true; remoteBrowseTo(B.dir); }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
         ImGui::SameLine();
         // Open Folder for the folder you are IN. It used to exist only on a
         // folder ROW, so opening the directory being browsed meant going up a
@@ -8986,6 +9130,21 @@ static void drawPanelRemote() {
                 : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
                   "individually (no request to the server).");
         ImGui::SameLine();
+        // List <-> tree. Expanding a node costs ONE list, once.
+        if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
+            app.rbTree = !app.rbTree;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(app.rbTree
+                ? "tree: a folder opens IN PLACE (click it; Right/Left also do).\n"
+                  "double-click or Enter still goes INTO it.\neach node is listed "
+                  "once and kept - collapsing costs nothing to undo.\nclick to go "
+                  "back to one folder at a time."
+                : "list: one folder at a time, a click enters it.\nclick to expand "
+                  "folders in place instead.");
+        ImGui::SameLine();
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
@@ -9003,9 +9162,25 @@ static void drawPanelRemote() {
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
     shown.reserve(view.size());
-    for (int i = 0; i < (int)view.size(); i++)
-        if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
-            shown.push_back(i);
+    if (!app.rbTree || !rbFilter[0]) {
+        for (int i = 0; i < (int)view.size(); i++)
+            if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
+                shown.push_back(i);
+    } else {
+        // In a tree, dropping a folder because its own NAME does not match
+        // would orphan the matching files inside it. Rows are in pre-order, so
+        // one backward pass keeps every match and every ancestor of a match.
+        std::vector<char> keep(view.size(), 0);
+        int need = -1;                 // an ancestor shallower than this is wanted
+        for (int i = (int)view.size() - 1; i >= 0; i--) {
+            bool m = !view[i].ph && globListMatch(rbFilter, view[i].name());
+            if (m || (need >= 0 && view[i].depth < need)) {
+                keep[i] = 1;
+                need = view[i].depth;
+            }
+        }
+        for (int i = 0; i < (int)view.size(); i++) if (keep[i]) shown.push_back(i);
+    }
     if (rbFilter[0]) {
         ImGui::SameLine();
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
@@ -9025,7 +9200,12 @@ static void drawPanelRemote() {
     if (rbAdvanced) {
         ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("disconnect")) { B = App::RemoteBrowse{}; ImGui::PopID(); return; }
+        if (ImGui::SmallButton("disconnect")) {
+            B = App::RemoteBrowse{};
+            rbForgetTree = true;         // another machine, other children
+            ImGui::PopID();
+            return;
+        }
         ImGui::SameLine();
         {   // star = bookmark the place being looked at; the combo recalls them
             std::string curUrl = placeUrl(B.host, B.port, B.dir);
@@ -9108,8 +9288,8 @@ static void drawPanelRemote() {
                 for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                     if (!rbSel[i]) continue;
                     if (view[i].isGroup())
-                        for (const auto& m : view[i].e->members) files.push_back(joined(m));
-                    else files.push_back(joined(view[i].name()));
+                        for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+                    else files.push_back(view[i].full());
                 }
                 sortFramesNumerically(files);
                 openRemoteStack(B.host, files);
@@ -9137,8 +9317,8 @@ static void drawPanelRemote() {
                     for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                         if (!rbSel[i]) continue;
                         if (view[i].isGroup())
-                            for (const auto& m : view[i].e->members) files.push_back(joined(m));
-                        else files.push_back(joined(view[i].name()));
+                            for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+                        else files.push_back(view[i].full());
                     }
                     std::string leaf = B.dir;
                     size_t sl2 = leaf.find_last_of('/');
@@ -9245,12 +9425,12 @@ static void drawPanelRemote() {
     static bool rbCursorScroll = false;  // bring it into view this frame
     {
         static std::string curSig;
-        static bool curFlat = false;
+        static bool curFlat = false, curTree = false;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
         if (sig != curSig) { curSig = sig; rbCursor = -1; }
-        else if (curFlat != app.rbFlat) {
-            // follow the row across a grouped/flat toggle, like the selection
-            std::vector<RbRow> old = rbBuildView(B.entries, curFlat);
+        else if (curFlat != app.rbFlat || curTree != app.rbTree) {
+            // follow the row across a grouped/flat or list/tree toggle
+            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, curFlat, curTree);
             const remote::Entry* was = rbCursor >= 0 && rbCursor < (int)old.size()
                                      ? old[rbCursor].e : nullptr;
             rbCursor = -1;
@@ -9260,6 +9440,7 @@ static void drawPanelRemote() {
             rbCursorScroll = rbCursor >= 0;
         }
         curFlat = app.rbFlat;
+        curTree = app.rbTree;
         if (rbCursor >= (int)view.size()) rbCursor = -1;
     }
     int rbCursorPos = -1;                // ...where it sits on SCREEN
@@ -9289,6 +9470,15 @@ static void drawPanelRemote() {
             (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
              ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
             rbOpenRow(view[rbCursor]);
+        // Right / Left expand and collapse the folder under the cursor. Only in
+        // tree mode: in the flat listing there is nothing to open in place.
+        if (app.rbTree && rbCursor >= 0 && rbCursor < (int)view.size() &&
+            view[rbCursor].isDir()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
+                rbTreeExpand(view[rbCursor].full());
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
+                rbTreeCollapse(view[rbCursor].full());
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) rbGoParent();
     }
     // The listing scrolls on its own so the header above never leaves the view.
@@ -9298,7 +9488,6 @@ static void drawPanelRemote() {
     static std::string rbPropsPath;
     static bool rbPropsOpen = false;
     static bool rbPropsNoSize = false;   // an expanded frame: no size/mtime of its own
-    enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
     // footer space for the preview scrub bar: RESERVED even when no preview is
     // alive, so starting one never shifts the rows under the cursor (a bar
     // that appeared above the list moved every row mid-double-click)
@@ -9320,8 +9509,18 @@ static void drawPanelRemote() {
         // `shown` is rebuilt every frame, so sorting it here honors a changed
         // sort spec, a fresh listing and the filter in one place. Directories
         // sort before files no matter the key - this is a browser, not a table
-        // of numbers.
+        // of numbers. In TREE mode the sort has already happened per level,
+        // inside the builder: sorting the flattened tree here would tear the
+        // children away from their parents. The spec is stashed for it.
         if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
+            if (sp->SpecsCount > 0) {
+                g_rbSortCol = (int)sp->Specs[0].ColumnUserID;
+                g_rbSortDesc = sp->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+            } else {
+                g_rbSortCol = RB_COL_NAME;
+                g_rbSortDesc = false;
+            }
+            if (!app.rbTree)
             std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
                 const RbRow& a = view[ia];
                 const RbRow& b = view[ib];
@@ -9361,9 +9560,12 @@ static void drawPanelRemote() {
             // three hairlines, a file gets nothing - the name is the row.
             // (First cut had drawn folder/page pictograms; they collided with
             // the text and were, verbatim, "くどい".)
-            std::string lb = "  " + rname;
+            // the tree's indent is drawn as leading spaces, so the Selectable
+            // still spans the whole row and the hit target never narrows
+            std::string lb(2 + (size_t)r.depth * 3, ' ');
+            lb += rname;
             if (r.isGroup()) lb += "   [" + std::to_string(e.frames) + " frames]";
-            bool servable = r.isDir() || isNpyName(rname);
+            bool servable = !r.ph && (r.isDir() || isNpyName(rname));   // (ph draws dimmed)
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
@@ -9381,13 +9583,21 @@ static void drawPanelRemote() {
                 ImVec2 p = ImGui::GetItemRectMin();
                 float h = ImGui::GetTextLineHeight();
                 float gut = ImGui::CalcTextSize("  ").x;      // never touch the name
+                float indent = ImGui::CalcTextSize("   ").x * (float)r.depth;
                 float y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
-                float cxm = p.x + gut * 0.45f, cym = y + h * 0.5f;
+                float cxm = p.x + indent + gut * 0.45f, cym = y + h * 0.5f;
                 if (r.isDir()) {      // › chevron, the way a tree hints "enter me"
                     ImU32 c = IM_COL32(150, 158, 166, 170);
                     float a = std::min(h * 0.16f, gut * 0.30f);
-                    rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
-                    rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
+                    // in a tree it also SAYS which way the node is: › closed,
+                    // v open, the one glyph carrying both meanings
+                    if (app.rbTree && rbHas(app.rbExpanded, r.full())) {
+                        rdl->AddLine(ImVec2(cxm - a, cym - a * 0.5f), ImVec2(cxm, cym + a * 0.5f), c, 1.4f);
+                        rdl->AddLine(ImVec2(cxm, cym + a * 0.5f), ImVec2(cxm + a, cym - a * 0.5f), c, 1.4f);
+                    } else {
+                        rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
+                        rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
+                    }
                 } else {              // stack: three hairlines, barely there
                     ImU32 c = IM_COL32(130, 165, 200, 150);
                     float w = std::min(h * 0.36f, gut * 0.8f);
@@ -9424,8 +9634,8 @@ static void drawPanelRemote() {
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 rbOpenRow(r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
-            if (ImGui::BeginPopupContextItem("ctx")) {
-                std::string full = joined(rname);
+            if (!r.ph && ImGui::BeginPopupContextItem("ctx")) {
+                std::string full = r.full();
                 if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(full);
@@ -9447,7 +9657,7 @@ static void drawPanelRemote() {
                 } else if (r.isGroup()) {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
-                        for (const auto& m : e.members) files.push_back(joined(m));
+                        for (const auto& m : e.members) files.push_back(r.join(m));
                         openRemoteStack(B.host, files);
                     }
                     // the server aggregates WITHOUT opening: "is this set even
@@ -9455,7 +9665,7 @@ static void drawPanelRemote() {
                     // rows only exist from protocol 3 on, so no version gate.
                     if (ImGui::MenuItem("Temporal stats (server)")) {
                         std::vector<std::string> files;
-                        for (const auto& m : e.members) files.push_back(joined(m));
+                        for (const auto& m : e.members) files.push_back(r.join(m));
                         std::string leaf = B.dir;
                         size_t sl2 = leaf.find_last_of('/');
                         if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
@@ -9479,7 +9689,7 @@ static void drawPanelRemote() {
                         snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
-                            for (const auto& m : e.members) files.push_back(joined(m));
+                            for (const auto& m : e.members) files.push_back(r.join(m));
                             openRemoteStack(B.host, files);
                         }
                     }
@@ -9504,13 +9714,16 @@ static void drawPanelRemote() {
                 ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
-            if (!r.isDir() && isNpyName(rname)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
+            if (!r.ph && !r.isDir() && isNpyName(rname))
+                ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
             ImGui::TableNextColumn();
             // blank, not zero: the group reply has no per-frame size or mtime
-            if (!r.isDir() && r.ownFile()) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
+            if (!r.ph && !r.isDir() && r.ownFile())
+                ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
             ImGui::TableNextColumn();
-            if (r.ownFile() && e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
-            else if (!r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
+            if (!r.ph && r.ownFile() && e.mtime > 0)
+                ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -10433,6 +10646,7 @@ static void drawHelpAbout() {
                 row("up / down",     "walk the listing, previewing as it goes");
                 row("Home / End",    "first / last row");
                 row("Enter",         "open for real (the double-click: a stack opens whole)");
+                row("right / left",  "tree mode: expand / collapse the folder under the cursor");
                 row("Backspace",     "up to the parent folder");
                 row(SC_MOD "+F",     "focus the filter box");
                 row(", / .",         "step the previewed sequence");
@@ -11633,8 +11847,8 @@ int main(int argc, char** argv) {
                 nMembers += (int)e.members.size();
                 if (!g) g = &e;
             }
-            std::vector<RbRow> gv = rbBuildView(B.entries, false);
-            std::vector<RbRow> fv = rbBuildView(B.entries, true);
+            std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
+            std::vector<RbRow> fv = rbBuildView(&B.dir, B.entries, true, false);
             bool sizes = gv.size() == B.entries.size() &&
                          fv.size() == B.entries.size() - nGroups + nMembers;
             // one grouped row for the sequence, and it is the group entry
@@ -11664,6 +11878,87 @@ int main(int argc, char** argv) {
                      memberCells) ? "ok" : "FAIL");
             if (!(sizes && gRows == nGroups && nGroups >= 1 && same && nogroups && memberCells))
                 ok = false;
+        }
+        {   // Tree mode, lazily: expanding a node issues exactly ONE LIST, on
+            // the worker; the children appear under the folder at depth+1;
+            // collapsing keeps the cache, so re-expanding issues nothing.
+            std::string sub;
+            for (const auto& e : B.entries)
+                if (e.dir && (sub.empty() || e.name == "scanroot")) sub = e.name;
+            if (sub.empty()) {
+                fprintf(stderr, "browseselftest: tree: no subfolder in %s to expand\n",
+                        dir.c_str());
+                ok = false;
+            } else {
+                std::string subPath = dir + "/" + sub;
+                int before = app.rbTreeLists;
+                // nothing is listed until it is asked for
+                bool lazy0 = app.rbTreeCache.empty();
+                rbTreeExpand(subPath);
+                double t1 = glfwGetTime();
+                while (glfwGetTime() - t1 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (app.rbTreeCache.count(subPath)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                int afterExpand = app.rbTreeLists;
+                std::vector<RbRow> tv = rbBuildView(&B.dir, B.entries, false, true);
+                // the children sit directly under their folder, one level in
+                int at = -1;
+                for (int i = 0; i < (int)tv.size(); i++)
+                    if (tv[i].isDir() && tv[i].name() == sub) { at = i; break; }
+                size_t nKids = app.rbTreeCache.count(subPath)
+                             ? app.rbTreeCache[subPath].size() : 0;
+                int kidsUnder = 0;
+                bool contiguous = at >= 0;
+                for (int i = at + 1; i < (int)tv.size() && tv[i].depth > tv[at].depth; i++)
+                    kidsUnder++;
+                if (at < 0 || (size_t)kidsUnder != nKids) contiguous = false;
+                // ...and they know which directory they came from
+                bool paths = at >= 0;
+                for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
+                    if (tv[i].full() != subPath + "/" + tv[i].name()) paths = false;
+                // collapse: rows go, the cache stays
+                rbTreeCollapse(subPath);
+                std::vector<RbRow> cv = rbBuildView(&B.dir, B.entries, false, true);
+                bool collapsed = cv.size() == B.entries.size() &&
+                                 app.rbTreeCache.count(subPath) == 1;
+                // re-expand: no second round trip
+                rbTreeExpand(subPath);
+                int afterAgain = app.rbTreeLists;
+                std::vector<RbRow> rv = rbBuildView(&B.dir, B.entries, false, true);
+                bool freeAgain = afterAgain == afterExpand && rv.size() == tv.size();
+                // and a grandchild: the recursion must indent, not flatten
+                int deep = 0, atDeep = -1;
+                if (at >= 0)
+                    for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
+                        if (tv[i].isDir()) { atDeep = i; break; }
+                if (atDeep >= 0) {
+                    rbTreeExpand(rv[atDeep].full());
+                    double t2 = glfwGetTime();
+                    while (glfwGetTime() - t2 < 120.0) {
+                        pumpRemoteBrowse();
+                        if (app.rbTreeCache.count(rv[atDeep].full())) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    std::vector<RbRow> dv = rbBuildView(&B.dir, B.entries, false, true);
+                    for (const auto& q : dv) if (q.depth == 2) deep++;
+                }
+                bool treeOk = lazy0 && afterExpand == before + 1 && nKids > 0 &&
+                              contiguous && paths && collapsed && freeAgain &&
+                              (atDeep < 0 || deep > 0);
+                fprintf(stderr, "browseselftest: tree lazy: nothing cached before=%d, "
+                                "expand %s -> %d LIST(s) (%d children at depth %d, paths "
+                                "ok=%d), collapse -> %d row(s) with the cache kept=%d, "
+                                "re-expand -> %d extra LIST(s), grandchild rows at "
+                                "depth 2 = %d: %s\n",
+                        lazy0 ? 1 : 0, sub.c_str(), afterExpand - before, kidsUnder,
+                        at >= 0 && at + 1 < (int)tv.size() ? tv[at + 1].depth : -1,
+                        paths ? 1 : 0, (int)cv.size(), collapsed ? 1 : 0,
+                        afterAgain - afterExpand, deep, treeOk ? "ok" : "FAIL");
+                if (!treeOk) ok = false;
+                rbTreeForget();
+            }
         }
         {   // "Open folder" on the folder being browsed: the same call the
             // toolbar button and the breadcrumb menu make. The scan must
@@ -13009,6 +13304,9 @@ int main(int argc, char** argv) {
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
+                // a tree node whose LIST is still out: its "(listing...)" row
+                // has to become children without waiting for the mouse to move
+                working |= !app.rbTreePending.empty();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
