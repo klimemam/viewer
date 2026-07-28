@@ -101,6 +101,10 @@ struct NpyFile {
     uint64_t dataOffset = 0;
     size_t elemSize = 0;
     bool ok = false;
+    // element strides for each logical axis, so a Fortran-order file reads
+    // through the same code as a C-order one (the local loader has always
+    // handled Fortran; refusing it only over the link was an inconsistency)
+    uint64_t sFrame = 0, sY = 0, sX = 0, sCh = 1;
 };
 
 static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err) {
@@ -145,7 +149,6 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
         dims.push_back(atoll(hdr.c_str() + i));
         while (i < close && hdr[i] != ',') i++;
     }
-    if (n.fortran) { err = "fortran-order .npy is not served (open it locally)"; return false; }
     if (dims.size() == 2)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = 1; }
     else if (dims.size() == 3) {
         if (dims[2] <= 4)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = (int)dims[2]; }
@@ -160,6 +163,31 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
         n.ch < 1 || n.ch > 4 || n.frames < 1 || n.frames > (1 << 20)) {
         err = "unreasonable .npy shape";
         return false;
+    }
+    // Per-axis element strides. C order: the last dimension is fastest.
+    // Fortran order: the first. Everything downstream indexes through these, so
+    // the two layouts differ in four numbers and nowhere else.
+    {
+        std::vector<uint64_t> d;                    // dims in declaration order
+        std::vector<uint64_t*> s;                   // stride slot for each
+        if (dims.size() == 2)      { d = { (uint64_t)n.h, (uint64_t)n.w };
+                                     s = { &n.sY, &n.sX }; }
+        else if (dims.size() == 3 && n.frames == 1) { d = { (uint64_t)n.h, (uint64_t)n.w, (uint64_t)n.ch };
+                                     s = { &n.sY, &n.sX, &n.sCh }; }
+        else if (dims.size() == 3) { d = { (uint64_t)n.frames, (uint64_t)n.h, (uint64_t)n.w };
+                                     s = { &n.sFrame, &n.sY, &n.sX }; }
+        else                       { d = { (uint64_t)n.frames, (uint64_t)n.h,
+                                           (uint64_t)n.w, (uint64_t)n.ch };
+                                     s = { &n.sFrame, &n.sY, &n.sX, &n.sCh }; }
+        for (auto* p : s) *p = 0;
+        uint64_t acc = 1;
+        if (n.fortran) {
+            for (size_t i = 0; i < d.size(); i++) { *s[i] = acc; acc *= d[i]; }
+        } else {
+            for (size_t i = d.size(); i-- > 0; ) { *s[i] = acc; acc *= d[i]; }
+        }
+        if (!n.sCh) n.sCh = 1;                      // 2D / (F,H,W): single channel
+        if (!n.sFrame) n.sFrame = (uint64_t)n.w * n.h * n.ch;   // single-frame file
     }
     n.ok = true;
     return true;
@@ -180,23 +208,61 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
     size_t px = n.elemSize * n.ch;
     out.resize((size_t)outW * outH * px);
 
-    uint64_t frameBytes = (uint64_t)n.w * n.h * px;
-    uint64_t base = n.dataOffset + (uint64_t)std::min<uint32_t>(r.frame, n.frames - 1) * frameBytes;
-    std::vector<uint8_t> row((size_t)(x1 - x0) * px);
+    uint32_t frame = std::min<uint32_t>(r.frame, (uint32_t)n.frames - 1);
+    const size_t es = n.elemSize;
     uint8_t* dst = out.data();
-    for (uint32_t y = y0, oy = 0; oy < outH; y += step, oy++) {
-        n.f.seekg((std::streamoff)(base + ((uint64_t)y * n.w + x0) * px));
-        n.f.read((char*)row.data(), (std::streamsize)row.size());
-        if (!n.f) { err = "short read"; return false; }
-        if (step == 1) {
-            memcpy(dst, row.data(), row.size());
-            dst += row.size();
-        } else {
-            for (uint32_t ox = 0; ox < outW; ox++) {
-                memcpy(dst, row.data() + (size_t)ox * step * px, px);
-                dst += px;
+    const bool rowContiguous = n.sCh == 1 && n.sX == (uint64_t)n.ch &&
+                               n.sY == (uint64_t)n.w * n.ch;      // plain C order
+    if (rowContiguous) {
+        uint64_t base = n.dataOffset + (uint64_t)frame * n.sFrame * es;
+        std::vector<uint8_t> row((size_t)(x1 - x0) * px);
+        for (uint32_t y = y0, oy = 0; oy < outH; y += step, oy++) {
+            n.f.seekg((std::streamoff)(base + ((uint64_t)y * n.w + x0) * px));
+            n.f.read((char*)row.data(), (std::streamsize)row.size());
+            if (!n.f) { err = "short read"; return false; }
+            if (step == 1) {
+                memcpy(dst, row.data(), row.size());
+                dst += row.size();
+            } else {
+                for (uint32_t ox = 0; ox < outW; ox++) {
+                    memcpy(dst, row.data() + (size_t)ox * step * px, px);
+                    dst += px;
+                }
             }
         }
+    } else {
+        // Fortran order (or any exotic axis order): read the byte extent the
+        // region spans once, then gather through the strides. One read instead
+        // of a seek per element, which is what makes this usable at all.
+        uint64_t lo = UINT64_MAX, hi = 0;
+        auto off = [&](uint64_t y, uint64_t x, uint64_t c) {
+            return (uint64_t)frame * n.sFrame + y * n.sY + x * n.sX + c * n.sCh;
+        };
+        const uint64_t corners[4][2] = { { y0, x0 }, { y0, (uint64_t)x1 - 1 },
+                                         { (uint64_t)y1 - 1, x0 },
+                                         { (uint64_t)y1 - 1, (uint64_t)x1 - 1 } };
+        for (const auto& cn : corners)
+            for (uint64_t c = 0; c < (uint64_t)n.ch; c++) {
+                uint64_t o = off(cn[0], cn[1], c);
+                lo = std::min(lo, o);
+                hi = std::max(hi, o);
+            }
+        uint64_t spanElems = hi - lo + 1;
+        if (spanElems * es > ((uint64_t)1 << 30)) {
+            err = "region spans too much of a non-contiguous (fortran-order) file";
+            return false;
+        }
+        std::vector<uint8_t> blk((size_t)(spanElems * es));
+        n.f.seekg((std::streamoff)(n.dataOffset + lo * es));
+        n.f.read((char*)blk.data(), (std::streamsize)blk.size());
+        if (!n.f) { err = "short read"; return false; }
+        for (uint32_t y = y0, oy = 0; oy < outH; y += step, oy++)
+            for (uint32_t x = x0, ox = 0; ox < outW; x += step, ox++)
+                for (uint32_t c = 0; c < (uint32_t)n.ch; c++) {
+                    uint64_t o = off(y, x, c) - lo;
+                    memcpy(dst, blk.data() + (size_t)(o * es), es);
+                    dst += es;
+                }
     }
     if (n.bigEndian && n.elemSize > 1) {          // normalise on the server side
         for (size_t i = 0; i + n.elemSize <= out.size(); i += n.elemSize)

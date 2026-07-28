@@ -450,12 +450,29 @@ bool parseUrl(const std::string& url, std::string& host, std::string& path) {
         return !path.empty();
     }
     const std::string pre = "ssh://";
-    if (url.compare(0, pre.size(), pre) != 0) return false;
-    size_t slash = url.find('/', pre.size());
-    if (slash == std::string::npos) return false;
-    host = url.substr(pre.size(), slash - pre.size());
-    path = url.substr(slash);
-    return !host.empty() && path.size() > 1;
+    if (url.compare(0, pre.size(), pre) == 0) {
+        std::string rest = url.substr(pre.size());
+        // ssh://host/abs/path and ssh://host:~/rel or ssh://host:/abs - the colon
+        // form is what fingers trained on scp will type
+        size_t cut = rest.find_first_of("/:");
+        if (cut == std::string::npos) return false;
+        host = rest.substr(0, cut);
+        path = rest[cut] == ':' ? rest.substr(cut + 1) : rest.substr(cut);
+        if (path.empty()) return false;
+        return !host.empty();
+    }
+    // Bare scp form: host:path or user@host:path. Not a URL, but it is what the
+    // muscle memory produces, and there is no ambiguity with a local path here
+    // because those are handled before this is ever called.
+    size_t colon = url.find(':');
+    if (colon != std::string::npos && colon > 0 && url.compare(0, 8, "local://") != 0 &&
+        url.find("://") == std::string::npos &&
+        !(colon == 1 && isalpha((unsigned char)url[0]))) {   // not "C:\..."
+        host = url.substr(0, colon);
+        path = url.substr(colon + 1);
+        return !host.empty() && !path.empty();
+    }
+    return false;
 }
 
 }  // namespace remote
