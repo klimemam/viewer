@@ -514,6 +514,11 @@ struct App {
         double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
         std::vector<float> idx, frameMean, frameStd;
     } srvTemporal;
+    // The same, for the compare B side. NEVER fired automatically: a server
+    // aggregate is a real job on a real machine, and B following A around
+    // would double them silently. The Temporal panel's "Measure B" button is
+    // the only thing that fills this.
+    ServerTemporal srvTemporalB;
     // background loader
     std::thread seqThread;
     std::atomic<bool> seqCancel{ false };
@@ -1420,8 +1425,13 @@ static void pumpMeasure() {
     }
     for (auto& d : batch) {
         app.mPending--;
-        if (d.token != app.srvTemporal.token) continue;   // superseded request
-        App::ServerTemporal& S = app.srvTemporal;
+        // the A slot or the explicitly-measured B slot, by token
+        App::ServerTemporal* Sp = nullptr;
+        if (app.srvTemporal.token && d.token == app.srvTemporal.token) Sp = &app.srvTemporal;
+        else if (app.srvTemporalB.token && d.token == app.srvTemporalB.token)
+            Sp = &app.srvTemporalB;
+        if (!Sp) continue;                                // superseded request
+        App::ServerTemporal& S = *Sp;
         S.pending = false;
         S.host = d.host;
         if (!d.ok) { S.valid = false; S.err = d.err; continue; }
@@ -1520,6 +1530,7 @@ static void closeStack(int seqId) {
     app.lin.rev++;
     app.temporal[0].seqId = app.temporal[1].seqId = -1;
     if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
+    if (app.srvTemporalB.seqId == seqId) app.srvTemporalB = App::ServerTemporal{};
 }
 
 // Close a batch: every stack and loose frame in it, plus the queued opens that
@@ -4680,11 +4691,12 @@ static uint64_t g_measureToken = 1;
 // Fire the server-side temporal aggregate for a remote stack, if policy allows.
 // The result feeds the Temporal panel with a [server, N frames] tag, in seconds,
 // without waiting for any frame transfer.
-static void maybeRequestServerTemporal(int seqId) {
+// `into` is the slot the answer lands in: app.srvTemporal for A (automatic),
+// app.srvTemporalB for the compare side (button only - see the struct).
+static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     App::SeqInfo* si = nullptr;
     for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
     if (!si || !serverComputes(*si)) return;
-    App::ServerTemporal& S = app.srvTemporal;
     S = App::ServerTemporal{};
     S.seqId = seqId;
     S.token = g_measureToken++;
@@ -4700,6 +4712,9 @@ static void maybeRequestServerTemporal(int seqId) {
         j.url = si->remoteUrl;
     }
     mEnqueue(std::move(j));
+}
+static void maybeRequestServerTemporal(int seqId) {
+    requestServerTemporal(seqId, app.srvTemporal);
 }
 
 // Temporal stats for a stack that is NOT opened: fired from the browser's group
@@ -8254,12 +8269,271 @@ static void copyPerFrameStats(int seqId) {
     toast(b, skipped != 0);
 }
 
+// One side's temporal numbers, wherever they came from. The A/B table takes
+// both sides through this, so a server-measured A and a locally computed B land
+// in the same rows under the same headers - and "there is no number here" is a
+// stated reason instead of a blank.
+struct AbTemporal {
+    bool valid = false, isStack = false, fromServer = false;
+    double sigT = 0, sigS = 0, sigTot = 0;
+    int frames = 0, expected = 0;
+    const std::vector<float>* idx = nullptr;
+    const std::vector<float>* mean = nullptr;
+    const char* note = "";
+};
+static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
+                               const App::ServerTemporal& S) {
+    AbTemporal o;
+    if (!d || d->seqId == 0) { o.note = "not a stack"; return o; }
+    o.isStack = true;
+    if (const App::SeqInfo* si = seqInfo(d->seqId)) o.expected = si->expectedFrames;
+    if (S.valid && S.seqId == d->seqId) {          // server-measured wins: it saw
+        o.valid = true; o.fromServer = true;       // every frame, not the resident ones
+        o.sigT = S.tempNoise; o.sigS = S.fixedPattern; o.sigTot = S.totalNoise;
+        o.frames = S.frames;
+        o.idx = &S.idx; o.mean = &S.frameMean;
+        return o;
+    }
+    if (T.valid && T.seqId == d->seqId) {
+        o.valid = true;
+        o.sigT = T.tempNoise; o.sigS = T.fixedPattern; o.sigTot = T.totalNoise;
+        o.frames = T.frames;
+        o.idx = &T.idx; o.mean = &T.frameMean;
+        return o;
+    }
+    o.note = S.pending && S.seqId == d->seqId ? "measuring on the server..."
+                                              : "needs >= 2 loaded frames";
+    return o;
+}
+
+// A difference only means something when both sides measured the same quantity.
+// A 1-channel stack's sigma_t and a 3-channel one's are not the same number, so
+// the delta columns stay empty rather than subtract two unlike things
+// (docs/ab-stats-plan.md 5).
+static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
+    return a && b && a->ch == b->ch;
+}
+
+// "DN" is only true for integer sensor data; a float .npy may hold reflectance,
+// electrons or anything else, so its unit is stated as the storage type rather
+// than asserted to be DN (same rule as the Inspector's).
+static std::string abValueUnit(const std::string& dtype) {
+    bool isInt = !dtype.empty() && (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
+    return isInt ? std::string("DN") : dtype;
+}
+
+// The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
+// (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
+static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
+    recomputeTemporalIfNeeded(im, app.temporal[0]);
+    // NOT throttled: temporal is keyed on the STACK and its ROI, so stepping
+    // frames never invalidates it (see the A4 check in --abstats-selftest).
+    recomputeTemporalIfNeeded(Bim, app.temporal[1]);
+    AbTemporal A = abTemporalOf(im, app.temporal[0], app.srvTemporal);
+    AbTemporal B = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
+
+    const std::string uA = abValueUnit(im->dtype), uB = abValueUnit(Bim->dtype);
+    const bool dtypeMix = uA != uB;
+    const std::string unit = dtypeMix ? (uA + "/" + uB) : uA;
+    const bool canDelta = abDeltaMeaningful(im, Bim);
+
+    ImGui::Text("Temporal");
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%s, %s]", app.temporal[0].roiUsed ? "selected ROI" : "whole image",
+                        A.fromServer || B.fromServer ? "server + local" : "local");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("One row per resident frame of A's stack, tab-separated.");
+    // B's server aggregate is never fired automatically - one explicit press,
+    // one remote job (docs/ab-stats-plan.md 4).
+    if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
+        if (serverComputes(*sb)) {
+            ImGui::SameLine();
+            bool busy = app.srvTemporalB.pending && app.srvTemporalB.seqId == Bim->seqId;
+            ImGui::BeginDisabled(busy);
+            if (ImGui::SmallButton(busy ? "Measuring B..." : "Measure B"))
+                requestServerTemporal(Bim->seqId, app.srvTemporalB);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Run the server-side aggregate over B's stack.\n"
+                                  "It is never started on its own: B follows A, and\n"
+                                  "an automatic B measurement would double every\n"
+                                  "remote job you did not ask for.");
+        }
+    ImGui::Separator();
+
+    char hA[64], hB[64];
+    auto frames = [](char* buf, size_t n, const char* side, const AbTemporal& s) {
+        if (!s.isStack) snprintf(buf, n, "%s", side);
+        else if (s.expected > s.frames) snprintf(buf, n, "%s (n=%d/%d)", side, s.frames, s.expected);
+        else snprintf(buf, n, "%s (n=%d/%d)", side, s.frames, s.frames);
+    };
+    frames(hA, sizeof hA, "A", A);
+    frames(hB, sizeof hB, "B", B);
+    std::string cQ = "quantity [" + unit + "]";
+    std::string cD = "delta A-B [" + unit + "]";
+
+    if (ImGui::BeginTable("abtemporal", 5, ImGuiTableFlags_SizingFixedFit |
+                                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+        ImGui::TableSetupColumn(cQ.c_str(), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(hA, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(hB, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(cD.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("delta [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableHeadersRow();
+        // isPct: the quantity is already a percentage, so a relative difference
+        // of a percentage is meaningless - the absolute one, in points, is the
+        // honest answer. Kept general; today's three rows are all in DN.
+        auto row = [&](const char* k, double a, double b, bool isPct) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            ImGui::TableNextColumn();
+            A.valid ? textNum("%.6g", a) : textNumStr("-");
+            ImGui::TableNextColumn();
+            if (B.valid) textNum("%.6g", b);
+            else textNumStr(B.isStack ? "-" : "- (not a stack)");
+            ImGui::TableNextColumn();
+            if (A.valid && B.valid && canDelta) textNum("%.6g", a - b); else textNumStr("");
+            ImGui::TableNextColumn();
+            if (!A.valid || !B.valid || !canDelta) textNumStr("");
+            // a quantity that is ALREADY a percentage has no meaningful relative
+            // difference: points are the honest answer. (Today's three rows are
+            // all in DN; the rule is here so the next row cannot get it wrong.)
+            else if (isPct) { char t[48]; snprintf(t, sizeof t, "%.4g pt", a - b); textNumStr(t); }
+            else if (a == 0) textNumStr("-  (A = 0)");
+            else textNum("%.4g", (a - b) / fabs(a) * 100.0);
+        };
+        row("temporal noise (sigma_t)", A.sigT, B.sigT, false);
+        row("fixed pattern (sigma_s)", A.sigS, B.sigS, false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
+                              "includes scene detail unless the ROI is flat");
+        row("total (quadrature)", A.sigTot, B.sigTot, false);
+        ImGui::EndTable();
+    }
+    if (!A.valid || !B.valid)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "A: %s   |   B: %s",
+                           A.valid ? "ok" : A.note, B.valid ? "ok" : B.note);
+    if (dtypeMix)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "dtype mismatch (A %s, B %s): the delta mixes units",
+                           im->dtype.c_str(), Bim->dtype.c_str());
+    if (!canDelta)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "channel counts differ (A %dch, B %dch): no delta - the two "
+                           "columns are not the same quantity", im->ch, Bim->ch);
+    if (A.fromServer || B.fromServer)
+        ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
+                            B.fromServer ? "server" : "local");
+
+    // ---- per-frame mean over time: A solid, B dashed, one shared axis ----
+    if (!A.mean || A.mean->empty()) return;
+    float mn = FLT_MAX, mx = -FLT_MAX, fx0 = FLT_MAX, fx1 = -FLT_MAX;
+    auto span = [&](const AbTemporal& s) {
+        if (!s.mean || s.mean->empty()) return;
+        for (float v : *s.mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        if (s.idx && !s.idx->empty()) {
+            fx0 = std::min(fx0, s.idx->front()); fx1 = std::max(fx1, s.idx->back());
+        }
+    };
+    span(A); span(B);
+    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
+    char yl[128];
+    if (dtypeMix) snprintf(yl, sizeof yl, "ROI mean value (A %s / B %s - DTYPE MISMATCH)",
+                           im->dtype.c_str(), Bim->dtype.c_str());
+    else snprintf(yl, sizeof yl, "ROI mean value (%s)", im->dtype.c_str());
+    const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
+
+    auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool dashed) {
+        if (!tp.ok || !s.mean || s.mean->size() < 2 || !s.idx) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        std::vector<ImVec2> pts;
+        pts.reserve(s.mean->size());
+        for (size_t i = 0; i < s.mean->size() && i < s.idx->size(); i++)
+            pts.push_back(tp.at((*s.idx)[i], (*s.mean)[i]));
+        if (pts.size() < 2) return;
+        if (dashed) addDashedPolyline(dl, pts.data(), (int)pts.size(), CURVE, 1.5f,
+                                      5 * app.uiScale, 4 * app.uiScale);
+        else dl->AddPolyline(pts.data(), (int)pts.size(), CURVE, 0, 1.5f);
+    };
+    auto marker = [&](const PlotRect& tp, const ImageDoc* d) {
+        if (!tp.ok || !d) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        float mxp = tp.at((float)d->seqIndex, tp.ymin).x;
+        dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
+    };
+    const float minSide = 320.0f * app.uiScale;
+    bool side = abSideBySide();
+    bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+    if (tooNarrow) side = false;
+    float tAvail = ImGui::GetContentRegionAvail().y
+                 - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
+                 - (tooNarrow ? ImGui::GetTextLineHeightWithSpacing() : 0.0f);
+    if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;
+    float plotH = std::max(tAvail, 70.0f * app.uiScale);
+    const char* xlab = "frame number (index in sequence)";
+    if (!side) {
+        PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+        if (tp.ok) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(tp.p0, tp.p1, true);
+            curve(tp, A, false);
+            curve(tp, B, true);
+            marker(tp, im);
+            dl->PopClipRect();
+        }
+        drawABLegend(tp, im->name, Bim->name);
+    } else {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
+                     + ImGui::GetTextLineHeight() + 8 * app.uiScale;
+        ImGui::BeginChild("##tempA", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("A", im->name);
+        {
+            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+            if (tp.ok) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                curve(tp, A, false); marker(tp, im);
+                dl->PopClipRect();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("##tempB", ImVec2(half, childH), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        drawABBand("B", Bim->name);
+        {   // same limits as A's plot, by construction
+            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+            if (tp.ok) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                curve(tp, B, true); marker(tp, Bim);
+                dl->PopClipRect();
+            }
+        }
+        ImGui::EndChild();
+    }
+    if (tooNarrow)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "panel narrower than %.0f px: overlaid instead of side by side",
+                           minSide);
+}
+
 static void drawPanelTemporal() {
     // a browser-fired aggregate (files nobody opened) owns the panel until
     // dismissed - it is the freshest thing the user asked for and has no
     // current image to attach to
     if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
+    // Compare on, and A is a stack: the A|B|delta|delta% table. A B that is not
+    // a stack still gets its column, saying exactly that. With no B at all the
+    // panel is exactly what it always was.
+    if (ImageDoc* Bim = abStatsB())
+        if (im && im->seqId != 0) { drawTemporalAB(im, Bim); return; }
     if (im && im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
         if (drawServerTemporal(si)) {         // remote stack, computed on the server
@@ -12626,7 +12900,8 @@ int main(int argc, char** argv) {
                 // and the channel counts differ too, which P3's delta columns use
                 check(app.proj[0].nSeries != app.proj[1].nSeries ||
                       cur()->ch == b5->ch, "P2 series count reflects the channel count");
-                closeCurrent(true);                     // drop the extra image again
+                selectImage((int)app.images.size() - 1);  // the extra image ITSELF
+                closeCurrent(true);                       // ...and only that one
                 selectImage(frA.front());
                 setCompareB(app.images[framesOfSeq(sidB).front()].get());
                 abStatsFrame();
@@ -12671,6 +12946,73 @@ int main(int argc, char** argv) {
                   "P2b B refreshes once the stepping stops");
             selectImage(frA.front());
             app.abStepBusyUntil = 0;
+        }
+
+        // ---- P3: the A|B|delta|delta% table's inputs ----
+        {
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            abStatsFrame();
+            ImageDoc* b7 = cmpB();
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            recomputeTemporalIfNeeded(b7, app.temporal[1]);
+            AbTemporal TA = abTemporalOf(cur(), app.temporal[0], app.srvTemporal);
+            AbTemporal TB = abTemporalOf(b7, app.temporal[1], app.srvTemporalB);
+            double dAbs = TA.sigT - TB.sigT;
+            double dPct = TA.sigT != 0 ? (TA.sigT - TB.sigT) / fabs(TA.sigT) * 100.0 : 0.0;
+            fprintf(stderr, "abstatsselftest: P3 table inputs: A sigma_t=%.9g (n=%d/%d, "
+                            "server=%d), B sigma_t=%.9g (n=%d/%d, server=%d), "
+                            "delta A-B=%.9g, delta=%.6g %%, unit=[%s]\n",
+                    TA.sigT, TA.frames, TA.expected, TA.fromServer ? 1 : 0,
+                    TB.sigT, TB.frames, TB.expected, TB.fromServer ? 1 : 0,
+                    dAbs, dPct, abValueUnit(cur()->dtype).c_str());
+            check(TA.valid && TB.valid && TA.isStack && TB.isStack,
+                  "P3 both sides resolve to stack temporal numbers");
+            check(!TA.fromServer && !TB.fromServer,
+                  "P3 local stacks come from the local computation");
+            check(dAbs == TA.sigT - TB.sigT && !TA.fromServer,
+                  "P3 delta is A - B (the difference image's sign)");
+            check(abDeltaMeaningful(cur(), b7), "P3 equal channel counts allow a delta");
+            // B's server aggregate must never have been fired on its own
+            check(app.srvTemporalB.token == 0 && !app.srvTemporalB.pending &&
+                  app.srvTemporalB.seqId == -1,
+                  "P3 B's server temporal is never fired automatically");
+        }
+        {   // a B that is not a stack, and a B with a different channel count
+            std::string root = g_abstatsSelftest;
+            std::replace(root.begin(), root.end(), '\\', '/');
+            while (!root.empty() && root.back() == '/') root.pop_back();
+            size_t sl = root.find_last_of('/');
+            root = sl == std::string::npos ? std::string(".") : root.substr(0, sl);
+            size_t before = app.images.size();
+            openPath(root + "/rgb_u8.npy");            // 3 channels, single frame
+            loadAll();
+            if (app.images.size() > before) {
+                ImageDoc* lone = app.images.back().get();
+                selectImage(frA.front());
+                setCompareB(lone);
+                abStatsFrame();
+                ImageDoc* b8 = cmpB();
+                recomputeTemporalIfNeeded(b8, app.temporal[1]);
+                AbTemporal TB2 = abTemporalOf(b8, app.temporal[1], app.srvTemporalB);
+                fprintf(stderr, "abstatsselftest: P3 lone B '%s' %dch: isStack=%d valid=%d "
+                                "note='%s', delta meaningful=%d (A %dch)\n",
+                        b8->name.c_str(), b8->ch, TB2.isStack ? 1 : 0, TB2.valid ? 1 : 0,
+                        TB2.note, abDeltaMeaningful(cur(), b8) ? 1 : 0, cur()->ch);
+                check(!TB2.isStack && !TB2.valid && std::string(TB2.note) == "not a stack",
+                      "P3 a B that is not a stack says so instead of a number");
+                check(cur()->ch != b8->ch && !abDeltaMeaningful(cur(), b8),
+                      "P3 different channel counts suppress the delta columns");
+                selectImage((int)app.images.size() - 1);  // the extra image ITSELF
+                closeCurrent(true);                       // ...and only that one
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                abStatsFrame();
+            } else {
+                fprintf(stderr, "abstatsselftest: P3 lone-B checks skipped (%s/rgb_u8.npy "
+                                "not there)\n", root.c_str());
+            }
         }
 
         // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
