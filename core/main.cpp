@@ -644,7 +644,11 @@ struct App {
         std::string label;            // what was measured ("10lx/frame_???.npy")
         std::vector<std::string> files;   // detached only: for "Open as stack"
         int frames = 0;
-        double tempNoise = 0, fixedPattern = 0, totalNoise = 0, mean = 0;
+        // Per CFA plane, because the peer answers per plane when it was told
+        // the mosaic (serve.cpp planeKey). nPl == 1 means the reply was pooled
+        // - which the panel then has to SAY, not hide.
+        int nPl = 1;
+        double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {}, mean[4] = {};
         std::vector<float> idx, frameMean, frameStd;
     } srvTemporal;
     // The same, for the compare B side. NEVER fired automatically: a server
@@ -795,8 +799,13 @@ struct App {
         int seqId = -1;
         int frames = 0;
         int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
+        // The mosaic is part of the KEY: toggling CFA in the Inspector changes
+        // what these numbers mean, and a cache that ignored it served the old
+        // plane-mixed answer back.
+        int cfa = -1, cfaPattern = -1;
+        int nPl = 1;                              // 4 when the frame is mosaiced
         std::vector<float> idx, frameMean, frameStd;
-        double tempNoise = 0, fixedPattern = 0, totalNoise = 0;
+        double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {};
         bool valid = false;
         bool roiUsed = false;
     } temporal[2];                    // 0 = A, 1 = B (compare)
@@ -1645,17 +1654,29 @@ static void pumpMeasure() {
         S.err.clear();
         S.valid = true;
         S.frames = d.res.framesUsed;
-        // CFA-all is column 0's un-suffixed keys; a mosaiced stack reports per
-        // plane, and the panel shows the overall figure from those when present.
-        S.mean = mFindNum(d.res, "mean [DN]", mFindNum(d.res, "mean [DN] R"));
-        S.tempNoise = mFindNum(d.res, "sigma_t [DN]", mFindNum(d.res, "sigma_t [DN] R"));
-        S.fixedPattern = mFindNum(d.res, "sigma_fpn [DN]", mFindNum(d.res, "sigma_fpn [DN] R"));
-        S.totalNoise = mFindNum(d.res, "sigma_tot [DN]", mFindNum(d.res, "sigma_tot [DN] R"));
+        // The peer answers per CFA plane when it was told the mosaic (keys
+        // suffixed " R" / " Gr" / " Gb" / " B", serve.cpp planeKey) and with
+        // un-suffixed keys when it was not. Take whichever shape arrived and
+        // record which it was - collapsing a four-plane reply onto its R plane
+        // and calling it "the overall figure" is worse than the pooled number.
+        auto has = [&](const char* k) {
+            if (d.res.cols.empty()) return false;
+            for (const auto& it : d.res.cols[0]) if (it.kind == 0 && it.key == k) return true;
+            return false;
+        };
+        S.nPl = has("sigma_t [DN] R") ? 4 : 1;
+        for (int p = 0; p < S.nPl; p++) {
+            std::string sfx = S.nPl > 1 ? std::string(" ") + CFA_CH_NAMES[p] : std::string();
+            S.mean[p] = mFindNum(d.res, ("mean [DN]" + sfx).c_str());
+            S.tempNoise[p] = mFindNum(d.res, ("sigma_t [DN]" + sfx).c_str());
+            S.fixedPattern[p] = mFindNum(d.res, ("sigma_fpn [DN]" + sfx).c_str());
+            S.totalNoise[p] = mFindNum(d.res, ("sigma_tot [DN]" + sfx).c_str());
+        }
         if (const auto* fm = mFindSeries(d.res, "frame mean")) { S.idx = fm->xs; S.frameMean = fm->ys; }
         if (const auto* fs = mFindSeries(d.res, "frame std"))  { S.frameStd = fs->ys; }
-        fprintf(stderr, "remote: server temporal over %d frames - sigma_t %.4g, "
-                        "sigma_fpn %.4g [%s]\n", S.frames, S.tempNoise, S.fixedPattern,
-                d.res.serverLoc ? "gpu" : "cpu");
+        fprintf(stderr, "remote: server temporal over %d frames, %d plane(s) - sigma_t "
+                        "%.4g, sigma_fpn %.4g [%s]\n", S.frames, S.nPl, S.tempNoise[0],
+                S.fixedPattern[0], d.res.serverLoc ? "gpu" : "cpu");
     }
 }
 
@@ -5298,22 +5319,49 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     // keyed on the resolved rect; this pass costs samples x frames, so it must
     // not run for annotation churn or mid-drag
     if (T.seqId == im->seqId && T.frames == (int)f.size() &&
-        T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh)
+        T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh &&
+        T.cfa == im->cfa && T.cfaPattern == im->cfaPattern)
         return;
     if (app.annBusy && T.seqId == im->seqId) return;
     T.seqId = im->seqId; T.frames = (int)f.size();
     T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed;
+    T.cfa = im->cfa; T.cfaPattern = im->cfaPattern;
     T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
-    T.tempNoise = T.fixedPattern = T.totalNoise = 0;
+    for (int p = 0; p < 4; p++) T.tempNoise[p] = T.fixedPattern[p] = T.totalNoise[p] = 0;
     T.valid = false;
+    // CFA planes are NEVER mixed in a statistic (docs/terminology.md). On a
+    // mosaiced flat field the R/Gr/Gb/B level difference is hundreds of DN, so
+    // a pooled sigma_fpn reports that difference as fixed-pattern noise -
+    // hundreds of DN of fake FPN, and totalNoise inherits it. Sample whole CFA
+    // CELLS rather than a strided run, so every plane gets exactly the same
+    // count and the decimation cannot land on one parity.
+    const bool cfa = im->cfa != 0 && im->ch == 1;
+    const int cell = im->cfa == 2 ? 4 : 2;         // Quad Bayer repeats over 4x4
+    T.nPl = cfa && rw >= cell && rh >= cell ? 4 : 1;
     // fixed sampling grid, capped so full-frame sequences stay interactive
     const size_t MAX_SAMPLES = 40000;
-    size_t total = (size_t)rw * rh;
-    size_t step = std::max<size_t>(1, total / MAX_SAMPLES);
     std::vector<size_t> offs;
-    for (size_t p = 0; p < total; p += step) {
-        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
-        offs.push_back(((size_t)y * im->w + x) * im->ch);   // channel 0 (or CFA sample)
+    std::vector<uint8_t> plane;
+    if (T.nPl == 1) {
+        size_t total = (size_t)rw * rh;
+        size_t step = std::max<size_t>(1, total / MAX_SAMPLES);
+        for (size_t p = 0; p < total; p += step) {
+            int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
+            offs.push_back(((size_t)y * im->w + x) * im->ch);   // channel 0
+            plane.push_back(0);
+        }
+    } else {
+        size_t bw = (size_t)(rw / cell), bh = (size_t)(rh / cell);
+        size_t blocks = bw * bh, perBlock = (size_t)cell * cell;
+        size_t bstep = std::max<size_t>(1, blocks / std::max<size_t>(1, MAX_SAMPLES / perBlock));
+        for (size_t b = 0; b < blocks; b += bstep)
+            for (int dy = 0; dy < cell; dy++)
+                for (int dx = 0; dx < cell; dx++) {
+                    int x = rx + (int)(b % bw) * cell + dx;
+                    int y = ry + (int)(b / bw) * cell + dy;
+                    offs.push_back(((size_t)y * im->w + x) * im->ch);
+                    plane.push_back((uint8_t)cfaChannelAt(*im, x, y));
+                }
     }
     if (offs.empty()) return;
     std::vector<double> sum(offs.size(), 0), sum2(offs.size(), 0);
@@ -5338,20 +5386,29 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     }
     if (used < 2) return;
     // per-sample temporal variance -> temporal noise; spatial spread of the
-    // time-averaged samples -> fixed pattern (DSNU/PRNU-like)
-    double tvarSum = 0, pmSum = 0, pmSum2 = 0;
+    // time-averaged samples -> fixed pattern (DSNU/PRNU-like). Both are
+    // accumulated PER PLANE; with no mosaic there is one plane and this is the
+    // arithmetic it always was.
+    double tvarSum[4] = {}, pmSum[4] = {}, pmSum2[4] = {};
+    size_t plc[4] = {};
     for (size_t k = 0; k < offs.size(); k++) {
+        int p = plane[k];
         double m = sum[k] / used;
         double v = sum2[k] / used - m * m;
-        tvarSum += v > 0 ? v : 0;
-        pmSum += m; pmSum2 += m * m;
+        tvarSum[p] += v > 0 ? v : 0;
+        pmSum[p] += m; pmSum2[p] += m * m;
+        plc[p]++;
     }
-    double tvar = tvarSum / offs.size();
-    double pmean = pmSum / offs.size();
-    double pvar = pmSum2 / offs.size() - pmean * pmean;
-    T.tempNoise = sqrt(tvar);
-    T.fixedPattern = sqrt(std::max(0.0, pvar));           // includes real scene detail
-    T.totalNoise = sqrt(tvar + std::max(0.0, pvar));
+    for (int p = 0; p < T.nPl; p++) {
+        if (!plc[p]) continue;
+        double n = (double)plc[p];
+        double tvar = tvarSum[p] / n;
+        double pmean = pmSum[p] / n;
+        double pvar = pmSum2[p] / n - pmean * pmean;
+        T.tempNoise[p] = sqrt(tvar);
+        T.fixedPattern[p] = sqrt(std::max(0.0, pvar));    // includes real scene detail
+        T.totalNoise[p] = sqrt(tvar + std::max(0.0, pvar));
+    }
     T.valid = true;
 }
 
@@ -5670,6 +5727,26 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
 }
 static void maybeRequestServerTemporal(int seqId) {
     requestServerTemporal(seqId, app.srvTemporal);
+}
+
+// The Inspector changed a frame's mosaic. The stack it belongs to carries that
+// mosaic to the server (SeqInfo::cfaType is what requestServerTemporal sends),
+// so the whole stack follows and any server aggregate is re-fired: a sigma
+// computed with the wrong plane split is a wrong number, not a stale one.
+static void seqMosaicChanged(const ImageDoc* im) {
+    if (!im || im->seqId == 0) return;
+    App::SeqInfo* si = nullptr;
+    for (auto& s : app.seqs) if (s.id == im->seqId) { si = &s; break; }
+    if (!si) return;
+    if (si->cfaType == im->cfa && si->cfaPattern == im->cfaPattern) return;
+    si->cfaType = im->cfa;
+    si->cfaPattern = im->cfaPattern;
+    for (auto& d : app.images)
+        if (d->seqId == si->id && d.get() != im) {
+            d->cfa = im->cfa; d->cfaPattern = im->cfaPattern; d->texDirty = true;
+        }
+    if (app.srvTemporal.seqId == si->id) requestServerTemporal(si->id, app.srvTemporal);
+    if (app.srvTemporalB.seqId == si->id) requestServerTemporal(si->id, app.srvTemporalB);
 }
 
 // Temporal stats for a stack that is NOT opened: fired from the browser's group
@@ -6242,6 +6319,13 @@ static void openRemote(const std::string& url, bool asPreview) {
     doc->remoteStep = step;
     doc->remoteFrames = (int)m.frames;
     doc->preview = asPreview;
+    // --cfa applies to a remote 1ch frame exactly as it does to a local one:
+    // openRemote never goes through addImage, so it had to be repeated here or
+    // a mosaiced sensor dump arrived over ssh as plain gray
+    if (app.forceCfa >= 0 && doc->ch == 1) {
+        doc->cfa = app.forceCfa;
+        doc->cfaPattern = app.forceCfaPattern & 3;
+    }
     // remote opens never went through addImage, so the batch is assigned here:
     // previews sit in their own "preview" pseudo-batch until promoted
     if (asPreview) doc->batchId = batchReuse("preview");
@@ -6283,6 +6367,11 @@ static void openRemote(const std::string& url, bool asPreview) {
         si.remoteUrl = url;           // frame-axis: one file, N frames
         si.remoteHost = host;
         si.expectedFrames = m.frames;
+        // the mosaic travels with the stack, so the server splits the planes
+        // the same way the local path does (it had NO writer before, so every
+        // server aggregate was plane-blind whatever the Inspector said)
+        si.cfaType = app.images.back()->cfa;
+        si.cfaPattern = app.images.back()->cfaPattern;
         app.seqs.push_back(si);
         ImageDoc* first = app.images.back().get();
         first->seqId = si.id;
@@ -6333,6 +6422,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
               : baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
     si.remoteHost = host;             // folder stack: one file per frame
     si.expectedFrames = (int)files.size();
+    si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
     for (const auto& f : files) si.remoteFiles.push_back(f);
     app.seqs.push_back(si);
     first->seqId = si.id;
@@ -6385,6 +6475,7 @@ static void promotePreview(ImageDoc* d) {
         si.remoteUrl = d->remoteUrl;
         si.remoteHost = host;
         si.expectedFrames = d->remoteFrames;
+        si.cfaType = d->cfa; si.cfaPattern = d->cfaPattern;       // planes travel too
         app.seqs.push_back(si);
         d->seqId = si.id;
         d->seqIndex = 0;
@@ -8010,6 +8101,7 @@ static void drawInspector() {
                     if (ImGui::Selectable(modes[i], i == im->cfa) && i != im->cfa) {
                         im->cfa = i;
                         im->texDirty = true;
+                        seqMosaicChanged(im);
                     }
                 ImGui::EndCombo();
             }
@@ -8021,6 +8113,7 @@ static void drawInspector() {
                         if (ImGui::Selectable(CFA_PATTERNS[i], i == im->cfaPattern)) {
                             im->cfaPattern = i;
                             im->texDirty = true;
+                            seqMosaicChanged(im);
                         }
                     ImGui::EndCombo();
                 }
@@ -9659,16 +9752,21 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
                             "switch to local computation once enough are here.");
         return false;                 // fall through to the local path
     }
-    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames]",
-                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames);
+    ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames, %s]",
+                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.nPl > 1 ? "CFA planes" : "plane=all (no CFA split)");
     ImGui::Separator();
-    if (ImGui::BeginTable("srvtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
-        auto row = [](const char* k, double v) {
+    if (ImGui::BeginTable("srvtemporal", 1 + S.nPl,
+                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("quantity [DN]", ImGuiTableColumnFlags_WidthStretch);
+        for (int p = 0; p < S.nPl; p++)
+            ImGui::TableSetupColumn(S.nPl > 1 ? LIN_PLANES[p] : "value",
+                                    ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableHeadersRow();
+        auto row = [&](const char* k, const double* v) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-            ImGui::TableNextColumn(); textNum("%.6g", v);
+            for (int p = 0; p < S.nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
         };
         row("temporal noise (sigma_t)", S.tempNoise);
         row("fixed pattern (sigma_fpn)", S.fixedPattern);
@@ -9746,15 +9844,19 @@ static void drawBrowseTemporal() {
     // cfaType was 0 by design (no open file to read a mosaic from): say so,
     // or a Bayer stack's plane-blind sigma reads as a wrong number
     ImGui::TextDisabled("plane=all (file not opened - no CFA split)");
-    if (ImGui::BeginTable("srvbtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
-        auto row = [](const char* k, double v) {
+    if (ImGui::BeginTable("srvbtemporal", 1 + S.nPl,
+                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("quantity [DN]", ImGuiTableColumnFlags_WidthStretch);
+        for (int p = 0; p < S.nPl; p++)
+            ImGui::TableSetupColumn(S.nPl > 1 ? LIN_PLANES[p] : "value",
+                                    ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableHeadersRow();
+        auto row = [&](const char* k, const double* v) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-            ImGui::TableNextColumn(); textNum("%.6g", v);
+            for (int p = 0; p < S.nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
         };
-        row("mean [DN]", S.mean);
+        row("mean", S.mean);
         row("temporal noise (sigma_t)", S.tempNoise);
         row("fixed pattern (sigma_fpn)", S.fixedPattern);
         row("total (quadrature)", S.totalNoise);
@@ -9875,7 +9977,8 @@ static void copyPerFrameStats(int seqId) {
 // stated reason instead of a blank.
 struct AbTemporal {
     bool valid = false, isStack = false, fromServer = false;
-    double sigT = 0, sigS = 0, sigTot = 0;
+    int nPl = 1;                      // CFA planes are never mixed, on either side
+    double sigT[4] = {}, sigS[4] = {}, sigTot[4] = {};
     int frames = 0, expected = 0;
     const std::vector<float>* idx = nullptr;
     const std::vector<float>* mean = nullptr;
@@ -9889,14 +9992,22 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
     if (const App::SeqInfo* si = seqInfo(d->seqId)) o.expected = si->expectedFrames;
     if (S.valid && S.seqId == d->seqId) {          // server-measured wins: it saw
         o.valid = true; o.fromServer = true;       // every frame, not the resident ones
-        o.sigT = S.tempNoise; o.sigS = S.fixedPattern; o.sigTot = S.totalNoise;
+        o.nPl = S.nPl;
+        for (int p = 0; p < S.nPl; p++) {
+            o.sigT[p] = S.tempNoise[p]; o.sigS[p] = S.fixedPattern[p];
+            o.sigTot[p] = S.totalNoise[p];
+        }
         o.frames = S.frames;
         o.idx = &S.idx; o.mean = &S.frameMean;
         return o;
     }
     if (T.valid && T.seqId == d->seqId) {
         o.valid = true;
-        o.sigT = T.tempNoise; o.sigS = T.fixedPattern; o.sigTot = T.totalNoise;
+        o.nPl = T.nPl;
+        for (int p = 0; p < T.nPl; p++) {
+            o.sigT[p] = T.tempNoise[p]; o.sigS[p] = T.fixedPattern[p];
+            o.sigTot[p] = T.totalNoise[p];
+        }
         o.frames = T.frames;
         o.idx = &T.idx; o.mean = &T.frameMean;
         return o;
@@ -9929,7 +10040,9 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     // between an f32 and a u16 stack is worth a warning even so
     const bool dtypeMix = im->dtype != Bim->dtype;
     const std::string unit = uA == uB ? uA : (uA + "/" + uB);
-    const bool canDelta = abDeltaMeaningful(im, Bim);
+    // ...and a four-plane sigma_t minus a pooled one is not a difference of
+    // anything, so the plane split joins the channel count in the test
+    const bool canDelta = abDeltaMeaningful(im, Bim) && A.nPl == B.nPl;
 
     ImGui::Text("Temporal");
     ImGui::SameLine();
@@ -9998,14 +10111,32 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             else if (a == 0) textNumStr("-  (A = 0)");
             else textNum("%.4g", (a - b) / fabs(a) * 100.0);
         };
-        row("temporal noise (sigma_t)", A.sigT, B.sigT, false);
-        row("fixed pattern (sigma_s)", A.sigS, B.sigS, false);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
-                              "includes scene detail unless the ROI is flat");
-        row("total (quadrature)", A.sigTot, B.sigTot, false);
+        // One row set per CFA plane: a stack whose planes are separated has
+        // four sigma_t, and folding them into one row would put the iron rule
+        // back (docs/terminology.md). When the two sides disagree about the
+        // plane split, canDelta is already false and the columns stand alone.
+        int nPl = std::max(A.nPl, B.nPl);
+        for (int p = 0; p < nPl; p++) {
+            char k1[64], k2[64], k3[64];
+            const char* sfx = nPl > 1 ? LIN_PLANES[p] : "";
+            snprintf(k1, sizeof k1, "temporal noise (sigma_t) %s", sfx);
+            snprintf(k2, sizeof k2, "fixed pattern (sigma_s) %s", sfx);
+            snprintf(k3, sizeof k3, "total (quadrature) %s", sfx);
+            row(k1, A.sigT[p], B.sigT[p], false);
+            row(k2, A.sigS[p], B.sigS[p], false);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
+                                  "includes scene detail unless the ROI is flat");
+            row(k3, A.sigTot[p], B.sigTot[p], false);
+        }
         ImGui::EndTable();
     }
+    if (A.valid && B.valid && A.nPl != B.nPl)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "plane split differs (A %s, B %s): no delta - the two "
+                           "columns are not the same quantity",
+                           A.nPl > 1 ? "CFA planes" : "plane=all",
+                           B.nPl > 1 ? "CFA planes" : "plane=all");
     if (!A.valid || !B.valid)
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "A: %s   |   B: %s",
                            A.valid ? "ok" : A.note, B.valid ? "ok" : B.note);
@@ -10152,8 +10283,9 @@ static void drawPanelTemporal() {
             ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[local, %d of %d frames]",
                                T.frames, expected);
         else
-            ImGui::TextDisabled("[local, %d frames, %s]", T.frames,
-                                T.roiUsed ? "selected ROI" : "whole image");
+            ImGui::TextDisabled("[local, %d frames, %s, %s]", T.frames,
+                                T.roiUsed ? "selected ROI" : "whole image",
+                                T.nPl > 1 ? "CFA planes" : "plane=all");
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy per-frame stats"))
             copyPerFrameStats(im->seqId);
@@ -10166,13 +10298,23 @@ static void drawPanelTemporal() {
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
         } else {
-            if (ImGui::BeginTable("temporalstats", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthFixed, numColW());
-                auto row = [](const char* k, double v) {
+            // one column per CFA plane, exactly as the linearity fit table
+            // does - a single pooled column for a mosaiced stack would be the
+            // inter-plane level spread wearing sigma_fpn's name
+            if (ImGui::BeginTable("temporalstats", 1 + T.nPl,
+                                  ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("quantity [DN]", ImGuiTableColumnFlags_WidthStretch);
+                for (int p = 0; p < T.nPl; p++)
+                    ImGui::TableSetupColumn(T.nPl > 1 ? LIN_PLANES[p] : "value",
+                                            ImGuiTableColumnFlags_WidthFixed, numColW());
+                ImGui::TableHeadersRow();
+                auto row = [&](const char* k, const double* v) {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-                    ImGui::TableNextColumn(); textNum("%.6g", v);
+                    for (int p = 0; p < T.nPl; p++) {
+                        ImGui::TableNextColumn();
+                        textNum("%.6g", v[p]);
+                    }
                 };
                 row("temporal noise (sigma_t)", T.tempNoise);
                 row("fixed pattern (sigma_s)", T.fixedPattern);
@@ -10186,8 +10328,12 @@ static void drawPanelTemporal() {
             float mn = FLT_MAX, mx = -FLT_MAX;
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
             float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
-            char yl[64];
-            snprintf(yl, sizeof yl, "ROI mean value (%s)", abValueUnit(im->dtype).c_str());
+            char yl[80];
+            // the per-frame mean is a LEVEL, not a noise statistic, so it is
+            // legitimately pooled - but it still has to say so next to a table
+            // that is split by plane
+            snprintf(yl, sizeof yl, "ROI mean value (%s%s)", abValueUnit(im->dtype).c_str(),
+                     T.nPl > 1 ? ", all planes" : "");
             float tAvail = ImGui::GetContentRegionAvail().y
                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
             PlotRect tp = beginPlot("frame number (index in sequence)", yl,
@@ -13787,6 +13933,68 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 a.name.c_str(), mr.serverLoc ? "gpu" : "cpu",
                 bad2 ? "FAIL" : "ok", local.size());
         bad += bad2 ? 1 : 0;
+        // ...and the same again with the frame declared MOSAICED. CFA planes
+        // are never mixed (docs/stats-taxonomy.md), so stats/moments must
+        // bucket by plane (R/Gr/Gb/B) instead of pooling into one "ch0" - and
+        // both sides must do it identically, or a remote measurement and a
+        // local one of the same pixels disagree.
+        if (ref.ch == 1) {
+            ImageDoc mosaic = ref;                  // same pixels, declared Bayer
+            mosaic.cfa = 1;
+            mosaic.cfaPattern = 0;                  // RGGB
+            std::vector<std::pair<std::string, std::string>> local2;
+            g_mstRows = &local2;
+            psFrame fr2 = makeFrame(mosaic);
+            psRect roi2{ (uint32_t)(ref.w / 4), (uint32_t)(ref.h / 4),
+                         (uint32_t)(ref.w / 2), (uint32_t)(ref.h / 2) };
+            perr[0] = 0;
+            if (a.isV2) {
+                psAnalyzeSink2 sk{ nullptr, mstNum, mstTxt, mstSer, {} };
+                rc = a.v2.analyze(&fr2, &roi2, &sk, perr, sizeof perr);
+            } else {
+                psAnalyzeSink sk{ nullptr, mstNum, mstTxt };
+                rc = a.v1.analyze(&fr2, &roi2, &sk, perr, sizeof perr);
+            }
+            int planeKeys = 0;
+            for (const auto& kv : local2)
+                if (kv.first.rfind("R.", 0) == 0 || kv.first.rfind("Gr.", 0) == 0 ||
+                    kv.first.rfind("Gb.", 0) == 0 || kv.first.rfind("B.", 0) == 0)
+                    planeKeys++;
+            int pooledKeys = 0;
+            for (const auto& kv : local2) if (kv.first.rfind("ch0.", 0) == 0) pooledKeys++;
+            remote::MeasureReq q2 = q;
+            q2.cfaType = 1; q2.cfaPattern = 0;
+            remote::MeasureResult mr2;
+            size_t bad3 = 0;
+            if (rc != 0 || !s.measure(q2, mr2, err)) {
+                fprintf(stderr, "selftest MEASURE cfa: %s\n", rc ? perr : err.c_str());
+                bad3++;
+            } else if (mr2.cols.size() != 1 || mr2.cols[0].size() != local2.size()) {
+                fprintf(stderr, "selftest MEASURE cfa: shape mismatch (%zu vs %zu items)\n",
+                        mr2.cols.empty() ? 0 : mr2.cols[0].size(), local2.size());
+                bad3++;
+            } else {
+                for (size_t i = 0; i < local2.size(); i++) {
+                    const remote::MeasureItem& it = mr2.cols[0][i];
+                    char b2[64];
+                    std::string got = it.kind == 0
+                        ? (snprintf(b2, 64, "%.9g", it.num), std::string(b2)) : it.text;
+                    if (it.key != local2[i].first || got != local2[i].second) {
+                        fprintf(stderr, "selftest MEASURE cfa mismatch: %s: '%s' vs "
+                                        "local '%s'\n", it.key.c_str(), got.c_str(),
+                                local2[i].second.c_str());
+                        bad3++;
+                    }
+                }
+            }
+            bool split = planeKeys >= 4 * 8 && pooledKeys == 0;
+            fprintf(stderr, "selftest: MEASURE %s on a Bayer frame: %d per-plane key(s), "
+                            "%d pooled ch0 key(s), local==peer: %s\n",
+                    a.name.c_str(), planeKeys, pooledKeys,
+                    (split && !bad3) ? "ok" : "FAIL");
+            bad += (split && !bad3) ? 0 : 1;
+            g_mstRows = nullptr;
+        }
     }
     // Aggregates: recompute the same statistics client-side from tiles the tile
     // path already proved correct, and compare. Frame-axis files only.
@@ -14687,11 +14895,11 @@ int main(int argc, char** argv) {
             fprintf(stderr, "rtemporalselftest: sigma_t server %.12g vs ref %.12g "
                             "(rel %.3g), sigma_fpn %.12g vs %.12g (rel %.3g), "
                             "mean rel %.3g\n",
-                    S.tempNoise, refSt, rel(S.tempNoise, refSt),
-                    S.fixedPattern, refFpn, rel(S.fixedPattern, refFpn),
-                    rel(S.mean, refMean));
-            if (rel(S.tempNoise, refSt) > 1e-9 || rel(S.fixedPattern, refFpn) > 1e-9 ||
-                rel(S.mean, refMean) > 1e-9) {
+                    S.tempNoise[0], refSt, rel(S.tempNoise[0], refSt),
+                    S.fixedPattern[0], refFpn, rel(S.fixedPattern[0], refFpn),
+                    rel(S.mean[0], refMean));
+            if (rel(S.tempNoise[0], refSt) > 1e-9 || rel(S.fixedPattern[0], refFpn) > 1e-9 ||
+                rel(S.mean[0], refMean) > 1e-9) {
                 fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
                 ok = false;
             }
@@ -16137,6 +16345,70 @@ int main(int argc, char** argv) {
                   "V9 dropping the current preview re-points A in range");
         }
 
+        // ---- V10: CFA planes are never mixed in a temporal statistic --------
+        // docs/terminology.md's iron rule. The fixture is exact on purpose: a
+        // Bayer stack in which every plane is perfectly flat and perfectly
+        // stable except for a +-10 DN alternation, and the four planes sit at
+        // 100 / 400 / 400 / 900 DN. Per plane the truth is sigma_t = 10 and
+        // sigma_fpn = 0. Pooled, sigma_fpn becomes the spatial spread of the
+        // four LEVELS - sqrt(285000 - 450^2) = 287.228 DN of pure fabrication,
+        // reported as fixed-pattern noise on a flat field.
+        {
+            closeAll();
+            const int W = 32, H = 32, NF = 4;
+            const double LVL[4] = { 100, 400, 400, 900 };
+            App::SeqInfo si;
+            si.id = app.nextSeqId++;
+            si.name = "cfa fixture";
+            app.seqs.push_back(si);
+            for (int f = 0; f < NF; f++) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "cfa_" + std::to_string(f) + ".npy";
+                d->w = W; d->h = H; d->ch = 1;
+                d->cfa = 1; d->cfaPattern = 0;              // RGGB
+                d->dtype = "f32";
+                d->data.resize((size_t)W * H);
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++)
+                        d->data[(size_t)y * W + x] =
+                            (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] + (f % 2 ? 10 : -10));
+                d->uid = app.nextUid++;
+                d->seqId = si.id;
+                d->seqIndex = f;
+                app.images.push_back(std::move(d));
+            }
+            app.current = 0;
+            app.selectedAnn = 0;
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            const App::TemporalState& T = app.temporal[0];
+            double worstFpn = 0, worstSigT = 0;
+            for (int p = 0; p < T.nPl; p++) {
+                worstFpn = std::max(worstFpn, fabs(T.fixedPattern[p]));
+                worstSigT = std::max(worstSigT, fabs(T.tempNoise[p] - 10.0));
+            }
+            fprintf(stderr, "verifyselftest: V10 Bayer fixture (levels 100/400/400/900, "
+                            "+-10 DN in time): nPl=%d, sigma_t %.6g/%.6g/%.6g/%.6g, "
+                            "sigma_fpn %.6g/%.6g/%.6g/%.6g\n",
+                    T.nPl, T.tempNoise[0], T.tempNoise[1], T.tempNoise[2], T.tempNoise[3],
+                    T.fixedPattern[0], T.fixedPattern[1], T.fixedPattern[2], T.fixedPattern[3]);
+            check(T.valid && T.nPl == 4, "V10 a mosaiced stack reports four planes");
+            check(worstFpn < 1e-6, "V10 each plane's FPN is 0 on a per-plane-flat field");
+            check(worstSigT < 1e-6, "V10 each plane's sigma_t is the real 10 DN");
+            // ...and the same pixels read as gray give the pooled number the
+            // panel used to print, which is the inter-plane level spread and
+            // nothing else. This also proves the mosaic is part of the cache
+            // key: without it the stale four-plane answer would come back.
+            for (auto& d : app.images) if (d->seqId == si.id) d->cfa = 0;
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            double pooled = app.temporal[0].fixedPattern[0];
+            fprintf(stderr, "verifyselftest: V10 the same pixels as gray: nPl=%d, "
+                            "sigma_fpn %.6g (the level spread, expected 287.228)\n",
+                    app.temporal[0].nPl, pooled);
+            check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
+                  "V10 the mosaic is part of the cache key");
+            closeAll();
+        }
+
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
@@ -16335,7 +16607,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "abstatsselftest: compare OFF, A='%s' (stack %d): "
                         "hist sampled=%zu maxBin=%u mean0=%.9g, sigma_t=%.9g\n",
                 cur()->name.c_str(), sidA, hOff.sampled, hOff.maxBin, hOff.mean[0],
-                tOff.tempNoise);
+                tOff.tempNoise[0]);
         check(app.hist[1].uid == 0 && app.proj[1].uid == 0 &&
               app.temporal[1].seqId == -1,
               "A0 compare off leaves slot 1 empty");
@@ -16392,10 +16664,10 @@ int main(int argc, char** argv) {
                             "sampled=%zu/%zu  mean0 %.12g vs %.12g  sd0 %.12g vs %.12g  "
                             "sigma_t %.12g vs %.12g\n",
                     R.nSeries, R.sampled, HB.sampled, R.mean[0], HB.mean[0],
-                    R.sd[0], HB.sd[0], refSig, app.temporal[1].tempNoise);
+                    R.sd[0], HB.sd[0], refSig, app.temporal[1].tempNoise[0]);
             check(binsEq, "A2 B histogram bins match an independent pass exactly");
             check(statEq, "A2 B mean/sd match within 1e-6 relative");
-            check(relEq(refSig, app.temporal[1].tempNoise, 1e-6),
+            check(relEq(refSig, app.temporal[1].tempNoise[0], 1e-6),
                   "A2 B sigma_t matches within 1e-6 relative");
             // the two sides really are different data, or A2/A3 prove nothing
             check(memcmp(app.hist[0].bins, app.hist[1].bins, sizeof app.hist[0].bins) != 0,
@@ -16607,19 +16879,19 @@ int main(int argc, char** argv) {
             recomputeTemporalIfNeeded(b7, app.temporal[1]);
             AbTemporal TA = abTemporalOf(cur(), app.temporal[0], app.srvTemporal);
             AbTemporal TB = abTemporalOf(b7, app.temporal[1], app.srvTemporalB);
-            double dAbs = TA.sigT - TB.sigT;
-            double dPct = TA.sigT != 0 ? (TA.sigT - TB.sigT) / fabs(TA.sigT) * 100.0 : 0.0;
+            double dAbs = TA.sigT[0] - TB.sigT[0];
+            double dPct = TA.sigT[0] != 0 ? (TA.sigT[0] - TB.sigT[0]) / fabs(TA.sigT[0]) * 100.0 : 0.0;
             fprintf(stderr, "abstatsselftest: P3 table inputs: A sigma_t=%.9g (n=%d/%d, "
                             "server=%d), B sigma_t=%.9g (n=%d/%d, server=%d), "
                             "delta A-B=%.9g, delta=%.6g %%, unit=[%s]\n",
-                    TA.sigT, TA.frames, TA.expected, TA.fromServer ? 1 : 0,
-                    TB.sigT, TB.frames, TB.expected, TB.fromServer ? 1 : 0,
+                    TA.sigT[0], TA.frames, TA.expected, TA.fromServer ? 1 : 0,
+                    TB.sigT[0], TB.frames, TB.expected, TB.fromServer ? 1 : 0,
                     dAbs, dPct, abValueUnit(cur()->dtype).c_str());
             check(TA.valid && TB.valid && TA.isStack && TB.isStack,
                   "P3 both sides resolve to stack temporal numbers");
             check(!TA.fromServer && !TB.fromServer,
                   "P3 local stacks come from the local computation");
-            check(dAbs == TA.sigT - TB.sigT && !TA.fromServer,
+            check(dAbs == TA.sigT[0] - TB.sigT[0] && !TA.fromServer,
                   "P3 delta is A - B (the difference image's sign)");
             check(abDeltaMeaningful(cur(), b7), "P3 equal channel counts allow a delta");
             // B's server aggregate must never have been fired on its own
