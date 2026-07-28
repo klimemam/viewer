@@ -7132,16 +7132,23 @@ static void drawPanelRemote() {
             toast("copied");
         }
     }
+    // full remote path of a listed name
+    auto joined = [&B](const std::string& n) {
+        return B.dir == "/" ? "/" + n : B.dir + "/" + n;
+    };
     int nNpy = 0;
-    for (const auto& e : B.entries) if (!e.dir && isNpyName(e.name)) nNpy++;
+    for (const auto& e : B.entries)
+        if (!e.dir && isNpyName(e.name)) nNpy += e.group ? (int)e.members.size() : 1;
     if (nNpy >= 2) {
         char lb[80];
         snprintf(lb, sizeof lb, "Open all %d .npy here as a stack", nNpy);
         if (ImGui::Button(lb)) {
             std::vector<std::string> files;
-            for (const auto& e : B.entries)
-                if (!e.dir && isNpyName(e.name))
-                    files.push_back(B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name);
+            for (const auto& e : B.entries) {
+                if (e.dir || !isNpyName(e.name)) continue;
+                if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
+                else files.push_back(joined(e.name));
+            }
             sortFramesNumerically(files);
             openRemoteStack(B.host, files);
         }
@@ -7240,12 +7247,20 @@ static void drawPanelRemote() {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             std::string lb = e.dir ? "[" + e.name + "]" : e.name;
+            if (e.group) lb += "  [" + std::to_string(e.frames) + " frames]";
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             if (ImGui::Selectable(lb.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && servable) {
-                std::string joined = B.dir == "/" ? "/" + e.name : B.dir + "/" + e.name;
-                if (e.dir) remoteBrowseTo(joined);
-                else       openRemote(makeRemoteUrl(B.host, joined));
+                if (e.dir) {
+                    remoteBrowseTo(joined(e.name));
+                } else if (e.group) {
+                    // one row = one stack; members arrive numerically sorted
+                    std::vector<std::string> files;
+                    for (const auto& m : e.members) files.push_back(joined(m));
+                    openRemoteStack(B.host, files);
+                } else {
+                    openRemote(makeRemoteUrl(B.host, joined(e.name)));
+                }
             }
             if (!servable) {
                 ImGui::PopStyleColor();
@@ -8138,11 +8153,13 @@ static int remoteSelfTest(const char* exe, const char* path) {
     }
     const ImageDoc& ref = *cur();
     int bad = 0;
-    {   // LIST v3: the listing's metadata must agree with the local loader
-        std::string dir = path, base = path;
+    std::string dir = path, base = path;       // the test file's folder and name
+    {
         size_t sl = dir.find_last_of("/\\");
         if (sl == std::string::npos) dir = ".";
         else { dir = dir.substr(0, sl); base = base.substr(sl + 1); }
+    }
+    {   // LIST v3: the listing's metadata must agree with the local loader
         std::vector<remote::Entry> ents;
         if (!s.list(dir, ents, err)) {
             fprintf(stderr, "selftest LIST: %s\n", err.c_str());
@@ -8198,6 +8215,38 @@ static int remoteSelfTest(const char* exe, const char* path) {
         fprintf(stderr, "selftest: LIST v2-compat parse (missing fields -> unknown): %s\n",
                 ok ? "ok" : "FAIL");
         bad += ok ? 0 : 1;
+    }
+    {   // Grouping: 24 numbered frames fold into ONE synthetic row; the loose
+        // .npy and the .txt stay plain. Fixture from tools/gen_testdata.py.
+        std::string rb = dir + "/rb";
+        std::vector<remote::Entry> ents;
+        if (!s.list(rb, ents, err)) {
+            fprintf(stderr, "selftest: LIST grouping: skipped (%s: %s)\n",
+                    rb.c_str(), err.c_str());
+        } else {
+            int nGroups = 0, nPlain = 0;
+            const remote::Entry* g = nullptr;
+            for (const auto& e : ents) {
+                if (e.dir) continue;                   // scanroot/ lives here too
+                if (e.group) { nGroups++; g = &e; }
+                else nPlain++;
+            }
+            bool ok = nGroups == 1 && nPlain == 3 && g && g->frames == 24 &&
+                      g->members.size() == 24 && g->hasMeta && g->dtype == "f32" &&
+                      g->name.find('#') != std::string::npos;
+            // the member names must lead back to real files, or the row is a lie
+            remote::Meta gm;
+            if (ok && !s.meta(rb + "/" + g->members[0], gm, err)) {
+                fprintf(stderr, "selftest LIST grouping: member META: %s\n", err.c_str());
+                ok = false;
+            }
+            fprintf(stderr, "selftest: LIST grouping %s: %d group(s), %d single(s), "
+                            "%u frames %s: %s\n",
+                    g ? g->name.c_str() : "?", nGroups, nPlain,
+                    g ? g->frames : 0, g ? fmtEntryShape(*g).c_str() : "?",
+                    ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
     }
     struct Case { int x, y, w, h, step; };
     const Case cases[] = {

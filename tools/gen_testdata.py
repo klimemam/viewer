@@ -70,6 +70,23 @@ for k in range(24):
     frame = np.clip(frame, 0, 65535).astype("<u2")
     (seq / f"flat_{k:04d}_{W}x{H}_gray16.raw").write_bytes(frame.tobytes())
 
+# remote-browser fixtures (--remote-selftest): one numbered .npy stack plus
+# loose files in the same folder (LIST grouping: 1 group + 3 singles), and a
+# root of per-illumination folders (SCAN / remote open-folder: 3 groups)
+rb = out / "rb"
+rb.mkdir(exist_ok=True)
+rng3 = np.random.default_rng(11)
+for k in range(24):
+    np.save(rb / f"frame_{k:03d}.npy", (rng3.random((64, 64)) * 4095).astype(np.float32))
+np.save(rb / "dark.npy", np.zeros((64, 64), np.float32))
+np.save(rb / "flat.npy", np.full((64, 64), 1000.0, np.float32))
+(rb / "notes.txt").write_text("not an image\n")
+for lv in ("10lx", "20lx", "40lx"):
+    d = rb / "scanroot" / lv
+    d.mkdir(parents=True, exist_ok=True)
+    for k in range(8):
+        np.save(d / f"frame_{k:03d}.npy", (rng3.random((32, 32)) * 4095).astype(np.float32))
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     print(" ", p.name, p.stat().st_size, "bytes")

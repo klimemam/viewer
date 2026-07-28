@@ -338,6 +338,97 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
     }
 }
 
+// ---- numbered-sequence grouping ------------------------------------------
+// The grouping key is the name with its trailing digit run (the run just
+// before ".npy") removed - the same axis the client's numeric frame sort
+// orders by, so both ends agree on what a sequence is, and uneven zero-padding
+// (frame_9, frame_10) still lands in one group.
+static bool splitNumberedNpy(const std::string& name, std::string& pre,
+                             long long& num, int& width) {
+    if (!isNpySuffix(name)) return false;
+    size_t end = name.size() - 4;
+    size_t i = end;
+    while (i > 0 && isdigit((unsigned char)name[i - 1])) i--;
+    if (i == end) return false;                 // no digits before .npy
+    pre = name.substr(0, i);
+    num = atoll(name.c_str() + i);
+    width = (int)(end - i);
+    return true;
+}
+
+struct NpyGroup {
+    std::string pattern;                // frame_###.npy - display name
+    std::vector<std::string> names;     // member file names, numeric order
+    uint64_t bytes = 0;                 // sum over members
+    int64_t mtime = 0;                  // newest member
+    std::filesystem::path first;        // header peek target
+};
+
+// Partition one directory's files into numbered groups (>= 2 members) and the
+// indices of everything else. `files` are (name, path) of regular files only.
+static void groupNumberedNpy(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                             std::vector<NpyGroup>& groups, std::vector<size_t>& singles) {
+    struct Member { long long num; int width; size_t idx; };
+    struct Bucket { std::string pre; std::vector<Member> m; };
+    std::vector<Bucket> buckets;
+    std::vector<char> used(files.size(), 0);
+    for (size_t i = 0; i < files.size(); i++) {
+        std::string pre; long long num; int width;
+        if (!splitNumberedNpy(files[i].first, pre, num, width)) continue;
+        Bucket* b = nullptr;
+        for (auto& q : buckets) if (q.pre == pre) { b = &q; break; }
+        if (!b) { buckets.push_back({ pre, {} }); b = &buckets.back(); }
+        b->m.push_back({ num, width, i });
+    }
+    for (auto& b : buckets) {
+        if (b.m.size() < 2) continue;
+        std::sort(b.m.begin(), b.m.end(),
+                  [](const Member& a, const Member& c) { return a.num < c.num; });
+        NpyGroup g;
+        g.pattern = b.pre + std::string((size_t)b.m.front().width, '#') + ".npy";
+        for (const auto& m : b.m) {
+            g.names.push_back(files[m.idx].first);
+            used[m.idx] = 1;
+            std::error_code ec;
+            g.bytes += (uint64_t)std::filesystem::file_size(files[m.idx].second, ec);
+            g.mtime = std::max(g.mtime, unixMtime(files[m.idx].second));
+        }
+        g.first = files[b.m.front().idx].second;
+        groups.push_back(std::move(g));
+    }
+    for (size_t i = 0; i < files.size(); i++)
+        if (!used[i]) singles.push_back(i);
+}
+
+// A group crosses the wire as its explicit member names (no directory part).
+// A (prefix, start, count, width) encoding would be smaller, but real capture
+// dumps have gaps and uneven zero-padding, and reconstructing names that do
+// not exist is exactly the failure this tool must not have. Names only: even
+// a 1000-frame group is ~20 KB, noise next to one tile.
+static void putGroupEntryV3(Buf& out, const NpyGroup& g, int& peekBudget) {
+    NpyFile n;
+    bool meta = false;
+    if (peekBudget > 0) {
+        peekBudget--;
+        std::string e2;
+        meta = parseNpyHeader(n, g.first.u8string(), e2);
+    }
+    out.putStr(g.pattern);
+    out.putU32(LE_GROUP | (meta ? LE_META : 0u));
+    out.putU32((uint32_t)(g.bytes & 0xFFFFFFFFu));
+    out.putU32((uint32_t)(g.bytes >> 32));
+    out.putU32((uint32_t)((uint64_t)g.mtime & 0xFFFFFFFFu));
+    out.putU32((uint32_t)((uint64_t)g.mtime >> 32));
+    if (meta) {
+        out.putU32(n.dtype);
+        out.putU32((uint32_t)n.ndim);
+        for (int i = 0; i < 4; i++) out.putU32(n.odims[i]);
+        out.putU32(n.fortran ? 1u : 0u);
+    }
+    out.putU32((uint32_t)g.names.size());
+    for (const auto& nm : g.names) out.putStr(nm);
+}
+
 static void handleList(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad LIST"); return; }
@@ -372,14 +463,43 @@ static void handleList(Buf& in) {
         sendMsg(MSG_OK, out);
         return;
     }
-    int peekBudget = 256;
-    out.putU32((uint32_t)entries.size());
+    // v3: numbered .npy siblings collapse into one synthetic stack entry;
+    // directories, non-npy files and loose .npy stay plain rows.
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+    std::vector<const std::filesystem::directory_entry*> dirs;
     for (auto& e : entries) {
         std::error_code e2;
-        bool dir = e.is_directory(e2);
-        uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
-        putListEntryV3(out, e.path(), e.path().filename().u8string(), dir, sz,
-                       unixMtime(e.path()), peekBudget);
+        if (e.is_directory(e2)) dirs.push_back(&e);
+        else files.push_back({ e.path().filename().u8string(), e.path() });
+    }
+    std::vector<NpyGroup> groups;
+    std::vector<size_t> singles;
+    groupNumberedNpy(files, groups, singles);
+    // one merged, name-sorted row list, so the reply reads like a directory
+    struct Row { std::string name; int kind; size_t idx; };   // 0 dir, 1 single, 2 group
+    std::vector<Row> rows;
+    for (size_t i = 0; i < dirs.size(); i++)
+        rows.push_back({ dirs[i]->path().filename().u8string(), 0, i });
+    for (size_t i : singles) rows.push_back({ files[i].first, 1, i });
+    for (size_t i = 0; i < groups.size(); i++)
+        rows.push_back({ groups[i].pattern, 2, i });
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.name < b.name; });
+    int peekBudget = 256;
+    out.putU32((uint32_t)rows.size());
+    for (const Row& r : rows) {
+        std::error_code e2;
+        if (r.kind == 0) {
+            putListEntryV3(out, dirs[r.idx]->path(), r.name, true, 0,
+                           unixMtime(dirs[r.idx]->path()), peekBudget);
+        } else if (r.kind == 1) {
+            const auto& f = files[r.idx];
+            putListEntryV3(out, f.second, r.name, false,
+                           (uint64_t)std::filesystem::file_size(f.second, e2),
+                           unixMtime(f.second), peekBudget);
+        } else {
+            putGroupEntryV3(out, groups[r.idx], peekBudget);
+        }
     }
     sendMsg(MSG_OK, out);
 }
