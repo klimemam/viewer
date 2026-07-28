@@ -13161,9 +13161,21 @@ static std::string g_seriesSelftest;    // --series-selftest <dir>: series invar
 // left, right, enter, home, end, back, flat, tree.
 static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
+// Key-routing evidence for --browse-keys-selftest: how many times the MAIN
+// view's arrow/Home/End handler ran, and how many times it stood down because
+// the Browse panel owned focus. The rule is one line of arithmetic - while the
+// panel has focus the first must not move and the second must.
+static int g_navKeyGlobal = 0;
+static int g_navKeyYielded = 0;
+static int g_navKeyAtBlur = -1, g_navKeyYieldAtBlur = -1;   // snapshot at "blur"
+static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
-    "left,end,home,up,down,more,down,back";
+    "left,end,home,up,down,more,down,back,"
+    // ...then hand focus back to nobody and repeat four of the same keys: the
+    // main view must own them again, or the gate would be "the arrows are dead"
+    // rather than "the panel owns them while it has focus"
+    "blur,down,up,end,home";
 
 static void printUsage() {
     printf(
@@ -16957,6 +16969,9 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        // --browse-keys "blur": give focus to nothing, so the next keys prove
+        // the main view still owns them when the Browse panel does not
+        if (g_browseKeysBlur) { g_browseKeysBlur = false; ImGui::SetWindowFocus(nullptr); }
         // ImGui hands input out over several frames (ConfigInputTrickleEventQueue):
         // NewFrame stops mid-queue on a wheel-after-move or a second action on one
         // button and KEEPS the rest for later. An event-driven loop that sleeps
@@ -16975,6 +16990,14 @@ int main(int argc, char** argv) {
         // modals (RAW dialog etc.) own the keyboard: no global shortcuts underneath —
         // Ctrl+W during reinterpret would shift the replaceIdx target image
         bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        // The Browse panel binds the arrows, Home/End and Ctrl+F for its own
+        // row navigation, gated on ITS focus. This block runs before any panel
+        // draws and knows nothing about focus, so every key both of them bind
+        // fires TWICE - once here on the main view, once there on the listing.
+        // One rule, computed once, applied to every key the panel claims.
+        ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
+        bool remoteFocused = nav && nav->RootWindow &&
+                             strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
         if (!io.WantTextInput && !popupOpen) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
@@ -16989,9 +17012,6 @@ int main(int argc, char** argv) {
             // sequence start/end = C-a/C-e (always Ctrl, also on macOS).
             // Ctrl+F is "find" while the Remote browser owns focus (it jumps to
             // the filter box there), so frame-stepping must yield to it.
-            ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
-            bool remoteFocused = nav && nav->RootWindow &&
-                                 strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
             if (!remoteFocused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) gotoFrame(1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B)) gotoFrame(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N)) gotoStack(1);
@@ -17042,13 +17062,29 @@ int main(int argc, char** argv) {
             // Press once = row/column band, press again = restore the remembered rect.
             if (ImGui::IsKeyPressed(ImGuiKey_X, false)) toggleBand(true);
             if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) toggleBand(false);
-            // arrows: horizontal = time (frames), vertical = stacks
-            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) gotoFrame(1);
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) gotoFrame(-1);
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) gotoStack(1);
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) gotoStack(-1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) gotoFrame(0, true, true);
-            if (ImGui::IsKeyPressed(ImGuiKey_End, false)) gotoFrame(0, true, false);
+            // arrows: horizontal = time (frames), vertical = stacks. These six
+            // are the Browse panel's row navigation too, so they yield to it
+            // exactly as Ctrl+F does - otherwise one Down both steps the browse
+            // cursor AND moves the main view to the next STACK, and with
+            // rangeScope = per frame that second effect REWRITES the stored
+            // black/white of an image the user never navigated to.
+            bool navKey = ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
+                          ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
+                          ImGui::IsKeyPressed(ImGuiKey_DownArrow) ||
+                          ImGui::IsKeyPressed(ImGuiKey_UpArrow) ||
+                          ImGui::IsKeyPressed(ImGuiKey_Home, false) ||
+                          ImGui::IsKeyPressed(ImGuiKey_End, false);
+            if (remoteFocused) {
+                if (navKey) g_navKeyYielded++;
+            } else {
+                if (navKey) g_navKeyGlobal++;
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) gotoFrame(1);
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) gotoFrame(-1);
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) gotoStack(1);
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) gotoStack(-1);
+                if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) gotoFrame(0, true, true);
+                if (ImGui::IsKeyPressed(ImGuiKey_End, false)) gotoFrame(0, true, false);
+            }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
             if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = 0;   // back to All
@@ -17659,15 +17695,34 @@ int main(int argc, char** argv) {
                     else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
+                    else if (a == "blur")  { g_browseKeysBlur = true;
+                                             g_navKeyAtBlur = g_navKeyGlobal;
+                                             g_navKeyYieldAtBlur = g_navKeyYielded; }
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
                 }
                 if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
             } else if (++reproIdle > 20) {
-                keysOk = true;
+                // KEY ROUTING. The Browse panel binds Down/Up/Left/Right/Home/
+                // End for its rows and the main loop's shortcut table binds the
+                // same six for stack and frame navigation. Neither claims key
+                // ownership, so before the focus gate one Down BOTH stepped the
+                // browse cursor and ran gotoStack(1) on the main view - and
+                // with rangeScope = per frame that rewrote the stored
+                // black/white of an image the user never navigated to.
+                int afterBlur = g_navKeyAtBlur < 0 ? -1 : g_navKeyGlobal - g_navKeyAtBlur;
+                bool routeOk = g_navKeyAtBlur == 0 && g_navKeyYieldAtBlur >= 6 &&
+                               afterBlur >= 4;
+                fprintf(stderr, "browsekeys: key routing: with the panel focused the "
+                                "main view ran %d nav key(s) and stood down for %d; "
+                                "after blur it ran %d more: %s\n",
+                        g_navKeyAtBlur, g_navKeyYieldAtBlur, afterBlur,
+                        routeOk ? "ok" : "FAIL");
+                keysOk = routeOk;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
-                                "no crash: ok\n", (int)keyActs.size());
+                                "no crash: %s\n", (int)keyActs.size(),
+                                routeOk ? "ok" : "FAILED");
                 fflush(stderr);
                 break;
             }
