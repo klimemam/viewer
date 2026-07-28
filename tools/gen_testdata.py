@@ -97,6 +97,20 @@ for g in range(2):
     for e in range(4):
         np.save(eset / f"g{g:02d}_e{e:02d}.npy",
                 (rng3.random((16, 16)) * 4095).astype(np.float32))
+# pattern-extent fixtures (--remote-selftest / --browse-selftest): an ALL-DIGIT
+# folder groups as "????.npy", which is correct by the rule and says nothing -
+# the displayed pattern must show the extent instead ("0000‥0003.npy"). padset
+# has uneven zero padding (f_9 / f_10 / f_11), where the extent must be read by
+# VALUE and not lexicographically ("f_9‥11.npy").
+dset = rb / "digitset"
+dset.mkdir(exist_ok=True)
+for k in range(4):
+    np.save(dset / f"{k:04d}.npy", (rng3.random((16, 16)) * 4095).astype(np.float32))
+pset = rb / "padset"
+pset.mkdir(exist_ok=True)
+for k in (9, 10, 11):
+    np.save(pset / f"f_{k}.npy", (rng3.random((16, 16)) * 4095).astype(np.float32))
+
 for lv in ("10lx", "20lx", "40lx"):
     d = rb / "scanroot" / lv
     d.mkdir(parents=True, exist_ok=True)

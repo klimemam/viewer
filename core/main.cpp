@@ -3245,7 +3245,16 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
         // every all-digit sequence name in the picker ('?' also reads as glob)
         patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
     patternOut += ext;
-    for (auto& f : found) out.push_back(f.second);
+    std::vector<std::string> bases;
+    bases.reserve(found.size());
+    for (auto& f : found) {
+        out.push_back(f.second);
+        bases.push_back(baseName(f.second));
+    }
+    // ...then say what the '?' run actually spans. Same function the peer runs
+    // (rp::patternWithExtent): a folder opened locally and the same folder
+    // listed over ssh must produce the identical stack name.
+    patternOut = rp::patternWithExtent(patternOut, bases);
     return out;
 }
 
@@ -7242,6 +7251,20 @@ static double extractLevelFromName(const std::string& name) {
     std::string part = name;
     size_t slash = part.find_last_of('/');
     if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
+    else {
+        // No folder qualifier (a stack opened straight out of its own folder):
+        // the FILE part is all there is, and its frame-axis extent is a frame
+        // count, never an illuminance. Cut the extent run out before reading -
+        // "0000..0003.npy" must stay "no level here", exactly as "????.npy"
+        // did before the extent replaced the wildcard.
+        size_t d = part.find("\xE2\x80\xA5");
+        if (d != std::string::npos) {
+            size_t a = d, b = d + 3;
+            while (a > 0 && isdigit((unsigned char)part[a - 1])) a--;
+            while (b < part.size() && isdigit((unsigned char)part[b])) b++;
+            part.erase(a, b - a);
+        }
+    }
     for (size_t i = 0; i < part.size(); i++) {
         if (isdigit((unsigned char)part[i])) {
             // avoid the "###" pattern placeholder and sizes like 640x480
@@ -10595,9 +10618,11 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 if (e.group) { nGroups++; g = &e; }
                 else nPlain++;
             }
+            // the pattern SHOWS ITS EXTENT: no bare '?' run survives into the
+            // name a user reads (rp::patternWithExtent)
             bool ok = nGroups == 1 && nPlain == 3 && g && g->frames == 24 &&
                       g->members.size() == 24 && g->hasMeta && g->dtype == "f32" &&
-                      g->name.find('?') != std::string::npos;
+                      g->name == "frame_000\xE2\x80\xA5" "023.npy";
             // the member names must lead back to real files, or the row is a lie
             remote::Meta gm;
             if (ok && !s.meta(rb + "/" + g->members[0], gm, err)) {
@@ -10612,9 +10637,10 @@ static int remoteSelfTest(const char* exe, const char* path) {
             bad += ok ? 0 : 1;
         }
     }
-    {   // Grouping stage 2: '?' covers ONLY the varying digit run. gainset has
-        // a constant gain digit next to the frame counter - the pattern must
-        // keep it literal (gain10_???.npy), or two gains read as one stack.
+    {   // Grouping stage 2: the extent covers ONLY the varying digit run.
+        // gainset has a constant gain digit next to the frame counter - the
+        // pattern must keep it LITERAL (gain10_000..007.npy, never
+        // gain10..20_...), or two gains read as one stack.
         std::string gd = dir + "/rb/gainset";
         std::vector<remote::Entry> ents;
         if (!s.list(gd, ents, err)) {
@@ -10631,7 +10657,8 @@ static int remoteSelfTest(const char* exe, const char* path) {
             }
             std::sort(pats.begin(), pats.end());
             bool ok = pats.size() == 2 && nPlain == 0 && frames8 &&
-                      pats[0] == "gain10_???.npy" && pats[1] == "gain20_???.npy";
+                      pats[0] == "gain10_000\xE2\x80\xA5" "007.npy" &&
+                      pats[1] == "gain20_000\xE2\x80\xA5" "007.npy";
             fprintf(stderr, "selftest: LIST grouping gainset -> %d group(s) [%s], "
                             "8 frames each=%d: %s\n",
                     (int)pats.size(),
@@ -10660,13 +10687,60 @@ static int remoteSelfTest(const char* exe, const char* path) {
             }
             std::sort(pats.begin(), pats.end());
             bool ok = pats.size() == 2 && nPlain == 0 && frames4 &&
-                      pats[0] == "g00_e??.npy" && pats[1] == "g01_e??.npy";
+                      pats[0] == "g00_e00\xE2\x80\xA5" "03.npy" &&
+                      pats[1] == "g01_e00\xE2\x80\xA5" "03.npy";
             fprintf(stderr, "selftest: LIST grouping expset (2 varying runs) -> "
                             "%d group(s) [%s], 4 frames each=%d: %s\n",
                     (int)pats.size(),
                     (pats.empty() ? std::string("?")
                                   : pats.size() < 2 ? pats[0] : pats[0] + "," + pats[1]).c_str(),
                     frames4 ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+    }
+    {   // Pattern extent, and the agreement between the two ends. digitset is
+        // all digits ("????.npy" by the rule, which says nothing); padset has
+        // uneven padding, so the extent has to be read by VALUE. For each, the
+        // peer's LIST pattern and the pattern the CLIENT builds for the same
+        // folder (findSequenceSiblings) must be the identical string - a
+        // capture opened locally and listed over ssh names one stack, not two.
+        struct PatCase { const char* sub; const char* first; const char* want; };
+        const PatCase pcs[] = {
+            { "digitset", "0000.npy", "0000\xE2\x80\xA5" "0003.npy" },
+            { "padset",   "f_9.npy",  "f_9\xE2\x80\xA5" "11.npy" },
+            { "gainset",  "gain10_000.npy", "gain10_000\xE2\x80\xA5" "007.npy" },
+        };
+        for (const PatCase& pc : pcs) {
+            std::string pd = dir + "/rb/" + pc.sub;
+            std::vector<remote::Entry> ents;
+            if (!s.list(pd, ents, err)) {
+                fprintf(stderr, "selftest: pattern %s: skipped (%s)\n", pc.sub, err.c_str());
+                continue;
+            }
+            std::string peerPat;
+            for (const auto& e : ents) if (e.group && peerPat.empty()) peerPat = e.name;
+            std::string clientPat;
+            findSequenceSiblings(pd + "/" + pc.first, clientPat);
+            bool ok = peerPat == pc.want && clientPat == pc.want;
+            fprintf(stderr, "selftest: pattern %s -> peer '%s', client '%s' "
+                            "(want '%s'): %s\n",
+                    pc.sub, peerPat.c_str(), clientPat.c_str(), pc.want,
+                    ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+        }
+        {   // The pattern is ALSO the stack name, and linearity's Auto levels
+            // parses stack names. It reads the FOLDER part - verified here, not
+            // assumed - so a changed file part is safe; and where there is no
+            // folder part the extent run is cut out first, so an all-digit
+            // stack still reports "no level" exactly as "????.npy" did.
+            double folder = extractLevelFromName("10lx/0000\xE2\x80\xA5" "0003.npy");
+            double bare   = extractLevelFromName("0000\xE2\x80\xA5" "0003.npy");
+            double gain   = extractLevelFromName("gain10_000\xE2\x80\xA5" "007.npy");
+            bool ok = folder == 10.0 && !std::isfinite(bare) && gain == 10.0;
+            fprintf(stderr, "selftest: auto-level from '10lx/...' -> %g, from a bare "
+                            "extent -> %s, from 'gain10_...' -> %g: %s\n",
+                    folder, std::isfinite(bare) ? "a number (WRONG)" : "none", gain,
+                    ok ? "ok" : "FAIL");
             bad += ok ? 0 : 1;
         }
     }
@@ -11157,9 +11231,20 @@ int main(int argc, char** argv) {
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
     std::string fontPath = jpFontPath();
+    // The Japanese ranges plus U+2025 TWO DOT LEADER: stack names carry it
+    // (frame_000‥023.npy - see rp::patternWithExtent), and a glyph the atlas
+    // does not hold renders as a fallback '?', which is precisely the
+    // uninformative character the extent exists to remove.
+    static ImVector<ImWchar> fontRanges;
+    {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        b.AddChar((ImWchar)0x2025);
+        b.BuildRanges(&fontRanges);
+    }
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
-                                       io.Fonts->GetGlyphRangesJapanese());
+                                       fontRanges.Data);
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
