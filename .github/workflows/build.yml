@@ -69,9 +69,11 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
             apt-get update -qq >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
+            # miniz.c is C: compiling it as C++ turns its tentative definitions
+            # into redefinition errors, so it gets its own gcc pass
+            gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
             g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -Icore -Iinclude -Ibuild/_deps/miniz-src \
-                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp \
-                build/_deps/miniz-src/miniz.c \
+                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp /tmp/miniz.o \
                 -o build/viewer-serve \
                 -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
             for f in plugins/*.c; do

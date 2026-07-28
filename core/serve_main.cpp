@@ -10,6 +10,13 @@
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
+        // The client compares this against its own protocol version to decide
+        // whether the installed peer is current; "--help works" is not enough,
+        // since an outdated peer answers --help perfectly well.
+        if (!strcmp(argv[i], "--version")) {
+            printf("viewer-serve protocol %u\n", rp::VERSION);
+            return 0;
+        }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             fprintf(stderr,
                     "viewer-serve: answer image requests on stdin/stdout.\n"

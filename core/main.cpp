@@ -346,6 +346,7 @@ struct App {
     std::atomic<bool> rbBusy{ false };
     std::atomic<bool> rbStop{ false };
     std::string pendingRemoteOpen;    // opened once the session is up
+    bool showRemoteError = false;     // the full failure text, on demand
     std::mutex sesMtx;                // app.remoteSession is shared with that worker
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
@@ -3525,13 +3526,23 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
     //    mismatch reported only "connection lost" before this check existed)
     if (!remote::runSshScript(host, port,
             "uname -s; uname -m\n"
-            "if \"$HOME/.viewer/viewer-serve\" --help >/dev/null 2>&1; then "
-            "echo HAVE_PEER; else echo NO_PEER; fi\n",
+            "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || echo NO_PEER\n",
             out, err, 20.0)) {
         log = "cannot reach " + host + ": " + err;
         return false;
     }
-    if (!force && out.find("HAVE_PEER") != std::string::npos) { log = "peer already installed"; return true; }
+    // "it runs" is not "it is current": an old peer answers --help happily and
+    // then cannot serve MEASURE. Compare the protocol version it reports.
+    int peerProto = 0;
+    size_t vp = out.find("viewer-serve protocol ");
+    if (vp != std::string::npos) peerProto = atoi(out.c_str() + vp + 22);
+    if (!force && peerProto >= (int)rp::VERSION) {
+        log = "peer already installed (protocol v" + std::to_string(peerProto) + ")";
+        return true;
+    }
+    if (!force && peerProto == 0 && out.find("NO_PEER") == std::string::npos &&
+        out.find("not found") == std::string::npos)
+        log = "the installed peer is older than this viewer; replacing it\n";
     bool isLinux = out.find("Linux") != std::string::npos;
     bool isDarwin = out.find("Darwin") != std::string::npos;
     if ((isLinux && out.find("x86_64") == std::string::npos) ||
@@ -3561,12 +3572,13 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
                 // lost" further down. Surface the loader's actual words.
                 std::string vout, verr3;
                 remote::runSshScript(host, port,
-                    "\"$HOME/.viewer/viewer-serve\" --help 2>&1 || true\n",
+                    "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || true\n",
                     vout, verr3, 15.0);
-                if (vout.find("viewer-serve") == std::string::npos) {
+                if (vout.find("viewer-serve protocol") == std::string::npos) {
                     log = "copied to " + host + ", but it does not run there:\n" + vout +
-                          "(usually an OS/glibc mismatch - update viewer-bin to get the "
-                          "compat build, or build viewer-serve on the server)";
+                          "\n(usually an OS/glibc mismatch - run update.cmd in viewer-bin "
+                          "to get the compat build, or build viewer-serve on the server: "
+                          "cmake --build <dir> --target viewer-serve)";
                     return false;
                 }
                 // plugins too, so server-side MEASURE has the same analyzers
@@ -6767,6 +6779,36 @@ static void drawRemoteOpenModal() {
     ImGui::EndPopup();
 }
 
+// The whole failure text, copyable. A remote install that fails deserves more
+// than a truncated line: the loader's own words are what identify a glibc
+// mismatch, and the user needs to be able to paste them.
+static void drawRemoteErrorWindow() {
+    if (!app.showRemoteError) return;
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 42, ImGui::GetFontSize() * 18),
+                             ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin("Remote connection details", &app.showRemoteError)) {
+        const App::RemoteBrowse& B = app.rbrowse;
+        ImGui::Text("host: %s", B.host.empty() ? "(none)" : B.host.c_str());
+        if (ImGui::Button("copy to clipboard")) {
+            std::string all = "host: " + B.host + "\n" + B.err + "\n" + g_bootstrapLog;
+            ImGui::SetClipboardText(all.c_str());
+            toast("copied");
+        }
+        ImGui::Separator();
+        ImGui::PushTextWrapPos(0.0f);
+        if (!B.err.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.5f, 1), "%s", B.err.c_str());
+        if (!g_bootstrapLog.empty()) {
+            ImGui::Separator();
+            ImGui::TextDisabled("install log:");
+            ImGui::TextUnformatted(g_bootstrapLog.c_str());
+        }
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+}
+
 static void drawHelpAbout() {
     if (app.showHelp) {
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -7661,8 +7703,14 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
                 } else if (!B.err.empty()) {
-                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  not connected", ICON_LINK);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", B.err.c_str());
+                    // The reason is the useful part: a tooltip hides it behind a
+                    // hover nobody thinks to try. Show the first line inline and
+                    // keep the full text one click away.
+                    std::string first = B.err.substr(0, B.err.find('\n'));
+                    if (first.size() > 90) first = first.substr(0, 87) + "...";
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  %s", ICON_LINK, first.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n\n(click for details)", B.err.c_str());
+                    if (ImGui::IsItemClicked()) app.showRemoteError = true;
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
@@ -7724,6 +7772,7 @@ int main(int argc, char** argv) {
         drawSequenceModal();
         drawFolderPickModal();
         drawRemoteOpenModal();
+        drawRemoteErrorWindow();
         drawHelpAbout();
 
         // toast
