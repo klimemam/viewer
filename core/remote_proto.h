@@ -13,6 +13,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
 
 namespace rp {
 
@@ -129,6 +130,35 @@ uint32_t dtypeFromName(const char* s);
 
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.
 int runServeMode();
+
+// Natural order over the WHOLE name: every digit run compares as a number
+// ("img2_gain10" < "img10_gain2"), case-insensitive elsewhere. Lives here
+// because BOTH ends must agree on frame order - the client sorts what it
+// opens, the server sorts what a scan folds into an unnumbered group.
+inline bool naturalLess(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        unsigned char ca = a[i], cb = b[j];
+        if (ca >= '0' && ca <= '9' && cb >= '0' && cb <= '9') {
+            size_t i0 = i, j0 = j;
+            while (i < a.size() && a[i] >= '0' && a[i] <= '9') i++;
+            while (j < b.size() && b[j] >= '0' && b[j] <= '9') j++;
+            size_t ia = i0, jb = j0;                 // strip leading zeros
+            while (ia < i - 1 && a[ia] == '0') ia++;
+            while (jb < j - 1 && b[jb] == '0') jb++;
+            size_t la = i - ia, lb = j - jb;
+            if (la != lb) return la < lb;
+            int c = a.compare(ia, la, b, jb, lb);
+            if (c != 0) return c < 0;
+        } else {
+            int la = ca >= 'A' && ca <= 'Z' ? ca + 32 : ca;
+            int lb2 = cb >= 'A' && cb <= 'Z' ? cb + 32 : cb;
+            if (la != lb2) return la < lb2;
+            i++; j++;
+        }
+    }
+    return a.size() - i < b.size() - j;
+}
 
 // META reply: what the client needs to lay out the image before any pixel moves.
 struct MetaRep {

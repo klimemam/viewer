@@ -645,7 +645,26 @@ static void handleScan(Buf& in) {
         std::vector<NpyGroup> gs;
         std::vector<size_t> singles;
         groupNumberedNpy(files, gs, singles);
-        for (size_t i : singles) {
+        // Two or more leftovers fold into ONE natural-order stack ("*.npy"):
+        // capture sets are not always numbered (capture_a / capture_b / ...),
+        // and N single-frame stacks from one folder is never what Open Folder
+        // meant. A lone file still opens as itself.
+        if (singles.size() >= 2) {
+            NpyGroup g;
+            g.pattern = "*.npy";
+            std::sort(singles.begin(), singles.end(), [&](size_t x, size_t y) {
+                return rp::naturalLess(files[x].first, files[y].first);
+            });
+            for (size_t i : singles) {
+                g.names.push_back(files[i].first);
+                std::error_code e2;
+                g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, e2);
+                g.mtime = std::max(g.mtime, unixMtime(files[i].second));
+            }
+            g.first = files[singles.front()].second;
+            gs.push_back(std::move(g));
+        } else if (singles.size() == 1) {
+            size_t i = singles[0];
             NpyGroup g;
             g.pattern = files[i].first;
             g.names = { files[i].first };

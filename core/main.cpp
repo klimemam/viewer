@@ -2293,6 +2293,11 @@ static void writeSessionTo(std::ostream& f) {
             for (const auto& o : app.images)
                 if (o->seqId == d->seqId && o->path != d->path) { inFile = false; break; }
             if (!inFile) f << "seqload 1\n";
+            // AFTER seqload: for a folder stack the SeqInfo only exists once the
+            // rescan ran, and a name applied before that lands on nothing. The
+            // name may be user-given ("25C dark") - it must survive the session.
+            if (const App::SeqInfo* sqi = seqInfo(d->seqId))
+                if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
         }
     }
     for (const auto& a : app.anns)   // label last: may contain spaces
@@ -2578,6 +2583,11 @@ static std::string loadSession(const std::string& path) {
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
         else if (key == "selann") ls >> selAnnIndex;
+        else if (key == "seqname") {    // user-given stack name (may contain spaces)
+            std::string nm = restOfLine(ls);
+            if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
+                if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
+        }
         else if (key == "seqlevel") {   // the exposure level of the stack above
             double lv = 0; ls >> lv;
             if (lastImageOk && cur() && cur()->seqId != 0)
@@ -3193,31 +3203,55 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         std::vector<std::string> files = d.second;
         std::sort(files.begin(), files.end());
         std::vector<bool> used(files.size(), false);
-        for (size_t i = 0; i < files.size() && groups.size() < MAX_GROUPS; i++) {
-            if (used[i]) continue;
-            std::string pattern;
-            std::vector<std::string> sibs = findSequenceSiblings(files[i], pattern);
+        // name the stack by its folder relative to the opened root
+        std::string rel = d.first.u8string();
+        if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
+        else rel.clear();
+        auto push = [&](std::vector<std::string> fs, std::string pattern) {
+            if (groups.size() >= MAX_GROUPS) return;
             App::PendingGroup g;
-            if (sibs.size() >= 2) {
-                g.files = sibs;
-                for (const auto& s : sibs)
-                    for (size_t k = 0; k < files.size(); k++)
-                        if (files[k] == s) used[k] = true;
-            } else {
-                g.files = { files[i] };
-                pattern = baseName(files[i]);
-                used[i] = true;
-            }
-            // name the stack by its folder relative to the opened root
-            std::string rel = d.first.u8string();
-            if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
-            else rel.clear();
+            g.files = std::move(fs);
             g.name = rel.empty() ? pattern : rel + "/" + pattern;
             std::string ext = std::filesystem::u8path(g.files[0]).extension().u8string();
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
             g.isRaw = ext != ".npy";
             groups.push_back(std::move(g));
+        };
+        std::vector<std::string> leftover;
+        for (size_t i = 0; i < files.size(); i++) {
+            if (used[i]) continue;
+            std::string pattern;
+            std::vector<std::string> sibs = findSequenceSiblings(files[i], pattern);
+            if (sibs.size() >= 2) {
+                for (const auto& s : sibs)
+                    for (size_t k = 0; k < files.size(); k++)
+                        if (files[k] == s) used[k] = true;
+                push(std::move(sibs), pattern);
+            } else {
+                used[i] = true;
+                leftover.push_back(files[i]);
+            }
+        }
+        // Two or more unnumbered leftovers = ONE stack in natural order, same
+        // fold the remote SCAN does: capture sets are not always numbered, and
+        // N single-frame stacks from one folder is never what Open Folder
+        // meant. Mixed extensions stay apart (raw needs one recipe per group).
+        std::map<std::string, std::vector<std::string>> byExt;
+        for (auto& f : leftover) {
+            std::string ext = std::filesystem::u8path(f).extension().u8string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            byExt[ext].push_back(std::move(f));
+        }
+        for (auto& [ext, fs] : byExt) {
+            if (fs.size() >= 2) {
+                std::vector<std::string> sorted = fs;
+                sortFramesNumerically(sorted);
+                push(std::move(sorted), "*" + ext);
+            } else {
+                push({ fs[0] }, baseName(fs[0]));
+            }
         }
     }
     return groups;
@@ -3608,20 +3642,10 @@ static void openRawDialogFor(const std::string& path) {
 // the region being looked at, at the resolution it is being looked at.
 // Numeric frame order: frame_1, frame_10, frame_100, frame_2 must not become the
 // time axis. Shared by the browser and anything else that builds a stack.
+// Frames need not be a strict counter pattern to stack in the order a human
+// expects - rp::naturalLess (shared with the peer) is the contract.
 static void sortFramesNumerically(std::vector<std::string>& files) {
-    std::sort(files.begin(), files.end(), [](const std::string& a, const std::string& b) {
-        auto key = [](const std::string& s) {
-            size_t end = s.size();
-            size_t dot = s.rfind('.');
-            if (dot != std::string::npos) end = dot;
-            size_t i = end;
-            while (i > 0 && isdigit((unsigned char)s[i - 1])) i--;
-            long long v = i < end ? atoll(s.c_str() + i) : -1;
-            return std::make_pair(s.substr(0, i), v);
-        };
-        auto ka = key(a), kb = key(b);
-        return ka.first != kb.first ? ka.first < kb.first : ka.second < kb.second;
-    });
+    std::sort(files.begin(), files.end(), rp::naturalLess);
 }
 
 // Put the peer on the server without the user copying anything: check
@@ -5247,6 +5271,51 @@ static void drawCanvas(ImVec2 avail) {
         dl->PopClipRect();
     }
 
+    // ---- the quiet footer: whose pixels these are, and where in the stack ----
+    // The name sits in the canvas corner at low alpha - visible when you look
+    // for it, invisible when you don't. The scrub bar replaces the slider that
+    // used to grow under the Files row and make the list jump.
+    if (im) {
+        std::vector<int> fr = im->seqId != 0 ? framesOfSeq(im->seqId) : std::vector<int>();
+        const App::SeqInfo* si = im->seqId != 0 ? seqInfo(im->seqId) : nullptr;
+        char label[400];
+        if (si && fr.size() > 1) {
+            int pos = 0;
+            for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
+            snprintf(label, sizeof label, "%s   %d/%d", si->name.c_str(),
+                     pos + 1, (int)fr.size());
+            // slim scrub bar above the label, canvas-wide, low-profile
+            float barH = 6.0f * s;
+            ImVec2 b0(canvasP0.x + 8 * s, canvasP1.y - barH - ImGui::GetFontSize() - 10 * s);
+            ImVec2 b1(canvasP1.x - 8 * s, b0.y + barH);
+            if (b1.x > b0.x + 40 * s) {
+                ImGui::SetCursorScreenPos(ImVec2(b0.x, b0.y - 2 * s));
+                ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, barH + 4 * s));
+                bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
+                int alpha = sh || sa ? 200 : 70;
+                dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, alpha / 3), barH * 0.5f);
+                float fx = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
+                dl->AddRectFilled(ImVec2(b0.x, b0.y), ImVec2(fx, b1.y),
+                                  IM_COL32(120, 170, 220, alpha), barH * 0.5f);
+                dl->AddCircleFilled(ImVec2(fx, (b0.y + b1.y) * 0.5f), barH * (sh || sa ? 1.2f : 0.8f),
+                                    IM_COL32(160, 200, 240, alpha + 55));
+                if (sa) {
+                    float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
+                    int want = (int)(t * (float)(fr.size() - 1) + 0.5f);
+                    if (want != pos) selectImage(fr[want]);
+                }
+                if (sh) ImGui::SetTooltip("frame %d / %d  (drag; . and , step)", pos + 1, (int)fr.size());
+            }
+        } else {
+            snprintf(label, sizeof label, "%s", im->name.c_str());
+        }
+        dl->PushClipRect(canvasP0, canvasP1, true);
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        ImVec2 tp(canvasP0.x + 8 * s, canvasP1.y - ts.y - 6 * s);
+        dl->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 110), label);   // legibility on white
+        dl->AddText(tp, IM_COL32(210, 218, 226, 130), label);
+        dl->PopClipRect();
+    }
 }
 
 static void recomputeHistogramIfNeeded(ImageDoc* im) {
@@ -6125,6 +6194,30 @@ static void drawPanelProjection() {
                 if (has) dl->AddLine(prev, pt, col, 1.2f);
                 prev = pt; has = true;
             }
+        }
+        // "There is a spike - WHICH column is it?" The readout answers with the
+        // exact index and the values under the cursor, without decimation: the
+        // marker snaps to the true sample, not to the plotted min-max bucket.
+        if (ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) {
+            float mx = ImGui::GetMousePos().x;
+            float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
+            int i = std::clamp((int)(t * (float)(n - 1) + 0.5f), 0, std::max(n - 1, 0));
+            dl->AddLine(pr.at((float)(origin + i), lo), pr.at((float)(origin + i), hi),
+                        IM_COL32(230, 200, 90, 140), 1.0f);
+            char tip[256];
+            int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y",
+                               origin + i);
+            static const char* CFA_N[4] = { "R", "Gr", "Gb", "B" };
+            static const char* RGB_N[4] = { "R", "G", "B", "A" };
+            for (int s2 = 0; s2 < P.nSeries; s2++) {
+                if (i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
+                const char* nm = P.nSeries == 1 ? "" : (cfa ? CFA_N[s2] : RGB_N[s2]);
+                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%.6g %s",
+                                nm, *nm ? ": " : "", series[s2][i], im->dtype.c_str());
+                dl->AddCircleFilled(pr.at((float)(origin + i), series[s2][i]), 3.0f,
+                                    IM_COL32(230, 200, 90, 230));
+            }
+            ImGui::SetTooltip("%s", tip);
         }
         dl->PopClipRect();
     };
@@ -7782,7 +7875,7 @@ static void drawPanelRemote() {
             for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
                 const remote::GlobHit& h = S.hits[row];
                 ImGui::PushID(row);
-                std::string lb = h.dir ? "[" + h.rel + "]" : h.rel;
+                std::string lb = h.dir ? h.rel + "/" : h.rel;   // trailing / marks dirs
                 if (ImGui::Selectable(lb.c_str())) {
                     std::string full = joinS(h.rel);
                     if (h.dir) {
@@ -7873,13 +7966,41 @@ static void drawPanelRemote() {
             ImGui::PushID(shown[row]);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            std::string lb = e.dir ? "[" + e.name + "]" : e.name;
-            if (e.group) lb += "  [" + std::to_string(e.frames) + " frames]";
+            // vscode-style rows: an icon column drawn with the draw list (the
+            // bundled font has no icon glyphs), names plain - no [brackets]
+            std::string lb = "   " + e.name;
+            if (e.group) lb += "   [" + std::to_string(e.frames) + " frames]";
             bool servable = e.dir || isNpyName(e.name);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
-            if (ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns) && servable) {
+            bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            {   // the icon, over the space the three-space prefix reserved
+                ImDrawList* rdl = ImGui::GetWindowDrawList();
+                ImVec2 p = ImGui::GetItemRectMin();
+                float h = ImGui::GetTextLineHeight();
+                float x = p.x + 2 * app.uiScale, y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
+                if (e.dir) {          // folder: tab + body, the universal shape
+                    ImU32 c = IM_COL32(222, 179, 92, 230);
+                    rdl->AddRectFilled(ImVec2(x, y + h * 0.22f), ImVec2(x + h * 0.45f, y + h * 0.40f),
+                                       c, 1.0f);
+                    rdl->AddRectFilled(ImVec2(x, y + h * 0.32f), ImVec2(x + h * 0.95f, y + h * 0.88f),
+                                       c, 2.0f);
+                } else if (e.group) { // stack: three offset pages
+                    ImU32 c = IM_COL32(120, 170, 220, 230);
+                    for (int k = 2; k >= 0; k--)
+                        rdl->AddRect(ImVec2(x + k * 2.0f * app.uiScale, y + h * 0.18f + k * 1.5f * app.uiScale),
+                                     ImVec2(x + k * 2.0f * app.uiScale + h * 0.55f,
+                                            y + h * 0.66f + k * 1.5f * app.uiScale), c, 1.0f);
+                } else {              // file: a page, dimmed for the unservable
+                    ImU32 c = servable ? IM_COL32(160, 170, 180, 220) : IM_COL32(120, 126, 132, 130);
+                    rdl->AddRect(ImVec2(x + h * 0.12f, y + h * 0.10f),
+                                 ImVec2(x + h * 0.72f, y + h * 0.90f), c, 1.0f);
+                    rdl->AddLine(ImVec2(x + h * 0.24f, y + h * 0.35f), ImVec2(x + h * 0.60f, y + h * 0.35f), c);
+                    rdl->AddLine(ImVec2(x + h * 0.24f, y + h * 0.55f), ImVec2(x + h * 0.60f, y + h * 0.55f), c);
+                }
+            }
+            if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
                 bool canSel = !e.dir && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
@@ -8137,13 +8258,31 @@ static void drawFileList() {
             selectImage(stack[pos]);
             if (app.fitOnSwitch) app.fitRequested = true;
         }
-        if (active) {
-            int slider = pos;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::SliderInt("##frame", &slider, 0, (int)stack.size() - 1, "frame %d")
-                && slider != pos)
-                selectImage(stack[slider]);
+        // The stack is the unit measurements attach to, so it earns a name of
+        // its own: "the 25C dark set", not whatever the capture script called
+        // the folder. F2 / right-click renames; the folder name is only the
+        // starting value.
+        if (si && ImGui::BeginPopupContextItem("seqctx")) {
+            static char renameBuf[256];
+            if (ImGui::IsWindowAppearing())
+                snprintf(renameBuf, sizeof renameBuf, "%s", si->name.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+            bool done = ImGui::InputText("##rename", renameBuf, sizeof renameBuf,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            done |= ImGui::SmallButton("rename");
+            if (done && renameBuf[0]) {
+                si->name = renameBuf;
+                app.lin.rev++;            // linearity rows show stack names
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
+        if (active && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+            ImGui::OpenPopup("seqctx");
+        // No frame slider here: it used to appear under the active row, and a
+        // row that grows on selection makes the whole list jump - the scrub bar
+        // lives at the bottom of the Image View now, where the frames are.
         ImGui::PopID();
       }
       if (showHeaders && open) ImGui::TreePop();
