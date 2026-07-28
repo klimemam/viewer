@@ -827,7 +827,22 @@ static App app;
 
 // ---- remote viewing: declared here, defined further down ----
 static const char* REMOTE_HOME = "~/.viewer";
-#define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
+// Plain ASCII: the bundled font has no icon set. TWO tags, because there are
+// two states. An empty host means the peer runs HERE - the same protocol over a
+// pipe instead of ssh - and a browse of this disk that flies an [ssh] flag,
+// says "local peer" in the title bar and prints "local://" in a dialog reads as
+// a connection to a machine called "local". Nothing is open. Say so.
+#define ICON_SSH   "[ssh]"
+#define ICON_LOCAL "[local]"
+// what an empty host is CALLED on screen (the url form stays "local://" - it is
+// storage, not language)
+#define PEER_HERE  "this machine"
+static const char* peerTag(const std::string& host) {
+    return host.empty() ? ICON_LOCAL : ICON_SSH;
+}
+static std::string peerLabel(const std::string& host) {
+    return host.empty() ? std::string(PEER_HERE) : host;
+}
 static void openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string());
@@ -4920,8 +4935,14 @@ static void pickerAccept() {
 // the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
     if (app.folderPickOpen && !ImGui::IsPopupOpen("Select sequences")) {
-        fprintf(stderr, "picker: OpenPopup (remote=%d, %d groups)\n",
-                app.folderPickRemote ? 1 : 0, (int)app.folderPick.size());
+        // "remote=1" was true of the code path and false of the world: a local
+        // browse takes it too. Name the SOURCE instead - that is the thing a
+        // reader of this log is trying to establish.
+        fprintf(stderr, "picker: OpenPopup (source=%s, %d groups)\n",
+                !app.folderPickRemote ? "disk"
+                : app.folderPickHost.empty() ? "peer on " PEER_HERE
+                                             : app.folderPickHost.c_str(),
+                (int)app.folderPick.size());
         ImGui::OpenPopup("Select sequences");
     }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
@@ -5579,7 +5600,7 @@ static bool ensureRemoteSession(const std::string& host, std::string& err, int p
                     : (app.remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
                                              : app.remoteExe);
     if (app.remoteSession->startOn(host, port, exe, err)) {
-        toast("connected to " + (host.empty() ? std::string("local peer") : host));
+        toast(host.empty() ? "browsing " PEER_HERE : "connected to " + host);
         return true;
     }
     if (host.empty()) return false;                 // nothing to bootstrap locally
@@ -5724,7 +5745,8 @@ static void rbWorker() {
             std::string err;
             bool alive = app.remoteSession->alive() && app.remoteSession->host() == job.host;
             if (!alive) {
-                rbSetPhase("connecting to " + (job.host.empty() ? "local peer" : job.host) + "...");
+                rbSetPhase(job.host.empty() ? "starting the local reader..."
+                                            : "connecting to " + job.host + "...");
                 alive = app.remoteSession->startOn(job.host, job.port, exe, err);
                 if (!alive && !job.host.empty()) {
                     // not there: the server installs its own peer from the
@@ -5876,7 +5898,13 @@ static void pumpRemoteBrowse() {
                 // with three different causes; the trail stays in
                 fprintf(stderr, "remote scan: %d groups -> picker requested\n",
                         (int)groups.size());
-                openPickerWith(std::move(groups), makeRemoteUrl(r.host, r.dir),
+                // The dialog's first line is READ, not pasted: for a local
+                // browse it is a path on this disk, and prefixing it "local://"
+                // told the user a scheme they never chose and a machine they
+                // are not talking to. The url form is unchanged everywhere it
+                // is stored (prefs, bookmarks, Copy path).
+                openPickerWith(std::move(groups),
+                               r.host.empty() ? r.dir : makeRemoteUrl(r.host, r.dir),
                                r.dir, true, r.host);
             }
             continue;
@@ -5926,7 +5954,7 @@ static void pumpRemoteBrowse() {
             // a listing nobody can see is not a connection anyone believes in
             app.showRemote = true;
             app.focusRemote = true;
-            toast("connected to " + (r.host.empty() ? std::string("local peer") : r.host));
+            toast(r.host.empty() ? "browsing " PEER_HERE : "connected to " + r.host);
         }
         // An outdated peer ANSWERS perfectly well, so the install-on-failure
         // path never runs for it - and every listing would show "-" for shape
@@ -6261,7 +6289,9 @@ static void openRemote(const std::string& url, bool asPreview) {
             app.seqNote = msg;
         }
     }
-    toast("opened " + baseName(rpath) + " from " + (host.empty() ? "local peer" : host));
+    // a file on this disk was not fetched "from" anywhere
+    toast(host.empty() ? "opened " + baseName(rpath)
+                       : "opened " + baseName(rpath) + " from " + host);
 }
 
 // A remote folder of numbered .npy files, opened as one stack: the first file
@@ -9597,7 +9627,7 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     ImGui::SameLine();
     if (S.pending) {
         ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
-                           S.host.empty() ? "local peer" : S.host.c_str());
+                           S.host.empty() ? PEER_HERE : S.host.c_str());
         ImGui::Separator();
         ImGui::TextDisabled("computing on the server over all %d frames", si->expectedFrames);
         return true;
@@ -9611,7 +9641,7 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
         return false;                 // fall through to the local path
     }
     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames]",
-                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames);
+                       S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames);
     ImGui::Separator();
     if (ImGui::BeginTable("srvtemporal", 2, ImGuiTableFlags_SizingFixedFit)) {
         ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthStretch);
@@ -9660,7 +9690,7 @@ static void drawBrowseTemporal() {
     ImGui::SameLine();
     if (S.pending) {
         ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
-                           S.host.empty() ? "local peer" : S.host.c_str());
+                           S.host.empty() ? PEER_HERE : S.host.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
         ImGui::Separator();
@@ -9677,7 +9707,7 @@ static void drawBrowseTemporal() {
         return;
     }
     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames - not opened: %s]",
-                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames,
                        S.label.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Open as stack")) {
@@ -11469,9 +11499,11 @@ static void drawPanelRemote() {
                           "every minute");
     // ---- row 3, on request: the connection and the server-side search ----
     if (rbAdvanced) {
-        ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
-        rbFlow(rbBtnW("disconnect"));    // same flow rule as row 2: never clipped
-        if (ImGui::SmallButton("disconnect")) {
+        ImGui::TextUnformatted(peerLabel(B.host).c_str());
+        // there is nothing to disconnect FROM when the peer runs here
+        const char* rbEndLbl = B.host.empty() ? "close browse##rbdisc" : "disconnect##rbdisc";
+        rbFlow(rbBtnW(rbEndLbl));        // same flow rule as row 2: never clipped
+        if (ImGui::SmallButton(rbEndLbl)) {
             rbDefer([] {                 // another machine, other children
                 app.rbrowse = App::RemoteBrowse{};
                 rbTreeForget();
@@ -12673,19 +12705,33 @@ static bool viewingRemote() {
     return app.rbrowse.connected || (im && !im->remoteUrl.empty());
 }
 
+// The host behind that, or "" for the local peer. The peer protocol is the same
+// either way - deliberately - but the ANSWER to "is this somewhere else?" is
+// not, and the title bar and the taskbar icon are answers to that question.
+static std::string viewingHost() {
+    if (!viewingRemote()) return {};
+    if (!app.rbrowse.host.empty()) return app.rbrowse.host;
+    const ImageDoc* im = cur();
+    if (im && !im->remoteUrl.empty()) {
+        std::string h, p;
+        remote::parseUrl(im->remoteUrl, h, p);
+        return h;
+    }
+    return {};
+}
+
 // One title, three places: the OS title bar (when there is one), the taskbar
 // button, and the integrated title bar this app draws for itself.
 static std::string windowTitleText() {
     const ImageDoc* im = cur();
     std::string t = im ? im->name + " - viewer" : "viewer v0.1";
-    if (viewingRemote()) {
-        std::string host = app.rbrowse.host;
-        if (host.empty() && im && !im->remoteUrl.empty()) {
-            std::string rp;
-            remote::parseUrl(im->remoteUrl, host, rp);
-        }
-        t += "  [" + (host.empty() ? std::string("local peer") : host) + "]";
-    }
+    // The bracket answers "which machine are these pixels on?". A local browse
+    // goes through the peer protocol but the file is on this disk, so there is
+    // no other machine to name - and "[local peer]" named one, which is how a
+    // Browse Folder (Local) looked like an open connection. No bracket is the
+    // true statement: it is a local file, exactly like File > Open.
+    std::string host = viewingHost();
+    if (!host.empty()) t += "  [" + host + "]";
     return t;
 }
 
@@ -14564,6 +14610,26 @@ int main(int argc, char** argv) {
                 B.connected ? 1 : 0, B.host.c_str(), B.dir.c_str(),
                 (int)B.entries.size(), app.showRemote ? 1 : 0,
                 B.err.empty() ? "" : " err=", B.err.c_str());
+        // ...and what it SAYS, which is the half that was wrong: a browse of
+        // this disk claimed a machine in the window title, an ssh session in
+        // the status bar and a "local://" scheme in the picker's header. The
+        // mechanism above is unchanged - only the words are checked here.
+        {
+            std::string title = windowTitleText();
+            std::string tag = peerTag(B.host);
+            std::string label = peerLabel(B.host);
+            std::string pickHdr = B.host.empty() ? B.dir : makeRemoteUrl(B.host, B.dir);
+            bool said = title.find('[') == std::string::npos &&
+                        title.find("ssh") == std::string::npos &&
+                        viewingHost().empty() &&
+                        tag == ICON_LOCAL && label == PEER_HERE &&
+                        pickHdr.find("local://") == std::string::npos;
+            fprintf(stderr, "localbrowseselftest: title=\"%s\" tag=%s peer=\"%s\" "
+                            "pickerheader=\"%s\" othermachine=%d: %s\n",
+                    title.c_str(), tag.c_str(), label.c_str(), pickHdr.c_str(),
+                    viewingHost().empty() ? 0 : 1, said ? "ok" : "FAIL");
+            if (!said) ok = false;
+        }
         fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
@@ -14865,7 +14931,7 @@ int main(int argc, char** argv) {
         };
         fprintf(stderr, "rtemporalselftest: [server %s, %d frames - not opened: %s] "
                         "valid=%d seqId=%d, %d image(s) open\n",
-                S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames,
                 S.label.c_str(), S.valid ? 1 : 0, S.seqId, (int)app.images.size());
         if (!fired || !S.valid || S.seqId != -2 || S.frames != (int)files.size() ||
             !app.images.empty()) {
@@ -17303,11 +17369,15 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                 } else if (B.connected) {
                     ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s  %s",
-                                       ICON_LINK, B.host.empty() ? "local peer" : B.host.c_str());
+                                       peerTag(B.host), peerLabel(B.host).c_str());
                     if (ImGui::IsItemHovered()) {
                         uint64_t rx = app.remoteSession ? app.remoteSession->bytesReceived() : 0;
-                        ImGui::SetTooltip("connected  -  %s\npeer protocol v%d, %.1f MB received\n"
-                                          "click to disconnect",
+                        ImGui::SetTooltip(B.host.empty()
+                            ? "browsing this machine  -  %s\nthe peer runs here, over a pipe: "
+                              "nothing is connected and nothing is on the network\n"
+                              "peer protocol v%d, %.1f MB read\nclick to close the browse"
+                            : "connected  -  %s\npeer protocol v%d, %.1f MB received\n"
+                              "click to disconnect",
                                           B.dir.c_str(),
                                           app.remoteSession ? app.remoteSession->peerVersion() : 0,
                                           rx / 1048576.0);
@@ -17326,7 +17396,8 @@ int main(int argc, char** argv) {
                     // keep the full text one click away.
                     std::string first = B.err.substr(0, B.err.find('\n'));
                     if (first.size() > 90) first = first.substr(0, 87) + "...";
-                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  %s", ICON_LINK, first.c_str());
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  %s",
+                                       peerTag(B.host), first.c_str());
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n\n(click for details)", B.err.c_str());
                     if (ImGui::IsItemClicked()) app.showRemoteError = true;
                     ImGui::SameLine();
@@ -17421,7 +17492,9 @@ int main(int argc, char** argv) {
             // With an integrated frame there is no system title bar to read the
             // title off - it is drawn in the menu bar instead - but it is still
             // what the taskbar button and the window list show.
-            const bool remoteNow = viewingRemote();
+            // ...and "another machine" is the same test the title uses: a local
+            // browse is not a connection, so it gets no green frame either.
+            const bool remoteNow = !viewingHost().empty();
             static std::string lastTitle;
             std::string title = windowTitleText();
             if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
