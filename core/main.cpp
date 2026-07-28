@@ -365,6 +365,7 @@ struct App {
         // frames being resident. remoteUrl for a frame-axis file; remoteFiles for
         // a folder-of-frames stack. expectedFrames = the true total from META.
         std::string remoteUrl, remoteHost;
+        int remotePort = 0;           // non-default ssh port, or 0
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
@@ -471,6 +472,7 @@ struct App {
         int port = 0;
         std::string pattern;          // RbGlob only
         uint32_t gen = 0;             // RbGlob: Stop bumps it, stale results drop
+        std::string exe;              // frozen at enqueue: see MJob
     };
     struct RbResult {
         int kind = RbConnect;
@@ -506,7 +508,7 @@ struct App {
     // all called frame_000.npy would be indistinguishable, and the linearity
     // Auto-levels reads the level from exactly this folder prefix.
     struct RemoteOpen { std::string host; std::vector<std::string> files;
-                        std::string name; int batchId = 0; };
+                        std::string name; int batchId = 0; int port = 0; };
     std::vector<RemoteOpen> rbOpenQueue;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
@@ -535,9 +537,13 @@ struct App {
     int procPolicy = PolAuto;
     // background MEASURE worker (own ssh connection: a 300-frame aggregate must
     // not stall the tile fetches). Results carry provenance for the panel.
+    // `exe` is the same snapshot RFetchJob carries and for the same reason
+    // (main.cpp: "how the peer is invoked, frozen NOW: the UI thread edits
+    // remoteExe freely"). A worker reading app.remoteExe while the Start Remote
+    // dialog assigns it is a data race on a std::string.
     struct MJob { std::string url; int op; uint64_t token; std::vector<std::string> files;
                   int cfaType = 0, cfaPattern = 0; float black = 0, white = 1;
-                  int rx = 0, ry = 0, rw = 0, rh = 0; };
+                  int rx = 0, ry = 0, rw = 0, rh = 0; std::string exe; };
     struct MDone { uint64_t token; bool ok = false; std::string err, host;
                    remote::MeasureResult res; };
     std::thread mThread;
@@ -858,8 +864,8 @@ static const char* REMOTE_HOME = "~/.viewer";
 #define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
 static void openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name = std::string());
-static std::string makeRemoteUrl(const std::string& host, const std::string& path);
+                            const std::string& name = std::string(), int port = 0);
+static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port = 0);
 static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
 static void rbTreeForget();       // drop the tree's cached children
@@ -1359,6 +1365,7 @@ static void forgetImage(ImageDoc* im) {
 static void rfWorker() {
     remote::Session ses;
     std::string sesHost = "\n";                  // impossible: force first connect
+    int sesPort = -1;
     while (!app.rfStop) {
         App::RFetchJob job;
         bool have = false;
@@ -1377,12 +1384,15 @@ static void rfWorker() {
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         d.gen = job.gen;
         std::string host, rpath, err;
-        if (!remote::parseUrl(job.url, host, rpath)) {
+        int port = 0;
+        if (!remote::parseUrl(job.url, host, rpath, &port)) {
             d.err = "bad remote url";
         } else {
-            if (!ses.alive() || sesHost != host) {
-                if (!ses.start(host, job.exe, err)) d.err = err;
-                else sesHost = host;
+            // startOn, not start(): start() hardwires port 0, i.e. plain
+            // `ssh host` - a DIFFERENT machine when the user named a port
+            if (!ses.alive() || sesHost != host || sesPort != port) {
+                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
+                else { sesHost = host; sesPort = port; }
             }
             if (d.err.empty()) {
                 int w = 0, h = 0, ch = 0;
@@ -1565,6 +1575,7 @@ static void stopRemoteFetcher() {
 static void mWorker() {
     remote::Session ses;
     std::string sesHost = "\n";
+    int sesPort = -1;
     while (!app.mStop) {
         App::MJob job;
         bool have = false;
@@ -1577,15 +1588,13 @@ static void mWorker() {
         App::MDone d;
         d.token = job.token;
         std::string host, rpath, err;
-        if (!remote::parseUrl(job.url, host, rpath)) { d.err = "bad remote url"; }
+        int port = 0;
+        if (!remote::parseUrl(job.url, host, rpath, &port)) { d.err = "bad remote url"; }
         else {
             d.host = host;
-            if (!ses.alive() || sesHost != host) {
-                std::string exe = app.remoteExe.empty()
-                    ? (host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
-                    : app.remoteExe;
-                if (!ses.start(host, exe, err)) d.err = err;
-                else sesHost = host;
+            if (!ses.alive() || sesHost != host || sesPort != port) {
+                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
+                else { sesHost = host; sesPort = port; }
             }
             if (d.err.empty()) {
                 remote::MeasureReq q;
@@ -1609,6 +1618,13 @@ static void mWorker() {
 }
 
 static void mEnqueue(App::MJob job) {
+    if (job.exe.empty()) {
+        std::string h, rp2;
+        remote::parseUrl(job.url, h, rp2);
+        job.exe = app.remoteExe.empty()
+            ? (h.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
+            : app.remoteExe;
+    }
     {
         std::lock_guard<std::mutex> lk(app.mMtx);
         app.mPending++;
@@ -3137,8 +3153,8 @@ static void restoreFull() {
 
 static void openRemote(const std::string& url, bool asPreview);   // fwd (default on the first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name);   // default lives on the first decl
-static std::string makeRemoteUrl(const std::string& host, const std::string& path);
+                            const std::string& name, int port);   // defaults: first decl
+static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port);   // defaults: first decl
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
@@ -5738,16 +5754,22 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port)
     return false;
 }
 
-static std::string makeRemoteUrl(const std::string& host, const std::string& path) {
+static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port) {
     if (host.empty()) return "local://" + path;
     // A home-relative path ("~/data/x.npy") pasted straight after the host would
     // read as part of the HOST ("ssh://trc2~/data/..."), and the mis-split host
     // then looks like a machine we have never connected to - which is what made
     // picking a file in the browser answer "could not install the peer".
     // git's ssh:// extension spells it /~/rel, and parseUrl unwraps that.
+    // The PORT is part of the locator, not a side channel. It used to be
+    // dropped here, so browsing ssh://host:2222/data worked (RbJob carries the
+    // port) while every url minted afterwards - ImageDoc::path, RFetchJob::url,
+    // MJob::url, the session file's npy3 line - said port 22. The fetch, the
+    // server-side MEASURE and every session restore then connected to whatever
+    // answered on 22, and the peer-install fallback would deploy there.
     std::string p = path;
     if (!p.empty() && p[0] != '/') p = "/" + p;
-    return "ssh://" + host + p;
+    return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
 }
 
 // Does analysis of this stack run on the server? Yes for remote data unless the
@@ -5778,10 +5800,10 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     j.op = rp::MOP_TEMPORAL_STATS;
     j.cfaType = si->cfaType; j.cfaPattern = si->cfaPattern;
     if (!si->remoteFiles.empty()) {
-        j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0]);
+        j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0], si->remotePort);
         for (const auto& f : si->remoteFiles) j.files.push_back(f);
     } else {
-        j.url = si->remoteUrl;
+        j.url = si->remoteUrl;        // already carries its port
     }
     mEnqueue(std::move(j));
 }
@@ -5833,7 +5855,7 @@ static void requestBrowseTemporal(const std::string& host,
     App::MJob j;
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
-    j.url = makeRemoteUrl(host, files[0]);
+    j.url = makeRemoteUrl(host, files[0], app.rbrowse.port);
     if (files.size() > 1)
         for (const auto& f : files) j.files.push_back(f);
     mEnqueue(std::move(j));
@@ -5866,9 +5888,7 @@ static void rbWorker() {
         r.host = job.host;
         r.port = job.port;
         r.dir = job.dir;
-        std::string exe = app.remoteExe.empty()
-            ? (job.host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
-            : app.remoteExe;
+        const std::string& exe = job.exe;   // snapshot taken at enqueue time
         if (job.kind == App::RbUpdatePeer) {
             rbSetPhase("updating the peer on " + job.host + " (git)...");
             if (app.rbSession) app.rbSession->stop();
@@ -5960,6 +5980,11 @@ static void rbWorker() {
 }
 
 static void rbEnqueue(App::RbJob job) {
+    // how the peer is invoked, frozen NOW on the UI thread that owns the string
+    if (job.exe.empty())
+        job.exe = app.remoteExe.empty()
+            ? (job.host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
+            : app.remoteExe;
     {
         std::lock_guard<std::mutex> lk(app.rbMtx);
         app.rbQueue.push_back(std::move(job));
@@ -6053,7 +6078,7 @@ static void pumpRemoteBrowse() {
                 // with three different causes; the trail stays in
                 fprintf(stderr, "remote scan: %d groups -> picker requested\n",
                         (int)groups.size());
-                openPickerWith(std::move(groups), makeRemoteUrl(r.host, r.dir),
+                openPickerWith(std::move(groups), makeRemoteUrl(r.host, r.dir, r.port),
                                r.dir, true, r.host);
             }
             continue;
@@ -6178,13 +6203,11 @@ static void remoteBrowseTo(const std::string& dir) {
 }
 
 // One canonical url for "this directory on this host", used by the places list
-// (bookmarks / recents). Unlike makeRemoteUrl it keeps a non-default port, and
-// "~" travels as git's /~/ extension so parseUrl round-trips it.
+// (bookmarks / recents). It IS makeRemoteUrl now: the two differed only in
+// whether they kept the port, and "the one that keeps it" is the only correct
+// answer, so there is one function and no way to pick the lossy one by mistake.
 static std::string placeUrl(const std::string& host, int port, const std::string& path) {
-    if (host.empty()) return "local://" + path;
-    std::string p = path;
-    if (!p.empty() && p[0] != '/') p = "/" + p;
-    return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
+    return makeRemoteUrl(host, path, port);
 }
 
 // Navigate to a places url. Same host and a live session: just browse there.
@@ -6255,7 +6278,7 @@ static void pumpRemoteOpenQueue() {
     app.rbOpenQueue.erase(app.rbOpenQueue.begin());
     sortFramesNumerically(ro.files);
     app.loadBatchId = ro.batchId;
-    openRemoteStack(ro.host, ro.files, ro.name);
+    openRemoteStack(ro.host, ro.files, ro.name, ro.port);
     app.loadBatchId = 0;
 }
 
@@ -6281,7 +6304,7 @@ static void startRemote(const std::string& hostSpec) {
         rbEnqueue(std::move(j));
         // opened once the worker has the session; opening it here would put the
         // ssh handshake back on the UI thread
-        app.pendingRemoteOpen = makeRemoteUrl(host, dir);
+        app.pendingRemoteOpen = makeRemoteUrl(host, dir, port);
         return;
     }
     app.rbrowse = App::RemoteBrowse{};
@@ -6326,10 +6349,11 @@ static void stepPreviewFrame(int delta) {
     int want = std::clamp(app.previewIndex + delta, 0, n - 1);
     if (want == app.previewIndex) return;
     std::string host = app.rbrowse.host;
+    int port = app.rbrowse.port;
     std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
     std::string label = app.previewLabel;
     app.previewIndex = want;
-    openRemote(makeRemoteUrl(host, files[want]), true);
+    openRemote(makeRemoteUrl(host, files[want], port), true);
     app.previewFiles = std::move(files);
     app.previewIndex = want;
     app.previewLabel = std::move(label);
@@ -6426,6 +6450,7 @@ static void openRemote(const std::string& url, bool asPreview) {
         si.name = baseName(rpath) + " [remote]";
         si.remoteUrl = url;           // frame-axis: one file, N frames
         si.remoteHost = host;
+        si.remotePort = port;
         si.expectedFrames = m.frames;
         // the mosaic travels with the stack, so the server splits the planes
         // the same way the local path does (it had NO writer before, so every
@@ -6466,10 +6491,10 @@ static void openRemote(const std::string& url, bool asPreview) {
 // shows immediately, the rest arrive in the background and slot in as ordinary
 // local frames. Processing never moves - the pixels do, once each.
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name) {
+                            const std::string& name, int port) {
     if (files.empty()) return;
     size_t before = app.images.size();
-    openRemote(makeRemoteUrl(host, files[0]));
+    openRemote(makeRemoteUrl(host, files[0], port));
     if (app.images.size() == before) return;      // first frame failed; toasted already
     ImageDoc* first = app.images.back().get();
     if (first->seqId != 0) return;                // it was a frame-axis file: done
@@ -6481,6 +6506,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     si.name = !name.empty() ? name + " [remote x" + std::to_string(files.size()) + "]"
               : baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
     si.remoteHost = host;             // folder stack: one file per frame
+    si.remotePort = port;
     si.expectedFrames = (int)files.size();
     si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
     for (const auto& f : files) si.remoteFiles.push_back(f);
@@ -6495,7 +6521,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
     for (int i = 1; i <= fit; i++) {
         App::RFetchJob j;
-        j.url = makeRemoteUrl(host, files[i]);
+        j.url = makeRemoteUrl(host, files[i], port);
         j.name = baseName(files[i]);
         j.seqId = si.id;
         j.seqIndex = i;
@@ -6518,7 +6544,8 @@ static void promotePreview(ImageDoc* d) {
     d->preview = false;
     if (app.previewUid == d->uid) app.previewUid = 0;
     std::string host, rpath;
-    remote::parseUrl(d->remoteUrl, host, rpath);
+    int port = 0;
+    remote::parseUrl(d->remoteUrl, host, rpath, &port);
     {   // out of the "preview" pseudo-batch, into a folder-named one
         size_t sl = rpath.find_last_of('/');
         std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
@@ -6534,6 +6561,7 @@ static void promotePreview(ImageDoc* d) {
         si.name = baseName(rpath) + " [remote]";
         si.remoteUrl = d->remoteUrl;
         si.remoteHost = host;
+        si.remotePort = port;
         si.expectedFrames = d->remoteFrames;
         si.cfaType = d->cfa; si.cfaPattern = d->cfaPattern;       // planes travel too
         app.seqs.push_back(si);
@@ -11489,7 +11517,7 @@ static void drawPanelRemote() {
         ImageDoc* pv = nullptr;
         for (const auto& di : app.images)
             if (di->uid == app.previewUid && di->preview) pv = di.get();
-        std::string u = makeRemoteUrl(B.host, target);
+        std::string u = makeRemoteUrl(B.host, target, B.port);
         if (pv && pv->remoteUrl == u) selectImage(app.current);
         else openRemote(u, true);
         app.previewFiles = std::move(seq);
@@ -11510,7 +11538,7 @@ static void drawPanelRemote() {
             for (const auto& m : r.e->members) files.push_back(r.join(m));
             // the canon's `folder/pattern`, built from the SAME text the peer
             // put in the group row (rp::patternWithExtent, shared verbatim)
-            openRemoteStack(B.host, files, stackNameFor(*r.dir, r.e->name));
+            openRemoteStack(B.host, files, stackNameFor(*r.dir, r.e->name), B.port);
             return;
         }
         for (const auto& di : app.images)
@@ -11758,7 +11786,7 @@ static void drawPanelRemote() {
                 std::vector<std::string> bases;
                 for (const auto& f : files) bases.push_back(baseName(f));
                 openRemoteStack(B.host, files,
-                                stackNameFor(B.dir, patternOfNames(bases)));
+                                stackNameFor(B.dir, patternOfNames(bases)), B.port);
                 rbSel.assign(view.size(), 0);
             }
             if (!reason.empty()) ImGui::EndDisabled();
@@ -11842,7 +11870,7 @@ static void drawPanelRemote() {
                     if (h.dir) {
                         rbGoTo(full);
                     } else if (isNpyName(h.rel)) {
-                        openRemote(makeRemoteUrl(B.host, full));
+                        openRemote(makeRemoteUrl(B.host, full, B.port));
                     } else {
                         // not servable: at least go where it lives
                         size_t sl = full.find_last_of('/');
@@ -12097,7 +12125,7 @@ static void drawPanelRemote() {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
-                        openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name));
+                        openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                     }
                     // the server aggregates WITHOUT opening: "is this set even
                     // worth transferring?" costs zero pixels this way. Group
@@ -12118,10 +12146,10 @@ static void drawPanelRemote() {
                     ImGui::Separator();
                 } else if (isNpyName(rname)) {
                     if (ImGui::MenuItem("Open"))
-                        openRemote(makeRemoteUrl(B.host, full));
+                        openRemote(makeRemoteUrl(B.host, full, B.port));
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
-                        openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname));
+                        openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
@@ -12129,7 +12157,7 @@ static void drawPanelRemote() {
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
-                            openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name));
+                            openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                         }
                     }
                     ImGui::Separator();
@@ -14905,6 +14933,31 @@ int main(int argc, char** argv) {
                 if (!idOk) ok = false;
                 closeAll();
             }
+        }
+        {   // PORT. A non-default ssh port used to survive only inside the
+            // browse worker: makeRemoteUrl dropped it, and that string is what
+            // becomes ImageDoc::path, RFetchJob::url, MJob::url and the session
+            // file's npy3 line. Everything downstream then ran plain `ssh host`
+            // - which is a DIFFERENT MACHINE if one answers on 22, and the
+            // install fallback would deploy the peer onto it.
+            const int P = 2222;
+            std::string u = makeRemoteUrl("user@host", "/data/f.npy", P);
+            std::string uh = makeRemoteUrl("user@host", "~/data/f.npy", P);
+            std::string h1, p1, h2, p2;
+            int gp1 = 0, gp2 = 0;
+            bool r1 = remote::parseUrl(u, h1, p1, &gp1);
+            bool r2 = remote::parseUrl(uh, h2, p2, &gp2);
+            // the places url and the open url are the same function now, so a
+            // bookmark and an open of the same place cannot disagree
+            bool same = placeUrl("user@host", P, "/data/f.npy") == u;
+            bool portOk = r1 && r2 && gp1 == P && gp2 == P && h1 == "user@host" &&
+                          p1 == "/data/f.npy" && p2 == "~/data/f.npy" && same &&
+                          u.find(":2222/") != std::string::npos;
+            fprintf(stderr, "browseselftest: port in the locator: '%s' -> host '%s' "
+                            "path '%s' port %d; '%s' -> port %d; placeUrl identical=%d: %s\n",
+                    u.c_str(), h1.c_str(), p1.c_str(), gp1, uh.c_str(), gp2,
+                    same ? 1 : 0, portOk ? "ok" : "FAIL");
+            if (!portOk) ok = false;
         }
         fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
