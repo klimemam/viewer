@@ -360,9 +360,10 @@ struct App {
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
-        // linearity: the exposure level this stack was captured at (lux, ms,
-        // photons - the unit lives in App::lin.unit). NaN = not set.
-        double level = std::numeric_limits<double>::quiet_NaN();
+        // NO level here. The value a stack was captured at is meaningless
+        // without the parameter's NAME and UNIT, and both of those belong to
+        // the series - so the value does too (Series::Member::value). Keeping
+        // it on the stack is what forced "one unit for the whole application".
     };
     std::vector<SeqInfo> seqs;
     // A batch is the unit the Files panel groups by: created per OPEN ACTION
@@ -515,8 +516,8 @@ struct App {
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
-    // Linearity: one row per stack (level in, response out), fits per CFA plane.
-    // Recomputed only on demand - this walks hundreds of frames.
+    // Linearity: one row per MEMBER of one series (value in, response out), fits
+    // per CFA plane. Recomputed only on demand - this walks hundreds of frames.
     struct LinState {
         struct Row {
             int seqId = 0;
@@ -528,6 +529,11 @@ struct App {
             std::string err;
         };
         std::vector<Row> rows;
+        int seriesId = 0;                 // the series these rows describe
+        // NOT the unit of any measurement: the PREFILL a newly created series
+        // starts from (prefs key linunit, unchanged). What gets printed on an
+        // axis comes from Series::unit, and empty there means "not set" - it
+        // never silently becomes "lx".
         char unit[16] = "lx";
         int tablePlane = 0;               // which CFA plane the per-stack table shows
         bool fitValid = false, roiUsed = false;
@@ -538,6 +544,28 @@ struct App {
         uint64_t rev = 0, computedRev = 0;
     } lin;
     bool showLinearity = false;
+    // Create / edit a series. ONE modal for both: the fields are identical and
+    // "edit" is only "create with the boxes already ticked". The value column
+    // is a SUGGESTION the user confirms - see drawSeriesModal.
+    struct SeriesEdit {
+        bool open = false;
+        int editId = 0;                   // 0 = creating a new one
+        int batchId = 0;
+        char name[128] = "";
+        char param[64] = "";
+        char unit[16] = "";
+        int kind = Series::KLinearity;
+        struct Row {
+            int seqId = 0;
+            bool check = true;
+            // TEXT, not a double: "" has to stay distinguishable from 0, and a
+            // numeric box cannot be empty. Parsed on accept; empty = NaN = unset.
+            char value[32] = "";
+            bool suggested = false;       // still extractLevelFromName's proposal
+            std::string name, from;       // from = the text the number was read out of
+        };
+        std::vector<Row> rows;
+    } seriesEdit;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
     // Browse listing view: false = the collapsed group rows the peer sends,
@@ -3264,11 +3292,10 @@ static std::string loadSession(const std::string& path) {
             if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
                 if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
         }
-        else if (key == "seqlevel") {   // the exposure level of the stack above
-            double lv = 0; ls >> lv;
-            if (lastImageOk && cur() && cur()->seqId != 0)
-                if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->level = lv;
-        }
+        // "seqlevel" (the old per-stack level) is not read here anymore: the
+        // value belongs to a series member now, and there is no series at this
+        // point in the parse. It comes back in the persistence phase as an
+        // explicit MIGRATION, which is the only thing it can honestly be.
         else if (key == "linunit") { std::string u = restOfLine(ls);
                                      snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
         else if (key == "seqframe") {   // select the frame this stack was left on
@@ -7993,8 +8020,9 @@ static void drawPanelProjection() {
 
 // "100lx/frame_###.npy" -> 100; "00/f_###" -> 0; "run42_200ms.npy [remote]" -> 42.
 // Rule: the first number in the FOLDER part when there is one, else in the whole
-// name. Deliberately simple - the field is editable, this is only the default.
-static double extractLevelFromName(const std::string& name) {
+// name. Deliberately simple - this is only a SUGGESTION a human confirms, and
+// srcOut reports the text it was read out of so the modal can show its work.
+static double extractLevelFromName(const std::string& name, std::string* srcOut = nullptr) {
     std::string part = name;
     size_t slash = part.find_last_of('/');
     if (slash != std::string::npos && slash > 0) part = part.substr(0, slash);
@@ -8012,9 +8040,11 @@ static double extractLevelFromName(const std::string& name) {
             part.erase(a, b - a);
         }
     }
+    if (srcOut) srcOut->clear();
     for (size_t i = 0; i < part.size(); i++) {
         if (isdigit((unsigned char)part[i])) {
             // avoid the "###" pattern placeholder and sizes like 640x480
+            if (srcOut) *srcOut = part;
             return atof(part.c_str() + i);
         }
     }
@@ -8118,37 +8148,58 @@ static const ImU32 LIN_COLS[4] = {
 
 // Everything the panel shows, recomputed only when Compute is pressed: this is
 // a measurement action over potentially hundreds of frames, not a per-frame UI.
-static void linRecompute() {
+//
+// ONE SERIES, not "every open stack". The old walk over app.seqs meant two
+// sweeps open at the same time were silently fitted as one curve, and the
+// parameter values had nowhere to live but the stacks themselves. The rows are
+// the series' members, in the series' order; include and value come straight
+// off Series::Member, so a table row IS members[i] and there is nothing to
+// carry across a recompute.
+static void linRecompute(int seriesId) {
     App::LinState& L = app.lin;
+    L.seriesId = seriesId;
     // the ROI is shared with everything else: the selected rect, or whole frame
     int rx = 0, ry = 0, rw = 0, rh = 0;
     L.roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn))
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; L.roiUsed = true; }
-    std::vector<std::pair<int, bool>> keepInc;
-    for (const auto& r : L.rows) keepInc.push_back({ r.seqId, r.include });
     L.rows.clear();
-    for (const auto& si : app.seqs) {
-        std::vector<int> fr = framesOfSeq(si.id);
-        if (fr.size() < 2 && si.expectedFrames < 2) continue;
+    App::Series* S = seriesById(seriesId);
+    if (!S) {
+        L.fitValid = false;
+        L.nPl = 1; L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
+    for (const auto& m : S->members) {
+        App::SeqInfo* si = seqInfo(m.seqId);
+        if (!si) continue;              // seriesAudit says this cannot happen
         App::LinState::Row r;
-        r.seqId = si.id;
-        r.name = si.name;
-        r.level = si.level;
-        StackStats st = computeStackStats(si.id, rx, ry, rw, rh);
+        r.seqId = m.seqId;
+        r.name = si->name;
+        r.level = m.value;
+        r.include = m.include;
+        StackStats st = computeStackStats(m.seqId, rx, ry, rw, rh);
         r.valid = st.valid;
         r.err = st.err;
         r.frames = st.frames;
         r.nPl = st.nPl;
         for (int p = 0; p < 4; p++) { r.mean[p] = st.mean[p]; r.sigmaT[p] = st.sigmaT[p]; }
-        for (const auto& k : keepInc) if (k.first == si.id) r.include = k.second;
         L.rows.push_back(std::move(r));
     }
-    // fits, per plane, over rows that have both a level and a measurement
+    // fits, per plane, over rows that have both a value and a measurement
     L.fitValid = false;
     L.nPl = 1;
     for (const auto& r : L.rows) if (r.valid) L.nPl = std::max(L.nPl, r.nPl);
     int fitted = 0;
+    // No unit, no fit. The per-stack MEANS above are DN either way and stay on
+    // screen; a sensitivity is DN per SOMETHING, and inventing that something
+    // is exactly the assumption the series layer exists to stop.
+    if (S->unit[0] == '\0') {
+        L.nPts = 0;
+        L.computedRev = ++L.rev;
+        return;
+    }
     for (int p = 0; p < L.nPl; p++) {
         std::vector<double> lx, ly, pm, pv;
         for (const auto& r : L.rows) {
@@ -8196,30 +8247,303 @@ static void linRecompute() {
     L.computedRev = ++L.rev;
 }
 
+// SELFTEST ONLY - the one place in the program that creates a series without a
+// human. The canon forbids auto-creation because a guessed sweep is a lie that
+// fits; a headless test has nobody to press Create, so it presses it here, in
+// the open: ONE series over every stack of one batch, values from
+// extractLevelFromName (exactly the proposal the Create modal puts on screen),
+// unit = the same prefill that modal starts from. Called only from --*-selftest
+// branches in main(); returns 0 when the batch held no stacks.
+static int selftestMakeSeries(int batchId, const char* unitPrefill) {
+    if (!batchId) return 0;
+    int id = newSeries(batchId, "");
+    if (App::Series* S = seriesById(id)) {
+        S->paramName = "level";
+        snprintf(S->unit, sizeof S->unit, "%s",
+                 unitPrefill && *unitPrefill ? unitPrefill : "lx");
+    }
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != batchId) continue;
+        addToSeries(id, si.id, extractLevelFromName(si.name));
+    }
+    App::Series* S = seriesById(id);
+    if (!S || S->members.empty()) { pruneEmptySeries(); return 0; }
+    return id;
+}
+
+static const char* SERIES_KINDS = "linearity\0PTC\0temperature\0other\0";
+
+// Fill the create/edit modal. Creating: every stack of the batch, all ticked,
+// each with extractLevelFromName's proposal ALREADY in its value box and marked
+// as a proposal. Editing: the members first, in their order, with their own
+// values, then the batch's non-members, unticked.
+//
+// The proposal is the whole point of the old "Auto levels" button, moved to
+// where it belongs: the user sees the numbers and the text they were read out
+// of BEFORE pressing Create, so pressing it is a confirmation. Nothing here
+// runs by itself - series are never auto-created (docs/terminology.md).
+static void openSeriesModal(int batchId, int editId) {
+    App::SeriesEdit& E = app.seriesEdit;
+    E = App::SeriesEdit{};
+    E.editId = editId;
+    E.batchId = batchId;
+    const App::Series* S = editId ? seriesById(editId) : nullptr;
+    if (S) {
+        E.batchId = S->batchId;
+        snprintf(E.name, sizeof E.name, "%s", S->name.c_str());
+        snprintf(E.param, sizeof E.param, "%s", S->paramName.c_str());
+        snprintf(E.unit, sizeof E.unit, "%s", S->unit);
+        E.kind = S->kind;
+    } else {
+        snprintf(E.name, sizeof E.name, "%s 掃引", batchNameOf(batchId).c_str());
+        // the prefill, and only that: an empty box stays empty (prefs linunit)
+        snprintf(E.unit, sizeof E.unit, "%s", app.lin.unit);
+    }
+    auto addRow = [&](int seqId, bool checked, double value, bool haveValue) {
+        App::SeriesEdit::Row r;
+        r.seqId = seqId;
+        r.check = checked;
+        App::SeqInfo* si = seqInfo(seqId);
+        r.name = si ? si->name : std::string();
+        double guess = extractLevelFromName(r.name, &r.from);
+        if (haveValue && std::isfinite(value)) {
+            snprintf(r.value, sizeof r.value, "%.6g", value);
+        } else if (std::isfinite(guess)) {
+            snprintf(r.value, sizeof r.value, "%.6g", guess);
+            r.suggested = true;           // dim + "(guess)" until it is touched
+        }
+        E.rows.push_back(std::move(r));
+    };
+    if (S)
+        for (const auto& m : S->members) addRow(m.seqId, true, m.value, true);
+    for (const auto& si : app.seqs) {
+        if (batchOfStack(si.id) != E.batchId) continue;
+        bool already = false;
+        for (const auto& r : E.rows) if (r.seqId == si.id) already = true;
+        if (!already) addRow(si.id, S == nullptr, 0, false);
+    }
+    E.open = true;
+}
+
+static void drawSeriesModal() {
+    App::SeriesEdit& E = app.seriesEdit;
+    // "###" fixes the popup's identity while the title changes: ImGui hashes
+    // only what follows it, so create and edit really are one modal.
+    const char* POPUP = "Series###seriesmodal";
+    char title[64];
+    snprintf(title, sizeof title, "%s###seriesmodal",
+             E.editId ? "Edit series" : "Create series");
+    if (E.open && !ImGui::IsPopupOpen(POPUP)) ImGui::OpenPopup(POPUP);
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(640 * app.uiScale, 480 * app.uiScale), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_None)) return;
+    if (!E.open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+
+    ImGui::Text("batch: %s", batchNameOf(E.batchId).c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(a series lives in exactly one batch)");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+    ImGui::InputText("name", E.name, sizeof E.name);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+    ImGui::InputText("parameter", E.param, sizeof E.param);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("what was swept: illuminance, exposure, temperature ...");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::InputText("unit", E.unit, sizeof E.unit);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... printed on every axis and\n"
+                          "column. LEAVE IT EMPTY if you do not know it yet: an\n"
+                          "unset unit means no fit, which is the honest answer.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+    ImGui::Combo("kind", &E.kind, SERIES_KINDS);
+    if (!E.unit[0])
+        ImGui::TextDisabled("unit not set - members and means still show, the fit will not.");
+
+    ImGui::SeparatorText("members  (value = the parameter this stack was captured at)");
+    if (ImGui::SmallButton("Sort by value")) {
+        std::stable_sort(E.rows.begin(), E.rows.end(),
+                         [](const App::SeriesEdit::Row& a, const App::SeriesEdit::Row& b) {
+                             double av = a.value[0] ? atof(a.value) : HUGE_VAL;
+                             double bv = b.value[0] ? atof(b.value) : HUGE_VAL;
+                             return av < bv;
+                         });
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("All")) for (auto& r : E.rows) r.check = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) for (auto& r : E.rows) r.check = false;
+    ImGui::SameLine();
+    int nChecked = 0, nValued = 0;
+    for (const auto& r : E.rows) {
+        if (!r.check) continue;
+        nChecked++;
+        if (r.value[0]) nValued++;
+    }
+    ImGui::TextDisabled("| %d of %d stacks, %d with a value", nChecked,
+                        (int)E.rows.size(), nValued);
+
+    const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
+    float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f;
+    int moveFrom = -1, moveTo = -1;
+    if (ImGui::BeginTable("sermembers", 5, TF, ImVec2(0, std::max(tableH, 80.0f * app.uiScale)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("read from", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 9);
+        ImGui::TableSetupColumn("order", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFrameHeight() * 2.4f);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)E.rows.size(); i++) {
+            App::SeriesEdit::Row& r = E.rows[i];
+            ImGui::PushID(r.seqId);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("##m", &r.check);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-1);
+            if (r.suggested)      // a proposal reads as one until it is confirmed
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::InputText("##v", r.value, sizeof r.value,
+                                 ImGuiInputTextFlags_CharsScientific))
+                r.suggested = false;
+            if (r.suggested) ImGui::PopStyleColor();
+            ImGui::TableNextColumn();
+            if (r.suggested) ImGui::TextDisabled("(guess) %s", r.from.c_str());
+            else if (r.from.empty() && !r.value[0]) ImGui::TextDisabled("-");
+            else ImGui::TextDisabled("%s", r.from.c_str());
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::SmallButton("^")) { moveFrom = i; moveTo = i - 1; }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(i == (int)E.rows.size() - 1);
+            if (ImGui::SmallButton("v")) { moveFrom = i; moveTo = i + 1; }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (moveFrom >= 0) std::swap(E.rows[moveFrom], E.rows[moveTo]);
+
+    ImGui::Separator();
+    bool canAccept = nChecked > 0;
+    ImGui::BeginDisabled(!canAccept);
+    if (ImGui::Button(E.editId ? "Save" : "Create", ImVec2(140 * app.uiScale, 0))) {
+        // Build the member list in TABLE ORDER: the row order is the series
+        // order, which is why the arrows exist.
+        std::vector<App::Series::Member> ms;
+        for (const auto& r : E.rows) {
+            if (!r.check || !seqInfo(r.seqId)) continue;
+            if (batchOfStack(r.seqId) != E.batchId) continue;   // strict containment
+            App::Series::Member m;
+            m.seqId = r.seqId;
+            m.value = r.value[0] ? atof(r.value)
+                                 : std::numeric_limits<double>::quiet_NaN();
+            m.include = true;
+            if (const App::Series* old = seriesById(E.editId))   // keep the fit flag
+                for (const auto& om : old->members)
+                    if (om.seqId == r.seqId) m.include = om.include;
+            ms.push_back(m);
+        }
+        int id = E.editId ? E.editId : newSeries(E.batchId, E.name);
+        // a stack belongs to AT MOST ONE series: taking one in takes it out of
+        // wherever it was
+        for (const auto& m : ms) {
+            App::Series* other = seriesOfStack(m.seqId);
+            if (other && other->id != id) removeFromSeries(m.seqId);
+        }
+        if (App::Series* S = seriesById(id)) {
+            S->name = E.name[0] ? E.name : batchNameOf(E.batchId) + " 掃引";
+            S->paramName = E.param;
+            snprintf(S->unit, sizeof S->unit, "%s", E.unit);
+            S->kind = std::clamp(E.kind, 0, 3);
+            S->members = std::move(ms);
+        }
+        // the next new series starts from the unit this one ended with
+        if (E.unit[0]) snprintf(app.lin.unit, sizeof app.lin.unit, "%s", E.unit);
+        app.prefsDirty = true;
+        pruneEmptySeries();
+        if (seriesById(id)) app.curSeriesId = id;
+        app.imagesRev++;
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110 * app.uiScale, 0))) {
+        E.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!canAccept) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("tick at least one stack");
+    }
+    ImGui::EndPopup();
+}
+
 static void drawPanelLinearity() {
     App::LinState& L = app.lin;
-    int nStacks = 0;
-    for (const auto& si : app.seqs)
-        if (framesOfSeq(si.id).size() >= 2 || si.expectedFrames >= 2) nStacks++;
-    if (nStacks < 2) {
-        ImGui::TextDisabled("linearity needs several stacks, one per exposure level");
-        ImGui::TextDisabled("(open a folder of folders: each subfolder = one level)");
+    // ---- which series? Nothing here creates one on its own -------------------
+    if (app.series.empty()) {
+        ImGui::TextWrapped("No series yet. Linearity is measured over a SERIES: the stacks "
+                           "of one swept parameter, each with its value, and the parameter's "
+                           "name and unit belong to that series - not to the application.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("A sweep is never guessed from the folder tree. One wrong");
+        ImGui::TextDisabled("guess would quietly fit data that was never a sweep.");
+        ImGui::Spacing();
+        int b = cur() ? cur()->batchId : 0;
+        ImGui::BeginDisabled(b == 0);
+        if (ImGui::Button("Create a series from this batch's stacks..."))
+            openSeriesModal(b, 0);
+        ImGui::EndDisabled();
+        if (b == 0) ImGui::TextDisabled("(nothing is open yet)");
+        else ImGui::TextDisabled("batch: %s", batchNameOf(b).c_str());
         return;
     }
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
-    ImGui::InputText("level unit", L.unit, sizeof L.unit);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("lx, ms, lx*s, photons/px ... whatever the x axis of\n"
-                          "your experiment is. Written on every axis and column.");
-    ImGui::SameLine();
-    if (ImGui::Button("Auto levels")) {
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
+    if (!seriesById(app.curSeriesId)) app.curSeriesId = app.series.front().id;
+    App::Series* S = seriesById(app.curSeriesId);
+    {
+        char label[320];
+        snprintf(label, sizeof label, "%s / %s", batchNameOf(S->batchId).c_str(),
+                 S->name.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 17);
+        if (ImGui::BeginCombo("##series", label)) {
+            for (const auto& s : app.series) {
+                char it[352];
+                // "##" would cut a batch or series name in half: give every row
+                // an explicit id and let the visible part be whatever it is
+                snprintf(it, sizeof it, "%s / %s##ser%d", batchNameOf(s.batchId).c_str(),
+                         s.name.c_str(), s.id);
+                if (ImGui::Selectable(it, s.id == app.curSeriesId)) app.curSeriesId = s.id;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Edit...")) openSeriesModal(S->batchId, S->id);
+        ImGui::SameLine();
+        if (ImGui::Button("New...")) openSeriesModal(cur() ? cur()->batchId : S->batchId, 0);
+        S = seriesById(app.curSeriesId);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("read the level from each stack's folder name\n(first number; only fills empty fields)");
+    const bool haveUnit = S->unit[0] != '\0';
+    if (S->paramName.empty()) ImGui::TextDisabled("(parameter unnamed)");
+    else ImGui::TextUnformatted(S->paramName.c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Compute")) linRecompute();
+    if (haveUnit) ImGui::Text("[%s]", S->unit);
+    else ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "[unit not set]");
+    if (!haveUnit && ImGui::IsItemHovered())
+        ImGui::SetTooltip("A sensitivity is DN per SOMETHING. Set the unit in\n"
+                          "Edit... - it is not assumed for you.");
+    ImGui::SameLine();
+    if (ImGui::Button("Compute")) linRecompute(S->id);
     ImGui::SameLine();
     ImGui::TextDisabled(L.roiUsed ? "| selected ROI" : "| whole frame");
     // The per-stack table has room for ONE response column. Averaging the CFA
@@ -8231,17 +8555,18 @@ static void drawPanelLinearity() {
         ImGui::Combo("table plane", &L.tablePlane, "R\0Gr\0Gb\0B\0");
         L.tablePlane = std::clamp(L.tablePlane, 0, L.nPl - 1);
     }
+    const bool fresh = L.seriesId == S->id;
 
-    // one row per stack: level in, response out
+    // one row per MEMBER, in the series' order: value in, response out
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
-    char lvlHdr[48], meanHdr[32], sigHdr[32];
-    snprintf(lvlHdr, sizeof lvlHdr, "level [%s]", L.unit);
+    char lvlHdr[64], meanHdr[32], sigHdr[32];
+    snprintf(lvlHdr, sizeof lvlHdr, "value [%s]", haveUnit ? S->unit : "unit not set");
     const char* pl = L.nPl > 1 ? LIN_PLANES[std::clamp(L.tablePlane, 0, 3)] : "";
     snprintf(meanHdr, sizeof meanHdr, "mean %s [DN]", pl);
     snprintf(sigHdr, sizeof sigHdr, "sigma_t %s [DN]", pl);
-    float tableH = ImGui::GetFontSize() * std::min(10, nStacks + 2) * 1.6f;
-    if (ImGui::BeginTable("lintab", 5 + (L.fitValid && L.nPl > 1 ? 2 : 2), TF, ImVec2(0, tableH))) {
+    float tableH = ImGui::GetFontSize() * std::min<int>(10, (int)S->members.size() + 2) * 1.6f;
+    if (ImGui::BeginTable("lintab", 7, TF, ImVec2(0, tableH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
         ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
@@ -8251,23 +8576,24 @@ static void drawPanelLinearity() {
         ImGui::TableSetupColumn(sigHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2);
         ImGui::TableHeadersRow();
-        for (auto& si : app.seqs) {
-            if (framesOfSeq(si.id).size() < 2 && si.expectedFrames < 2) continue;
-            ImGui::PushID(si.id);
+        for (auto& m : S->members) {
+            App::SeqInfo* si = seqInfo(m.seqId);
+            if (!si) continue;
+            ImGui::PushID(m.seqId);
             const App::LinState::Row* row = nullptr;
-            for (const auto& r : L.rows) if (r.seqId == si.id) { row = &r; break; }
+            if (fresh)
+                for (const auto& r : L.rows) if (r.seqId == m.seqId) { row = &r; break; }
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            bool inc = true;
-            for (auto& r : L.rows) if (r.seqId == si.id) inc = r.include;
-            if (ImGui::Checkbox("##inc", &inc))
-                for (auto& r : L.rows) if (r.seqId == si.id) r.include = inc;
+            if (ImGui::Checkbox("##inc", &m.include))
+                for (auto& r : L.rows) if (r.seqId == m.seqId) r.include = m.include;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("include this point in the fit");
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(si.name.c_str());
+            ImGui::TextUnformatted(si->name.c_str());
             ImGui::TableNextColumn();
-            double lv = std::isfinite(si.level) ? si.level : 0.0;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputDouble("##lv", &lv, 0, 0, "%.6g")) si.level = lv;
+            // NEVER 0 for "not set": the whole reason values live on the member
+            if (std::isfinite(m.value)) textNum("%.6g", m.value);
+            else ImGui::TextDisabled("unset");
             ImGui::TableNextColumn();
             if (row && row->valid) ImGui::Text("%d", row->frames);
             else ImGui::TextDisabled("-");
@@ -8283,18 +8609,25 @@ static void drawPanelLinearity() {
         }
         ImGui::EndTable();
     }
+    ImGui::TextDisabled("values are edited in Edit... - a blank one is UNSET, not zero");
 
-    if (!L.fitValid) {
-        ImGui::TextDisabled("set levels (Auto levels or type them), then Compute.");
-        ImGui::TextDisabled("3+ stacks with levels give a fit; CFA planes stay separate.");
+    if (!L.fitValid || !fresh) {
+        if (!haveUnit)
+            ImGui::TextDisabled("no unit: set one in Edit... and the fit follows.");
+        else if (seriesFitPoints(*S) < 2)
+            ImGui::TextDisabled("a fit needs 2+ members with a value (3+ to see linearity).");
+        else if (!fresh)
+            ImGui::TextDisabled("press Compute to measure this series.");
+        else
+            ImGui::TextDisabled("press Compute; CFA planes stay separate throughout.");
         return;
     }
 
     // ---- the answers ----
-    ImGui::SeparatorText("fit  (response = sensitivity * level + offset)");
+    ImGui::SeparatorText("fit  (response = sensitivity * value + offset)");
     if (ImGui::BeginTable("linfit", 7, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         char sensHdr[64];
-        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", L.unit);
+        snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", S->unit);
         ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn(sensHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("offset [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -8351,8 +8684,11 @@ static void drawPanelLinearity() {
         }
     }
     if (pts.empty()) return;
-    char xl[64];
-    snprintf(xl, sizeof xl, "level [%s]", L.unit);
+    // A plotted axis states the quantity AND the unit, and the unit is the
+    // series' - there is no fit without one, so it is never empty here.
+    char xl[96];
+    snprintf(xl, sizeof xl, "%s [%s]",
+             S->paramName.empty() ? "value" : S->paramName.c_str(), S->unit);
     float half = std::max((ImGui::GetContentRegionAvail().y - ImGui::GetFontSize() * 5) * 0.5f,
                           70.0f * app.uiScale);
     {
@@ -13351,7 +13687,10 @@ int main(int argc, char** argv) {
         }
         pickerAccept();
         loadAll();
-        linRecompute();                    // rows exist, so residue is detectable
+        // rows exist, so residue is detectable - and the stack being closed is a
+        // series member, so closeStack's series hook is on the hook too
+        linRecompute(selftestMakeSeries(app.images.empty() ? 0 : app.images[0]->batchId,
+                                        app.lin.unit));
         int imagesBefore = (int)app.images.size(), seqsBefore = (int)app.seqs.size();
         if (seqsBefore < 3) {
             fprintf(stderr, "closeselftest: expected 3 stacks under %s, got %d\n",
@@ -14451,24 +14790,42 @@ int main(int argc, char** argv) {
                 !app.folderPickOpen) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        for (auto& si : app.seqs)
-            if (!std::isfinite(si.level)) si.level = extractLevelFromName(si.name);
-        linRecompute();
-        const App::LinState& L = app.lin;
-        for (const auto& r : L.rows)
-            fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
-                            "mean=%.6g sigma_t=%.6g %s\n",
-                    r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
-                    r.valid ? "" : ("ERR:" + r.err).c_str());
-        for (int p = 0; p < L.nPl; p++)
-            fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
-                            "LEmax=%.4f K=%.6g read=%.5g\n",
-                    L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
-                    L.leMax[p], L.ptcK[p], L.readDN[p]);
-        fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
-                L.fitValid ? "ok" : "FAILED");
+        // The fit is per SERIES now, and the application never creates one by
+        // itself (docs/terminology.md) - so this selftest creates it, in the
+        // open, through selftestMakeSeries: one series per BATCH over that
+        // batch's stacks, member values from extractLevelFromName (the same
+        // proposal the Create modal shows a human), unit = the prefill
+        // (prefs linunit, "lx" unless the user changed it). That is the ONLY
+        // auto-creation in the program and it lives behind this flag.
+        bool fitOk = false;
+        std::vector<int> bids;
+        for (const auto& b : app.batches) bids.push_back(b.id);
+        for (int bid : bids) {
+            int sid = selftestMakeSeries(bid, app.lin.unit);
+            if (!sid) continue;
+            linRecompute(sid);
+            const App::LinState& L = app.lin;
+            const App::Series* S = seriesById(sid);
+            fprintf(stderr, "linselftest: series '%s' (batch '%s') unit '%s': %d member(s)\n",
+                    S->name.c_str(), batchNameOf(bid).c_str(), S->unit,
+                    (int)S->members.size());
+            for (const auto& r : L.rows)
+                fprintf(stderr, "linselftest: stack '%s' level=%.6g frames=%d planes=%d "
+                                "mean=%.6g sigma_t=%.6g %s\n",
+                        r.name.c_str(), r.level, r.frames, r.nPl, r.mean[0], r.sigmaT[0],
+                        r.valid ? "" : ("ERR:" + r.err).c_str());
+            for (int p = 0; p < L.nPl; p++)
+                fprintf(stderr, "linselftest: plane %s sens=%.6g offs=%.6g r2=%.8f "
+                                "LEmax=%.4f K=%.6g read=%.5g\n",
+                        L.nPl > 1 ? LIN_PLANES[p] : "all", L.slope[p], L.offs[p], L.r2[p],
+                        L.leMax[p], L.ptcK[p], L.readDN[p]);
+            fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
+                    L.fitValid ? "ok" : "FAILED");
+            fitOk |= L.fitValid;
+        }
+        if (!fitOk) fprintf(stderr, "linselftest: no series could be fitted\n");
         if (app.seqThread.joinable()) app.seqThread.join();
-        return L.fitValid ? 0 : 1;
+        return fitOk ? 0 : 1;
     }
 
     std::vector<double> benchMs;
@@ -14476,6 +14833,7 @@ int main(int argc, char** argv) {
     if (benchFrames) {                 // exercise every panel, not just the defaults
         app.showFiles = app.showInspector = app.showRois = app.showAnalysis = true;
         app.showHistogram = app.showTemporal = app.showProjection = true;
+        app.showLinearity = true;      // ...which now includes the series selector
         benchMs.reserve(benchFrames);
     }
     double lastFrameEnd = glfwGetTime();
@@ -14890,6 +15248,7 @@ int main(int argc, char** argv) {
 
         drawRawModal();
         drawSequenceModal();
+        drawSeriesModal();
         drawFolderPickModal();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
@@ -15026,6 +15385,7 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
                 working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
