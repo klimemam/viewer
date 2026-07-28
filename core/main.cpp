@@ -4577,7 +4577,17 @@ static void startNextQueuedGroup() {
     if (!err.empty()) { toast(baseName(g.files[0]) + ": " + err, true); return; }
     // reference the image we just appended, not app.current (which may be elsewhere)
     int idx = (int)app.images.size() - 1;
-    if (g.files.size() >= 2) startSequenceLoad(idx, g.files, g.name);
+    if (idx < 0) return;
+    if (g.files.size() >= 2) { startSequenceLoad(idx, g.files, g.name); return; }
+    // ONE file that carries a frame axis is a stack too, and loadNpy could only
+    // name it after the file it came out of ("capture.npy  (8 frames)"). The
+    // canon's default stack name is フォルダ/パターン and the group name IS that:
+    // apply it here, where the stack is minted, exactly as startSequenceLoad
+    // does for the multi-file case. Without this a sweep laid out as one
+    // capture.npy per level opens as N stacks of ONE name, indistinguishable in
+    // Files, and the only number the value proposal can read out of that name is
+    // the frame count (seven levels all "8").
+    if (App::SeqInfo* si = seqInfo(app.images[idx]->seqId)) si->name = g.name;
 }
 
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
@@ -6274,7 +6284,19 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     openRemote(makeRemoteUrl(host, files[0]));
     if (app.images.size() == before) return;      // first frame failed; toasted already
     ImageDoc* first = app.images.back().get();
-    if (first->seqId != 0) return;                // it was a frame-axis file: done
+    if (first->seqId != 0) {
+        // A frame-axis file IS the stack already: openRemote built the SeqInfo
+        // and, knowing only the url, could name it nothing better than
+        // "capture.npy [remote]". The scan knows the FOLDER, so the canon's
+        // フォルダ/パターン name is applied here - this early return used to skip
+        // the naming below entirely, and a sweep of one capture.npy per level
+        // came up as seven stacks with one name.
+        if (!name.empty())
+            if (App::SeqInfo* si = seqInfo(first->seqId))
+                si->name = name + " [remote x" +
+                           std::to_string(std::max(1, si->expectedFrames)) + "]";
+        return;
+    }
     App::SeqInfo si;
     si.id = app.nextSeqId++;
     // A scan names the stack by its folder ("10lx/frame_#.npy"): seven stacks
@@ -13237,6 +13259,7 @@ static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
+static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -13289,6 +13312,7 @@ static void printUsage() {
         "                              in the menu bar (default: last used)\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
         "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
+        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -13407,6 +13431,8 @@ static void parseCli(int argc, char** argv) {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--series-selftest") {
             g_seriesSelftest = next();             // handled in main()
+        } else if (a == "--sweepfile-selftest") {
+            g_sweepFileSelftest = next();          // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -15614,6 +15640,156 @@ int main(int argc, char** argv) {
         stopRemoteFetcher();
         std::filesystem::remove(std::filesystem::u8path(sess), tec);
         std::filesystem::remove(std::filesystem::u8path(legacy), tec);
+        return ok ? 0 : 1;
+    }
+
+    // A sweep laid out as ONE multi-frame .npy per level (levelfiles/lv000/
+    // capture.npy ...), which is an ordinary capture layout and which no other
+    // fixture here has: every existing series fixture is 24 numbered files per
+    // level, so every group is multi-file and every stack is minted by
+    // startSequenceLoad - the one path that ever applied the group name. This
+    // one goes through loadNpy (local) and openRemote (remote) instead, and it
+    // asserts the two things that broke there: the NAME (the canon's
+    // フォルダ/パターン, which the value proposal reads and the sweep matched on)
+    // and a linearity fit recovering the numbers the fixture injected.
+    if (!g_sweepFileSelftest.empty()) {
+        std::string dir = g_sweepFileSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        bool ok = true;
+        auto check = [&](const char* what, bool cond) {
+            fprintf(stderr, "sweepfile: %-60s %s\n", what, cond ? "ok" : "FAILED");
+            if (!cond) ok = false;
+        };
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen && app.seriesPending.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        auto sortedNames = []() {
+            std::vector<std::string> v;
+            for (const auto& si : app.seqs) v.push_back(si.name);
+            std::sort(v.begin(), v.end());
+            return v;
+        };
+        // the fixture: gen_levelfiles.py, sens 8 DN/lx, offset 64 DN, K 2 DN/e-,
+        // read 3 DN, one 8-frame capture.npy per folder
+        const char* LV[7] = { "lv000", "lv010", "lv020", "lv040", "lv080", "lv160", "lv320" };
+        const double VAL[7] = { 0, 10, 20, 40, 80, 160, 320 };
+        auto reportNames = [&](const char* what, const std::vector<std::string>& nm) {
+            std::string j;
+            for (const auto& s : nm) j += (j.empty() ? "" : ", ") + s;
+            fprintf(stderr, "sweepfile: %s stack names: %s\n", what, j.c_str());
+        };
+        auto checkSeries = [&](const char* what) {
+            const App::Series* W = app.series.empty() ? nullptr : &app.series.front();
+            std::string vals;
+            if (W)
+                for (const auto& m : W->members) {
+                    char b[32];
+                    snprintf(b, sizeof b, "%.6g", m.value);
+                    vals += (vals.empty() ? "" : ",");
+                    vals += std::isfinite(m.value) ? b : "unset";
+                }
+            fprintf(stderr, "sweepfile: %s sweep -> %d series, %d member(s) [%s]\n", what,
+                    (int)app.series.size(), W ? (int)W->members.size() : -1, vals.c_str());
+            bool valsOk = W && W->members.size() == 7;
+            for (int i = 0; valsOk && i < 7; i++)
+                valsOk = std::isfinite(W->members[i].value) &&
+                         fabs(W->members[i].value - VAL[i]) < 1e-9;
+            check("open as a sweep makes exactly ONE series", app.series.size() == 1);
+            check("...holding every single-file level (none 'could not be matched')",
+                  W && W->members.size() == 7);
+            check("...each at the value its FOLDER gave, in value order", valsOk);
+            check("...with the parameter and unit typed in the picker",
+                  W && W->paramName == "illuminance" && std::string(W->unit) == "lx");
+            return W ? W->id : 0;
+        };
+
+        // ---- local: File > Open Folder, ticked as a sweep ---------------------
+        openFolder(dir);
+        check("the picker opened over the level folders", app.folderPickOpen);
+        app.pickSweep = true;
+        snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+        snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+        pickerAccept();
+        loadAll();
+        {
+            std::vector<std::string> nm = sortedNames();
+            reportNames("local", nm);
+            bool namesOk = nm.size() == 7;
+            for (int i = 0; namesOk && i < 7; i++)
+                namesOk = nm[i] == std::string(LV[i]) + "/capture.npy";
+            check("a one-file stack keeps the canon's フォルダ/パターン name", namesOk);
+        }
+        int sid = checkSeries("local");
+        if (sid) {
+            linRecompute(sid);
+            const App::LinState& L = app.lin;
+            fprintf(stderr, "sweepfile: fit: %d point(s) sens=%.6g offs=%.6g r2=%.8f "
+                            "LEmax=%.4f K=%.6g read=%.5g (%s)\n", L.nPts, L.slope[0],
+                    L.offs[0], L.r2[0], L.leMax[0], L.ptcK[0], L.readDN[0],
+                    L.readFromDark ? "dark stack" : "extrapolated");
+            check("the fit runs over all seven levels", L.fitValid && L.nPts == 7);
+            check("...recovering the injected sens 8.0 DN/lx",
+                  L.fitValid && fabs(L.slope[0] - 8.0) <= 0.08);
+            check("...offset 64.0 DN", L.fitValid && fabs(L.offs[0] - 64.0) <= 1.0);
+            check("...K 2.0 DN/e-", L.fitValid && fabs(L.ptcK[0] - 2.0) <= 0.2);
+            check("...read 3.0 DN, MEASURED in the lv000 dark stack",
+                  L.fitValid && L.readFromDark && fabs(L.readDN[0] - 3.0) <= 0.15);
+        }
+
+        // ---- remote: the same layout over the peer ----------------------------
+        // openRemote mints the frame-axis stack itself and openRemoteStack used
+        // to return before it could say which folder it came from.
+        closeAll();
+        startRemote("local://" + dir);
+        {
+            double t0 = glfwGetTime();
+            bool scanSent = false;
+            while (glfwGetTime() - t0 < 300.0) {
+                pumpRemoteBrowse();
+                pumpRemoteFetch();
+                pumpRemoteOpenQueue();
+                pumpSequenceAndQueue();
+                if (app.rbrowse.connected && !scanSent) {
+                    App::RbJob j; j.kind = App::RbScan;
+                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = dir;
+                    rbEnqueue(std::move(j));
+                    scanSent = true;
+                }
+                if (app.folderPickOpen && app.folderPickRemote) {
+                    app.pickSweep = true;
+                    snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+                    snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+                    pickerAccept();
+                }
+                if (scanSent && !app.rbBusy && !app.seqs.empty() && !app.folderPickOpen &&
+                    app.rbOpenQueue.empty() && app.rfPending == 0 &&
+                    app.seriesPending.empty())
+                    break;
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        {
+            std::vector<std::string> nm = sortedNames();
+            reportNames("remote", nm);
+            bool namesOk = nm.size() == 7;
+            for (int i = 0; namesOk && i < 7; i++)
+                namesOk = nm[i] == std::string(LV[i]) + "/capture.npy [remote x8]";
+            check("a remote frame-axis stack keeps it too", namesOk);
+        }
+        checkSeries("remote");
+        fprintf(stderr, "sweepfile: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
         return ok ? 0 : 1;
     }
 
