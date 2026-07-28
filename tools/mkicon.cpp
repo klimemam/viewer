@@ -6,7 +6,11 @@
 //                                    which is what Explorer, the shortcut and a
 //                                    pinned taskbar button read
 //       <outdir>/viewer.png          Linux .desktop / macOS .app bundle (256 px)
-//       <outdir>/viewer-remote.png   the tinted variant, for docs
+//       <outdir>/viewer-remote.ico   the green variant, for the shortcut that
+//       <outdir>/viewer-remote.png   connects to a server: it says "this one
+//                                    starts on the far machine" on the desktop,
+//                                    before anything is running to recolor its
+//                                    own taskbar button
 //
 // Generating them keeps binaries out of the source tree - the repo carries the
 // description of the mark, not seven bitmaps of it.
@@ -112,10 +116,10 @@ std::vector<uint8_t> icoImage(const std::vector<uint8_t>& rgba, int size) {
     return v;
 }
 
-bool writeIco(const std::string& path, const std::vector<int>& sizes) {
+bool writeIco(const std::string& path, const std::vector<int>& sizes, app_icon::Variant variant) {
     std::vector<std::vector<uint8_t>> imgs;
     for (int s : sizes) {
-        const std::vector<uint8_t> rgba = app_icon::render(s, app_icon::Local);
+        const std::vector<uint8_t> rgba = app_icon::render(s, variant);
         imgs.push_back(s >= 128 ? encodePng(rgba, s) : icoImage(rgba, s));
         if (imgs.back().empty()) return false;
     }
@@ -146,9 +150,11 @@ int main(int argc, char** argv) {
 
     // 256 is what Explorer's large-tile views ask for; 16/32 are what the
     // taskbar and title bar actually get seen at.
-    if (!writeIco(base + "viewer.ico", {16, 20, 24, 32, 40, 48, 64, 128, 256})) return 1;
+    const std::vector<int> sizes = {16, 20, 24, 32, 40, 48, 64, 128, 256};
+    if (!writeIco(base + "viewer.ico", sizes, app_icon::Local)) return 1;
+    if (!writeIco(base + "viewer-remote.ico", sizes, app_icon::Remote)) return 1;
     if (!writePng(base + "viewer.png", app_icon::render(256, app_icon::Local), 256)) return 1;
     if (!writePng(base + "viewer-remote.png", app_icon::render(256, app_icon::Remote), 256)) return 1;
-    printf("mkicon: wrote viewer.ico, viewer.png, viewer-remote.png to %s\n", dir.c_str());
+    printf("mkicon: wrote viewer{,-remote}.{ico,png} to %s\n", dir.c_str());
     return 0;
 }
