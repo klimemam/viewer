@@ -127,6 +127,7 @@ struct ImageDoc {
     bool texDirty = true;
     bool texNearest = true;
     // CFA (Bayer) metadata
+    int batchId = 0;                  // which 塊 (Files header) this belongs to
     int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
     int cfaPattern = 0;               // index into CFA_PATTERNS
     bool cfaColorize = false;
@@ -326,6 +327,14 @@ struct App {
         double level = std::numeric_limits<double>::quiet_NaN();
     };
     std::vector<SeqInfo> seqs;
+    // A batch is the unit the Files panel groups by: created per OPEN ACTION
+    // (not per folder - reopening the same folder makes a NEW batch), named
+    // after the folder only as a starting value, renameable, session-saved.
+    // It is the user's analysis grouping, deliberately decoupled from disk.
+    struct Batch { int id; std::string name; };
+    std::vector<Batch> batches;
+    int nextBatchId = 1;
+    int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     int nextSeqId = 1;
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
@@ -386,7 +395,8 @@ struct App {
     // name: folder-qualified stack name ("10lx/frame_###.npy") - seven stacks
     // all called frame_000.npy would be indistinguishable, and the linearity
     // Auto-levels reads the level from exactly this folder prefix.
-    struct RemoteOpen { std::string host; std::vector<std::string> files; std::string name; };
+    struct RemoteOpen { std::string host; std::vector<std::string> files;
+                        std::string name; int batchId = 0; };
     std::vector<RemoteOpen> rbOpenQueue;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
@@ -515,7 +525,8 @@ struct App {
     std::vector<std::string> seqAskFiles;
     std::string seqAskPattern;
     // queued stacks from "Open Folder" (loaded one after another)
-    struct PendingGroup { std::string name; std::vector<std::string> files; bool isRaw = false; };
+    struct PendingGroup { std::string name; std::vector<std::string> files;
+                          bool isRaw = false; int batchId = 0; };
     std::vector<PendingGroup> seqQueue;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder
@@ -646,6 +657,21 @@ static void toast(const std::string& msg, bool err = false) {
         if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
         if (err) app.msgUnreadErr = true;
     }
+}
+
+// One batch per OPEN ACTION: reopening a folder deliberately makes a fresh
+// one - "calling the same folder twice" must give two groupings you can name
+// apart, or the second load is invisible.
+static int newBatch(const std::string& name) {
+    app.batches.push_back({ app.nextBatchId, name.empty() ? "opened" : name });
+    app.imagesRev++;                      // the Files grouping caches on this
+    return app.nextBatchId++;
+}
+// Loose single-file opens share the folder-named batch instead (the old
+// behavior, and the right one for "clicked three files in a row").
+static int batchReuse(const std::string& name) {
+    for (const auto& b : app.batches) if (b.name == name) return b.id;
+    return newBatch(name);
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
@@ -1458,6 +1484,16 @@ static void requestMeasure(int sel) {
 static bool g_quietLoad = false;
 
 static void addImage(std::unique_ptr<ImageDoc> im) {
+    if (im->batchId == 0) {
+        if (app.loadBatchId) im->batchId = app.loadBatchId;
+        else {
+            size_t sl = im->path.find_last_of("/\\");
+            std::string dir = sl == std::string::npos ? std::string() : im->path.substr(0, sl);
+            size_t s2 = dir.find_last_of("/\\");
+            std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
+            im->batchId = batchReuse(leaf.empty() ? "generated" : leaf);
+        }
+    }
     // --cfa says "this dump is mosaiced" for formats that carry no such flag (an
     // .npy of a sensor read is exactly that). The Inspector can still change it
     // per image; this only sets what a file arrives as.
@@ -2285,6 +2321,10 @@ static void writeSessionTo(std::ostream& f) {
               << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
         }
         f << d->path << "\n";           // path last: may contain spaces
+        // the batch travels BY NAME: ids do not survive sessions, and equal
+        // names merging on restore is the least surprising failure mode
+        for (const auto& b : app.batches)
+            if (b.id == d->batchId) { f << "imgbatch " << b.name << "\n"; break; }
         if (d->seqId != 0) {
             f << "seqframe " << d->seqIndex << "\n";   // come back to the same frame
             // A folder sequence must rescan its siblings; an in-file frame axis
@@ -2584,6 +2624,13 @@ static std::string loadSession(const std::string& path) {
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
         else if (key == "selann") ls >> selAnnIndex;
+        else if (key == "imgbatch") {   // batch of the image above, by name
+            std::string nm = restOfLine(ls);
+            if (!nm.empty() && lastImageOk && cur()) {
+                cur()->batchId = batchReuse(nm);
+                app.imagesRev++;
+            }
+        }
         else if (key == "seqname") {    // user-given stack name (may contain spaces)
             std::string nm = restOfLine(ls);
             if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
@@ -3277,6 +3324,7 @@ static void startNextQueuedGroup() {
     app.seqQueue.erase(app.seqQueue.begin());
     std::string err;
     g_quietLoad = true;               // keep the user's current image selected
+    app.loadBatchId = g.batchId;      // the head frame lands in the group's batch
     if (g.isRaw) {
         RawDialog d = g_folderRecipe;
         d.path = g.files[0];
@@ -3286,6 +3334,7 @@ static void startNextQueuedGroup() {
         err = loadNpy(g.files[0]);
     }
     g_quietLoad = false;
+    app.loadBatchId = 0;
     if (!err.empty()) { toast(baseName(g.files[0]) + ": " + err, true); return; }
     // reference the image we just appended, not app.current (which may be elsewhere)
     int idx = (int)app.images.size() - 1;
@@ -3315,6 +3364,10 @@ static void openFolder(const std::string& path) {
     // the include/exclude filters ARE the way a capture tree gets narrowed.
     // "Always load folder" keeps its original job - loading a single file's
     // numbered siblings without asking - and no longer mutes this dialog.
+    {   // one fresh batch per Open Folder, named for the root (rename later)
+        int b = newBatch(baseName(path));
+        for (auto& g : groups) g.batchId = b;
+    }
     if (groups.size() == 1) { enqueueGroups(std::move(groups)); return; }
     app.folderPick.clear();
     for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
@@ -3492,7 +3545,7 @@ static void drawFolderPickModal() {
             toast("opening " + std::to_string(sel.size()) + " remote stack(s), " +
                   std::to_string(frames) + " frames");
             for (auto& g : sel)
-                app.rbOpenQueue.push_back({ app.folderPickHost, std::move(g.files), g.name });
+                app.rbOpenQueue.push_back({ app.folderPickHost, std::move(g.files), g.name, g.batchId });
         } else {
             enqueueGroups(std::move(sel));
         }
@@ -4084,11 +4137,17 @@ static void pumpRemoteBrowse() {
                 return a == "/" ? "/" + b : a + "/" + b;
             };
             std::vector<App::PendingGroup> groups;
+            std::string broot = r.dir;
+            while (broot.size() > 1 && broot.back() == '/') broot.pop_back();
+            size_t bsl = broot.find_last_of('/');
+            int scanBatch = newBatch(bsl == std::string::npos || bsl + 1 >= broot.size()
+                                     ? broot : broot.substr(bsl + 1));
             for (const auto& g : r.scanGroups) {
                 App::PendingGroup pg;
                 pg.name = g.dir.empty() ? g.entry.name : g.dir + "/" + g.entry.name;
                 std::string base = joinR(r.dir, g.dir);
                 for (const auto& m : g.entry.members) pg.files.push_back(joinR(base, m));
+                pg.batchId = scanBatch;
                 groups.push_back(std::move(pg));
             }
             if (r.truncated)
@@ -4108,7 +4167,7 @@ static void pumpRemoteBrowse() {
                 toast("opening " + std::to_string(groups.size()) + " remote stack(s), " +
                       std::to_string(frames) + " frames");
                 for (auto& g : groups)
-                    app.rbOpenQueue.push_back({ r.host, std::move(g.files), g.name });
+                    app.rbOpenQueue.push_back({ r.host, std::move(g.files), g.name, g.batchId });
             } else {
                 app.folderPick.clear();
                 for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
@@ -4262,7 +4321,9 @@ static void pumpRemoteOpenQueue() {
     App::RemoteOpen ro = std::move(app.rbOpenQueue.front());
     app.rbOpenQueue.erase(app.rbOpenQueue.begin());
     sortFramesNumerically(ro.files);
+    app.loadBatchId = ro.batchId;
     openRemoteStack(ro.host, ro.files, ro.name);
+    app.loadBatchId = 0;
 }
 
 // File > Start Remote: connect (installing the peer if needed), then browse.
@@ -8182,50 +8243,60 @@ static void drawFileList() {
     // produced a flat list of bare filenames with nothing saying where each came
     // from. The folder is the only thing that distinguishes them.
     const auto& stacks = stacksCached();
-    struct FileGroup { std::string dir, label; std::vector<const std::vector<int>*> stacks; };
+    // Grouped by BATCH, not by folder: a batch is one open action, named by the
+    // user (folder name is only the starting value). Two loads from the same
+    // folder are two batches - that is the point.
+    struct FileGroup { int batch; std::string dir, label; std::vector<const std::vector<int>*> stacks; };
     static std::vector<FileGroup> groups;
     static uint64_t groupsRev = 0;
     if (groupsRev != app.imagesRev) {
         groupsRev = app.imagesRev;
         groups.clear();
         for (const auto& stack : stacks) {
-            const std::string& p = app.images[stack.front()]->path;
-            size_t slash = p.find_last_of("/\\");
-            std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
+            const ImageDoc& head = *app.images[stack.front()];
             FileGroup* g = nullptr;
-            for (auto& q : groups) if (q.dir == dir) { g = &q; break; }
-            if (!g) { groups.push_back({ dir, {}, {} }); g = &groups.back(); }
+            for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
+            if (!g) {
+                const std::string& p = head.path;
+                size_t slash = p.find_last_of("/\\");
+                std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
+                std::string label = "opened";
+                for (const auto& b : app.batches) if (b.id == head.batchId) label = b.name;
+                groups.push_back({ head.batchId, dir, label, {} });
+                g = &groups.back();
+            }
             g->stacks.push_back(&stack);
         }
-        // label = folder name; if two folders share it (A/00 and B/00), keep the
-        // parent too, which is exactly the case the user hits with per-condition
-        // subfolders
-        for (auto& g : groups) {
-            size_t slash = g.dir.find_last_of("/\\");
-            g.label = slash == std::string::npos ? g.dir : g.dir.substr(slash + 1);
-            if (g.label.empty()) g.label = g.dir.empty() ? "generated" : g.dir;
-        }
-        for (auto& g : groups)
-            for (auto& h : groups)
-                if (&g != &h && g.label == h.label && !g.dir.empty()) {
-                    size_t s1 = g.dir.find_last_of("/\\");
-                    std::string up = s1 == std::string::npos ? std::string() : g.dir.substr(0, s1);
-                    size_t s2 = up.find_last_of("/\\");
-                    std::string parent = s2 == std::string::npos ? up : up.substr(s2 + 1);
-                    if (!parent.empty()) g.label = parent + "/" + g.label;
-                    break;
-                }
     }
     // one file open needs no header
     bool showHeaders = groups.size() > 1 || (groups.size() == 1 && stacks.size() > 1);
     for (const auto& group : groups) {
-      ImGui::PushID(group.dir.c_str());
+      ImGui::PushID(group.batch);
       bool open = true;
       if (showHeaders) {
           open = ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
                                             ImGuiTreeNodeFlags_SpanAvailWidth,
                                    "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
-          if (ImGui::IsItemHovered() && !group.dir.empty()) ImGui::SetTooltip("%s", group.dir.c_str());
+          if (ImGui::IsItemHovered() && !group.dir.empty())
+              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)", group.dir.c_str());
+          // the batch is the user's grouping, so its name is theirs to change
+          if (ImGui::BeginPopupContextItem("batchctx")) {
+              static char nameBuf[256];
+              if (ImGui::IsWindowAppearing())
+                  snprintf(nameBuf, sizeof nameBuf, "%s", group.label.c_str());
+              ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+              bool done = ImGui::InputText("##bname", nameBuf, sizeof nameBuf,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+              ImGui::SameLine();
+              done |= ImGui::SmallButton("rename");
+              if (done && nameBuf[0]) {
+                  for (auto& b : app.batches)
+                      if (b.id == group.batch) b.name = nameBuf;
+                  app.imagesRev++;               // rebuild the cached labels
+                  ImGui::CloseCurrentPopup();
+              }
+              ImGui::EndPopup();
+          }
       }
       if (open)
       for (const auto& stackPtr : group.stacks) {
@@ -9700,8 +9771,16 @@ int main(int argc, char** argv) {
     if (g_fstatSelftest) {
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 600.0) {
+            if (app.folderPickOpen && !app.folderPickRemote) {   // headless accept
+                std::vector<App::PendingGroup> sel;
+                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
+                app.folderPick.clear();
+                app.folderPickOpen = false;
+                enqueueGroups(std::move(sel));
+            }
             pumpSequenceAndQueue();
-            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending()) break;
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                !app.folderPickOpen) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (app.seqs.empty()) { fprintf(stderr, "fstatselftest: no stack loaded\n"); return 1; }
@@ -9719,8 +9798,18 @@ int main(int argc, char** argv) {
     if (g_linSelftest) {
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 600.0) {       // wall clock: the loader is a thread
+            // headless "Load selected": Open Folder now ALWAYS shows the picker,
+            // so a selftest accepts it the way the Load button would
+            if (app.folderPickOpen && !app.folderPickRemote) {
+                std::vector<App::PendingGroup> sel;
+                for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
+                app.folderPick.clear();
+                app.folderPickOpen = false;
+                enqueueGroups(std::move(sel));
+            }
             pumpSequenceAndQueue();
-            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending()) break;
+            if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                !app.folderPickOpen) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         for (auto& si : app.seqs)
