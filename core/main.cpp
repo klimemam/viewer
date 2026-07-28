@@ -10819,6 +10819,25 @@ static std::string fmtUnixTime(int64_t t) {
     strftime(b, sizeof b, "%Y-%m-%d %H:%M", &tmv);
     return b;
 }
+// The same instant in five fewer characters, for a column too narrow to hold
+// the full stamp. The rule is `ls -l`'s, and for the same reason: a capture
+// dump is browsed on the day it was taken, where the time of day is the whole
+// question, and an archive is browsed by year, where it is noise.
+static std::string fmtUnixTimeShort(int64_t t) {
+    if (t <= 0) return "-";
+    time_t tt = (time_t)t;
+    struct tm tmv {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char b[32];
+    const int64_t SIX_MONTHS = 182LL * 24 * 3600;
+    strftime(b, sizeof b, (int64_t)time(nullptr) - t < SIX_MONTHS ? "%m-%d %H:%M"
+                                                                 : "%Y-%m-%d", &tmv);
+    return b;
+}
 // "(3000,4000) u16" - the file's declared shape, so what the browser promises is
 // what META will later confirm.
 static std::string fmtEntryShape(const remote::Entry& e) {
@@ -11011,7 +11030,10 @@ static void drawRemotePlacesCombo() {
 // Where the Browse toolbar's two width-critical controls ended up, in screen x,
 // against the panel's own content edges. Recorded every frame so a selftest can
 // assert the thing a human reads off a screenshot: "the filter is on screen".
-struct RbToolbarGeom { float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0; };
+struct RbToolbarGeom {
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
+    float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+};
 static RbToolbarGeom g_rbToolbar;
 static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
 
@@ -11745,19 +11767,65 @@ static void drawPanelRemote() {
     // alive, so starting one never shifts the rows under the cursor (a bar
     // that appeared above the list moved every row mid-double-click)
     float rbFootH = ImGui::GetFrameHeightWithSpacing();
+    // Column widths, measured from the widest thing each column actually
+    // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
+    // SCROLLING table auto-fits over its first frames, which for this table are
+    // the frames before the listing has arrived. "modified" was therefore sized
+    // against an empty column and kept that width for good: a 16-character
+    // timestamp clipped to "202" even with the panel dragged out to 1150 px.
+    // ImGuiTableFlags_Resizable then wrote the number into the layout file, so
+    // it survived restarts too.
+    // A metadata column is WidthFixed | NoResize with an explicit width, which
+    // is the one combination ImGui re-applies on EVERY frame (TableUpdateLayout:
+    // a non-resizable fixed column takes InitStretchWeightOrWidth as its width).
+    // With Resizable the width was latched on the initialising frame instead and
+    // then written to the layout file, which is exactly how a stale number
+    // outlived every resize. The panel is what the user drags now, not the
+    // column edges - and the columns follow it.
+    const ImGuiStyle& tSt = ImGui::GetStyle();
+    const float tCell  = tSt.CellPadding.x * 2 + 1;              // + inner border
+    const float wShape = ImGui::CalcTextSize("(3000,4000) u16").x;
+    const float wSize  = ImGui::CalcTextSize("1023.9 MB").x;
+    const float wDate  = ImGui::CalcTextSize("2026-07-27 14:03").x;
+    // the wider of fmtUnixTimeShort's two forms, so the column does not clip on
+    // the day a file crosses the six-month line
+    const float wDateS = std::max(ImGui::CalcTextSize("2026-07-27").x,
+                                  ImGui::CalcTextSize("07-27 14:03").x);
+    // The name IS the row, so it keeps a readable minimum and the metadata is
+    // paid for out of what is left, dropping from the right. A column that
+    // cannot hold its own value is worth less than the name it is taking the
+    // width from - three characters of a timestamp tell nobody anything.
+    float tBudget = ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 9 - tCell;
+    const bool colShape = tBudget >= wShape + tCell;
+    if (colShape) tBudget -= wShape + tCell;
+    const bool colSize = colShape && tBudget >= wSize + tCell;
+    if (colSize) tBudget -= wSize + tCell;
+    const bool dateFull  = colSize && tBudget >= wDate + tCell;
+    const bool dateShort = colSize && !dateFull && tBudget >= wDateS + tCell;
+    const bool colDate = dateFull || dateShort;
+    auto tHide = [](bool show) {
+        return show ? ImGuiTableColumnFlags_None : ImGuiTableColumnFlags_Disabled;
+    };
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
-                                       ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                                       ImGuiTableFlags_ScrollY |
                                        ImGuiTableFlags_SortTristate,
                                        ImVec2(0, -rbFootH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
         ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
-                                                 ImGuiTableColumnFlags_NoSort, 0.0f, RB_COL_SHAPE);
+                                                 ImGuiTableColumnFlags_NoResize |
+                                                 ImGuiTableColumnFlags_NoSort |
+                                                 tHide(colShape), wShape, RB_COL_SHAPE);
         ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed |
-                                        ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_SIZE);
+                                        ImGuiTableColumnFlags_NoResize |
+                                        ImGuiTableColumnFlags_PreferSortDescending |
+                                        tHide(colSize), wSize, RB_COL_SIZE);
         ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
-                                            ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
+                                            ImGuiTableColumnFlags_NoResize |
+                                            ImGuiTableColumnFlags_PreferSortDescending |
+                                            tHide(colDate), dateFull ? wDate : wDateS,
+                                            RB_COL_MTIME);
         ImGui::TableHeadersRow();
         // The spec is STASHED, not applied: `shown` was already sorted with it,
         // above, where the keyboard and the clipper can agree with the screen.
@@ -11955,8 +12023,24 @@ static void drawPanelRemote() {
             if (!r.ph && !r.isDir() && r.ownFile())
                 ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
             ImGui::TableNextColumn();
-            if (!r.ph && r.ownFile() && e.mtime > 0)
-                ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            if (!r.ph && r.ownFile() && e.mtime > 0) {
+                float cellW = ImGui::GetContentRegionAvail().x;
+                std::string ts = dateShort ? fmtUnixTimeShort(e.mtime)
+                                           : fmtUnixTime(e.mtime);
+                ImGui::TextDisabled("%s", ts.c_str());
+                // widest stamp actually printed against the room it had: the
+                // one thing --browse-keys-selftest asserts about this column
+                // (nothing is printed at all when the column is dropped)
+                if (colDate) {
+                    g_rbToolbar.dateCellW = cellW;
+                    g_rbToolbar.dateTextW = std::max(g_rbToolbar.dateTextW,
+                                                     ImGui::CalcTextSize(ts.c_str()).x);
+                }
+                // the short form drops a field, so the full stamp stays one
+                // hover away rather than only in Properties
+                if (dateShort && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", fmtUnixTime(e.mtime).c_str());
+            }
             else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
@@ -13309,7 +13393,7 @@ static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,more,down,back,"
-    "w271,w200,w180,w420,w1150,more,w271,w180,w0";
+    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0";
 
 static void printUsage() {
     printf(
@@ -17666,11 +17750,17 @@ int main(int argc, char** argv) {
                     bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
                                   g.moreR <= g.x1 + slack;
                     bool usable = g.filterR - g.filterL >= ImGui::GetFontSize() * 3.5f;
-                    if (!inside || !usable) keysWidthBad++;
+                    // ...and the "modified" column: shown means it FITS. It is
+                    // allowed to be absent (a panel too narrow to afford it) and
+                    // it is allowed to be short - it is not allowed to print
+                    // three characters of a sixteen-character stamp.
+                    bool dateOk = g.dateTextW <= 0 || g.dateTextW <= g.dateCellW + slack;
+                    if (!inside || !usable || !dateOk) keysWidthBad++;
                     fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
-                                    "filter=[%.0f,%.0f] more_r=%.0f: %s\n",
+                                    "filter=[%.0f,%.0f] more_r=%.0f date=%.0f/%.0f: %s\n",
                             g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
-                            (inside && usable) ? "ok" : "FAIL");
+                            g.dateTextW, g.dateCellW,
+                            (inside && usable && dateOk) ? "ok" : "FAIL");
                     fflush(stderr);
                 }
                 if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
