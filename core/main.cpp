@@ -11008,6 +11008,13 @@ static void drawRemotePlacesCombo() {
     ImGui::EndCombo();
 }
 
+// Where the Browse toolbar's two width-critical controls ended up, in screen x,
+// against the panel's own content edges. Recorded every frame so a selftest can
+// assert the thing a human reads off a screenshot: "the filter is on screen".
+struct RbToolbarGeom { float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0; };
+static RbToolbarGeom g_rbToolbar;
+static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
+
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     // FIRST, so it is destroyed LAST - after `view` and after every row that
@@ -11015,6 +11022,9 @@ static void drawPanelRemote() {
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree
     // next frame" deferral that covered the tree cache and nothing else.)
     RbDeferredActions rbActions;
+    g_rbToolbar = RbToolbarGeom{};
+    g_rbToolbar.x0 = ImGui::GetCursorScreenPos().x;
+    g_rbToolbar.x1 = g_rbToolbar.x0 + ImGui::GetContentRegionAvail().x;
     ImGui::PushID("remotetree");
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
@@ -11261,6 +11271,33 @@ static void drawPanelRemote() {
     };
     // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
     // narrow it down. Everything else is behind "more".
+    //
+    // The row FLOWS. It used to be one fixed SameLine chain, and at the panel's
+    // own default docked width (0.17 of the window - 271 px on a 1600 px screen)
+    // that chain ran off the right edge somewhere after "list": the filter box
+    // and the "more" button were submitted outside the clip rect, so the panel's
+    // most-used control was not on screen at all and read as missing. Now every
+    // item asks for room before it joins the line and starts a new one when
+    // there is none, exactly as the breadcrumb bar above already does - the row
+    // grows downwards instead of disappearing sideways, and nothing in it can
+    // become unreachable at any width.
+    const ImGuiStyle& rbStyle = ImGui::GetStyle();
+    auto rbBtnW = [&](const char* lb) {           // what a SmallButton will take
+        return ImGui::CalcTextSize(lb, nullptr, true).x + rbStyle.FramePadding.x * 2;
+    };
+    auto rbFlow = [&](float need) {               // join the line, or break first
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
+    };
+    // Measured, not guessed: what has to survive to the right of the filter.
+    // The WIDER of the two labels the fold button wears, so clicking it cannot
+    // reflow the row it sits in ("more" is 12 px wider than "less").
+    const float rbAdvW = std::max(rbBtnW("more##rbadv"), rbBtnW("less##rbadv"));
+    auto rbFilterTailW = [&](bool counted) {
+        float w = rbAdvW + rbStyle.ItemSpacing.x;
+        if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
+        return w;
+    };
     static char rbFilter[256] = "";
     {
         ImGui::BeginDisabled(atRoot);
@@ -11268,17 +11305,17 @@ static void drawPanelRemote() {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("parent folder (Backspace)");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("home"));
         if (ImGui::SmallButton("home")) rbGoTo("~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("refresh"));
         if (ImGui::SmallButton("refresh")) {
             rbDefer([] { rbTreeForget(); });        // in order: forget, then list
             rbGoTo(B.dir);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("open folder"));
         // Open Folder for the folder you are IN. It used to exist only on a
         // folder ROW, so opening the directory being browsed meant going up a
         // level to find its own name in the parent's listing - and if that
@@ -11287,7 +11324,7 @@ static void drawPanelRemote() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
                               "which stacks to open:\n%s", B.dir.c_str());
-        ImGui::SameLine();
+        rbFlow(rbBtnW("grouped"));
         // Grouped <-> flat. No round trip: the peer already sent every member.
         if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
             app.rbFlat = !app.rbFlat;
@@ -11301,7 +11338,7 @@ static void drawPanelRemote() {
                   "not in the listing reply - those cells stay blank)"
                 : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
                   "individually (no request to the server).");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("tree"));
         // List <-> tree. Expanding a node costs ONE list, once.
         if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
             app.rbTree = !app.rbTree;
@@ -11316,16 +11353,27 @@ static void drawPanelRemote() {
                   "back to one folder at a time."
                 : "list: one folder at a time, a click enters it.\nclick to expand "
                   "folders in place instead.");
-        ImGui::SameLine();
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
+        //
+        // The filter is the row's payload, so it is the one item with a floor:
+        // it takes a whole line of its own rather than shrink below what a glob
+        // needs to be readable in.
+        const float tailW = rbFilterTailW(rbFilter[0] != 0);
+        const float filterMin = ImGui::GetFontSize() * 8;
+        rbFlow(filterMin + tailW);
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
             ImGui::SetKeyboardFocusHere();
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        // below the floor the tail wraps instead (rbFlow, further down), so a
+        // panel too narrow for both still shows a usable filter
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
+                                         ImGui::GetFontSize() * 4));
         ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
                                  rbFilter, sizeof rbFilter);
+        g_rbToolbar.filterL = ImGui::GetItemRectMin().x;
+        g_rbToolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("filters the listing below without asking the server\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
@@ -11382,16 +11430,17 @@ static void drawPanelRemote() {
             return g_rbSortDesc ? cmp > 0 : cmp < 0;
         });
     if (rbFilter[0]) {
-        ImGui::SameLine();
+        rbFlow(ImGui::CalcTextSize("9999/9999").x);
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
-    ImGui::SameLine();
+    rbFlow(rbAdvW);
     if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
         rbAdvanced = !rbAdvanced;
         app.prefsDirty = true;
         savePrefs();
     }
+    g_rbToolbar.moreR = ImGui::GetItemRectMax().x;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("the connection, the places list and the server-side\n"
                           "recursive search - the things a browse does not need\n"
@@ -11399,7 +11448,7 @@ static void drawPanelRemote() {
     // ---- row 3, on request: the connection and the server-side search ----
     if (rbAdvanced) {
         ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
-        ImGui::SameLine();
+        rbFlow(rbBtnW("disconnect"));    // same flow rule as row 2: never clipped
         if (ImGui::SmallButton("disconnect")) {
             rbDefer([] {                 // another machine, other children
                 app.rbrowse = App::RemoteBrowse{};
@@ -11408,7 +11457,7 @@ static void drawPanelRemote() {
             ImGui::PopID();
             return;
         }
-        ImGui::SameLine();
+        rbFlow(rbBtnW("*"));
         {   // star = bookmark the place being looked at; the combo recalls them
             std::string curUrl = placeUrl(B.host, B.port, B.dir);
             bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
@@ -11428,11 +11477,13 @@ static void drawPanelRemote() {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
                                   curUrl.c_str());
-            ImGui::SameLine();
+            rbFlow(ImGui::GetFontSize() * 8);
             drawRemotePlacesCombo();
         }
         if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        const float srchTailW = rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - srchTailW,
+                                         ImGui::GetFontSize() * 4));
         bool go = ImGui::InputTextWithHint("##rbsearch",
                                            "search server (recursive): frame_* or **/dark.npy",
                                            rbSearchBuf, sizeof rbSearchBuf,
@@ -11441,7 +11492,7 @@ static void drawPanelRemote() {
             ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
                               "bare text matches anywhere in the relative path;\n"
                               "* and ? glob across '/'");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("Stop##rbsearch"));
         if (app.rbSearch.running) {
             if (ImGui::SmallButton("Stop##rbsearch")) {
                 app.rbSearch.gen++;               // in-flight result becomes stale
@@ -11452,7 +11503,7 @@ static void drawPanelRemote() {
         }
         if (!rbSearchRoot.empty()) {
             ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
-            ImGui::SameLine();
+            rbFlow(rbBtnW("x##sroot"));
             if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
         }
     } else if (!rbSearchRoot.empty() || app.rbSearch.running) {
@@ -13246,12 +13297,19 @@ static std::string g_seriesSelftest;    // --series-selftest <dir>: series invar
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree.
+// left, right, enter, home, end, back, flat, tree, more, and w<px>.
+//
+// w<px> floats the panel at an exact width and then asserts what a human would
+// otherwise have to read off a screenshot: that the filter box and the "more"
+// button are still INSIDE the panel, and that the filter is wide enough to type
+// a glob into. 271 is the panel's own default docked width on a 1600 px screen,
+// which is where the fixed SameLine chain used to push both of them off-screen.
 static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
-    "left,end,home,up,down,more,down,back";
+    "left,end,home,up,down,more,down,back,"
+    "w271,w200,w180,w420,w1150,more,w271,w180,w0";
 
 static void printUsage() {
     printf(
@@ -16847,6 +16905,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> keyActs;
     size_t keyAct = 0;
     int keyPhase = 0;
+    int keysWidthBad = 0;      // toolbar-geometry checks that failed
     bool keysOk = false;
     if (!g_browseKeys.empty()) {
         std::string d = g_browseKeys;
@@ -17045,6 +17104,16 @@ int main(int argc, char** argv) {
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         if (app.showRemote) {
             if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
+            // --browse-keys-selftest's "w<px>" action: float the panel at an
+            // exact width so the toolbar's flow layout can be asserted at the
+            // widths a human would drag it to. Off (0) in every other run.
+            if (g_rbForceW > 0) {
+                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+                ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
+                                        ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
+                                         ImGuiCond_Always);
+            }
             // Renamed "Browse" (it browses local folders too, via the local
             // peer), with the ImGui ID pinned by the ### suffix so the title
             // can change again without orphaning docked layouts.
@@ -17583,15 +17652,33 @@ int main(int argc, char** argv) {
                     else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
+                    else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                } else if (keyPhase == 7 && g_rbForceW > 0) {
+                    // The toolbar's contract at ANY width: the filter box and
+                    // the "more" button are inside the panel, and the filter is
+                    // wide enough to hold a glob. Both used to be submitted past
+                    // the right edge at the panel's default docked width.
+                    const RbToolbarGeom& g = g_rbToolbar;
+                    float slack = 1.0f;             // one pixel of rounding
+                    bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
+                                  g.moreR <= g.x1 + slack;
+                    bool usable = g.filterR - g.filterL >= ImGui::GetFontSize() * 3.5f;
+                    if (!inside || !usable) keysWidthBad++;
+                    fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
+                                    "filter=[%.0f,%.0f] more_r=%.0f: %s\n",
+                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
+                            (inside && usable) ? "ok" : "FAIL");
+                    fflush(stderr);
                 }
                 if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
             } else if (++reproIdle > 20) {
-                keysOk = true;
+                keysOk = keysWidthBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
-                                "no crash: ok\n", (int)keyActs.size());
+                                "no crash, %d toolbar width check(s) failed: %s\n",
+                        (int)keyActs.size(), keysWidthBad, keysOk ? "ok" : "FAILED");
                 fflush(stderr);
                 break;
             }
