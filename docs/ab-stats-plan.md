@@ -8,15 +8,14 @@
   自体は変えない**(最小差分)。`recomputeHistogramIfNeeded(ImageDoc*)` → `(ImageDoc*, HistState&)`、
   projection も同様、`recomputeTemporalIfNeeded()` → `(const ImageDoc*, TemporalState&)`。
   中身は `app.hist` 参照を引数に置換するだけ。
-- 参照は少ない: main.cpp 1057/1543/6204/6799(hist)、1058/6879/6998(proj)、
-  1059/1449/1545/3376/4212/7801(temporal)。`forgetImage`/`closeAll` は**両スロット**を潰す。
+- 参照は少ない(hist 1057/1543/6204/6799、proj 1058/6879/6998、temporal 1059/1449/1545/3376/
+  4212/7801)。`forgetImage`/`closeAll` は**両スロット**を潰す。
 - **slot 1 は `cmpB() != nullptr` のときだけ埋める**。compare off の 1 フレーム目で
   `hist[1].uid=0; temporal[1].seqId=-1;` と 1 回無効化し以後触らない → compare off の
   コストは現状と完全に同じ。パネルは `ImGui::Begin` が true のときしか計算しない(既存の
   性質)ので閉じたパネルの B 側コストはゼロ。
-- **frame step**: `compareFollowFrame` on だと B の uid も毎回変わり hist/proj は A/B 両方が
-  再計算 = **ステップ当たりのコストがほぼ倍**。temporal は `seqId`+ROI がキーなのでステップでは
-  再計算されない(ROI 変更時のみ)。
+- **frame step**: `compareFollowFrame` on だと B の uid も毎回変わり hist/proj は A/B 両方が再計算
+  = **ステップ当たりのコストがほぼ倍**。temporal は `seqId`+ROI がキーなので再計算されない。
 - 12 Mpx での実コストは**未測定。推測を書かない**。測り方: 12 Mpx の 2 stack を開き
   Histogram/Projection を出した状態で `--bench 300` を (a) compare off、(b) CmpSplit+follow on
   で走らせ median frame time の差を取る。ただし `--bench` はフレームを進めないので **bench に
