@@ -128,6 +128,8 @@ struct ImageDoc {
     bool texNearest = true;
     // CFA (Bayer) metadata
     int batchId = 0;                  // which 塊 (Files header) this belongs to
+    bool preview = false;             // transient: not yet a registered open
+    int remoteFrames = 1;             // frame-axis count, kept for promotion
     int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
     int cfaPattern = 0;               // index into CFA_PATTERNS
     bool cfaColorize = false;
@@ -335,6 +337,7 @@ struct App {
     std::vector<Batch> batches;
     int nextBatchId = 1;
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
+    uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
     int nextSeqId = 1;
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
@@ -500,6 +503,7 @@ struct App {
         int seqId = 0, seqIndex = 0;
         uint32_t gen = 0;             // closeAll bumps the generation; stale
                                       // results must not graft onto a new list
+        bool low = false;             // preview buffering: yields to registered opens
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -598,7 +602,7 @@ static App app;
 // ---- remote viewing: declared here, defined further down ----
 static const char* REMOTE_HOME = "~/.viewer";
 #define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
-static void openRemote(const std::string& url);
+static void openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string());
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
@@ -617,6 +621,8 @@ static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
+
+static void promotePreview(ImageDoc* d);   // fwd: preview -> registered open
 
 // The B side of an A/B compare, or null when compare is off / B is gone / B is A.
 static ImageDoc* resolveB() {
@@ -641,6 +647,8 @@ static ImageDoc* cmpB() { return app.compareMode == App::CmpOff ? nullptr : reso
 
 // remember B as an identity, not as a name
 static void setCompareB(const ImageDoc* d) {
+    // making a preview the B side IS using it: promote before it can vanish
+    if (d && d->preview) promotePreview(const_cast<ImageDoc*>(d));
     app.compareBUid = d ? d->uid : 0;
     app.compareB = d ? d->name : std::string();
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
@@ -1054,19 +1062,39 @@ static void rfEnqueue(App::RFetchJob job) {
         std::lock_guard<std::mutex> lk(app.rfMtx);
         app.rfPending++;
         app.rfTotal++;
-        app.rfQueue.push_back(std::move(job));
+        // an unpromoted preview is only ALLOWED the link when nothing a user
+        // registered is waiting: normal jobs enter ahead of every low one
+        if (job.low) {
+            app.rfQueue.push_back(std::move(job));
+        } else {
+            auto it = app.rfQueue.begin();
+            while (it != app.rfQueue.end() && !it->low) ++it;
+            app.rfQueue.insert(it, std::move(job));
+        }
     }
     if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
 }
 
-static void requestFullRemote(const ImageDoc* d) {
+static void requestFullRemote(const ImageDoc* d, bool low = false) {
     if (d->remoteUrl.empty() || d->remoteStep <= 1) return;
     {
         std::lock_guard<std::mutex> lk(app.rfMtx);
-        for (const auto& j : app.rfQueue) if (j.uid == d->uid) return;   // queued already
+        for (auto it = app.rfQueue.begin(); it != app.rfQueue.end(); ++it)
+            if (it->uid == d->uid) {
+                if (it->low && !low) {         // promotion: same job, real priority
+                    App::RFetchJob j = std::move(*it);
+                    j.low = false;
+                    app.rfQueue.erase(it);
+                    auto at = app.rfQueue.begin();
+                    while (at != app.rfQueue.end() && !at->low) ++at;
+                    app.rfQueue.insert(at, std::move(j));
+                }
+                return;
+            }
     }
     App::RFetchJob j;
     j.url = d->remoteUrl; j.frame = d->remoteFrame; j.uid = d->uid;
+    j.low = low;
     rfEnqueue(std::move(j));
 }
 
@@ -2211,7 +2239,7 @@ static void restoreFull() {
     toast("restored full frame");
 }
 
-static void openRemote(const std::string& url);   // fwd: sessions can hold ssh:// images
+static void openRemote(const std::string& url, bool asPreview);   // fwd (default on the first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name);   // default lives on the first decl
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
@@ -2355,6 +2383,8 @@ static void writeSessionTo(std::ostream& f) {
 }
 
 static void saveSession(std::string path, bool quiet = false) {
+    for (auto& d : app.images)                  // a saved session has no transients
+        if (d->preview) promotePreview(d.get());
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
@@ -4362,12 +4392,30 @@ static void startRemote(const std::string& hostSpec) {
     rbEnqueue(std::move(j));
 }
 
-static void openRemote(const std::string& url) {
+// Close the transient preview, if one is still unpromoted.
+static void dropPreview() {
+    if (!app.previewUid) return;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->uid == app.previewUid) {
+            if (!app.images[i]->preview) break;      // promoted: not ours anymore
+            forgetImage(app.images[i].get());
+            if (app.images[i]->tex) glDeleteTextures(1, &app.images[i]->tex);
+            app.images.erase(app.images.begin() + i);
+            if (app.current >= (int)app.images.size())
+                app.current = (int)app.images.size() - 1;
+            app.imagesRev++;
+            break;
+        }
+    app.previewUid = 0;
+}
+
+static void openRemote(const std::string& url, bool asPreview) {
     std::string host, rpath;
     if (!remote::parseUrl(url, host, rpath)) {
         toast("expected ssh://user@host/path/to/file.npy", true);
         return;
     }
+    if (asPreview) dropPreview();          // ONE slot: the next look replaces it
     std::string err;
     if (!ensureRemoteSession(host, err)) { toast("remote: " + err, true); return; }
     remote::Meta m;
@@ -4399,6 +4447,19 @@ static void openRemote(const std::string& url) {
     doc->remoteUrl = url;
     doc->remoteFrame = 0;
     doc->remoteStep = step;
+    doc->remoteFrames = (int)m.frames;
+    doc->preview = asPreview;
+    // remote opens never went through addImage, so the batch is assigned here:
+    // previews sit in their own "preview" pseudo-batch until promoted
+    if (asPreview) doc->batchId = batchReuse("preview");
+    else if (app.loadBatchId) doc->batchId = app.loadBatchId;
+    else {
+        size_t sl = rpath.find_last_of('/');
+        std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
+        size_t s2 = dir.find_last_of('/');
+        std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
+        doc->batchId = batchReuse(leaf.empty() ? host : leaf);
+    }
     computeMinMax(*doc);
     defaultRange(*doc);
     doc->texDirty = true;
@@ -4406,13 +4467,23 @@ static void openRemote(const std::string& url) {
     app.imagesRev++;
     selectImage((int)app.images.size() - 1);
     app.fitRequested = true;
-    // the preview is for orientation; the pixels you can measure come right after
-    if (step > 1) requestFullRemote(app.images.back().get());
+    if (asPreview) app.previewUid = app.images.back()->uid;
+    // The full-resolution follow-up. Registered opens always get it. A preview
+    // gets it too when the frame is cheap enough to just have (small file or
+    // fast link - "problem-free" full fetch, verbatim), but only at LOW
+    // priority: an unpromoted preview never delays anything registered.
+    if (step > 1) {
+        size_t estBytes = (size_t)m.w * m.h * tch * rp::dtypeSize(rp::dtypeFromName(dt.c_str()));
+        if (!asPreview) requestFullRemote(app.images.back().get());
+        else if (estBytes <= (size_t)48 << 20)
+            requestFullRemote(app.images.back().get(), true);
+    }
     // A frame axis makes this a stack: prefetch the rest in the background, and
     // they become ordinary local frames as they land - temporal analysis, frame
     // stepping, every analyzer, all unchanged. Processing stays local by design;
-    // the remote side only ever ships pixels.
-    if (m.frames > 1) {
+    // the remote side only ever ships pixels. A PREVIEW is only ever its first
+    // frame: the rest of the stack is exactly the buffering promotion defers.
+    if (m.frames > 1 && !asPreview) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
         si.name = baseName(rpath) + " [remote]";
@@ -4494,6 +4565,54 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                  "(File > Sequence loading > Memory budget)", fit + 1, (int)files.size());
         app.seqNote = msg;
     }
+}
+
+// A preview becomes a registered open the moment it is USED: double-click,
+// Enter, being measured, being made compare-B, or a session save. The user
+// never answers "did you mean to keep this?" - their actions already did.
+static void promotePreview(ImageDoc* d) {
+    if (!d || !d->preview) return;
+    d->preview = false;
+    if (app.previewUid == d->uid) app.previewUid = 0;
+    std::string host, rpath;
+    remote::parseUrl(d->remoteUrl, host, rpath);
+    {   // out of the "preview" pseudo-batch, into a folder-named one
+        size_t sl = rpath.find_last_of('/');
+        std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
+        size_t s2 = dir.find_last_of('/');
+        std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
+        d->batchId = batchReuse(leaf.empty() ? (host.empty() ? "opened" : host) : leaf);
+    }
+    // the buffering the preview deferred, at REGISTERED priority now
+    requestFullRemote(d);
+    if (d->remoteFrames > 1 && d->seqId == 0) {
+        App::SeqInfo si;
+        si.id = app.nextSeqId++;
+        si.name = baseName(rpath) + " [remote]";
+        si.remoteUrl = d->remoteUrl;
+        si.remoteHost = host;
+        si.expectedFrames = d->remoteFrames;
+        app.seqs.push_back(si);
+        d->seqId = si.id;
+        d->seqIndex = 0;
+        maybeRequestServerTemporal(si.id);
+        size_t perFrame = (size_t)d->w * d->h * d->ch * sizeof(float) *
+                          (d->remoteStep > 1 ? (size_t)d->remoteStep * d->remoteStep : 1);
+        size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+        int fit = (int)std::min<size_t>((size_t)d->remoteFrames - 1,
+                                        perFrame ? room / perFrame : 0);
+        for (int i = 1; i <= fit; i++) {
+            App::RFetchJob j;
+            j.url = d->remoteUrl;
+            j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.seqId = si.id;
+            j.seqIndex = i;
+            j.frame = i;
+            rfEnqueue(std::move(j));
+        }
+    }
+    app.imagesRev++;
+    toast(d->name + ": opened");
 }
 
 static void openPath(const std::string& path) {
@@ -7324,6 +7443,7 @@ static void drawPanelAnalysis() {
             double runT0 = glfwGetTime();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
             ana.colColor.clear(); ana.units.clear(); ana.headline.clear();
+            if (im->preview) promotePreview(im);   // measuring it = keeping it
             ana.img = im; ana.uid = im->uid; ana.plugin = app.anaSel; ana.rev = app.annRev;
             ana.dataRev = im->dataRev; ana.black = effBlack(*im); ana.white = effWhite(*im);
             ana.cfa = im->cfa; ana.cfaPattern = im->cfaPattern;
@@ -8095,14 +8215,38 @@ static void drawPanelRemote() {
                 } else if (e.dir) {
                     remoteBrowseTo(joined(e.name));
                 } else if (e.group) {
-                    // one row = one stack; members arrive numerically sorted
+                    // single click: a poster-frame PREVIEW of the stack (frame
+                    // 0, decimated, nothing registered). Double-click below
+                    // opens the stack for real.
+                    openRemote(makeRemoteUrl(B.host, joined(e.members.empty()
+                                             ? e.name : e.members[0])), true);
+                    rbSelAnchor = ei;
+                } else {
+                    // idempotent: clicking the same file again re-shows the
+                    // preview instead of re-fetching it
+                    std::string u = makeRemoteUrl(B.host, joined(e.name));
+                    ImageDoc* pv = nullptr;
+                    for (const auto& di : app.images)
+                        if (di->uid == app.previewUid && di->preview) pv = di.get();
+                    if (pv && pv->remoteUrl == u) selectImage(app.current);
+                    else openRemote(u, true);
+                    rbSelAnchor = ei;
+                }
+            }
+            // Double-click = a registered open (the VSCode pinning gesture).
+            // The first of the two clicks already made the preview; this
+            // promotes it - or, for a stack row, opens the whole stack.
+            if (servable && !e.dir && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (e.group) {
+                    dropPreview();               // the poster frame did its job
                     std::vector<std::string> files;
                     for (const auto& m : e.members) files.push_back(joined(m));
                     openRemoteStack(B.host, files);
-                    rbSelAnchor = ei;
                 } else {
-                    openRemote(makeRemoteUrl(B.host, joined(e.name)));
-                    rbSelAnchor = ei;
+                    for (const auto& di : app.images)
+                        if (di->uid == app.previewUid && di->preview)
+                            promotePreview(di.get());
                 }
             }
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
