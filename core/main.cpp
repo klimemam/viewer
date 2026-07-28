@@ -489,6 +489,11 @@ struct App {
     bool showLinearity = false;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
     bool showRemote = false;          // the server browser, its own panel
+    // Browse listing view: false = the collapsed group rows the peer sends,
+    // true = every frame of every sequence as its own row. Expansion is a pure
+    // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
+    // so the toggle costs no round trip. Persisted: it is a way of working.
+    bool rbFlat = false;
     bool focusRemote = false;         // bring it forward when a menu item asks
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
@@ -2732,6 +2737,7 @@ static void savePrefs() {
     f << "linunit " << app.lin.unit << "\n";
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+    f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -2766,6 +2772,7 @@ static void loadPrefs() {
                                          app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
+        else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
             std::string s;
@@ -8606,6 +8613,41 @@ static std::string fmtEntryShape(const remote::Entry& e) {
     return s;
 }
 
+// ---- listing view: one row of the Browse table --------------------------------
+// A numbered sequence arrives as ONE synthetic entry carrying `.members`, so
+// "show me the individual frames" is a view over the reply we already have -
+// no LIST, no round trip, nothing to invalidate. `member` picks which face the
+// row wears: -1 = the entry itself (folder, plain file, or the collapsed group
+// row), >= 0 = the n-th frame of a group.
+//
+// What an expanded frame does NOT have is its own size and mtime: the group
+// reply carries the SUM of the members' bytes and the NEWEST member's time,
+// and there is no per-file breakdown in it. Those cells stay blank rather than
+// repeating the group's numbers on 24 rows, which would be a lie 24 times.
+// shape/dtype are shared by construction (the peer only groups files that
+// agree), so they are shown.
+struct RbRow {
+    const remote::Entry* e = nullptr;
+    int member = -1;
+    const std::string& name() const { return member < 0 ? e->name : e->members[member]; }
+    bool isDir()   const { return member < 0 && e->dir; }
+    bool isGroup() const { return member < 0 && e->group; }
+    bool ownFile() const { return member < 0; }   // has its own size / mtime
+};
+// Grouped or flat, from the same entries. Free function so the headless
+// selftest drives exactly what the panel draws.
+static std::vector<RbRow> rbBuildView(const std::vector<remote::Entry>& entries, bool flat) {
+    std::vector<RbRow> v;
+    v.reserve(entries.size());
+    for (const auto& e : entries) {
+        if (flat && e.group && !e.members.empty())
+            for (int m = 0; m < (int)e.members.size(); m++) v.push_back({ &e, m });
+        else
+            v.push_back({ &e, -1 });
+    }
+    return v;
+}
+
 // Bookmarks + recents in one dropdown. Available connected or not: picking a
 // place while disconnected is exactly how a session starts next morning.
 static void drawRemotePlacesCombo() {
@@ -8778,30 +8820,90 @@ static void drawPanelRemote() {
     auto joined = [&B](const std::string& n) {
         return B.dir == "/" ? "/" + n : B.dir + "/" + n;
     };
-    // Multi-select (Ctrl / Shift + click on file rows). Selection is keyed to
-    // the exact listing: a navigation or a refresh invalidates the indices, so
-    // it resets rather than pointing at different rows.
+    // The listing as ROWS: grouped (one row per sequence) or flat (one row per
+    // frame). Rebuilt every frame from the same reply - see rbBuildView.
+    std::vector<RbRow> view = rbBuildView(B.entries, app.rbFlat);
+    // Multi-select (Ctrl / Shift + click on file rows), indexed by ROW. A
+    // navigation or a refresh invalidates the indices, so it resets rather
+    // than pointing at different rows. A grouped/flat TOGGLE does not: the
+    // selection carries across by owning entry, so expanding a selected
+    // sequence selects its frames and collapsing them selects the sequence.
     static std::vector<char> rbSel;
-    static int rbSelAnchor = -1;               // entry index of the last click
+    static int rbSelAnchor = -1;               // row index of the last click
+    static bool rbSelFlat = false;             // which view rbSel was built for
     {
         static std::string selSig;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
         if (sig != selSig) {
             selSig = sig;
-            rbSel.assign(B.entries.size(), 0);
+            rbSel.assign(view.size(), 0);
+            rbSelAnchor = -1;
+        } else if (rbSelFlat != app.rbFlat) {
+            std::vector<RbRow> old = rbBuildView(B.entries, rbSelFlat);
+            std::vector<const remote::Entry*> sel;
+            for (size_t i = 0; i < old.size() && i < rbSel.size(); i++)
+                if (rbSel[i]) sel.push_back(old[i].e);
+            rbSel.assign(view.size(), 0);
+            for (size_t i = 0; i < view.size(); i++)
+                if (std::find(sel.begin(), sel.end(), view[i].e) != sel.end()) rbSel[i] = 1;
             rbSelAnchor = -1;
         }
+        rbSelFlat = app.rbFlat;
+        if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
+    // What a plain click does: enter a folder, or show a throwaway PREVIEW of
+    // a file / of a sequence's poster frame. Nothing is registered. Factored
+    // out because the keyboard (arrow keys) has to do exactly the same thing.
+    auto rbActivateRow = [&](const RbRow& r) {
+        if (r.isDir()) { remoteBrowseTo(joined(r.name())); return; }
+        if (!isNpyName(r.name())) return;
+        // stepping context for the scrub bar / , and . : the whole sequence
+        // when the row belongs to one, so a flat row still steps its siblings
+        const std::vector<std::string>* seq = (r.isGroup() || r.member >= 0) &&
+                                              !r.e->members.empty() ? &r.e->members : nullptr;
+        std::string target = r.isGroup()
+            ? joined(r.e->members.empty() ? r.e->name : r.e->members[0])
+            : joined(r.name());
+        // idempotent: clicking the same file again re-shows the preview
+        // instead of re-fetching it
+        ImageDoc* pv = nullptr;
+        for (const auto& di : app.images)
+            if (di->uid == app.previewUid && di->preview) pv = di.get();
+        std::string u = makeRemoteUrl(B.host, target);
+        if (pv && pv->remoteUrl == u) selectImage(app.current);
+        else openRemote(u, true);
+        app.previewFiles.clear();
+        if (seq) {
+            for (const auto& m : *seq) app.previewFiles.push_back(joined(m));
+            app.previewIndex = r.member >= 0 ? r.member : 0;
+            app.previewLabel = r.e->name;
+        }
+    };
+    // What a double-click (and Enter) does: a REGISTERED open. A sequence row
+    // opens the whole stack; a frame promotes the preview it just made.
+    auto rbOpenRow = [&](const RbRow& r) {
+        if (r.isDir()) { remoteBrowseTo(joined(r.name())); return; }
+        if (!isNpyName(r.name())) return;
+        if (r.isGroup()) {
+            dropPreview();                   // the poster frame did its job
+            std::vector<std::string> files;
+            for (const auto& m : r.e->members) files.push_back(joined(m));
+            openRemoteStack(B.host, files);
+            return;
+        }
+        for (const auto& di : app.images)
+            if (di->uid == app.previewUid && di->preview) promotePreview(di.get());
+    };
     {   // "Open N selected as stack" - enabled only when the v3 metadata proves
         // the frames can actually stack, BEFORE any pixel is transferred
         int nSel = 0;
         const remote::Entry* first = nullptr;
         std::string reason;
-        for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+        for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
             if (!rbSel[i]) continue;
-            const remote::Entry& e = B.entries[i];
+            const remote::Entry& e = *view[i].e;
             nSel++;
-            if (!isNpyName(e.name)) { reason = "only .npy files can form a stack"; continue; }
+            if (!isNpyName(view[i].name())) { reason = "only .npy files can form a stack"; continue; }
             if (!e.hasMeta) {
                 reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
                 continue;
@@ -8818,15 +8920,15 @@ static void drawPanelRemote() {
             if (!reason.empty()) ImGui::BeginDisabled();
             if (ImGui::Button(lb)) {
                 std::vector<std::string> files;
-                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                     if (!rbSel[i]) continue;
-                    const remote::Entry& e = B.entries[i];
-                    if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
-                    else files.push_back(joined(e.name));
+                    if (view[i].isGroup())
+                        for (const auto& m : view[i].e->members) files.push_back(joined(m));
+                    else files.push_back(joined(view[i].name()));
                 }
                 sortFramesNumerically(files);
                 openRemoteStack(B.host, files);
-                rbSel.assign(B.entries.size(), 0);
+                rbSel.assign(view.size(), 0);
             }
             if (!reason.empty()) ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -8842,16 +8944,16 @@ static void drawPanelRemote() {
                     if (app.remoteSession) pv2 = app.remoteSession->peerVersion();
                 }
                 bool tempOk = pv2 >= 2;
-                for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++)
-                    if (rbSel[i] && !isNpyName(B.entries[i].name)) tempOk = false;
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
+                    if (rbSel[i] && !isNpyName(view[i].name())) tempOk = false;
                 ImGui::BeginDisabled(!tempOk);
                 if (ImGui::Button("Temporal stats (server)")) {
                     std::vector<std::string> files;
-                    for (size_t i = 0; i < B.entries.size() && i < rbSel.size(); i++) {
+                    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                         if (!rbSel[i]) continue;
-                        const remote::Entry& e = B.entries[i];
-                        if (e.group) for (const auto& m : e.members) files.push_back(joined(m));
-                        else files.push_back(joined(e.name));
+                        if (view[i].isGroup())
+                            for (const auto& m : view[i].e->members) files.push_back(joined(m));
+                        else files.push_back(joined(view[i].name()));
                     }
                     std::string leaf = B.dir;
                     size_t sl2 = leaf.find_last_of('/');
@@ -8871,7 +8973,7 @@ static void drawPanelRemote() {
                                   : "only .npy files can form a stack");
             }
             ImGui::SameLine();
-            if (ImGui::SmallButton("clear##sel")) rbSel.assign(B.entries.size(), 0);
+            if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
         }
     }
     // Filter what is already listed - no round-trip to the server. Substring by
@@ -8879,6 +8981,20 @@ static void drawPanelRemote() {
     // capture dump directory holds hundreds of entries and one condition matters.
     static char rbFilter[256] = "";
     {
+        // Grouped <-> flat. No round trip: the peer already sent every member.
+        if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
+            app.rbFlat = !app.rbFlat;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(app.rbFlat
+                ? "flat: every frame is its own row.\nclick to collapse numbered "
+                  "sequences back into one row each.\n(per-frame size and date are "
+                  "not in the listing reply - those cells stay blank)"
+                : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
+                  "individually (no request to the server).");
+        ImGui::SameLine();
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
             ImGui::SetKeyboardFocusHere();
@@ -8890,16 +9006,16 @@ static void drawPanelRemote() {
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
     }
-    // filtered view of B.entries, by index (the clipper needs random access)
+    // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
-    shown.reserve(B.entries.size());
-    for (int i = 0; i < (int)B.entries.size(); i++)
-        if (!rbFilter[0] || globListMatch(rbFilter, B.entries[i].name))
+    shown.reserve(view.size());
+    for (int i = 0; i < (int)view.size(); i++)
+        if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
             shown.push_back(i);
     if (rbFilter[0]) {
         ImGui::SameLine();
-        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
+        ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)view.size());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
     // Server-side search - a different thing from the filter above (which only
     // narrows what is already listed), so it gets its own labelled row.
@@ -9015,6 +9131,7 @@ static void drawPanelRemote() {
     static remote::Entry rbPropsEntry;
     static std::string rbPropsPath;
     static bool rbPropsOpen = false;
+    static bool rbPropsNoSize = false;   // an expanded frame: no size/mtime of its own
     enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
     // footer space for the preview scrub bar: RESERVED even when no preview is
     // alive, so starting one never shifts the rows under the cursor (a bar
@@ -9040,16 +9157,20 @@ static void drawPanelRemote() {
         // of numbers.
         if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
             std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
-                const remote::Entry& a = B.entries[ia];
-                const remote::Entry& b = B.entries[ib];
-                if (a.dir != b.dir) return a.dir;
+                const RbRow& a = view[ia];
+                const RbRow& b = view[ib];
+                if (a.isDir() != b.isDir()) return a.isDir();
                 for (int s = 0; s < sp->SpecsCount; s++) {
                     const ImGuiTableColumnSortSpecs& c = sp->Specs[s];
                     int cmp = 0;
+                    // an expanded frame has no size / mtime of its own: it sorts
+                    // as unknown (0) rather than borrowing the group's totals
+                    uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
+                    int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
                     switch (c.ColumnUserID) {
-                        case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
-                        case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
-                        default:           cmp = a.name.compare(b.name); break;
+                        case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
+                        case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
+                        default:           cmp = a.name().compare(b.name()); break;
                     }
                     if (cmp) return c.SortDirection == ImGuiSortDirection_Descending ? cmp > 0
                                                                                      : cmp < 0;
@@ -9061,7 +9182,9 @@ static void drawPanelRemote() {
         clip.Begin((int)shown.size());
         while (clip.Step())
         for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
-            const remote::Entry& e = B.entries[shown[row]];
+            const RbRow& r = view[shown[row]];
+            const remote::Entry& e = *r.e;
+            const std::string& rname = r.name();
             ImGui::PushID(shown[row]);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
@@ -9069,21 +9192,21 @@ static void drawPanelRemote() {
             // three hairlines, a file gets nothing - the name is the row.
             // (First cut had drawn folder/page pictograms; they collided with
             // the text and were, verbatim, "くどい".)
-            std::string lb = "  " + e.name;
-            if (e.group) lb += "   [" + std::to_string(e.frames) + " frames]";
-            bool servable = e.dir || isNpyName(e.name);
+            std::string lb = "  " + rname;
+            if (r.isGroup()) lb += "   [" + std::to_string(e.frames) + " frames]";
+            bool servable = r.isDir() || isNpyName(rname);
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
-            if (e.dir || e.group) {   // inside the two-space gutter the label reserves
+            if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
                 ImVec2 p = ImGui::GetItemRectMin();
                 float h = ImGui::GetTextLineHeight();
                 float gut = ImGui::CalcTextSize("  ").x;      // never touch the name
                 float y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
                 float cxm = p.x + gut * 0.45f, cym = y + h * 0.5f;
-                if (e.dir) {          // › chevron, the way a tree hints "enter me"
+                if (r.isDir()) {      // › chevron, the way a tree hints "enter me"
                     ImU32 c = IM_COL32(150, 158, 166, 170);
                     float a = std::min(h * 0.16f, gut * 0.30f);
                     rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
@@ -9098,7 +9221,7 @@ static void drawPanelRemote() {
             }
             if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
-                bool canSel = !e.dir && ei < (int)rbSel.size();
+                bool canSel = !r.isDir() && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
                     rbSel[ei] ^= 1;                    // toggle, plain click still opens
                     rbSelAnchor = ei;
@@ -9109,54 +9232,23 @@ static void drawPanelRemote() {
                         if (shown[k] == rbSelAnchor) a = k;
                     if (a < 0) a = row;
                     for (int k = std::min(a, row); k <= std::max(a, row); k++)
-                        if (!B.entries[shown[k]].dir && (size_t)shown[k] < rbSel.size())
+                        if (!view[shown[k]].isDir() && (size_t)shown[k] < rbSel.size())
                             rbSel[shown[k]] = 1;
-                } else if (e.dir) {
-                    remoteBrowseTo(joined(e.name));
-                } else if (e.group) {
-                    // single click: a poster-frame PREVIEW of the stack (frame
-                    // 0, decimated, nothing registered). Double-click below
-                    // opens the stack for real.
-                    openRemote(makeRemoteUrl(B.host, joined(e.members.empty()
-                                             ? e.name : e.members[0])), true);
-                    app.previewFiles.clear();
-                    for (const auto& m : e.members)
-                        app.previewFiles.push_back(joined(m));
-                    app.previewIndex = 0;
-                    app.previewLabel = e.name;
-                    rbSelAnchor = ei;
                 } else {
-                    // idempotent: clicking the same file again re-shows the
-                    // preview instead of re-fetching it
-                    std::string u = makeRemoteUrl(B.host, joined(e.name));
-                    ImageDoc* pv = nullptr;
-                    for (const auto& di : app.images)
-                        if (di->uid == app.previewUid && di->preview) pv = di.get();
-                    if (pv && pv->remoteUrl == u) selectImage(app.current);
-                    else openRemote(u, true);
+                    rbActivateRow(r);
                     rbSelAnchor = ei;
                 }
             }
             // Double-click = a registered open (the VSCode pinning gesture).
             // The first of the two clicks already made the preview; this
             // promotes it - or, for a stack row, opens the whole stack.
-            if (servable && !e.dir && ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                if (e.group) {
-                    dropPreview();               // the poster frame did its job
-                    std::vector<std::string> files;
-                    for (const auto& m : e.members) files.push_back(joined(m));
-                    openRemoteStack(B.host, files);
-                } else {
-                    for (const auto& di : app.images)
-                        if (di->uid == app.previewUid && di->preview)
-                            promotePreview(di.get());
-                }
-            }
+            if (servable && !r.isDir() && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                rbOpenRow(r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (ImGui::BeginPopupContextItem("ctx")) {
-                std::string full = joined(e.name);
-                if (e.dir) {
+                std::string full = joined(rname);
+                if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(full);
                     if (ImGui::MenuItem("Search under here")) {
@@ -9174,7 +9266,7 @@ static void drawPanelRemote() {
                         toast("bookmarked " + u);
                     }
                     ImGui::Separator();
-                } else if (e.group) {
+                } else if (r.isGroup()) {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(joined(m));
@@ -9197,32 +9289,50 @@ static void drawPanelRemote() {
                                           "shown in the Temporal panel - nothing opens,\n"
                                           "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
-                } else if (isNpyName(e.name)) {
+                } else if (isNpyName(rname)) {
                     if (ImGui::MenuItem("Open"))
                         openRemote(makeRemoteUrl(B.host, full));
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
                         openRemoteStack(B.host, { full });
+                    // an expanded frame still knows the sequence it came from
+                    if (r.member >= 0) {
+                        char sl[64];
+                        snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
+                        if (ImGui::MenuItem(sl)) {
+                            std::vector<std::string> files;
+                            for (const auto& m : e.members) files.push_back(joined(m));
+                            openRemoteStack(B.host, files);
+                        }
+                    }
                     ImGui::Separator();
                 }
                 if (ImGui::MenuItem("Copy path")) {
                     ImGui::SetClipboardText(full.c_str());
                     toast("copied " + full);
                 }
-                if (!e.dir && ImGui::MenuItem("Properties...")) {
+                if (!r.isDir() && ImGui::MenuItem("Properties...")) {
                     rbPropsEntry = e;
+                    if (r.member >= 0) {          // an expanded frame: the group's
+                        rbPropsEntry.name = rname;   // meta, but none of its totals
+                        rbPropsEntry.group = false;
+                        rbPropsEntry.frames = 0;
+                        rbPropsEntry.members.clear();
+                    }
+                    rbPropsNoSize = r.member >= 0;
                     rbPropsPath = full;
                     rbPropsOpen = true;
                 }
                 ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
-            if (!e.dir && isNpyName(e.name)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
+            if (!r.isDir() && isNpyName(rname)) ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
             ImGui::TableNextColumn();
-            if (!e.dir) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
+            // blank, not zero: the group reply has no per-frame size or mtime
+            if (!r.isDir() && r.ownFile()) ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
             ImGui::TableNextColumn();
-            if (e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
-            else if (!e.dir) ImGui::TextDisabled("-");
+            if (r.ownFile() && e.mtime > 0) ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            else if (!r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -9268,9 +9378,16 @@ static void drawPanelRemote() {
         }
         if (e.group)
             ImGui::Text("stack: %u frames (%s)", e.frames, e.name.c_str());
+        if (rbPropsNoSize) {
+            // Never invent one: the listing reply carries the group's total
+            // bytes and its newest mtime, and no per-member breakdown.
+            ImGui::TextDisabled("size      -   (not in the sequence listing)");
+            ImGui::TextDisabled("modified  -   (not in the sequence listing)");
+        } else {
         ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
                     (unsigned long long)e.size, e.group ? "  - all frames" : "");
         ImGui::Text("modified  %s (this machine's timezone)", fmtUnixTime(e.mtime).c_str());
+        }
         ImGui::Text("shape     %s%s", fmtEntryShape(e).c_str(),
                     e.hasMeta && e.group ? "  - per frame" : "");
         if (!e.hasMeta)
@@ -10167,6 +10284,7 @@ static std::string g_closeSelftest;     // --close-selftest <dir>: close per sta
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
+static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 
 static void printUsage() {
@@ -10300,6 +10418,8 @@ static void parseCli(int argc, char** argv) {
             g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--localbrowse-selftest") {
             g_localbrowseSelftest = next();        // handled in main()
+        } else if (a == "--browse-selftest") {
+            g_browseSelftest = next();             // handled in main()
         } else if (a == "--verify-selftest") {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
@@ -11231,6 +11351,79 @@ int main(int argc, char** argv) {
                 (int)B.entries.size(), app.showRemote ? 1 : 0,
                 B.err.empty() ? "" : " err=", B.err.c_str());
         fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // The Browse panel's own behaviour, verifiable without a human. Connects a
+    // LOCAL peer to <dir> and drives the same functions the panel draws with.
+    if (!g_browseSelftest.empty()) {
+        std::string dir = g_browseSelftest;
+        std::replace(dir.begin(), dir.end(), '\\', '/');
+        while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        startRemote("local://" + dir);
+        double t0 = glfwGetTime();
+        while (glfwGetTime() - t0 < 120.0) {
+            pumpRemoteBrowse();
+            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+            if (!app.rbrowse.err.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const App::RemoteBrowse& B = app.rbrowse;
+        if (!B.connected || B.entries.empty()) {
+            fprintf(stderr, "browseselftest: no listing for %s (%s)\n",
+                    dir.c_str(), B.err.c_str());
+            stopRbWorker(); stopRemoteFetcher(); stopMeasureWorker();
+            return 1;
+        }
+        bool ok = true;
+        {   // Grouped <-> flat is a CLIENT-SIDE view over one reply: the flat
+            // listing must be exactly the group's members, in the peer's order,
+            // and the grouped one exactly one row for them.
+            const remote::Entry* g = nullptr;
+            int nGroups = 0, nMembers = 0;
+            for (const auto& e : B.entries) {
+                if (!e.group) continue;
+                nGroups++;
+                nMembers += (int)e.members.size();
+                if (!g) g = &e;
+            }
+            std::vector<RbRow> gv = rbBuildView(B.entries, false);
+            std::vector<RbRow> fv = rbBuildView(B.entries, true);
+            bool sizes = gv.size() == B.entries.size() &&
+                         fv.size() == B.entries.size() - nGroups + nMembers;
+            // one grouped row for the sequence, and it is the group entry
+            int gRows = 0;
+            for (const auto& r : gv) if (r.isGroup()) gRows++;
+            // the expanded rows, in order, ARE the members
+            std::vector<std::string> expanded;
+            bool memberCells = true;
+            for (const auto& r : fv) {
+                if (r.e != g || r.member < 0) continue;
+                expanded.push_back(r.name());
+                // an expanded frame has no size / mtime of its own, but keeps
+                // the shape/dtype the group shares by construction
+                if (r.ownFile() || r.isGroup() || r.isDir()) memberCells = false;
+                if (r.e->hasMeta != g->hasMeta || r.e->dtype != g->dtype) memberCells = false;
+            }
+            bool same = g && expanded == g->members;
+            bool nogroups = true;
+            for (const auto& r : fv) if (r.isGroup()) nogroups = false;
+            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d sequence row(s), "
+                            "'%s' x%d], flat %d row(s), members match=%d, no group rows "
+                            "when flat=%d, member size/mtime blank=%d: %s\n",
+                    dir.c_str(), (int)gv.size(), gRows, g ? g->name.c_str() : "?",
+                    g ? (int)g->members.size() : 0, (int)fv.size(), same ? 1 : 0,
+                    nogroups ? 1 : 0, memberCells ? 1 : 0,
+                    (sizes && gRows == nGroups && nGroups >= 1 && same && nogroups &&
+                     memberCells) ? "ok" : "FAIL");
+            if (!(sizes && gRows == nGroups && nGroups >= 1 && same && nogroups && memberCells))
+                ok = false;
+        }
+        fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
         stopMeasureWorker();
