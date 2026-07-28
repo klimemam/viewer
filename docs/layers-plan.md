@@ -115,5 +115,8 @@
    結果は `not opened` タグ付き」(項目 4)。
 4. Close/frame 欄に例外を明記「`Ctrl+Alt+W` でその 1 枚だけ閉じる逃げ道。既定は stack ごと」。
 5. 命名の規則に追記「桁 run が 2 本以上変化する場合、peer は `?` を 2 本並べず stack を分割する」(項目 6)。
-6. マトリクス リニアリティ/batch 欄「fit の対象集合」は**現状不可**(`linRecompute` は `app.seqs` 全体を
-   走査し batch フィルタを持たない)。「将来(現在は全 stack が対象)」への格下げを提案。
+6. ~~マトリクス リニアリティ/batch 欄「fit の対象集合」は**現状不可**(`linRecompute` は `app.seqs` 全体を
+   走査し batch フィルタを持たない)。「将来(現在は全 stack が対象)」への格下げを提案。~~
+   **撤回** — [series-plan.md](series-plan.md) §7 項目 7 のとおり phase 2 で解消した。`linRecompute(int
+   seriesId)` は `Series::members` だけを回り、単位も series が持つ。fit の対象集合は batch ではなく
+   **series**、というのが正典の答えである(batch は構造を主張しない)。
