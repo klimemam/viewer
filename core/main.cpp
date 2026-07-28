@@ -695,6 +695,7 @@ struct App {
         uint32_t gen = 0;             // closeAll bumps the generation; stale
                                       // results must not graft onto a new list
         bool low = false;             // preview buffering: yields to registered opens
+        size_t bytes = 0;             // what this frame will occupy once resident
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -706,11 +707,19 @@ struct App {
         std::string url, name;
         int frame = 0, seqId = 0, seqIndex = 0;
         uint32_t gen = 0;
+        size_t bytes = 0;             // what was committed for it, to give back
     };
     std::atomic<uint32_t> rfGen{ 0 };
     std::thread rfThread;
     std::atomic<bool> rfStop{ false };
     std::atomic<int> rfPending{ 0 };
+    // Bytes COMMITTED but not yet resident. residentImageBytes() counts only
+    // app.images, so two opens a second apart each sized their prefetch against
+    // a budget the other had already spent - each enqueueing a full budget's
+    // worth. rbOpenQueue serialises the scan-open path for exactly this reason
+    // ("the next stack starts only when the fetcher is idle"), but every
+    // browser open and every session-restore line bypasses that queue.
+    std::atomic<size_t> rfBytesInFlight{ 0 };
     std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
     std::mutex rfMtx;
     std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
@@ -1391,6 +1400,7 @@ static void rfWorker() {
         d.url = job.url; d.name = job.name;
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         d.gen = job.gen;
+        d.bytes = job.bytes;
         std::string host, rpath, err;
         int port = 0;
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
@@ -1442,6 +1452,7 @@ static void rfEnqueue(App::RFetchJob job) {
         std::lock_guard<std::mutex> lk(app.rfMtx);
         app.rfPending++;
         app.rfTotal++;
+        app.rfBytesInFlight += job.bytes;
         // an unpromoted preview is only ALLOWED the link when nothing a user
         // registered is waiting: normal jobs enter ahead of every low one
         if (job.low) {
@@ -1475,6 +1486,12 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     App::RFetchJob j;
     j.url = d->remoteUrl; j.frame = d->remoteFrame; j.uid = d->uid;
     j.low = low;
+    // the full frame REPLACES the decimated one, so only the growth is new
+    {
+        size_t have = d->data.size() * sizeof(float);
+        size_t full = have * (size_t)d->remoteStep * d->remoteStep;
+        j.bytes = full > have ? full - have : 0;
+    }
     rfEnqueue(std::move(j));
 }
 
@@ -1489,8 +1506,10 @@ static void pumpRemoteFetch() {
     for (auto& d : batch) {
         if (d.gen != app.rfGen) continue;   // outlived a Close All: drop entirely
         app.rfPending--;
+        app.rfBytesInFlight -= std::min(app.rfBytesInFlight.load(), d.bytes);
         app.rfFetched++;
         if (app.rfPending <= 0) {
+            app.rfBytesInFlight = 0;        // nothing outstanding: no drift
             if (app.rfFetched > 1)
                 fprintf(stderr, "remote: fetch complete (%d items)\n", app.rfFetched.load());
             app.rfTotal = 0;
@@ -1955,11 +1974,15 @@ static void closeStack(int seqId) {
         // arrival instead (seqInfo(d.seqId) == nullptr). Both are needed.
         std::lock_guard<std::mutex> lk(app.rfMtx);
         int removed = 0;
+        size_t freed = 0;
         for (auto it = app.rfQueue.begin(); it != app.rfQueue.end();)
-            if (it->seqId == seqId) { it = app.rfQueue.erase(it); removed++; }
+            if (it->seqId == seqId) { freed += it->bytes; it = app.rfQueue.erase(it); removed++; }
             else ++it;
         app.rfPending -= removed;
-        if (app.rfPending <= 0) { app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; }
+        app.rfBytesInFlight -= std::min(app.rfBytesInFlight.load(), freed);
+        if (app.rfPending <= 0) {
+            app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; app.rfBytesInFlight = 0;
+        }
     }
     // rbOpenQueue entries carry no seqId yet, so a stack whose FOLDER is still
     // queued may open later regardless - accepted; closeBatch removes those by
@@ -2248,6 +2271,7 @@ static void closeAll() {
         app.rfPending = 0;
         app.rfTotal = 0;
         app.rfFetched = 0;
+        app.rfBytesInFlight = 0;
     }
 }
 
@@ -3894,6 +3918,12 @@ static size_t residentImageBytes() {
     size_t n = 0;
     for (const auto& d : app.images) n += d->data.size() * sizeof(float);
     return n;
+}
+// What the budget has to reckon with: what has landed PLUS what has been
+// committed and is still on the wire. Sizing a prefetch against residency
+// alone lets N overlapping opens each claim the whole budget.
+static size_t claimedImageBytes() {
+    return residentImageBytes() + app.rfBytesInFlight.load();
 }
 
 // split a stem into alternating text / digit segments: "flat_0007_640x480" ->
@@ -6502,7 +6532,7 @@ static void openRemote(const std::string& url, bool asPreview) {
         // policy allows the server to compute (auto/server for remote data)
         maybeRequestServerTemporal(si.id);
         size_t perFrame = (size_t)m.w * m.h * m.ch * sizeof(float);
-        size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+        size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
         int fit = (int)std::min<size_t>((size_t)m.frames - 1, perFrame ? room / perFrame : 0);
         for (int i = 1; i <= fit; i++) {
             App::RFetchJob j;
@@ -6511,6 +6541,7 @@ static void openRemote(const std::string& url, bool asPreview) {
             j.frame = i;
             j.seqId = si.id;
             j.seqIndex = i;
+            j.bytes = perFrame;       // committed against the budget until it lands
             rfEnqueue(std::move(j));
         }
         if (fit < m.frames - 1) {
@@ -6554,7 +6585,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
     if (first->remoteStep > 1)                    // preview dims: scale the estimate
         perFrame *= (size_t)first->remoteStep * first->remoteStep;
-    size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+    size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
     int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
     for (int i = 1; i <= fit; i++) {
         App::RFetchJob j;
@@ -6562,6 +6593,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         j.name = baseName(files[i]);
         j.seqId = si.id;
         j.seqIndex = i;
+        j.bytes = perFrame;
         rfEnqueue(std::move(j));
     }
     if (fit < (int)files.size() - 1) {
@@ -6607,7 +6639,7 @@ static void promotePreview(ImageDoc* d) {
         maybeRequestServerTemporal(si.id);
         size_t perFrame = (size_t)d->w * d->h * d->ch * sizeof(float) *
                           (d->remoteStep > 1 ? (size_t)d->remoteStep * d->remoteStep : 1);
-        size_t room = seqMemBudget() - std::min(seqMemBudget(), residentImageBytes());
+        size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
         int fit = (int)std::min<size_t>((size_t)d->remoteFrames - 1,
                                         perFrame ? room / perFrame : 0);
         for (int i = 1; i <= fit; i++) {
@@ -6617,6 +6649,7 @@ static void promotePreview(ImageDoc* d) {
             j.seqId = si.id;
             j.seqIndex = i;
             j.frame = i;
+            j.bytes = perFrame;
             rfEnqueue(std::move(j));
         }
     }
@@ -12398,6 +12431,7 @@ static void drawFileList() {
             std::lock_guard<std::mutex> lk(app.rfMtx);
             app.rfQueue.clear();
             app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0;
+            app.rfBytesInFlight = 0;
         }
     }
     if (app.rfPending > 0)
@@ -16707,6 +16741,79 @@ int main(int argc, char** argv) {
                     app.temporal[0].nPl, pooled);
             check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
                   "V10 the mosaic is part of the cache key");
+            closeAll();
+        }
+
+        {   // ---- V14: the memory budget counts what is COMMITTED ------------
+            // residentImageBytes() sums app.images only, so frames already
+            // enqueued and in transfer counted as zero. Two browser opens a
+            // second apart each computed the same free room and each committed
+            // a full budget's worth. rbOpenQueue serialises the scan path for
+            // exactly this reason; every direct open bypasses it.
+            closeAll();
+            std::string scanroot2 = g_verifySelftest;
+            std::replace(scanroot2.begin(), scanroot2.end(), '\\', '/');
+            size_t sl2 = scanroot2.find_last_of('/');
+            scanroot2 = (sl2 == std::string::npos ? std::string(".")
+                                                  : scanroot2.substr(0, sl2)) + "/rb/scanroot";
+            app.rbrowse = App::RemoteBrowse{};
+            startRemote("local://" + scanroot2);
+            double t0b = glfwGetTime();
+            while (glfwGetTime() - t0b < 120.0) {
+                pumpRemoteBrowse();
+                if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
+                if (!app.rbrowse.err.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<std::string> f10;
+            for (const auto& e : app.rbrowse.entries)
+                if (e.dir && e.name == "10lx") {
+                    // list it, then take its frames
+                    remoteBrowseTo(scanroot2 + "/10lx");
+                    double t1b = glfwGetTime();
+                    while (glfwGetTime() - t1b < 120.0) {
+                        pumpRemoteBrowse();
+                        if (app.rbrowse.dir == scanroot2 + "/10lx") break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    for (const auto& e2 : app.rbrowse.entries)
+                        if (e2.group)
+                            for (const auto& m : e2.members)
+                                f10.push_back(app.rbrowse.dir + "/" + m);
+                    break;
+                }
+            if (f10.size() < 3) {
+                fprintf(stderr, "verifyselftest: V14 no remote stack under %s\n",
+                        scanroot2.c_str());
+                ok = false;
+            } else {
+                size_t res0 = residentImageBytes(), claim0 = claimedImageBytes();
+                openRemoteStack("", f10, "10lx/x", 0);        // no pumping: all in flight
+                size_t res1 = residentImageBytes(), claim1 = claimedImageBytes();
+                bool budgetOk = claim1 > res1 && app.rfBytesInFlight > 0 &&
+                                claim0 == res0;
+                fprintf(stderr, "verifyselftest: V14 after one stack open with nothing "
+                                "pumped: resident %zu -> %zu B, claimed %zu -> %zu B, "
+                                "in flight %zu B (%d job(s))\n",
+                        res0, res1, claim0, claim1, app.rfBytesInFlight.load(),
+                        app.rfPending.load());
+                check(budgetOk, "V14 committed-but-unlanded bytes count against the budget");
+                // ...and they are given back as the frames land
+                double t2b = glfwGetTime();
+                while (glfwGetTime() - t2b < 60.0 && app.rfPending > 0) {
+                    pumpRemoteFetch();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                fprintf(stderr, "verifyselftest: V14 after draining: in flight %zu B, "
+                                "claimed == resident: %d\n",
+                        app.rfBytesInFlight.load(),
+                        claimedImageBytes() == residentImageBytes() ? 1 : 0);
+                check(app.rfBytesInFlight == 0 &&
+                      claimedImageBytes() == residentImageBytes(),
+                      "V14 the commitment is released when the frame lands");
+            }
+            stopRbWorker();
+            app.rbStop = false;
             closeAll();
         }
 
