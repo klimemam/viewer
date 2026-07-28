@@ -3713,7 +3713,6 @@ static void drawFolderPickModal() {
     ImGui::Separator();
 
     // footer: mode row + status/warning line(s) + button row, measured not guessed
-    std::string err;
     std::vector<std::string> shapes;               // distinct known shapes in selection
     bool mixedRawNpy = false;
     {
