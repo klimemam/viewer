@@ -372,6 +372,36 @@ struct App {
     struct Batch { int id; std::string name; };
     std::vector<Batch> batches;
     int nextBatchId = 1;
+    // ---- series (系列): the stacks of ONE swept parameter (docs/terminology.md) --
+    // A batch makes no structural claim; a series does. Its members carry a
+    // PARAMETER VALUE and an ORDER, and the whole run is one measurement - so
+    // the parameter's name, its unit and the kind of fit live HERE, not on the
+    // stack and not once per application.
+    //
+    // Series::members is the ONLY truth about membership. There is deliberately
+    // no SeqInfo::seriesId: two places holding the same fact drift apart, and
+    // the reverse lookup (seriesOfStack) is a walk over a handful of series.
+    struct Series {
+        enum { KLinearity = 0, KPtc = 1, KTemperature = 2, KOther = 3 };
+        int id = 0, batchId = 0;      // the batch it lives in - strictly ONE
+        std::string name;             // "<batch> 掃引" until a human names it
+        std::string paramName;        // "illuminance" / "exposure" / ...
+        // Empty = NOT SET, and that is the default: assuming "lx" would put a
+        // unit on an axis nobody chose. No unit, no fit (see seriesCanFit).
+        char unit[16] = "";
+        int kind = KLinearity;
+        // value NaN = not set. NEVER treated as 0 - it is left out of the fit
+        // and reads as "unset" on screen.
+        struct Member {
+            int seqId = 0;
+            double value = std::numeric_limits<double>::quiet_NaN();
+            bool include = true;
+        };
+        std::vector<Member> members;  // order = display order (sorting is a button)
+    };
+    std::vector<Series> series;
+    int nextSeriesId = 1;
+    int curSeriesId = 0;              // which series the Linearity panel shows
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
     // Where that preview came from, so the browser can step through the
@@ -1522,6 +1552,129 @@ static App::SeqInfo* seqInfo(int id);             // fwd
 static void stopSequenceLoader();                 // fwd
 static void pruneEmptyBatches();                  // fwd (defined with the moves)
 
+// ---- series (系列), the model (docs/terminology.md, docs/series-plan.md) -------
+// No UI here on purpose: the invariants have to hold before anything can draw
+// them. Series are few and members are tens, so every lookup is a plain walk.
+static App::Series* seriesById(int id) {
+    for (auto& s : app.series) if (s.id == id) return &s;
+    return nullptr;
+}
+// Reverse membership. The canon: a stack belongs to AT MOST ONE series, so the
+// first hit is the only hit (seriesAudit proves it, addToSeries maintains it).
+static App::Series* seriesOfStack(int seqId) {
+    if (seqId == 0) return nullptr;
+    for (auto& s : app.series)
+        for (const auto& m : s.members)
+            if (m.seqId == seqId) return &s;
+    return nullptr;
+}
+// The batch a stack is in, read off its frames (the frames own batchId).
+// 0 = the stack has no frames resident, so it claims no batch.
+static int batchOfStack(int seqId) {
+    for (const auto& d : app.images) if (d->seqId == seqId) return d->batchId;
+    return 0;
+}
+static std::string batchNameOf(int batchId) {
+    for (const auto& b : app.batches) if (b.id == batchId) return b.name;
+    return {};
+}
+// Default name until a human gives it one (docs/terminology.md).
+static int newSeries(int batchId, const std::string& name) {
+    App::Series s;
+    s.id = app.nextSeriesId++;
+    s.batchId = batchId;
+    s.name = name.empty() ? batchNameOf(batchId) + " 掃引" : name;
+    app.series.push_back(std::move(s));
+    app.imagesRev++;                  // the Files grouping caches on this
+    return app.series.back().id;
+}
+// Drop one stack from whatever series holds it. Returns the series' id, or 0.
+static int removeFromSeries(int seqId) {
+    for (auto& s : app.series)
+        for (auto it = s.members.begin(); it != s.members.end(); ++it)
+            if (it->seqId == seqId) {
+                s.members.erase(it);
+                app.imagesRev++;
+                return s.id;
+            }
+    return 0;
+}
+// Add a stack to a series. Fails (false) when the stack is not in the series'
+// batch - the canon's strict containment, enforced rather than papered over:
+// the caller's answer is "Move to batch first", never "we widened the series".
+// Adding a stack that already sits in another series MOVES it (at most one).
+static bool addToSeries(int seriesId, int seqId, double value, bool include = true) {
+    App::Series* S = seriesById(seriesId);
+    if (!S || seqId == 0 || !seqInfo(seqId)) return false;
+    int b = batchOfStack(seqId);
+    if (b != S->batchId) return false;
+    for (auto& m : S->members)
+        if (m.seqId == seqId) { m.value = value; m.include = include; return true; }
+    removeFromSeries(seqId);
+    S->members.push_back({ seqId, value, include });
+    app.imagesRev++;
+    return true;
+}
+// A series with nothing in it is not a work in progress, it is litter: the
+// creation path leaves one member behind, closes take the rest away.
+static void pruneEmptySeries() {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->members.empty()) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+}
+// Points a fit would actually use: included, value SET (NaN is "unset", never
+// 0), and the stack still there.
+static int seriesFitPoints(const App::Series& S) {
+    int n = 0;
+    for (const auto& m : S.members)
+        if (m.include && std::isfinite(m.value) && seqInfo(m.seqId)) n++;
+    return n;
+}
+// Two points and a named unit. A series of one is perfectly legal (it is being
+// built); it just cannot be fitted yet. An unset unit is the same kind of "not
+// yet" - fitting without one would print numbers per nothing.
+static bool seriesCanFit(const App::Series& S) {
+    return S.unit[0] != '\0' && seriesFitPoints(S) >= 2;
+}
+// Every invariant the canon states, checked exhaustively. Used by
+// --series-selftest after every mutation; cheap enough to call from anywhere.
+static bool seriesAudit(std::string& why) {
+    std::vector<int> seen;
+    for (const auto& S : app.series) {
+        if (S.members.empty()) { why = "series '" + S.name + "' has no members"; return false; }
+        bool haveBatch = false;
+        for (const auto& b : app.batches) if (b.id == S.batchId) haveBatch = true;
+        if (!haveBatch) { why = "series '" + S.name + "' points at a dead batch"; return false; }
+        for (const auto& m : S.members) {
+            if (!seqInfo(m.seqId)) {
+                why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                      " does not exist";
+                return false;
+            }
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId != S.batchId) {
+                    why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
+                          " has a frame in batch " + std::to_string(d->batchId) +
+                          " (series batch " + std::to_string(S.batchId) + ")";
+                    return false;
+                }
+            for (int s : seen)
+                if (s == m.seqId) {
+                    why = "stack " + std::to_string(m.seqId) + " is in two series";
+                    return false;
+                }
+            seen.push_back(m.seqId);
+        }
+    }
+    why.clear();
+    return true;
+}
+
 // Close a set of images by index: erase in descending order so the indices stay
 // valid, one forget per cache that can name them, current re-picked at the end.
 static void closeImages(std::vector<int> idxs) {
@@ -1585,6 +1738,10 @@ static void closeStack(int seqId) {
     closeImages(framesOfSeq(seqId));
     for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
         if (it->id == seqId) { app.seqs.erase(it); break; }
+    // the stack is gone, so it is not a member of anything anymore; a series
+    // that held nothing else goes with it (docs/series-plan.md invariant 3)
+    removeFromSeries(seqId);
+    pruneEmptySeries();
     for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
         if (it->seqId == seqId) it = app.lin.rows.erase(it);
         else ++it;
@@ -1595,8 +1752,18 @@ static void closeStack(int seqId) {
 }
 
 // Close a batch: every stack and loose frame in it, plus the queued opens that
-// would resurrect it the moment the fetcher goes idle.
+// would resurrect it the moment the fetcher goes idle. A series lives in
+// exactly one batch, so the batch's series go too - Close on a batch is the
+// canon's "discard the contents", not "ungroup".
 static void closeBatch(int batchId) {
+    for (auto it = app.series.begin(); it != app.series.end();)
+        if (it->batchId == batchId) {
+            if (app.curSeriesId == it->id) app.curSeriesId = 0;
+            it = app.series.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
     std::vector<int> seqIds;
     for (const auto& d : app.images)
         if (d->batchId == batchId && d->seqId != 0 &&
@@ -1670,7 +1837,19 @@ static void pruneEmptyBatches() {
 
 // Move a STACK between batches - the whole stack, per the canon's containment
 // (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
+// A member moved out ALONE leaves its series: series ⊂ batch is strict, and the
+// canon says say so rather than forbid it. Moving the series itself is a
+// different operation (it carries every member and its own batchId along).
 static void moveStackToBatch(int seqId, int batchId) {
+    if (App::Series* S = seriesOfStack(seqId))
+        if (S->batchId != batchId) {
+            std::string sn = S->name;
+            App::SeqInfo* si = seqInfo(seqId);
+            removeFromSeries(seqId);
+            pruneEmptySeries();
+            toast((si ? si->name : std::string("stack")) + " left series \"" + sn +
+                  "\" (moved to another batch)");
+        }
     for (int idx : framesOfSeq(seqId)) app.images[idx]->batchId = batchId;
     app.imagesRev++;
     pruneEmptyBatches();
@@ -1696,6 +1875,10 @@ static void closeAll() {
         if (d->tex) glDeleteTextures(1, &d->tex);
     app.images.clear();
     app.seqs.clear();
+    // Series name stacks that no longer exist; they go with them (and with the
+    // batches below - a series cannot outlive its batch).
+    app.series.clear();
+    app.curSeriesId = 0;
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
@@ -11457,6 +11640,7 @@ static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Brows
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
+static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
 
 static void printUsage() {
     printf(
@@ -11491,6 +11675,7 @@ static void printUsage() {
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
+        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -11603,6 +11788,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
+        } else if (a == "--series-selftest") {
+            g_seriesSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -12972,6 +13159,174 @@ int main(int argc, char** argv) {
         fprintf(stderr, "batchselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        return ok ? 0 : 1;
+    }
+
+    // The series (系列) layer - the MODEL, with no UI behind it (phase 1 draws
+    // nothing at all). Every invariant docs/terminology.md and docs/series-plan.md
+    // state, checked exhaustively (seriesAudit) after every mutation, on the real
+    // load path: Open Folder -> picker -> stacks.
+    if (!g_seriesSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 600.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](const char* what, bool cond) {
+            fprintf(stderr, "seriesselftest: %-62s %s\n", what, cond ? "ok" : "FAILED");
+            if (!cond) ok = false;
+        };
+        auto audit = [&]() {
+            std::string why;
+            if (seriesAudit(why)) return true;
+            fprintf(stderr, "seriesselftest: AUDIT: %s\n", why.c_str());
+            return false;
+        };
+        openFolder(g_seriesSelftest);
+        loadAll();
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        if (sids.size() < 4 || app.images.empty()) {
+            fprintf(stderr, "seriesselftest: need >= 4 stacks under %s, got %d\n",
+                    g_seriesSelftest.c_str(), (int)sids.size());
+            return 1;
+        }
+        int b0 = app.images[0]->batchId;
+
+        // ---- 1. build one series out of every stack of one batch --------------
+        int S1 = newSeries(b0, "");                 // "" = the canon's default name
+        {
+            App::Series* S = seriesById(S1);
+            S->paramName = "illuminance";
+            snprintf(S->unit, sizeof S->unit, "lx");
+        }
+        int added = 0;
+        for (int s : sids)
+            if (addToSeries(S1, s, extractLevelFromName(seqInfo(s)->name))) added++;
+        App::Series* S = seriesById(S1);
+        int valued = 0, batchOk = 0;
+        for (const auto& m : S->members) {
+            if (std::isfinite(m.value)) valued++;
+            for (const auto& d : app.images)
+                if (d->seqId == m.seqId && d->batchId == S->batchId) { batchOk++; break; }
+        }
+        fprintf(stderr, "seriesselftest: created series '%s' in batch '%s': %d member(s), "
+                        "%d valued, param '%s' unit '%s' kind %d\n",
+                S->name.c_str(), batchNameOf(b0).c_str(), (int)S->members.size(), valued,
+                S->paramName.c_str(), S->unit, S->kind);
+        check("every stack of the batch joined", added == (int)sids.size() &&
+                                                 S->members.size() == sids.size());
+        check("every member's value came from its name", valued == (int)S->members.size());
+        check("every member's frames are in the series' batch", batchOk == (int)S->members.size());
+        check("default name is \"<batch> 掃引\"", S->name == batchNameOf(b0) + " 掃引");
+        check("invariant 1: audit after create", audit());
+        check("N members + a unit -> seriesCanFit", seriesCanFit(*S));
+        {   // the unit is never assumed: without one there is no fit, ever
+            char keep[16];
+            snprintf(keep, sizeof keep, "%s", S->unit);
+            S->unit[0] = '\0';
+            check("unit unset -> no fit (never assumed)", !seriesCanFit(*S));
+            snprintf(S->unit, sizeof S->unit, "%s", keep);
+        }
+
+        // ---- invariant 6: an unset value is UNSET, never 0 --------------------
+        int ptsAll = seriesFitPoints(*S);
+        {
+            double keep = S->members[0].value;
+            S->members[0].value = std::numeric_limits<double>::quiet_NaN();
+            int nanPts = seriesFitPoints(*S);
+            S->members[0].value = keep;
+            S->members[0].include = false;
+            int excPts = seriesFitPoints(*S);
+            S->members[0].include = true;
+            fprintf(stderr, "seriesselftest: fit points %d -> %d with one value unset, "
+                            "%d with one excluded\n", ptsAll, nanPts, excPts);
+            check("invariant 6: an unset value leaves the fit", nanPts == ptsAll - 1);
+            check("an excluded member leaves the fit", excPts == ptsAll - 1);
+            check("both are reversible", seriesFitPoints(*S) == ptsAll);
+        }
+
+        // ---- invariant 2: a stack is in AT MOST ONE series --------------------
+        int S2 = newSeries(b0, "second");
+        {
+            int moved = sids[0];
+            bool didMove = addToSeries(S2, moved, 1.0);
+            S = seriesById(S1);
+            App::Series* T = seriesById(S2);
+            fprintf(stderr, "seriesselftest: stack %d added to '%s': '%s' now %d member(s), "
+                            "'%s' %d\n", moved, T->name.c_str(), S->name.c_str(),
+                    (int)S->members.size(), T->name.c_str(), (int)T->members.size());
+            check("invariant 2: adding elsewhere MOVES the stack",
+                  didMove && T->members.size() == 1 && S->members.size() == sids.size() - 1 &&
+                  seriesOfStack(moved) == T);
+            check("invariant 5: a single member cannot be fitted", !seriesCanFit(*T));
+            check("invariant 1: audit after the move", audit());
+            addToSeries(S1, moved, extractLevelFromName(seqInfo(moved)->name));
+            pruneEmptySeries();
+            check("emptied series is pruned", seriesById(S2) == nullptr &&
+                  seriesById(S1)->members.size() == sids.size());
+        }
+
+        // ---- invariant 4: a member moved out alone LEAVES the series ----------
+        {
+            int other = newBatch(uniqueBatchName("other"));
+            int mv = sids[1];
+            size_t before = seriesById(S1)->members.size();
+            app.toast.clear();
+            moveStackToBatch(mv, other);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: moveStackToBatch(%d -> '%s'): %d -> %d member(s), "
+                            "toast \"%s\"\n", mv, "other", (int)before,
+                    (int)S->members.size(), app.toast.c_str());
+            check("invariant 4: the moved stack left the series",
+                  S->members.size() == before - 1 && seriesOfStack(mv) == nullptr);
+            check("...and the screen was told", app.toast.find("left series") != std::string::npos);
+            check("invariant 1: audit after the move-to-batch", audit());
+            bool crossed = addToSeries(S1, mv, 1.0);
+            fprintf(stderr, "seriesselftest: addToSeries across batches returned %d\n",
+                    crossed ? 1 : 0);
+            check("a stack of another batch cannot join", !crossed && seriesOfStack(mv) == nullptr);
+        }
+
+        // ---- invariant 3: closeStack removes the member ----------------------
+        {
+            int cl = seriesById(S1)->members.front().seqId;
+            size_t before = seriesById(S1)->members.size();
+            closeStack(cl);
+            S = seriesById(S1);
+            fprintf(stderr, "seriesselftest: closeStack(%d): %d -> %d member(s)\n",
+                    cl, (int)before, S ? (int)S->members.size() : -1);
+            check("invariant 3: closeStack drops the member",
+                  S && S->members.size() == before - 1 && seriesOfStack(cl) == nullptr);
+            check("invariant 1: audit after closeStack", audit());
+        }
+
+        // ---- invariant 5: one member is legal, just not fittable --------------
+        while (seriesById(S1) && seriesById(S1)->members.size() > 1)
+            removeFromSeries(seriesById(S1)->members.back().seqId);
+        S = seriesById(S1);
+        check("a one-member series is legal", S != nullptr && S->members.size() == 1);
+        check("invariant 5: ...and seriesCanFit() is false", S && !seriesCanFit(*S));
+
+        // ---- invariant 3: closeBatch takes its series with it -----------------
+        {
+            int before = (int)app.series.size();
+            closeBatch(b0);
+            fprintf(stderr, "seriesselftest: closeBatch(%d): %d -> %d series\n",
+                    b0, before, (int)app.series.size());
+            check("invariant 3: closeBatch discards its series",
+                  seriesById(S1) == nullptr && app.series.empty());
+            check("invariant 1: audit after closeBatch", audit());
+        }
+        fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
         return ok ? 0 : 1;
     }
 
