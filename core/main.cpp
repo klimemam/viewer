@@ -3122,9 +3122,12 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
     }
     if (cands.size() < 2) return out;
 
-    // pick the digit field that varies (most distinct values); later field wins ties
+    // The frame axis is the LAST digit field that varies among the siblings -
+    // capture software puts the counter last (frame_001, IMG_0001, lv000_f02).
+    // Picking the field with the most distinct values instead made a folder of
+    // 10 illuminances x 3 frames group by ILLUMINANCE, so each "stack" spanned
+    // ten levels and its sigma_t meant nothing. The peer uses the same rule.
     int best = -1;
-    size_t bestCount = 0;
     for (size_t k = 0; k < segs.size(); k++) {
         if (!segs[k].digit) continue;
         std::vector<std::string> vals;
@@ -3139,7 +3142,7 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
             if (!dup) vals.push_back(c.segs[k].s);
         }
         (void)othersMatch;
-        if (vals.size() >= 2 && vals.size() >= bestCount) { bestCount = vals.size(); best = (int)k; }
+        if (vals.size() >= 2) best = (int)k;     // keep overwriting: the last wins
     }
     if (best < 0) return out;
 

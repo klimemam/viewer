@@ -394,8 +394,8 @@ static std::vector<SegRun> segRuns(const std::string& stem) {
 //
 // Two stages. Stage 1 buckets by npySegKey (every digit run collapsed) - cheap
 // and unchanged. Stage 2 decides, PER BUCKET, which digit run is the frame
-// axis: the varying run with the most distinct values, later run on ties (the
-// client's findSequenceSiblings rule). The pattern then keeps every other
+// axis: the LAST varying run (the client's findSequenceSiblings rule). The
+// pattern then keeps every other
 // digit run literal - "gain10_???.npy", never "gain??_???.npy": '?' means
 // "varies along the stack", and a gain digit under a '?' claims two gains got
 // averaged. When a SECOND run also varies, the bucket splits by the other
@@ -462,7 +462,12 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         }
         int frameAxis = -1, varying = 0;
         if (segOk) {
-            size_t bestDistinct = 0;
+            // The frame axis is the LAST varying run, not the one with the most
+            // distinct values. Capture software puts the counter last -
+            // frame_001, IMG_0001, lv000_f02 - and a condition run can easily
+            // outnumber the frames: 10 illuminances x 3 frames grouped by
+            // illuminance, producing three "stacks" each spanning 10 levels,
+            // which is exactly the condition-mixed stack the canon forbids.
             for (size_t r = 0; r < nRuns; r++) {
                 std::vector<std::string> distinct;
                 for (const auto& v : vals) {
@@ -472,10 +477,7 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
                 }
                 if (distinct.size() < 2) continue;
                 varying++;
-                if (distinct.size() >= bestDistinct) {   // >= : later run wins ties
-                    bestDistinct = distinct.size();
-                    frameAxis = (int)r;
-                }
+                frameAxis = (int)r;           // keep overwriting: the last one wins
             }
         }
         if (!segOk || frameAxis < 0) {        // cannot analyze: stage-1 grouping
