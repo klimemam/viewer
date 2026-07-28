@@ -13627,6 +13627,11 @@ int main(int argc, char** argv) {
                     app.rbBusy || app.mPending > 0 ||
                     app.openDlg || app.saveDlg ||
                     app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
+                    // the A/B step throttle is a DEADLINE, not an event: without
+                    // a frame after it expires, B's statistics stay stale until
+                    // the user happens to move the mouse (the input wake tail is
+                    // 0.25 s, the throttle 0.30, and low-bandwidth has no tail)
+                    frameT0 < app.abStepBusyUntil ||
                     // auto blink alternates on a timer, so it needs frames with
                     // no input at all - same case as a background load
                     (app.compareMode == App::CmpFlip && app.flipAuto);
@@ -13708,6 +13713,7 @@ int main(int argc, char** argv) {
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
+                working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
