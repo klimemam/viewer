@@ -58,6 +58,30 @@ jobs:
           awk -v m="$med" 'BEGIN { exit (m > 50 ? 1 : 0) }' \
             || { echo "frame time regressed badly (>50 ms)"; exit 1; }
 
+      # viewer-serve gets copied to whatever compute box the user has, and those
+      # run old distros: a binary linked against the runner's glibc 2.39 dies
+      # there with "GLIBC_2.38 not found" (reproduced on the user's server).
+      # Rebuild it - and the plugins MEASURE loads - inside Ubuntu 20.04
+      # (glibc 2.31), which covers everything from RHEL 8 up.
+      - name: Rebuild viewer-serve for old glibc (Ubuntu 20.04 container)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
+            apt-get update -qq >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
+            g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -Icore -Iinclude -Ibuild/_deps/miniz-src \
+                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp \
+                build/_deps/miniz-src/miniz.c \
+                -o build/viewer-serve \
+                -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
+            for f in plugins/*.c; do
+              gcc -O2 -shared -fPIC -Iinclude "$f" \
+                  -o "build/plugins/$(basename "${f%.c}").so" -lm
+            done'
+          ./build/viewer-serve --help
+          echo "glibc ceiling of the compat binary:"
+          objdump -T build/viewer-serve | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+
       - name: Package (Windows exe + plugins)
         if: runner.os == 'Windows'
         shell: pwsh

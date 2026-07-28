@@ -3520,15 +3520,28 @@ static std::string updateScript() {
 // Install the peer, best method first. Returns a human-readable log either way.
 static bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
     std::string out, err;
-    // 1. what OS is over there, and is the peer already in place?
+    // 1. what machine is over there, and is a WORKING peer already in place?
+    //    (--help must actually run: a peer that was copied but dies on a glibc
+    //    mismatch reported only "connection lost" before this check existed)
     if (!remote::runSshScript(host, port,
-            "uname -s\n"
-            "[ -x \"$HOME/.viewer/viewer-serve\" ] && echo HAVE_PEER || echo NO_PEER\n",
+            "uname -s; uname -m\n"
+            "if \"$HOME/.viewer/viewer-serve\" --help >/dev/null 2>&1; then "
+            "echo HAVE_PEER; else echo NO_PEER; fi\n",
             out, err, 20.0)) {
         log = "cannot reach " + host + ": " + err;
         return false;
     }
     if (!force && out.find("HAVE_PEER") != std::string::npos) { log = "peer already installed"; return true; }
+    bool isLinux = out.find("Linux") != std::string::npos;
+    bool isDarwin = out.find("Darwin") != std::string::npos;
+    if ((isLinux && out.find("x86_64") == std::string::npos) ||
+        (isDarwin && out.find("arm64") == std::string::npos) ||
+        (!isLinux && !isDarwin)) {
+        log = "no prebuilt peer for this machine:\n" + out +
+              "(binaries exist for Linux x86_64 and macOS arm64; build viewer-serve "
+              "from source on the server and place it at ~/.viewer/viewer-serve)";
+        return false;
+    }
 
     // 2. hand it our own copy - no network and no credentials needed on the far
     //    side, which is what a lab compute box usually has
@@ -3543,6 +3556,19 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
                 "mv ~/.viewer/viewer-serve.new ~/.viewer/viewer-serve && echo VIEWER_SERVE_OK'",
                 bytes, o2, e2, 120.0);
             if (ok && o2.find("VIEWER_SERVE_OK") != std::string::npos) {
+                // PROVE it runs before calling this a success: a binary built on
+                // a newer distro dies on glibc with nothing but "connection
+                // lost" further down. Surface the loader's actual words.
+                std::string vout, verr3;
+                remote::runSshScript(host, port,
+                    "\"$HOME/.viewer/viewer-serve\" --help 2>&1 || true\n",
+                    vout, verr3, 15.0);
+                if (vout.find("viewer-serve") == std::string::npos) {
+                    log = "copied to " + host + ", but it does not run there:\n" + vout +
+                          "(usually an OS/glibc mismatch - update viewer-bin to get the "
+                          "compat build, or build viewer-serve on the server)";
+                    return false;
+                }
                 // plugins too, so server-side MEASURE has the same analyzers
                 std::filesystem::path pdir = std::filesystem::u8path(local).parent_path() / "plugins";
                 std::error_code ec;
