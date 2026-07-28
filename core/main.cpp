@@ -3308,8 +3308,14 @@ static void openFolder(const std::string& path) {
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
         toast("scan stopped at 256 sequences - narrow the folder or use the filters", true);
-    // one group, or "always load": no point asking
-    if (groups.size() == 1 || app.seqLoadMode == 1) { enqueueGroups(std::move(groups)); return; }
+    // One group opens outright. Several ALWAYS ask - including under "Always
+    // load folder", which used to bypass this. That setting is remembered from
+    // a long-ago "Load sequence?" prompt, and silently swallowing the picker
+    // because of it read as "the dialog stopped appearing" (verbatim, twice):
+    // the include/exclude filters ARE the way a capture tree gets narrowed.
+    // "Always load folder" keeps its original job - loading a single file's
+    // numbered siblings without asking - and no longer mutes this dialog.
+    if (groups.size() == 1) { enqueueGroups(std::move(groups)); return; }
     app.folderPick.clear();
     for (auto& g : groups) app.folderPick.push_back({ std::move(g), true });
     app.folderPickRoot = path;
@@ -4658,11 +4664,16 @@ static void drawCanvas(ImVec2 avail) {
     const float TICK = 7.0f * s;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImVec2 canvasP0 = ImVec2(origin.x + RULER_W, origin.y + RULER_H);
-    ImVec2 canvasSize = ImVec2(std::max(avail.x - RULER_W, 50.0f), std::max(avail.y - RULER_H, 50.0f));
-    ImVec2 canvasP1 = ImVec2(canvasP0.x + canvasSize.x, canvasP0.y + canvasSize.y);
 
     ImageDoc* im = cur();
+    // The footer strip (name + scrub bar) is RESERVED below the canvas, never
+    // drawn over the pixels: overlapping the image was vetoed outright, and a
+    // bar over the bottom rows would sit exactly where shading is judged.
+    const float FOOT_H = im ? ImGui::GetFontSize() + 10.0f * s : 0.0f;
+    ImVec2 canvasP0 = ImVec2(origin.x + RULER_W, origin.y + RULER_H);
+    ImVec2 canvasSize = ImVec2(std::max(avail.x - RULER_W, 50.0f),
+                               std::max(avail.y - RULER_H - FOOT_H, 50.0f));
+    ImVec2 canvasP1 = ImVec2(canvasP0.x + canvasSize.x, canvasP0.y + canvasSize.y);
 
     // interaction region = canvas (excluding rulers)
     ImGui::SetCursorScreenPos(canvasP0);
@@ -5278,34 +5289,43 @@ static void drawCanvas(ImVec2 avail) {
         dl->PopClipRect();
     }
 
-    // ---- the quiet footer: whose pixels these are, and where in the stack ----
-    // The name sits in the canvas corner at low alpha - visible when you look
-    // for it, invisible when you don't. The scrub bar replaces the slider that
-    // used to grow under the Files row and make the list jump.
+    // ---- the footer strip: whose pixels these are, and where in the stack ----
+    // Its own reserved band under the canvas (FOOT_H above): name at the left,
+    // scrub bar filling the middle, frame counter at the right. Nothing here
+    // ever covers a pixel being judged.
     if (im) {
+        float fy0 = canvasP1.y + 3.0f * s;
+        float fy1 = origin.y + avail.y - 2.0f * s;
+        float cy = (fy0 + fy1) * 0.5f;
         std::vector<int> fr = im->seqId != 0 ? framesOfSeq(im->seqId) : std::vector<int>();
         const App::SeqInfo* si = im->seqId != 0 ? seqInfo(im->seqId) : nullptr;
-        char label[400];
+        const char* name = si && fr.size() > 1 ? si->name.c_str() : im->name.c_str();
+        ImVec2 ts = ImGui::CalcTextSize(name);
+        float nameW = std::min(ts.x, canvasSize.x * 0.45f);
+        dl->PushClipRect(ImVec2(canvasP0.x, fy0), ImVec2(canvasP0.x + nameW, fy1), true);
+        dl->AddText(ImVec2(canvasP0.x, cy - ts.y * 0.5f), IM_COL32(175, 183, 191, 200), name);
+        dl->PopClipRect();
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
-            snprintf(label, sizeof label, "%s   %d/%d", si->name.c_str(),
-                     pos + 1, (int)fr.size());
-            // slim scrub bar above the label, canvas-wide, low-profile
-            float barH = 6.0f * s;
-            ImVec2 b0(canvasP0.x + 8 * s, canvasP1.y - barH - ImGui::GetFontSize() - 10 * s);
-            ImVec2 b1(canvasP1.x - 8 * s, b0.y + barH);
+            char cnt[32];
+            snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
+            ImVec2 cs = ImGui::CalcTextSize(cnt);
+            dl->AddText(ImVec2(canvasP1.x - cs.x, cy - cs.y * 0.5f),
+                        IM_COL32(175, 183, 191, 200), cnt);
+            float barH = 5.0f * s;
+            ImVec2 b0(canvasP0.x + nameW + 12 * s, cy - barH * 0.5f);
+            ImVec2 b1(canvasP1.x - cs.x - 12 * s, cy + barH * 0.5f);
             if (b1.x > b0.x + 40 * s) {
-                ImGui::SetCursorScreenPos(ImVec2(b0.x, b0.y - 2 * s));
-                ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, barH + 4 * s));
+                ImGui::SetCursorScreenPos(ImVec2(b0.x, fy0));
+                ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, fy1 - fy0));
                 bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
-                int alpha = sh || sa ? 200 : 70;
-                dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, alpha / 3), barH * 0.5f);
+                int alpha = sh || sa ? 235 : 150;
+                dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
                 float fx = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
-                dl->AddRectFilled(ImVec2(b0.x, b0.y), ImVec2(fx, b1.y),
-                                  IM_COL32(120, 170, 220, alpha), barH * 0.5f);
-                dl->AddCircleFilled(ImVec2(fx, (b0.y + b1.y) * 0.5f), barH * (sh || sa ? 1.2f : 0.8f),
-                                    IM_COL32(160, 200, 240, alpha + 55));
+                dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha), barH * 0.5f);
+                dl->AddCircleFilled(ImVec2(fx, cy), barH * (sh || sa ? 1.4f : 1.0f),
+                                    IM_COL32(160, 200, 240, alpha));
                 if (sa) {
                     float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
                     int want = (int)(t * (float)(fr.size() - 1) + 0.5f);
@@ -5313,15 +5333,7 @@ static void drawCanvas(ImVec2 avail) {
                 }
                 if (sh) ImGui::SetTooltip("frame %d / %d  (drag; . and , step)", pos + 1, (int)fr.size());
             }
-        } else {
-            snprintf(label, sizeof label, "%s", im->name.c_str());
         }
-        dl->PushClipRect(canvasP0, canvasP1, true);
-        ImVec2 ts = ImGui::CalcTextSize(label);
-        ImVec2 tp(canvasP0.x + 8 * s, canvasP1.y - ts.y - 6 * s);
-        dl->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 110), label);   // legibility on white
-        dl->AddText(tp, IM_COL32(210, 218, 226, 130), label);
-        dl->PopClipRect();
     }
 }
 
