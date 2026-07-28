@@ -13767,6 +13767,11 @@ int main(int argc, char** argv) {
               "A0 compare off leaves slot 1 empty");
 
         // ---- A1: compare on, both slots fill ----
+        // Explicitly on "B uses A's range". A3 below asserts that adding B does
+        // not move A, and that is only the contract in this mode: under the
+        // union default A's bin axis is SUPPOSED to widen to cover B - that is
+        // the whole mode - and the union's own contract is checked in A3b.
+        app.compareRangeMode = 1;
         setCompareB(app.images[frB.front()].get());
         app.compareMode = App::CmpSplit;
         app.compareFollowFrame = true;
@@ -13823,10 +13828,32 @@ int main(int argc, char** argv) {
                   "A2 fixture: A and B histograms actually differ");
         }
 
-        // ---- A3: A did not move ----
+        // ---- A3: A did not move (on "B uses A's range") ----
         check(histSame(hOff, app.hist[0]), "A3 A histogram byte-identical with B present");
         check(projSame(pOff, app.proj[0]), "A3 A projection byte-identical with B present");
         check(tempSame(tOff, app.temporal[0]), "A3 A temporal byte-identical with B present");
+
+        // ---- A3b: the union default bins BOTH sides on A and B together ----
+        {
+            app.compareRangeMode = 2;
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            recomputeHistogramIfNeeded(B, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            float uLo = std::min(cur()->vmin, B->vmin), uHi = std::max(cur()->vmax, B->vmax);
+            bool axis = app.hist[0].black == uLo && app.hist[0].white == uHi;
+            bool shared = app.hist[0].black == app.hist[1].black &&
+                          app.hist[0].white == app.hist[1].white;
+            fprintf(stderr, "abstatsselftest: union: A bins %.9g..%.9g, B bins %.9g..%.9g "
+                            "| content A %.9g..%.9g, B %.9g..%.9g | A alone %.9g..%.9g\n",
+                    app.hist[0].black, app.hist[0].white, app.hist[1].black, app.hist[1].white,
+                    cur()->vmin, cur()->vmax, B->vmin, B->vmax, hOff.black, hOff.white);
+            check(axis, "A3b union: A is binned on the A-and-B union, not on A alone");
+            check(shared, "A3b union: both sides land on the same bin axis");
+            // ...and it is a DISPLAY overlay: going back restores A exactly
+            app.compareRangeMode = 1;
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            check(histSame(hOff, app.hist[0]),
+                  "A3b back on A's range: A is byte-identical to compare-off again");
+        }
 
         // ---- A4: five frame steps, both keys follow; temporal does not re-run ----
         {
