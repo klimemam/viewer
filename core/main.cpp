@@ -372,6 +372,11 @@ struct App {
     // openRemoteStack computes reflects what the previous one actually loaded.
     struct RemoteOpen { std::string host; std::vector<std::string> files; };
     std::vector<RemoteOpen> rbOpenQueue;
+    // Places: starred host+path urls, and the last ~10 visited (most recent
+    // first). Both persist in prefs - a lab machine's data layout outlives any
+    // one session.
+    std::vector<std::string> rbBookmarks;
+    std::vector<std::string> rbRecents;
     bool showRemoteError = false;     // the full failure text, on demand
     std::mutex sesMtx;                // app.remoteSession is shared with that worker
     // where analysis runs. auto: remote data -> server, local -> local. server:
@@ -559,6 +564,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
+static std::string placeUrl(const std::string& host, int port, const std::string& path);
 static void rbEnqueue(App::RbJob job);
 static void pumpRemoteBrowse();
 static void stopRbWorker();
@@ -2338,6 +2344,8 @@ static void savePrefs() {
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
+    for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
+    for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
 }
 
 static void loadPrefs() {
@@ -2367,12 +2375,17 @@ static void loadPrefs() {
                                          app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
-        else if (key == "remoteexe" || key == "remoteurl") {
+        else if (key == "remoteexe" || key == "remoteurl" ||
+                 key == "rbookmark" || key == "rbrecent") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
             while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
-            if (!s.empty()) (key == "remoteexe" ? app.remoteExe : app.lastRemoteUrl) = s;
+            if (s.empty()) continue;
+            if      (key == "remoteexe") app.remoteExe = s;
+            else if (key == "remoteurl") app.lastRemoteUrl = s;
+            else if (key == "rbookmark") app.rbBookmarks.push_back(s);
+            else if (app.rbRecents.size() < 10) app.rbRecents.push_back(s);
         }
     }
     app.themeVariant = std::clamp(app.themeVariant, 0, 1);
@@ -4024,6 +4037,14 @@ static void pumpRemoteBrowse() {
         B.port = r.port;
         B.dir = r.dir;
         B.entries = std::move(r.entries);
+        {   // every directory actually listed becomes the newest "recent place"
+            std::string u = placeUrl(r.host, r.port, r.dir);
+            auto& v = app.rbRecents;
+            v.erase(std::remove(v.begin(), v.end(), u), v.end());
+            v.insert(v.begin(), u);
+            if (v.size() > 10) v.resize(10);
+            app.prefsDirty = true;
+        }
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
             // a listing nobody can see is not a connection anyone believes in
@@ -4047,6 +4068,41 @@ static void remoteBrowseTo(const std::string& dir) {
     j.host = app.rbrowse.host;
     j.port = app.rbrowse.port;
     j.dir = dir;
+    rbEnqueue(std::move(j));
+}
+
+// One canonical url for "this directory on this host", used by the places list
+// (bookmarks / recents). Unlike makeRemoteUrl it keeps a non-default port, and
+// "~" travels as git's /~/ extension so parseUrl round-trips it.
+static std::string placeUrl(const std::string& host, int port, const std::string& path) {
+    if (host.empty()) return "local://" + path;
+    std::string p = path;
+    if (!p.empty() && p[0] != '/') p = "/" + p;
+    return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
+}
+
+// Navigate to a places url. Same host and a live session: just browse there.
+// Anything else goes through the normal async connect - never a handshake on
+// the UI thread.
+static void goToPlace(const std::string& url) {
+    std::string host, path;
+    int port = 0;
+    if (!remote::parseUrl(url, host, path, &port)) {
+        toast("cannot parse place: " + url, true);
+        return;
+    }
+    if (app.rbrowse.connected && app.rbrowse.host == host && app.rbrowse.port == port) {
+        remoteBrowseTo(path);
+        return;
+    }
+    app.rbrowse = App::RemoteBrowse{};
+    app.rbrowse.host = host;
+    app.rbrowse.port = port;
+    App::RbJob j;
+    j.kind = App::RbConnect;
+    j.host = host;
+    j.port = port;
+    j.dir = path;
     rbEnqueue(std::move(j));
 }
 
@@ -7190,12 +7246,46 @@ static std::string fmtEntryShape(const remote::Entry& e) {
     return s;
 }
 
+// Bookmarks + recents in one dropdown. Available connected or not: picking a
+// place while disconnected is exactly how a session starts next morning.
+static void drawRemotePlacesCombo() {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
+                           ImGuiComboFlags_HeightLarge))
+        return;
+    int rm = -1;
+    if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");
+    for (int i = 0; i < (int)app.rbBookmarks.size(); i++) {
+        ImGui::PushID(i);
+        if (ImGui::SmallButton("x")) rm = i;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
+        ImGui::SameLine();
+        if (ImGui::Selectable(app.rbBookmarks[i].c_str())) goToPlace(app.rbBookmarks[i]);
+        ImGui::PopID();
+    }
+    if (rm >= 0) {
+        app.rbBookmarks.erase(app.rbBookmarks.begin() + rm);
+        app.prefsDirty = true;
+        savePrefs();
+    }
+    if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
+    for (int i = 0; i < (int)app.rbRecents.size(); i++) {
+        ImGui::PushID(1000 + i);
+        if (ImGui::Selectable(app.rbRecents[i].c_str())) goToPlace(app.rbRecents[i]);
+        ImGui::PopID();
+    }
+    if (app.rbBookmarks.empty() && app.rbRecents.empty())
+        ImGui::TextDisabled("nothing yet - the * button bookmarks the open folder");
+    ImGui::EndCombo();
+}
+
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     ImGui::PushID("remotetree");
     if (!B.connected) {
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
+        drawRemotePlacesCombo();
         if (!B.err.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
             ImGui::PushTextWrapPos(0.0f);
@@ -7216,10 +7306,95 @@ static void drawPanelRemote() {
     if (ImGui::SmallButton("home")) remoteBrowseTo("~");
     ImGui::SameLine();
     if (ImGui::SmallButton("refresh")) remoteBrowseTo(B.dir);
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("%s", B.dir.c_str());
-    ImGui::PopTextWrapPos();
     if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+    {   // star = bookmark the place being looked at; the combo recalls them
+        std::string curUrl = placeUrl(B.host, B.port, B.dir);
+        bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                 curUrl) != app.rbBookmarks.end();
+        if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
+        if (ImGui::SmallButton("*")) {
+            if (starred)
+                app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                  app.rbBookmarks.end(), curUrl),
+                                      app.rbBookmarks.end());
+            else
+                app.rbBookmarks.push_back(curUrl);
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (starred) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
+                              curUrl.c_str());
+        ImGui::SameLine();
+        drawRemotePlacesCombo();
+    }
+    // ---- path bar: breadcrumbs, or one text field while editing ----
+    static char rbPathEdit[1024];
+    static bool rbPathEditing = false, rbPathFocus = false;
+    if (!rbPathEditing) {
+        struct Seg { std::string label, path; };
+        std::vector<Seg> segs;
+        const std::string& d = B.dir;
+        size_t i = 0;
+        if (!d.empty() && d[0] == '/')      { segs.push_back({ "/", "/" }); i = 1; }
+        else if (!d.empty() && d[0] == '~') { segs.push_back({ "~", "~" });
+                                              i = d.size() > 1 && d[1] == '/' ? 2 : 1; }
+        while (i < d.size()) {
+            size_t s = d.find('/', i);
+            std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
+            if (!part.empty()) {
+                std::string prefix = segs.empty() ? part
+                                   : segs.back().path == "/" ? "/" + part
+                                   : segs.back().path + "/" + part;
+                segs.push_back({ part, prefix });
+            }
+            if (s == std::string::npos) break;
+            i = s + 1;
+        }
+        bool editReq = false;
+        for (size_t k = 0; k < segs.size(); k++) {
+            ImGui::PushID((int)k);
+            if (k) {
+                ImGui::SameLine(0, 2);
+                // capture paths run long: wrap instead of clipping the tail off
+                if (ImGui::GetContentRegionAvail().x <
+                    ImGui::CalcTextSize(segs[k].label.c_str()).x + ImGui::GetFontSize())
+                    ImGui::NewLine();
+            }
+            if (ImGui::SmallButton(segs[k].label.c_str())) remoteBrowseTo(segs[k].path);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) editReq = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n(right-click to edit the path)", segs[k].path.c_str());
+            ImGui::PopID();
+        }
+        if (!segs.empty()) ImGui::SameLine();
+        if (ImGui::SmallButton("edit##path")) editReq = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("type or paste a path (right-clicking the bar works too)");
+        if (editReq) {
+            snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
+            rbPathEditing = true;
+            rbPathFocus = true;
+        }
+    } else {
+        if (rbPathFocus) { ImGui::SetKeyboardFocusHere(); rbPathFocus = false; }
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 4);
+        bool entered = ImGui::InputText("##rbpath", rbPathEdit, sizeof rbPathEdit,
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        if (entered) {
+            std::string p = rbPathEdit;
+            while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(0, 1);
+            while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
+            while (p.size() > 1 && p.back() == '/') p.pop_back();
+            rbPathEditing = false;
+            remoteBrowseTo(p.empty() ? "~" : p);
+        } else if (ImGui::IsItemDeactivated()) {
+            rbPathEditing = false;    // Esc (ImGui reverts the text) or focus loss
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("cancel##path")) rbPathEditing = false;
+    }
     if (!B.err.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
         ImGui::PushTextWrapPos(0.0f);
@@ -7376,6 +7551,16 @@ static void drawPanelRemote() {
                 if (e.dir) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(full);
+                    if (ImGui::MenuItem("Bookmark")) {
+                        std::string u = placeUrl(B.host, B.port, full);
+                        if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
+                            app.rbBookmarks.end()) {
+                            app.rbBookmarks.push_back(u);
+                            app.prefsDirty = true;
+                            savePrefs();
+                        }
+                        toast("bookmarked " + u);
+                    }
                     ImGui::Separator();
                 } else if (e.group) {
                     if (ImGui::MenuItem("Open as stack")) {
