@@ -2511,6 +2511,7 @@ static void writeSessionTo(std::ostream& f) {
     // display state that lives outside the per-image range
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
+    f << "rangescope " << app.rangeScope << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
@@ -2814,6 +2815,7 @@ static std::string loadSession(const std::string& path) {
         else if (key == "current") ls >> wantCurrent;
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
+        else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "roichannel") ls >> app.roiChannel;
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
@@ -6676,6 +6678,18 @@ static void drawInspector() {
                 ImGui::SetTooltip("shared range for display only - each image keeps its own,\n"
                                   "unlink to get them back");
         }
+        {   // What happens to the range when you STEP to another frame. It lived
+            // in the View menu, which is nowhere near the numbers it governs -
+            // this is the panel where the range is actually set.
+            ImGui::SetNextItemWidth(-1);
+            ImGui::Combo("on switch##rangescope", &app.rangeScope,
+                         "Auto per frame\0Keep within a stack\0Keep everywhere\0");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
+                                  "Keep within a stack: frames of one stack share the\n"
+                                  "  reference frame's range, so they compare directly (default)\n"
+                                  "Keep everywhere: the current range follows you across stacks");
+        }
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
         static float bwEdit[2];
@@ -9571,18 +9585,6 @@ static void drawMenuBar(GLFWwindow* win) {
             app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         ImGui::Separator();
         ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
-        if (ImGui::BeginMenu("Value range scope")) {
-            if (ImGui::MenuItem("Auto per frame", nullptr, app.rangeScope == 0)) app.rangeScope = 0;
-            if (ImGui::MenuItem("Shared within a stack", nullptr, app.rangeScope == 1)) app.rangeScope = 1;
-            if (ImGui::MenuItem("Shared across everything", nullptr, app.rangeScope == 2)) app.rangeScope = 2;
-            ImGui::EndMenu();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("What happens to black/white when you switch images:%s"
-                              "per frame = every frame auto-ranges to its own min..max%s"
-                              "per stack = frames of a stack share the reference range (default)%s"
-                              "everything = the current range follows you everywhere",
-                              "\n", "\n", "\n");
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
