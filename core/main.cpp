@@ -674,6 +674,24 @@ struct App {
     // a 3-stack session came back with 7 of its 15 frames.
     struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern; };
     std::vector<SeqRestore> seqRestore;
+    // Series a session asked for, resolved LAZILY for the same reason: at parse
+    // time the stacks do not exist yet (a folder stack is one loose image plus a
+    // queued rescan), so a member cannot be looked up. Members are named by the
+    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because seqname is
+    // dropped on restore for exactly this reason (cur()->seqId is still 0 when
+    // the line is parsed; verified in loadSession).
+    struct SeriesRestore {
+        std::string name, batchName, paramName, unit;
+        int kind = 0;
+        struct M { double value; bool include; std::string path; };
+        std::vector<M> members;
+    };
+    std::vector<SeriesRestore> seriesRestore;
+    // MIGRATION of the old per-stack level, also by path. saveSession has never
+    // written "seqlevel" (verified over the whole history), so this is normally
+    // empty - it exists for hand-written and third-party files, and it creates
+    // a series only where the file actually says there was a sweep.
+    std::vector<std::pair<std::string, double>> seqLevelLegacy;
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -1904,9 +1922,12 @@ static void closeAll() {
     app.images.clear();
     app.seqs.clear();
     // Series name stacks that no longer exist; they go with them (and with the
-    // batches below - a series cannot outlive its batch).
+    // batches below - a series cannot outlive its batch). Pending restores name
+    // stacks of the list being thrown away, so they go too.
     app.series.clear();
     app.curSeriesId = 0;
+    app.seriesRestore.clear();
+    app.seqLevelLegacy.clear();
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
@@ -2975,6 +2996,36 @@ static void writeSessionTo(std::ostream& f) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
         }
     }
+    // ---- series (系列), after the image lines -------------------------------
+    // A FLAT block with unique keys, on purpose: an older viewer skips every
+    // line it does not know and still opens the session, and this one opens a
+    // session with no block as zero series. Nothing else in the format moves.
+    //
+    // Members travel by the PATH OF THEIR FIRST FRAME. A stack NAME would be
+    // the obvious choice and is the wrong one: seqname is written but silently
+    // dropped on restore for folder stacks (when the line is parsed the stack
+    // does not exist yet - the frames arrive from a queued rescan), so half the
+    // members would resolve to nothing. A path is what the session already
+    // proves it can round-trip: it is how the image lines themselves work.
+    for (const auto& S : app.series) {
+        std::string bn = batchNameOf(S.batchId);
+        if (bn.empty()) continue;          // no batch, nothing to restore it into
+        f << "series " << S.name << "\n";              // name last on its line: spaces
+        f << "seriesbatch " << bn << "\n";             // by NAME, like imgbatch
+        f << "seriesparam " << S.paramName << "\n";
+        f << "seriesunit " << S.unit << "\n";          // empty line = unit not set
+        f << "serieskind " << S.kind << "\n";
+        for (const auto& m : S.members) {
+            std::vector<int> fr = framesOfSeq(m.seqId);
+            if (fr.empty()) continue;
+            f << "seriesmember ";
+            if (std::isfinite(m.value)) f << m.value;
+            else f << "-";                             // "-" = unset, NOT zero
+            f << " " << (m.include ? 1 : 0) << " "
+              << app.images[fr.front()]->path << "\n";   // path last: spaces
+        }
+        f << "seriesend\n";
+    }
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " "
@@ -3190,6 +3241,7 @@ static std::string loadSession(const std::string& path) {
     // whole stack, so resolve it to a real index once that line is fully applied
     // (seqframe, which picks the frame, comes after the image line).
     int lineOrd = -1, wantCurrent = -1, resolvedCurrent = -1;
+    int curSeries = -1;               // index into app.seriesRestore, -1 = outside a block
     bool capturing = false;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
@@ -3292,10 +3344,49 @@ static std::string loadSession(const std::string& path) {
             if (!nm.empty() && lastImageOk && cur() && cur()->seqId != 0)
                 if (App::SeqInfo* si2 = seqInfo(cur()->seqId)) si2->name = nm;
         }
-        // "seqlevel" (the old per-stack level) is not read here anymore: the
-        // value belongs to a series member now, and there is no series at this
-        // point in the parse. It comes back in the persistence phase as an
-        // explicit MIGRATION, which is the only thing it can honestly be.
+        // MIGRATION of the old per-stack level. saveSession has never written
+        // this key (verified over the whole history: no commit ever emitted
+        // it), so it fires only for hand-written or third-party files. Note the
+        // old reader also required cur()->seqId != 0, which is FALSE for a
+        // folder stack at parse time - it could only ever have worked for an
+        // in-file frame axis. This one keys on the PATH, which works for both,
+        // and turns into a series only where there is a sweep to speak of.
+        else if (key == "seqlevel") {
+            double lv = 0; ls >> lv;
+            if (lastImageOk && cur() && !cur()->path.empty() && std::isfinite(lv))
+                app.seqLevelLegacy.push_back({ cur()->path, lv });
+        }
+        // ---- series (系列) block: collected here, RESOLVED later -------------
+        // Nothing can be looked up yet - a folder stack is still one loose image
+        // with a queued rescan behind it. See resolveSeriesRestore.
+        else if (key == "series") {
+            App::SeriesRestore r;
+            r.name = restOfLine(ls);
+            app.seriesRestore.push_back(std::move(r));
+            curSeries = (int)app.seriesRestore.size() - 1;
+        }
+        else if (key == "seriesend") curSeries = -1;
+        else if (key == "seriesbatch") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].batchName = restOfLine(ls);
+        }
+        else if (key == "seriesparam") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].paramName = restOfLine(ls);
+        }
+        else if (key == "seriesunit") {
+            if (curSeries >= 0) app.seriesRestore[curSeries].unit = restOfLine(ls);
+        }
+        else if (key == "serieskind") {
+            if (curSeries >= 0) { int k = 0; ls >> k; app.seriesRestore[curSeries].kind = k; }
+        }
+        else if (key == "seriesmember") {   // "<value|-> <0|1> <path of frame 0>"
+            std::string v; int inc = 1;
+            ls >> v >> inc;
+            std::string p = restOfLine(ls);
+            if (curSeries >= 0 && !p.empty())
+                app.seriesRestore[curSeries].members.push_back(
+                    { v == "-" ? std::numeric_limits<double>::quiet_NaN() : atof(v.c_str()),
+                      inc != 0, p });
+        }
         else if (key == "linunit") { std::string u = restOfLine(ls);
                                      snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
         else if (key == "seqframe") {   // select the frame this stack was left on
@@ -3773,6 +3864,107 @@ static bool seqReadyPending() {
     return !app.seqReady.empty();
 }
 
+// The stack a session's series member names, found by the path of its FIRST
+// frame. 0 = that frame is not open (or is not part of a stack).
+static int seqIdOfFirstFramePath(const std::string& path) {
+    for (const auto& d : app.images)
+        if (d->seqId != 0 && d->path == path) return d->seqId;
+    return 0;
+}
+
+// Turn what the session file said into real series. Runs once, when every
+// stack the file asked for exists - a member cannot be looked up before then.
+// Members that cannot be found are COUNTED and reported: silently dropping
+// points out of a measurement is the one thing this must not do.
+static void resolveSeriesRestore() {
+    int made = 0, lost = 0, lostSeries = 0;
+    for (const auto& R : app.seriesRestore) {
+        int bid = 0;
+        for (const auto& b : app.batches) if (b.name == R.batchName) bid = b.id;
+        if (!bid) { lostSeries++; lost += (int)R.members.size(); continue; }
+        std::vector<App::Series::Member> ms;
+        for (const auto& m : R.members) {
+            int sid = seqIdOfFirstFramePath(m.path);
+            // strict containment survives the round trip too, or not at all
+            if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
+            bool dup = false;
+            for (const auto& x : ms) if (x.seqId == sid) dup = true;
+            if (dup) continue;
+            ms.push_back({ sid, m.value, m.include });
+        }
+        if (ms.empty()) { lostSeries++; continue; }
+        int id = newSeries(bid, R.name);
+        for (const auto& m : ms) {           // at most one series per stack
+            App::Series* other = seriesOfStack(m.seqId);
+            if (other && other->id != id) removeFromSeries(m.seqId);
+        }
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = R.paramName;
+            snprintf(S->unit, sizeof S->unit, "%s", R.unit.c_str());
+            S->kind = std::clamp(R.kind, 0, 3);
+            S->members = std::move(ms);
+            made++;
+        }
+    }
+    app.seriesRestore.clear();
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made || lost || lostSeries) {
+        std::string msg = "restored " + std::to_string(made) + " series";
+        if (lost || lostSeries)
+            msg += "; " + std::to_string(lost) + " member(s) and " +
+                   std::to_string(lostSeries) + " series could not be resolved";
+        toast(msg, lost > 0 || lostSeries > 0);
+        fprintf(stderr, "series: %s\n", msg.c_str());
+    }
+}
+
+// Old sessions that carried a per-stack "seqlevel": one series per BATCH that
+// actually has two or more levelled stacks, named "<batch> 掃引", unit = the
+// prefill, kind = linearity. A batch with fewer gets NOTHING - guessing a sweep
+// out of the folder structure is precisely what the canon forbids.
+static void migrateLegacyLevels() {
+    std::vector<std::pair<int, double>> lvl;      // seqId -> level
+    for (const auto& p : app.seqLevelLegacy) {
+        int sid = seqIdOfFirstFramePath(p.first);
+        if (!sid || seriesOfStack(sid)) continue;   // an explicit series wins
+        bool dup = false;
+        for (const auto& q : lvl) if (q.first == sid) dup = true;
+        if (!dup) lvl.emplace_back(sid, p.second);
+    }
+    app.seqLevelLegacy.clear();
+    std::vector<int> batches;
+    for (const auto& q : lvl) {
+        int b = batchOfStack(q.first);
+        if (!b) continue;
+        bool seen = false;
+        for (int x : batches) if (x == b) seen = true;
+        if (!seen) batches.push_back(b);
+    }
+    int made = 0;
+    for (int b : batches) {
+        int n = 0;
+        for (const auto& q : lvl) if (batchOfStack(q.first) == b) n++;
+        if (n < 2) continue;                        // not a sweep, do not invent one
+        int id = newSeries(b, "");
+        if (App::Series* S = seriesById(id)) {
+            S->paramName = "level";
+            snprintf(S->unit, sizeof S->unit, "%s", app.lin.unit);
+            S->kind = App::Series::KLinearity;
+        }
+        for (const auto& q : lvl)
+            if (batchOfStack(q.first) == b) addToSeries(id, q.first, q.second);
+        made++;
+    }
+    pruneEmptySeries();
+    if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    if (made) {
+        toast("migrated " + std::to_string(made) +
+              " series from an old session's stack levels");
+        fprintf(stderr, "series: migrated %d from seqlevel\n", made);
+    }
+}
+
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpSequenceAndQueue() {
     pumpSequence();
@@ -3788,6 +3980,15 @@ static void pumpSequenceAndQueue() {
         return;                 // let it start before chaining anything else
     }
     if (!app.seqRunning && !app.seqQueue.empty() && !seqReadyPending()) startNextQueuedGroup();
+    // Series LAST, and only once everything a member could name is open: the
+    // stacks arrive over many frames, and a lookup one frame too early would
+    // report perfectly good members as missing.
+    if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty()) &&
+        !app.seqRunning && app.seqQueue.empty() && app.seqRestore.empty() &&
+        app.rbOpenQueue.empty() && !seqReadyPending()) {
+        if (!app.seriesRestore.empty()) resolveSeriesRestore();
+        if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
+    }
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -13571,6 +13772,114 @@ int main(int argc, char** argv) {
             snprintf(S->unit, sizeof S->unit, "%s", keep);
         }
 
+        // ---- persistence: save -> load -> lazy resolve ------------------------
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_seriesselftest.vsession").u8string();
+        std::string legacy = (std::filesystem::temp_directory_path(tec) /
+                              "viewer_serieslegacy.vsession").u8string();
+        int legacyCount = 0;
+        {   // an OLD-format session, written now while the paths are known. It
+            // has to be built by hand because saveSession has NEVER emitted
+            // "seqlevel" - which is the honest reason the migration below is
+            // nearly always a no-op.
+            std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+            lf << "viewer-session 1\n" << std::setprecision(9);
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                if (fr.empty() || !std::isfinite(m.value)) continue;
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << app.images[fr.front()]->path << "\n";
+                lf << "imgbatch legacyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel " << m.value << "\n";
+                legacyCount++;
+            }
+        }
+        const char* RENAMED = "renamed member stack";
+        {
+            // Doctor the series first, so the round trip has something to lose:
+            // a renamed stack, an UNSET value, an excluded member.
+            seqInfo(S->members[1].seqId)->name = RENAMED;
+            S->members[2].value = std::numeric_limits<double>::quiet_NaN();
+            S->members[3].include = false;
+            struct Want { std::string path; double value; bool include; };
+            std::vector<Want> want;
+            for (const auto& m : S->members) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                want.push_back({ fr.empty() ? std::string() : app.images[fr.front()]->path,
+                                 m.value, m.include });
+            }
+            std::string wantName = S->name, wantParam = S->paramName, wantUnit = S->unit;
+            std::string wantBatch = batchNameOf(S->batchId);
+            int wantKind = S->kind;
+            saveSession(sess, true);
+            std::string lerr = loadSession(sess);       // closeAll happens inside
+            check("session reloaded", lerr.empty());
+            loadAll();                                  // stacks come back first
+            double tr = glfwGetTime();                  // ...the series after them
+            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            App::Series* R = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: round trip: %d series; '%s' param '%s' "
+                            "unit '%s' kind %d, %d member(s), batch '%s'\n",
+                    (int)app.series.size(), R ? R->name.c_str() : "",
+                    R ? R->paramName.c_str() : "", R ? R->unit : "", R ? R->kind : -1,
+                    R ? (int)R->members.size() : -1,
+                    R ? batchNameOf(R->batchId).c_str() : "");
+            check("exactly one series came back", app.series.size() == 1);
+            check("name / parameter / unit / kind survive",
+                  R && R->name == wantName && R->paramName == wantParam &&
+                  wantUnit == R->unit && R->kind == wantKind);
+            check("the series is in its batch, restored BY NAME",
+                  R && batchNameOf(R->batchId) == wantBatch);
+            bool memOk = R && R->members.size() == want.size();
+            if (memOk)
+                for (size_t i = 0; i < want.size(); i++) {
+                    std::vector<int> fr = framesOfSeq(R->members[i].seqId);
+                    std::string p = fr.empty() ? std::string() : app.images[fr.front()]->path;
+                    double a = want[i].value, b = R->members[i].value;
+                    bool vOk = std::isfinite(a) == std::isfinite(b) &&
+                               (!std::isfinite(a) ||
+                                fabs(a - b) <= 1e-9 * std::max(1.0, fabs(a)));
+                    if (p != want[i].path || !vOk ||
+                        R->members[i].include != want[i].include) memOk = false;
+                }
+            check("members: order, first-frame path, value and include all survive", memOk);
+            check("the unset member came back UNSET, not 0",
+                  R && R->members.size() > 2 && !std::isfinite(R->members[2].value));
+            check("the excluded member came back excluded",
+                  R && R->members.size() > 3 && !R->members[3].include);
+            check("invariant 1: audit after restore", audit());
+            // Why members are keyed by PATH and not by stack name: the name of a
+            // FOLDER stack does not survive at all. seqname is written, but when
+            // it is parsed the stack does not exist yet (the frames come from a
+            // queued rescan), so the line lands on nothing.
+            bool nameSurvived = false;
+            for (const auto& si : app.seqs) if (si.name == RENAMED) nameSurvived = true;
+            fprintf(stderr, "seriesselftest: the renamed stack's name after restore: %s\n",
+                    nameSurvived ? "SURVIVED" : "lost (folder stack: seqname lands on nothing)");
+            check("stack names do NOT survive for folder stacks (hence path keys)",
+                  !nameSurvived);
+        }
+        // everything below works on what came back: the reload minted new ids
+        if (app.series.empty() || app.images.empty() || app.series.front().members.size() < 4) {
+            fprintf(stderr, "seriesselftest: nothing usable survived the round trip\n");
+            return 1;
+        }
+        S1 = app.series.front().id;
+        S = seriesById(S1);
+        b0 = S->batchId;
+        sids.clear();
+        for (const auto& m : S->members) sids.push_back(m.seqId);
+        // Undo the exclusion; the value deliberately left UNSET stays unset - it
+        // is the point of the next block. (It cannot be re-derived from the name
+        // either: a restored folder stack is called "frame_000‥023.npy", with no
+        // folder part to read a level out of. That is the same seqname hole,
+        // seen from the other side.)
+        for (auto& m : S->members) m.include = true;
+
         // ---- invariant 6: an unset value is UNSET, never 0 --------------------
         int ptsAll = seriesFitPoints(*S);
         {
@@ -13660,9 +13969,62 @@ int main(int argc, char** argv) {
                   seriesById(S1) == nullptr && app.series.empty());
             check("invariant 1: audit after closeBatch", audit());
         }
+
+        // ---- migration: an OLD session that carried per-stack levels -----------
+        {
+            std::string lerr = loadSession(legacy);
+            check("legacy (seqlevel) session loaded", lerr.empty());
+            loadAll();
+            double tm = glfwGetTime();
+            while (glfwGetTime() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* M = app.series.empty() ? nullptr : &app.series.front();
+            fprintf(stderr, "seriesselftest: seqlevel migration: %d series, %d member(s), "
+                            "name '%s' unit '%s' kind %d (%d levelled stacks in the file)\n",
+                    (int)app.series.size(), M ? (int)M->members.size() : -1,
+                    M ? M->name.c_str() : "", M ? M->unit : "", M ? M->kind : -1,
+                    legacyCount);
+            check("one series migrated out of the levels", app.series.size() == 1);
+            check("...holding every levelled stack",
+                  M && (int)M->members.size() == legacyCount);
+            check("...named \"<batch> 掃引\", kind linearity",
+                  M && M->name == "legacyset 掃引" && M->kind == App::Series::KLinearity);
+            check("invariant 1: audit after migration", audit());
+            // The negative half of the same rule: ONE levelled stack is not a
+            // sweep, and nothing may be invented from it.
+            std::string onePath;
+            if (M && !M->members.empty()) {
+                std::vector<int> fr = framesOfSeq(M->members.front().seqId);
+                if (!fr.empty()) onePath = app.images[fr.front()]->path;
+            }
+            {
+                std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+                lf << "viewer-session 1\n";
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << onePath << "\n";
+                lf << "imgbatch lonelyset\n";
+                lf << "seqload 1\n";
+                lf << "seqlevel 42\n";
+            }
+            loadSession(legacy);
+            loadAll();
+            double tm2 = glfwGetTime();
+            while (glfwGetTime() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: one levelled stack alone -> %d series, "
+                            "%d stack(s) open\n", (int)app.series.size(),
+                    (int)app.seqs.size());
+            check("a single levelled stack makes NO series", app.series.empty() &&
+                                                            !app.seqs.empty());
+        }
         fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
+        std::filesystem::remove(std::filesystem::u8path(legacy), tec);
         return ok ? 0 : 1;
     }
 
@@ -15388,6 +15750,8 @@ int main(int argc, char** argv) {
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
+                // a session's series wait for their stacks, then need one frame
+                working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
                 working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
