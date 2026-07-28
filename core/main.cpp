@@ -1343,6 +1343,7 @@ static void pumpMeasure() {
 static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below)
 static App::SeqInfo* seqInfo(int id);             // fwd
 static void stopSequenceLoader();                 // fwd
+static void pruneEmptyBatches();                  // fwd (defined with the moves)
 
 // Close a set of images by index: erase in descending order so the indices stay
 // valid, one forget per cache that can name them, current re-picked at the end.
@@ -1380,6 +1381,7 @@ static void closeImages(std::vector<int> idxs) {
     if (!resolveB()) {   // B went with them: a later same-name file must not
         app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
     }
+    pruneEmptyBatches();
 }
 
 // Close every frame of a stack plus its SeqInfo, and stop everything that
@@ -1434,6 +1436,7 @@ static void closeBatch(int batchId) {
         if (it->batchId == batchId) it = app.seqQueue.erase(it);
         else ++it;
     if (app.loadBatchId == batchId) app.loadBatchId = 0;
+    pruneEmptyBatches();       // the queue purge above may have freed this batch
 }
 
 // Ctrl+W: the stack when the frame is in one (the canon), the image otherwise.
@@ -1451,6 +1454,47 @@ static void closeCurrent(bool frameOnly = false) {
     // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
     // too, or a zero-frame stack haunts the linearity table
     if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
+    pruneEmptyBatches();
+}
+
+// Drop batches nothing references anymore: no image, no queued group, no
+// pending remote open, not the load target. Called after every close and after
+// every move - an empty Files heading is a lie about what is open. The preview
+// pseudo-batch stays: its emptiness is its normal state between previews.
+static void pruneEmptyBatches() {
+    for (auto it = app.batches.begin(); it != app.batches.end();) {
+        bool used = it->name == "preview" || app.loadBatchId == it->id;
+        if (!used)
+            for (const auto& d : app.images)
+                if (d->batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.seqQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used)
+            for (const auto& q : app.rbOpenQueue)
+                if (q.batchId == it->id) { used = true; break; }
+        if (!used) {
+            it = app.batches.erase(it);
+            app.imagesRev++;
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Move a STACK between batches - the whole stack, per the canon's containment
+// (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
+static void moveStackToBatch(int seqId, int batchId) {
+    for (int idx : framesOfSeq(seqId)) app.images[idx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
+}
+// A standalone frame (no stack) hangs off the batch directly and moves alone.
+static void moveImageToBatch(int imageIdx, int batchId) {
+    if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
+    app.images[imageIdx]->batchId = batchId;
+    app.imagesRev++;
+    pruneEmptyBatches();
 }
 static void closeAll() {
     app.ana.img = nullptr;
@@ -8866,10 +8910,42 @@ static void drawFileList() {
         if (ImGui::SmallButton("dismiss##seqnote")) app.seqNote.clear();
     }
     ImGui::Separator();
-    // Context-menu closes are DEFERRED to the end of the walk: closing here
-    // erases images mid-iteration while the row loop still holds indices into
-    // the pre-close stacksCached() snapshot.
+    // Context-menu closes and moves are DEFERRED to the end of the walk:
+    // closing erases images mid-iteration while the row loop still holds
+    // indices into the pre-close stacksCached() snapshot, and a move prunes
+    // app.batches while the submenu is iterating it.
     int pendingCloseSeq = 0, pendingCloseBatch = 0;
+    int pendingMoveSeq = 0, pendingMoveImg = -1, pendingMoveTarget = 0;
+    // "Move to batch" submenu, shared by the stack row (seqctx) and the
+    // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
+    // Batch names go through a ### suffix: user text must not become the ID.
+    auto moveToBatchMenu = [&](int curBatch) -> int {
+        int target = 0;
+        if (ImGui::BeginMenu("Move to batch")) {
+            for (const auto& b : app.batches) {
+                if (b.id == curBatch) continue;           // already there
+                if (b.name == "preview") continue;        // pseudo-batch
+                char lb2[300];
+                snprintf(lb2, sizeof lb2, "%s###mb%d", b.name.c_str(), b.id);
+                if (ImGui::MenuItem(lb2)) target = b.id;
+            }
+            ImGui::Separator();
+            static char nbBuf[256] = "";
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+            bool go = ImGui::InputTextWithHint("##newbatch", "New batch...",
+                                               nbBuf, sizeof nbBuf,
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            go |= ImGui::SmallButton("create");
+            if (go && nbBuf[0]) {
+                target = newBatch(uniqueBatchName(nbBuf));
+                nbBuf[0] = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndMenu();
+        }
+        return target;
+    };
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
     // produced a flat list of bare filenames with nothing saying where each came
@@ -8960,10 +9036,19 @@ static void drawFileList() {
             int i = stack.front();
             char lb[512];
             snprintf(lb, 512, "%s##%d", head.name.c_str(), i);
+            ImGui::PushID(i);
             if (rowWithMeta(head, lb, i == app.current, nullptr)) {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
+            // a standalone frame hangs off the batch directly, so it gets the
+            // move menu itself (stacks move via seqctx below)
+            if (ImGui::BeginPopupContextItem("imgctx")) {
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
             continue;
         }
         App::SeqInfo* si = seqInfo(head.seqId);
@@ -8999,6 +9084,10 @@ static void drawFileList() {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::Separator();
+            {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+                int t = moveToBatchMenu(head.batchId);
+                if (t) { pendingMoveSeq = si->id; pendingMoveTarget = t; }
+            }
             if (ImGui::MenuItem("Close stack"))     // the stack layer's Close
                 pendingCloseSeq = si->id;
             ImGui::EndPopup();
@@ -9015,6 +9104,8 @@ static void drawFileList() {
     }
     if (pendingCloseSeq) closeStack(pendingCloseSeq);
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
+    if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
+    if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
 }
 
 static void drawSequenceModal() {
@@ -9568,6 +9659,7 @@ static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout,
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
+static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 
 static void printUsage() {
     printf(
@@ -9692,6 +9784,8 @@ static void parseCli(int argc, char** argv) {
             g_pickerSelftest = next();             // handled in main()
         } else if (a == "--close-selftest") {
             g_closeSelftest = next();              // handled in main()
+        } else if (a == "--batch-selftest") {
+            g_batchSelftest = next();              // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | server | local-fetch
@@ -10524,6 +10618,78 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
+        return ok ? 0 : 1;
+    }
+
+    // Move-to-batch, verifiable without a human (docs/terminology.md): stacks
+    // move between batches WHOLE, emptied batches are pruned, and the batch
+    // name survives a session save/load round-trip (imgbatch travels by name).
+    if (!g_batchSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        openFolder(g_batchSelftest);
+        if (!app.folderPickOpen) {
+            fprintf(stderr, "batchselftest: picker did not open\n");
+            return 1;
+        }
+        pickerAccept();
+        loadAll();
+        if (app.seqs.empty() || app.images.empty()) {
+            fprintf(stderr, "batchselftest: nothing loaded\n");
+            return 1;
+        }
+        int oldBatch = app.images[0]->batchId;
+        int nb = newBatch(uniqueBatchName("moved"));
+        std::vector<int> sids;
+        for (const auto& si : app.seqs) sids.push_back(si.id);
+        for (int s : sids) moveStackToBatch(s, nb);
+        int offBatch = 0;
+        for (const auto& d : app.images) if (d->batchId != nb) offBatch++;
+        bool oldGone = true;
+        for (const auto& b : app.batches) if (b.id == oldBatch) oldGone = false;
+        fprintf(stderr, "batchselftest: moved %d stack(s) to batch '%s': "
+                        "%d of %d frames off-batch, old batch %d pruned=%d\n",
+                (int)sids.size(), "moved", offBatch, (int)app.images.size(),
+                oldBatch, oldGone ? 1 : 0);
+        if (offBatch != 0 || !oldGone) {
+            fprintf(stderr, "batchselftest: FAILED - move left strays\n");
+            ok = false;
+        }
+        // ---- session round-trip: the batch travels BY NAME ----
+        std::error_code tec;
+        std::string sess = (std::filesystem::temp_directory_path(tec) /
+                            "viewer_batchselftest.vsession").u8string();
+        saveSession(sess, true);
+        std::string lerr = loadSession(sess);      // closeAll happens inside
+        if (!lerr.empty()) {
+            fprintf(stderr, "batchselftest: FAILED - session reload: %s\n", lerr.c_str());
+            ok = false;
+        }
+        loadAll();                                 // seqload rescans the folders
+        int movedId = 0;
+        for (const auto& b : app.batches) if (b.name == "moved") movedId = b.id;
+        int strays = 0;
+        for (const auto& d : app.images) if (d->batchId != movedId) strays++;
+        fprintf(stderr, "batchselftest: reloaded session: %d image(s), %d stack(s), "
+                        "batch 'moved' %s, %d stray frame(s)\n",
+                (int)app.images.size(), (int)app.seqs.size(),
+                movedId ? "restored" : "MISSING", strays);
+        if (!movedId || strays != 0 || app.images.empty() ||
+            app.seqs.size() != sids.size()) {
+            fprintf(stderr, "batchselftest: FAILED - session did not restore the batch\n");
+            ok = false;
+        }
+        fprintf(stderr, "batchselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        std::filesystem::remove(std::filesystem::u8path(sess), tec);
         return ok ? 0 : 1;
     }
 
