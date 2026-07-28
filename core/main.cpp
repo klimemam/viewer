@@ -6693,44 +6693,67 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
     return pr;
 }
 
-// A/B legend for an overlaid plot, drawn straight after beginPlot. It shows a
-// SAMPLE of each stroke - solid for A, dashed for B - because a text-only "A"
-// and "B" leaves the reader matching words to lines. The swatches are neutral
-// grey on purpose: every hue on these plots already means a CFA plane, and the
-// legend must not claim one.
-static void drawABLegend(const PlotRect& pr, const std::string& aName,
-                         const std::string& bName, bool bStale = false) {
-    if (!pr.ok) return;
+// The A/B legend, on its own row BENEATH the plot. It used to be a filled box
+// pinned inside the plot rect, top right, where it covered the data it was
+// explaining: on a narrow panel it took roughly half the plot width, and any
+// distribution with its peak on the right disappeared behind it. (The union
+// range default makes that rarer; it does not make a box that hides data
+// right.) One line, left to right, like everything else in these panels, at
+// the cost of one text row - which the layouts reserve whether or not compare
+// is on, so turning it on never moves the plot out from under the cursor.
+//
+// The swatches show a SAMPLE of each stroke - solid for A, dashed for B -
+// because a text-only "A" and "B" leaves the reader matching words to lines.
+// A is the neutral ink every plot draws in; B carries the blue tint it is
+// actually drawn with (a mono series would otherwise give both sides the same
+// grey). Names are elided from the FRONT: the tail is what tells two captures
+// apart. They come from abDocLabel, so two stacks of one series do not both
+// read "frame_000.npy".
+static float abLegendSw()  { return 24 * app.uiScale; }
+static float abLegendGap() { return 6 * app.uiScale; }
+static std::string abLegendText(const char* side, const std::string& name) {
+    return std::string(side) + ": " + elideFront(name, 26);
+}
+static float abLegendEntryW(const char* side, const std::string& name, bool stale) {
+    float w = abLegendSw() + abLegendGap() +
+              ImGui::CalcTextSize(abLegendText(side, name).c_str()).x;
+    if (stale) w += abLegendGap() + ImGui::CalcTextSize(AB_STALE_TOKEN).x;
+    return w;
+}
+// Too narrow for both entries side by side: stack them rather than clip one.
+static bool abLegendOneLine(const std::string& aName, const std::string& bName, bool bStale) {
+    return abLegendEntryW("A", aName, false) + 18 * app.uiScale +
+           abLegendEntryW("B", bName, bStale) <= ImGui::GetContentRegionAvail().x;
+}
+static float abLegendH(const std::string& aName, const std::string& bName, bool bStale) {
+    return ImGui::GetTextLineHeightWithSpacing() *
+           (abLegendOneLine(aName, bName, bStale) ? 1.0f : 2.0f);
+}
+static void drawABLegendRow(const std::string& aName, const std::string& bName,
+                            bool bStale = false) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float s = app.uiScale, fh = ImGui::GetFontSize();
-    std::string la = "A: " + elideFront(aName, 26);
-    std::string lb = "B: " + elideFront(bName, 26);
-    const float sw = 24 * s, gap = 6 * s, pad = 6 * s;
-    const float stw = bStale ? ImGui::CalcTextSize(AB_STALE_TOKEN).x + gap : 0.0f;
-    float tw = std::max(ImGui::CalcTextSize(la.c_str()).x,
-                        ImGui::CalcTextSize(lb.c_str()).x + stw);
-    float w = sw + gap + tw + pad * 2;
-    float h = fh * 2 + pad * 2 + 2 * s;
-    if (w > pr.p1.x - pr.p0.x || h > pr.p1.y - pr.p0.y) return;   // no room: skip it
-    ImVec2 q0(pr.p1.x - w - 4 * s, pr.p0.y + 4 * s);
-    ImVec2 q1(q0.x + w, q0.y + h);
-    dl->PushClipRect(pr.p0, pr.p1, true);
-    dl->AddRectFilled(q0, q1, IM_COL32(18, 21, 24, 215), 3 * s);
-    dl->AddRect(q0, q1, IM_COL32(70, 78, 86, 255), 3 * s);
+    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * s;
     const ImU32 ink = IM_COL32(215, 222, 228, 255);
-    // the swatches carry the colours actually drawn: A neutral, B tinted where
-    // a mono series would otherwise give both sides the same grey
     const ImU32 inkB = IM_COL32(120, 190, 255, 255);
-    float yA = q0.y + pad + fh * 0.5f, yB = yA + fh + 2 * s;
-    dl->AddLine(ImVec2(q0.x + pad, yA), ImVec2(q0.x + pad + sw, yA), ink, 1.6f);
-    ImVec2 dash[2] = { ImVec2(q0.x + pad, yB), ImVec2(q0.x + pad + sw, yB) };
+    const bool one = abLegendOneLine(aName, bName, bStale);
+    const float lineAdvance = ImGui::GetTextLineHeightWithSpacing();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const std::string la = abLegendText("A", aName), lb = abLegendText("B", bName);
+    dl->AddLine(ImVec2(p.x, p.y + fh * 0.5f), ImVec2(p.x + sw, p.y + fh * 0.5f), ink, 1.6f);
+    dl->AddText(ImVec2(p.x + sw + gap, p.y), ink, la.c_str());
+    const float bx = one ? p.x + abLegendEntryW("A", aName, false) + sep : p.x;
+    const float by = one ? p.y : p.y + lineAdvance;
+    ImVec2 dash[2] = { ImVec2(bx, by + fh * 0.5f), ImVec2(bx + sw, by + fh * 0.5f) };
     addDashedPolyline(dl, dash, 2, inkB, 1.6f, 4 * s, 3 * s);
-    dl->AddText(ImVec2(q0.x + pad + sw + gap, yA - fh * 0.5f), ink, la.c_str());
-    dl->AddText(ImVec2(q0.x + pad + sw + gap, yB - fh * 0.5f), ink, lb.c_str());
+    dl->AddText(ImVec2(bx + sw + gap, by), ink, lb.c_str());
     if (bStale)
-        dl->AddText(ImVec2(q0.x + pad + sw + gap + ImGui::CalcTextSize(lb.c_str()).x + gap,
-                           yB - fh * 0.5f), AB_AMBER32, AB_STALE_TOKEN);
-    dl->PopClipRect();
+        dl->AddText(ImVec2(bx + sw + gap + ImGui::CalcTextSize(lb.c_str()).x + gap, by),
+                    AB_AMBER32, AB_STALE_TOKEN);
+    // consume exactly what abLegendH promised (ImGui adds one ItemSpacing after)
+    ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x,
+                        one ? ImGui::GetTextLineHeight()
+                            : ImGui::GetTextLineHeight() + lineAdvance));
 }
 
 // The heading strip over one half of a side-by-side pair. Neutral colour: which
@@ -7471,9 +7494,12 @@ static void drawPanelHistogram() {
         // fill the rest of the panel: a fixed height overflowed the bottom dock
         float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
                       + (tooNarrow ? abNarrowNoteH() : 0.0f);
+        // the legend row lives under the overlaid plot, and its height comes off
+        // the plot BEFORE the plot is laid out
+        float legendH = Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f;
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
-                     - footerH;
+                     - footerH - legendH;
         if (side) hAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // heading band
         float plotH = std::max(hAvail, 70.0f * app.uiScale);
 
@@ -7481,7 +7507,7 @@ static void drawPanelHistogram() {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegend(hp, abDocLabel(im), bLabel, bStale);
+            if (Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -7734,7 +7760,10 @@ static void drawPanelProjection() {
                  + lineH;                                  // footnote
     if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
     if (tooNarrow) statsH += abNarrowNoteH();
-    float avail = ImGui::GetContentRegionAvail().y - statsH;
+    // one legend row under each overlaid plot, reserved before they are sized
+    const std::string aLabel = abDocLabel(im);
+    float legendH = Bim && !side ? abLegendH(aLabel, bLabel, bStale) : 0.0f;
+    float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
@@ -7847,8 +7876,8 @@ static void drawPanelProjection() {
         if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
         if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
         dl->PopClipRect();
-        if (wantA && wantB && Bim) drawABLegend(pr, abDocLabel(im), bLabel, bStale);
         hoverReadout(pr, horizontal, wantA, wantB);
+        if (wantA && wantB && Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
     };
 
     if (!side) {
@@ -8758,9 +8787,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     bool side = abSideBySide();
     bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
     if (tooNarrow) side = false;
+    const std::string aLabel = abDocLabel(im), bLabel = abDocLabel(Bim);
     float tAvail = ImGui::GetContentRegionAvail().y
                  - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
-                 - (tooNarrow ? abNarrowNoteH() : 0.0f);
+                 - (tooNarrow ? abNarrowNoteH() : 0.0f)
+                 - (side ? 0.0f : abLegendH(aLabel, bLabel, false));
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
     const char* xlab = "frame number (index in sequence)";
@@ -8774,7 +8805,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             marker(tp, im);
             dl->PopClipRect();
         }
-        drawABLegend(tp, abDocLabel(im), abDocLabel(Bim));
+        drawABLegendRow(aLabel, bLabel);
     } else {
         const ImGuiStyle& st = ImGui::GetStyle();
         float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
@@ -8782,7 +8813,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                      + ImGui::GetTextLineHeight() + 8 * app.uiScale;
         ImGui::BeginChild("##tempA", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("A", abDocLabel(im));
+        drawABBand("A", aLabel);
         {
             PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
             if (tp.ok) {
