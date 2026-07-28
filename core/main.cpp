@@ -6582,6 +6582,16 @@ static std::string elideFront(const std::string& s, size_t keep) {
     return s.size() <= keep ? s : ("..." + s.substr(s.size() - keep));
 }
 
+// The one amber this UI warns in: the fallback notices, the mismatch notices,
+// and the [stale] marker below. Anything the reader must NOTICE is this colour.
+static const ImVec4 AB_AMBER(0.95f, 0.72f, 0.35f, 1.0f);
+static const ImU32  AB_AMBER32 = IM_COL32(242, 184, 89, 255);
+// B's numbers are one frame behind while A is being stepped. The marker used to
+// be appended to B's NAME and drawn in the surrounding grey, which during fast
+// stepping is indistinguishable from part of the file name - the one moment it
+// exists to be read. It is a separate token now, in the warning amber.
+static const char* AB_STALE_TOKEN = "[stale]";
+
 // What A or B is CALLED, everywhere the two are set against each other.
 // A capture series names every stack's frames identically - 00/frame_000.npy
 // and 01/frame_000.npy are both "frame_000.npy" - so the FILE name identifies
@@ -6680,14 +6690,16 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
 // grey on purpose: every hue on these plots already means a CFA plane, and the
 // legend must not claim one.
 static void drawABLegend(const PlotRect& pr, const std::string& aName,
-                         const std::string& bName) {
+                         const std::string& bName, bool bStale = false) {
     if (!pr.ok) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float s = app.uiScale, fh = ImGui::GetFontSize();
     std::string la = "A: " + elideFront(aName, 26);
     std::string lb = "B: " + elideFront(bName, 26);
     const float sw = 24 * s, gap = 6 * s, pad = 6 * s;
-    float tw = std::max(ImGui::CalcTextSize(la.c_str()).x, ImGui::CalcTextSize(lb.c_str()).x);
+    const float stw = bStale ? ImGui::CalcTextSize(AB_STALE_TOKEN).x + gap : 0.0f;
+    float tw = std::max(ImGui::CalcTextSize(la.c_str()).x,
+                        ImGui::CalcTextSize(lb.c_str()).x + stw);
     float w = sw + gap + tw + pad * 2;
     float h = fh * 2 + pad * 2 + 2 * s;
     if (w > pr.p1.x - pr.p0.x || h > pr.p1.y - pr.p0.y) return;   // no room: skip it
@@ -6706,12 +6718,15 @@ static void drawABLegend(const PlotRect& pr, const std::string& aName,
     addDashedPolyline(dl, dash, 2, inkB, 1.6f, 4 * s, 3 * s);
     dl->AddText(ImVec2(q0.x + pad + sw + gap, yA - fh * 0.5f), ink, la.c_str());
     dl->AddText(ImVec2(q0.x + pad + sw + gap, yB - fh * 0.5f), ink, lb.c_str());
+    if (bStale)
+        dl->AddText(ImVec2(q0.x + pad + sw + gap + ImGui::CalcTextSize(lb.c_str()).x + gap,
+                           yB - fh * 0.5f), AB_AMBER32, AB_STALE_TOKEN);
     dl->PopClipRect();
 }
 
 // The heading strip over one half of a side-by-side pair. Neutral colour: which
 // side you are looking at is the message, not which channel.
-static void drawABBand(const char* side, const std::string& name) {
+static void drawABBand(const char* side, const std::string& name, bool stale = false) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float s = app.uiScale;
     ImVec2 p = ImGui::GetCursorScreenPos();
@@ -6721,6 +6736,9 @@ static void drawABBand(const char* side, const std::string& name) {
     std::string t = std::string(side) + "   " + elideFront(name, 34);
     dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);
     dl->AddText(ImVec2(p.x + 6 * s, p.y + 2 * s), IM_COL32(225, 230, 236, 255), t.c_str());
+    if (stale)
+        dl->AddText(ImVec2(p.x + 6 * s + ImGui::CalcTextSize(t.c_str()).x + 8 * s,
+                           p.y + 2 * s), AB_AMBER32, AB_STALE_TOKEN);
     dl->PopClipRect();
     ImGui::Dummy(ImVec2(w, h + 2 * s));
 }
@@ -7239,8 +7257,7 @@ static void drawPanelHistogram() {
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         const bool bStale = Bim && HB.uid != Bim->uid;
-        const std::string bLabel = Bim ? abDocLabel(Bim) + (bStale ? "   [stale]" : "")
-                                   : std::string();
+        const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
         // with a B on screen, an unlabelled table of numbers is ambiguous:
@@ -7428,7 +7445,7 @@ static void drawPanelHistogram() {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegend(hp, abDocLabel(im), bLabel);
+            if (Bim) drawABLegend(hp, abDocLabel(im), bLabel, bStale);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -7446,7 +7463,7 @@ static void drawPanelHistogram() {
             ImGui::SameLine();
             ImGui::BeginChild("##histB", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand("B", bLabel);
+            drawABBand("B", bLabel, bStale);
             // identical axis ranges by construction: same xl/yl, same limits
             drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                               false, false, plotH), false, true);
@@ -7457,10 +7474,15 @@ static void drawPanelHistogram() {
         ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
                             H.clipLo * 100.0, H.clipHi * 100.0,
                             cfaHist ? " | R/Gr/Gb/B" : "");
-        if (Bim)
+        if (Bim) {
             ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
                                 HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
                                 bLabel.c_str());
+            if (bStale) {   // never inside the disabled string: it must stand out
+                ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
+                ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
+            }
+        }
     }
 
 }
@@ -7596,8 +7618,7 @@ static void drawPanelProjection() {
     const App::ProjState& P = app.proj[0];
     const App::ProjState& PB = app.proj[1];
     const bool bStale = Bim && PB.uid != Bim->uid;
-    const std::string bLabel = Bim ? abDocLabel(Bim) + (bStale ? "   [stale]" : "")
-                                   : std::string();
+    const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
     ImGui::SameLine();
     if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
                                  P.roiUsed ? "ROI" : "whole image");
@@ -7785,7 +7806,7 @@ static void drawPanelProjection() {
         if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
         if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
         dl->PopClipRect();
-        if (wantA && wantB && Bim) drawABLegend(pr, abDocLabel(im), bLabel);
+        if (wantA && wantB && Bim) drawABLegend(pr, abDocLabel(im), bLabel, bStale);
         hoverReadout(pr, horizontal, wantA, wantB);
     };
 
@@ -7807,7 +7828,7 @@ static void drawPanelProjection() {
         ImGui::SameLine();
         ImGui::BeginChild("##projB", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("B", bLabel);
+        drawABBand("B", bLabel, bStale);
         if (app.showProjH) onePlot(true, false, true);
         if (app.showProjV) onePlot(false, false, true);
         ImGui::EndChild();
