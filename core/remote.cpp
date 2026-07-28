@@ -477,6 +477,42 @@ bool Session::scan(const std::string& root, int depth, int maxGroups,
     return true;
 }
 
+bool Session::glob(const std::string& root, const std::string& pattern, int depth,
+                   int maxResults, std::vector<GlobHit>& out, bool& truncated,
+                   int& skippedDirs, std::string& err) {
+    if (peerVersion_ < 3) {
+        err = "the remote peer is protocol " + std::to_string(peerVersion_) +
+              " - File > Update remote peer enables recursive search";
+        return false;
+    }
+    W w;
+    w.str(serverPath(root));
+    w.str(pattern);
+    w.u32((uint32_t)std::max(0, depth));
+    w.u32((uint32_t)std::max(0, maxResults));
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_GLOB, w.b, err) || !recv(type, reply, err)) return false;
+    R r(reply);
+    if (type != rp::MSG_OK) { r.str(err); return false; }
+    uint32_t flags = 0, skipped = 0, n = 0;
+    if (!r.u32(flags) || !r.u32(skipped) || !r.u32(n) || n > 1000000) {
+        err = "bad GLOB reply";
+        return false;
+    }
+    truncated = (flags & 1) != 0;
+    skippedDirs = (int)skipped;
+    out.clear();
+    for (uint32_t i = 0; i < n; i++) {
+        GlobHit h;
+        uint32_t d = 0;
+        if (!r.str(h.rel) || !r.u32(d)) { err = "bad GLOB reply"; return false; }
+        h.dir = d != 0;
+        out.push_back(std::move(h));
+    }
+    return true;
+}
+
 bool Session::meta(const std::string& path, Meta& out, std::string& err) {
     W w; w.str(serverPath(path));
     std::vector<uint8_t> reply;

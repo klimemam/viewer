@@ -504,6 +504,92 @@ static void handleList(Buf& in) {
     sendMsg(MSG_OK, out);
 }
 
+// GLOB: recursive find under a root. The pattern addresses a subtree, so *
+// and ? deliberately cross '/' (unlike a shell); "**/" additionally matches
+// zero directories, bash-globstar-style; a pattern with no wildcard is a
+// case-insensitive substring. Matching is case-insensitive throughout -
+// FRAME_001.NPY is the same capture dump.
+static bool globCross(const char* pat, const char* str) {
+    const char *star = nullptr, *ss = str;
+    while (*str) {
+        char p = *pat, s = *str;
+        if (p == '?' || (p && tolower((unsigned char)p) == tolower((unsigned char)s))) {
+            pat++; str++; continue;
+        }
+        if (p == '*') { star = pat++; ss = str; continue; }
+        if (star) { pat = star + 1; str = ++ss; continue; }
+        return false;
+    }
+    while (*pat == '*') pat++;
+    return *pat == 0;
+}
+static bool globPatternMatches(const std::string& pat, const std::string& rel) {
+    if (pat.find('*') == std::string::npos && pat.find('?') == std::string::npos) {
+        std::string a = pat, b = rel;
+        for (char& c : a) c = (char)tolower((unsigned char)c);
+        for (char& c : b) c = (char)tolower((unsigned char)c);
+        return b.find(a) != std::string::npos;
+    }
+    if (globCross(pat.c_str(), rel.c_str())) return true;
+    return pat.compare(0, 3, "**/") == 0 && globCross(pat.c_str() + 3, rel.c_str());
+}
+
+//   -> [str root][str pattern][u32 depthLimit][u32 maxResults]
+//   <- [u32 flags bit0=truncated][u32 skippedDirs][u32 n]
+//      n * ([str relPath][u32 isDir])   relPath uses '/' on every platform
+static void handleGlob(Buf& in) {
+    std::string root, pattern;
+    uint32_t depth = 6, cap = 2000;
+    if (!in.getStr(root) || !in.getStr(pattern) || !in.getU32(depth) || !in.getU32(cap)) {
+        sendErr("bad GLOB");
+        return;
+    }
+    if (pattern.empty()) { sendErr("empty GLOB pattern"); return; }
+    depth = std::min(depth, 32u);
+    cap = std::min(cap ? cap : 2000u, 100000u);
+    std::error_code ec;
+    std::filesystem::path rootP = std::filesystem::u8path(root);
+    if (!std::filesystem::is_directory(rootP, ec)) {
+        sendErr("not a directory: " + root);
+        return;
+    }
+    uint32_t skipped = 0;
+    bool trunc = false;
+    struct Hit { std::string rel; bool dir; };
+    std::vector<Hit> hits;
+    // same walk discipline as SCAN: no symlinks, unreadable = count and go on
+    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
+    while (!todo.empty() && !trunc) {
+        auto cur = todo.back();
+        todo.pop_back();
+        std::error_code dec;
+        std::filesystem::directory_iterator it(cur.first, dec), end;
+        if (dec) { skipped++; continue; }
+        for (; it != end && !trunc; it.increment(dec)) {
+            if (dec) { dec.clear(); skipped++; break; }
+            std::error_code fec;
+            if (it->is_symlink(fec)) continue;
+            bool isDir = it->is_directory(fec);
+            if (isDir && cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
+            std::string rel = it->path().lexically_relative(rootP).generic_u8string();
+            if (!globPatternMatches(pattern, rel)) continue;
+            if (hits.size() >= cap) { trunc = true; break; }
+            hits.push_back({ std::move(rel), isDir });
+        }
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.rel < b.rel; });
+    Buf out;
+    out.putU32(trunc ? 1u : 0u);
+    out.putU32(skipped);
+    out.putU32((uint32_t)hits.size());
+    for (const auto& h : hits) {
+        out.putStr(h.rel);
+        out.putU32(h.dir ? 1u : 0u);
+    }
+    sendMsg(MSG_OK, out);
+}
+
 // SCAN: the server-side half of "open this folder as stacks". Walks the
 // subtree (depth- and count-limited), groups numbered .npy per directory, and
 // returns ONE reply the client turns into open-as-stack jobs - the remote
@@ -1100,6 +1186,7 @@ void handleRequest(uint32_t type, Buf& in) {
             break;
         }
         case MSG_LIST: handleList(in); break;
+        case MSG_GLOB: handleGlob(in); break;
         case MSG_SCAN: handleScan(in); break;
         case MSG_META: handleMeta(in); break;
         case MSG_TILE: handleTile(in); break;

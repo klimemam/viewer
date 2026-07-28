@@ -38,6 +38,9 @@ bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
 // the root itself) and its group entry (pattern, members, meta).
 struct ScanGroup { std::string dir; Entry entry; };
 
+// One GLOB result: path relative to the searched root ('/' separators).
+struct GlobHit { std::string rel; bool dir = false; };
+
 struct Meta {
     int w = 0, h = 0, ch = 1, frames = 1;
     std::string dtype;
@@ -92,6 +95,11 @@ public:
     bool scan(const std::string& root, int depth, int maxGroups,
               std::vector<ScanGroup>& out, bool& truncated, int& skippedDirs,
               std::string& err);
+    // Recursive find under `root`. Pattern: glob (* and ? cross '/'), or a
+    // case-insensitive substring when it has no wildcard.
+    bool glob(const std::string& root, const std::string& pattern, int depth,
+              int maxResults, std::vector<GlobHit>& out, bool& truncated,
+              int& skippedDirs, std::string& err);
     bool meta(const std::string& path, Meta& out, std::string& err);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
     // (converted from the source dtype) plus the decimated dimensions.

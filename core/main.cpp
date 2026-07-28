@@ -346,8 +346,14 @@ struct App {
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
     // app" is precisely the bug class this tool exists to avoid.
-    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3 };
-    struct RbJob { int kind = RbConnect; std::string host, dir; int port = 0; };
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4 };
+    struct RbJob {
+        int kind = RbConnect;
+        std::string host, dir;
+        int port = 0;
+        std::string pattern;          // RbGlob only
+        uint32_t gen = 0;             // RbGlob: Stop bumps it, stale results drop
+    };
     struct RbResult {
         int kind = RbConnect;
         bool ok = false;
@@ -358,6 +364,9 @@ struct App {
         std::vector<remote::ScanGroup> scanGroups;
         bool truncated = false;
         int skippedDirs = 0;
+        // RbGlob payload
+        std::vector<remote::GlobHit> hits;
+        uint32_t gen = 0;
     };
     std::thread rbThread;
     std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
@@ -377,6 +386,18 @@ struct App {
     // one session.
     std::vector<std::string> rbBookmarks;
     std::vector<std::string> rbRecents;
+    // Server-side recursive find (GLOB). gen is the cancel token: Stop bumps
+    // it and the worker's result is dropped on arrival (the walk itself is
+    // bounded by depth and result caps, so there is nothing to interrupt).
+    struct RemoteSearch {
+        bool active = false;          // results view instead of the listing
+        bool running = false;
+        uint32_t gen = 0;
+        std::string root, pattern;
+        std::vector<remote::GlobHit> hits;
+        bool truncated = false;
+        int skippedDirs = 0;
+    } rbSearch;
     bool showRemoteError = false;     // the full failure text, on demand
     std::mutex sesMtx;                // app.remoteSession is shared with that worker
     // where analysis runs. auto: remote data -> server, local -> local. server:
@@ -3934,6 +3955,19 @@ static void rbWorker() {
                 } else {
                     r.err = err;
                 }
+            } else if (job.kind == App::RbGlob) {
+                rbSetPhase("searching " + job.pattern + " under " + job.dir + "...");
+                r.gen = job.gen;
+                bool trunc = false;
+                int skipped = 0;
+                if (app.remoteSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
+                                            trunc, skipped, err)) {
+                    r.ok = true;
+                    r.truncated = trunc;
+                    r.skippedDirs = skipped;
+                } else {
+                    r.err = err;
+                }
             } else {
                 rbSetPhase("listing " + job.dir + "...");
                 std::vector<remote::Entry> got;
@@ -3981,6 +4015,17 @@ static void pumpRemoteBrowse() {
             g_bootstrapLog = r.info;
             toast(r.ok ? "remote peer updated on " + r.host
                        : "remote update failed: " + r.err, !r.ok);
+            continue;
+        }
+        if (r.kind == App::RbGlob) {
+            App::RemoteSearch& S = app.rbSearch;
+            if (r.gen != S.gen) continue;          // stopped or superseded: drop
+            S.running = false;
+            if (!r.ok) { toast("remote search: " + r.err, true); continue; }
+            S.hits = std::move(r.hits);
+            S.truncated = r.truncated;
+            S.skippedDirs = r.skippedDirs;
+            S.active = true;
             continue;
         }
         if (r.kind == App::RbScan) {
@@ -4103,6 +4148,28 @@ static void goToPlace(const std::string& url) {
     j.host = host;
     j.port = port;
     j.dir = path;
+    rbEnqueue(std::move(j));
+}
+
+// Kick a server-side recursive find; the result lands in app.rbSearch through
+// the browse worker. Any previous search is superseded by the gen bump.
+static void remoteStartSearch(const std::string& root, const std::string& pattern) {
+    App::RemoteSearch& S = app.rbSearch;
+    S.gen++;
+    S.running = true;
+    S.active = true;
+    S.root = root;
+    S.pattern = pattern;
+    S.hits.clear();
+    S.truncated = false;
+    S.skippedDirs = 0;
+    App::RbJob j;
+    j.kind = App::RbGlob;
+    j.host = app.rbrowse.host;
+    j.port = app.rbrowse.port;
+    j.dir = root;
+    j.pattern = pattern;
+    j.gen = S.gen;
     rbEnqueue(std::move(j));
 }
 
@@ -7455,6 +7522,37 @@ static void drawPanelRemote() {
         ImGui::TextDisabled("%d of %d", (int)shown.size(), (int)B.entries.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("entries shown of entries listed");
     }
+    // Server-side search - a different thing from the filter above (which only
+    // narrows what is already listed), so it gets its own labelled row.
+    static char rbSearchBuf[256] = "";
+    static bool rbSearchFocus = false;
+    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
+    {
+        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        bool go = ImGui::InputTextWithHint("##rbsearch",
+                                           "search server (recursive): frame_* or **/dark.npy",
+                                           rbSearchBuf, sizeof rbSearchBuf,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
+                              "bare text matches anywhere in the relative path;\n"
+                              "* and ? glob across '/'");
+        ImGui::SameLine();
+        if (app.rbSearch.running) {
+            if (ImGui::SmallButton("Stop##rbsearch")) {
+                app.rbSearch.gen++;               // in-flight result becomes stale
+                app.rbSearch.running = false;
+            }
+        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
+            remoteStartSearch(rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
+        }
+        if (!rbSearchRoot.empty()) {
+            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
+        }
+    }
     // The metadata columns exist from protocol 3 on. Say so once, up here - a
     // "-" in every row of every column explains nothing.
     {
@@ -7469,6 +7567,63 @@ static void drawPanelRemote() {
                                "enables shape / date columns", pv);
     }
     ImGui::Separator();
+    if (app.rbSearch.active) {         // search results stand in for the listing
+        App::RemoteSearch& S = app.rbSearch;
+        auto joinS = [&S](const std::string& rel) {
+            return S.root == "/" ? "/" + rel : S.root + "/" + rel;
+        };
+        if (S.running) {
+            ImGui::TextDisabled("searching %s under %s ...", S.pattern.c_str(), S.root.c_str());
+        } else {
+            ImGui::Text("%d result(s) for %s under %s%s", (int)S.hits.size(),
+                        S.pattern.c_str(), S.root.c_str(),
+                        S.truncated ? "  (first 2000 - narrow the pattern)" : "");
+            if (S.skippedDirs)
+                ImGui::TextDisabled("%d unreadable folder(s) skipped", S.skippedDirs);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("close results")) S.active = false;
+        if (ImGui::BeginChild("searchhits", ImVec2(0, 0), ImGuiChildFlags_None)) {
+            ImGuiListClipper clip;
+            clip.Begin((int)S.hits.size());
+            while (clip.Step())
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                const remote::GlobHit& h = S.hits[row];
+                ImGui::PushID(row);
+                std::string lb = h.dir ? "[" + h.rel + "]" : h.rel;
+                if (ImGui::Selectable(lb.c_str())) {
+                    std::string full = joinS(h.rel);
+                    if (h.dir) {
+                        remoteBrowseTo(full);
+                    } else if (isNpyName(h.rel)) {
+                        openRemote(makeRemoteUrl(B.host, full));
+                    } else {
+                        // not servable: at least go where it lives
+                        size_t sl = full.find_last_of('/');
+                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                          : full.substr(0, sl));
+                    }
+                }
+                if (ImGui::BeginPopupContextItem("sctx")) {
+                    std::string full = joinS(h.rel);
+                    if (!h.dir && ImGui::MenuItem("Go to containing folder")) {
+                        size_t sl = full.find_last_of('/');
+                        remoteBrowseTo(sl == std::string::npos || sl == 0 ? "/"
+                                                                          : full.substr(0, sl));
+                    }
+                    if (ImGui::MenuItem("Copy path")) {
+                        ImGui::SetClipboardText(full.c_str());
+                        toast("copied " + full);
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopID();
+        return;
+    }
     if (B.dir != "~" && B.dir != "/" && ImGui::Selectable("[..]")) {
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
@@ -7551,6 +7706,10 @@ static void drawPanelRemote() {
                 if (e.dir) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(full);
+                    if (ImGui::MenuItem("Search under here")) {
+                        rbSearchRoot = full;      // the search row shows and clears it
+                        rbSearchFocus = true;
+                    }
                     if (ImGui::MenuItem("Bookmark")) {
                         std::string u = placeUrl(B.host, B.port, full);
                         if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
@@ -8633,6 +8792,43 @@ static int remoteSelfTest(const char* exe, const char* path) {
                     sroot.c_str(), (int)gs.size(), dirsSeen.c_str(),
                     trunc ? 1 : 0, skipped, ok ? "ok" : "FAIL");
             bad += ok ? 0 : 1;
+        }
+    }
+    {   // GLOB: recursive find - full count, cap-5 truncation, bare substring
+        std::string groot = dir + "/rb";
+        std::vector<remote::GlobHit> hits;
+        bool trunc = false;
+        int skipped = 0;
+        if (!s.glob(groot, "**/frame_*.npy", 6, 2000, hits, trunc, skipped, err)) {
+            fprintf(stderr, "selftest: GLOB: skipped (%s: %s)\n", groot.c_str(), err.c_str());
+        } else {
+            // 24 in rb/ itself + 3 x 8 under scanroot/
+            bool ok = hits.size() == 48 && !trunc;
+            for (const auto& h : hits) if (h.dir) ok = false;
+            fprintf(stderr, "selftest: GLOB **/frame_*.npy under %s -> %d hit(s), "
+                            "truncated=%d: %s\n",
+                    groot.c_str(), (int)hits.size(), trunc ? 1 : 0, ok ? "ok" : "FAIL");
+            bad += ok ? 0 : 1;
+
+            if (!s.glob(groot, "**/frame_*.npy", 6, 5, hits, trunc, skipped, err)) {
+                fprintf(stderr, "selftest GLOB cap: %s\n", err.c_str());
+                bad++;
+            } else {
+                bool ok2 = hits.size() == 5 && trunc;
+                fprintf(stderr, "selftest: GLOB cap 5 -> %d hit(s), truncated=%d: %s\n",
+                        (int)hits.size(), trunc ? 1 : 0, ok2 ? "ok" : "FAIL");
+                bad += ok2 ? 0 : 1;
+            }
+            if (!s.glob(groot, "dark", 6, 2000, hits, trunc, skipped, err)) {
+                fprintf(stderr, "selftest GLOB substring: %s\n", err.c_str());
+                bad++;
+            } else {
+                bool ok3 = hits.size() == 1 && hits[0].rel == "dark.npy";
+                fprintf(stderr, "selftest: GLOB substring 'dark' -> %d hit(s) (%s): %s\n",
+                        (int)hits.size(), hits.empty() ? "?" : hits[0].rel.c_str(),
+                        ok3 ? "ok" : "FAIL");
+                bad += ok3 ? 0 : 1;
+            }
         }
     }
     struct Case { int x, y, w, h, step; };
