@@ -24,8 +24,10 @@
 
 .PARAMETER RemoteHost
     Also make a shortcut that connects to this host on startup, e.g. user@server.
-    It gets the same icon; the running window recolors its own icon green while a
-    remote session is up.
+    It gets the green variant of the icon (viewer-remote.ico, generated next to
+    the exe) so it is telling you where it starts before you click it - the same
+    green the running window paints its own taskbar button while the session is
+    up. Without that file it falls back to the exe's own icon.
 
 .PARAMETER RemotePath
     Directory to browse on that host (default ~). A .npy path opens that file.
@@ -85,7 +87,9 @@ if (-not $NoDesktop)   { $targets['desktop']    = [Environment]::GetFolderPath('
 if (-not $NoStartMenu) { $targets['Start menu'] = [Environment]::GetFolderPath('Programs') }
 if ($targets.Count -eq 0) { throw '-NoDesktop and -NoStartMenu together leave nothing to do' }
 
-$remoteName = if ($RemoteHost) { "$Name ($RemoteHost)" } else { $null }
+# ssh://host:2222 is a legitimate host spec and ':' is not a legitimate file
+# name, so the shortcut is named after a sanitized copy - the url keeps the port.
+$remoteName = if ($RemoteHost) { "$Name (" + ($RemoteHost -replace '[\\/:*?"<>|]', '-') + ")" } else { $null }
 
 if ($Uninstall) {
     foreach ($t in $targets.GetEnumerator()) {
@@ -105,13 +109,28 @@ $exePath = Find-ViewerExe
 $exeDir  = Split-Path -Parent $exePath
 Write-Host "viewer:  $exePath"
 
+# The green icon for a remote shortcut: shipped next to the exe by CI, or left
+# in the build tree by mkicon. Its absence is not an error - the exe's own icon
+# is a fine fallback, and the running window recolors itself either way.
+$remoteIcon = $null
+if ($RemoteHost) {
+    foreach ($c in @('viewer-remote.ico', 'icons\viewer-remote.ico',
+                     '..\icons\viewer-remote.ico', '..\build\icons\viewer-remote.ico',
+                     '..\build-mingw\icons\viewer-remote.ico')) {
+        $p = Join-Path $exeDir $c
+        if (Test-Path -LiteralPath $p) { $remoteIcon = (Resolve-Path -LiteralPath $p).Path; break }
+    }
+    if ($remoteIcon) { Write-Host "icon:    $remoteIcon (remote shortcut)" }
+    else { Write-Host 'icon:    viewer-remote.ico not found - using the exe icon for both' }
+}
+
 $shell = New-Object -ComObject WScript.Shell
-function New-ViewerShortcut([string]$path, [string]$arguments, [string]$description) {
+function New-ViewerShortcut([string]$path, [string]$arguments, [string]$description, [string]$icon) {
     $lnk = $shell.CreateShortcut($path)
     $lnk.TargetPath       = $exePath
     $lnk.Arguments        = $arguments
     $lnk.WorkingDirectory = $exeDir
-    $lnk.IconLocation     = "$exePath,0"
+    $lnk.IconLocation     = if ($icon) { "$icon,0" } else { "$exePath,0" }
     $lnk.Description      = $description
     $lnk.WindowStyle      = 7          # minimized: see the note at the top
     $lnk.Save()
@@ -119,10 +138,11 @@ function New-ViewerShortcut([string]$path, [string]$arguments, [string]$descript
 }
 
 foreach ($t in $targets.GetEnumerator()) {
-    New-ViewerShortcut (Join-Path $t.Value "$Name.lnk") '' 'viewer - engineering image viewer'
+    New-ViewerShortcut (Join-Path $t.Value "$Name.lnk") '' 'viewer - engineering image viewer' $null
     if ($RemoteHost) {
         $url = Get-RemoteUrl $RemoteHost $RemotePath
-        New-ViewerShortcut (Join-Path $t.Value "$remoteName.lnk") "`"$url`"" "viewer - connect to $RemoteHost"
+        New-ViewerShortcut (Join-Path $t.Value "$remoteName.lnk") "`"$url`"" `
+                           "viewer - connect to $RemoteHost" $remoteIcon
     }
 }
 

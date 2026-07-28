@@ -97,11 +97,14 @@ jobs:
           Copy-Item build/Release/viewer.exe stage/
           Copy-Item build/Release/viewer-serve.exe stage/
           Copy-Item -Recurse build/plugins stage/plugins
-          # desktop shortcut installer, and the generated icon it can point at
+          # desktop shortcut installer, and the icons it points at (the green
+          # viewer-remote.ico is what a connect-to-a-server shortcut gets)
           Copy-Item tools/install_shortcut.cmd stage/
           Copy-Item tools/install_shortcut.ps1 stage/
           Copy-Item build/icons/viewer.ico stage/
           Copy-Item build/icons/viewer.png stage/
+          Copy-Item build/icons/viewer-remote.ico stage/
+          Copy-Item build/icons/viewer-remote.png stage/
       # viewer-serve is what you copy to a compute server: it links no GL and no
       # X11, so it starts on a headless box where the GUI binary would not load.
       - name: Package (preserve executable bit)

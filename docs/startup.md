@@ -48,15 +48,23 @@ win64\install_shortcut.cmd                                    :: Windows
 |---|---|
 | タスクバーに常駐 | 一度起動 → タスクバーのボタンを右クリック → **ピン留め** |
 | ファイルを開く | `.npy` / `.raw` を**ショートカットにドロップ**(起動後のウィンドウへの D&D も可) |
-| **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、Files パネルにそのフォルダが出ます |
+| **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、Remote パネルにそのフォルダが出ます |
 
 パスを省くとホーム(`~`)を開きます。`.npy` を指定すればその画像を直接開きます。
 
-**アイコン**: ウィンドウ/タスクバーのアイコンは **CFA の 2x2(R/Gr/Gb/B)を枠で囲んだ印**で、
-枠の色が状態を表します —— **青 = ローカル、緑 = リモート接続中**(ステータスバーの
-リンク表示と同じ緑)。タイトルバーにも `frame_000.npy - viewer [user@server]` のように
-接続先が出るので、ローカルとリモートのウィンドウを並べても取り違えません。
+**アイコン**: **CFA の 2x2(R/Gr/Gb/B)を枠で囲んだ印**で、枠の色が状態を表します ——
+**青 = ローカル、緑 = リモート**(ステータスバーのリンク表示と同じ緑)。
+
+| どこ | 見え方 |
+|---|---|
+| デスクトップ/スタートメニューの `viewer` | 青 |
+| デスクトップ/スタートメニューの `viewer (host)` | **緑**(サーバ直結のショートカットだと一目で分かる) |
+| 走っているウィンドウ・タスクバーのボタン | **接続したら青→緑に変わる**(切断で戻る) |
+| タイトルバー | `frame_000.npy - viewer [user@server]` |
+
 アイコンは実行時に描いているので、接続/切断した瞬間にタスクバーの色が変わります。
+ショートカット用の緑アイコンはビルド時に `viewer-remote.ico` / `viewer-remote.png` として
+生成され、バイナリの隣に置かれます(無ければ exe のアイコンにフォールバック)。
 
 <details><summary>なぜコンソール窓が一瞬出る(ことがある)のか</summary>
 
