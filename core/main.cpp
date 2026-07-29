@@ -6617,7 +6617,9 @@ static void drawCanvas(ImVec2 avail) {
     // The footer strip (name + scrub bar) is RESERVED below the canvas, never
     // drawn over the pixels: overlapping the image was vetoed outright, and a
     // bar over the bottom rows would sit exactly where shading is judged.
-    const float FOOT_H = im ? ImGui::GetFontSize() + 10.0f * s : 0.0f;
+    // two lines: batch above, file/stack below - a filename alone cannot say
+    // WHICH frame_000.npy this is when every level folder holds one
+    const float FOOT_H = im ? ImGui::GetFontSize() * 2 + 12.0f * s : 0.0f;
     ImVec2 canvasP0 = ImVec2(origin.x + RULER_W, origin.y + RULER_H);
     ImVec2 canvasSize = ImVec2(std::max(avail.x - RULER_W, 50.0f),
                                std::max(avail.y - RULER_H - FOOT_H, 50.0f));
@@ -7249,15 +7251,40 @@ static void drawCanvas(ImVec2 avail) {
     // ever covers a pixel being judged.
     if (im) {
         float fy0 = canvasP1.y + 3.0f * s;
-        float fy1 = origin.y + avail.y - 2.0f * s;
-        float cy = (fy0 + fy1) * 0.5f;
         std::vector<int> fr = im->seqId != 0 ? framesOfSeq(im->seqId) : std::vector<int>();
         const App::SeqInfo* si = im->seqId != 0 ? seqInfo(im->seqId) : nullptr;
-        const char* name = si && fr.size() > 1 ? si->name.c_str() : im->name.c_str();
+        // numbered-file stack: the pixels on screen came from ONE file, so say
+        // which. Only a single-file stack (all members share a name) shows the
+        // pattern - there the frame counter is the only honest address anyway.
+        const char* name = im->name.c_str();
+        if (si && fr.size() > 1) {
+            bool perFile = false;
+            for (int idx : fr)
+                if (idx >= 0 && idx < (int)app.images.size() &&
+                    app.images[idx]->name != im->name) { perFile = true; break; }
+            if (!perFile) name = si->name.c_str();
+        }
+        // line 1: the batch (and the series, when this stack is in a sweep) -
+        // dimmer than the name, because it is the context, not the subject
+        const char* bname = nullptr;
+        for (const auto& b : app.batches) if (b.id == im->batchId) bname = b.name.c_str();
+        const App::Series* fser = si ? seriesOfStack(si->id) : nullptr;
+        char ctx[320];
+        if (bname && fser) snprintf(ctx, sizeof ctx, "%s  >  %s", bname, fser->name.c_str());
+        else if (bname)   snprintf(ctx, sizeof ctx, "%s", bname);
+        else              ctx[0] = 0;
+        const float lh = ImGui::GetFontSize();
+        float topY = fy0 + 1.0f * s, botY = topY + lh + 2.0f * s;
+        if (ctx[0]) {
+            dl->PushClipRect(ImVec2(canvasP0.x, topY),
+                             ImVec2(canvasP0.x + canvasSize.x * 0.6f, topY + lh), true);
+            dl->AddText(ImVec2(canvasP0.x, topY), IM_COL32(140, 148, 156, 190), ctx);
+            dl->PopClipRect();
+        }
         ImVec2 ts = ImGui::CalcTextSize(name);
         float nameW = std::min(ts.x, canvasSize.x * 0.45f);
-        dl->PushClipRect(ImVec2(canvasP0.x, fy0), ImVec2(canvasP0.x + nameW, fy1), true);
-        dl->AddText(ImVec2(canvasP0.x, cy - ts.y * 0.5f), IM_COL32(175, 183, 191, 200), name);
+        dl->PushClipRect(ImVec2(canvasP0.x, botY), ImVec2(canvasP0.x + nameW, botY + lh), true);
+        dl->AddText(ImVec2(canvasP0.x, botY), IM_COL32(175, 183, 191, 200), name);
         dl->PopClipRect();
         if (si && fr.size() > 1) {
             int pos = 0;
@@ -7265,20 +7292,19 @@ static void drawCanvas(ImVec2 avail) {
             char cnt[32];
             snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
             ImVec2 cs = ImGui::CalcTextSize(cnt);
-            dl->AddText(ImVec2(canvasP1.x - cs.x, cy - cs.y * 0.5f),
-                        IM_COL32(175, 183, 191, 200), cnt);
+            dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
             float barH = 5.0f * s;
-            ImVec2 b0(canvasP0.x + nameW + 12 * s, cy - barH * 0.5f);
-            ImVec2 b1(canvasP1.x - cs.x - 12 * s, cy + barH * 0.5f);
+            ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
+            ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
             if (b1.x > b0.x + 40 * s) {
-                ImGui::SetCursorScreenPos(ImVec2(b0.x, fy0));
-                ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, fy1 - fy0));
+                ImGui::SetCursorScreenPos(ImVec2(b0.x, botY));
+                ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, lh));
                 bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
                 int alpha = sh || sa ? 235 : 150;
                 dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
                 float fx = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
                 dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha), barH * 0.5f);
-                dl->AddCircleFilled(ImVec2(fx, cy), barH * (sh || sa ? 1.4f : 1.0f),
+                dl->AddCircleFilled(ImVec2(fx, botY + lh * 0.5f), barH * (sh || sa ? 1.4f : 1.0f),
                                     IM_COL32(160, 200, 240, alpha));
                 if (sa) {
                     float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
