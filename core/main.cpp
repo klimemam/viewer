@@ -485,7 +485,7 @@ struct App {
     // all called frame_000.npy would be indistinguishable, and the linearity
     // Auto-levels reads the level from exactly this folder prefix.
     struct RemoteOpen { std::string host; std::vector<std::string> files;
-                        std::string name; int batchId = 0; };
+                        std::string name; int batchId = 0; int token = 0; };
     std::vector<RemoteOpen> rbOpenQueue;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
@@ -684,8 +684,13 @@ struct App {
     // queued stacks from "Open Folder" (loaded one after another).
     // shape: "24x1200x1600 u16" when known (npy header peek locally, v3 listing
     // metadata remotely); the picker shows it and the merge warning compares it.
+    // token: the identity of the stack this group is GOING to create, stamped
+    // when the group is queued and recorded against the real seqId the moment
+    // the stack appears (see groupStacks). A pending sweep resolves against
+    // that, never against a display name.
     struct PendingGroup { std::string name; std::vector<std::string> files;
-                          bool isRaw = false; int batchId = 0; std::string shape; };
+                          bool isRaw = false; int batchId = 0; std::string shape;
+                          int token = 0; };
     std::vector<PendingGroup> seqQueue;
     // Sibling loads a session asked for, drained one at a time.
     // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
@@ -714,20 +719,28 @@ struct App {
     std::vector<std::pair<std::string, double>> seqLevelLegacy;
     // A sweep the PICKER was told to make ("open as a sweep"), resolved once
     // its stacks are open - the same lateness as seriesRestore and for the same
-    // reason. Members are named by their GROUP name, which becomes the stack's
-    // name (PendingGroup::name / RemoteOpen::name -> SeqInfo::name): the remote
-    // queue holds no seqId, so a name is the only handle there is.
+    // reason. Each member carries the TOKEN of the group it was ticked on, and
+    // that is what it resolves by: the stack the group actually created is
+    // recorded under that token at creation (App::groupStacks). The group name
+    // is kept for the message and as a fallback, but it is not identity - it is
+    // a display string, renameable with F2 the instant the head frame lands.
     struct SeriesPending {
         int batchId = 0;
         std::string name, paramName, unit;
         int kind = Series::KLinearity;
-        std::vector<std::pair<std::string, double>> byName;   // stack name -> value
+        struct Want { int token = 0; std::string name; double value = 0; };
+        std::vector<Want> members;
     };
     // A QUEUE, not a slot. Resolution waits for every load to drain, which for a
     // folder-of-folders is seconds and for a remote sweep much longer, and File >
     // Open Folder is available throughout - a single slot meant the second sweep
     // silently threw the first one's ticked box, typed parameter and unit away.
     std::vector<SeriesPending> seriesPending;
+    // Which stack each queued group produced, by token. Filled while a sweep is
+    // waiting and cleared when it resolves, so it never outlives the Open that
+    // stamped it.
+    int nextGroupToken = 1;
+    std::vector<std::pair<int, int>> groupStacks;   // group token -> seqId
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
@@ -830,7 +843,7 @@ static const char* REMOTE_HOME = "~/.viewer";
 #define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
 static void openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name = std::string());
+                            const std::string& name = std::string(), int token = 0);
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 static bool ensureRemoteSession(const std::string& host, std::string& err, int port = 0);
 static void remoteBrowseTo(const std::string& dir);
@@ -2145,6 +2158,7 @@ static void closeAll() {
     app.seriesRestore.clear();
     app.seqLevelLegacy.clear();
     app.seriesPending.clear();                  // they named stacks being thrown away
+    app.groupStacks.clear();                    // ...and those stacks are gone too
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
@@ -3081,7 +3095,7 @@ static void restoreFull() {
 
 static void openRemote(const std::string& url, bool asPreview);   // fwd (default on the first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name);   // default lives on the first decl
+                            const std::string& name, int token);   // defaults: first decl
 static std::string makeRemoteUrl(const std::string& host, const std::string& path);
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
@@ -4118,6 +4132,19 @@ static bool seqReadyPending() {
 // stacks at once. Taking "the first one" then hands every member of the second
 // copy's series a stack in the wrong batch, strict containment rejects them all,
 // and the whole series is lost - permanently, at the next autosave.
+// A queued group has produced its stack: remember WHICH, under the token the
+// group was stamped with. Recorded only while a sweep is waiting - that is the
+// only consumer, and it bounds the table to the groups of the Opens still in
+// flight (256 apiece), which resolvePendingSeries then clears.
+// seqId 0 = the load made a lone frame, not a stack: nothing to record, and the
+// resolver counts that member as unmatched, which is the truth.
+static void noteGroupStack(int token, int seqId) {
+    if (!token || !seqId || app.seriesPending.empty()) return;
+    for (auto& p : app.groupStacks)
+        if (p.first == token) { p.second = seqId; return; }
+    app.groupStacks.emplace_back(token, seqId);
+}
+
 static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0) {
     int any = 0;
     for (const auto& d : app.images) {
@@ -4227,10 +4254,16 @@ static void migrateLegacyLevels() {
     }
 }
 
-// The picker's "open as a sweep", once its stacks exist. Matching is BY NAME:
-// the group name the picker accepted becomes the stack's name, and for a remote
-// stack it is that name plus " [remote xN]" (openRemoteStack). The remote queue
-// carries no seqId at all, so there is nothing else to match on.
+// The picker's "open as a sweep", once its stacks exist. Matching is by
+// IDENTITY: each ticked group was stamped with a token, and the stack that
+// group created was recorded under it at creation (noteGroupStack). A display
+// name is not identity - Files renames a stack with F2 the moment its head
+// frame lands, and a rename to another group's name used to hand that group's
+// LEVEL to the wrong stack: a silently misplaced point on the axis the fit is
+// taken against, which is worse than the loss it was reported as.
+//
+// The name is still accepted as a fallback for a tokenless entry (a session
+// written by an older build, a group queued outside the picker).
 //
 // Nothing here invents anything: the values were read from the group names and
 // shown in the picker before Load was pressed, and a group whose stack never
@@ -4238,15 +4271,22 @@ static void migrateLegacyLevels() {
 static void resolveOnePendingSeries(const App::SeriesPending& P) {
     std::vector<int> used;
     int id = 0, made = 0, lost = 0;
-    for (const auto& e : P.byName) {
+    auto free4 = [&](int sid) {
+        return sid && seqInfo(sid) && batchOfStack(sid) == P.batchId &&
+               std::find(used.begin(), used.end(), sid) == used.end();
+    };
+    for (const auto& e : P.members) {
         int seqId = 0;
+        if (e.token)
+            for (const auto& gs : app.groupStacks)
+                if (gs.first == e.token && free4(gs.second)) { seqId = gs.second; break; }
         for (const auto& si : app.seqs) {
-            if (batchOfStack(si.id) != P.batchId) continue;
-            if (std::find(used.begin(), used.end(), si.id) != used.end()) continue;
-            bool same = si.name == e.first ||
-                        (si.name.size() > e.first.size() + 10 &&
-                         si.name.compare(0, e.first.size(), e.first) == 0 &&
-                         si.name.compare(e.first.size(), 10, " [remote x") == 0);
+            if (seqId) break;
+            if (!free4(si.id)) continue;
+            bool same = si.name == e.name ||
+                        (si.name.size() > e.name.size() + 10 &&
+                         si.name.compare(0, e.name.size(), e.name) == 0 &&
+                         si.name.compare(e.name.size(), 10, " [remote x") == 0);
             if (same) { seqId = si.id; break; }
         }
         if (!seqId) { lost++; continue; }
@@ -4259,7 +4299,7 @@ static void resolveOnePendingSeries(const App::SeriesPending& P) {
                 S->kind = P.kind;
             }
         }
-        if (addToSeries(id, seqId, e.second)) made++;
+        if (addToSeries(id, seqId, e.value)) made++;
         else lost++;
     }
     // In VALUE order, not the order the folders happened to sort in: the groups
@@ -4291,6 +4331,7 @@ static void resolvePendingSeries() {
     std::vector<App::SeriesPending> queue;
     queue.swap(app.seriesPending);
     for (const auto& P : queue) resolveOnePendingSeries(P);
+    app.groupStacks.clear();          // the only thing that reads them is done
 }
 
 // called once per frame: integrate decoded frames, then chain the next stack
@@ -4578,7 +4619,11 @@ static void startNextQueuedGroup() {
     // reference the image we just appended, not app.current (which may be elsewhere)
     int idx = (int)app.images.size() - 1;
     if (idx < 0) return;
-    if (g.files.size() >= 2) { startSequenceLoad(idx, g.files, g.name); return; }
+    if (g.files.size() >= 2) {
+        startSequenceLoad(idx, g.files, g.name);
+        noteGroupStack(g.token, app.images[idx]->seqId);
+        return;
+    }
     // ONE file that carries a frame axis is a stack too, and loadNpy could only
     // name it after the file it came out of ("capture.npy  (8 frames)"). The
     // canon's default stack name is フォルダ/パターン and the group name IS that:
@@ -4588,6 +4633,7 @@ static void startNextQueuedGroup() {
     // Files, and the only number the value proposal can read out of that name is
     // the frame count (seven levels all "8").
     if (App::SeqInfo* si = seqInfo(app.images[idx]->seqId)) si->name = g.name;
+    noteGroupStack(g.token, app.images[idx]->seqId);
 }
 
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
@@ -4906,8 +4952,14 @@ static void pickerAccept() {
         P.paramName = swParam;
         P.unit = swUnit;                       // may be empty: then no fit, and
         P.kind = App::Series::KLinearity;      // the panel says exactly that
-        for (const auto& g : sel)
-            P.byName.emplace_back(g.name, extractLevelFromName(g.name));
+        // Stamp each ticked group with an identity NOW - before it is queued -
+        // and carry it on the pending member. The stack does not exist yet; the
+        // token is the handle to the one this group will make, whatever it ends
+        // up being called by the time everything has drained.
+        for (auto& g : sel) {
+            g.token = app.nextGroupToken++;
+            P.members.push_back({ g.token, g.name, extractLevelFromName(g.name) });
+        }
         app.seriesPending.push_back(std::move(P));   // QUEUED, never overwritten
     }
     if (remote) {
@@ -4918,7 +4970,8 @@ static void pickerAccept() {
         toast("opening " + std::to_string(sel.size()) + " remote stack(s), " +
               std::to_string(frames) + " frames");
         for (auto& g : sel)
-            app.rbOpenQueue.push_back({ host, std::move(g.files), g.name, g.batchId });
+            app.rbOpenQueue.push_back({ host, std::move(g.files), g.name, g.batchId,
+                                        g.token });
     } else {
         enqueueGroups(std::move(sel));
     }
@@ -6083,7 +6136,7 @@ static void pumpRemoteOpenQueue() {
     app.rbOpenQueue.erase(app.rbOpenQueue.begin());
     sortFramesNumerically(ro.files);
     app.loadBatchId = ro.batchId;
-    openRemoteStack(ro.host, ro.files, ro.name);
+    openRemoteStack(ro.host, ro.files, ro.name, ro.token);
     app.loadBatchId = 0;
 }
 
@@ -6278,7 +6331,7 @@ static void openRemote(const std::string& url, bool asPreview) {
 // shows immediately, the rest arrive in the background and slot in as ordinary
 // local frames. Processing never moves - the pixels do, once each.
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
-                            const std::string& name) {
+                            const std::string& name, int token) {
     if (files.empty()) return;
     size_t before = app.images.size();
     openRemote(makeRemoteUrl(host, files[0]));
@@ -6295,6 +6348,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
             if (App::SeqInfo* si = seqInfo(first->seqId))
                 si->name = name + " [remote x" +
                            std::to_string(std::max(1, si->expectedFrames)) + "]";
+        noteGroupStack(token, first->seqId);
         return;
     }
     App::SeqInfo si;
@@ -6310,6 +6364,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     app.seqs.push_back(si);
     first->seqId = si.id;
     first->seqIndex = 0;
+    noteGroupStack(token, si.id);
     maybeRequestServerTemporal(si.id);
     size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
     if (first->remoteStep > 1)                    // preview dims: scale the estimate
@@ -6614,6 +6669,8 @@ static void drawRawModal() {
             App::PendingGroup g = app.seqQueue.front();
             app.seqQueue.erase(app.seqQueue.begin());
             if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
+            if (app.current >= 0 && app.current < (int)app.images.size())
+                noteGroupStack(g.token, app.images[app.current]->seqId);
             ImGui::CloseCurrentPopup();
         } else {
             bool fresh = rawDlg.replaceIdx < 0;
@@ -15741,6 +15798,47 @@ int main(int argc, char** argv) {
             check("...K 2.0 DN/e-", L.fitValid && fabs(L.ptcK[0] - 2.0) <= 0.2);
             check("...read 3.0 DN, MEASURED in the lv000 dark stack",
                   L.fitValid && L.readFromDark && fabs(L.readDN[0] - 3.0) <= 0.15);
+        }
+
+        // ---- a rename while the sweep is still loading -------------------------
+        // Files renames a stack (F2 / right-click) the instant its head frame
+        // lands, which is long before every queue drains and the sweep resolves.
+        // Renaming one stack to ANOTHER group's exact name used to lose that
+        // group's member AND hand the other group's LEVEL to the renamed stack:
+        // a misplaced point on the axis the fit is taken against, reported only
+        // as "1 could not be matched". Identity is stamped at creation, so the
+        // name the user types is just a name.
+        {
+            closeAll();
+            openFolder(dir);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            int renamed = 0;
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                pumpSequenceAndQueue();
+                if (!renamed && app.seqs.size() == 2) {      // lv000, lv010 are up
+                    renamed = app.seqs[1].id;
+                    seqInfo(renamed)->name = "lv320/capture.npy";   // another group's
+                    fprintf(stderr, "sweepfile: renamed stack %d (was lv010) to "
+                                    "\"lv320/capture.npy\" mid-load\n", renamed);
+                }
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen && app.seriesPending.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const App::Series* W = app.series.empty() ? nullptr : &app.series.front();
+            double vRenamed = std::numeric_limits<double>::quiet_NaN();
+            if (W)
+                for (const auto& m : W->members) if (m.seqId == renamed) vRenamed = m.value;
+            fprintf(stderr, "sweepfile: after the mid-load rename -> %d series, %d "
+                            "member(s), the renamed stack is at %.6g\n",
+                    (int)app.series.size(), W ? (int)W->members.size() : -1, vRenamed);
+            check("a mid-load rename loses no member", W && W->members.size() == 7);
+            check("...and the renamed stack keeps ITS level, not the name's",
+                  renamed && fabs(vRenamed - 10.0) < 1e-9);
         }
 
         // ---- remote: the same layout over the peer ----------------------------
