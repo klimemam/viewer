@@ -110,6 +110,24 @@ static std::string baseName(const std::string& p) {
     size_t i = p.find_last_of("/\\");
     return i == std::string::npos ? p : p.substr(i + 1);
 }
+// A path on its way to the SCREEN. The bundled CJK font draws U+005C as the yen
+// sign - the JIS legacy - so a Windows path renders "C:(yen)Users(yen)hish".
+// Every candidate font does it (Meiryo, Yu Gothic, MS Gothic, Noto CJK JP), so
+// this is not one font's bug to route around, and there is no second font in
+// the atlas to fall back to: the CJK face IS the app's font, one base, no
+// merge. Dropping U+005C from its ranges would leave the glyph missing, not
+// borrowed - a '?' where the separator should be.
+//
+// So the separator is shown, not the codepoint. The app already normalises to
+// '/' everywhere it compares or joins paths (openPickerWith does it per file,
+// browseLocalFolder does it on the way in, and every remote path is '/'), the
+// Windows API takes '/' as readily as '\\', and a path copied out of here
+// pastes into Python, CMake and a shell unescaped. Storage is untouched: this
+// is display only.
+static std::string dispPath(std::string p) {
+    std::replace(p.begin(), p.end(), '\\', '/');
+    return p;
+}
 static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
     float mag = powf(10.0f, floorf(log10f(std::max(raw, 1e-9f))));
     for (float m : {1.0f, 2.0f, 5.0f, 10.0f})
@@ -4952,7 +4970,7 @@ static void drawFolderPickModal() {
                                         ImVec2(FLT_MAX, FLT_MAX));
     if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
 
-    ImGui::TextDisabled("%s", app.folderPickRoot.c_str());
+    ImGui::TextDisabled("%s", dispPath(app.folderPickRoot).c_str());
     int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
     for (const auto& e : app.folderPick) {
         totalFiles += (int)e.g.files.size();
@@ -12323,7 +12341,8 @@ static void drawFileList() {
                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
           if (isPreview) ImGui::PopStyleColor();
           if (ImGui::IsItemHovered() && !group.dir.empty())
-              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)", group.dir.c_str());
+              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
+                                dispPath(group.dir).c_str());
           // the batch is the user's grouping, so its name is theirs to change
           if (ImGui::BeginPopupContextItem("batchctx")) {
               static char nameBuf[256];
@@ -12385,7 +12404,7 @@ static void drawFileList() {
                                                        ImGui::GetTextLineHeight()) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
             }
-            if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
+            if (hov) ImGui::SetTooltip("%s\n%s", dispPath(d.path).c_str(), meta);
             return clicked;
         };
         // One row. mem != nullptr means the row is being drawn INSIDE a series
@@ -12704,7 +12723,8 @@ static void drawSequenceModal() {
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
-    ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(), app.seqAskPattern.c_str());
+    ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(),
+                dispPath(app.seqAskPattern).c_str());
     ImGui::TextDisabled("Loading them as one stack enables temporal analysis.");
     ImGui::TextDisabled("Frames decode in the background; you can keep working.");
     ImGui::Separator();
@@ -14518,10 +14538,38 @@ int main(int argc, char** argv) {
         bool ok = true;
 
         // ---- UC3: filter "_A", one stack per group -> only the A files load
-        openFolder(g_pickerSelftest);
+        // Scanned through a NATIVE path, separators and all - which is what a
+        // folder dialog hands over on Windows, and the input the yen-sign bug
+        // needs: the CJK font draws U+005C as the yen sign, so a path shown
+        // raw reads "C:(yen)Users(yen)hish". What the picker DISPLAYS is
+        // checked below.
+        {
+            std::string root = g_pickerSelftest;
+#if defined(_WIN32)
+            std::replace(root.begin(), root.end(), '/', '\\');
+#endif
+            openFolder(root);
+        }
         if (!app.folderPickOpen) {
             fprintf(stderr, "pickerselftest: picker did not open\n");
             return 1;
+        }
+        {   // no separator survives to the screen as the codepoint the font
+            // draws as a yen sign
+            std::string bad;
+            auto noBS = [&](const std::string& what, const std::string& shown) {
+                if (shown.find('\\') != std::string::npos && bad.empty())
+                    bad = what + ": " + shown;
+            };
+            noBS("picker header", dispPath(app.folderPickRoot));
+            for (const auto& e : app.folderPick) {
+                noBS("group name", e.g.name);
+                for (const auto& r : e.rel) noBS("file row", r);
+            }
+            fprintf(stderr, "pickerselftest: scanned \"%s\" -> header reads \"%s\": %s%s\n",
+                    app.folderPickRoot.c_str(), dispPath(app.folderPickRoot).c_str(),
+                    bad.empty() ? "ok" : "FAIL ", bad.c_str());
+            if (!bad.empty()) ok = false;
         }
         int total = 0;
         for (const auto& e : app.folderPick) total += (int)e.g.files.size();
