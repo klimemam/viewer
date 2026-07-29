@@ -9326,7 +9326,15 @@ static void openSeriesModal(int batchId, int editId) {
             // offered in the column beside the box instead of inside it.
             r.orig = value;
             r.haveOrig = true;
-            if (std::isfinite(value)) snprintf(r.value, sizeof r.value, "%.6g", value);
+            // LOSSLESSLY. From the first keystroke in this box the TEXT is the
+            // value (touched), so whatever is prefilled becomes authoritative
+            // the moment the box is touched at all - and "click in, type a
+            // digit, delete it again, Save" then committed the six digits the
+            // box was showing: 1234567.89 saved as 1234570, the exact rounding
+            // the orig/touched split exists to prevent, on the axis the fit is
+            // taken against. fmtExact round-trips and fits (%.17g is ~24 of 32).
+            if (std::isfinite(value))
+                snprintf(r.value, sizeof r.value, "%s", fmtExact(value).c_str());
             else r.guess = guess;
         } else if (std::isfinite(guess)) {
             snprintf(r.value, sizeof r.value, "%.6g", guess);
@@ -15492,6 +15500,24 @@ int main(int argc, char** argv) {
                   !std::isfinite(vu));
             check("...and does not round the values it never touched", vp == PRECISE);
             check("invariant 1: audit after the no-op Save", audit());
+
+            // The case the no-op Save cannot see: the box was TOUCHED and put
+            // back. InputText reports a change on any accepted keystroke, so
+            // from the first one the TEXT is the value - and a lossy prefill is
+            // then authoritative. Type a digit into 1234567.89 and delete it
+            // again, press Save, and the member became 1234570.
+            openSeriesModal(b, sid);
+            std::string shown;
+            for (auto& r : app.seriesEdit.rows)
+                if (r.seqId == preciseSeq) { r.touched = true; shown = r.value; }
+            seriesModalAccept();
+            M = seriesById(sid);
+            double vt = 0;
+            for (const auto& m : M->members) if (m.seqId == preciseSeq) vt = m.value;
+            fprintf(stderr, "seriesselftest: box touched and reverted (showing \"%s\"): "
+                            "%.11g -> %.11g\n", shown.c_str(), PRECISE, vt);
+            check("a box touched and put back re-reads as the SAME double",
+                  vt == PRECISE);
 
             // Text the program cannot read is UNSET, not 0. 0 is not "missing":
             // it is the dark stack the offset is anchored to and the read noise
