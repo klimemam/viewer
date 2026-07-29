@@ -203,6 +203,42 @@ LRESULT CALLBACK frameProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return (z & HZ_CAPTION) ? HTCAPTION : HTCLIENT;
         }
 
+        // ---- nothing paints the non-client area but us ----------------------
+        //
+        // WM_NCCALCSIZE above hands the whole window rect to the client, so the
+        // frame has nothing left to draw. DefWindowProc does not know that, and
+        // Windows still asks it to draw - and it draws the system title bar
+        // straight over the bar this app draws for itself.
+        //
+        // Stepping frames is where that shows, because the window title carries
+        // the frame's file name: every step is a SetWindowText. A message trace
+        // over a stepping burst has WM_NCUAHDRAWCAPTION arriving immediately
+        // after every single WM_SETTEXT and at no other time -
+        //
+        //     WM_KEYDOWN / WM_SETTEXT / WM_NCUAHDRAWCAPTION / WM_KEYUP  x N
+        //
+        // - which is the theme manager drawing the caption back, once per step:
+        // the frame "パタつく" of the report.
+        //
+        // WM_NCUAHDRAWCAPTION and WM_NCUAHDRAWFRAME are undocumented (UAH =
+        // the user-area hook uxtheme draws non-client parts through). They have
+        // no headers, so the numbers are spelled out. WM_NCPAINT and
+        // WM_NCACTIVATE are the documented halves of the same job.
+        //
+        // Behaviour is untouched: WM_NCHITTEST still answers HTCAPTION and the
+        // edges, so Aero Snap, Aero Shake, the double-click and the resize are
+        // all still the system's. Only the PAINTING stops.
+        case WM_NCPAINT:
+            return 0;
+        case 0x00AE:            // WM_NCUAHDRAWCAPTION
+        case 0x00AF:            // WM_NCUAHDRAWFRAME
+            return 0;
+        case WM_NCACTIVATE:
+            // lParam -1 means "do not redraw the non-client area". The message
+            // still has to go through, or an inactive window stops updating
+            // while another app is in front - so it is passed on, not dropped.
+            return CallWindowProc(g_prevProc, h, msg, wp, -1);
+
         // HTMAXBUTTON is non-client, so the click arrives here instead of as a
         // normal mouse event. Swallow the press, act on the release - the same
         // order a real button has.
