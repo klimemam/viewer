@@ -6,6 +6,7 @@
 // network, and no credentials of our own - ssh owns the authentication. Passing
 // an empty host starts a local peer instead, which is how this is tested.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -87,6 +88,16 @@ public:
     bool startOn(const std::string& host, int port, const std::string& exe, std::string& err);
     bool alive() const { return alive_; }
     void stop();
+    // A worker's stop flag. recv() blocks inside a raw pipe read, and the
+    // workers poll their stop flags only BETWEEN queue items - so a worker
+    // parked in a read never saw the flag, and main()'s four joins held the
+    // dead window on screen for as long as the request took (up to ssh's
+    // ~45-60 s keepalive teardown on a black-holed link, unbounded for a
+    // local:// peer). With this set, a blocked read gives up within one 50 ms
+    // slice. Deliberately NOT a wall-clock deadline: a legitimate MEASURE over
+    // a 300-frame aggregate produces no bytes for minutes and is not a fault.
+    // The pointer must outlive the Session.
+    void setAbort(const std::atomic<bool>* flag) { abort_ = flag; }
 
     bool list(const std::string& path, std::vector<Entry>& out, std::string& err);
     // Walk the subtree under `root` server-side and return every stack below
@@ -123,6 +134,7 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int port_ = 0;
+    const std::atomic<bool>* abort_ = nullptr;
     void* impl_ = nullptr;      // platform pipe/process handles
 };
 

@@ -1404,6 +1404,7 @@ static void forgetImage(ImageDoc* im) {
 // connection and are swapped in by the UI thread.
 static void rfWorker() {
     remote::Session ses;
+    ses.setAbort(&app.rfStop);        // a blocked read gives up when Quit asks
     std::string sesHost = "\n";                  // impossible: force first connect
     int sesPort = -1;
     while (!app.rfStop) {
@@ -1624,6 +1625,7 @@ static void stopRemoteFetcher() {
 // and that must not stall the tile fetches on the other worker.
 static void mWorker() {
     remote::Session ses;
+    ses.setAbort(&app.mStop);         // a blocked read gives up when Quit asks
     std::string sesHost = "\n";
     int sesPort = -1;
     while (!app.mStop) {
@@ -6046,7 +6048,10 @@ static void rbWorker() {
             if (app.rbSession) app.rbSession->stop();
             r.ok = true;
         } else {
-            if (!app.rbSession) app.rbSession.reset(new remote::Session());
+            if (!app.rbSession) {
+                app.rbSession.reset(new remote::Session());
+                app.rbSession->setAbort(&app.rbStop);   // Quit interrupts a blocked read
+            }
             std::string err;
             bool alive = app.rbSession->alive() && app.rbSession->host() == job.host;
             if (!alive) {
@@ -14270,6 +14275,27 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 mismatch ? "FAIL" : "ok", mismatch,
                 wire / 1048576.0, (double)got.size() * 4 / 1048576.0);
         bad += mismatch ? 1 : 0;
+    }
+    {   // A blocked protocol read must be interruptible, or Quit waits it out
+        // with a dead window on screen: the workers poll their stop flags only
+        // BETWEEN queue items, so one parked inside recv() never saw them.
+        std::atomic<bool> stopFlag{ false };
+        remote::Session s2;
+        s2.setAbort(&stopFlag);
+        std::string e2;
+        std::vector<remote::Entry> ents2;
+        bool started = s2.startOn("", 0, exe, e2);
+        bool listedOk = started && s2.list(dir, ents2, e2);
+        stopFlag = true;                       // exactly what stop*() sets
+        double at0 = glfwGetTime();
+        bool listedAfter = s2.list(dir, ents2, e2);
+        double asecs = glfwGetTime() - at0;
+        bool abortOk = started && listedOk && !listedAfter && asecs < 1.0;
+        fprintf(stderr, "selftest: abortable read: LIST before the flag %s, after it %s "
+                        "in %.3f s: %s\n",
+                listedOk ? "ok" : "FAILED", listedAfter ? "STILL SUCCEEDED" : "gave up",
+                asecs, abortOk ? "ok" : "FAIL");
+        bad += abortOk ? 0 : 1;
     }
     {   // A TILE reply sizes an allocation, so it is validated against the
         // REQUEST and not only against itself. Both hostile shapes below pass

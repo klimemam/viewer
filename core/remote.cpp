@@ -31,6 +31,9 @@ struct Pipe {
     int inW = -1, outR = -1;
     pid_t pid = -1;
 #endif
+    // Set by the owning worker so a blocked read can be given up on. See
+    // Session::setAbort for why this is a flag and not a deadline.
+    const std::atomic<bool>* abort = nullptr;
 };
 
 static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err) {
@@ -127,14 +130,31 @@ static bool pipeWrite(Pipe& p, const void* buf, size_t n) {
     return true;
 }
 
+// Blocking, but interruptible. runSshCommand has used the same
+// PeekNamedPipe / poll slice loop since it was written ("ReadFile on a pipe
+// blocks with no way out"); the protocol path did not, so a worker parked here
+// could not be stopped and the quit path waited it out with the dead window
+// still on screen.
 static bool pipeRead(Pipe& p, void* buf, size_t n) {
     uint8_t* q = (uint8_t*)buf;
     while (n) {
+        if (p.abort && p.abort->load()) return false;
 #if defined(_WIN32)
+        DWORD avail = 0;
+        if (p.abort) {                    // only pay for the poll when it can matter
+            if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) return false;
+            if (avail == 0) { Sleep(20); continue; }
+        }
         DWORD got = 0;
         if (!ReadFile(p.outR, q, (DWORD)std::min<size_t>(n, 1u << 20), &got, nullptr) || !got)
             return false;
 #else
+        if (p.abort) {
+            struct pollfd pf { p.outR, POLLIN, 0 };
+            int pr = poll(&pf, 1, 20);
+            if (pr == 0) continue;
+            if (pr < 0) return false;
+        }
         ssize_t got = read(p.outR, q, std::min<size_t>(n, 1u << 20));
         if (got <= 0) return false;
 #endif
@@ -306,6 +326,7 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     host_ = host;
     port_ = port;
     Pipe* p = new Pipe();
+    p->abort = abort_;                // interruptible reads for a worker's session
     impl_ = p;
     std::vector<std::string> argv;
     if (host.empty()) {
