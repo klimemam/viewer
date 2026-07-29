@@ -12191,6 +12191,63 @@ static void drawPanelRemote() {
     ImGui::PopID();
 }
 
+// One heading in the Files panel: a batch, the stacks under it, and the folder
+// its first stack came from. Grouped by BATCH, not by folder - a batch is one
+// open action, named by the user (the folder name is only the starting value),
+// and two loads from the same folder are two batches, which is the point.
+struct FileGroup {
+    int batch = 0;
+    std::string dir, label;
+    std::vector<const std::vector<int>*> stacks;
+};
+// Extracted from drawFileList so the ORDER can be asserted without a frame: it
+// is the thing "Move to batch" must not change.
+//
+// The order is app.batches', which is the order the batches were CREATED in.
+// It used to be the order they were first met while walking the stacks - and
+// that is a property of the stacks, not of the batches. Moving one stack into
+// another batch moved that batch's whole heading to wherever the moved stack
+// happened to sit, which for a move "upwards" is the top of the list, so every
+// other heading shifted and the user had to find their work again. A move
+// changes which heading a row sits UNDER. It must not reorder the headings.
+static std::vector<FileGroup> buildFileGroups(const std::vector<std::vector<int>>& stacks) {
+    std::vector<FileGroup> groups;
+    for (const auto& stack : stacks) {
+        const ImageDoc& head = *app.images[stack.front()];
+        FileGroup* g = nullptr;
+        for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
+        if (!g) {
+            const std::string& p = head.path;
+            size_t slash = p.find_last_of("/\\");
+            std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
+            std::string label = "opened";
+            for (const auto& b : app.batches) if (b.id == head.batchId) label = b.name;
+            groups.push_back({ head.batchId, dir, label, {} });
+            g = &groups.back();
+        }
+        g->stacks.push_back(&stack);
+    }
+    auto rank = [](int id) {
+        for (size_t i = 0; i < app.batches.size(); i++)
+            if (app.batches[i].id == id) return (int)i;
+        return (int)app.batches.size();    // no batch names it: last, order kept
+    };
+    std::stable_sort(groups.begin(), groups.end(),
+                     [&](const FileGroup& a, const FileGroup& b) {
+                         return rank(a.batch) < rank(b.batch);
+                     });
+    // The transient preview is PINNED LAST and never reorders the rest.
+    // It used to sort in wherever its batch was created, so glancing at a
+    // file in the browser inserted a heading in the middle of the list and
+    // pushed everything the user was working with down a row - the opposite
+    // of what a throwaway look should cost.
+    for (size_t i = 0; i + 1 < groups.size(); i++)
+        if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
+                                                        groups.begin() + i + 1,
+                                                        groups.end()); break; }
+    return groups;
+}
+
 static void drawFileList() {
     if (ImGui::Button("Open (O)")) openFileDialog();
     ImGui::SameLine();
@@ -12286,39 +12343,11 @@ static void drawFileList() {
     // produced a flat list of bare filenames with nothing saying where each came
     // from. The folder is the only thing that distinguishes them.
     const auto& stacks = stacksCached();
-    // Grouped by BATCH, not by folder: a batch is one open action, named by the
-    // user (folder name is only the starting value). Two loads from the same
-    // folder are two batches - that is the point.
-    struct FileGroup { int batch; std::string dir, label; std::vector<const std::vector<int>*> stacks; };
     static std::vector<FileGroup> groups;
     static uint64_t groupsRev = 0;
     if (groupsRev != app.imagesRev) {
         groupsRev = app.imagesRev;
-        groups.clear();
-        for (const auto& stack : stacks) {
-            const ImageDoc& head = *app.images[stack.front()];
-            FileGroup* g = nullptr;
-            for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
-            if (!g) {
-                const std::string& p = head.path;
-                size_t slash = p.find_last_of("/\\");
-                std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
-                std::string label = "opened";
-                for (const auto& b : app.batches) if (b.id == head.batchId) label = b.name;
-                groups.push_back({ head.batchId, dir, label, {} });
-                g = &groups.back();
-            }
-            g->stacks.push_back(&stack);
-        }
-        // The transient preview is PINNED LAST and never reorders the rest.
-        // It used to sort in wherever its batch was created, so glancing at a
-        // file in the browser inserted a heading in the middle of the list and
-        // pushed everything the user was working with down a row - the opposite
-        // of what a throwaway look should cost.
-        for (size_t i = 0; i + 1 < groups.size(); i++)
-            if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
-                                                            groups.begin() + i + 1,
-                                                            groups.end()); break; }
+        groups = buildFileGroups(stacks);
     }
     // The batch heading is ALWAYS drawn. It used to appear only once there was
     // more than one thing open, so opening a second folder made a heading
@@ -15071,6 +15100,53 @@ int main(int argc, char** argv) {
             return 1;
         }
         int oldBatch = app.images[0]->batchId;
+        // ---- a move must not reorder the Files list ----
+        // Three batches, then the FIRST stack moved into the LAST batch - the
+        // direction that used to reorder everything, because the old order was
+        // "whichever batch this walk of the stacks meets first" and the moved
+        // stack is met first. The headings the panel draws ARE buildFileGroups'
+        // labels, so this is what a human reads down the Files panel.
+        //
+        // The invariant is not "identical": a batch left empty by the move is
+        // pruned, and its heading rightly disappears. It is that what remains
+        // is still in the SAME RELATIVE ORDER - a subsequence of what was there
+        // before. Nothing may overtake anything.
+        if (app.seqs.size() >= 3) {
+            std::vector<int> tri;
+            for (const auto& si : app.seqs) tri.push_back(si.id);
+            // one at a time: an empty batch is pruned by the next move, so a
+            // batch has to be created immediately before something goes into it
+            int bA = newBatch(uniqueBatchName("ord A"));
+            moveStackToBatch(tri[0], bA);
+            int bB = newBatch(uniqueBatchName("ord B"));
+            moveStackToBatch(tri[1], bB);
+            int bC = newBatch(uniqueBatchName("ord C"));
+            for (size_t i = 2; i < tri.size(); i++) moveStackToBatch(tri[i], bC);
+            auto order = [](const std::vector<FileGroup>& g) {
+                std::vector<std::string> o;
+                for (const auto& q : g) o.push_back(q.label);
+                return o;
+            };
+            auto join = [](const std::vector<std::string>& v) {
+                std::string o;
+                for (const auto& x : v) o += (o.empty() ? "" : " ") + x;
+                return o;
+            };
+            std::vector<std::string> before = order(buildFileGroups(stacksCached()));
+            moveStackToBatch(tri[0], bC);        // first batch -> last batch
+            std::vector<std::string> after = order(buildFileGroups(stacksCached()));
+            size_t k = 0;                        // after must be a SUBSEQUENCE
+            for (const auto& lb : before) if (k < after.size() && after[k] == lb) k++;
+            bool kept = k == after.size();
+            fprintf(stderr, "batchselftest: headings [%s] -> after moving the first "
+                            "stack into the last batch [%s]: %s\n",
+                    join(before).c_str(), join(after).c_str(), kept ? "ok" : "FAIL");
+            if (!kept) {
+                fprintf(stderr, "batchselftest: FAILED - the move reordered the list\n");
+                ok = false;
+            }
+            (void)bA; (void)bB;
+        }
         int nb = newBatch(uniqueBatchName("moved"));
         std::vector<int> sids;
         for (const auto& si : app.seqs) sids.push_back(si.id);
