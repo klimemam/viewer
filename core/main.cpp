@@ -1258,6 +1258,28 @@ static void swapCompare() {
     toast("A / B swapped:  A = " + bn + "   B = " + an);
 }
 
+// What the A/B item on a Files row offers, for the frame or stack that row
+// would hand to B.
+//
+// The row you are LOOKING AT is A, and "B = A" is not a comparison: resolveB()
+// answers null for it, so the old menu simply disabled the item there. That is
+// the row everyone right-clicks first - you point at the thing you are working
+// on - and a grey line with no reason on it reads as "this feature is broken",
+// which is how it was reported. So that row is offered the other half of the
+// pair instead, and both states say why.
+//
+// Out here rather than in the menu so it can be checked without a frame
+// (--abstats-selftest, A7).
+enum AbRowItem {
+    AbSetB,        // a different image: it can become B
+    AbSwap,        // this row IS A and a B exists: swapping is the useful move
+    AbSwapNoB      // this row IS A and there is no B yet: nothing to swap with
+};
+static AbRowItem abRowItem(const ImageDoc* pick) {
+    if (pick != cur()) return AbSetB;
+    return cmpB() ? AbSwap : AbSwapNoB;
+}
+
 static void computeMinMax(ImageDoc& im) {
     float mn = FLT_MAX, mx = -FLT_MAX;
     for (float v : im.data) {
@@ -13401,6 +13423,31 @@ static void drawFileList() {
         }
         return target;
     };
+    // The A/B item both kinds of row carry, by IDENTITY rather than by name:
+    // the B-image menu lists names, and two batches full of frame_001.npy made
+    // that a coin toss. `pick` is the frame this row would hand to B.
+    auto compareBItem = [](ImageDoc* pick) {
+        switch (abRowItem(pick)) {
+        case AbSetB:
+            if (ImGui::MenuItem("Set as compare B")) {
+                setCompareB(pick);
+                if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
+            }
+            break;
+        case AbSwap:
+            if (ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C")) swapCompare();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("This row is A - the image on screen.\n"
+                                  "Swapping sends it to B and brings B here as A.");
+            break;
+        case AbSwapNoB:
+            ImGui::MenuItem("Swap A and B", "Shift+\\ or Shift+C", false, false);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("This row is A - the image on screen, so it cannot\n"
+                                  "also be B. Right-click a DIFFERENT row to set B.");
+            break;
+        }
+    };
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
     // produced a flat list of bare filenames with nothing saying where each came
@@ -13517,13 +13564,7 @@ static void drawFileList() {
             // a standalone frame hangs off the batch directly, so it gets the
             // move menu itself (stacks move via seqctx below)
             if (ImGui::BeginPopupContextItem("imgctx")) {
-                // by IDENTITY, not by name: the B-image menu lists names, and
-                // two batches full of frame_001.npy made it a coin toss
-                if (ImGui::MenuItem("Set as compare B", nullptr, false,
-                                    app.images[i].get() != cur())) {
-                    setCompareB(app.images[i].get());
-                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-                }
+                compareBItem(app.images[i].get());
                 ImGui::Separator();
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
@@ -13595,17 +13636,13 @@ static void drawFileList() {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::Separator();
-            {   // by identity, not name - same reason as the frame row's item.
-                // B = the frame this stack is showing; with "B follows A's
+            {   // B = the frame this stack is showing; with "B follows A's
                 // frame number" on, it tracks A from there anyway.
                 ImageDoc* bpick = app.images[stack.front()].get();
                 if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
                     app.images[si->lastImageIdx]->seqId == si->id)
                     bpick = app.images[si->lastImageIdx].get();
-                if (ImGui::MenuItem("Set as compare B", nullptr, false, bpick != cur())) {
-                    setCompareB(bpick);
-                    if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-                }
+                compareBItem(bpick);
             }
             ImGui::Separator();
             // The series (系列) this stack is in, or could be. Multi-select is
@@ -19621,6 +19658,52 @@ int main(int argc, char** argv) {
             check(app.hist[1].img == nullptr && app.hist[1].uid == 0 &&
                   app.proj[1].img == nullptr && app.proj[1].uid == 0 && !cmpB(),
                   "A6 closing B leaves no dangling pointer in slot 1");
+        }
+
+        // ---- A7: the Files row's A/B item is never a dead grey line ----------
+        // Reported from the shipped build: "Set as compare B" is greyed out.
+        // It was greyed on exactly one row - the CURRENT one, which is the row
+        // you right-click first - and nothing said so. The rule now: a row that
+        // is not A offers "Set as compare B"; the row that IS A offers the swap
+        // instead, and only that one may be disabled (no B to swap with).
+        {   // A6 closed one stack; multi/ has three, so two are still open
+            check(app.seqs.size() >= 2, "A7 fixture: two stacks still open");
+            std::vector<int> fa, fb;
+            if (app.seqs.size() >= 2) {
+                fa = framesOfSeq(app.seqs[0].id);
+                fb = framesOfSeq(app.seqs[1].id);
+            }
+            check(!fa.empty() && !fb.empty(), "A7 fixture: two stacks with frames");
+            if (!fa.empty() && !fb.empty()) {
+                selectImage(fa.front());
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                fprintf(stderr, "abstatsselftest: A7 compare off: A-row=%d other-row=%d\n",
+                        (int)abRowItem(app.images[fa.front()].get()),
+                        (int)abRowItem(app.images[fb.front()].get()));
+                check(abRowItem(app.images[fb.front()].get()) == AbSetB,
+                      "A7 another row offers Set as compare B");
+                check(abRowItem(app.images[fa.front()].get()) == AbSwapNoB,
+                      "A7 the current row offers the swap, not a dead Set-as-B");
+                // ...and turning compare on changes NOTHING about another row:
+                // the user read the greying as "compare has to be armed first".
+                app.compareMode = App::CmpWipe;
+                ensureCompareB();
+                check(abRowItem(app.images[fb.front()].get()) == AbSetB,
+                      "A7 compare on: another row still offers Set as compare B");
+                check(abRowItem(app.images[fa.front()].get()) == AbSwap,
+                      "A7 compare on: the current row offers a LIVE swap");
+                // every other frame of A's own stack is still a legal B
+                if (fa.size() > 1)
+                    check(abRowItem(app.images[fa[1]].get()) == AbSetB,
+                          "A7 a different frame of A's stack can still be B");
+                // and the swap really moves A, which is what makes the row
+                // right-clickable as B a moment later
+                ImageDoc* wasA = cur();
+                swapCompare();
+                check(cur() != wasA && abRowItem(wasA) == AbSetB,
+                      "A7 after the swap the old A is a Set-as-B row again");
+            }
         }
 
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
