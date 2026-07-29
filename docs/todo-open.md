@@ -1,0 +1,183 @@
+# 未着手・中断中の課題 (2026-07-29 時点)
+
+実機で報告された不具合と、クレジット切れで中断した調査の引き継ぎ。
+各項目に「どこまで分かっているか」を書いてあるので、そこから再開する。
+
+Fable エージェント2本が月間上限で死亡。**やり直しではなく、途中から**再開できるよう
+に、両方の「死ぬ直前に掴んでいた手がかり」をここに残す。両方とも worktree は作成済み。
+
+---
+
+## 1. Preview バグ2件 — worktree `c:/Users/hish/Desktop/viewer-preview-wt` (branch `preview-fixes`)
+
+ユーザー報告 (逐語):
+- 「Previewで連続フレームが見れない．Group解除ができないから画像が見れないことになってしまう．」
+- 「Previewで連続フレーム(Stack)をダブルクリックすると，一枚目とStackが2つFilesに登録される．」
+
+### 死ぬ直前の最後の一言 (これが再開の起点)
+> Toasts draw into the foreground list — not the focus thief.
+> The suspect is the **server-temporal result focusing the Temporal panel**. Let me check.
+
+つまり Fable は「Preview で画像が見れない」の原因を **フォーカス泥棒** の線で追っていた:
+Preview を出した直後に何かが別パネル(Temporal)にフォーカスを奪い、Image View が
+Preview を映さない/映しても即座に取り替えられる、という筋。トースト描画は容疑から外れた。
+**次に見るべきは server-temporal の結果到着ハンドラが Temporal パネルへ
+SetWindowFocus/FocusWindow している箇所。**
+
+### 期待仕様 (設計はこれで確定済み)
+- グループ化された stack 行の Preview は **ungroup 不要で画素が出る**。ポスターフレーム +
+  既存の preview スクラブ(`stepPreviewFrame`, main.cpp ~6141、UI は ~11931-11953)で送れる。
+  永続登録は一切しない。
+- ダブルクリック = その stack が **ちょうど1回** 開く。ポスター/preview は兄弟として残らず
+  drop される。Files に残るのは stack エントリのみ。
+- preview スロットは1個のまま。measure したら promote (~10537) も維持。
+
+### コード上のアンカー (main.cpp)
+`openRemote(url, asPreview)` 6156 / `dropPreview` 6117 / `promotePreview` 6317 /
+`app.previewUid` / `batchReuse("preview")` 6198 / preview 疑似バッチの描画 12129 /
+ダブルクリック経路 11270 (`dropPreview(); // the poster frame did its job`) と 11277。
+Browse パネルは `drawPanelRemote` 11010、行の遅延操作は `rbDefer`/`RbDeferredActions`。
+
+---
+
+## 2. X11 で窓が動かせない・最大化できない — worktree `c:/Users/hish/Desktop/viewer-x11-wt` (branch `x11-frame`)
+
+ユーザー報告: 「LinuxでX WindowsでLocal 実行すると，Windowを動かせない．」「最大化も効かない．」
+
+### 死ぬ直前の最後の一言 (実機で計測済みの貴重な結果)
+> **Metacity: drag1 works, drag2 dead, maximize works.**
+> The **eaten-release pattern is confirmed across WMs**. Try xfwm4 and a software-GL mutter retry.
+
+これは大きい。**Linux 実機で実際に動かして** 取った観測:
+- 1回目のドラッグは動く、**2回目以降が死ぬ** → 「押しっぱなし」状態がアプリ側に残る。
+- 原因は **release イベントが食われる (eaten release)**。`_NET_WM_MOVERESIZE` を投げると
+  以後のポインタは WM がグラブするので、**ButtonRelease がアプリに来ない**。アプリ側の
+  「ドラッグ中」フラグ(または ImGui の MouseDown)が立ちっぱなしになり、次のドラッグ開始
+  条件(押下エッジ)が二度と成立しない。
+- Metacity では maximize は効いた → `glfwMaximizeWindow` が全 WM でダメなのではなく
+  **WM 依存**。`_NET_WM_STATE` ClientMessage 版のフォールバックは依然として要る。
+- 次にやる予定だった検証: **xfwm4** と、**software-GL での mutter 再試行**。
+
+### 修正の方向 (上の観測から確定的に言えること)
+`_NET_WM_MOVERESIZE` を送った直後に、**アプリ側のドラッグ状態を自分で降ろす**
+(ImGui へ MouseUp を注入する / window_frame 側の startZone をクリアする)。
+WM にグラブを渡した時点でそのドラッグはアプリのものではなくなるので、
+「release を待つ」設計自体が誤り。
+
+### 不変条件 (これは死守)
+Integrated が move+resize+maximize を提供できない環境では、**必ず装飾付き System へ
+大声でフォールバック** (`unavailableReason()` + Messages パネルに1行)。
+動かせない窓を絶対に作らない。
+
+### 触ってはいけない場所
+`window_frame.cpp` の Win32 ブロック — user-bugs (`ec33428`) が
+WM_NCPAINT/UAH/WM_NCACTIVATE を潰す修正を入れている。統合後の main を基点にすること。
+
+---
+
+## 3. A と B のサイズが違うと画面全体 Fit になる (ユーザー報告 2026-07-29 夜)
+
+ユーザー報告 (逐語): 「A, Bが異なるサイズの時に画面全体Fitになってしまう．」
+
+### 構造 (調査済み — ここから始めれば早い)
+
+**ビューは1つしかない。** `app.view` (zoom + center) を A と B が共有していて、
+`mapIn`/`unmapIn` (main.cpp ~7563) はどちらのペインでも同じ `app.view` を使う。
+これは意図的で、コメントもそう言っている:
+
+    // "fit" must fit the pane the image is drawn in, not the whole canvas. A is
+    // the reference, so fit A's pane; B is the same view by construction.
+    ImVec2 fitSize = split ? ImVec2(paneAsz.x, canvasSize.y) : canvasSize;
+    if (im && app.fitRequested) { fitToCanvas(fitSize); app.fitRequested = false; }
+
+`fitToCanvas` (~7480) は `cur()` = **A の寸法だけ**で zoom を決める:
+
+    app.view.zoom = std::min(canvasSize.x / im->w, canvasSize.y / im->h) * 0.97f;
+    app.view.center = ImVec2(im->w * 0.5f, im->h * 0.5f);
+
+`fitRequested` を立てる場所: 2140 / 2252 (画像を閉じたとき) / 2700
+(`images.size()==1 || fitOnSwitch`) / 3352 / 3400 / 7035 / 13587 / 13643
+(stack 切替時の `fitOnSwitch`)。**B を設定した経路がどれかを踏んでいないか**を
+まず確認すること。
+
+### ここは設計判断が要る (だから Fable 案件)
+
+サイズが違う2枚に「同じビュー」を課すと、fit は本質的に定義できない
+(A に合わせれば B がはみ出す/縮む)。取れる道は3つ:
+
+1. **共有ビューのまま、大きいほうに fit** — 両方必ず画面内。ただし A が小さいと
+   A が小さく表示される。
+2. **共有ビューのまま A に fit** (現状の建前) — B のはみ出しを許容し、はみ出して
+   いることを画面で言う。
+3. **ペインごとに独立 fit** — 見た目は一番きれいだが、**画質評価では罠**。
+   異なる倍率で並べた2枚の解像感・ノイズ感を比べると誤った結論に直行する。
+   やるなら「倍率が違う」ことを両ペインに常時明示しないと危険。
+
+**推奨は 1 か 2。** 3 を選ぶ場合はラベル必須。どれを選ぶにせよ、
+**倍率が共有されているのか否かは画面から常に読めること** が要件。
+(既に `b->w != im->w` のときは Compare 設定に "size differs: B is %dx%d" と
+橙で出している — main.cpp ~8805。表示の置き場所としてはこの近くが自然。)
+
+### 回帰テスト
+
+`--abstats-selftest` に、サイズの違う2枚を A/B にして
+「fit 後に A も B も可視で、zoom が共有されている(または共有されていないと
+明示されている)」を assert する check を足す。fixture はサイズ違いが要るので
+`tools/gen_testdata.py` に1つ足すことになるはず。
+
+---
+
+## 4. 非階層(常に遷移)モードには `..` 行を戻す (ユーザー報告 2026-07-29 夜)
+
+ユーザー報告 (逐語): 「階層ビューワの再は..は不要だけど，今の非階層(常に遷移)だと，
+..は欲しくなるね．」
+(= tree 表示では `..` は要らないが、フォルダに入って遷移していく今の平坦表示では要る)
+
+### なぜ消えたか (コードに理由が書いてある — main.cpp ~12877)
+
+    // The "[..]" row that used to sit here is gone: the toolbar's "up" button
+    // and Backspace both do it, and a row that exists only outside the home
+    // directory shifted every listing row by one line on the way in and out.
+
+**この理由は tree モードでしか成り立たない。** tree なら親は画面に見えているので
+`..` は重複だが、平坦表示 (`app.rbTree == false`、~698) では現在地しか出ておらず、
+上に戻る手段がツールバーの `up` ボタン (~12487 `rbGoParent()`) と Backspace だけになる。
+どちらもリスト**の外**にあるので、行を追っているカーソル/マウスの流れから外れる。
+
+### 要件
+
+- `app.rbTree == false` のときだけ `..` 行を先頭に出す (tree のときは出さない —
+  ユーザーが明示的にそう言っている)。
+- 消した理由だった「行が1つずれる」問題は残る。**ホームより上でも下でも常に
+  1行目にある**ようにすれば、入る/出るで行位置がずれない (かつての実装は
+  「ホーム外でだけ出る」から動いていた)。ルート直下で押せない場合も、
+  行は出したまま無効表示にすればずれない。
+- `rbCursor` (~12887) のキーボード操作、`rbSel`、クリッパ (`IncludeItemByIndex` は
+  **必ず `clipper.Begin()` の後** — 前に呼ぶと null TempData 書き込みで即 SIGSEGV)
+  のインデックス計算が1行ぶんずれるので、そこを全部見ること。
+- 既存の `up` ボタンと Backspace はそのまま残す (増やすのであって置き換えではない)。
+
+### 回帰テスト
+
+`--browse-keys-selftest` は既に実入力で行を叩いているので、そこに
+「平坦表示では 1 行目が `..` で、入って出ても行番号がずれない」
+「tree 表示では `..` 行が無い」を足す。
+
+---
+
+## 5. 環境の重要事実 (両エージェントが独立に確認)
+
+**この Windows 機は現在 OpenGL のクライアント領域を一切キャプチャできない。**
+`CopyFromScreen` / `BitBlt+CAPTUREBLT` / `BitBlt(GetWindowDC)` / `PrintWindow` の
+すべてが**真っ白**を返す。一方で同じ画像内のタイトルバー(GDI)は正しく写り、デスクトップ
+全体のキャプチャも正常(VS Code は読める)。GL 自体は動いている
+(`glReadPixels` はマゼンタを返す、`--bench` は 0.32ms/frame)。
+→ **スクリーンショットによる検証は今この機械では不可能。** 白い画像を「モニタが寝てる」
+と誤診して時間を溶かさないこと。代わりに使えた観測手段:
+`GetWindowText` によるウィンドウタイトル、stderr、Win32 メッセージトレース、
+そして「視覚的事実を selftest の測定可能な assertion に変換する」。
+
+入力注入の罠2つ:
+- `keybd_event` に scancode 0 を渡すと `GLFW_KEY_UNKNOWN` になり矢印キーが無反応。
+  `MapVirtualKey` + `KEYEVENTF_EXTENDEDKEY` が要る。
+- タイトルバーを続けて2回クリックするとダブルクリック扱いで最大化し、全座標がずれる。
