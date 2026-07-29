@@ -6,6 +6,7 @@
 // network, and no credentials of our own - ssh owns the authentication. Passing
 // an empty host starts a local peer instead, which is how this is tested.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -87,6 +88,24 @@ public:
     bool startOn(const std::string& host, int port, const std::string& exe, std::string& err);
     bool alive() const { return alive_; }
     void stop();
+    // A worker's stop flag. recv() blocks inside a raw pipe read, and the
+    // workers poll their stop flags only BETWEEN queue items - so a worker
+    // parked in a read never saw the flag, and main()'s four joins held the
+    // dead window on screen for as long as the request took (up to ssh's
+    // ~45-60 s keepalive teardown on a black-holed link, unbounded for a
+    // local:// peer). With this set, a blocked read gives up within one 50 ms
+    // slice. Deliberately NOT a wall-clock deadline: a legitimate MEASURE over
+    // a 300-frame aggregate produces no bytes for minutes and is not a fault.
+    // The pointer must outlive the Session.
+    void setAbort(const std::atomic<bool>* flag) { abort_ = flag; }
+    // Give up a read after `seconds` with NO bytes arriving at all (0 = never,
+    // the default). For the UI thread's session, where the window is not being
+    // repainted while the read blocks: a preview's META + TILE is a small
+    // request, and "the link died" must become an error in seconds rather than
+    // waiting out ssh's ~45-60 s keepalive - or, for a local:// peer, forever.
+    // NOT set on the workers: a legitimate MEASURE over a 300-frame aggregate
+    // produces no bytes for minutes and is not a fault.
+    void setIdleTimeout(double seconds) { idleTimeout_ = seconds; }
 
     bool list(const std::string& path, std::vector<Entry>& out, std::string& err);
     // Walk the subtree under `root` server-side and return every stack below
@@ -123,8 +142,21 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int port_ = 0;
+    const std::atomic<bool>* abort_ = nullptr;
+    double idleTimeout_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles
 };
+
+// Is a TILE reply consistent with the REQUEST that produced it? A peer cannot
+// legitimately return more samples than were asked for, and that invariant is
+// what bounds the allocation the reply sizes. Exposed (rather than buried in
+// Session::tile) so the hostile cases are testable without a hostile peer:
+// without it, w=h=2^30 / ch=4 / f32 overflows the 64-bit product to exactly 0
+// and matches rawBytes=0, and a self-consistent 32768x32767 u32 reply makes a
+// ~4 MB deflate payload allocate 4 GB.
+bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
+                   uint32_t repW, uint32_t repH, uint32_t repCh,
+                   uint32_t dtype, uint32_t rawBytes);
 
 // Run one shell command on the host (or locally when host is empty) and collect
 // its combined output. `stdinData` is fed to it verbatim - a script for `sh`, or

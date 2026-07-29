@@ -123,8 +123,19 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     uint32_t hlen = 0;
     if (major == 1) { uint16_t l = 0; n.f.read((char*)&l, 2); hlen = l; }
     else            { n.f.read((char*)&hlen, 4); }
+    // The non-v1 branch takes a RAW u32 straight off the file and used to size
+    // a std::string with it, unbounded, with no read check. A 12-byte file
+    // whose header length reads 0xffffffff therefore cost 4 GB of commit and
+    // ~1.8 s on EVERY LIST of its directory (measured against the real peer),
+    // up to 256 such files per LIST and 512 per SCAN - and on a memory-capped
+    // box the peer is OOM-killed and the session dies for everyone using it.
+    // The client's two .npy header readers have always bounded this; the peer
+    // did not. 64 KB is why numpy minted the 2.0 format at all, so the bound
+    // rejects nothing legitimate.
+    if (hlen == 0 || hlen > 65536) { err = "bad .npy header length"; return false; }
     std::string hdr(hlen, '\0');
     n.f.read(&hdr[0], hlen);
+    if (n.f.gcount() != (std::streamsize)hlen) { err = "truncated .npy header"; return false; }
     n.dataOffset = (uint64_t)n.f.tellg();
 
     size_t dp = hdr.find("'descr'");
@@ -443,8 +454,15 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         }
         // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
         // client applies the SAME function to the patterns it builds locally -
-        // see rp::patternWithExtent for why it has to be the same one.
-        if (frameAxis >= 0) g.pattern = rp::patternWithExtent(g.pattern, g.names);
+        // see rp::patternWithExtent for why it has to be the same one. Which is
+        // exactly why it is gated on the CLIENT's version: a v4 client cannot
+        // produce this text locally, so serving it would make the same folder
+        // read one way over ssh and another way opened from disk. The version
+        // rule was enforced only downward (a newer client updates an older
+        // peer); this is the mirror case, and the peer is the only end that
+        // can act on it.
+        if (frameAxis >= 0 && g_clientVersion >= 5)
+            g.pattern = rp::patternWithExtent(g.pattern, g.names);
         g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
     };

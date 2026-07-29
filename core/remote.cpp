@@ -31,6 +31,10 @@ struct Pipe {
     int inW = -1, outR = -1;
     pid_t pid = -1;
 #endif
+    // Set by the owning worker so a blocked read can be given up on. See
+    // Session::setAbort for why this is a flag and not a deadline.
+    const std::atomic<bool>* abort = nullptr;
+    double idleTimeout = 0;           // seconds with no bytes at all; 0 = never
 };
 
 static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err) {
@@ -127,18 +131,41 @@ static bool pipeWrite(Pipe& p, const void* buf, size_t n) {
     return true;
 }
 
+// Blocking, but interruptible. runSshCommand has used the same
+// PeekNamedPipe / poll slice loop since it was written ("ReadFile on a pipe
+// blocks with no way out"); the protocol path did not, so a worker parked here
+// could not be stopped and the quit path waited it out with the dead window
+// still on screen.
+static double nowSeconds();           // fwd (defined with runSshCommand)
 static bool pipeRead(Pipe& p, void* buf, size_t n) {
     uint8_t* q = (uint8_t*)buf;
+    const bool sliced = p.abort || p.idleTimeout > 0;
+    double deadline = p.idleTimeout > 0 ? nowSeconds() + p.idleTimeout : 0;
     while (n) {
+        if (p.abort && p.abort->load()) return false;
+        if (deadline > 0 && nowSeconds() > deadline) return false;
 #if defined(_WIN32)
+        DWORD avail = 0;
+        if (sliced) {                     // only pay for the poll when it can matter
+            if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) return false;
+            if (avail == 0) { Sleep(20); continue; }
+        }
         DWORD got = 0;
         if (!ReadFile(p.outR, q, (DWORD)std::min<size_t>(n, 1u << 20), &got, nullptr) || !got)
             return false;
 #else
+        if (sliced) {
+            struct pollfd pf { p.outR, POLLIN, 0 };
+            int pr = poll(&pf, 1, 20);
+            if (pr == 0) continue;
+            if (pr < 0) return false;
+        }
         ssize_t got = read(p.outR, q, std::min<size_t>(n, 1u << 20));
         if (got <= 0) return false;
 #endif
         q += got; n -= (size_t)got;
+        // progress resets the clock: a slow tile is not a dead link
+        if (deadline > 0) deadline = nowSeconds() + p.idleTimeout;
     }
     return true;
 }
@@ -306,6 +333,8 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     host_ = host;
     port_ = port;
     Pipe* p = new Pipe();
+    p->abort = abort_;                // interruptible reads for a worker's session
+    p->idleTimeout = idleTimeout_;    // ...and a bounded one for the UI thread's
     impl_ = p;
     std::vector<std::string> argv;
     if (host.empty()) {
@@ -545,6 +574,23 @@ static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<fl
     }
 }
 
+bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
+                   uint32_t repW, uint32_t repH, uint32_t repCh,
+                   uint32_t dtype, uint32_t rawBytes) {
+    if (!step) return false;
+    // FIRST against the REQUEST, which the caller holds: the peer cannot
+    // return more samples than were asked for. That single invariant bounds
+    // every factor below, which is what makes the self-consistency check
+    // meaningful instead of defeatable by 64-bit overflow.
+    uint32_t maxW = (uint32_t)(((uint64_t)reqW + step - 1) / step);
+    uint32_t maxH = (uint32_t)(((uint64_t)reqH + step - 1) / step);
+    if (repW > maxW || repH > maxH) return false;
+    if (!repW || !repH || !repCh || repCh > 4 || dtype >= rp::DT_COUNT) return false;
+    // ...then the dims and the byte count must agree BEFORE anything indexes
+    // by dims, or toFloat reads far past the buffer.
+    return (uint64_t)repW * repH * repCh * rp::dtypeSize(dtype) == (uint64_t)rawBytes;
+}
+
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
                    std::string& err) {
@@ -564,13 +610,11 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     if (type != rp::MSG_OK) { r.str(err); return false; }
     rp::TileRep rep{};
     if (!r.blob(&rep, sizeof rep)) { err = "bad TILE reply"; return false; }
-    // The dims and the byte count must agree BEFORE anything indexes by dims: a
-    // peer whose reply disagrees with itself (or a truncated 4 GB tile) would
-    // otherwise send toFloat reading far past the buffer. Reproduced as a crash
-    // by the verification agent; now it is an error message.
-    size_t need = (size_t)rep.w * rep.h * rep.ch * rp::dtypeSize(rep.dtype);
-    if (!rep.w || !rep.h || !rep.ch || rep.ch > 4 || rep.dtype >= rp::DT_COUNT ||
-        need != rep.rawBytes) {
+    // Validated against the REQUEST as well as against itself: see
+    // tileReplySane. Reproduced as a process kill by the verification agent
+    // (std::length_error out of toFloat, uncaught on every client path); now
+    // it is an error message.
+    if (!tileReplySane(q.w, q.h, q.step, rep.w, rep.h, rep.ch, rep.dtype, rep.rawBytes)) {
         err = "inconsistent tile from the peer";
         return false;
     }
