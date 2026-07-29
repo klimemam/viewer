@@ -5784,11 +5784,28 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
                 remote::runSshScript(host, port,
                     "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || true\n",
                     vout, verr3, 15.0);
-                if (vout.find("viewer-serve protocol") == std::string::npos) {
+                size_t vp2 = vout.find("viewer-serve protocol ");
+                if (vp2 == std::string::npos) {
                     log = "copied to " + host + ", but it does not run there:\n" + vout +
                           "\n(usually an OS/glibc mismatch - run update.cmd in viewer-bin "
                           "to get the compat build, or build viewer-serve on the server: "
                           "cmake --build <dir> --target viewer-serve)";
+                    return false;
+                }
+                // "it runs" is still not "it is current". The number is on the
+                // wire and the parse is twenty lines up (peerProto); without
+                // comparing it, a stale local viewer-serve - an out-of-date
+                // viewer-bin checkout, which findLocalPeer PREFERS over a
+                // same-dir build - was copied, toasted "remote peer updated",
+                // reconnected, and then served pre-v4 grouping and pre-v5
+                // pattern text for the rest of the session with nothing on
+                // screen saying why (autoUpdateTried stops any retry).
+                int newProto = atoi(vout.c_str() + vp2 + 22);
+                if (newProto < (int)rp::VERSION) {
+                    log = "copied to " + host + ", but it reports protocol " +
+                          std::to_string(newProto) + " (this viewer speaks " +
+                          std::to_string((int)rp::VERSION) + ") - the local peer binary "
+                          "at " + local + " is stale: run update.cmd in viewer-bin";
                     return false;
                 }
                 // plugins too, so server-side MEASURE has the same analyzers
@@ -12018,10 +12035,24 @@ static void drawPanelRemote() {
     // "-" in every row of every column explains nothing.
     {
         int pv = B.peerVersion;              // published by the worker; no lock
+        // Both directions. Downward the update can fix it, so name the fix;
+        // upward it cannot, and the honest statement is that the listing may
+        // not match what a local open produces (the peer gates the v5 pattern
+        // text on the client version now, but v4 grouping cannot be un-applied
+        // without keeping dead code).
         if (pv > 0 && pv < 3)
             ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
                                "peer is protocol %d - File > Update remote peer "
                                "enables shape / date columns", pv);
+        else if (pv > 0 && pv < (int)rp::VERSION)
+            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
+                               "peer is protocol %d, this viewer speaks %d - "
+                               "File > Update remote peer", pv, (int)rp::VERSION);
+        else if (pv > (int)rp::VERSION)
+            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
+                               "peer speaks protocol %d, this viewer speaks %d - "
+                               "listings may group differently from a local open; "
+                               "update the viewer", pv, (int)rp::VERSION);
     }
     ImGui::Separator();
     if (app.rbSearch.active) {         // search results stand in for the listing

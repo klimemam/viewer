@@ -454,8 +454,15 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         }
         // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
         // client applies the SAME function to the patterns it builds locally -
-        // see rp::patternWithExtent for why it has to be the same one.
-        if (frameAxis >= 0) g.pattern = rp::patternWithExtent(g.pattern, g.names);
+        // see rp::patternWithExtent for why it has to be the same one. Which is
+        // exactly why it is gated on the CLIENT's version: a v4 client cannot
+        // produce this text locally, so serving it would make the same folder
+        // read one way over ssh and another way opened from disk. The version
+        // rule was enforced only downward (a newer client updates an older
+        // peer); this is the mirror case, and the peer is the only end that
+        // can act on it.
+        if (frameAxis >= 0 && g_clientVersion >= 5)
+            g.pattern = rp::patternWithExtent(g.pattern, g.names);
         g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
     };
