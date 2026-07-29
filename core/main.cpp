@@ -8349,6 +8349,14 @@ static std::string abValueUnit(const std::string&) {
 // are not comparable at all (see recomputeHistogramIfNeeded) - so naming A's
 // range there stays true.
 static const char* abRangeSaid(bool haveB) {
+    // linkRange wins over all of it, and does so BEFORE any of this is consulted:
+    // effBlack/effWhite return the linked pair and never reach abRange, so the
+    // axis spans the range shared by every open image - widened by stacks that
+    // have nothing to do with the comparison. The Inspector already knows this
+    // (it HIDES the A/B combo while the scope is "everything"), but the View >
+    // Compare menu still sets the mode and the default is 2 regardless, so all
+    // three combinations came out labelled with a range that was not in force.
+    if (app.linkRange) return "linked range, all open images";
     if (!haveB) return "black-white range";
     return app.compareRangeMode == 2 ? "A and B combined range" : "A's black-white range";
 }
@@ -8368,6 +8376,23 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
     return xl;
 }
 
+// Is the B histogram slot describing something other than the picture in front
+// of the reader? TWO keys, not one. The image is the obvious half. The other is
+// the RANGE the bins were built on: in the union default the bin range is the
+// min/max of the two CURRENT frames, so it moves every time A steps, and A's
+// histogram re-bins each step because its cache keys include black/white while
+// B's recompute is skipped for as long as the stepping throttle is armed.
+// plotSeries then places B's bins POSITIONALLY across the current plot rect, so
+// a slot binned for the old union is drawn shifted and squeezed on the new axis.
+// Keyed on uid alone, the amber [stale] tag fired only when B itself changed -
+// so it never fired for the case that needs it most, a B pinned with Shift+B
+// (an advertised workflow: its uid never moves). Once the stepping stops the
+// recompute runs and both comparisons go back to equal.
+static bool abHistBStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
+    if (!a || !b) return false;
+    return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a);
+}
+
 static void drawPanelHistogram() {
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
@@ -8382,7 +8407,7 @@ static void drawPanelHistogram() {
             recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
-        const bool bStale = Bim && HB.uid != Bim->uid;
+        const bool bStale = abHistBStale(im, Bim, HB);
         const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
@@ -17284,6 +17309,54 @@ int main(int argc, char** argv) {
             app.abStepBusyUntil = 0;
         }
 
+        // ---- P2c: a PINNED B goes stale when the RANGE moves, not only when
+        // B does ----
+        // The union default re-fits the bin range to the two current frames, so
+        // stepping A moves it every frame. B's recompute is skipped while the
+        // throttle is armed and its bins are drawn positionally on the new axis;
+        // keyed on uid alone the [stale] tag could not see that, and a pinned B
+        // (Shift+B) never changes uid at all.
+        {
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            bool saveFollow = app.compareFollowFrame;
+            int saveShare = app.compareRangeMode;
+            app.compareFollowFrame = false;        // PINNED: B's uid never moves
+            app.compareRangeMode = 2;              // the union default
+            app.abStepBusyUntil = 0;
+            abStatsFrame();
+            recomputeHistogramIfNeeded(cur(), app.hist[0]);
+            recomputeHistogramIfNeeded(cmpB(), app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            bool freshFirst = !abHistBStale(cur(), cmpB(), app.hist[1]);
+            float binned0 = app.hist[1].black, binned1 = app.hist[1].white;
+            gotoFrame(1); gotoFrame(1);            // two switches inside 300 ms
+            ImageDoc* Bp = cmpB();
+            if (Bp && (!abStepBusy() || app.hist[1].uid == 0))   // exactly the panel
+                recomputeHistogramIfNeeded(Bp, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            bool uidUnchanged = Bp && app.hist[1].uid == Bp->uid;
+            bool rangeMoved = app.hist[1].black != effBlack(*cur()) ||
+                              app.hist[1].white != effWhite(*cur());
+            bool flagged = abHistBStale(cur(), Bp, app.hist[1]);
+            fprintf(stderr, "abstatsselftest: P2c pinned B: binned on %.6g..%.6g, axis now "
+                            "%.6g..%.6g, B uid unchanged=%d, stale=%d\n",
+                    binned0, binned1, effBlack(*cur()), effWhite(*cur()),
+                    uidUnchanged ? 1 : 0, flagged ? 1 : 0);
+            check(freshFirst, "P2c a freshly binned B is not stale");
+            check(rangeMoved && uidUnchanged,
+                  "P2c fixture: stepping A moves the union while B's uid does not");
+            check(flagged, "P2c a pinned B binned on the OLD union reads as stale");
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+            if (Bp && (!abStepBusy() || app.hist[1].uid == 0))
+                recomputeHistogramIfNeeded(Bp, app.hist[1], effBlack(*cur()), effWhite(*cur()));
+            check(!abHistBStale(cur(), Bp, app.hist[1]),
+                  "P2c ...and is fresh again once the stepping stops");
+            app.compareFollowFrame = saveFollow;
+            app.compareRangeMode = saveShare;
+            selectImage(frA.front());
+            app.abStepBusyUntil = 0;
+        }
+
         // ---- P3: the A|B|delta|delta% table's inputs ----
         {
             selectImage(frA.front());
@@ -17497,16 +17570,36 @@ int main(int argc, char** argv) {
             // "A's black-white range" in every mode, including the union - a
             // claim about the picture that the picture does not support.
             int save = app.compareRangeMode;
-            for (int sh = 0; sh < 3; sh++) {
-                app.compareRangeMode = sh;
-                std::string lab = abHistXLabel(cur(), cmpB());
-                bool named = sh == 2 ? lab.find("A and B combined") != std::string::npos
-                                     : lab.find("A\'s black-white") != std::string::npos;
-                fprintf(stderr, "rangeselftest: hist x axis | %-11s | %s | %s\n",
-                        SHARE[sh], lab.c_str(),
-                        named ? "names the range in force" : "WRONG");
-                if (!named) bad++;
+            bool saveLink = app.linkRange;
+            // ...and "in force" includes the Value range scope. linkRange
+            // short-circuits effBlack/effWhite before abRange is even consulted,
+            // so with the scope set to everything the axis spans the linked pair
+            // - widened by stacks that have nothing to do with the comparison -
+            // whatever the A/B combo happens to say.
+            for (int lk = 0; lk < 2; lk++) {
+                app.linkRange = lk != 0;
+                if (app.linkRange) {
+                    app.linkBlack = app.images[fa[0]]->vmin;
+                    app.linkWhite = app.images[fa[0]]->vmax;
+                }
+                for (int sh = 0; sh < 3; sh++) {
+                    app.compareRangeMode = sh;
+                    std::string lab = abHistXLabel(cur(), cmpB());
+                    bool named = app.linkRange
+                                     ? lab.find("linked range") != std::string::npos
+                                     : (sh == 2
+                                            ? lab.find("A and B combined") != std::string::npos
+                                            : lab.find("A\'s black-white") != std::string::npos);
+                    // and the label has to match the NUMBERS, not just read well
+                    bool spans = !app.linkRange || (effBlack(*cur()) == app.linkBlack &&
+                                                    effWhite(*cur()) == app.linkWhite);
+                    fprintf(stderr, "rangeselftest: hist x axis | %-6s %-11s | %s | %s\n",
+                            app.linkRange ? "linked" : "own", SHARE[sh], lab.c_str(),
+                            named && spans ? "names the range in force" : "WRONG");
+                    if (!named || !spans) bad++;
+                }
             }
+            app.linkRange = saveLink;
             app.compareRangeMode = save;
         }
         for (int m = 0; m < 3; m++) {
