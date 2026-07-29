@@ -20,6 +20,15 @@
   #ifndef NTDDI_VERSION
     #define NTDDI_VERSION 0x06020000
   #endif
+  // windows.h defines min/max as MACROS unless told not to, and MSVC's headers
+  // do it by default - so std::max(a, b) expands to std::(a, b) and every use
+  // in this file is "error C2589: '(': illegal token on right side of '::'".
+  // MinGW's headers leave them alone, which is why the local build was clean
+  // and only the MSVC job failed. main.cpp, plugin_host.cpp and remote.cpp all
+  // carry this already; this file was new and missed it.
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
   #define GLFW_EXPOSE_NATIVE_WIN32
   #include <GLFW/glfw3native.h>
   #include <windows.h>
