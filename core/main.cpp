@@ -192,6 +192,12 @@ struct App {
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     std::unique_ptr<pfd::save_file> saveDlg;
     std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    // One predicate for "an OS file dialog is pending". pollFileDialog only
+    // runs inside a drawn frame, so a dialog missing from the idle loop's busy
+    // set is polled only when some unrelated event happens to wake the loop -
+    // which is how Export curves' CSV came to be written on the viewer's next
+    // input rather than when the dialog closed. Defined out of line below,
+    // next to folderDlg.
     std::string pendingCsv;                    // built at click time: the results may
                                                // change while the OS dialog is open
     bool showHelp = false, showAbout = false;
@@ -463,6 +469,26 @@ struct App {
         // and the MEASURE button; rxBytes feeds the status-bar tooltip.
         int peerVersion = 0;
         uint64_t rxBytes = 0;
+        // "Search under here" stores an ABSOLUTE path on THIS machine. It was a
+        // function-local static of drawPanelRemote, and every state-replacing
+        // path (the disconnect button, goToPlace) assigns `App::RemoteBrowse{}`
+        // - so entries, dir, host and the tree cache were forgotten on a host
+        // change and this string was not: Search on machine B stayed rooted at
+        // machine A's folder. Living here makes "reset on host change" true by
+        // construction, for this field and for the next one.
+        std::string searchRoot;
+        // Bumped on every listing REPLACEMENT. The row-selection and cursor
+        // caches keyed on host|dir|entry-COUNT, so a refresh that added one
+        // file and removed another kept row-indexed selection flags pointing
+        // at different files - and "Open N selected as stack" then acted on
+        // files the user never picked.
+        uint64_t rev = 1;
+        // The cancel token for SCAN, as rbSearch.gen is for GLOB. A cancelled
+        // scan's late reply used to reach openPickerWith, which does not merely
+        // raise a modal - it CLEARS app.folderPick and resets the root, filter,
+        // merge and sweep fields, destroying a local Open Folder selection the
+        // user was in the middle of filtering.
+        uint32_t scanGen = 0;
     } rbrowse;
     // The connect / install / list sequence runs on THIS worker, never on the UI
     // thread: a git clone on the far side takes seconds, and "Connect froze the
@@ -540,7 +566,19 @@ struct App {
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
     // batch). local-fetch: never use the server for compute (today's behavior).
-    enum { PolAuto = 0, PolServer = 1, PolLocalFetch = 2 };
+    // PolServer (1) is RETIRED. It promised "even a resident frame is measured
+    // server-side", and nothing implemented it: serverComputes - the only
+    // functional read of procPolicy in the program - is
+    // `procPolicy != PolLocalFetch`, so PolServer and PolAuto took the same
+    // branch everywhere, and the Analysis panel (where a single-frame
+    // measurement would be routed) never reads procPolicy at all. Nor is it
+    // implementable as promised with today's protocol: the peer reads files by
+    // PATH on the server, so "measure a LOCAL frame on the server" has nothing
+    // to measure there. A persisted, CLI-settable setting labelled "measure on
+    // the server" that is byte-for-byte equivalent to auto is worse than a
+    // missing one, so the menu item is gone and the value folds into auto
+    // wherever it is read back.
+    enum { PolAuto = 0, PolServerRetired = 1, PolLocalFetch = 2 };
     int procPolicy = PolAuto;
     // background MEASURE worker (own ssh connection: a 300-frame aggregate must
     // not stall the tile fetches). Results carry provenance for the panel.
@@ -829,6 +867,9 @@ struct App {
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+    bool anyFileDialog() const {      // see the note on csvDlg
+        return openDlg || saveDlg || csvDlg || folderDlg;
+    }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
     struct TemporalState {
@@ -894,7 +935,7 @@ static App app;
 // ---- remote viewing: declared here, defined further down ----
 static const char* REMOTE_HOME = "~/.viewer";
 #define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
-static void openRemote(const std::string& url, bool asPreview = false);
+static bool openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0);
 static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port = 0);
@@ -917,8 +958,17 @@ static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.image
 
 static void promotePreview(ImageDoc* d);   // fwd: preview -> registered open
 
+// Set by resolveB when follow-frame is on, both sides are stacks, and B has no
+// frame carrying A's number - B is then the LAST latched frame, which is not
+// A's partner any more. The A/B surfaces render it with the [stale] vocabulary
+// they already have; silently returning a mismatched pair is the part that had
+// to go. (docs/terminology.md: stack-to-stack comparison holds the frame
+// NUMBER, and abDocLabel names the STACK, so nothing on screen said otherwise.)
+static bool g_abFollowDiverged = false;
+
 // The B side of an A/B compare, or null when compare is off / B is gone / B is A.
 static ImageDoc* resolveB() {
+    g_abFollowDiverged = false;
     if (app.compareBUid) {
         ImageDoc* b = nullptr;
         for (const auto& d : app.images)
@@ -930,8 +980,16 @@ static ImageDoc* resolveB() {
         ImageDoc* a = cur();
         if (app.compareFollowFrame && a && b->seqId != 0 && a->seqId != 0 &&
             b->seqId != a->seqId && b->seqIndex != a->seqIndex) {
+            bool found = false;
             for (const auto& d : app.images)
-                if (d->seqId == b->seqId && d->seqIndex == a->seqIndex) { b = d.get(); break; }
+                if (d->seqId == b->seqId && d->seqIndex == a->seqIndex) {
+                    b = d.get(); found = true; break;
+                }
+            // B's stack is shorter, or its remote frames have not arrived: the
+            // loop used to fall through and hand back the last latched frame,
+            // so the difference image, the A/B statistics and the wipe all
+            // proceeded on a pair that was no longer a pair.
+            if (!found) g_abFollowDiverged = true;
         }
         return b == cur() ? nullptr : b;
     }
@@ -3211,7 +3269,7 @@ static void restoreFull() {
     toast("restored full frame");
 }
 
-static void openRemote(const std::string& url, bool asPreview);   // fwd (default on the first decl)
+static bool openRemote(const std::string& url, bool asPreview);   // fwd (default: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port);   // defaults: first decl
 static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port);   // defaults: first decl
@@ -3506,7 +3564,9 @@ static void loadPrefs() {
                                          if (app.memBudgetGB > 0)
                                              app.memBudgetGB = std::clamp(app.memBudgetGB, 0.5f, 4096.0f); }
         else if (key == "procpolicy")  { ls >> app.procPolicy;
-                                         app.procPolicy = std::clamp(app.procPolicy, 0, 2); }
+                                         app.procPolicy = std::clamp(app.procPolicy, 0, 2);
+                                         if (app.procPolicy == App::PolServerRetired)
+                                             app.procPolicy = App::PolAuto; }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
@@ -6034,6 +6094,7 @@ static void rbWorker() {
         r.host = job.host;
         r.port = job.port;
         r.dir = job.dir;
+        r.gen = job.gen;              // the cancel token, for every kind that has one
         const std::string& exe = job.exe;   // snapshot taken at enqueue time
         if (job.kind == App::RbUpdatePeer) {
             rbSetPhase("updating the peer on " + job.host + " (git)...");
@@ -6089,7 +6150,6 @@ static void rbWorker() {
                 }
             } else if (job.kind == App::RbGlob) {
                 rbSetPhase("searching " + job.pattern + " under " + job.dir + "...");
-                r.gen = job.gen;
                 bool trunc = false;
                 int skipped = 0;
                 if (app.rbSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
@@ -6191,6 +6251,14 @@ static void pumpRemoteBrowse() {
             continue;
         }
         if (r.kind == App::RbScan) {
+            // Stopped or superseded: DROP it. openPickerWith clears
+            // app.folderPick and resets the picker's root / filter / merge /
+            // sweep fields, so a late reply from an abandoned scan does not
+            // merely arrive - it destroys whatever the picker currently holds,
+            // including a local Open Folder selection being filtered, and
+            // re-raises the modal over it. RbGlob has had this guard since it
+            // was written; RbScan carried no token at all.
+            if (r.gen != B.scanGen) continue;
             if (!r.ok) { toast("remote scan: " + r.err, true); continue; }
             auto joinR = [](const std::string& a, const std::string& b) {
                 if (b.empty()) return a;
@@ -6268,6 +6336,7 @@ static void pumpRemoteBrowse() {
         B.port = r.port;
         B.dir = r.dir;
         B.entries = std::move(r.entries);
+        B.rev++;                      // the row caches key on this, not on a count
         {   // every directory actually listed becomes the newest "recent place"
             std::string u = placeUrl(r.host, r.port, r.dir);
             auto& v = app.rbRecents;
@@ -6415,6 +6484,7 @@ static void remoteScanFolder(const std::string& root) {
     j.host = app.rbrowse.host;
     j.port = app.rbrowse.port;
     j.dir = root;
+    j.gen = ++app.rbrowse.scanGen;    // cancel token, exactly as RbGlob has
     rbEnqueue(std::move(j));
 }
 
@@ -6502,27 +6572,34 @@ static void stepPreviewFrame(int delta) {
     std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
     std::string label = app.previewLabel;
     app.previewIndex = want;
-    openRemote(makeRemoteUrl(host, files[want], port), true);
+    // a failed step must not restore the list over a preview that is now gone
+    if (!openRemote(makeRemoteUrl(host, files[want], port), true)) return;
     app.previewFiles = std::move(files);
     app.previewIndex = want;
     app.previewLabel = std::move(label);
 }
 
-static void openRemote(const std::string& url, bool asPreview) {
+// Returns false when nothing was opened. It has four failure returns AFTER
+// dropPreview() has already cleared the preview state, and its callers used to
+// have no way to know: rbActivateRow repopulated previewFiles unconditionally,
+// so a failed open left a scrub bar with 2+ entries and previewUid == 0 - a
+// bar for a preview that does not exist, whose buttons and , / . keys each
+// re-ran the failing open, one toast per press, forever.
+static bool openRemote(const std::string& url, bool asPreview) {
     std::string host, rpath;
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) {
         toast("expected ssh://user@host/path/to/file.npy", true);
-        return;
+        return false;
     }
     if (asPreview) dropPreview();          // ONE slot: the next look replaces it
     std::string err;
     // app.uiSession, never the browse worker's: two threads framing requests
     // into one ssh stdin desynchronise the stream permanently, and the worker's
     // stop() would free the pipe under this thread's blocking read.
-    if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return; }
+    if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return false; }
     remote::Meta m;
-    if (!app.uiSession.meta(rpath, m, err)) { toast("remote: " + err, true); return; }
+    if (!app.uiSession.meta(rpath, m, err)) { toast("remote: " + err, true); return false; }
 
     // First view: the whole frame decimated to something a screen can show. A
     // zoom or a pan asks for a better tile; nothing else on screen costs a byte.
@@ -6532,11 +6609,11 @@ static void openRemote(const std::string& url, bool asPreview) {
     std::string dt;
     if (!app.uiSession.tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
         toast("remote: " + err, true);
-        return;
+        return false;
     }
     if (tw < 1 || th < 1 || tch < 1 || tch > 4) {   // a 0ch doc would crash later
         toast("remote: peer returned a degenerate frame", true);
-        return;
+        return false;
     }
     auto doc = std::make_unique<ImageDoc>();
     doc->name = baseName(rpath) + (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
@@ -6635,6 +6712,7 @@ static void openRemote(const std::string& url, bool asPreview) {
         }
     }
     toast("opened " + baseName(rpath) + " from " + (host.empty() ? "local peer" : host));
+    return true;
 }
 
 // A remote folder of numbered .npy files, opened as one stack: the first file
@@ -8578,7 +8656,10 @@ static void drawPanelHistogram() {
             recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
-        const bool bStale = Bim && HB.uid != Bim->uid;
+        // ...or B is not A's partner at all: follow-frame found no frame of
+        // B's stack carrying A's number, so what is drawn is the last latched
+        // one. Same amber token, because it is the same statement.
+        const bool bStale = Bim && (HB.uid != Bim->uid || g_abFollowDiverged);
         const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
         ImGui::Text("Statistics");
         ImGui::SameLine();
@@ -8934,7 +9015,7 @@ static void drawPanelProjection() {
         recomputeProjectionIfNeeded(Bim, app.proj[1]);
     const App::ProjState& P = app.proj[0];
     const App::ProjState& PB = app.proj[1];
-    const bool bStale = Bim && PB.uid != Bim->uid;
+    const bool bStale = Bim && (PB.uid != Bim->uid || g_abFollowDiverged);
     const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
     ImGui::SameLine();
     if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
@@ -10451,6 +10532,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         }
         ImGui::EndTable();
     }
+    if (g_abFollowDiverged)
+        ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
+                           "follow-frame: B's stack has no frame %d - showing the "
+                           "last one it had, so this is not a matched pair",
+                           im->seqIndex);
     if (A.valid && B.valid && A.nPl != B.nPl)
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
                            "plane split differs (A %s, B %s): no delta - the two "
@@ -10559,7 +10645,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::SameLine();
         ImGui::BeginChild("##tempB", ImVec2(half, childH), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("B", abDocLabel(Bim));
+        drawABBand("B", abDocLabel(Bim), g_abFollowDiverged);
         {   // same limits as A's plot, by construction
             PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
             if (tp.ok) {
@@ -11575,7 +11661,9 @@ static void drawPanelRemote() {
     // menu can aim it at a folder.
     static char rbSearchBuf[256] = "";
     static bool rbSearchFocus = false;
-    static std::string rbSearchRoot;   // set by "Search under here"; empty = this folder
+    // set by "Search under here"; empty = this folder. On App::RemoteBrowse, so
+    // it dies with the connection - see the field.
+    std::string& rbSearchRoot = app.rbrowse.searchRoot;
     // where we are, and how to leave
     bool atRoot = B.dir == "~" || B.dir == "/";
     auto rbGoParent = [&]() {
@@ -11710,7 +11798,7 @@ static void drawPanelRemote() {
     static bool rbSelTree = false;
     {
         static std::string selSig;
-        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
         if (sig != selSig) {
             selSig = sig;
             rbSel.assign(view.size(), 0);
@@ -11766,8 +11854,12 @@ static void drawPanelRemote() {
         for (const auto& di : app.images)
             if (di->uid == app.previewUid && di->preview) pv = di.get();
         std::string u = makeRemoteUrl(B.host, target, B.port);
+        bool live = true;
         if (pv && pv->remoteUrl == u) selectImage(app.current);
-        else openRemote(u, true);
+        else live = openRemote(u, true);
+        // only when there IS a preview: a scrub bar over nothing re-runs the
+        // failing open on every press of its buttons and of , / .
+        if (!live) return;
         app.previewFiles = std::move(seq);
         if (!app.previewFiles.empty()) {
             app.previewIndex = seqAt;
@@ -12185,7 +12277,7 @@ static void drawPanelRemote() {
     {
         static std::string curSig;
         static bool curFlat = false, curTree = false;
-        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.entries.size());
+        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
         if (sig != curSig) { curSig = sig; rbCursor = -1; }
         else if (curFlat != app.rbFlat || curTree != app.rbTree) {
             // follow the row across a grouped/flat or list/tree toggle
@@ -13201,9 +13293,6 @@ static void drawMenuBar(GLFWwindow* win) {
                 if (ImGui::MenuItem("  auto (server for remote data)", nullptr,
                                     app.procPolicy == App::PolAuto))
                     app.procPolicy = App::PolAuto;
-                if (ImGui::MenuItem("  server (measure on the server)", nullptr,
-                                    app.procPolicy == App::PolServer))
-                    app.procPolicy = App::PolServer;
                 if (ImGui::MenuItem("  local fetch (bring frames here)", nullptr,
                                     app.procPolicy == App::PolLocalFetch))
                     app.procPolicy = App::PolLocalFetch;
@@ -13886,12 +13975,16 @@ static void parseCli(int argc, char** argv) {
             g_seriesSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
-        } else if (a == "--remote-policy") {        // auto | server | local-fetch
+        } else if (a == "--remote-policy") {        // auto | local-fetch
             std::string v = next();
             if (v == "auto") app.procPolicy = App::PolAuto;
-            else if (v == "server") app.procPolicy = App::PolServer;
+            else if (v == "server") {          // accepted, so scripts keep working
+                app.procPolicy = App::PolAuto;
+                fprintf(stderr, "--remote-policy server is retired (it was identical to "
+                                "auto): using auto\n");
+            }
             else if (v == "local-fetch" || v == "local") app.procPolicy = App::PolLocalFetch;
-            else fprintf(stderr, "--remote-policy expects auto|server|local-fetch\n");
+            else fprintf(stderr, "--remote-policy expects auto|local-fetch\n");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
         } else if (a == "--mem-budget") {          // GB the sequence loader may use
@@ -15301,6 +15394,43 @@ int main(int argc, char** argv) {
                 if (!idOk) ok = false;
                 closeAll();
             }
+        }
+        {   // A CANCELLED SCAN'S LATE REPLY. openPickerWith does not merely
+            // raise a modal: it clears app.folderPick and resets the picker's
+            // root, filter, merge and sweep fields. So the reply from an
+            // abandoned remote scan destroyed whatever the picker held -
+            // including a local Open Folder selection being filtered - and
+            // re-raised the modal over it. RbGlob has carried a generation
+            // token since it was written; RbScan carried none at all.
+            app.folderPick.clear();
+            app.folderPickOpen = false;
+            remoteScanFolder(B.dir);
+            uint32_t genAt = app.rbrowse.scanGen;
+            app.rbrowse.scanGen++;            // exactly what the cancel button does
+            double t3 = glfwGetTime();
+            bool sawScan = false;
+            while (glfwGetTime() - t3 < 60.0) {
+                {   // wait for the worker to actually produce the scan result
+                    std::lock_guard<std::mutex> lk(app.rbMtx);
+                    for (const auto& rr : app.rbDone)
+                        if (rr.kind == App::RbScan && rr.gen == genAt) sawScan = true;
+                }
+                pumpRemoteBrowse();
+                if (sawScan) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            for (int k = 0; k < 20; k++) {    // and a few more frames of pumping
+                pumpRemoteBrowse();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            bool cancelOk = sawScan && !app.folderPickOpen && app.folderPick.empty();
+            fprintf(stderr, "browseselftest: cancelled scan: reply gen %u arrived=%d, "
+                            "picker opened anyway=%d (%d group(s)): %s\n",
+                    genAt, sawScan ? 1 : 0, app.folderPickOpen ? 1 : 0,
+                    (int)app.folderPick.size(), cancelOk ? "ok" : "FAIL");
+            if (!cancelOk) ok = false;
+            app.folderPick.clear();
+            app.folderPickOpen = false;
         }
         {   // MALFORMED .npy HEADER LENGTH. The peer sized a std::string from a
             // raw u32 taken straight off the file, with no bound and no read
@@ -18402,8 +18532,13 @@ int main(int argc, char** argv) {
                                        spin[(int)(ImGui::GetTime() * 8) & 3], phase.c_str());
                     ImGui::SameLine();
                     if (ImGui::SmallButton("cancel##rb")) {
+                        // the in-flight ssh still finishes - but its result is
+                        // now stale on arrival instead of destructive
+                        app.rbrowse.scanGen++;
+                        app.rbSearch.gen++;
+                        app.rbSearch.running = false;
                         std::lock_guard<std::mutex> lk(app.rbMtx);
-                        app.rbQueue.clear();      // the in-flight ssh still finishes
+                        app.rbQueue.clear();
                     }
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
@@ -18599,8 +18734,8 @@ int main(int argc, char** argv) {
         // "not responding", which is exactly what a spinner is supposed to deny.
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
                     app.rbBusy || app.mPending > 0 ||
-                    app.openDlg || app.saveDlg ||
-                    app.folderDlg || (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
+                    app.anyFileDialog() ||
+                    (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
                     // a frame after it expires, B's statistics stay stale until
                     // the user happens to move the mouse (the input wake tail is
@@ -18686,6 +18821,7 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                working |= app.anyFileDialog();   // pollFileDialog lives in the frame
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
