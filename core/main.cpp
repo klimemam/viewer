@@ -12014,6 +12014,9 @@ struct RbRow {
 // earlier). A sort change therefore lands on the next frame - invisible, and
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+// The keyboard cursor's ROW INDEX. Written by the listing, read by the
+// toolbar above it - which is why it is not a local of the block that moves it.
+static int  g_rbCursor = -1;
 static int  g_rbSortCol = RB_COL_NAME;
 static bool g_rbSortDesc = false;
 
@@ -12547,6 +12550,17 @@ static void drawPanelRemote() {
         rbFlow(rbBtnW("tree"));
         // List <-> tree. Expanding a node costs ONE list, once.
         if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
+            // Leaving the tree with something under the cursor: the listing
+            // opens on THAT folder. Walking down a tree is how you got to a
+            // folder five levels deep; dropping back to the root on the way out
+            // throws away the only thing the trip was for. A file under the
+            // cursor means the folder holding it.
+            if (app.rbTree && g_rbCursor >= 0 && g_rbCursor < (int)view.size()) {
+                const RbRow& r = view[g_rbCursor];
+                std::string want = r.ph || r.up ? std::string()
+                                 : r.isDir()    ? r.full() : *r.dir;
+                if (!want.empty() && want != B.dir) rbGoTo(want);   // deferred
+            }
             app.rbTree = !app.rbTree;
             app.prefsDirty = true;
             savePrefs();
@@ -12907,7 +12921,7 @@ static void drawPanelRemote() {
     // parent. Gated on IsAnyItemActive so the filter box, the path field and
     // the search field keep every key they type; disjoint from the , / . frame
     // stepping under the listing, which owns different keys entirely.
-    static int rbCursor = -1;            // row index, or -1 = no cursor yet
+    int& rbCursor = g_rbCursor;          // row index, or -1 = no cursor yet
     static bool rbCursorScroll = false;  // bring it into view this frame
     {
         static std::string curSig;
@@ -20415,9 +20429,32 @@ int main(int argc, char** argv) {
                 { std::lock_guard<std::mutex> lk(app.rbMtx); phase = app.rbPhase; }
                 const App::RemoteBrowse& B = app.rbrowse;
                 if (!phase.empty()) {
-                    const char* spin = "|/-\\";
-                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.4f, 1), "%c %s",
-                                       spin[(int)(ImGui::GetTime() * 8) & 3], phase.c_str());
+                    // The spinner and the phase text both live in cells of a
+                    // FIXED width. The font is proportional, so "|" and "/" are
+                    // not the same width: spinning re-laid out the row eight
+                    // times a second and walked the cancel button out from
+                    // under the cursor - a button that dodges the pointer while
+                    // you aim at it. Same for the phase, which changes length
+                    // as it goes ("connecting to..." -> "listing...").
+                    const char* spin[4] = { "|", "/", "-", "\\" };
+                    const int fi = (int)(ImGui::GetTime() * 8) & 3;
+                    float sw = 0;
+                    for (const char* g : spin) sw = std::max(sw, ImGui::CalcTextSize(g).x);
+                    const float pad = ImGui::GetStyle().ItemSpacing.x;
+                    const float phaseW = ImGui::CalcTextSize("installing the viewer peer").x;
+                    ImVec2 at = ImGui::GetCursorScreenPos();
+                    ImDrawList* sdl = ImGui::GetWindowDrawList();
+                    const ImU32 amber = ImGui::GetColorU32(ImVec4(1.0f, 0.82f, 0.4f, 1));
+                    // centred in its cell, so it turns on the spot
+                    float gw = ImGui::CalcTextSize(spin[fi]).x;
+                    sdl->AddText(ImVec2(at.x + (sw - gw) * 0.5f, at.y), amber, spin[fi]);
+                    sdl->PushClipRect(ImVec2(at.x + sw + pad, at.y),
+                                      ImVec2(at.x + sw + pad + phaseW,
+                                             at.y + ImGui::GetTextLineHeight()), true);
+                    sdl->AddText(ImVec2(at.x + sw + pad, at.y), amber, phase.c_str());
+                    sdl->PopClipRect();
+                    ImGui::Dummy(ImVec2(sw + pad + phaseW, ImGui::GetTextLineHeight()));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", phase.c_str());
                     ImGui::SameLine();
                     if (ImGui::SmallButton("cancel##rb")) {
                         // the in-flight ssh still finishes - but its result is
