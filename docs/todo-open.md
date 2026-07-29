@@ -165,7 +165,71 @@ WM_NCPAINT/UAH/WM_NCACTIVATE を潰す修正を入れている。統合後の ma
 
 ---
 
-## 5. 環境の重要事実 (両エージェントが独立に確認)
+## 5. `sequence` と `stack` が混在している — 用語を定義しなおす
+
+ユーザー指摘 (2026-07-29): 「sequencesとstackという言葉が混在している．terminologyを
+改めて定義しなおしましょう．」
+
+正典 (`docs/terminology.md`) は **stack** を層の名前として定義している
+(`frame ⊂ stack ⊂ series ⊂ batch`)。にもかかわらず UI は今も `sequence` と言う。
+**同じ物を2つの名前で呼んでいる**のが今の状態。
+
+### 実測した混在 (UI 文字列)
+
+    "Select sequences"            "Load sequence"        "Load sequence?"
+    "Sequence loading"            "which sequences do you want?"
+    "%d sequence(s), %d files"    "selected: %d sequence(s), %d files"
+    "Open folder (all sequences below it)"   "Open the whole sequence (%u frames)"
+    "each checked sequence becomes its own stack"      ← 1文に両方
+    "folder: loads every numbered sequence below it, one stack per group"  ← 同上
+    "step the previewed sequence"  "loading sequence: "  "frame number (index in sequence)"
+    "needs a stack: load a numbered sequence first"    ← 同上
+
+最後の3つが症状を一番よく表している: **1つの文の中で両方使っている。**
+
+### まず決めるべきこと (これが設計判断で、だから Fable)
+
+`sequence` は消すべき同義語なのか、それとも**別の物を指しているのか**。
+後者に見える根拠がある:
+
+- **ディスク上の連番ファイル群** (`frame_000.npy … frame_023.npy`) と、
+- **読み込まれて時間軸を持つ計測対象** (`SeqInfo`、σ_t が意味を持つ単位)
+
+は同じものではない。前者はまだ何も開いていない状態でも存在する
+(ブラウザのグループ行、picker の候補)。正典が名前を与えているのは後者 = **stack**。
+
+**推奨**: ディスク側は「連番ファイル (numbered files)」と呼び、`sequence` という
+語を UI から**引退**させる。読み込まれた物は常に **stack**。
+"each checked sequence becomes its own stack" は
+"each checked group of numbered files becomes its own stack" になる。
+ただし最終判断はユーザーに確認すること — 日本語の画面表記も併せて決める。
+
+### 触ってよい範囲と、触ってはいけない範囲
+
+**互換性のある表面** — 変えると既存のセッション/スクリプトが壊れる。改名しない
+(するなら読み込み側で旧キーも受ける移行が要る):
+
+- セッションのキー: `seqload` `seqname` `seqframe` `seqlevel`
+- CLI: `--sequence ask|always|never`
+- selftest 名 (`--lin-selftest` 等の内部名は自由だが、既存スクリプトが叩いている)
+
+**自由に変えてよい**: UI 文字列、`docs/*.md`、トースト、ログ。
+
+**コード識別子** (`SeqInfo` `seqId` `seqQueue` `seqLoadingId` … 約40個) は
+機械的な一括改名になるので**別コミット**にすること。混ぜると意味のある変更が
+レビューで埋もれる。急ぎではない — 画面の言葉が先。
+
+### 成果物
+
+1. `docs/terminology.md` に「`sequence` は使わない。ディスク上の連番ファイル群は
+   〜、読み込まれた物は stack」と**明記**する (今は stack の定義はあるが、
+   `sequence` を禁じる記述がない。だから混ざった)。
+2. UI 文字列の置換。
+3. 回帰: 文字列を assert しているテスト (`--browse-selftest` の row 文言など) の追随。
+
+---
+
+## 6. 環境の重要事実 (両エージェントが独立に確認)
 
 **この Windows 機は現在 OpenGL のクライアント領域を一切キャプチャできない。**
 `CopyFromScreen` / `BitBlt+CAPTUREBLT` / `BitBlt(GetWindowDC)` / `PrintWindow` の

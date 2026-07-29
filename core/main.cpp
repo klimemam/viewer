@@ -11996,6 +11996,7 @@ struct RbRow {
     const remote::Entry* e = nullptr;
     const std::string* dir = nullptr;
     int member = -1;
+    bool up = false;               // the ".." row (listing only - see rbBuildView)
     int depth = 0;                 // tree indent level; 0 = the listed folder
     bool ph = false;               // "(listing...)": a node whose LIST is in flight
     const std::string& name() const { return member < 0 ? e->name : e->members[member]; }
@@ -12026,7 +12027,26 @@ static std::vector<RbRow> rbBuildView(const std::string* dir,
                                       const std::vector<remote::Entry>& entries,
                                       bool flat, bool tree) {
     std::vector<RbRow> v;
-    v.reserve(entries.size());
+    v.reserve(entries.size() + 1);
+    // ".." belongs to the LISTING, not to the tree: a tree already shows the
+    // parent, so a row pointing at it is a duplicate. In the listing the
+    // current folder is all there is, and the only ways out (the toolbar's
+    // "up", Backspace) both live outside the list the eye is following.
+    //
+    // It used to exist and was removed because it appeared only outside the
+    // home directory and so shifted every row by one on the way in and out.
+    // The fix for that is to always be row 0 - at the root it is present and
+    // dead rather than absent - not to have no row at all.
+    if (!tree) {
+        static remote::Entry upEnt;        // read-only, stable: rows hold pointers
+        upEnt.name = "..";
+        upEnt.dir = true;
+        RbRow r;
+        r.e = &upEnt;
+        r.dir = dir;
+        r.up = true;
+        v.push_back(r);
+    }
     rbAddRows(dir, entries, flat, tree, 0, v);
     return v;
 }
@@ -12055,10 +12075,11 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
         const remote::Entry& e = ents[oi];
         if (flat && e.group && !e.members.empty()) {
             for (int m = 0; m < (int)e.members.size(); m++)
-                out.push_back({ &e, dir, m, depth, false });
+                { RbRow r; r.e = &e; r.dir = dir; r.member = m; r.depth = depth;
+                  out.push_back(r); }
             continue;
         }
-        out.push_back({ &e, dir, -1, depth, false });
+        { RbRow r; r.e = &e; r.dir = dir; r.depth = depth; out.push_back(r); }
         if (!tree || !e.dir) continue;
         std::string sub = *dir == "/" ? "/" + e.name : *dir + "/" + e.name;
         if (!rbHas(app.rbExpanded, sub)) continue;
@@ -12070,7 +12091,8 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
             static const remote::Entry busy = [] {
                 remote::Entry b; b.name = "(listing...)"; return b;
             }();
-            out.push_back({ &busy, dir, -1, depth + 1, true });
+            { RbRow r; r.e = &busy; r.dir = dir; r.depth = depth + 1; r.ph = true;
+              out.push_back(r); }
         }
     }
 }
@@ -12391,6 +12413,7 @@ static void drawPanelRemote() {
     // out because the keyboard (arrow keys) has to do exactly the same thing.
     auto rbActivateRow = [&](const RbRow& r) {
         if (r.ph) return;
+        if (r.up) { rbGoParent(); return; }     // dead at the root, by rbGoParent
         if (r.isDir()) {
             // In a TREE a folder opens where it is; the listing still enters it.
             if (app.rbTree) {
@@ -12438,6 +12461,7 @@ static void drawPanelRemote() {
     // opens the whole stack; a frame promotes the preview it just made.
     auto rbOpenRow = [&](const RbRow& r) {
         if (r.ph) return;
+        if (r.up) { rbGoParent(); return; }
         if (r.isDir()) { rbGoTo(r.full()); return; }
         if (!isNpyName(r.name())) return;
         if (r.isGroup()) {
@@ -12567,8 +12591,8 @@ static void drawPanelRemote() {
     shown.reserve(view.size());
     if (!app.rbTree || !rbFilter[0]) {
         for (int i = 0; i < (int)view.size(); i++)
-            if (!rbFilter[0] || globListMatch(rbFilter, view[i].name()))
-                shown.push_back(i);
+            if (view[i].up || !rbFilter[0] || globListMatch(rbFilter, view[i].name()))
+                shown.push_back(i);      // a filter narrows the listing, not the exit
     } else {
         // In a tree, dropping a folder because its own NAME does not match
         // would orphan the matching files inside it. Rows are in pre-order, so
@@ -12599,6 +12623,7 @@ static void drawPanelRemote() {
         std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
             const RbRow& a = view[ia];
             const RbRow& b = view[ib];
+            if (a.up != b.up) return a.up;      // ".." is row 0 under every sort
             if (a.isDir() != b.isDir()) return a.isDir();
             // an expanded frame has no size / mtime of its own: it sorts as
             // unknown (0) rather than borrowing the group's totals
@@ -13060,9 +13085,10 @@ static void drawPanelRemote() {
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
             // where a selftest aims a right-click: the first row that HAS a
-            // context menu (a placeholder "(listing...)" row has none, and a
-            // tree still fetching a node can put one at the top)
-            if (!r.ph && g_rbToolbar.rowY <= 0) {
+            // context menu (a placeholder "(listing...)" row has none, the ".."
+            // row has none, and a tree still fetching a node can put one at the
+            // top)
+            if (!r.ph && !r.up && g_rbToolbar.rowY <= 0) {
                 g_rbToolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
                 g_rbToolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
             }
@@ -13130,7 +13156,7 @@ static void drawPanelRemote() {
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 rbOpenRow(r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
-            if (!r.ph && ImGui::BeginPopupContextItem("ctx")) {
+            if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
                 if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
@@ -16098,8 +16124,14 @@ int main(int argc, char** argv) {
             }
             std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
             std::vector<RbRow> fv = rbBuildView(&B.dir, B.entries, true, false);
-            bool sizes = gv.size() == B.entries.size() &&
-                         fv.size() == B.entries.size() - nGroups + nMembers;
+            // ...plus the one ".." row the listing always carries (row 0,
+            // under every sort - it is navigation, not a listed entry)
+            int gUp = 0, fUp = 0;
+            for (const auto& r : gv) if (r.up) gUp++;
+            for (const auto& r : fv) if (r.up) fUp++;
+            bool sizes = gUp == 1 && fUp == 1 &&
+                         gv.size() == B.entries.size() + 1 &&
+                         fv.size() == B.entries.size() + 1 - nGroups + nMembers;
             // one grouped row for the sequence, and it is the group entry
             int gRows = 0;
             for (const auto& r : gv) if (r.isGroup()) gRows++;
@@ -16144,8 +16176,12 @@ int main(int argc, char** argv) {
                 marker = 1;
                 queued = rbDeferredPending() == pend0 + 1 && ranAt == -1;
                 // ...and the rows are still readable, which is the whole point
-                aliveOk = !rows.empty() && rows[0].e == &B.entries[0] &&
-                          rows[0].e->name == B.entries[0].name;
+                // rows[0] is "..", whose entry is a static, not one of
+                // B.entries: the row that must survive is the first LISTED one
+                const RbRow* first = nullptr;
+                for (const auto& r : rows) if (!r.up) { first = &r; break; }
+                aliveOk = first && first->e == &B.entries[0] &&
+                          first->e->name == B.entries[0].name;
                 marker = 2;                            // the row list dies here
             }
             bool defOk = queued && aliveOk && ranAt == 2 && rbDeferredPending() == 0;
@@ -16236,6 +16272,33 @@ int main(int argc, char** argv) {
                 if (!treeOk) ok = false;
                 rbTreeForget();
             }
+        }
+        {   // ".." belongs to the LISTING only. In a tree the parent is already
+            // on screen, so a row pointing at it is a duplicate - and the user
+            // said so explicitly. It is row 0 whatever the sort, and a filter
+            // narrows the listing without ever hiding the way out: the version
+            // that appeared only outside the home directory is what shifted
+            // every row by one on the way in and out.
+            auto rows = [&](bool flat, bool tree) {
+                return rbBuildView(&B.dir, B.entries, flat, tree);
+            };
+            std::vector<RbRow> lv = rows(false, false), tv = rows(false, true);
+            std::vector<RbRow> fv2 = rows(true, false);
+            bool listHas = !lv.empty() && lv[0].up && lv[0].name() == "..";
+            bool flatHas = !fv2.empty() && fv2[0].up;
+            bool treeNone = true;
+            for (const auto& r : tv) if (r.up) treeNone = false;
+            // ...and it is a directory row, so the arrow keys step onto it
+            // without previewing it and Enter leaves rather than opening
+            bool asDir = listHas && lv[0].isDir() && !lv[0].isGroup();
+            int ups = 0;
+            for (const auto& r : lv) if (r.up) ups++;
+            bool upOk = listHas && flatHas && treeNone && asDir && ups == 1;
+            fprintf(stderr, "browseselftest: \"..\": listing row0=%d flat row0=%d "
+                            "tree has none=%d draws as a folder=%d exactly one=%d: %s\n",
+                    listHas ? 1 : 0, flatHas ? 1 : 0, treeNone ? 1 : 0, asDir ? 1 : 0,
+                    ups, upOk ? "ok" : "FAIL");
+            if (!upOk) ok = false;
         }
         {   // "Open folder" on the folder being browsed: the same call the
             // toolbar button and the breadcrumb menu make. The scan must
