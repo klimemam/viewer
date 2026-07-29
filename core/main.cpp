@@ -8471,13 +8471,27 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
 // the cost of one text row - which the layouts reserve whether or not compare
 // is on, so turning it on never moves the plot out from under the cursor.
 //
-// The swatches show a SAMPLE of each stroke - solid for A, dashed for B -
+// The swatches show a SAMPLE of each stroke - A's neutral ink, B's tint -
 // because a text-only "A" and "B" leaves the reader matching words to lines.
 // A is the neutral ink every plot draws in; B carries the blue tint it is
 // actually drawn with (a mono series would otherwise give both sides the same
 // grey). Names are elided from the FRONT: the tail is what tells two captures
 // apart. They come from abDocLabel, so two stacks of one series do not both
 // read "frame_000.npy".
+// The ink B is drawn in when it shares a plot with A. Two curves of the same
+// hue need one difference the eye can take in without tracing either of them;
+// a dash pattern is not it, because a profile dense enough to matter turns
+// dashes into a solid line at one zoom and into a broken curve at the next.
+// Lifting toward white keeps the plane identity (R stays red) and separates
+// the sides by weight, which survives decimation.
+static const ImU32 AB_B_INK = IM_COL32(120, 190, 255, 230);   // the mono case, and the legend
+static ImU32 abLiftInk(ImU32 c, float t) {
+    int r = (int)( c        & 0xFF), g = (int)((c >> 8) & 0xFF);
+    int b = (int)((c >> 16) & 0xFF), a = (int)((c >> 24) & 0xFF);
+    auto up = [&](int v) { return v + (int)((255 - v) * t); };
+    return IM_COL32(up(r), up(g), up(b), a);
+}
+
 static float abLegendSw()  { return 24 * app.uiScale; }
 static float abLegendGap() { return 6 * app.uiScale; }
 static std::string abLegendText(const char* side, const std::string& name) {
@@ -8513,8 +8527,7 @@ static void drawABLegendRow(const std::string& aName, const std::string& bName,
     dl->AddText(ImVec2(p.x + sw + gap, p.y), ink, la.c_str());
     const float bx = one ? p.x + abLegendEntryW("A", aName, false) + sep : p.x;
     const float by = one ? p.y : p.y + lineAdvance;
-    ImVec2 dash[2] = { ImVec2(bx, by + fh * 0.5f), ImVec2(bx + sw, by + fh * 0.5f) };
-    addDashedPolyline(dl, dash, 2, inkB, 1.6f, 4 * s, 3 * s);
+    dl->AddLine(ImVec2(bx, by + fh * 0.5f), ImVec2(bx + sw, by + fh * 0.5f), inkB, 1.6f);
     dl->AddText(ImVec2(bx + sw + gap, by), ink, lb.c_str());
     if (bStale)
         dl->AddText(ImVec2(bx + sw + gap + ImGui::CalcTextSize(lb.c_str()).x + gap, by),
@@ -9578,21 +9591,31 @@ static void drawPanelProjection() {
             x1 = std::max(x1, (float)(ob + std::max(nb - 1, 1)));
         }
     };
-    // Stroke one side's profiles. dashed = this is B. bars = draw the min-max
-    // range of a decimated bucket; A only, per the plan - two sets of range
-    // bars on one plot is noise, and the reader needs one reference.
+    // Stroke one side's profiles. isB = this is the compare slot. tint = the
+    // two are sharing ONE plot, so B needs its own ink; drawn side by side
+    // there is nothing to tell apart within a plot, and B is stroked exactly
+    // like A so the two panels can be read against each other. bars = the
+    // min-max range of a decimated bucket - suppressed only when overlaid,
+    // where two sets of range bars on one plot is noise.
     auto stroke = [&](const PlotRect& pr, const App::ProjState& S, bool horizontal,
-                      bool dashed, bool bars) {
+                      bool isB, bool tint, bool bars) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const std::vector<float>* series = horizontal ? S.h : S.v;
         int origin = horizontal ? S.rx : S.ry;
         for (int s = 0; s < S.nSeries; s++) {
             // colour follows A's series OF THE SAME NAME (R is always R); a
             // series only one side has gets a neutral stroke, never a plane hue
-            int a = dashed ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            int a = isB ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            const bool mono = !cfa && P.nSeries == 1;
             ImU32 col = a < 0 ? ODD_COL
                       : (cfa ? CFA_COLS[a]
-                             : (P.nSeries == 1 ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
+                             : (mono ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
+            // B on A's plot: keep the plane hue and lift it toward white, so R
+            // still reads as R and the pair still separates at a glance. A dash
+            // pattern did that job before and lost against a dense profile -
+            // the curve simply looked broken. The mono case has no hue to keep
+            // (A is already near-white), so B takes the blue the legend flies.
+            if (tint && a >= 0) col = mono ? AB_B_INK : abLiftInk(col, 0.45f);
             const std::vector<float>& d = series[s];
             // decimate to the plot's pixel width: 4000 samples into 400 px was
             // 4000 line segments per series per frame
@@ -9600,11 +9623,8 @@ static void drawPanelProjection() {
             int stride = std::max(1, (int)d.size() / px);
             std::vector<ImVec2> run;
             auto flush = [&]() {
-                if (run.size() >= 2) {
-                    if (dashed) addDashedPolyline(dl, run.data(), (int)run.size(), col, 1.2f,
-                                                  5 * app.uiScale, 4 * app.uiScale);
-                    else dl->AddPolyline(run.data(), (int)run.size(), col, 0, 1.2f);
-                }
+                if (run.size() >= 2)
+                    dl->AddPolyline(run.data(), (int)run.size(), col, 0, 1.2f);
                 run.clear();
             };
             for (int i = 0; i < (int)d.size(); i += stride) {
@@ -9672,8 +9692,11 @@ static void drawPanelProjection() {
         if (!pr.ok) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->PushClipRect(pr.p0, pr.p1, true);
-        if (wantA) stroke(pr, P, horizontal, false, true);     // solid, with min-max bars
-        if (wantB && Bim) stroke(pr, PB, horizontal, true, false);   // dashed, no bars
+        // overlaid = both on this plot: B gets its own ink and gives up the
+        // range bars. Alone in its own panel, B is stroked exactly like A.
+        const bool overlaid = wantA && wantB && Bim;
+        if (wantA) stroke(pr, P, horizontal, false, false, true);
+        if (wantB && Bim) stroke(pr, PB, horizontal, true, overlaid, !overlaid);
         dl->PopClipRect();
         hoverReadout(pr, horizontal, wantA, wantB);
         if (wantA && wantB && Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
@@ -11066,7 +11089,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     else snprintf(yl, sizeof yl, "%s mean value (%s)", rlab, unit.c_str());
     const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
 
-    auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool dashed) {
+    // tint = B is sharing A's plot and needs its own ink; alone in its own
+    // panel it is stroked exactly like A, so the two can be read against each
+    // other. (Same rule as the projection profiles - a dash pattern reads as a
+    // broken curve rather than as "this one is B".)
+    auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool tint) {
         if (!tp.ok || !s.mean || s.mean->size() < 2 || !s.idx) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         std::vector<ImVec2> pts;
@@ -11074,9 +11101,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         for (size_t i = 0; i < s.mean->size() && i < s.idx->size(); i++)
             pts.push_back(tp.at((*s.idx)[i], (*s.mean)[i]));
         if (pts.size() < 2) return;
-        if (dashed) addDashedPolyline(dl, pts.data(), (int)pts.size(), CURVE, 1.5f,
-                                      5 * app.uiScale, 4 * app.uiScale);
-        else dl->AddPolyline(pts.data(), (int)pts.size(), CURVE, 0, 1.5f);
+        dl->AddPolyline(pts.data(), (int)pts.size(), tint ? AB_B_INK : CURVE, 0, 1.5f);
     };
     auto marker = [&](const PlotRect& tp, const ImageDoc* d) {
         if (!tp.ok || !d) return;
@@ -11134,7 +11159,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             if (tp.ok) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 dl->PushClipRect(tp.p0, tp.p1, true);
-                curve(tp, B, true); marker(tp, Bim);
+                curve(tp, B, false); marker(tp, Bim);   // its own plot: A's stroke
                 dl->PopClipRect();
             }
         }
