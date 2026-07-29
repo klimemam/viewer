@@ -688,9 +688,12 @@ struct App {
     // when the group is queued and recorded against the real seqId the moment
     // the stack appears (see groupStacks). A pending sweep resolves against
     // that, never against a display name.
+    // openId: which Open Folder queued this group. The queue spans Opens (a
+    // second Open while the first drains appends), and the raw format recipe is
+    // answered once per OPEN - it must not reach the other one's files.
     struct PendingGroup { std::string name; std::vector<std::string> files;
                           bool isRaw = false; int batchId = 0; std::string shape;
-                          int token = 0; };
+                          int token = 0; int openId = 0; };
     std::vector<PendingGroup> seqQueue;
     // Sibling loads a session asked for, drained one at a time.
     // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
@@ -743,6 +746,8 @@ struct App {
     int nextGroupToken = 1;
     std::vector<std::pair<int, int>> groupStacks;   // group token -> seqId
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
+    int folderRecipeOpenId = 0;       // ...and WHOSE Open answered for it
+    int nextOpenId = 1;               // one per Open Folder, stamped on its groups
     // "which sequences do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
     // filter matches against exactly these strings, so folder names and file
@@ -4472,7 +4477,15 @@ static void resolveOnePendingSeries(const App::SeriesPending& P) {
 static void resolvePendingSeries() {
     std::vector<App::SeriesPending> queue;
     queue.swap(app.seriesPending);
-    for (const auto& P : queue) resolveOnePendingSeries(P);
+    for (const auto& P : queue) {
+        // The batch a sweep was accepted into can be gone by now. closeBatch
+        // purges its notes, but a raw dialog cancelled out of the queue, and
+        // anything else that reaches pruneEmptyBatches, does not - and a note
+        // about a batch that no longer exists has nothing to say to anybody.
+        bool live = false;
+        for (const auto& b : app.batches) if (b.id == P.batchId) live = true;
+        if (live) resolveOnePendingSeries(P);
+    }
     app.groupStacks.clear();          // the only thing that reads them is done
 }
 
@@ -4733,11 +4746,17 @@ static void startNextQueuedGroup() {
     if (app.seqQueue.empty() || app.seqRunning || rawDlg.open || rawDlg.forQueue ||
         app.folderPickOpen) return;
     App::PendingGroup g = app.seqQueue.front();
-    if (g.isRaw && !app.folderRecipeValid) {
-        openRawDialogFor(g.files[0]);          // ask once for the whole batch
+    // The recipe belongs to the OPEN that answered for it. Two raw folders with
+    // different width/height/dtype/offset cannot both be right, and the queue
+    // spans Opens: applying a latched recipe to another Open's files decodes
+    // them as garbage, silently, whenever those files are big enough.
+    const bool haveRecipe = app.folderRecipeValid && app.folderRecipeOpenId == g.openId;
+    if (g.isRaw && !haveRecipe) {
+        openRawDialogFor(g.files[0]);          // ask once per Open
         if (rawDlg.open) {
             rawDlg.forQueue = true;
-            rawDlg.queueCount = (int)app.seqQueue.size();
+            rawDlg.queueCount = 0;             // ...for THIS Open's stacks
+            for (const auto& q : app.seqQueue) if (q.openId == g.openId) rawDlg.queueCount++;
         } else {
             app.seqQueue.erase(app.seqQueue.begin());   // unreadable: skip
         }
@@ -4780,7 +4799,14 @@ static void startNextQueuedGroup() {
 
 static void enqueueGroups(std::vector<App::PendingGroup> groups) {
     if (groups.empty()) return;
-    app.folderRecipeValid = false;
+    // One Open, one openId. This used to be `app.folderRecipeValid = false`,
+    // which is the wrong scope in both directions once the queue spans Opens:
+    // opening raw folder B while raw folder A drained CANCELLED the recipe the
+    // user had already given for A (so the dialog came back showing an A file
+    // to someone who had just opened B), and the answer to that dialog was then
+    // latched for every remaining group of BOTH folders.
+    int oid = app.nextOpenId++;
+    for (auto& g : groups) g.openId = oid;
     // APPEND. This used to be `app.seqQueue = std::move(groups)`, so a second
     // Open while the first was still loading silently CANCELLED every stack the
     // first Open had not started yet - the second Open's folder came up looking
@@ -6795,7 +6821,21 @@ static void drawRawModal() {
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         rawDlg.replaceIdx = -1;
-        if (rawDlg.forQueue) { rawDlg.forQueue = false; app.seqQueue.clear(); }
+        if (rawDlg.forQueue) {
+            rawDlg.forQueue = false;
+            // Only the Open that ASKED. A blanket clear threw away the stacks a
+            // DIFFERENT Open had queued - in silence, since the queue spans
+            // Opens now. And say how many did not open: dropping a folder's
+            // worth of stacks is not something to do without a word.
+            int oid = app.seqQueue.empty() ? 0 : app.seqQueue.front().openId;
+            int dropped = 0;
+            for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
+                if (it->openId == oid) { it = app.seqQueue.erase(it); dropped++; }
+                else ++it;
+            if (dropped)
+                toast("cancelled: " + std::to_string(dropped) + " stack(s) not opened", true);
+            pruneEmptyBatches();
+        }
         ImGui::CloseCurrentPopup();
     }
     if (ok) {
@@ -6809,6 +6849,7 @@ static void drawRawModal() {
             app.folderRecipeValid = true;
             rawDlg.forQueue = false;
             App::PendingGroup g = app.seqQueue.front();
+            app.folderRecipeOpenId = g.openId;   // this Open's geometry, nobody else's
             app.seqQueue.erase(app.seqQueue.begin());
             if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
             if (app.current >= 0 && app.current < (int)app.images.size())
@@ -16848,6 +16889,115 @@ int main(int argc, char** argv) {
             fprintf(stderr, "verifyselftest: V8 note: the in-flight drop path was%s "
                             "the one that had to catch it\n",
                     pendingAfter > 0 ? "" : " NOT");
+        }
+
+        // ---- V9: the raw recipe belongs to the Open that answered for it ------
+        // The queue spans Opens now (a second Open Folder while the first drains
+        // APPENDS instead of replacing), but g_folderRecipe was process-global
+        // with three touch points. Opening raw folder B while raw folder A
+        // drained reset folderRecipeValid - so A's dialog came back, showing an
+        // A file, to a user who had just opened B - and the answer was then
+        // applied to every remaining raw group of BOTH folders. Two folders with
+        // different geometry cannot both be right.
+        {
+            closeAll();
+            app.seqQueue.clear();
+            app.folderRecipeValid = false;
+            rawDlg.open = false;
+            rawDlg.forQueue = false;
+            std::error_code rec;
+            std::filesystem::path rroot = std::filesystem::temp_directory_path(rec) /
+                                          "viewer_rawrecipe";
+            std::filesystem::remove_all(rroot, rec);
+            std::filesystem::create_directories(rroot / "A", rec);
+            std::filesystem::create_directories(rroot / "B", rec);
+            // A: 32x32 u8 = 1024 bytes per file. B: 64x64 u8 = 4096 - a real
+            // geometry difference, and B's files are big enough that A's recipe
+            // would decode them without complaining.
+            auto mkraw = [](const std::filesystem::path& p, size_t n) {
+                std::ofstream o(p, std::ios::binary);
+                std::vector<char> buf(n, 7);
+                o.write(buf.data(), (std::streamsize)n);
+            };
+            for (int i = 0; i < 2; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "a_%03d.raw", i);
+                mkraw(rroot / "A" / nm, 32 * 32);
+                snprintf(nm, sizeof nm, "b_%03d.raw", i);
+                mkraw(rroot / "B" / nm, 64 * 64);
+            }
+            auto oneGroup = [](const std::string& file, const std::string& name) {
+                App::PendingGroup g;
+                g.files.push_back(file);
+                g.name = name;
+                g.isRaw = true;
+                return g;
+            };
+            std::vector<App::PendingGroup> ga;
+            ga.push_back(oneGroup((rroot / "A" / "a_000.raw").u8string(), "A/a0"));
+            ga.push_back(oneGroup((rroot / "A" / "a_001.raw").u8string(), "A/a1"));
+            enqueueGroups(std::move(ga));      // raises the dialog for A's first
+            int openA = app.seqQueue.empty() ? 0 : app.seqQueue.front().openId;
+            bool askedA = rawDlg.open && rawDlg.forQueue;
+            // the user answers it: exactly what the dialog's Load does
+            g_folderRecipe = rawDlg;
+            g_folderRecipe.w = 32; g_folderRecipe.h = 32;
+            g_folderRecipe.dtype = RD_U8; g_folderRecipe.interp = RI_GRAY;
+            g_folderRecipe.offset = 0;
+            g_folderRecipe.forQueue = false;
+            g_folderRecipe.replaceIdx = -1;
+            g_folderRecipe.cropOn = false;
+            app.folderRecipeValid = true;
+            app.folderRecipeOpenId = openA;
+            rawDlg.open = false; rawDlg.forQueue = false;
+            std::vector<App::PendingGroup> gb;  // ...and NOW a second Open
+            gb.push_back(oneGroup((rroot / "B" / "b_000.raw").u8string(), "B/b0"));
+            enqueueGroups(std::move(gb));
+            bool keptA = app.folderRecipeValid && app.folderRecipeOpenId == openA;
+            int qBefore = (int)app.seqQueue.size();
+            startNextQueuedGroup();             // A's second group: uses A's recipe
+            bool aDecoded = !app.images.empty() && app.images.back()->w == 32 &&
+                            app.images.back()->h == 32 && !rawDlg.open;
+            startNextQueuedGroup();             // B's group: must ASK, not assume
+            bool askedB = rawDlg.open && rawDlg.forQueue;
+            bool noGarbage = true;              // nothing decoded with A's geometry
+            for (const auto& d : app.images)
+                if (d->path.find("b_") != std::string::npos) noGarbage = false;
+            fprintf(stderr, "verifyselftest: V9 raw recipe: asked for A=%d, kept over the "
+                            "second Open=%d, A's 2nd stack %dx%d, asked again for B=%d, "
+                            "queue %d\n", askedA ? 1 : 0, keptA ? 1 : 0,
+                    app.images.empty() ? 0 : app.images.back()->w,
+                    app.images.empty() ? 0 : app.images.back()->h, askedB ? 1 : 0, qBefore);
+            check(askedA, "V9 a raw queue asks for a recipe once");
+            check(keptA, "V9 a second Open does not cancel the first's answered recipe");
+            check(aDecoded, "V9 ...which still applies to the rest of ITS OWN Open");
+            check(askedB, "V9 the other Open's raw group asks for its own recipe");
+            check(noGarbage, "V9 ...and nothing of it was decoded with the wrong geometry");
+            // Cancel takes only the Open that asked with it.
+            int bOpen = app.seqQueue.empty() ? 0 : app.seqQueue.front().openId;
+            std::vector<App::PendingGroup> gc;
+            gc.push_back(oneGroup((rroot / "A" / "a_000.raw").u8string(), "C/c0"));
+            enqueueGroups(std::move(gc));       // a THIRD Open queues behind B
+            int qAll = (int)app.seqQueue.size();
+            rawDlg.forQueue = true;
+            {   // the Cancel branch of drawRawDialog, verbatim
+                rawDlg.forQueue = false;
+                int oid = app.seqQueue.empty() ? 0 : app.seqQueue.front().openId;
+                int dropped = 0;
+                for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
+                    if (it->openId == oid) { it = app.seqQueue.erase(it); dropped++; }
+                    else ++it;
+                fprintf(stderr, "verifyselftest: V9 Cancel dropped %d of %d queued "
+                                "group(s), %d left\n", dropped, qAll,
+                        (int)app.seqQueue.size());
+            }
+            bool othersKept = !app.seqQueue.empty();
+            for (const auto& q : app.seqQueue) if (q.openId == bOpen) othersKept = false;
+            check(othersKept, "V9 Cancel drops only the asking Open's queued stacks");
+            app.seqQueue.clear();
+            app.folderRecipeValid = false;
+            rawDlg.open = false; rawDlg.forQueue = false;
+            std::filesystem::remove_all(rroot, rec);
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
