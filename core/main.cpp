@@ -3276,7 +3276,18 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             bool inFile = true;
             for (const auto& o : app.images)
                 if (o->seqId == d->seqId && o->path != d->path) { inFile = false; break; }
-            if (!inFile) f << "seqload 1\n";
+            // ...but the head frame of the CURRENT rescan is also the only
+            // image with its seqId until pumpSequence integrates the siblings
+            // (4 per UI frame - the worker finishing first is the norm, so
+            // seqRunning is no witness). That is not an in-file axis (loadNpy
+            // builds those whole before anyone can save); it is the window
+            // between seqRestore being consumed and integration, and the
+            // autosave on quit and the crash snapshot both live inside it.
+            // seqLoadingId is the durable marker: it stays on this stack until
+            // the stack is closed or the next load starts - and by then the
+            // siblings are integrated and !inFile carries the line instead.
+            if (!inFile || (app.seqLoadingId != 0 && d->seqId == app.seqLoadingId))
+                f << "seqload 1\n";
             // AFTER seqload: for a folder stack the SeqInfo only exists once the
             // rescan ran, and a name applied before that lands on nothing. The
             // name may be user-given ("25C dark") - it must survive the session.
@@ -3366,6 +3377,14 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     for (const auto& P : app.seriesPending) {
         lostSeries++;
         lostMembers += (int)P.members.size();
+    }
+    // Legacy per-stack levels waiting on the same drain gate are in the same
+    // position: not writable in this format (their stacks do not exist yet),
+    // so they must at least be COUNTED, or a save in their window reads clean
+    // while destroying every declared level.
+    if (!app.seqLevelLegacy.empty()) {
+        lostSeries++;
+        lostMembers += (int)app.seqLevelLegacy.size();
     }
     if (lostSeries || lostMembers)
         fprintf(stderr, "series: NOT saved: %d series and %d member(s) had nothing to "
@@ -5082,6 +5101,10 @@ static std::vector<App::PendingGroup> pickerSelection(std::string* errOut = null
 // what actually loads - a numbered group filtered down to one file lands here
 // too, and that was the wider half of the hole.
 static int pickLoneImageGroups() {
+    // Remote is different: openRemoteStack mints a real SeqInfo for a single
+    // remote frame ("<group> [remote x1]"), so a lone remote row DOES become a
+    // stack and DOES resolve into the sweep. Warning about it would be wrong.
+    if (app.folderPickRemote) return 0;
     int n = 0;
     for (const auto& e : app.folderPick) {
         if (!e.selected || e.nMatch != 1) continue;
