@@ -3669,7 +3669,19 @@ static std::string loadSession(const std::string& path) {
         // in-file frame axis. This one keys on the PATH, which works for both,
         // and turns into a series only where there is a sweep to speak of.
         else if (key == "seqlevel") {
-            double lv = 0; ls >> lv;
+            // STRICTLY, like the seriesmember branch below. `ls >> lv` stores
+            // 0.0 on a failed extraction (C++11 onward), so "notanumber", "1e",
+            // "-" and a bare "seqlevel" all sailed through the isfinite guard as
+            // a hard measurement at ZERO - and zero here is not a missing point,
+            // it is the DARK stack: migrateLegacyLevels gives the series the
+            // "lx" prefill so it is fittable out of the box, and linRecompute
+            // then anchors the offset on it and MEASURES read noise in a stack
+            // nobody declared dark. This branch exists ONLY for hand-written and
+            // third-party files, which is precisely the input that carries
+            // unparseable text. An unreadable legacy level is no legacy level;
+            // a batch of them migrates to nothing, which is what the canon says
+            // (値は「読めなければ未設定」... 0 ではない).
+            double lv = parseSeriesValue(restOfLine(ls).c_str());
             if (lastImageOk && cur() && !cur()->path.empty() && std::isfinite(lv))
                 app.seqLevelLegacy.push_back({ cur()->path, lv });
         }
@@ -15312,11 +15324,13 @@ int main(int argc, char** argv) {
             check("invariant 1: audit after migration", audit());
             // The negative half of the same rule: ONE levelled stack is not a
             // sweep, and nothing may be invented from it.
-            std::string onePath;
-            if (M && !M->members.empty()) {
-                std::vector<int> fr = framesOfSeq(M->members.front().seqId);
-                if (!fr.empty()) onePath = app.images[fr.front()]->path;
-            }
+            std::vector<std::string> lpaths;
+            if (M)
+                for (const auto& m : M->members) {
+                    std::vector<int> fr = framesOfSeq(m.seqId);
+                    if (!fr.empty()) lpaths.push_back(app.images[fr.front()]->path);
+                }
+            std::string onePath = lpaths.empty() ? std::string() : lpaths.front();
             {
                 std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
                 lf << "viewer-session 1\n";
@@ -15337,6 +15351,39 @@ int main(int argc, char** argv) {
                     (int)app.seqs.size());
             check("a single levelled stack makes NO series", app.series.empty() &&
                                                             !app.seqs.empty());
+            // ...and the same rule for TEXT. `ls >> lv` stores 0.0 when the
+            // extraction fails, so every unreadable level used to migrate as a
+            // hard 0 - which in linearity is the dark stack, and the migration
+            // hands the series the "lx" prefill so it is fittable at once. This
+            // branch reads hand-written and third-party files only, i.e. exactly
+            // the input that carries text a parser cannot read.
+            {
+                std::ofstream lf(pathFromUtf8(legacy), std::ios::binary);
+                lf << "viewer-session 1\n";
+                const char* BAD[] = { "notanumber", "1e", "-", "12x", "" };
+                for (size_t i = 0; i < lpaths.size(); i++) {
+                    lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << lpaths[i] << "\n";
+                    lf << "imgbatch junkset\n" << "seqload 1\n";
+                    lf << "seqlevel " << BAD[std::min<size_t>(i, 4)] << "\n";
+                }
+            }
+            loadSession(legacy);
+            loadAll();
+            double tm3 = glfwGetTime();
+            while (glfwGetTime() - tm3 < 120.0 && !app.seqLevelLegacy.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int zeroed = 0;
+            for (const auto& s : app.series)
+                for (const auto& m : s.members)
+                    if (std::isfinite(m.value) && fabs(m.value) < 1e-9) zeroed++;
+            fprintf(stderr, "seriesselftest: %d unreadable seqlevel(s) -> %d series, "
+                            "%d member(s) at 0, %d stack(s) open\n", (int)lpaths.size(),
+                    (int)app.series.size(), zeroed, (int)app.seqs.size());
+            check("an unreadable seqlevel is UNSET, never a dark stack at 0",
+                  lpaths.size() >= 2 && app.series.empty() && zeroed == 0 &&
+                  !app.seqs.empty());
         }
 
         // ---- the create/edit modal, pressed the way a human presses it --------
