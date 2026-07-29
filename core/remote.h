@@ -126,6 +126,17 @@ private:
     void* impl_ = nullptr;      // platform pipe/process handles
 };
 
+// Is a TILE reply consistent with the REQUEST that produced it? A peer cannot
+// legitimately return more samples than were asked for, and that invariant is
+// what bounds the allocation the reply sizes. Exposed (rather than buried in
+// Session::tile) so the hostile cases are testable without a hostile peer:
+// without it, w=h=2^30 / ch=4 / f32 overflows the 64-bit product to exactly 0
+// and matches rawBytes=0, and a self-consistent 32768x32767 u32 reply makes a
+// ~4 MB deflate payload allocate 4 GB.
+bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
+                   uint32_t repW, uint32_t repH, uint32_t repCh,
+                   uint32_t dtype, uint32_t rawBytes);
+
 // Run one shell command on the host (or locally when host is empty) and collect
 // its combined output. `stdinData` is fed to it verbatim - a script for `sh`, or
 // the bytes of a file for `cat > path`. Returns false on spawn failure or when

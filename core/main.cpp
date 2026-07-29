@@ -14186,6 +14186,37 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 wire / 1048576.0, (double)got.size() * 4 / 1048576.0);
         bad += mismatch ? 1 : 0;
     }
+    {   // A TILE reply sizes an allocation, so it is validated against the
+        // REQUEST and not only against itself. Both hostile shapes below pass
+        // every self-consistency test the client used to apply.
+        struct C { const char* what; uint32_t rw, rh, st, w, h, ch, dt, raw; bool want; };
+        const C cases[] = {
+            // 64-bit overflow: 2^30 x 2^30 x 4 x 4 bytes is exactly 2^64, which
+            // wraps to 0 and matches rawBytes = 0. toFloat then resized to 2^62
+            // floats and std::length_error killed the process.
+            { "overflow to 0", 512, 512, 1, 0x40000000u, 0x40000000u, 4, rp::DT_F32, 0, false },
+            // no overflow at all: fully self-consistent, ~4 MB of deflate on the
+            // wire (under recv's 512 MB cap), 4 GB of allocation on arrival
+            { "deflate bomb", 512, 512, 1, 32768, 32767, 1, rp::DT_U32, 4294836224u, false },
+            { "more rows than asked", 512, 512, 1, 512, 513, 1, rp::DT_U16, 512u*513*2, false },
+            { "bad dtype", 512, 512, 1, 8, 8, 1, rp::DT_COUNT, 64, false },
+            { "byte count disagrees", 512, 512, 1, 8, 8, 1, rp::DT_U16, 64, false },
+            { "legitimate full tile", 512, 512, 1, 512, 512, 1, rp::DT_U16, 512u*512*2, true },
+            { "legitimate decimated", 513, 513, 3, 171, 171, 3, rp::DT_F32, 171u*171*3*4, true },
+        };
+        int badT = 0;
+        for (const C& c : cases) {
+            bool got = remote::tileReplySane(c.rw, c.rh, c.st, c.w, c.h, c.ch, c.dt, c.raw);
+            if (got != c.want) {
+                fprintf(stderr, "selftest TILE guard: %s -> %s, wanted %s\n",
+                        c.what, got ? "accepted" : "rejected", c.want ? "accepted" : "rejected");
+                badT++;
+            }
+        }
+        fprintf(stderr, "selftest: TILE reply guard over %d shape(s): %s\n",
+                (int)(sizeof cases / sizeof cases[0]), badT ? "FAIL" : "ok");
+        bad += badT ? 1 : 0;
+    }
     // MEASURE: the same plugin must produce the same numbers on both sides.
     // Same code, same f32 input - the comparison is string-exact on %.9g.
     plugin_host::loadAll({ plugin_host::exeDir() + "/plugins" },
@@ -15159,6 +15190,52 @@ int main(int argc, char** argv) {
                 if (!idOk) ok = false;
                 closeAll();
             }
+        }
+        {   // MALFORMED .npy HEADER LENGTH. The peer sized a std::string from a
+            // raw u32 taken straight off the file, with no bound and no read
+            // check, so a 12-byte file whose header length reads 0xffffffff
+            // cost 4 GB of commit and ~1.8 s on EVERY LIST of its directory -
+            // up to 256 of them in one LIST, 512 in one SCAN. The client's own
+            // .npy readers have always bounded it; the peer had the guard
+            // missing in the wrong binary.
+            std::error_code bec;
+            std::filesystem::path bomb =
+                std::filesystem::temp_directory_path(bec) / "viewer_hlenbomb";
+            std::filesystem::remove_all(bomb, bec);
+            std::filesystem::create_directories(bomb, bec);
+            std::filesystem::copy_file(pathFromUtf8(dir + "/dark.npy"), bomb / "good.npy",
+                                       std::filesystem::copy_options::overwrite_existing, bec);
+            // lettered, not numbered: a numbered run would group into ONE row
+            for (int i = 0; i < 8; i++) {
+                std::ofstream bf(bomb / (std::string("bomb") + (char)('a' + i) + ".npy"),
+                                 std::ios::binary);
+                bf.write("\x93NUMPY\x02\x00\xff\xff\xff\xff", 12);
+            }
+            std::string bdir = bomb.u8string();
+            std::replace(bdir.begin(), bdir.end(), '\\', '/');
+            double bt0 = glfwGetTime();
+            remoteBrowseTo(bdir);
+            double t2 = glfwGetTime();
+            while (glfwGetTime() - t2 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == bdir) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            double secs = glfwGetTime() - bt0;
+            int meta = 0, nb = 0;
+            for (const auto& e : B.entries) {
+                if (e.name.rfind("bomb", 0) == 0) nb++;
+                if (e.hasMeta) meta++;
+            }
+            // Measured: 0.06 s with the guard, 3.49 s for four bombs without
+            // it. Eight bombs and a 2 s bound leaves ~30x headroom over a
+            // healthy LIST and still fails the unbounded allocation by ~3x.
+            bool bombOk = B.dir == bdir && nb == 8 && meta == 1 && secs < 2.0;
+            fprintf(stderr, "browseselftest: malformed .npy headers: listed %d entr(ies) "
+                            "(%d bombs, %d with metadata) in %.2f s: %s\n",
+                    (int)B.entries.size(), nb, meta, secs, bombOk ? "ok" : "FAIL");
+            if (!bombOk) ok = false;
+            std::filesystem::remove_all(bomb, bec);
         }
         {   // PORT. A non-default ssh port used to survive only inside the
             // browse worker: makeRemoteUrl dropped it, and that string is what

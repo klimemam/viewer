@@ -545,6 +545,23 @@ static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<fl
     }
 }
 
+bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
+                   uint32_t repW, uint32_t repH, uint32_t repCh,
+                   uint32_t dtype, uint32_t rawBytes) {
+    if (!step) return false;
+    // FIRST against the REQUEST, which the caller holds: the peer cannot
+    // return more samples than were asked for. That single invariant bounds
+    // every factor below, which is what makes the self-consistency check
+    // meaningful instead of defeatable by 64-bit overflow.
+    uint32_t maxW = (uint32_t)(((uint64_t)reqW + step - 1) / step);
+    uint32_t maxH = (uint32_t)(((uint64_t)reqH + step - 1) / step);
+    if (repW > maxW || repH > maxH) return false;
+    if (!repW || !repH || !repCh || repCh > 4 || dtype >= rp::DT_COUNT) return false;
+    // ...then the dims and the byte count must agree BEFORE anything indexes
+    // by dims, or toFloat reads far past the buffer.
+    return (uint64_t)repW * repH * repCh * rp::dtypeSize(dtype) == (uint64_t)rawBytes;
+}
+
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
                    std::string& err) {
@@ -564,13 +581,11 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     if (type != rp::MSG_OK) { r.str(err); return false; }
     rp::TileRep rep{};
     if (!r.blob(&rep, sizeof rep)) { err = "bad TILE reply"; return false; }
-    // The dims and the byte count must agree BEFORE anything indexes by dims: a
-    // peer whose reply disagrees with itself (or a truncated 4 GB tile) would
-    // otherwise send toFloat reading far past the buffer. Reproduced as a crash
-    // by the verification agent; now it is an error message.
-    size_t need = (size_t)rep.w * rep.h * rep.ch * rp::dtypeSize(rep.dtype);
-    if (!rep.w || !rep.h || !rep.ch || rep.ch > 4 || rep.dtype >= rp::DT_COUNT ||
-        need != rep.rawBytes) {
+    // Validated against the REQUEST as well as against itself: see
+    // tileReplySane. Reproduced as a process kill by the verification agent
+    // (std::length_error out of toFloat, uncaught on every client path); now
+    // it is an error message.
+    if (!tileReplySane(q.w, q.h, q.step, rep.w, rep.h, rep.ch, rep.dtype, rep.rawBytes)) {
         err = "inconsistent tile from the peer";
         return false;
     }
