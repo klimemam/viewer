@@ -5689,6 +5689,11 @@ static std::string bootstrapScript() {
     // POSIX sh, delivered over stdin so no quoting layer can mangle it.
     // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
     return
+        // Everything the script says reaches the user: runSshCommand wires the
+        // child's stderr to the PARENT's, so cp's "Text file busy" went to the
+        // viewer's own console and the log the user is shown contained git
+        // output and no cause at all.
+        "exec 2>&1\n"
         "set -e\n"
         "d=$HOME/.viewer\n"
         "mkdir -p \"$d\"\n"
@@ -5714,8 +5719,19 @@ static std::string bootstrapScript() {
         "  *)      echo \"unsupported server OS: $u\"; exit 1 ;;\n"
         "esac\n"
         "[ -f \"$src/viewer-serve\" ] || { echo 'binaries branch has no viewer-serve'; exit 1; }\n"
-        "cp \"$src/viewer-serve\" \"$d/viewer-serve\"\n"
-        "chmod +x \"$d/viewer-serve\"\n"
+        // Replace the INODE, never the bytes: rfWorker and mWorker each hold a
+        // ~/.viewer/viewer-serve process for the life of the app and only the
+        // BROWSE session is stopped for an update, so a plain cp opens the
+        // running binary O_WRONLY|O_TRUNC and fails with ETXTBSY - which
+        // `set -e` then turns into an update that reports the wrong reason.
+        // Step 2 of deployPeer already does .new + chmod + mv for this reason.
+        "cp \"$src/viewer-serve\" \"$d/viewer-serve.new\"\n"
+        "chmod +x \"$d/viewer-serve.new\"\n"
+        "mv \"$d/viewer-serve.new\" \"$d/viewer-serve\"\n"
+        // The plugins are already safe as they stand: rm -rf UNLINKS them, which
+        // a live peer's mapping survives, and cp -r then creates new inodes.
+        // Only an in-place TRUNCATE would be a SIGBUS in the peer - which is
+        // what deployPeer's direct `cat >` did, and no longer does.
         "rm -rf \"$d/plugins\"; [ -d \"$src/plugins\" ] && cp -r \"$src/plugins\" \"$d/plugins\"\n"
         "echo VIEWER_SERVE_OK\n";
 }
@@ -5816,9 +5832,17 @@ static bool deployPeer(const std::string& host, int port, bool force, std::strin
                         std::string pb;
                         if (!e.is_regular_file(ec) || !readWholeFile(e.path().u8string(), pb)) continue;
                         std::string o3, e3;
+                        // .new + mv, like the binary two blocks up: `cat >`
+                        // truncates the .so IN PLACE, and a live peer that has
+                        // run one MEASURE has it mapped (serve.cpp dlopens
+                        // exactly ~/.viewer/plugins) - truncating under the
+                        // mapping is a SIGBUS in the peer.
+                        std::string pn = e.path().filename().u8string();
                         remote::runSshCommand(host, port,
-                            "sh -c 'mkdir -p ~/.viewer/plugins && cat > ~/.viewer/plugins/" +
-                                e.path().filename().u8string() + "'",
+                            "sh -c 'mkdir -p ~/.viewer/plugins && cat > "
+                            "~/.viewer/plugins/" + pn + ".new && "
+                            "mv ~/.viewer/plugins/" + pn + ".new "
+                            "~/.viewer/plugins/" + pn + "'",
                             pb, o3, e3, 60.0);
                     }
                 }
