@@ -5949,6 +5949,11 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port)
     std::string exe = (host.empty() && app.remoteExe.empty()) ? app.exePath
                     : (app.remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
                                              : app.remoteExe);
+    // The window is not repainting while this session reads, so a dead link
+    // must become an error in seconds rather than waiting out ssh's keepalive
+    // (and a local:// peer has no keepalive at all). Progress resets the clock,
+    // so a slow tile is not a timeout.
+    app.uiSession.setIdleTimeout(30.0);
     if (app.uiSession.startOn(host, port, exe, err)) return true;
     if (!host.empty())
         err += "\n(the browse panel installs the peer; connect there first)";

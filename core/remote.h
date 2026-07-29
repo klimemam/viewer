@@ -98,6 +98,14 @@ public:
     // a 300-frame aggregate produces no bytes for minutes and is not a fault.
     // The pointer must outlive the Session.
     void setAbort(const std::atomic<bool>* flag) { abort_ = flag; }
+    // Give up a read after `seconds` with NO bytes arriving at all (0 = never,
+    // the default). For the UI thread's session, where the window is not being
+    // repainted while the read blocks: a preview's META + TILE is a small
+    // request, and "the link died" must become an error in seconds rather than
+    // waiting out ssh's ~45-60 s keepalive - or, for a local:// peer, forever.
+    // NOT set on the workers: a legitimate MEASURE over a 300-frame aggregate
+    // produces no bytes for minutes and is not a fault.
+    void setIdleTimeout(double seconds) { idleTimeout_ = seconds; }
 
     bool list(const std::string& path, std::vector<Entry>& out, std::string& err);
     // Walk the subtree under `root` server-side and return every stack below
@@ -135,6 +143,7 @@ private:
     int peerVersion_ = 0;
     int port_ = 0;
     const std::atomic<bool>* abort_ = nullptr;
+    double idleTimeout_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles
 };
 

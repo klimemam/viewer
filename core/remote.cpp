@@ -34,6 +34,7 @@ struct Pipe {
     // Set by the owning worker so a blocked read can be given up on. See
     // Session::setAbort for why this is a flag and not a deadline.
     const std::atomic<bool>* abort = nullptr;
+    double idleTimeout = 0;           // seconds with no bytes at all; 0 = never
 };
 
 static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err) {
@@ -135,13 +136,17 @@ static bool pipeWrite(Pipe& p, const void* buf, size_t n) {
 // blocks with no way out"); the protocol path did not, so a worker parked here
 // could not be stopped and the quit path waited it out with the dead window
 // still on screen.
+static double nowSeconds();           // fwd (defined with runSshCommand)
 static bool pipeRead(Pipe& p, void* buf, size_t n) {
     uint8_t* q = (uint8_t*)buf;
+    const bool sliced = p.abort || p.idleTimeout > 0;
+    double deadline = p.idleTimeout > 0 ? nowSeconds() + p.idleTimeout : 0;
     while (n) {
         if (p.abort && p.abort->load()) return false;
+        if (deadline > 0 && nowSeconds() > deadline) return false;
 #if defined(_WIN32)
         DWORD avail = 0;
-        if (p.abort) {                    // only pay for the poll when it can matter
+        if (sliced) {                     // only pay for the poll when it can matter
             if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) return false;
             if (avail == 0) { Sleep(20); continue; }
         }
@@ -149,7 +154,7 @@ static bool pipeRead(Pipe& p, void* buf, size_t n) {
         if (!ReadFile(p.outR, q, (DWORD)std::min<size_t>(n, 1u << 20), &got, nullptr) || !got)
             return false;
 #else
-        if (p.abort) {
+        if (sliced) {
             struct pollfd pf { p.outR, POLLIN, 0 };
             int pr = poll(&pf, 1, 20);
             if (pr == 0) continue;
@@ -159,6 +164,8 @@ static bool pipeRead(Pipe& p, void* buf, size_t n) {
         if (got <= 0) return false;
 #endif
         q += got; n -= (size_t)got;
+        // progress resets the clock: a slow tile is not a dead link
+        if (deadline > 0) deadline = nowSeconds() + p.idleTimeout;
     }
     return true;
 }
@@ -327,6 +334,7 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     port_ = port;
     Pipe* p = new Pipe();
     p->abort = abort_;                // interruptible reads for a worker's session
+    p->idleTimeout = idleTimeout_;    // ...and a bounded one for the UI thread's
     impl_ = p;
     std::vector<std::string> argv;
     if (host.empty()) {
