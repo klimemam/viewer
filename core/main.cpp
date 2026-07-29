@@ -708,6 +708,7 @@ struct App {
         std::string name, batchName, paramName, unit;
         int kind = 0;
         int badValues = 0;                // value fields the parser could not read
+        int truncated = 0;                // member lines cut before their path
         struct M { double value; bool include; std::string path; };
         std::vector<M> members;
     };
@@ -3226,6 +3227,15 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // name may be user-given ("25C dark") - it must survive the session.
             if (const App::SeqInfo* sqi = seqInfo(d->seqId))
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
+        } else {
+            // A stack whose sibling rescan is still QUEUED has no SeqInfo yet
+            // (seqRestore is drained one at a time, over many frames), so the
+            // branch above cannot fire and this head frame would be written as
+            // a lone image - taking its series member down with it, because a
+            // member resolves through a stack. "seqload 1" is exactly the
+            // request that is still outstanding; ask for it again.
+            for (const auto& r : app.seqRestore)
+                if (r.uid == d->uid) { f << "seqload 1\n"; break; }
         }
     }
     // ---- series (系列), after the image lines -------------------------------
@@ -3264,6 +3274,43 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
               << app.images[fr.front()]->path << "\n";   // path last: spaces
         }
         f << "seriesend\n";
+    }
+    // Series the LOADED file still owes: parsed into seriesRestore and waiting
+    // for their stacks, because a member cannot be looked up before its stack
+    // exists and that wait is minutes for a remote sweep. app.series is empty
+    // for the whole of that window (closeAll cleared it), while Ctrl+S, the
+    // 0.4 s crash snapshot, the debounced autosave and the autosave on quit are
+    // all live - so a save inside it used to write the series out of existence
+    // and toast "session saved" with nothing to report. They round-trip
+    // VERBATIM: SeriesRestore holds exactly the fields this format has, members
+    // by path included.
+    for (const auto& R : app.seriesRestore) {
+        lostMembers += R.truncated;      // unreadable in, unwritable out
+        if (R.batchName.empty() || R.members.empty()) {
+            lostSeries++;
+            lostMembers += (int)R.members.size();
+            continue;
+        }
+        f << "series " << R.name << "\n";
+        f << "seriesbatch " << R.batchName << "\n";
+        f << "seriesparam " << R.paramName << "\n";
+        f << "seriesunit " << R.unit << "\n";
+        f << "serieskind " << R.kind << "\n";
+        for (const auto& m : R.members) {
+            f << "seriesmember ";
+            if (std::isfinite(m.value)) f << fmtExact(m.value);
+            else f << "-";
+            f << " " << (m.include ? 1 : 0) << " " << m.path << "\n";
+        }
+        f << "seriesend\n";
+    }
+    // A picker sweep that has not resolved yet cannot be written at all: its
+    // members are GROUP names and creation tokens, and this format speaks paths
+    // of frames that do not exist yet. Counted, so the toast warns instead of
+    // reading clean - which is the whole point of these counters.
+    for (const auto& P : app.seriesPending) {
+        lostSeries++;
+        lostMembers += (int)P.members.size();
     }
     if (lostSeries || lostMembers)
         fprintf(stderr, "series: NOT saved: %d series and %d member(s) had nothing to "
@@ -3641,7 +3688,17 @@ static std::string loadSession(const std::string& path) {
             std::string v, inc;
             ls >> v >> inc;
             std::string p = restOfLine(ls);
-            if (curSeries >= 0 && !p.empty()) {
+            if (curSeries < 0) {
+                // nothing to attach it to; the block header is what was lost
+            } else if (p.empty()) {
+                // The path is the LAST field, so a line cut short loses it FIRST
+                // (a power loss during the autosave, the crash handler's short-
+                // write break, a hand-edit). Such a line never becomes a member,
+                // so nothing downstream can count it - which made it the one
+                // silent drop left in a loader whose whole contract is that
+                // there are none. Count it here and let the toast say so.
+                app.seriesRestore[curSeries].truncated++;
+            } else {
                 double val = parseSeriesValue(v.c_str());
                 if (v != "-" && !std::isfinite(val)) app.seriesRestore[curSeries].badValues++;
                 app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p });
@@ -4124,14 +4181,6 @@ static bool seqReadyPending() {
     return !app.seqReady.empty();
 }
 
-// The stack a session's series member names, found by the path of its FIRST
-// frame. 0 = that frame is not open (or is not part of a stack).
-//
-// preferBatch disambiguates the case the canon explicitly blesses: reopening
-// the same folder makes a NEW batch, so one file is legitimately resident in two
-// stacks at once. Taking "the first one" then hands every member of the second
-// copy's series a stack in the wrong batch, strict containment rejects them all,
-// and the whole series is lost - permanently, at the next autosave.
 // A queued group has produced its stack: remember WHICH, under the token the
 // group was stamped with. Recorded only while a sweep is waiting - that is the
 // only consumer, and it bounds the table to the groups of the Opens still in
@@ -4145,10 +4194,27 @@ static void noteGroupStack(int token, int seqId) {
     app.groupStacks.emplace_back(token, seqId);
 }
 
-static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0) {
+// The stack a session's series member names, found by the path of its FIRST
+// frame. 0 = that frame is not open (or is not part of a stack).
+//
+// preferBatch disambiguates the case the canon explicitly blesses: reopening
+// the same folder makes a NEW batch, so one file is legitimately resident in two
+// stacks at once. Taking "the first one" then hands every member of the second
+// copy's series a stack in the wrong batch, strict containment rejects them all,
+// and the whole series is lost - permanently, at the next autosave.
+//
+// taken excludes the stacks earlier members already claimed. preferBatch only
+// separates stacks in DIFFERENT batches, and the canon recommends reaching the
+// other arrangement too ("メンバを同じ batch へ移してから series を作る"): two
+// same-path stacks inside ONE batch are told apart by nothing but this list.
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
+                                 const std::vector<int>* taken = nullptr) {
+    auto claimed = [&](int sid) {
+        return taken && std::find(taken->begin(), taken->end(), sid) != taken->end();
+    };
     int any = 0;
     for (const auto& d : app.images) {
-        if (d->seqId == 0 || d->path != path) continue;
+        if (d->seqId == 0 || d->path != path || claimed(d->seqId)) continue;
         if (preferBatch && d->batchId == preferBatch) return d->seqId;
         if (!any) any = d->seqId;
     }
@@ -4161,24 +4227,38 @@ static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0) {
 // points out of a measurement is the one thing this must not do.
 static void resolveSeriesRestore() {
     int made = 0, lost = 0, lostSeries = 0, badValues = 0;
+    // ONE claim list, across every member of every series in the file. Two
+    // stacks legitimately hold the same first-frame path (open the same folder
+    // twice, then Move one into the other batch - both moves the canon
+    // recommends), and without this the second same-path member resolved onto
+    // the stack the first had already taken. Inside one series that was a bare
+    // `continue`: a member and its hand-typed value gone under a full-success
+    // toast, made permanent by the next autosave. Across two series it was
+    // worse - the later one STOLE the earlier one's stacks, pruneEmptySeries
+    // deleted what was left of it, and `made` had already counted it.
+    std::vector<int> taken;
     for (const auto& R : app.seriesRestore) {
         badValues += R.badValues;
+        lost += R.truncated;        // cut before its path: never became a member
         int bid = 0;
         for (const auto& b : app.batches) if (b.name == R.batchName) bid = b.id;
         if (!bid) { lostSeries++; lost += (int)R.members.size(); continue; }
         std::vector<App::Series::Member> ms;
         for (const auto& m : R.members) {
-            int sid = seqIdOfFirstFramePath(m.path, bid);
+            int sid = seqIdOfFirstFramePath(m.path, bid, &taken);
             // strict containment survives the round trip too, or not at all
             if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
-            bool dup = false;
-            for (const auto& x : ms) if (x.seqId == sid) dup = true;
-            if (dup) continue;
+            taken.push_back(sid);
             ms.push_back({ sid, m.value, m.include });
         }
         if (ms.empty()) { lostSeries++; continue; }
         int id = newSeries(bid, R.name);
-        for (const auto& m : ms) {           // at most one series per stack
+        // At most one series per stack. With `taken` spanning the whole file no
+        // series restored here can hold another's stack, so this can now only
+        // fire for a series that existed BEFORE the restore - which loadSession
+        // makes impossible (closeAll) and which nothing else in the program
+        // arranges.
+        for (const auto& m : ms) {
             App::Series* other = seriesOfStack(m.seqId);
             if (other && other->id != id) removeFromSeries(m.seqId);
         }
@@ -15482,6 +15562,163 @@ int main(int argc, char** argv) {
                   app.series[0].batchId != app.series[1].batchId);
             check("invariant 1: audit after the two-batch restore", audit());
             std::filesystem::remove(std::filesystem::u8path(dup), tec);
+
+            // ...and the arrangement the canon RECOMMENDS for making one sweep
+            // out of two opens: Move a stack from the second batch into the
+            // first, so two stacks of the SAME first-frame path sit in ONE
+            // batch. preferBatch cannot separate those - it only chooses
+            // between batches - and the second member used to resolve onto the
+            // stack the first had taken and be dropped by a bare `continue`,
+            // uncounted, under a "restored 1 series" toast.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bm = app.images.empty() ? 0 : app.images[0]->batchId;
+            int keep = app.seqs.empty() ? 0 : app.seqs.front().id;
+            std::string keepPath;
+            {
+                std::vector<int> fr = framesOfSeq(keep);
+                if (!fr.empty()) keepPath = app.images[fr.front()]->path;
+            }
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int mv = 0;
+            for (const auto& si : app.seqs) {
+                if (si.id == keep || batchOfStack(si.id) == bm) continue;
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (!fr.empty() && app.images[fr.front()]->path == keepPath) mv = si.id;
+            }
+            if (mv) moveStackToBatch(mv, bm);
+            int sm = newSeries(bm, "merged");
+            if (App::Series* M2 = seriesById(sm)) {
+                M2->paramName = "illuminance";
+                snprintf(M2->unit, sizeof M2->unit, "lx");
+            }
+            addToSeries(sm, keep, 1.0);
+            addToSeries(sm, mv, 2.0);
+            size_t nMerged = seriesById(sm) ? seriesById(sm)->members.size() : 0;
+            std::string same = (std::filesystem::temp_directory_path(tec) /
+                                "viewer_seriessamepath.vsession").u8string();
+            saveSession(same, true);
+            loadSession(same);
+            loadAll();
+            double ts = glfwGetTime();
+            while (glfwGetTime() - ts < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            {
+                const App::Series* M3 = app.series.empty() ? nullptr : &app.series.front();
+                std::string vals;
+                bool distinct = M3 && M3->members.size() == 2 &&
+                                M3->members[0].seqId != M3->members[1].seqId;
+                if (M3)
+                    for (const auto& m : M3->members) {
+                        char bb[32];
+                        snprintf(bb, sizeof bb, "%.6g", m.value);
+                        vals += (vals.empty() ? "" : ",");
+                        vals += std::isfinite(m.value) ? bb : "unset";
+                    }
+                fprintf(stderr, "seriesselftest: two same-path stacks in ONE batch: saved "
+                                "%d member(s), restored %d [%s], toast \"%s\"\n",
+                        (int)nMerged, M3 ? (int)M3->members.size() : -1, vals.c_str(),
+                        app.toast.c_str());
+                check("two same-path stacks in one batch both survive the round trip",
+                      nMerged == 2 && M3 && M3->members.size() == 2);
+                check("...bound to DIFFERENT stacks, each keeping its own value",
+                      distinct && vals == "1,2");
+                check("invariant 1: audit after the same-path restore", audit());
+            }
+            std::filesystem::remove(std::filesystem::u8path(same), tec);
+
+            // A seriesmember line cut before its path (a power loss during the
+            // autosave, the crash handler's short write, a hand-edit). The path
+            // is the LAST field, so truncation takes it first: the line never
+            // becomes a member and nothing downstream could count it.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            std::vector<std::string> tpaths;
+            for (const auto& si : app.seqs) {
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (!fr.empty()) tpaths.push_back(app.images[fr.front()]->path);
+            }
+            std::string tbn = batchNameOf(app.images.empty() ? 0 : app.images[0]->batchId);
+            std::string cut = (std::filesystem::temp_directory_path(tec) /
+                               "viewer_seriescut.vsession").u8string();
+            {
+                std::ofstream cf(pathFromUtf8(cut), std::ios::binary);
+                cf << "viewer-session 1\n";
+                for (const auto& p : tpaths)
+                    cf << "image 0 1 npy3 0 0 0 0 0 0 0 " << p << "\n"
+                       << "imgbatch " << tbn << "\n" << "seqload 1\n";
+                cf << "series cut\nseriesbatch " << tbn << "\n"
+                   << "seriesparam illuminance\nseriesunit lx\nserieskind 0\n";
+                for (size_t i = 0; i + 1 < tpaths.size(); i++)
+                    cf << "seriesmember " << (i * 10) << " 1 " << tpaths[i] << "\n";
+                cf << "seriesmember 60 1\n";      // cut before the path
+                cf << "seriesend\n";
+            }
+            closeAll();
+            loadSession(cut);
+            loadAll();
+            double tc = glfwGetTime();
+            while (glfwGetTime() - tc < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: truncated member line -> %d member(s), "
+                            "toast \"%s\"\n",
+                    app.series.empty() ? -1 : (int)app.series.front().members.size(),
+                    app.toast.c_str());
+            check("a truncated seriesmember line is REPORTED, not swallowed",
+                  app.toast.find("could not be resolved") != std::string::npos &&
+                  app.toast.find("1 member(s)") != std::string::npos);
+            std::filesystem::remove(std::filesystem::u8path(cut), tec);
+
+            // Ctrl+S (or the autosave, or the crash snapshot) while the file's
+            // series are still waiting for their stacks. app.series is empty
+            // for that whole window, so the save used to write them away and
+            // toast "session saved" with nothing to report.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int bw = app.images.empty() ? 0 : app.images[0]->batchId;
+            int sw = selftestMakeSeries(bw, "lx");
+            size_t nWip = seriesById(sw) ? seriesById(sw)->members.size() : 0;
+            std::string wip = (std::filesystem::temp_directory_path(tec) /
+                               "viewer_serieswip.vsession").u8string();
+            std::string mid = (std::filesystem::temp_directory_path(tec) /
+                               "viewer_seriesmid.vsession").u8string();
+            saveSession(wip, true);
+            loadSession(wip);              // parsed; the stacks are queued
+            check("the restore really is pending (app.series empty, nothing lost yet)",
+                  app.series.empty() && !app.seriesRestore.empty());
+            saveSession(mid, true);        // <- the save INSIDE the window
+            loadAll();
+            double tw = glfwGetTime();
+            while (glfwGetTime() - tw < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            closeAll();
+            loadSession(mid);
+            loadAll();
+            double tm = glfwGetTime();
+            while (glfwGetTime() - tm < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: saved mid-restore -> %d series, %d member(s) "
+                            "(had %d)\n", (int)app.series.size(),
+                    app.series.empty() ? -1 : (int)app.series.front().members.size(),
+                    (int)nWip);
+            check("a save while the restore is pending keeps the series",
+                  nWip > 0 && app.series.size() == 1 &&
+                  app.series.front().members.size() == nWip);
+            check("invariant 1: audit after the mid-restore save", audit());
+            std::filesystem::remove(std::filesystem::u8path(wip), tec);
+            std::filesystem::remove(std::filesystem::u8path(mid), tec);
         }
 
         // ---- phase 4: what the Files panel's series row actually does ---------
