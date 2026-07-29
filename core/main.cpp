@@ -11063,6 +11063,7 @@ static void drawRemotePlacesCombo() {
 struct RbToolbarGeom {
     float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
     float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+    int   emptyLocalBtn = 0;               // the not-connected state's local entry
 };
 static RbToolbarGeom g_rbToolbar;
 static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
@@ -11079,6 +11080,22 @@ static void drawPanelRemote() {
     g_rbToolbar.x1 = g_rbToolbar.x0 + ImGui::GetContentRegionAvail().x;
     ImGui::PushID("remotetree");
     if (!B.connected) {
+        // The empty state used to offer ssh and nothing else, and then say
+        // "Connect to a machine, then pick the file here" - so View > Panels >
+        // Browse opened a panel with no way out unless you already knew the
+        // File menu had a second door into it. The panel browses THIS disk too;
+        // that has to be one of the two buttons, and it is the cheaper one, so
+        // it goes first.
+        const float need = ImGui::CalcTextSize("Start Remote (ssh)...").x +
+                           ImGui::GetStyle().FramePadding.x * 2;
+        if (ImGui::Button("Browse Local Folder...")) browseFolderDialog();
+        g_rbToolbar.emptyLocalBtn = 1;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("pick a folder on this machine and list it here -\n"
+                              "same rows, same grouping, same server-side stats.\n"
+                              "(File > Browse Folder (Local)... is the same command)");
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
         drawRemotePlacesCombo();
@@ -11090,7 +11107,10 @@ static void drawPanelRemote() {
             ImGui::PopStyleColor();
             if (ImGui::SmallButton("details / copy")) app.showRemoteError = true;
         }
-        ImGui::TextDisabled("Connect to a machine, then pick the file here.");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Pick a folder on this machine, or connect to another one, "
+                            "and the files land here.");
+        ImGui::PopTextWrapPos();
         ImGui::PopID();
         return;
     }
@@ -13439,7 +13459,7 @@ static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,more,down,back,"
-    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0";
+    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,disc";
 
 static void printUsage() {
     printf(
@@ -17055,7 +17075,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> keyActs;
     size_t keyAct = 0;
     int keyPhase = 0;
-    int keysWidthBad = 0;      // toolbar-geometry checks that failed
+    int keysCheckBad = 0;      // panel-geometry and empty-state checks that failed
     bool keysOk = false;
     if (!g_browseKeys.empty()) {
         std::string d = g_browseKeys;
@@ -17809,10 +17829,20 @@ int main(int argc, char** argv) {
                     else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
+                    else if (a == "disc") { app.rbrowse = App::RemoteBrowse{}; rbTreeForget(); }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                } else if (keyPhase == 7 && a == "disc") {
+                    // View > Panels > Browse lands here with nothing open, and
+                    // it must not be a remote-only dead end: the panel browses
+                    // this disk too, so it has to say so without the File menu.
+                    bool hasLocal = g_rbToolbar.emptyLocalBtn != 0;
+                    if (!hasLocal) keysCheckBad++;
+                    fprintf(stderr, "browsekeys: empty state offers a local browse: %s\n",
+                            hasLocal ? "ok" : "FAIL");
+                    fflush(stderr);
                 } else if (keyPhase == 7 && g_rbForceW > 0) {
                     // The toolbar's contract at ANY width: the filter box and
                     // the "more" button are inside the panel, and the filter is
@@ -17828,7 +17858,7 @@ int main(int argc, char** argv) {
                     // it is allowed to be short - it is not allowed to print
                     // three characters of a sixteen-character stamp.
                     bool dateOk = g.dateTextW <= 0 || g.dateTextW <= g.dateCellW + slack;
-                    if (!inside || !usable || !dateOk) keysWidthBad++;
+                    if (!inside || !usable || !dateOk) keysCheckBad++;
                     fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
                                     "filter=[%.0f,%.0f] more_r=%.0f date=%.0f/%.0f: %s\n",
                             g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
@@ -17838,10 +17868,10 @@ int main(int argc, char** argv) {
                 }
                 if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
             } else if (++reproIdle > 20) {
-                keysOk = keysWidthBad == 0;
+                keysOk = keysCheckBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
-                                "no crash, %d toolbar width check(s) failed: %s\n",
-                        (int)keyActs.size(), keysWidthBad, keysOk ? "ok" : "FAILED");
+                                "no crash, %d panel check(s) failed: %s\n",
+                        (int)keyActs.size(), keysCheckBad, keysOk ? "ok" : "FAILED");
                 fflush(stderr);
                 break;
             }
