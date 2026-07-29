@@ -13625,8 +13625,17 @@ static void drawFileList() {
             return;
           }
           App::SeqInfo* si = seqInfo(head.seqId);
+          // Switching A to another stack KEEPS the frame number, clipped to what
+          // this stack has. Landing on frame 0 threw away the position every
+          // time - and comparing two captures means looking at the same frame
+          // of each, so the number is the thing worth preserving, not the
+          // stack's own history. (Same rule B already follows: see
+          // compareFollowFrame in resolveB.)
           int pos = 0;
           bool active = false;
+          if (const ImageDoc* a = cur())
+              if (a->seqId != 0)
+                  pos = std::clamp(a->seqIndex, 0, (int)stack.size() - 1);
           for (int k = 0; k < (int)stack.size(); k++)
               if (stack[k] == app.current) { pos = k; active = true; }
           ImGui::PushID(head.seqId);
