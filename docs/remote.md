@@ -304,7 +304,7 @@ viewer ssh://user@host/data/run42
 | **対応フォーマット** | **`.npy` のみ**。`parseNpyHeader` が u8/i8/u16/i16/u32/i32/f32/f64 と 2〜4 次元の shape を扱う |
 | **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
 | **Fortran order の .npy** | サーバは明示的に拒否(`"fortran-order .npy is not served (open it locally)"`)。行 seek が成立しないため |
-| **`MSG_MEASURE`** | **未実装**。enum に予約枠があるだけ。今は解析結果ではなくタイルを引いて手元で測る |
+| **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
 | **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
 | **`ssh://` の CLI 配線** | `remote::parseUrl` はあるが、起動パスへの接続はこれから(`--serve` 側は `main.cpp` に配線済み) |
 | **LIST のファイルサイズ** | 32 bit にクランプされる(4 GB 超は頭打ち表示) |
