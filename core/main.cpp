@@ -2029,6 +2029,21 @@ static void moveStackToBatch(int seqId, int batchId) {
             App::SeqInfo* si = seqInfo(seqId);
             removeFromSeries(seqId);
             pruneEmptySeries();
+            // The membership just changed, so whatever was computed measured a
+            // different set (docs/terminology.md: editing members / values /
+            // unit / parameter discards the computed fit). The Linearity panel's
+            // only freshness keys are the series id and fitValid, and a move
+            // leaves the series alive - so both stayed true, the fit table and
+            // the "%d points" count went on describing the old membership, and
+            // both plots went on DRAWING the departed stack's point under a
+            // member table that no longer listed it. Every sibling edit already
+            // does this: closeStack, the seqctx join, the Files "leave series",
+            // the modal's Save.
+            //
+            // moveSeriesToBatch sets S->batchId FIRST, so its per-member calls
+            // never reach this branch: a series moved WHOLE keeps its fit, which
+            // is right - nothing about its membership changed.
+            linFitStale();
             toast((si ? si->name : std::string("stack")) + " left series \"" + sn +
                   "\" (moved to another batch)");
         }
@@ -15215,15 +15230,26 @@ int main(int argc, char** argv) {
             int other = newBatch(uniqueBatchName("other"));
             int mv = sids[1];
             size_t before = seriesById(S1)->members.size();
+            // A membership edit made from OUTSIDE the modal invalidates just as
+            // one made inside it does: the panel keys freshness on the series id
+            // and fitValid alone, and a move leaves the series alive.
+            linRecompute(S1);
+            bool fitBefore = app.lin.fitValid;
+            int ptsBefore = app.lin.nPts;
             app.toast.clear();
             moveStackToBatch(mv, other);
             S = seriesById(S1);
             fprintf(stderr, "seriesselftest: moveStackToBatch(%d -> '%s'): %d -> %d member(s), "
                             "toast \"%s\"\n", mv, "other", (int)before,
                     (int)S->members.size(), app.toast.c_str());
+            fprintf(stderr, "seriesselftest: fit before the move %s (%d point(s)), after %s\n",
+                    fitBefore ? "ok" : "none", ptsBefore,
+                    app.lin.fitValid ? "STILL ok" : "dropped");
             check("invariant 4: the moved stack left the series",
                   S->members.size() == before - 1 && seriesOfStack(mv) == nullptr);
             check("...and the screen was told", app.toast.find("left series") != std::string::npos);
+            check("...and the fit that counted it is dropped",
+                  fitBefore && ptsBefore > 0 && !app.lin.fitValid);
             check("invariant 1: audit after the move-to-batch", audit());
             bool crossed = addToSeries(S1, mv, 1.0);
             fprintf(stderr, "seriesselftest: addToSeries across batches returned %d\n",
