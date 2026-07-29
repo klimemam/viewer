@@ -5070,6 +5070,32 @@ static std::vector<App::PendingGroup> pickerSelection(std::string* errOut = null
     return sel;
 }
 
+// Selected groups that will not become a STACK, and so cannot become a series
+// member: ONE file holding ONE 2-D array, or one raw frame. loadNpy calls
+// addImage for those with no SeqInfo at all, and resolveOnePendingSeries walks
+// app.seqs - a lone frame is structurally invisible to it. The picker previews a
+// value for such a row like any other and the user used to find out at the far
+// end of the load, as "N could not be matched".
+//
+// Shape comes from the npy header peek (local) or the v3 listing (remote); when
+// it is unknown nothing is claimed. nMatch is the live filter's cut, which is
+// what actually loads - a numbered group filtered down to one file lands here
+// too, and that was the wider half of the hole.
+static int pickLoneImageGroups() {
+    int n = 0;
+    for (const auto& e : app.folderPick) {
+        if (!e.selected || e.nMatch != 1) continue;
+        if (e.g.isRaw) { n++; continue; }        // a raw file is one frame, always
+        int dims = e.g.shape.empty() ? 0 : 1;    // "8x32x32 f32" -> 3, "480x640 f32" -> 2
+        for (char c : e.g.shape) {
+            if (c == ' ') break;
+            if (c == 'x') dims++;
+        }
+        if (dims == 2) n++;
+    }
+    return n;
+}
+
 // Close the picker and open its selection through the route the scan came from.
 // No ImGui calls: the headless selftests and the auto-accept blocks in main()
 // go through this exact function.
@@ -5223,7 +5249,7 @@ static void drawFolderPickModal() {
     if (!sweepRow) app.pickSweep = false;
     float footer = ImGui::GetFrameHeightWithSpacing() * (sweepRow ? 4 : 3) +
                    ImGui::GetTextLineHeightWithSpacing() *
-                       ((mergeWarn ? 2 : 1) + (app.pickSweep ? 1 : 0));
+                       ((mergeWarn ? 2 : 1) + (app.pickSweep ? 2 : 0));
     ImGui::BeginChild("picktree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
     // group the flat list by the folder part of "folder/pattern"
     std::vector<std::string> folders;
@@ -5423,6 +5449,18 @@ static void drawFolderPickModal() {
                                 "the fit waits for one.", valued);
         else
             ImGui::TextDisabled("all %d have a value, in %s", valued, app.pickSweepUnit);
+        // A row that cannot become a stack cannot become a member. Said HERE,
+        // while the box can still be unticked and the selection changed, rather
+        // than at the far end of the load as "N could not be matched". The line
+        // is always drawn (blank when there are none) so the footer's reserved
+        // height does not move as the filter is typed.
+        int lone = pickLoneImageGroups();
+        if (lone)
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                               "%d of them is ONE 2-D frame: a lone frame is not a stack, "
+                               "so it cannot join the series", lone);
+        else
+            ImGui::NewLine();
     }
     bool loadable = selGroups > 0 && !(app.pickMerge == 1 && mixedRawNpy);
     if (app.pickMerge == 1 && mixedRawNpy)
@@ -14631,6 +14669,33 @@ int main(int argc, char** argv) {
             ok = false;
         }
 
+        // ---- UC6: a group the filter cut to ONE 2-D file cannot join a sweep --
+        // "Open as a sweep" resolves STACKS. A lone frame never becomes one
+        // (loadNpy calls addImage with no SeqInfo) and resolveOnePendingSeries
+        // walks app.seqs, so it is structurally unmatchable - which the user used
+        // to discover at the far end of the load as "N could not be matched".
+        {
+            openFolder(g_pickerSelftest);
+            snprintf(app.pickFilter, sizeof app.pickFilter, "00_A");
+            applyPickFilter();
+            int cut = 0, lone = pickLoneImageGroups();
+            std::string shp;
+            for (const auto& e : app.folderPick)
+                if (e.selected && e.nMatch == 1) { cut++; shp = e.g.shape; }
+            fprintf(stderr, "pickerselftest: UC6 filter \"00_A\" -> %d group(s) cut to one "
+                            "file (shape \"%s\"), %d cannot join a sweep\n",
+                    cut, shp.c_str(), lone);
+            if (cut != 1 || lone != 1) {
+                fprintf(stderr, "pickerselftest: UC6 FAILED - a group cut to one 2-D frame "
+                                "must be reported as unable to join a sweep\n");
+                ok = false;
+            }
+            app.pickFilter[0] = '\0';
+            applyPickFilter();
+            app.folderPick.clear();
+            app.folderPickOpen = false;
+        }
+
         // ---- UC2: no filter, merge mode -> ONE stack, union, natural order
         size_t seqsBefore = app.seqs.size();
         openFolder(g_pickerSelftest);          // reopens the picker, filter cleared
@@ -16337,6 +16402,11 @@ int main(int argc, char** argv) {
         // ---- local: File > Open Folder, ticked as a sweep ---------------------
         openFolder(dir);
         check("the picker opened over the level folders", app.folderPickOpen);
+        // ...and none of these one-file groups is a LONE FRAME: they carry a
+        // frame axis, so each becomes a stack and can be a member. The picker's
+        // warning must not cry wolf over exactly the layout this test is about.
+        check("a one-file group with a frame axis is not flagged as unjoinable",
+              pickLoneImageGroups() == 0 && app.folderPick.size() == 7);
         app.pickSweep = true;
         snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
         snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
