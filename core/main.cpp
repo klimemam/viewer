@@ -1962,6 +1962,18 @@ static void closeBatch(int batchId) {
     for (auto it = app.seqQueue.begin(); it != app.seqQueue.end();)
         if (it->batchId == batchId) it = app.seqQueue.erase(it);
         else ++it;
+    // ...and the sweeps the picker accepted INTO this batch, which are only a
+    // NOTE until every load drains. closeAll purges them for exactly this
+    // reason ("they named stacks being thrown away") and this function already
+    // purges two queues by batchId - it just missed the third container. Batch
+    // ids are never reused, so a surviving note resolves against nothing: a red
+    // "sweep: 0 stack(s) ... N could not be matched" about an Open the user
+    // deliberately discarded, and if the folder was reopened meanwhile the note
+    // still points at the dead batch, so the new one gets no series either.
+    for (auto it = app.seriesPending.begin(); it != app.seriesPending.end();)
+        if (it->batchId == batchId) it = app.seriesPending.erase(it);
+        else ++it;
+    if (app.seriesPending.empty()) app.groupStacks.clear();
     if (app.loadBatchId == batchId) app.loadBatchId = 0;
     pruneEmptyBatches();       // the queue purge above may have freed this batch
 }
@@ -9333,7 +9345,19 @@ static int seriesModalAccept() {
         ms.push_back(m);
     }
     if (ms.empty()) return 0;
-    int id = E.editId ? E.editId : newSeries(E.batchId, E.name);
+    // E.editId was checked when the modal OPENED, never here. Meanwhile
+    // pumpSequenceAndQueue runs every frame regardless of the modal (it even
+    // forces frames while one is up), so resolveSeriesRestore or a picker sweep
+    // draining mid-edit can move the edited series' stacks into ITS series and
+    // pruneEmptySeries deletes what that empties. Keeping the dead id then made
+    // Save destructive: the loop below ripped every ticked stack out of whatever
+    // live series now held it, seriesById(id) found nothing to put them back
+    // into, the rebuilt member list was dropped on the floor, and the return
+    // value saying so was discarded by the caller - no toast, typed values gone.
+    // A dead edit becomes a CREATE: the rip is followed by a real assignment, so
+    // the membership and the values the user typed survive.
+    int id = (E.editId && seriesById(E.editId)) ? E.editId
+                                                : newSeries(E.batchId, E.name);
     // a stack belongs to AT MOST ONE series: taking one in takes it out of
     // wherever it was
     for (const auto& m : ms) {
@@ -15865,6 +15889,75 @@ int main(int argc, char** argv) {
                       (int)app.seqs.size() == stacksBefore - members);
                 check("invariant 1: audit after Close series", audit());
             }
+        }
+
+        // ---- the modal's target dying while the modal is open -----------------
+        // pumpSequenceAndQueue runs every frame regardless of the modal, so a
+        // session restore or a picker sweep draining mid-edit can move the
+        // edited series' stacks into ITS series and prune the emptied one. Save
+        // then held a dead id: it ripped the ticked stacks out of the live
+        // series that now held them and put them nowhere.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            std::vector<int> ids;
+            for (const auto& si : app.seqs) ids.push_back(si.id);
+            int bE = app.images.empty() ? 0 : app.images[0]->batchId;
+            int A = newSeries(bE, "edited");
+            if (App::Series* SA = seriesById(A)) {
+                SA->paramName = "illuminance";
+                snprintf(SA->unit, sizeof SA->unit, "lx");
+            }
+            for (size_t i = 0; i < 3 && i < ids.size(); i++)
+                addToSeries(A, ids[i], (double)(i * 10));
+            openSeriesModal(bE, A);
+            // ...and now the resolver's half, under the open modal
+            int B = newSeries(bE, "arrived");
+            for (size_t i = 0; i < 3 && i < ids.size(); i++)
+                addToSeries(B, ids[i], (double)(i * 10));
+            pruneEmptySeries();
+            check("the edited series really died under the open modal",
+                  seriesById(A) == nullptr && seriesById(B) != nullptr);
+            int got = seriesModalAccept();
+            const App::Series* G = seriesById(got);
+            fprintf(stderr, "seriesselftest: Save on a dead editId -> series %d, %d "
+                            "series left, %d member(s)\n", got, (int)app.series.size(),
+                    G ? (int)G->members.size() : -1);
+            check("Save on a dead edit keeps the membership and the typed values",
+                  got != 0 && G && G->members.size() == 3);
+            check("...and does not leave the stacks in no series at all",
+                  seriesOfStack(ids[0]) != nullptr);
+            check("invariant 1: audit after the dead-edit Save", audit());
+        }
+
+        // ---- a sweep whose batch is closed before it resolves ------------------
+        // A sweep is only a note keyed by batchId until every load drains.
+        // closeBatch purged the two open queues by batchId and missed this one.
+        {
+            closeAll();
+            openFolder(g_seriesSelftest);
+            app.pickSweep = true;
+            snprintf(app.pickSweepParam, sizeof app.pickSweepParam, "illuminance");
+            snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
+            pickerAccept();
+            check("the sweep is pending before the close", app.seriesPending.size() == 1);
+            int bc = app.seriesPending.empty() ? 0 : app.seriesPending.front().batchId;
+            app.toast.clear();
+            closeBatch(bc);
+            check("closeBatch takes the batch's pending sweep with it",
+                  app.seriesPending.empty());
+            loadAll();
+            double tb = glfwGetTime();
+            while (glfwGetTime() - tb < 1.0) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: sweep batch closed mid-load -> %d series, "
+                            "toast \"%s\"\n", (int)app.series.size(), app.toast.c_str());
+            check("...so nothing is created and nothing complains afterwards",
+                  app.series.empty() &&
+                  app.toast.find("could not be matched") == std::string::npos);
         }
 
         // ---- phase 5: the picker's "open as a sweep" --------------------------
