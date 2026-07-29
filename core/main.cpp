@@ -999,6 +999,29 @@ static std::string uniqueBatchName(std::string base) {
         if (!taken(n)) return n;
     }
 }
+// The Files header's rename, as a function so it can be tested and so it goes
+// through the uniquifier every creation path already uses. It was the ONE
+// name-write that did not, and the canon says why that matters: a session
+// restores batches by name, so two live batches sharing one MERGE on the next
+// load. That used to be cosmetic. With series persisted it is not: two copies
+// of the same folder (which the canon blesses) inside the merged batch defeat
+// preferBatch, so the second restored series resolves onto the stacks the first
+// already holds, takes them, and pruneEmptySeries deletes the emptied first one
+// - while the toast still counts it as restored, because `made` was incremented
+// before the theft. The next autosave makes it permanent.
+static void renameBatch(int batchId, const std::string& want) {
+    for (auto& b : app.batches) {
+        if (b.id != batchId) continue;
+        if (want.empty() || want == b.name) return;
+        std::string uniq = uniqueBatchName(want);   // skips names nobody holds
+        if (uniq != want)
+            toast("batch renamed to \"" + uniq + "\": \"" + want + "\" is taken, and a "
+                  "session restores batches by name");
+        b.name = uniq;
+        app.imagesRev++;                  // the Files grouping caches on this
+        return;
+    }
+}
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
 
@@ -12343,9 +12366,7 @@ static void drawFileList() {
               ImGui::SameLine();
               done |= ImGui::SmallButton("rename");
               if (done && nameBuf[0]) {
-                  for (auto& b : app.batches)
-                      if (b.id == group.batch) b.name = nameBuf;
-                  app.imagesRev++;               // rebuild the cached labels
+                  renameBatch(group.batch, nameBuf);   // uniquified: names restore sessions
                   ImGui::CloseCurrentPopup();
               }
               ImGui::Separator();
@@ -15816,6 +15837,57 @@ int main(int argc, char** argv) {
             check("invariant 1: audit after the mid-restore save", audit());
             std::filesystem::remove(std::filesystem::u8path(wip), tec);
             std::filesystem::remove(std::filesystem::u8path(mid), tec);
+
+            // Renaming two live batches to ONE name. Batch names must be unique
+            // (docs/terminology.md) because a session restores batches by name,
+            // so duplicates merge on the next load - and with the same folder
+            // open twice, the merge defeats preferBatch and one series is
+            // silently emptied and pruned under a "restored 2 series" toast.
+            closeAll();
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int r1 = app.images.empty() ? 0 : app.images[0]->batchId;
+            openFolder(g_seriesSelftest);
+            loadAll();
+            int r2 = 0;
+            for (const auto& bt : app.batches) if (bt.id != r1 && bt.name != "preview") r2 = bt.id;
+            int rs1 = selftestMakeSeries(r1, "lx"), rs2 = selftestMakeSeries(r2, "ms");
+            size_t n1 = seriesById(rs1) ? seriesById(rs1)->members.size() : 0;
+            size_t n2 = seriesById(rs2) ? seriesById(rs2)->members.size() : 0;
+            renameBatch(r1, "set");
+            renameBatch(r2, "set");
+            fprintf(stderr, "seriesselftest: both batches renamed to \"set\" -> \"%s\" "
+                            "and \"%s\"\n", batchNameOf(r1).c_str(), batchNameOf(r2).c_str());
+            check("a rename cannot duplicate a live batch name",
+                  batchNameOf(r1) != batchNameOf(r2) && batchNameOf(r1) == "set");
+            std::string rn = (std::filesystem::temp_directory_path(tec) /
+                              "viewer_seriesrename.vsession").u8string();
+            saveSession(rn, true);
+            loadSession(rn);
+            loadAll();
+            double tr = glfwGetTime();
+            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            fprintf(stderr, "seriesselftest: after the rename round trip: %d series in "
+                            "%d batch(es) (saved %d + %d member(s))\n",
+                    (int)app.series.size(),
+                    app.series.size() == 2 &&
+                            app.series[0].batchId == app.series[1].batchId ? 1 : 2,
+                    (int)n1, (int)n2);
+            check("...so neither series is lost on the round trip",
+                  n1 > 0 && n2 > 0 && app.series.size() == 2 &&
+                  app.series[0].members.size() == n1 &&
+                  app.series[1].members.size() == n2);
+            // The remaining damage a duplicate name does, now that the restore
+            // claim list stops the cross-series theft: batchReuse MERGES the two
+            // on load, so the user's two groupings silently come back as one.
+            check("...and each comes back in its OWN batch, not merged into one",
+                  app.series.size() == 2 &&
+                  app.series[0].batchId != app.series[1].batchId);
+            check("invariant 1: audit after the rename round trip", audit());
+            std::filesystem::remove(std::filesystem::u8path(rn), tec);
         }
 
         // ---- phase 4: what the Files panel's series row actually does ---------
