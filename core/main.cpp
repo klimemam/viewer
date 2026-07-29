@@ -11064,9 +11064,17 @@ struct RbToolbarGeom {
     float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
     float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
     int   emptyLocalBtn = 0;               // the not-connected state's local entry
+    float rowX = 0, rowY = 0;              // centre of the first row submitted
 };
 static RbToolbarGeom g_rbToolbar;
 static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
+// --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
+// frame, after the GLFW backend has had its say: the backend overwrites the
+// mouse position from the OS cursor whenever the window counts as focused, and
+// a HIDDEN window still counts (Win32 GetActiveWindow answers per thread). An
+// event queued between frames therefore lost the race about one run in six.
+static ImVec2 g_injMouse(-1, -1);   // <0: not injecting
+static int    g_injMouseBtn = -1;   // button held, -1 = none
 
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
@@ -11924,6 +11932,13 @@ static void drawPanelRemote() {
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            // where a selftest aims a right-click: the first row that HAS a
+            // context menu (a placeholder "(listing...)" row has none, and a
+            // tree still fetching a node can put one at the top)
+            if (!r.ph && g_rbToolbar.rowY <= 0) {
+                g_rbToolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
+                g_rbToolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
+            }
             if (shown[row] == rbCursor) {
                 // the keyboard cursor: an outline, not a fill - the fill means
                 // "selected for a multi-file action" and the two are not the same
@@ -13447,7 +13462,9 @@ static std::string g_seriesSelftest;    // --series-selftest <dir>: series invar
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree, more, and w<px>.
+// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx, esc
+// and
+// w<px>.
 //
 // w<px> floats the panel at an exact width and then asserts what a human would
 // otherwise have to read off a screenshot: that the filter box and the "more"
@@ -13459,7 +13476,8 @@ static std::string g_browseKeys;        // <dir>, empty = not running
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,more,down,back,"
-    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,disc";
+    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
+    "rctx,esc,fmenu,esc,disc";
 
 static void printUsage() {
     printf(
@@ -17110,6 +17128,15 @@ int main(int argc, char** argv) {
         double frameBodyT0 = glfwGetTime();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+        if (g_injMouse.x >= 0) {            // see g_injMouse: after the backend
+            io.AddMousePosEvent(g_injMouse.x, g_injMouse.y);
+            static int injHeld = -1;
+            if (injHeld != g_injMouseBtn) {
+                if (injHeld >= 0) io.AddMouseButtonEvent(injHeld, false);
+                if (g_injMouseBtn >= 0) io.AddMouseButtonEvent(g_injMouseBtn, true);
+                injHeld = g_injMouseBtn;
+            }
+        }
         ImGui::NewFrame();
         // ImGui hands input out over several frames (ConfigInputTrickleEventQueue):
         // NewFrame stops mid-queue on a wheel-after-move or a second action on one
@@ -17546,6 +17573,23 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+        // Escape closes a menu or a context popup. ImGui does that itself only
+        // with keyboard NAV enabled, and this app cannot enable it - the Browse
+        // panel owns the arrow keys, and nav would take them - so a menu opened
+        // by accident stayed open until it was clicked away. That is not just
+        // untidy: an open menu OWNS the keyboard, and every accelerator typed
+        // underneath it went nowhere (a Ctrl+W with the File menu up closed
+        // nothing at all). Runs here, after every popup this frame has been
+        // submitted, so the stack it reads is complete.
+        //   - modals are left alone: theirs is a decision, and their own
+        //     Cancel / Escape already owns the key.
+        //   - an ACTIVE item gets the key first, so Escape in the "New batch"
+        //     field inside Move to batch reverts the text instead of throwing
+        //     the whole menu away.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
+            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                        ImGuiPopupFlags_AnyPopupLevel))
+            ImGui::ClosePopupsExceptModals();
         // after every panel has had its say about the mouse: drag, resize and
         // the cursor shape along the window edges
         window_frame::endFrame();
@@ -17802,6 +17846,7 @@ int main(int argc, char** argv) {
                 if (a == "home")  return ImGuiKey_Home;
                 if (a == "end")   return ImGuiKey_End;
                 if (a == "back")  return ImGuiKey_Backspace;
+                if (a == "esc")   return ImGuiKey_Escape;
                 return ImGuiKey_None;
             };
             if (!reproReady) {
@@ -17830,10 +17875,49 @@ int main(int argc, char** argv) {
                     else if (a == "tree")  app.rbTree = !app.rbTree;
                     else if (a == "focus") app.focusRemote = true;
                     else if (a == "disc") { app.rbrowse = App::RemoteBrowse{}; rbTreeForget(); }
+                    else if (a == "fmenu") {
+                        // A real click on the menu bar's "File". The move, the
+                        // press and the release get a phase each: ImGui trickles
+                        // a queued burst over several frames, and a click whose
+                        // hover is still settling opens nothing.
+                        if (ImGuiWindow* mb = ImGui::FindWindowByName("##MainMenuBar")) {
+                            const ImGuiStyle& mst = ImGui::GetStyle();
+                            g_injMouse = ImVec2(mb->Pos.x + mst.WindowPadding.x +
+                                                mst.ItemSpacing.x +
+                                                ImGui::CalcTextSize("File").x * 0.5f,
+                                                mb->Pos.y + mb->Size.y * 0.5f);
+                        }
+                    } else if (a == "rctx" && g_rbToolbar.rowY > 0) {
+                        // ...and the other half of the defect: a right-click
+                        // context popup on a listing row.
+                        g_injMouse = ImVec2(g_rbToolbar.rowX, g_rbToolbar.rowY);
+                    }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                } else if (keyPhase == 2) {
+                    if (a == "fmenu") g_injMouseBtn = 0;
+                    if (a == "rctx")  g_injMouseBtn = 1;
+                } else if (keyPhase == 4) {
+                    g_injMouseBtn = -1;
+                } else if (keyPhase == 7 && (a == "fmenu" || a == "rctx" || a == "esc")) {
+                    // Escape must close a menu. ImGui only does that with
+                    // keyboard nav on, which this app cannot have, so the File
+                    // menu stayed up - and an open menu owns the keyboard, which
+                    // is how a Ctrl+W underneath it went nowhere. "fmenu" and
+                    // "rctx" assert the click landed (without that, "esc"
+                    // proves nothing); "esc" asserts the popup is gone.
+                    bool up = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                                          ImGuiPopupFlags_AnyPopupLevel);
+                    bool want = (a != "esc");
+                    if (up != want) keysCheckBad++;
+                    fprintf(stderr, "browsekeys: after %-5s a popup is %s "
+                                    "(cursor %.0f,%.0f): %s\n",
+                            a.c_str(), up ? "open" : "closed",
+                            rio.MousePos.x, rio.MousePos.y,
+                            up == want ? "ok" : "FAIL");
+                    fflush(stderr);
                 } else if (keyPhase == 7 && a == "disc") {
                     // View > Panels > Browse lands here with nothing open, and
                     // it must not be a remote-only dead end: the panel browses
