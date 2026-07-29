@@ -145,3 +145,24 @@ seriesend
     **その series の batch 側の stack** を選ぶ。
 13. §2 の「値は提案として最初から表示」は**新規作成のときだけ**。既存メンバの「値未設定」に推定値を入れ直すと、
     何も触らない Save が値を捏造する。編集時は空欄のまま、推定値は隣の列に出すだけにした。
+
+### 新コードレビューの後（掃引の同定まわり）
+
+14. §5 の「`PendingGroup::name＝SeqInfo::name` で解決」を**撤回**する。名前の一致自体は 15 で成立させたが、
+    **表示名は同定ではない**: Files の F2 は先頭フレームが着いた瞬間から効くので、ドレイン待ちの間に人が名前を
+    変えられる。別グループの名前に変えると、そのグループの**レベルが別の stack に付く**（数えられた欠落より悪い）。
+    解決は **作成時に刻んだ token**（`PendingGroup`/`RemoteOpen::token` → seqId、`noteGroupStack`）で行い、
+    名前一致は token を持たない項目のフォールバックとして残す。
+15. 命名の規則は**単一ファイルの stack にも効く**。`startSequenceLoad`（2ファイル以上）だけがフォルダ/パターン名を
+    付けていたので、1レベル1ファイル（`lv000/capture.npy`）の掃引は同名の stack が N 個できた。推定値はそこから
+    フレーム数（`(8 frames)` の 8）を読んでいた。名前は**生成した場所**で付ける: `startNextQueuedGroup` の
+    単一ファイル経路と、`openRemoteStack` のフレーム軸の早期 return（`<group> [remote xN]`）。
+16. §3 の「黙って捨てない」は**保存側にも**要る。`app.seriesRestore` が解決待ちの間（リモート掃引なら数分）
+    `app.series` は空で、その間の Ctrl+S / autosave / クラッシュスナップショットは series を消していた。
+    `writeSessionTo` は seriesRestore をそのまま書き戻し、まだ path を持たない picker の掃引は
+    lost に数える。復元側の探索は **file 全体で1つの取得済みリスト**を持つ（同じ path の stack が同じ batch に
+    2つ居るのは、正典が勧める「同じ batch へ移してから series を作る」の結果として正常）。
+17. 掃引として開けない行は **picker で言う**。1ファイル・2次元の行は stack にならない＝メンバになれないので、
+    ドレイン後の「N could not be matched」ではなく、チェックを外せるうちに出す。
+    **ローカル限定**: リモートは openRemoteStack が単発フレームにも SeqInfo を鋳るので
+    (`[remote x1]`)、その行は stack になり掃引に**入る**。リモートで警告するのは嘘になる。
