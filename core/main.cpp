@@ -6790,6 +6790,11 @@ static void rbTreeForget() {
 // Browse one directory on the connected server (async: a dead link hangs the
 // worker, never the window).
 static void remoteBrowseTo(const std::string& dir) {
+    // Going anywhere leaves the search results: they stand in for the listing,
+    // so a listing that arrives underneath them cannot be seen. Every way of
+    // navigating funnels through here, which is why the rule lives here and
+    // not on each of the six things that move.
+    app.rbSearch.active = false;
     App::RbJob j;
     j.kind = App::RbList;
     j.host = app.rbrowse.host;
@@ -12860,6 +12865,14 @@ static void drawPanelRemote() {
         auto joinS = [&S](const std::string& rel) {
             return S.root == "/" ? "/" + rel : S.root + "/" + rel;
         };
+        // The way back comes FIRST. It used to sit after the result line, and
+        // that line carries a pattern and a full path - longer than the panel
+        // at its docked width, so the only exit was pushed off the right edge.
+        if (ImGui::SmallButton("back to listing")) S.active = false;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("back to %s\n(navigating anywhere also leaves the results)",
+                              B.dir.c_str());
+        ImGui::SameLine();
         if (S.running) {
             ImGui::TextDisabled("searching %s under %s ...", S.pattern.c_str(), S.root.c_str());
         } else {
@@ -12869,8 +12882,6 @@ static void drawPanelRemote() {
             if (S.skippedDirs)
                 ImGui::TextDisabled("%d unreadable folder(s) skipped", S.skippedDirs);
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("close results")) S.active = false;
         if (ImGui::BeginChild("searchhits", ImVec2(0, 0), ImGuiChildFlags_None)) {
             ImGuiListClipper clip;
             clip.Begin((int)S.hits.size());
