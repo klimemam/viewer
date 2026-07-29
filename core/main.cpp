@@ -110,6 +110,24 @@ static std::string baseName(const std::string& p) {
     size_t i = p.find_last_of("/\\");
     return i == std::string::npos ? p : p.substr(i + 1);
 }
+// A path on its way to the SCREEN. The bundled CJK font draws U+005C as the yen
+// sign - the JIS legacy - so a Windows path renders "C:(yen)Users(yen)hish".
+// Every candidate font does it (Meiryo, Yu Gothic, MS Gothic, Noto CJK JP), so
+// this is not one font's bug to route around, and there is no second font in
+// the atlas to fall back to: the CJK face IS the app's font, one base, no
+// merge. Dropping U+005C from its ranges would leave the glyph missing, not
+// borrowed - a '?' where the separator should be.
+//
+// So the separator is shown, not the codepoint. The app already normalises to
+// '/' everywhere it compares or joins paths (openPickerWith does it per file,
+// browseLocalFolder does it on the way in, and every remote path is '/'), the
+// Windows API takes '/' as readily as '\\', and a path copied out of here
+// pastes into Python, CMake and a shell unescaped. Storage is untouched: this
+// is display only.
+static std::string dispPath(std::string p) {
+    std::replace(p.begin(), p.end(), '\\', '/');
+    return p;
+}
 static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
     float mag = powf(10.0f, floorf(log10f(std::max(raw, 1e-9f))));
     for (float m : {1.0f, 2.0f, 5.0f, 10.0f})
@@ -959,7 +977,22 @@ static App app;
 
 // ---- remote viewing: declared here, defined further down ----
 static const char* REMOTE_HOME = "~/.viewer";
-#define ICON_LINK "[ssh]"      // plain ASCII: the bundled font has no icon set
+// Plain ASCII: the bundled font has no icon set. TWO tags, because there are
+// two states. An empty host means the peer runs HERE - the same protocol over a
+// pipe instead of ssh - and a browse of this disk that flies an [ssh] flag,
+// says "local peer" in the title bar and prints "local://" in a dialog reads as
+// a connection to a machine called "local". Nothing is open. Say so.
+#define ICON_SSH   "[ssh]"
+#define ICON_LOCAL "[local]"
+// what an empty host is CALLED on screen (the url form stays "local://" - it is
+// storage, not language)
+#define PEER_HERE  "this machine"
+static const char* peerTag(const std::string& host) {
+    return host.empty() ? ICON_LOCAL : ICON_SSH;
+}
+static std::string peerLabel(const std::string& host) {
+    return host.empty() ? std::string(PEER_HERE) : host;
+}
 static bool openRemote(const std::string& url, bool asPreview = false);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
@@ -5494,8 +5527,14 @@ static void drawFolderPickModal() {
     // windows are then submitted on top of one another every frame. Whoever
     // loses simply opens when the winner closes.
     if (app.folderPickOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
-        fprintf(stderr, "picker: OpenPopup (remote=%d, %d groups)\n",
-                app.folderPickRemote ? 1 : 0, (int)app.folderPick.size());
+        // "remote=1" was true of the code path and false of the world: a local
+        // browse takes it too. Name the SOURCE instead - that is the thing a
+        // reader of this log is trying to establish.
+        fprintf(stderr, "picker: OpenPopup (source=%s, %d groups)\n",
+                !app.folderPickRemote ? "disk"
+                : app.folderPickHost.empty() ? "peer on " PEER_HERE
+                                             : app.folderPickHost.c_str(),
+                (int)app.folderPick.size());
         ImGui::OpenPopup("Select sequences");
     }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
@@ -5505,7 +5544,7 @@ static void drawFolderPickModal() {
                                         ImVec2(FLT_MAX, FLT_MAX));
     if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
 
-    ImGui::TextDisabled("%s", app.folderPickRoot.c_str());
+    ImGui::TextDisabled("%s", dispPath(app.folderPickRoot).c_str());
     int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
     for (const auto& e : app.folderPick) {
         totalFiles += (int)e.g.files.size();
@@ -6427,7 +6466,8 @@ static void rbWorker() {
             std::string err;
             bool alive = app.rbSession->alive() && app.rbSession->host() == job.host;
             if (!alive) {
-                rbSetPhase("connecting to " + (job.host.empty() ? "local peer" : job.host) + "...");
+                rbSetPhase(job.host.empty() ? "starting the local reader..."
+                                            : "connecting to " + job.host + "...");
                 alive = app.rbSession->startOn(job.host, job.port, exe, err);
                 if (!alive && !job.host.empty()) {
                     // not there: the server installs its own peer from the
@@ -6606,7 +6646,13 @@ static void pumpRemoteBrowse() {
                 // with three different causes; the trail stays in
                 fprintf(stderr, "remote scan: %d groups -> picker requested\n",
                         (int)groups.size());
-                openPickerWith(std::move(groups), makeRemoteUrl(r.host, r.dir, r.port),
+                // The dialog's first line is READ, not pasted: for a local
+                // browse it is a path on this disk, and prefixing it "local://"
+                // told the user a scheme they never chose and a machine they
+                // are not talking to. The url form is unchanged everywhere it
+                // is stored (prefs, bookmarks, Copy path).
+                openPickerWith(std::move(groups),
+                               r.host.empty() ? r.dir : makeRemoteUrl(r.host, r.dir, r.port),
                                r.dir, true, r.host, r.port);
             }
             continue;
@@ -6662,7 +6708,7 @@ static void pumpRemoteBrowse() {
             // a listing nobody can see is not a connection anyone believes in
             app.showRemote = true;
             app.focusRemote = true;
-            toast("connected to " + (r.host.empty() ? std::string("local peer") : r.host));
+            toast(r.host.empty() ? "browsing " PEER_HERE : "connected to " + r.host);
         }
         // An outdated peer ANSWERS perfectly well, so the install-on-failure
         // path never runs for it - and every listing would show "-" for shape
@@ -7022,7 +7068,9 @@ static bool openRemote(const std::string& url, bool asPreview) {
             app.seqNote = msg;
         }
     }
-    toast("opened " + baseName(rpath) + " from " + (host.empty() ? "local peer" : host));
+    // a file on this disk was not fetched "from" anywhere
+    toast(host.empty() ? "opened " + baseName(rpath)
+                       : "opened " + baseName(rpath) + " from " + host);
     return true;
 }
 
@@ -10527,7 +10575,7 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     ImGui::SameLine();
     if (S.pending) {
         ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
-                           S.host.empty() ? "local peer" : S.host.c_str());
+                           S.host.empty() ? PEER_HERE : S.host.c_str());
         ImGui::Separator();
         ImGui::TextDisabled("computing on the server over all %d frames", si->expectedFrames);
         return true;
@@ -10541,7 +10589,7 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
         return false;                 // fall through to the local path
     }
     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames, %s, %s]",
-                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames,
                        S.roiUsed ? "selected ROI" : "whole image",
                        S.nPl > 1 ? "CFA planes" : "plane=all (no CFA split)");
     ImGui::Separator();
@@ -10600,7 +10648,7 @@ static void drawBrowseTemporal() {
     ImGui::SameLine();
     if (S.pending) {
         ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s - measuring...]",
-                           S.host.empty() ? "local peer" : S.host.c_str());
+                           S.host.empty() ? PEER_HERE : S.host.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
         ImGui::Separator();
@@ -10617,7 +10665,7 @@ static void drawBrowseTemporal() {
         return;
     }
     ImGui::TextColored(ImVec4(0.55f, 0.78f, 1.0f, 1), "[server %s, %d frames - not opened: %s]",
-                       S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                       S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames,
                        S.label.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Open as stack")) {
@@ -11849,6 +11897,25 @@ static std::string fmtUnixTime(int64_t t) {
     strftime(b, sizeof b, "%Y-%m-%d %H:%M", &tmv);
     return b;
 }
+// The same instant in five fewer characters, for a column too narrow to hold
+// the full stamp. The rule is `ls -l`'s, and for the same reason: a capture
+// dump is browsed on the day it was taken, where the time of day is the whole
+// question, and an archive is browsed by year, where it is noise.
+static std::string fmtUnixTimeShort(int64_t t) {
+    if (t <= 0) return "-";
+    time_t tt = (time_t)t;
+    struct tm tmv {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char b[32];
+    const int64_t SIX_MONTHS = 182LL * 24 * 3600;
+    strftime(b, sizeof b, (int64_t)time(nullptr) - t < SIX_MONTHS ? "%m-%d %H:%M"
+                                                                 : "%Y-%m-%d", &tmv);
+    return b;
+}
 // "(3000,4000) u16" - the file's declared shape, so what the browser promises is
 // what META will later confirm.
 static std::string fmtEntryShape(const remote::Entry& e) {
@@ -12038,6 +12105,25 @@ static void drawRemotePlacesCombo() {
     ImGui::EndCombo();
 }
 
+// Where the Browse toolbar's two width-critical controls ended up, in screen x,
+// against the panel's own content edges. Recorded every frame so a selftest can
+// assert the thing a human reads off a screenshot: "the filter is on screen".
+struct RbToolbarGeom {
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
+    float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+    int   emptyLocalBtn = 0;               // the not-connected state's local entry
+    float rowX = 0, rowY = 0;              // centre of the first row submitted
+};
+static RbToolbarGeom g_rbToolbar;
+static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
+// --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
+// frame, after the GLFW backend has had its say: the backend overwrites the
+// mouse position from the OS cursor whenever the window counts as focused, and
+// a HIDDEN window still counts (Win32 GetActiveWindow answers per thread). An
+// event queued between frames therefore lost the race about one run in six.
+static ImVec2 g_injMouse(-1, -1);   // <0: not injecting
+static int    g_injMouseBtn = -1;   // button held, -1 = none
+
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
     // FIRST, so it is destroyed LAST - after `view` and after every row that
@@ -12045,8 +12131,27 @@ static void drawPanelRemote() {
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree
     // next frame" deferral that covered the tree cache and nothing else.)
     RbDeferredActions rbActions;
+    g_rbToolbar = RbToolbarGeom{};
+    g_rbToolbar.x0 = ImGui::GetCursorScreenPos().x;
+    g_rbToolbar.x1 = g_rbToolbar.x0 + ImGui::GetContentRegionAvail().x;
     ImGui::PushID("remotetree");
     if (!B.connected) {
+        // The empty state used to offer ssh and nothing else, and then say
+        // "Connect to a machine, then pick the file here" - so View > Panels >
+        // Browse opened a panel with no way out unless you already knew the
+        // File menu had a second door into it. The panel browses THIS disk too;
+        // that has to be one of the two buttons, and it is the cheaper one, so
+        // it goes first.
+        const float need = ImGui::CalcTextSize("Start Remote (ssh)...").x +
+                           ImGui::GetStyle().FramePadding.x * 2;
+        if (ImGui::Button("Browse Local Folder...")) browseFolderDialog();
+        g_rbToolbar.emptyLocalBtn = 1;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("pick a folder on this machine and list it here -\n"
+                              "same rows, same grouping, same server-side stats.\n"
+                              "(File > Browse Folder (Local)... is the same command)");
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
         if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
         drawRemotePlacesCombo();
@@ -12058,7 +12163,10 @@ static void drawPanelRemote() {
             ImGui::PopStyleColor();
             if (ImGui::SmallButton("details / copy")) app.showRemoteError = true;
         }
-        ImGui::TextDisabled("Connect to a machine, then pick the file here.");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Pick a folder on this machine, or connect to another one, "
+                            "and the files land here.");
+        ImGui::PopTextWrapPos();
         ImGui::PopID();
         return;
     }
@@ -12299,6 +12407,33 @@ static void drawPanelRemote() {
     };
     // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
     // narrow it down. Everything else is behind "more".
+    //
+    // The row FLOWS. It used to be one fixed SameLine chain, and at the panel's
+    // own default docked width (0.17 of the window - 271 px on a 1600 px screen)
+    // that chain ran off the right edge somewhere after "list": the filter box
+    // and the "more" button were submitted outside the clip rect, so the panel's
+    // most-used control was not on screen at all and read as missing. Now every
+    // item asks for room before it joins the line and starts a new one when
+    // there is none, exactly as the breadcrumb bar above already does - the row
+    // grows downwards instead of disappearing sideways, and nothing in it can
+    // become unreachable at any width.
+    const ImGuiStyle& rbStyle = ImGui::GetStyle();
+    auto rbBtnW = [&](const char* lb) {           // what a SmallButton will take
+        return ImGui::CalcTextSize(lb, nullptr, true).x + rbStyle.FramePadding.x * 2;
+    };
+    auto rbFlow = [&](float need) {               // join the line, or break first
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
+    };
+    // Measured, not guessed: what has to survive to the right of the filter.
+    // The WIDER of the two labels the fold button wears, so clicking it cannot
+    // reflow the row it sits in ("more" is 12 px wider than "less").
+    const float rbAdvW = std::max(rbBtnW("more##rbadv"), rbBtnW("less##rbadv"));
+    auto rbFilterTailW = [&](bool counted) {
+        float w = rbAdvW + rbStyle.ItemSpacing.x;
+        if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
+        return w;
+    };
     static char rbFilter[256] = "";
     {
         ImGui::BeginDisabled(atRoot);
@@ -12306,17 +12441,17 @@ static void drawPanelRemote() {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("parent folder (Backspace)");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("home"));
         if (ImGui::SmallButton("home")) rbGoTo("~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("refresh"));
         if (ImGui::SmallButton("refresh")) {
             rbDefer([] { rbTreeForget(); });        // in order: forget, then list
             rbGoTo(B.dir);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("open folder"));
         // Open Folder for the folder you are IN. It used to exist only on a
         // folder ROW, so opening the directory being browsed meant going up a
         // level to find its own name in the parent's listing - and if that
@@ -12325,7 +12460,7 @@ static void drawPanelRemote() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
                               "which stacks to open:\n%s", B.dir.c_str());
-        ImGui::SameLine();
+        rbFlow(rbBtnW("grouped"));
         // Grouped <-> flat. No round trip: the peer already sent every member.
         if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
             app.rbFlat = !app.rbFlat;
@@ -12339,7 +12474,7 @@ static void drawPanelRemote() {
                   "not in the listing reply - those cells stay blank)"
                 : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
                   "individually (no request to the server).");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("tree"));
         // List <-> tree. Expanding a node costs ONE list, once.
         if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
             app.rbTree = !app.rbTree;
@@ -12354,16 +12489,27 @@ static void drawPanelRemote() {
                   "back to one folder at a time."
                 : "list: one folder at a time, a click enters it.\nclick to expand "
                   "folders in place instead.");
-        ImGui::SameLine();
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
+        //
+        // The filter is the row's payload, so it is the one item with a floor:
+        // it takes a whole line of its own rather than shrink below what a glob
+        // needs to be readable in.
+        const float tailW = rbFilterTailW(rbFilter[0] != 0);
+        const float filterMin = ImGui::GetFontSize() * 8;
+        rbFlow(filterMin + tailW);
         if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
             ImGui::SetKeyboardFocusHere();
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+        // below the floor the tail wraps instead (rbFlow, further down), so a
+        // panel too narrow for both still shows a usable filter
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
+                                         ImGui::GetFontSize() * 4));
         ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
                                  rbFilter, sizeof rbFilter);
+        g_rbToolbar.filterL = ImGui::GetItemRectMin().x;
+        g_rbToolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("filters the listing below without asking the server\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
@@ -12420,25 +12566,28 @@ static void drawPanelRemote() {
             return g_rbSortDesc ? cmp > 0 : cmp < 0;
         });
     if (rbFilter[0]) {
-        ImGui::SameLine();
+        rbFlow(ImGui::CalcTextSize("9999/9999").x);
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
-    ImGui::SameLine();
+    rbFlow(rbAdvW);
     if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
         rbAdvanced = !rbAdvanced;
         app.prefsDirty = true;
         savePrefs();
     }
+    g_rbToolbar.moreR = ImGui::GetItemRectMax().x;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("the connection, the places list and the server-side\n"
                           "recursive search - the things a browse does not need\n"
                           "every minute");
     // ---- row 3, on request: the connection and the server-side search ----
     if (rbAdvanced) {
-        ImGui::TextUnformatted(B.host.empty() ? "local peer" : B.host.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("disconnect")) {
+        ImGui::TextUnformatted(peerLabel(B.host).c_str());
+        // there is nothing to disconnect FROM when the peer runs here
+        const char* rbEndLbl = B.host.empty() ? "close browse##rbdisc" : "disconnect##rbdisc";
+        rbFlow(rbBtnW(rbEndLbl));        // same flow rule as row 2: never clipped
+        if (ImGui::SmallButton(rbEndLbl)) {
             rbDefer([] {                 // another machine, other children
                 app.uiSession.stop();    // ours to stop; the worker's is a job
                 App::RbJob j;
@@ -12450,7 +12599,7 @@ static void drawPanelRemote() {
             ImGui::PopID();
             return;
         }
-        ImGui::SameLine();
+        rbFlow(rbBtnW("*"));
         {   // star = bookmark the place being looked at; the combo recalls them
             std::string curUrl = placeUrl(B.host, B.port, B.dir);
             bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
@@ -12470,11 +12619,13 @@ static void drawPanelRemote() {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
                                   curUrl.c_str());
-            ImGui::SameLine();
+            rbFlow(ImGui::GetFontSize() * 8);
             drawRemotePlacesCombo();
         }
         if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7);
+        const float srchTailW = rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - srchTailW,
+                                         ImGui::GetFontSize() * 4));
         bool go = ImGui::InputTextWithHint("##rbsearch",
                                            "search server (recursive): frame_* or **/dark.npy",
                                            rbSearchBuf, sizeof rbSearchBuf,
@@ -12483,7 +12634,7 @@ static void drawPanelRemote() {
             ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
                               "bare text matches anywhere in the relative path;\n"
                               "* and ? glob across '/'");
-        ImGui::SameLine();
+        rbFlow(rbBtnW("Stop##rbsearch"));
         if (app.rbSearch.running) {
             if (ImGui::SmallButton("Stop##rbsearch")) {
                 app.rbSearch.gen++;               // in-flight result becomes stale
@@ -12494,7 +12645,7 @@ static void drawPanelRemote() {
         }
         if (!rbSearchRoot.empty()) {
             ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
-            ImGui::SameLine();
+            rbFlow(rbBtnW("x##sroot"));
             if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
         }
     } else if (!rbSearchRoot.empty() || app.rbSearch.running) {
@@ -12756,19 +12907,65 @@ static void drawPanelRemote() {
     // alive, so starting one never shifts the rows under the cursor (a bar
     // that appeared above the list moved every row mid-double-click)
     float rbFootH = ImGui::GetFrameHeightWithSpacing();
+    // Column widths, measured from the widest thing each column actually
+    // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
+    // SCROLLING table auto-fits over its first frames, which for this table are
+    // the frames before the listing has arrived. "modified" was therefore sized
+    // against an empty column and kept that width for good: a 16-character
+    // timestamp clipped to "202" even with the panel dragged out to 1150 px.
+    // ImGuiTableFlags_Resizable then wrote the number into the layout file, so
+    // it survived restarts too.
+    // A metadata column is WidthFixed | NoResize with an explicit width, which
+    // is the one combination ImGui re-applies on EVERY frame (TableUpdateLayout:
+    // a non-resizable fixed column takes InitStretchWeightOrWidth as its width).
+    // With Resizable the width was latched on the initialising frame instead and
+    // then written to the layout file, which is exactly how a stale number
+    // outlived every resize. The panel is what the user drags now, not the
+    // column edges - and the columns follow it.
+    const ImGuiStyle& tSt = ImGui::GetStyle();
+    const float tCell  = tSt.CellPadding.x * 2 + 1;              // + inner border
+    const float wShape = ImGui::CalcTextSize("(3000,4000) u16").x;
+    const float wSize  = ImGui::CalcTextSize("1023.9 MB").x;
+    const float wDate  = ImGui::CalcTextSize("2026-07-27 14:03").x;
+    // the wider of fmtUnixTimeShort's two forms, so the column does not clip on
+    // the day a file crosses the six-month line
+    const float wDateS = std::max(ImGui::CalcTextSize("2026-07-27").x,
+                                  ImGui::CalcTextSize("07-27 14:03").x);
+    // The name IS the row, so it keeps a readable minimum and the metadata is
+    // paid for out of what is left, dropping from the right. A column that
+    // cannot hold its own value is worth less than the name it is taking the
+    // width from - three characters of a timestamp tell nobody anything.
+    float tBudget = ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 9 - tCell;
+    const bool colShape = tBudget >= wShape + tCell;
+    if (colShape) tBudget -= wShape + tCell;
+    const bool colSize = colShape && tBudget >= wSize + tCell;
+    if (colSize) tBudget -= wSize + tCell;
+    const bool dateFull  = colSize && tBudget >= wDate + tCell;
+    const bool dateShort = colSize && !dateFull && tBudget >= wDateS + tCell;
+    const bool colDate = dateFull || dateShort;
+    auto tHide = [](bool show) {
+        return show ? ImGuiTableColumnFlags_None : ImGuiTableColumnFlags_Disabled;
+    };
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
-                                       ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                                       ImGuiTableFlags_ScrollY |
                                        ImGuiTableFlags_SortTristate,
                                        ImVec2(0, -rbFootH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
         ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
-                                                 ImGuiTableColumnFlags_NoSort, 0.0f, RB_COL_SHAPE);
+                                                 ImGuiTableColumnFlags_NoResize |
+                                                 ImGuiTableColumnFlags_NoSort |
+                                                 tHide(colShape), wShape, RB_COL_SHAPE);
         ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed |
-                                        ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_SIZE);
+                                        ImGuiTableColumnFlags_NoResize |
+                                        ImGuiTableColumnFlags_PreferSortDescending |
+                                        tHide(colSize), wSize, RB_COL_SIZE);
         ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
-                                            ImGuiTableColumnFlags_PreferSortDescending, 0.0f, RB_COL_MTIME);
+                                            ImGuiTableColumnFlags_NoResize |
+                                            ImGuiTableColumnFlags_PreferSortDescending |
+                                            tHide(colDate), dateFull ? wDate : wDateS,
+                                            RB_COL_MTIME);
         ImGui::TableHeadersRow();
         // The spec is STASHED, not applied: `shown` was already sorted with it,
         // above, where the keyboard and the clipper can agree with the screen.
@@ -12815,6 +13012,13 @@ static void drawPanelRemote() {
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            // where a selftest aims a right-click: the first row that HAS a
+            // context menu (a placeholder "(listing...)" row has none, and a
+            // tree still fetching a node can put one at the top)
+            if (!r.ph && g_rbToolbar.rowY <= 0) {
+                g_rbToolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
+                g_rbToolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
+            }
             if (shown[row] == rbCursor) {
                 // the keyboard cursor: an outline, not a fill - the fill means
                 // "selected for a multi-file action" and the two are not the same
@@ -12966,8 +13170,24 @@ static void drawPanelRemote() {
             if (!r.ph && !r.isDir() && r.ownFile())
                 ImGui::TextDisabled("%s", fmtBytesHuman(e.size).c_str());
             ImGui::TableNextColumn();
-            if (!r.ph && r.ownFile() && e.mtime > 0)
-                ImGui::TextDisabled("%s", fmtUnixTime(e.mtime).c_str());
+            if (!r.ph && r.ownFile() && e.mtime > 0) {
+                float cellW = ImGui::GetContentRegionAvail().x;
+                std::string ts = dateShort ? fmtUnixTimeShort(e.mtime)
+                                           : fmtUnixTime(e.mtime);
+                ImGui::TextDisabled("%s", ts.c_str());
+                // widest stamp actually printed against the room it had: the
+                // one thing --browse-keys-selftest asserts about this column
+                // (nothing is printed at all when the column is dropped)
+                if (colDate) {
+                    g_rbToolbar.dateCellW = cellW;
+                    g_rbToolbar.dateTextW = std::max(g_rbToolbar.dateTextW,
+                                                     ImGui::CalcTextSize(ts.c_str()).x);
+                }
+                // the short form drops a field, so the full stamp stays one
+                // hover away rather than only in Properties
+                if (dateShort && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", fmtUnixTime(e.mtime).c_str());
+            }
             else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
         }
@@ -13031,6 +13251,63 @@ static void drawPanelRemote() {
         ImGui::EndPopup();
     }
     ImGui::PopID();
+}
+
+// One heading in the Files panel: a batch, the stacks under it, and the folder
+// its first stack came from. Grouped by BATCH, not by folder - a batch is one
+// open action, named by the user (the folder name is only the starting value),
+// and two loads from the same folder are two batches, which is the point.
+struct FileGroup {
+    int batch = 0;
+    std::string dir, label;
+    std::vector<const std::vector<int>*> stacks;
+};
+// Extracted from drawFileList so the ORDER can be asserted without a frame: it
+// is the thing "Move to batch" must not change.
+//
+// The order is app.batches', which is the order the batches were CREATED in.
+// It used to be the order they were first met while walking the stacks - and
+// that is a property of the stacks, not of the batches. Moving one stack into
+// another batch moved that batch's whole heading to wherever the moved stack
+// happened to sit, which for a move "upwards" is the top of the list, so every
+// other heading shifted and the user had to find their work again. A move
+// changes which heading a row sits UNDER. It must not reorder the headings.
+static std::vector<FileGroup> buildFileGroups(const std::vector<std::vector<int>>& stacks) {
+    std::vector<FileGroup> groups;
+    for (const auto& stack : stacks) {
+        const ImageDoc& head = *app.images[stack.front()];
+        FileGroup* g = nullptr;
+        for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
+        if (!g) {
+            const std::string& p = head.path;
+            size_t slash = p.find_last_of("/\\");
+            std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
+            std::string label = "opened";
+            for (const auto& b : app.batches) if (b.id == head.batchId) label = b.name;
+            groups.push_back({ head.batchId, dir, label, {} });
+            g = &groups.back();
+        }
+        g->stacks.push_back(&stack);
+    }
+    auto rank = [](int id) {
+        for (size_t i = 0; i < app.batches.size(); i++)
+            if (app.batches[i].id == id) return (int)i;
+        return (int)app.batches.size();    // no batch names it: last, order kept
+    };
+    std::stable_sort(groups.begin(), groups.end(),
+                     [&](const FileGroup& a, const FileGroup& b) {
+                         return rank(a.batch) < rank(b.batch);
+                     });
+    // The transient preview is PINNED LAST and never reorders the rest.
+    // It used to sort in wherever its batch was created, so glancing at a
+    // file in the browser inserted a heading in the middle of the list and
+    // pushed everything the user was working with down a row - the opposite
+    // of what a throwaway look should cost.
+    for (size_t i = 0; i + 1 < groups.size(); i++)
+        if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
+                                                        groups.begin() + i + 1,
+                                                        groups.end()); break; }
+    return groups;
 }
 
 static void drawFileList() {
@@ -13129,39 +13406,11 @@ static void drawFileList() {
     // produced a flat list of bare filenames with nothing saying where each came
     // from. The folder is the only thing that distinguishes them.
     const auto& stacks = stacksCached();
-    // Grouped by BATCH, not by folder: a batch is one open action, named by the
-    // user (folder name is only the starting value). Two loads from the same
-    // folder are two batches - that is the point.
-    struct FileGroup { int batch; std::string dir, label; std::vector<const std::vector<int>*> stacks; };
     static std::vector<FileGroup> groups;
     static uint64_t groupsRev = 0;
     if (groupsRev != app.imagesRev) {
         groupsRev = app.imagesRev;
-        groups.clear();
-        for (const auto& stack : stacks) {
-            const ImageDoc& head = *app.images[stack.front()];
-            FileGroup* g = nullptr;
-            for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
-            if (!g) {
-                const std::string& p = head.path;
-                size_t slash = p.find_last_of("/\\");
-                std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
-                std::string label = "opened";
-                for (const auto& b : app.batches) if (b.id == head.batchId) label = b.name;
-                groups.push_back({ head.batchId, dir, label, {} });
-                g = &groups.back();
-            }
-            g->stacks.push_back(&stack);
-        }
-        // The transient preview is PINNED LAST and never reorders the rest.
-        // It used to sort in wherever its batch was created, so glancing at a
-        // file in the browser inserted a heading in the middle of the list and
-        // pushed everything the user was working with down a row - the opposite
-        // of what a throwaway look should cost.
-        for (size_t i = 0; i + 1 < groups.size(); i++)
-            if (groups[i].label == "preview") { std::rotate(groups.begin() + i,
-                                                            groups.begin() + i + 1,
-                                                            groups.end()); break; }
+        groups = buildFileGroups(stacks);
     }
     // The batch heading is ALWAYS drawn. It used to appear only once there was
     // more than one thing open, so opening a second folder made a heading
@@ -13184,7 +13433,8 @@ static void drawFileList() {
                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
           if (isPreview) ImGui::PopStyleColor();
           if (ImGui::IsItemHovered() && !group.dir.empty())
-              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)", group.dir.c_str());
+              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
+                                dispPath(group.dir).c_str());
           // the batch is the user's grouping, so its name is theirs to change
           if (ImGui::BeginPopupContextItem("batchctx")) {
               static char nameBuf[256];
@@ -13244,7 +13494,7 @@ static void drawFileList() {
                                                        ImGui::GetTextLineHeight()) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
             }
-            if (hov) ImGui::SetTooltip("%s\n%s", d.path.c_str(), meta);
+            if (hov) ImGui::SetTooltip("%s\n%s", dispPath(d.path).c_str(), meta);
             return clicked;
         };
         // One row. mem != nullptr means the row is being drawn INSIDE a series
@@ -13578,7 +13828,8 @@ static void drawSequenceModal() {
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
-    ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(), app.seqAskPattern.c_str());
+    ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(),
+                dispPath(app.seqAskPattern).c_str());
     ImGui::TextDisabled("Loading them as one stack enables temporal analysis.");
     ImGui::TextDisabled("Frames decode in the background; you can keep working.");
     ImGui::Separator();
@@ -13614,19 +13865,33 @@ static bool viewingRemote() {
     return app.rbrowse.connected || (im && !im->remoteUrl.empty());
 }
 
+// The host behind that, or "" for the local peer. The peer protocol is the same
+// either way - deliberately - but the ANSWER to "is this somewhere else?" is
+// not, and the title bar and the taskbar icon are answers to that question.
+static std::string viewingHost() {
+    if (!viewingRemote()) return {};
+    if (!app.rbrowse.host.empty()) return app.rbrowse.host;
+    const ImageDoc* im = cur();
+    if (im && !im->remoteUrl.empty()) {
+        std::string h, p;
+        remote::parseUrl(im->remoteUrl, h, p);
+        return h;
+    }
+    return {};
+}
+
 // One title, three places: the OS title bar (when there is one), the taskbar
 // button, and the integrated title bar this app draws for itself.
 static std::string windowTitleText() {
     const ImageDoc* im = cur();
     std::string t = im ? im->name + " - viewer" : "viewer v0.1";
-    if (viewingRemote()) {
-        std::string host = app.rbrowse.host;
-        if (host.empty() && im && !im->remoteUrl.empty()) {
-            std::string rp;
-            remote::parseUrl(im->remoteUrl, host, rp);
-        }
-        t += "  [" + (host.empty() ? std::string("local peer") : host) + "]";
-    }
+    // The bracket answers "which machine are these pixels on?". A local browse
+    // goes through the peer protocol but the file is on this disk, so there is
+    // no other machine to name - and "[local peer]" named one, which is how a
+    // Browse Folder (Local) looked like an open connection. No bracket is the
+    // true statement: it is a local file, exactly like File > Open.
+    std::string host = viewingHost();
+    if (!host.empty()) t += "  [" + host + "]";
     return t;
 }
 
@@ -14320,7 +14585,15 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree.
+// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx, esc
+// and
+// w<px>.
+//
+// w<px> floats the panel at an exact width and then asserts what a human would
+// otherwise have to read off a screenshot: that the filter box and the "more"
+// button are still INSIDE the panel, and that the filter is wide enough to type
+// a glob into. 271 is the panel's own default docked width on a 1600 px screen,
+// which is where the fixed SameLine chain used to push both of them off-screen.
 static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
 // Key-routing evidence for --browse-keys-selftest: how many times the MAIN
@@ -14343,9 +14616,16 @@ static std::string g_browseKeysActs =
     // main view must own them again, or the gate would be "the arrows are dead"
     // rather than "the panel owns them while it has focus"
     "blur,down,up,end,home,"
-    // ...and finally the root-level popup collision: open the RAW dialog for a
+    // ...then the panel geometry sweep: the toolbar must stay inside the panel
+    // at every docked width, and Escape must close a menu and a context popup.
+    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
+    "rctx,esc,fmenu,esc,disc,"
+    // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
-    // modal. The RAW dialog must survive.
+    // modal. The RAW dialog must survive - which is why this runs last: it
+    // deliberately ENDS with a modal up, and Escape leaves modals alone
+    // (theirs is a decision), so anything checking Escape after it would be
+    // reading the surviving modal rather than its own popup.
     "rawopen,popupcheck,seqask,popupcheck";
 
 static void printUsage() {
@@ -15508,10 +15788,38 @@ int main(int argc, char** argv) {
         bool ok = true;
 
         // ---- UC3: filter "_A", one stack per group -> only the A files load
-        openFolder(g_pickerSelftest);
+        // Scanned through a NATIVE path, separators and all - which is what a
+        // folder dialog hands over on Windows, and the input the yen-sign bug
+        // needs: the CJK font draws U+005C as the yen sign, so a path shown
+        // raw reads "C:(yen)Users(yen)hish". What the picker DISPLAYS is
+        // checked below.
+        {
+            std::string root = g_pickerSelftest;
+#if defined(_WIN32)
+            std::replace(root.begin(), root.end(), '/', '\\');
+#endif
+            openFolder(root);
+        }
         if (!app.folderPickOpen) {
             fprintf(stderr, "pickerselftest: picker did not open\n");
             return 1;
+        }
+        {   // no separator survives to the screen as the codepoint the font
+            // draws as a yen sign
+            std::string bad;
+            auto noBS = [&](const std::string& what, const std::string& shown) {
+                if (shown.find('\\') != std::string::npos && bad.empty())
+                    bad = what + ": " + shown;
+            };
+            noBS("picker header", dispPath(app.folderPickRoot));
+            for (const auto& e : app.folderPick) {
+                noBS("group name", e.g.name);
+                for (const auto& r : e.rel) noBS("file row", r);
+            }
+            fprintf(stderr, "pickerselftest: scanned \"%s\" -> header reads \"%s\": %s%s\n",
+                    app.folderPickRoot.c_str(), dispPath(app.folderPickRoot).c_str(),
+                    bad.empty() ? "ok" : "FAIL ", bad.c_str());
+            if (!bad.empty()) ok = false;
         }
         int total = 0;
         for (const auto& e : app.folderPick) total += (int)e.g.files.size();
@@ -15665,6 +15973,26 @@ int main(int argc, char** argv) {
                 B.connected ? 1 : 0, B.host.c_str(), B.dir.c_str(),
                 (int)B.entries.size(), app.showRemote ? 1 : 0,
                 B.err.empty() ? "" : " err=", B.err.c_str());
+        // ...and what it SAYS, which is the half that was wrong: a browse of
+        // this disk claimed a machine in the window title, an ssh session in
+        // the status bar and a "local://" scheme in the picker's header. The
+        // mechanism above is unchanged - only the words are checked here.
+        {
+            std::string title = windowTitleText();
+            std::string tag = peerTag(B.host);
+            std::string label = peerLabel(B.host);
+            std::string pickHdr = B.host.empty() ? B.dir : makeRemoteUrl(B.host, B.dir);
+            bool said = title.find('[') == std::string::npos &&
+                        title.find("ssh") == std::string::npos &&
+                        viewingHost().empty() &&
+                        tag == ICON_LOCAL && label == PEER_HERE &&
+                        pickHdr.find("local://") == std::string::npos;
+            fprintf(stderr, "localbrowseselftest: title=\"%s\" tag=%s peer=\"%s\" "
+                            "pickerheader=\"%s\" othermachine=%d: %s\n",
+                    title.c_str(), tag.c_str(), label.c_str(), pickHdr.c_str(),
+                    viewingHost().empty() ? 0 : 1, said ? "ok" : "FAIL");
+            if (!said) ok = false;
+        }
         fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
@@ -16163,7 +16491,7 @@ int main(int argc, char** argv) {
         };
         fprintf(stderr, "rtemporalselftest: [server %s, %d frames - not opened: %s] "
                         "valid=%d seqId=%d, %d image(s) open\n",
-                S.host.empty() ? "local peer" : S.host.c_str(), S.frames,
+                S.host.empty() ? PEER_HERE : S.host.c_str(), S.frames,
                 S.label.c_str(), S.valid ? 1 : 0, S.seqId, (int)app.images.size());
         if (!fired || !S.valid || S.seqId != -2 || S.frames != (int)files.size() ||
             !app.images.empty()) {
@@ -16217,6 +16545,53 @@ int main(int argc, char** argv) {
             return 1;
         }
         int oldBatch = app.images[0]->batchId;
+        // ---- a move must not reorder the Files list ----
+        // Three batches, then the FIRST stack moved into the LAST batch - the
+        // direction that used to reorder everything, because the old order was
+        // "whichever batch this walk of the stacks meets first" and the moved
+        // stack is met first. The headings the panel draws ARE buildFileGroups'
+        // labels, so this is what a human reads down the Files panel.
+        //
+        // The invariant is not "identical": a batch left empty by the move is
+        // pruned, and its heading rightly disappears. It is that what remains
+        // is still in the SAME RELATIVE ORDER - a subsequence of what was there
+        // before. Nothing may overtake anything.
+        if (app.seqs.size() >= 3) {
+            std::vector<int> tri;
+            for (const auto& si : app.seqs) tri.push_back(si.id);
+            // one at a time: an empty batch is pruned by the next move, so a
+            // batch has to be created immediately before something goes into it
+            int bA = newBatch(uniqueBatchName("ord A"));
+            moveStackToBatch(tri[0], bA);
+            int bB = newBatch(uniqueBatchName("ord B"));
+            moveStackToBatch(tri[1], bB);
+            int bC = newBatch(uniqueBatchName("ord C"));
+            for (size_t i = 2; i < tri.size(); i++) moveStackToBatch(tri[i], bC);
+            auto order = [](const std::vector<FileGroup>& g) {
+                std::vector<std::string> o;
+                for (const auto& q : g) o.push_back(q.label);
+                return o;
+            };
+            auto join = [](const std::vector<std::string>& v) {
+                std::string o;
+                for (const auto& x : v) o += (o.empty() ? "" : " ") + x;
+                return o;
+            };
+            std::vector<std::string> before = order(buildFileGroups(stacksCached()));
+            moveStackToBatch(tri[0], bC);        // first batch -> last batch
+            std::vector<std::string> after = order(buildFileGroups(stacksCached()));
+            size_t k = 0;                        // after must be a SUBSEQUENCE
+            for (const auto& lb : before) if (k < after.size() && after[k] == lb) k++;
+            bool kept = k == after.size();
+            fprintf(stderr, "batchselftest: headings [%s] -> after moving the first "
+                            "stack into the last batch [%s]: %s\n",
+                    join(before).c_str(), join(after).c_str(), kept ? "ok" : "FAIL");
+            if (!kept) {
+                fprintf(stderr, "batchselftest: FAILED - the move reordered the list\n");
+                ok = false;
+            }
+            (void)bA; (void)bB;
+        }
         int nb = newBatch(uniqueBatchName("moved"));
         std::vector<int> sids;
         for (const auto& si : app.seqs) sids.push_back(si.id);
@@ -19501,6 +19876,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> keyActs;
     size_t keyAct = 0;
     int keyPhase = 0;
+    int keysCheckBad = 0;      // panel-geometry and empty-state checks that failed
     bool keysOk = false;
     if (!g_browseKeys.empty()) {
         std::string d = g_browseKeys;
@@ -19535,6 +19911,15 @@ int main(int argc, char** argv) {
         double frameBodyT0 = glfwGetTime();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+        if (g_injMouse.x >= 0) {            // see g_injMouse: after the backend
+            io.AddMousePosEvent(g_injMouse.x, g_injMouse.y);
+            static int injHeld = -1;
+            if (injHeld != g_injMouseBtn) {
+                if (injHeld >= 0) io.AddMouseButtonEvent(injHeld, false);
+                if (g_injMouseBtn >= 0) io.AddMouseButtonEvent(g_injMouseBtn, true);
+                injHeld = g_injMouseBtn;
+            }
+        }
         ImGui::NewFrame();
         // --browse-keys "blur": give focus to nothing, so the next keys prove
         // the main view still owns them when the Browse panel does not
@@ -19723,6 +20108,16 @@ int main(int argc, char** argv) {
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         if (app.showRemote) {
             if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
+            // --browse-keys-selftest's "w<px>" action: float the panel at an
+            // exact width so the toolbar's flow layout can be asserted at the
+            // widths a human would drag it to. Off (0) in every other run.
+            if (g_rbForceW > 0) {
+                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+                ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
+                                        ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
+                                         ImGuiCond_Always);
+            }
             // Renamed "Browse" (it browses local folders too, via the local
             // peer), with the ImGui ID pinned by the ### suffix so the title
             // can change again without orphaning docked layouts.
@@ -19833,13 +20228,17 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                 } else if (B.connected) {
                     ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s  %s",
-                                       ICON_LINK, B.host.empty() ? "local peer" : B.host.c_str());
+                                       peerTag(B.host), peerLabel(B.host).c_str());
                     if (ImGui::IsItemHovered()) {
                         // published counters plus this thread's own session: no
                         // draw-path code touches the worker's Session
                         uint64_t rx = B.rxBytes + app.uiSession.bytesReceived();
-                        ImGui::SetTooltip("connected  -  %s\npeer protocol v%d, %.1f MB received\n"
-                                          "click to disconnect",
+                        ImGui::SetTooltip(B.host.empty()
+                            ? "browsing this machine  -  %s\nthe peer runs here, over a pipe: "
+                              "nothing is connected and nothing is on the network\n"
+                              "peer protocol v%d, %.1f MB read\nclick to close the browse"
+                            : "connected  -  %s\npeer protocol v%d, %.1f MB received\n"
+                              "click to disconnect",
                                           B.dir.c_str(), B.peerVersion, rx / 1048576.0);
                     }
                     if (ImGui::IsItemClicked()) {
@@ -19858,7 +20257,8 @@ int main(int argc, char** argv) {
                     // keep the full text one click away.
                     std::string first = B.err.substr(0, B.err.find('\n'));
                     if (first.size() > 90) first = first.substr(0, 87) + "...";
-                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  %s", ICON_LINK, first.c_str());
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s  %s",
+                                       peerTag(B.host), first.c_str());
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n\n(click for details)", B.err.c_str());
                     if (ImGui::IsItemClicked()) app.showRemoteError = true;
                     ImGui::SameLine();
@@ -19953,7 +20353,9 @@ int main(int argc, char** argv) {
             // With an integrated frame there is no system title bar to read the
             // title off - it is drawn in the menu bar instead - but it is still
             // what the taskbar button and the window list show.
-            const bool remoteNow = viewingRemote();
+            // ...and "another machine" is the same test the title uses: a local
+            // browse is not a connection, so it gets no green frame either.
+            const bool remoteNow = !viewingHost().empty();
             static std::string lastTitle;
             std::string title = windowTitleText();
             if (title != lastTitle) { glfwSetWindowTitle(win, title.c_str()); lastTitle = title; }
@@ -19985,6 +20387,23 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+        // Escape closes a menu or a context popup. ImGui does that itself only
+        // with keyboard NAV enabled, and this app cannot enable it - the Browse
+        // panel owns the arrow keys, and nav would take them - so a menu opened
+        // by accident stayed open until it was clicked away. That is not just
+        // untidy: an open menu OWNS the keyboard, and every accelerator typed
+        // underneath it went nowhere (a Ctrl+W with the File menu up closed
+        // nothing at all). Runs here, after every popup this frame has been
+        // submitted, so the stack it reads is complete.
+        //   - modals are left alone: theirs is a decision, and their own
+        //     Cancel / Escape already owns the key.
+        //   - an ACTIVE item gets the key first, so Escape in the "New batch"
+        //     field inside Move to batch reverts the text instead of throwing
+        //     the whole menu away.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
+            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                        ImGuiPopupFlags_AnyPopupLevel))
+            ImGui::ClosePopupsExceptModals();
         // after every panel has had its say about the mouse: drag, resize and
         // the cursor shape along the window edges
         window_frame::endFrame();
@@ -20242,6 +20661,7 @@ int main(int argc, char** argv) {
                 if (a == "home")  return ImGuiKey_Home;
                 if (a == "end")   return ImGuiKey_End;
                 if (a == "back")  return ImGuiKey_Backspace;
+                if (a == "esc")   return ImGuiKey_Escape;
                 return ImGuiKey_None;
             };
             if (!reproReady) {
@@ -20290,12 +20710,84 @@ int main(int argc, char** argv) {
                         if (g_popupChecks < 2)
                             g_popupCheck[g_popupChecks++] = g_rawPopupAlive ? 1 : 0;
                     }
+                    else if (a == "disc") { app.rbrowse = App::RemoteBrowse{}; rbTreeForget(); }
+                    else if (a == "fmenu") {
+                        // A real click on the menu bar's "File". The move, the
+                        // press and the release get a phase each: ImGui trickles
+                        // a queued burst over several frames, and a click whose
+                        // hover is still settling opens nothing.
+                        if (ImGuiWindow* mb = ImGui::FindWindowByName("##MainMenuBar")) {
+                            const ImGuiStyle& mst = ImGui::GetStyle();
+                            g_injMouse = ImVec2(mb->Pos.x + mst.WindowPadding.x +
+                                                mst.ItemSpacing.x +
+                                                ImGui::CalcTextSize("File").x * 0.5f,
+                                                mb->Pos.y + mb->Size.y * 0.5f);
+                        }
+                    } else if (a == "rctx" && g_rbToolbar.rowY > 0) {
+                        // ...and the other half of the defect: a right-click
+                        // context popup on a listing row.
+                        g_injMouse = ImVec2(g_rbToolbar.rowX, g_rbToolbar.rowY);
+                    }
+                    else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (a == "blur")  { g_browseKeysBlur = true;
                                              g_navKeyAtBlur = g_navKeyGlobal;
                                              g_navKeyYieldAtBlur = g_navKeyYielded; }
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
+                } else if (keyPhase == 2) {
+                    if (a == "fmenu") g_injMouseBtn = 0;
+                    if (a == "rctx")  g_injMouseBtn = 1;
+                } else if (keyPhase == 4) {
+                    g_injMouseBtn = -1;
+                } else if (keyPhase == 7 && (a == "fmenu" || a == "rctx" || a == "esc")) {
+                    // Escape must close a menu. ImGui only does that with
+                    // keyboard nav on, which this app cannot have, so the File
+                    // menu stayed up - and an open menu owns the keyboard, which
+                    // is how a Ctrl+W underneath it went nowhere. "fmenu" and
+                    // "rctx" assert the click landed (without that, "esc"
+                    // proves nothing); "esc" asserts the popup is gone.
+                    bool up = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                                          ImGuiPopupFlags_AnyPopupLevel);
+                    bool want = (a != "esc");
+                    if (up != want) keysCheckBad++;
+                    fprintf(stderr, "browsekeys: after %-5s a popup is %s "
+                                    "(cursor %.0f,%.0f): %s\n",
+                            a.c_str(), up ? "open" : "closed",
+                            rio.MousePos.x, rio.MousePos.y,
+                            up == want ? "ok" : "FAIL");
+                    fflush(stderr);
+                } else if (keyPhase == 7 && a == "disc") {
+                    // View > Panels > Browse lands here with nothing open, and
+                    // it must not be a remote-only dead end: the panel browses
+                    // this disk too, so it has to say so without the File menu.
+                    bool hasLocal = g_rbToolbar.emptyLocalBtn != 0;
+                    if (!hasLocal) keysCheckBad++;
+                    fprintf(stderr, "browsekeys: empty state offers a local browse: %s\n",
+                            hasLocal ? "ok" : "FAIL");
+                    fflush(stderr);
+                } else if (keyPhase == 7 && g_rbForceW > 0) {
+                    // The toolbar's contract at ANY width: the filter box and
+                    // the "more" button are inside the panel, and the filter is
+                    // wide enough to hold a glob. Both used to be submitted past
+                    // the right edge at the panel's default docked width.
+                    const RbToolbarGeom& g = g_rbToolbar;
+                    float slack = 1.0f;             // one pixel of rounding
+                    bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
+                                  g.moreR <= g.x1 + slack;
+                    bool usable = g.filterR - g.filterL >= ImGui::GetFontSize() * 3.5f;
+                    // ...and the "modified" column: shown means it FITS. It is
+                    // allowed to be absent (a panel too narrow to afford it) and
+                    // it is allowed to be short - it is not allowed to print
+                    // three characters of a sixteen-character stamp.
+                    bool dateOk = g.dateTextW <= 0 || g.dateTextW <= g.dateCellW + slack;
+                    if (!inside || !usable || !dateOk) keysCheckBad++;
+                    fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
+                                    "filter=[%.0f,%.0f] more_r=%.0f date=%.0f/%.0f: %s\n",
+                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
+                            g.dateTextW, g.dateCellW,
+                            (inside && usable && dateOk) ? "ok" : "FAIL");
+                    fflush(stderr);
                 }
                 if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
             } else if (++reproIdle > 20) {
@@ -20328,10 +20820,11 @@ int main(int argc, char** argv) {
                                 "implies a live dialog=%d: %s\n",
                         g_popupCheck[0], g_popupCheck[1],
                         (!rawDlg.forQueue || rawDlg.open) ? 1 : 0, popOk ? "ok" : "FAIL");
-                keysOk = routeOk && popOk;
+                keysOk = routeOk && popOk && keysCheckBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
-                                "no crash: %s\n", (int)keyActs.size(),
-                                (routeOk && popOk) ? "ok" : "FAILED");
+                                "no crash, %d panel check(s) failed: %s\n",
+                        (int)keyActs.size(), keysCheckBad,
+                        keysOk ? "ok" : "FAILED");
                 fflush(stderr);
                 break;
             }
