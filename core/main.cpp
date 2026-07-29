@@ -7277,7 +7277,14 @@ static void drawCanvas(ImVec2 avail) {
             bool inRange = app.ctxX >= 0 && app.ctxY >= 0 && app.ctxX < im->w && app.ctxY < im->h;
             if (ImGui::MenuItem("Add pin here", "P", false, inRange) && !annBlockedOnPreview())
                 addAnn(1, app.ctxX, app.ctxY, 0, 0);
-            App::Ann* sel = findAnn(app.selectedAnn);
+            // NOT a cached pointer. app.anns is a std::vector, the two band
+            // items below push_back into it, and ImGui's MenuItem only marks
+            // the popup closed - the rest of this body still runs, so the four
+            // items after them would read (and, on a later frame, write)
+            // through freed heap when the vector reallocated. addAnn also
+            // reassigns app.selectedAnn, so even without a reallocation a
+            // cached pointer stops denoting the selected annotation.
+            auto sel = [] { return findAnn(app.selectedAnn); };
             ImGui::Separator();
             // a single row / column is one pixel thick and cannot be dragged out
             if (ImGui::MenuItem("Select this row (1 px)", "X", false, inRange)) {
@@ -7294,16 +7301,28 @@ static void drawCanvas(ImVec2 avail) {
                     n->label = "col " + std::to_string(app.ctxX);
                 }
             }
-            if (ImGui::MenuItem("Widen ROI to full width", nullptr, false, sel && sel->type == 0)) {
-                sel->prevX = sel->x; sel->prevW = sel->w; sel->x = 0; sel->w = im->w; app.annRev++;
+            {
+                App::Ann* s1 = sel();
+                if (ImGui::MenuItem("Widen ROI to full width", nullptr, false,
+                                    s1 && s1->type == 0))
+                    if (App::Ann* a1 = sel()) {
+                        a1->prevX = a1->x; a1->prevW = a1->w;
+                        a1->x = 0; a1->w = im->w; app.annRev++;
+                    }
+                App::Ann* s2 = sel();
+                if (ImGui::MenuItem("Widen ROI to full height", nullptr, false,
+                                    s2 && s2->type == 0))
+                    if (App::Ann* a2 = sel()) {
+                        a2->prevY = a2->y; a2->prevH = a2->h;
+                        a2->y = 0; a2->h = im->h; app.annRev++;
+                    }
+                App::Ann* s3 = sel();
+                if (ImGui::MenuItem("Crop image to this ROI", nullptr, false,
+                                    s3 && s3->type == 0))
+                    cropCurrentToSelectedRoi();
+                if (ImGui::MenuItem("Delete", "Del", false, sel() != nullptr))
+                    deleteAnn(app.selectedAnn);
             }
-            if (ImGui::MenuItem("Widen ROI to full height", nullptr, false, sel && sel->type == 0)) {
-                sel->prevY = sel->y; sel->prevH = sel->h; sel->y = 0; sel->h = im->h; app.annRev++;
-            }
-            if (ImGui::MenuItem("Crop image to this ROI", nullptr, false, sel && sel->type == 0))
-                cropCurrentToSelectedRoi();
-            if (ImGui::MenuItem("Delete", "Del", false, sel != nullptr))
-                deleteAnn(app.selectedAnn);
             ImGui::Separator();
             if (ImGui::MenuItem("Fit to window", "F")) app.fitRequested = true;
             if (ImGui::MenuItem("Actual size", "1")) app.view.zoom = 1.0f;
@@ -11994,9 +12013,19 @@ static void drawPanelRemote() {
                 reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
                          fmtEntryShape(e);
         }
-        if (nSel >= 2) {
+        {   // ALWAYS submitted, disabled below two selections. The panel's own
+            // rule, written for the scrub bar: "footer space RESERVED even when
+            // no preview is alive, so starting one never shifts the rows under
+            // the cursor". This row appearing at nSel == 2 pushed the whole
+            // listing down one button height on the frame AFTER the second
+            // Ctrl+click - so the third click of a rapid multi-select landed on
+            // the row above the one under the cursor and toggled the wrong file
+            // into the selection that then feeds "Open N selected as stack".
             char lb[64];
-            snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
+            if (nSel >= 2) snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
+            else           snprintf(lb, sizeof lb, "Open selected as stack");
+            bool few = nSel < 2;
+            if (few) reason = "select two or more files (Ctrl / Shift + click)";
             if (!reason.empty()) ImGui::BeginDisabled();
             if (ImGui::Button(lb)) {
                 std::vector<std::string> files;
@@ -12055,6 +12084,7 @@ static void drawPanelRemote() {
             if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
         }
     }
+    
     // The metadata columns exist from protocol 3 on. Say so once, up here - a
     // "-" in every row of every column explains nothing.
     {
