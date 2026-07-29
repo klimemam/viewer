@@ -71,13 +71,18 @@ for k in range(24):
     (seq / f"flat_{k:04d}_{W}x{H}_gray16.raw").write_bytes(frame.tobytes())
 
 # remote-browser fixtures (--remote-selftest): one numbered .npy stack plus
-# loose files in the same folder (LIST grouping: 1 group + 3 singles), and a
-# root of per-illumination folders (SCAN / remote open-folder: 3 groups)
+# loose files in the same folder (LIST grouping: 1 group + 4 singles), and a
+# root of per-illumination folders (SCAN / remote open-folder: 3 groups).
+# burst.npy is the OTHER stack kind - one file, 6 frames on axis 0 - for the
+# preview scrub and double-click coverage (--preview-selftest): it lists as a
+# single (no group row, nothing to flatten), so previewing its frames only
+# works if the scrub steps the frame index inside the file
 rb = out / "rb"
 rb.mkdir(exist_ok=True)
 rng3 = np.random.default_rng(11)
 for k in range(24):
     np.save(rb / f"frame_{k:03d}.npy", (rng3.random((64, 64)) * 4095).astype(np.float32))
+np.save(rb / "burst.npy", (rng3.random((6, 32, 32)) * 4095).astype(np.float32))
 np.save(rb / "dark.npy", np.zeros((64, 64), np.float32))
 np.save(rb / "flat.npy", np.full((64, 64), 1000.0, np.float32))
 (rb / "notes.txt").write_text("not an image\n")
