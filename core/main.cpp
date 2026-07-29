@@ -4914,14 +4914,13 @@ static App::SeqInfo* seqInfo(int id) {
 }
 static void selectImage(int idx) {
     if (idx < 0 || idx >= (int)app.images.size()) return;
-    // Walking A onto the image pinned as B would silently switch compare off
-    // (B must not be A). Swap instead, so stepping through a stack against a
-    // pinned frame keeps comparing in both directions.
-    if (app.compareMode != App::CmpOff && cur() && app.images[idx].get() != cur() &&
-        app.compareBUid && app.images[idx]->uid == app.compareBUid) {
-        setCompareB(cur());
-        toast("A / B swapped");
-    }
+    // Walking A onto the image pinned as B used to SWAP them, so that looking
+    // at B stopped it from being B and rewrote the pin to whatever A had been.
+    // B is something the user pinned deliberately; navigating must not rewrite
+    // it. Nothing is needed here: resolveB already answers null while A sits on
+    // B, so the comparison goes quiet for exactly as long as you are standing
+    // on it and comes back, still pinned, when you step away. Shift+\ (or the
+    // row's "Swap A and B") is how you swap - on purpose.
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
     // Held-down frame stepping: B's caches cost real milliseconds per step
@@ -19800,6 +19799,32 @@ int main(int argc, char** argv) {
                 swapCompare();
                 check(cur() != wasA && abRowItem(wasA) == AbSetB,
                       "A7 after the swap the old A is a Set-as-B row again");
+                // A8: B is a PIN. Walking A onto it used to swap the two, so
+                // looking at B stopped it from being B and rewrote the pin to
+                // whatever A had been. Now the comparison goes quiet while A
+                // stands on B, and B is still B when A steps away.
+                {
+                    uint64_t pin = app.compareBUid;
+                    int bIdx = -1;
+                    for (int i = 0; i < (int)app.images.size(); i++)
+                        if (app.images[i]->uid == pin) bIdx = i;
+                    int away = -1;
+                    for (int i = 0; i < (int)app.images.size(); i++)
+                        if (app.images[i]->uid != pin && app.images[i]->seqId != 0) { away = i; break; }
+                    if (bIdx >= 0 && away >= 0) {
+                        selectImage(bIdx);                 // stand on B
+                        bool kept = app.compareBUid == pin, quiet = cmpB() == nullptr;
+                        selectImage(away);                 // and step off it
+                        bool back = app.compareBUid == pin && cmpB() &&
+                                    cmpB()->uid == pin;
+                        fprintf(stderr, "abstatsselftest: A8 stand on B: pin kept=%d "
+                                        "compare quiet=%d; step away: B is back=%d\n",
+                                kept ? 1 : 0, quiet ? 1 : 0, back ? 1 : 0);
+                        check(kept, "A8 selecting B does not rewrite the pin");
+                        check(quiet, "A8 ...the comparison goes quiet while A stands on it");
+                        check(back, "A8 ...and B is still B when A steps away");
+                    }
+                }
             }
         }
 
