@@ -211,6 +211,7 @@ struct App {
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     std::unique_ptr<pfd::save_file> saveDlg;
     std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    std::unique_ptr<pfd::save_file> pngDlg;    // Image > Save view as PNG
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
     // set is polled only when some unrelated event happens to wake the loop -
@@ -908,7 +909,7 @@ struct App {
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
     bool anyFileDialog() const {      // see the note on csvDlg
-        return openDlg || saveDlg || csvDlg || folderDlg;
+        return openDlg || saveDlg || csvDlg || pngDlg || folderDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
@@ -1419,13 +1420,13 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
 }
 
 // upload/normalize into RGBA8 texture
-static void rebuildTexture(ImageDoc& im) {
-    // One scratch buffer for the whole app: a 12 Mpx image is a 48 MB allocation,
-    // and this runs on every range/gamma/LUT change.
-    static std::vector<uint8_t> rgba;
+// float pixels -> display RGBA, exactly as the screen shows them (range, gamma,
+// colormap, CFA colorize). Split out of rebuildTexture so that EXPORTING a view
+// runs the same code: a picture pasted into a report that does not match the
+// screen is worse than no picture.
+static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
     rgba.resize((size_t)im.w * im.h * 4);
     const float ib = effBlack(im), iw = effWhite(im);
-    im.texBlack = ib; im.texWhite = iw;
     float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
     bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
@@ -1484,6 +1485,14 @@ static void rebuildTexture(ImageDoc& im) {
         }
         rgba[p * 4 + 3] = 255;
     }
+}
+
+static void rebuildTexture(ImageDoc& im) {
+    // One scratch buffer for the whole app: a 12 Mpx image is a 48 MB allocation,
+    // and this runs on every range/gamma/LUT change.
+    static std::vector<uint8_t> rgba;
+    im.texBlack = effBlack(im); im.texWhite = effWhite(im);
+    renderDocRGBA(im, rgba);
     if (!im.tex) glGenTextures(1, &im.tex);
     touchTex(im);
     glBindTexture(GL_TEXTURE_2D, im.tex);
@@ -1495,6 +1504,124 @@ static void rebuildTexture(ImageDoc& im) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, im.texNearest ? GL_NEAREST : GL_LINEAR);
     im.texDirty = false;
 }
+// ---------------------------------------------------------------- export
+// Getting a picture OUT of the tool and into a report. Two things are wanted
+// and they are not the same thing:
+//   dot by dot  - one image pixel per output pixel, no resampling. What an
+//                 image-quality reader needs: the noise is the subject, and a
+//                 scaled screenshot invents and destroys exactly that.
+//   as displayed - the canvas as it sits, zoom and overlays included. Not here
+//                 yet (see docs/todo-open.md): it needs a framebuffer readback
+//                 after the frame is rendered, and this machine cannot verify
+//                 the result today.
+// Both go through renderDocRGBA, so what leaves the app is what the screen
+// showed - the same range, gamma, colormap and CFA colorize.
+
+// PNG via miniz, which is already linked for .npz. No new dependency.
+static std::vector<uint8_t> encodePng(const std::vector<uint8_t>& rgba, int w, int h) {
+    std::vector<uint8_t> out;
+    size_t len = 0;
+    void* png = tdefl_write_image_to_png_file_in_memory_ex(rgba.data(), w, h, 4, &len, 6, MZ_FALSE);
+    if (!png) return out;
+    out.assign((const uint8_t*)png, (const uint8_t*)png + len);
+    mz_free(png);
+    return out;
+}
+
+#ifdef _WIN32
+// Two formats, because "paste" means different things to different programs:
+// CF_DIB is what Word, PowerPoint and Excel read; the registered "PNG" format
+// is what most browsers and chat clients prefer, and it keeps the alpha.
+static bool clipboardPutImage(const std::vector<uint8_t>& rgba, int w, int h,
+                              const std::vector<uint8_t>& png, std::string& err) {
+    if (!OpenClipboard(nullptr)) { err = "the clipboard is held by another program"; return false; }
+    EmptyClipboard();
+    bool any = false;
+    {   // CF_DIB: BITMAPINFOHEADER + BGRA, bottom-up
+        const size_t px = (size_t)w * h * 4;
+        HGLOBAL hm = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + px);
+        if (hm) {
+            uint8_t* dst = (uint8_t*)GlobalLock(hm);
+            BITMAPINFOHEADER bi{};
+            bi.biSize = sizeof bi; bi.biWidth = w; bi.biHeight = h;   // + = bottom-up
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = BI_RGB;
+            bi.biSizeImage = (DWORD)px;
+            memcpy(dst, &bi, sizeof bi);
+            uint8_t* q = dst + sizeof bi;
+            for (int y = 0; y < h; y++) {
+                const uint8_t* src = &rgba[(size_t)(h - 1 - y) * w * 4];
+                for (int x = 0; x < w; x++) {
+                    q[x * 4 + 0] = src[x * 4 + 2];   // B
+                    q[x * 4 + 1] = src[x * 4 + 1];   // G
+                    q[x * 4 + 2] = src[x * 4 + 0];   // R
+                    q[x * 4 + 3] = src[x * 4 + 3];
+                }
+                q += (size_t)w * 4;
+            }
+            GlobalUnlock(hm);
+            if (SetClipboardData(CF_DIB, hm)) any = true; else GlobalFree(hm);
+        }
+    }
+    if (!png.empty()) {
+        UINT cfPng = RegisterClipboardFormatA("PNG");
+        HGLOBAL hp = cfPng ? GlobalAlloc(GMEM_MOVEABLE, png.size()) : nullptr;
+        if (hp) {
+            memcpy(GlobalLock(hp), png.data(), png.size());
+            GlobalUnlock(hp);
+            if (SetClipboardData(cfPng, hp)) any = true; else GlobalFree(hp);
+        }
+    }
+    CloseClipboard();
+    if (!any) err = "the clipboard refused the image";
+    return any;
+}
+#endif
+
+// The ONE place an export is produced, so the file and the clipboard can never
+// disagree about what the picture is.
+static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int& h) {
+    if (!im || im->w < 1 || im->h < 1) return false;
+    w = im->w; h = im->h;
+    renderDocRGBA(*im, rgba);
+    return true;
+}
+
+static void copyViewDotByDot() {
+    ImageDoc* im = cur();
+    std::vector<uint8_t> rgba; int w = 0, h = 0;
+    if (!exportDocRGBA(im, rgba, w, h)) { toast("nothing to copy", true); return; }
+    std::vector<uint8_t> png = encodePng(rgba, w, h);
+#ifdef _WIN32
+    std::string err;
+    if (clipboardPutImage(rgba, w, h, png, err))
+        toast("copied " + std::to_string(w) + "x" + std::to_string(h) + " (dot by dot)");
+    else
+        toast("copy failed: " + err, true);
+#else
+    // No image clipboard without a toolkit here: write the PNG next to nothing
+    // and hand over the PATH, which every file dialog and chat client accepts.
+    std::string path = (std::filesystem::temp_directory_path() /
+                        ("viewer-" + std::to_string(im->uid) + ".png")).u8string();
+    std::ofstream f(path, std::ios::binary);
+    f.write((const char*)png.data(), (std::streamsize)png.size());
+    f.close();
+    ImGui::SetClipboardText(path.c_str());
+    toast("wrote " + path + " (path on the clipboard)");
+#endif
+}
+
+static void saveViewPng(const std::string& path) {
+    ImageDoc* im = cur();
+    std::vector<uint8_t> rgba; int w = 0, h = 0;
+    if (!exportDocRGBA(im, rgba, w, h)) { toast("nothing to save", true); return; }
+    std::vector<uint8_t> png = encodePng(rgba, w, h);
+    if (png.empty()) { toast("PNG encode failed", true); return; }
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) { toast("cannot write " + path, true); return; }
+    f.write((const char*)png.data(), (std::streamsize)png.size());
+    toast("saved " + baseName(path) + "  " + std::to_string(w) + "x" + std::to_string(h));
+}
+
 static void setFilter(ImageDoc& im, bool nearest) {
     if (im.texNearest == nearest || !im.tex) { im.texNearest = nearest; return; }
     im.texNearest = nearest;
@@ -2699,6 +2826,79 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
         // the view is shared: only frame the very first image, keep it afterwards
         if (app.images.size() == 1 || app.fitOnSwitch) app.fitRequested = true;
     }
+}
+
+// ---- ROI montage: the same ROI from every frame, laid side by side ---------
+// A contact sheet of one region across a stack - the thing you actually paste
+// into a report to show drift, flicker or a defect appearing.
+//
+// The result is a real ImageDoc, not a picture: it can be measured, ranged and
+// exported like anything else. So it carries DATA rules, not poster rules -
+//   - no separator lines: a drawn line is a pixel value that was never captured
+//   - CFA phase is preserved by snapping the ROI to even coordinates, or the
+//     tiles would each start on a different Bayer phase and every per-plane
+//     statistic over the montage would be wrong
+//   - it says n of N: a partially loaded stack must not look complete
+static bool montageROI(bool horizontal, std::string& err) {
+    ImageDoc* im = cur();
+    if (!im) { err = "no image"; return false; }
+    if (im->seqId == 0) { err = "not a stack: montage lays out the frames of one stack"; return false; }
+    App::Ann* a = findAnn(app.selectedAnn);
+    if (!a || a->type != 0) { err = "select a rectangle ROI first"; return false; }
+    int rx = std::clamp(a->x, 0, im->w), ry = std::clamp(a->y, 0, im->h);
+    int rw = std::clamp(a->w, 0, im->w - rx), rh = std::clamp(a->h, 0, im->h - ry);
+    if (rw < 1 || rh < 1) { err = "the ROI is empty"; return false; }
+    bool snapped = false;
+    if (im->cfa) {                       // keep every tile on the same Bayer phase
+        if (rx & 1) { rx--; rw++; snapped = true; }
+        if (ry & 1) { ry--; rh++; snapped = true; }
+        if (rw & 1) { rw--; snapped = true; }
+        if (rh & 1) { rh--; snapped = true; }
+        if (rw < 2 || rh < 2) { err = "the ROI is too small for a CFA montage"; return false; }
+    }
+    std::vector<int> fr = framesOfSeq(im->seqId);
+    if (fr.size() < 2) { err = "the stack has one frame"; return false; }
+    const int ch = im->ch, n = (int)fr.size();
+    const int ow = horizontal ? rw * n : rw;
+    const int oh = horizontal ? rh : rh * n;
+    auto out = std::make_unique<ImageDoc>();
+    out->w = ow; out->h = oh; out->ch = ch;
+    out->dtype = im->dtype;
+    out->data.assign((size_t)ow * oh * ch, 0.0f);
+    for (int k = 0; k < n; k++) {
+        const ImageDoc& src = *app.images[fr[k]];
+        if (src.w != im->w || src.h != im->h || src.ch != ch) continue;   // ragged stack
+        const int ox = horizontal ? rw * k : 0;
+        const int oy = horizontal ? 0 : rh * k;
+        for (int y = 0; y < rh; y++) {
+            const float* sp = &src.data[((size_t)(ry + y) * src.w + rx) * ch];
+            float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+            memcpy(dp, sp, (size_t)rw * ch * sizeof(float));
+        }
+    }
+    // the montage inherits the CFA description only if the phase survived, which
+    // the even-snap above guarantees; the pattern itself is unchanged
+    out->cfa = im->cfa; out->cfaPattern = im->cfaPattern;
+    out->black = im->black; out->white = im->white;
+    out->vmin = im->vmin; out->vmax = im->vmax;
+    out->batchId = im->batchId;
+    const App::SeqInfo* si = seqInfo(im->seqId);
+    int expected = si && si->expectedFrames > 0 ? si->expectedFrames : n;
+    char nm[512];
+    snprintf(nm, sizeof nm, "%s  ROI %dx%d x%d%s %s", si ? si->name.c_str() : im->name.c_str(),
+             rw, rh, n, n < expected ? (" of " + std::to_string(expected)).c_str() : "",
+             horizontal ? "(montage H)" : "(montage V)");
+    out->name = nm;
+    out->note = std::string("ROI (") + std::to_string(rx) + "," + std::to_string(ry) + ") " +
+                std::to_string(rw) + "x" + std::to_string(rh) + " from " +
+                std::to_string(n) + (n < expected ? " of " + std::to_string(expected) : "") +
+                " frame(s)" + (snapped ? ", snapped to the CFA phase" : "");
+    out->texDirty = true;
+    addImage(std::move(out));
+    if (n < expected)
+        toast("montage: " + std::to_string(n) + " of " + std::to_string(expected) +
+              " frames are loaded", true);
+    return true;
 }
 
 // ---------------------------------------------------------------- .npz (zip)
@@ -7325,6 +7525,14 @@ static void pollFileDialog() {           // called once per frame from the main 
         app.csvDlg.reset();
         app.pendingCsv.clear();
     }
+    if (app.pngDlg && app.pngDlg->ready(0)) {
+        std::string p = app.pngDlg->result();
+        if (!p.empty()) {
+            if (p.size() < 4 || p.substr(p.size() - 4) != ".png") p += ".png";
+            saveViewPng(p);
+        }
+        app.pngDlg.reset();
+    }
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();
@@ -7823,6 +8031,37 @@ static void drawCanvas(ImVec2 avail) {
                     cropCurrentToSelectedRoi();
                 if (ImGui::MenuItem("Delete", "Del", false, sel() != nullptr))
                     deleteAnn(app.selectedAnn);
+            }
+            ImGui::Separator();
+            {   // out of the tool and into a report
+                ImageDoc* ci = cur();
+                if (ImGui::MenuItem("Copy image (dot by dot)", "Ctrl+Shift+C", false, ci != nullptr))
+                    copyViewDotByDot();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("one image pixel per copied pixel, with the range,\n"
+                                      "gamma and colormap you see. No resampling.");
+                if (ImGui::MenuItem("Save image as PNG...", nullptr, false, ci != nullptr)) {
+                    if (!pfd::settings::available())
+                        toast("no file-dialog backend found (install zenity or kdialog)", true);
+                    else
+                        app.pngDlg = std::make_unique<pfd::save_file>("Save image as PNG",
+                            baseName(ci->name) + ".png",
+                            std::vector<std::string>{ "PNG (*.png)", "*.png" });
+                }
+                const bool inStack = ci && ci->seqId != 0;
+                App::Ann* ra = findAnn(app.selectedAnn);
+                const bool roiOk = ra && ra->type == 0;
+                if (ImGui::BeginMenu("Montage ROI across the stack", inStack && roiOk)) {
+                    std::string merr;
+                    if (ImGui::MenuItem("side by side (horizontal)"))
+                        if (!montageROI(true, merr)) toast(merr, true);
+                    if (ImGui::MenuItem("stacked (vertical)"))
+                        if (!montageROI(false, merr)) toast(merr, true);
+                    ImGui::EndMenu();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !(inStack && roiOk))
+                    ImGui::SetTooltip(!inStack ? "the current image is not part of a stack"
+                                               : "select a rectangle ROI first");
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Fit to window", "F")) app.fitRequested = true;
@@ -12832,6 +13071,28 @@ static void drawPanelRemote() {
                                   : "only .npy files can form a stack");
             }
             ImGui::SameLine();
+            // A selection you can open but cannot NAME is half a selection: the
+            // paths are what goes into a script, a ticket or a message. The
+            // single-row context menu has had "Copy path" all along; the
+            // multi-select row simply never grew one.
+            if (ImGui::SmallButton("Copy paths##sel")) {
+                std::string all;
+                int nf = 0;
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                    if (!rbSel[i]) continue;
+                    if (view[i].isGroup())            // a group row means its frames
+                        for (const auto& m : view[i].e->members) {
+                            all += view[i].join(m); all += "\n"; nf++;
+                        }
+                    else { all += view[i].full(); all += "\n"; nf++; }
+                }
+                ImGui::SetClipboardText(all.c_str());
+                toast("copied " + std::to_string(nf) + " path(s)");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("one absolute path per line; a numbered group\n"
+                                  "expands to the frames it stands for");
+            ImGui::SameLine();
             if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
         }
     }
@@ -14696,6 +14957,7 @@ static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
+static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
@@ -14902,6 +15164,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
+        } else if (a == "--export-selftest") {
+            g_exportSelftest = next();             // handled in main()
         } else if (a == "--series-selftest") {
             g_seriesSelftest = next();             // handled in main()
         } else if (a == "--sweepfile-selftest") {
@@ -16861,6 +17125,121 @@ int main(int argc, char** argv) {
     // nothing at all). Every invariant docs/terminology.md and docs/series-plan.md
     // state, checked exhaustively (seriesAudit) after every mutation, on the real
     // load path: Open Folder -> picker -> stacks.
+    // ---- --export-selftest: getting a picture OUT ---------------------------
+    // Every claim here is one I cannot see on this machine (the GL client area
+    // captures white, see docs/todo-open.md), so each is asserted on the bytes.
+    if (!g_exportSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool c, const char* what) {
+            fprintf(stderr, "exportselftest: %-58s %s\n", what, c ? "PASS" : "FAILED");
+            if (!c) ok = false;
+        };
+        auto drain = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        openFolder(g_exportSelftest);
+        if (app.folderPickOpen) pickerAccept();
+        drain();
+        if (app.images.empty()) { fprintf(stderr, "exportselftest: nothing loaded\n"); return 1; }
+        ImageDoc* im = cur();
+        check(im && im->w > 0, "E1 an image is open");
+
+        {   // PNG: a real signature, the right size, and the SAME pixels the
+            // screen would get (renderDocRGBA is the one mapping, not a copy)
+            std::vector<uint8_t> rgba; int w = 0, h = 0;
+            bool got = exportDocRGBA(im, rgba, w, h);
+            check(got && w == im->w && h == im->h, "E2 the export is the image's own size");
+            check(rgba.size() == (size_t)w * h * 4, "E2 ...and one RGBA quad per pixel");
+            std::vector<uint8_t> png = encodePng(rgba, w, h);
+            static const uint8_t SIG[8] = { 0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A };
+            bool sig = png.size() > 8 && memcmp(png.data(), SIG, 8) == 0;
+            check(sig, "E3 the bytes are a PNG");
+            // IHDR carries the dimensions big-endian at offset 16
+            uint32_t pw = 0, ph = 0;
+            if (png.size() > 24) {
+                for (int i = 0; i < 4; i++) pw = (pw << 8) | png[16 + i];
+                for (int i = 0; i < 4; i++) ph = (ph << 8) | png[20 + i];
+            }
+            fprintf(stderr, "exportselftest: PNG %zu bytes, IHDR %ux%u, image %dx%d\n",
+                    png.size(), pw, ph, w, h);
+            check((int)pw == w && (int)ph == h, "E3 ...and its IHDR matches the image");
+            // the range really is applied: a black pixel and a white pixel differ
+            std::vector<uint8_t> a2;
+            float ob = im->black, ow2 = im->white;
+            im->black = im->vmin; im->white = im->vmax; renderDocRGBA(*im, a2);
+            im->black = im->vmax; im->white = im->vmax + 1;
+            std::vector<uint8_t> b2; renderDocRGBA(*im, b2);
+            im->black = ob; im->white = ow2;
+            check(a2 != b2, "E4 the display range reaches the export");
+        }
+
+        {   // montage: geometry, count, CFA phase, and n-of-N honesty
+            std::string err;
+            check(!montageROI(true, err), "E5 no ROI selected -> refused");
+            fprintf(stderr, "exportselftest: refusal said: %s\n", err.c_str());
+            // a rectangle ROI at an ODD origin, to exercise the CFA snap
+            int before = (int)app.images.size();
+            App::Ann ann; ann.type = 0; ann.x = 3; ann.y = 5; ann.w = 9; ann.h = 7;
+            ann.id = app.nextAnnId++;
+            app.anns.push_back(ann);
+            app.selectedAnn = ann.id;
+            std::vector<int> fr = framesOfSeq(im->seqId);
+            check(fr.size() >= 2, "E5 the fixture stack has frames to lay out");
+            bool made = montageROI(true, err);
+            check(made, "E6 horizontal montage is produced");
+            if (made) {
+                ImageDoc* m = app.images.back().get();
+                int n = (int)fr.size();
+                // with a CFA image the ROI snaps to even: 3,5,9x7 -> 2,4,10x8
+                int erw = im->cfa ? 10 : 9, erh = im->cfa ? 8 : 7;
+                fprintf(stderr, "exportselftest: montage %dx%d from %d frame(s), "
+                                "ROI %dx%d (cfa=%d), name '%s'\n",
+                        m->w, m->h, n, erw, erh, im->cfa, m->name.c_str());
+                check(m->w == erw * n && m->h == erh, "E6 ...W = ROI width x frames, H = ROI height");
+                check((int)app.images.size() == before + 1, "E6 ...exactly one image was added");
+                check(m->batchId == im->batchId, "E7 the montage joins its source's batch");
+                check(m->cfa == im->cfa && m->cfaPattern == im->cfaPattern,
+                      "E7 ...and keeps the CFA description");
+                if (im->cfa) check((erw & 1) == 0 && (erh & 1) == 0,
+                                   "E8 the ROI was snapped even, so every tile shares the phase");
+                // the first tile really is frame 0's ROI, pixel for pixel
+                const ImageDoc& f0 = *app.images[fr[0]];
+                int rx = im->cfa ? 2 : 3, ry = im->cfa ? 4 : 5;
+                bool same = true;
+                for (int y = 0; y < erh && same; y++)
+                    for (int x = 0; x < erw; x++)
+                        if (m->data[((size_t)y * m->w + x) * m->ch] !=
+                            f0.data[((size_t)(ry + y) * f0.w + (rx + x)) * f0.ch]) { same = false; break; }
+                check(same, "E9 tile 0 is frame 0's ROI, pixel for pixel");
+            }
+            int mid = (int)app.images.size();
+            // the montage BECOMES the current image (you want to see what you
+            // just made), and a montage is not a stack - so going round again
+            // means going back to the source first. That is the real gesture,
+            // not a test artefact.
+            selectImage(fr[0]);
+            app.selectedAnn = ann.id;
+            bool madeV = montageROI(false, err);
+            check(madeV, "E10 vertical montage is produced");
+            if (madeV) {
+                ImageDoc* v = app.images.back().get();
+                int n = (int)fr.size();
+                int erw = im->cfa ? 10 : 9, erh = im->cfa ? 8 : 7;
+                check(v->w == erw && v->h == erh * n, "E10 ...H = ROI height x frames");
+                check((int)app.images.size() == mid + 1, "E10 ...one image added");
+            }
+        }
+        fprintf(stderr, "exportselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
     if (!g_seriesSelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = glfwGetTime();
