@@ -859,21 +859,21 @@ A がフレーム k、B がフレーム k−1 を映している瞬間、その�
 ### 今どうなっているか (確認済み)
 
 パネルの開閉は **View > Panels** のチェック項目だけ (`BeginMenu("View")` main.cpp
-~14835 の中の `BeginMenu("Panels")` ~14986)。項目は 10 個 — `showFiles` `showRemote`
+~14941 の中の `BeginMenu("Panels")` ~15092)。項目は 10 個 — `showFiles` `showRemote`
 `showInspector` `showRois` `showAnalysis` `showHistogram` `showTemporal`
 `showProjection` `showLinearity` `showMessages`。どれも `bool` 1個で、実体は
 `ImGui::Begin("Projection", &app.showProjection)` のように **名前で1枚に固定された
-ウィンドウ** (~21114 からまとめて並ぶ)。
+ウィンドウ** (~21285 からまとめて並ぶ)。
 
-ドッキングは `ImGuiConfigFlags_DockingEnable` (~16409) と `DockSpace("MainDock")`
-(~21086)。既定配置を DockBuilder で組むのは `app.resetLayout` のときだけ
-(~21088-21104、`DockBuilderSplitNode` → `DockBuilderDockWindow`)。
-それ以外の配置を覚えているのは **2箇所**: `layout.ini` (`io.IniFilename`、~16427) と、
-セッションの `layout_begin` ブロック (`SaveIniSettingsToMemory` ~3811 /
-`LoadIniSettingsFromMemory` ~21577)。**再ドックはこの2つと喧嘩しないこと。**
+ドッキングは `ImGuiConfigFlags_DockingEnable` (~16515) と `DockSpace("MainDock")`
+(~21257)。既定配置を DockBuilder で組むのは `app.resetLayout` のときだけ
+(~21259-21275、`DockBuilderSplitNode` → `DockBuilderDockWindow`)。
+それ以外の配置を覚えているのは **2箇所**: `layout.ini` (`io.IniFilename`、~16533) と、
+セッションの `layout_begin` ブロック (`SaveIniSettingsToMemory` ~3825 /
+`LoadIniSettingsFromMemory` ~21748)。**再ドックはこの2つと喧嘩しないこと。**
 
 「右上にボタン」という置き方自体は前例がある — Histogram の `log` チェックボックスが
-`SameLine(GetContentRegionMax().x - cbW)` で右端に寄せてある (~9570 付近)。
+`SameLine(GetContentRegionMax().x - cbW)` で右端に寄せてある (~9588 付近)。
 
 ### ImGui 1.91.8-docking でできること・できないこと (版を確認した)
 
@@ -916,7 +916,7 @@ A がフレーム k、B がフレーム k−1 を映している瞬間、その�
 いいのかな．暫定UIで，本来どうすべきかはFable TODOにつみましょう．」
 
 Projection の表への**暫定の per-table 指定は入った** (`6047aab`: `app.projDecimals`
-+ `textStat` ~9111、コンボは ~10218)。**1つの表に1つのつまみ**で、明示的に暫定。
++ `textStat` ~9128、コンボは ~10304)。**1つの表に1つのつまみ**で、明示的に暫定。
 ここに記録するのは**全体の話**のほう。
 
 ### 数えた事実
@@ -929,12 +929,12 @@ Projection の表への**暫定の per-table 指定は入った** (`6047aab`: `a
 
 「値をどう書くか」を決める関数も **3つ**ある:
 
-- `textNum(fmt, v)` (~9100) — **書式は呼び出し側が持つ**。20箇所以上が各自
+- `textNum(fmt, v)` (~9117) — **書式は呼び出し側が持つ**。20箇所以上が各自
   `"%.6g"` と書いている (Histogram の quickstats、Temporal、Linearity、A/B 差分表)
-- `fmtVal(v, dtype)` (~7696) — **dtype で分岐する唯一の場所**。整数 dtype なら
+- `fmtVal(v, dtype)` (~7713) — **dtype で分岐する唯一の場所**。整数 dtype なら
   `%.0f`、それ以外は `%.5g`。Inspector の画素値・min/max とステータスバーの
   ホバー値だけがここを通る
-- `textStat(v)` (~9111) — 暫定で入った Projection 専用
+- `textStat(v)` (~9128) — 暫定で入った Projection 専用
 
 ### 何が壊れているか
 
@@ -942,7 +942,7 @@ Projection の表への**暫定の per-table 指定は入った** (`6047aab`: `a
 `textNum` は `CalcTextSize` で右揃えしているが、**小数点の位置が揃わないので
 列として目で追えないし、貼っても列にならない**。ユーザーの「そろえたい」はここ。
 
-そして **コピー経路は表示書式を一切見ていない**。`copyPerFrameStats` (~11354) は
+そして **コピー経路は表示書式を一切見ていない**。`copyPerFrameStats` (~11460) は
 TSV に `"\t%.6g\t%.6g\t%.4g\t%.4g"` と**直書き**している。表に指定を足しても
 クリップボードには届かない。
 
@@ -962,7 +962,7 @@ TSV に `"\t%.6g\t%.6g\t%.4g\t%.4g"` と**直書き**している。表に指定
 ### 外してはいけない制約
 
 - **報告書に貼った数値は再現可能であること。** 表示を丸めるなら、コピー経路は
-  丸めないか、丸めたと分かる形にすること。`fmtExact` (~2267) という
+  丸めないか、丸めたと分かる形にすること。`fmtExact` (~2280) という
   「round-trip する最短表記」(9桁から17桁まで上げて `strtod` の一致を確認する)
   が既にあり、series の level 入力で使われている。**コピーはこれを使うのが筋。**
 - **整数センサの DN には自然な精度がある。** u12 の画素に `%.6g` を当てると
@@ -971,21 +971,22 @@ TSV に `"\t%.6g\t%.6g\t%.4g\t%.4g"` と**直書き**している。表に指定
 
 ---
 
-## 24. 統計表の行 — 「all」行、B 側のプレーン展開、並び順
+## 24. 統計表の行 — 「all」行、B 側のプレーン展開、並び順 (**(1)(3) は済、(2) が不具合**)
 
 ユーザー要望 (2026-07-30): 「chあるのは素晴らしい．BayerのときとかにR,Gr,Gb,B以外に
 all欲しい．あとA,B比較でBはR,Gとかに展開されない．また，並びはSide順か，CHはそろってて
 その中でSide順か，切り替えられるようにしておくとよいね．」
 
-3つ別の話。(2) を調べたら**別の不具合が出てきた**ので、そこから。
+3つ別の話。**(1) と (3) は `1b3c94b` で入った** (下に何が決まったかを書く)。
+残るのは (2) — 調べたら**別の、もっと深い不具合**が出てきたので、そこから。
 
 ### (2) 【確認済みの不具合・設計判断は不要・先に直す】CFA の間引きが**プレーンを丸ごと落としている**
 
-`recomputeProjectionIfNeeded` (~9772) の間引き:
+`recomputeProjectionIfNeeded` (~9789) の間引き:
 
     const size_t PROJ_MAX_SAMPLES = 2000000;
     int step = (int)std::max<size_t>(1, ((size_t)rw * rh) / PROJ_MAX_SAMPLES);
-    if (im->cfa) step = ((step + 1) / 2) * 2;   // keep the CFA phase intact   ← ~9821
+    if (im->cfa) step = ((step + 1) / 2) * 2;   // keep the CFA phase intact   ← ~9844
 
 **step は CFA なら必ず 2 以上になる** (`((1+1)/2)*2 == 2`)。小さい画像でもそうなる。
 そのあと2パス:
@@ -1006,7 +1007,7 @@ RGGB / ROI 原点 (0,0) で loop を再現して数えた結果:
 | R | 有 | 有 | 全部出る |
 | Gr | 有 | **0** | σv が `-` |
 | Gb | **0** | 有 | mean と σf と σh が `-` |
-| B | **0** | **0** | `!f.valid && !hh.valid && !vv.valid` (~10267) で **行ごと消える** |
+| B | **0** | **0** | `!f.valid && !hh.valid && !vv.valid` (~10374) で **行ごと消える** |
 
 640x480 / 2048x2048 / 4096x3072 のどれでも同じ (step は 2 / 2 / 6)。
 ROI 原点が奇数だと**消えるプレーンが R に変わる**だけで、必ず1枚消える。
@@ -1020,15 +1021,15 @@ ROI 原点が奇数だと**消えるプレーンが R に変わる**だけで、
 **同じ族が他に2箇所ある** (どちらも平坦インデックス `p += step` を歩き、
 step が偶数・幅が偶数だと x の偶奇が固定される):
 
-- `recomputeHistogramIfNeeded` の `step = max(1, total/1000000)` (~8650) —
+- `recomputeHistogramIfNeeded` の `step = max(1, total/1000000)` (~8667) —
   1920x1080 で step=10、2048x2048 で 4、4096x3072 で 12。いずれも
   **Gr と B のサンプル数が 0**、mean/sd が 0、ヒストグラム曲線が空になる。
   1 Mpx 以下 (640x480, 1024x1024) では step=1 なので出ない。
-- `roiBasicStatsUncached` の `step = max(1, total/200000)` (~11877) —
+- `roiBasicStatsUncached` の `step = max(1, total/200000)` (~11983) —
   800x600 で step=2、1920x1080 で 10、4096x3072 で 62。**Gr と B が n=0**、
   `valid=false` なので ROI 表のその行が空になる。
 
-(`ensureDiffTexture` の `total/200000` (~1463) も同じ歩き方だが、プレーン別ではなく
+(`ensureDiffTexture` の `total/200000` (~1476) も同じ歩き方だが、プレーン別ではなく
 チャネル最大の百分位なので測定値ではない。表示ゲインが偏るだけ。)
 
 **素性**: この間引きは `a56d159` "Performance audit fixes" (2026-07-27) で入った。
@@ -1036,101 +1037,119 @@ step が偶数・幅が偶数だと x の偶奇が固定される):
 **性能修正が測定値を黙って変えた**典型。コメントが謳う不変条件
 「no column or row is ever left without data」自体が CFA では成立していない。
 
+**`1b3c94b` の「all」行はこの偏りをそのまま受け継いだ。** プールは同じ2パスの中
+(`if (P.allRow) put(4, val);` ~9868) で行われるので、**H の "all" は偶数行 = R と Gr
+だけ、V の "all" は偶数列 = R と Gb だけ、領域の σf は H パス由来なので R と Gr だけ**。
+「全プレーンをまとめた」と読める行が、実際には**4枚中2枚のプールになっている。**
+
+**そして新しい検査 V17 はこれを見られない。** `--verify-selftest` の V17 (~19888) は
+プーリングの算術を検算するとき `if (!T2.fStat[i].valid) continue;` で**空のプレーンを
+飛ばす** — つまり「サンプルが来なかった2枚」をちょうど除外した上で全分散の法則を
+確認している。`T2.nSeries == 4` も通る (`nSeries` は `cfa` から決まる値で、
+サンプルが入ったかとは無関係)。**欠陥を跨いで自己無矛盾なので、永久に緑のまま。**
+
 **直し方の要点**: 「位相を保つために step を偶数にする」が逆効果。CFA では
 **step を 2 の倍数にするのではなく、位相ごとに 4 本の走査を持つ** (偶数行と奇数行の
 両方を、偶数列と奇数列の両方を必ず1回は通す) か、`step` を奇数に丸めるかのどちらか。
 `fStat` を H パスだけで積むのもやめること。
-**回帰**: `--abstats-selftest` に「CFA 画像で `nSeries` 本すべての `fStat`/`hStat`/`vStat`
-が valid」「plane 別サンプル数が 0 でない」を assert する検査を足す。数字が合うかでは
-なく**存在するか**を見る検査なので、fixture は既存の Bayer データで足りる。
+**回帰**: 「CFA 画像で `nSeries` 本すべての `fStat`/`hStat`/`vStat` が valid」
+「plane 別サンプル数が 0 でない」を assert する検査を足す。数字が合うかではなく
+**存在するか**を見る検査 — V17 の `continue` を消して「valid でなければ落ちる」に
+変えるのが最短。fixture は既存の Bayer データで足りる。
 
-### (2') 「A,B比較で B が展開されない」の、compare スロット側の読み
+### (2') 「A,B比較で B が展開されない」の、compare スロット側の読み — **画面で言う所までは済 (`36cc08d`)**
 
 上の不具合と別に、**compare スロット B のプレーン数が A と違う経路も実在する**。
 `recomputeProjectionIfNeeded` は `P.nSeries = cfa ? 4 : std::min(im->ch, 3)` を
-**その doc 自身の `cfa`** から決める (~9794、`cfa = im->ch == 1 && im->cfa != 0`)。
-Histogram も同じ形 (`H.nSeries` ~8644)。そして:
+**その doc 自身の `cfa`** から決める (~9811、`cfa = im->ch == 1 && im->cfa != 0`)。
+Histogram も同じ形 (`H.nSeries` ~8661)。そして:
 
 - CFA の解釈は **`ImageDoc` ごとの属性**で、Inspector の "Interpret" コンボは
-  `cur()` = **A にしか効かない** (~9300)。
-- `seqMosaicChanged` (~6735) が伝播するのは **同じ `seqId` の中だけ**
+  `cur()` = **A にしか効かない** (~9317)。
+- `seqMosaicChanged` (~6752) が伝播するのは **同じ `seqId` の中だけ**
   (`if (d->seqId == si->id)`)。別々に開いた2ファイルなら B には伝わらない。
-- 一括で効くのは CLI の `--cfa` (`app.forceCfa`、ロード時に適用 ~2931 / ~7358) だけ。
+- 一括で効くのは CLI の `--cfa` (`app.forceCfa`、ロード時に適用 ~2944 / ~7375) だけ。
 
 つまり **A を手で Bayer にした瞬間、B は Gray のまま**になり、A は R/Gr/Gb/B の
 4行、B は `ch0` の1行になる。表の欠陥ではなく「B の解釈を設定する手段が無い」
 という欠陥。`abStepBusy()` は 300 ms の throttle でしかなく (項目21)、
-`abSeriesMatch` (~8972) も**行を落とさない** — 使っているのは線の色と
-凡例だけ (~10054、名前が一致しないプレーンは `ODD_COL` で描く)。**行を減らしているのは
+`abSeriesMatch` (~8989) も**行を落とさない** — 使っているのは線の色と
+凡例だけ (~10088、名前が一致しないプレーンは `ODD_COL` で描く)。**行を減らしているのは
 `nSeries` そのもの。**
 
-ついでに数えた事実: **Histogram の "quickstats" 表 (~9547) には B の行が1本も無い。**
+ついでに数えた事実: **Histogram の "quickstats" 表 (~9564) には B の行が1本も無い。**
 `app.hist[0]` の `nSeries` だけを回していて side 列すら無く、比較中でも A の
 数字しか出ない。Projection だけが side 列を持っている。「B が展開されない」を
 Histogram の表で見たのなら、これが答え (=そもそも B が居ない)。
 
-決めること: **CFA の解釈は doc の属性か、比較ペアの属性か。** 「B にも同じ解釈を
-当てる」を自動にすると、意図的に別解釈で並べたい場合 (raw と demosaic 済み) が
-壊れる。最低限、**A と B でプレーン集合が違うことを表で言う**こと
-(サイズ違いを "size differs" と言っているのと同じ扱い、項目3 参照)。
+**済んだ部分 (`36cc08d`)**: 「最低限、プレーン集合が違うことを表で言う」は入った。
+`projSayPlaneMismatch` (~10243) が、少ない側の名前と
+"its CFA interpretation differs" を橙で出し、ツールチップで直し方
+(Inspector > Interpret) を言う。サイズ違いの "size differs" (項目3) と同じ扱い。
 
-### (1) 「all」行 — 正典と衝突する。しかも既に半分やってしまっている
+**残っている決めごと**: **CFA の解釈は doc の属性か、比較ペアの属性か、
+それともセンサの属性か。** 「B にも自動で同じ解釈を当てる」にすると、
+意図的に別解釈で並べたい場合 (raw と demosaic 済み) が壊れる。
+逆に今のままだと、**A を Bayer にするたびに B を選び直して同じ操作をやり直す**
+必要がある (Interpret は `cur()` にしか効かないので)。
+候補: (a) doc のまま + 警告 (今)、(b) 比較に入る側へ引き継ぐ、
+(c) 「この stack はモザイクである」を stack/series の宣言にする
+(項目16-3 の flat/dark 宣言と同じ形の問題 — 宣言か推論か)。
 
-正典:
+### (1) 「all」行 — 済 (`1b3c94b`)。正典との折り合いの付け方も込みで
+
+正典はこう言っている:
 
 - `docs/stats-taxonomy.md` 29行目: 「**鉄則 — plane は決して混ぜない**」
   「plane 混合平均は**「別の測定」であり既定にしない**」
 - `docs/terminology.md` 92行目: 「CFA プレーンは統計で決して混ぜない」
 
-コードには既に**その言い方**がある: `"plane=all (no CFA split)"` (~11218 / ~11311 /
-~13408 / ~13824)、`nPl > 1 ? "CFA planes" : "plane=all"` (~11629)。
-だから「all」行を足すなら **この語彙で、5枚目のプレーンに見えない形で**出すこと。
+入ったものは正典に沿っている: `app.projAllRow` は**既定 OFF**、`P.allRow` は
+`nSeries` とは**別のフラグ** (~967 / ~9815) なので 5枚目のプレーンにはならず、
+行はその組の**最後**に固定 (`projForEachRow` ~10257)。プールは plane 行と
+**同じパスの中**なので、全体と部分が同じサンプルでできている。
 
-**注意 — 「all」という語は既に別の意味で使われている。** Histogram の
-`plane##hist` コンボ (~9587) と ROIs の `channel` コンボ (~11954) の "all" は
-「**全プレーンをそれぞれ描く/並べる**」というフィルタであって、混合ではない。
-ところが **ROIs の "all" だけは実際に混ぜている**: `roiBasicStatsUncached`
-(~11870) は `chSel < 0` のとき CFA でもプレーンを分けずに `sum`/`sum2` に積む。
-**同じ単語が2つの意味で使われていて、片方は正典違反。**
+**残っている宿題**: 画面が「これは σ に何を含むか」を言っていない。
+プールされた σf には**プレーン間の平均差 (= モザイクのコントラスト)** が
+全分散の法則どおり入る (V17 が `within + between` で検算しているとおり)。
+Bayer の "all" の σ は**ノイズではない**。既存の語彙
+`"plane=all (no CFA split)"` (~11324 / ~11417 / ~13514 / ~13930) と
+`nPl > 1 ? "CFA planes" : "plane=all"` (~11735) が既にあるので、
+**同じ言い方をこの行にも出す**こと。
 
-決めるべきは**どの「all」か**。2つあり、σ では値が違う:
+**もうひとつ残っている**: 「all」という語は既に**別の意味**で使われている。
+Histogram の `plane##hist` コンボ (~9604) と ROIs の `channel` コンボ (~12060) の
+"all" は「**全プレーンをそれぞれ描く/並べる**」というフィルタで、混合ではない。
+ところが **ROIs の "all" だけは実際に混ぜている**: `roiBasicStatsUncached` (~11976)
+は `chSel < 0` のとき CFA でもプレーンを分けずに `sum`/`sum2` に積む — つまり
+Projection に入ったのと同じ測定を、**ラベル無しで**出している。
+**同じ単語が3通りに使われている状態。** ROIs 側を Projection に揃えること。
 
-- **(a) モザイクを無視した生画素の統計** — Bayer では R と B の感度差が
-  そのまま分散に入る。σf は「ノイズ」ではなく**モザイクのコントラスト**になり、
-  σh (列平均の σ) は隣接列が別色なので**櫛そのもの**を測る。**危険。**
-- **(b) 4プレーンの統計を集約したもの** (プレーン平均の平均、σ はプレーン内 σ の
-  プーリング)。これなら σ の意味が保たれる。
+### (3) 並び順 — 済 (`1b3c94b`)。ただし channel 主の突合せが**名前ではなく添字**
 
-**mean と p-p だけは (a) でも意味があるが、σ 系は (b) でなければ嘘になる。**
-どちらを "all" と呼ぶのか、両方出すのか、を先に決めること。決めずに行を足すと、
-今の ROIs の "all" が Projection にも増える。
+`app.projStatOrder` (0 = side 主 / 1 = channel 主) と `projForEachRow` (~10257) が
+入り、**wide と per-axis の両方が同じ関数から行を取る**ので、2つの表が
+「どの行が、どの順で」で食い違えなくなった。prefs は `projstatlayout` 行に同居
+(~3803)。以前の状態 (wide = side 主、per-axis = axis 主 → side → plane、
+どちらも `ImGuiTableFlags_Sortable` 無し) は解消。
 
-### (3) 並び順 — 今は side 主 / axis 主。どちらも切り替えられない
+**残っている欠陥**: channel 主の突合せが**スロット添字**で行われている:
 
-- wide 表 (`wrow` ~10262): `wrow(P,"A")` → `wrow(PB,"B")` → extras の順で、
-  各 `wrow` がそのサイドの全プレーンを吐く。つまり **side 主** —
-  A/R, A/Gr, A/Gb, A/B, B/R, …
-- per-axis 表 (`rows` ~10321): `if (showProjH) { rows(A) rows(B) … }` →
-  `if (showProjV) { … }` なので **axis 主 → side → plane** の3段。
-- どちらの `BeginTable` にも `ImGuiTableFlags_Sortable` は付いていない
-  (`SizingFixedFit | RowBg | ScrollX` のみ)。**列ソートは存在しない。**
+    for (int i = 0; i < maxSeries; i++)
+        for (const auto& sr : sides)
+            if (i < sr.S->nSeries) row(*sr.S, sr.name.c_str(), i);
 
-ユーザーの言う「CHはそろっててその中でSide順」= **channel 主** (R/A, R/B, R/C,
-Gr/A, Gr/B, …)。実装の罠:
+(2') のとおり **サイドごとにプレーン集合が違いうる**ので、A が Bayer で B が
+Gray だと **`R:A` の真下に `ch0:B` が並ぶ**。「同じプレーンを縦に並べる」という
+channel 主の目的がそこで壊れる。名前で突き合わせる `abSeriesMatch(names, n, want)`
+(~8989) が既にあり、片側にしか無い系列に -1 を返す — **これを使うこと**。
+片側に無いプレーンの行は**詰めずに `-`** を出す (詰めるとサイドごとに行数が変わり、
+縦の対応が取れなくなる)。
 
-- **サイドごとにプレーン集合が違いうる** ((2') のとおり)。channel 主にするには
-  名前の**和集合**が要る。`abSeriesMatch(names, n, want)` (~8972) が既に
-  名前で突き合わせて、片側にしか無い系列に -1 を返す。**これを使い回すこと** —
-  2つ目の突合せロジックを作らない。
-- 片側に無いプレーンの行は**詰めずに `-`** を出すこと。詰めると行数がサイドごとに
-  変わり、隣の列と対応が取れなくなる。
-- 表の高さは**先に予約されている** (`statRows` ~10006 / ~10014)。行の組み方を
-  変えたら予約式も同じ規則で直すこと。さもないとプロットが表を画面外へ押し出す。
-- 並び順はフレーム送り中に**変わってはいけない** (「columns must not reflow while
-  stepping through frames」~9545 の既存規則の行版)。
-
-保存先は `projStatLayout` / `projDecimals` と同じ prefs 行 (`projstatlayout` ~3790)
-に足すのが素直。
+もう1点、表の高さは**先に予約されている** (`statRows` ~10040 / ~10048、
+`allRows` を数え込むよう追随済み)。行の組み方をこれ以上変えるなら予約式も
+同じ規則で直すこと。並び順がフレーム送り中に変わらないことも維持する
+(「columns must not reflow while stepping through frames」~9562 の行版)。
 
 ---
 
@@ -1150,25 +1169,25 @@ A,B比較になりますが，選択中のやつをBとしてAも選択中のや
 
 | 要望 | 状態 |
 |---|---|
-| 「B が前のやつあったらそれ」 | **済 (`6047aab`)。** `App::lastCompareBUid` (~325) を `setCompareB` (~1109) が書き、`ensureCompareB` が最初の候補として読む (~1311)。`--abstats-selftest` の A9 が固定 (~20623) |
-| 「無かったら選択のやつ」 | **未。** 第2候補は従来どおり `app.prevImageUid` (直前に**見ていた** doc、`selectImage` ~5264 が更新) → それも無ければリストで次の画像 (~1319)。下記1のとおり、今の作りでは「選択のやつ」は B になれない |
+| 「B が前のやつあったらそれ」 | **済 (`6047aab`)。** `App::lastCompareBUid` (~325) を `setCompareB` (~1122) が書き、`ensureCompareB` が最初の候補として読む (~1324)。`--abstats-selftest` の A9 が固定 (~20794) |
+| 「無かったら選択のやつ」 | **未。** 第2候補は従来どおり `app.prevImageUid` (直前に**見ていた** doc、`selectImage` ~5281 が更新) → それも無ければリストで次の画像 (~1332)。下記1のとおり、今の作りでは「選択のやつ」は B になれない |
 | 「Shift+C で C 以降の比較」 | **書かれたが到達しない。下記2。** |
 
 なお、ユーザーが気付いた「前の状態を維持している」挙動そのものは `lastCompareBUid`
-とは別物で、`ensureCompareB` 先頭の `if (resolveB()) return;` (~1306) が作っている
+とは別物で、`ensureCompareB` 先頭の `if (resolveB()) return;` (~1319) が作っている
 — `app.compareBUid` はモードを Off にしても消えないため。B が消えるのは画像を
-閉じたときと Close All (~2391 / ~2503 / ~2722)、セッション読み込み (~4272) だけ。
+閉じたときと Close All (~2404 / ~2516 / ~2735)、セッション読み込み (~4289) だけ。
 `lastCompareBUid` が効くのは**その先** (B を閉じた後、比較を組み直すとき)。
 
 ### 1. 「無かったら選択のやつ」= A と B が同じ画像 【要決定】
 
 今の作りはこれを**意図的に禁じている**:
 
-- `resolveB()` の最後 `return b == cur() ? nullptr : b;` (~1083)
+- `resolveB()` の最後 `return b == cur() ? nullptr : b;` (~1096)
 - `ensureCompareB` の候補走査は全部 `d.get() != cur()` 付き
-- `addCompareSlot` も `if (!d || d == cur()) return;` (~1267)
+- `addCompareSlot` も `if (!d || d == cur()) return;` (~1280)
 
-理由は `selectImage` (~5255) のコメントに書いてある — 「B はユーザーが意図して
+理由は `selectImage` (~5272) のコメントに書いてある — 「B はユーザーが意図して
 留めたもの。A がそこへ歩いてきても書き換えない。立っている間だけ比較が黙り、
 離れれば留めたまま戻る」。**A==B で始めるなら、この規律を変えることになる。**
 差分は全ゼロ、ワイプは無意味、統計表は同じ行が2本 — 何を見せるのかまで決めること。
@@ -1179,33 +1198,33 @@ A,B比較になりますが，選択中のやつをBとしてAも選択中のや
 
 ### 2. 【不具合】Shift+C は書かれたが**永久に到達しない**。しかも二重予約
 
-`6047aab` は `showCompareSlots()` (~1330) を足し、こう呼んでいる:
+`6047aab` は `showCompareSlots()` (~1343) を足し、こう呼んでいる:
 
-    if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys   ← ~20977
+    if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys   ← ~21148
         ...
         if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false) ||
             ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-            if (ImGui::GetIO().KeyShift) showCompareSlots();   // C, D, E...   ← ~20986
+            if (ImGui::GetIO().KeyShift) showCompareSlots();   // C, D, E...   ← ~21157
             else                         cycleCompare();
         }
 
 ブロック全体が `io.KeyMods == ImGuiMod_None` でガードされているので、
 **その中の `io.KeyShift` は定義上つねに false**。`showCompareSlots()` は
-**死んだコード**で、Shift+C は下の Shift ブロック (~21054) に落ちて
+**死んだコード**で、Shift+C は下の Shift ブロック (~21225) に落ちて
 **`swapCompare()` になる** — つまり挙動は変わっていない。
 
 さらに Shift+C は**もともと Swap に予約済み**で、5箇所に印字されている:
-Files 行メニュー (~14134 / ~14140)、View > Compare A/B (~14893)、
-ヘルプのキー一覧 (~15270)、ステータスバーのツールチップ (~21322)。
+Files 行メニュー (~14240 / ~14246)、View > Compare A/B (~14999)、
+ヘルプのキー一覧 (~15376)、ステータスバーのツールチップ (~21493)。
 
 **決めること**: Swap をどのキーへ動かすか、あるいは「C 以降」を別のキーにするか。
 どちらにしても**上の5箇所の文字列が追随する**こと。実装側の注意は
-「Shift 付きは plain キーのブロックに書けない、~21054 の Shift ブロックに書く」。
+「Shift 付きは plain キーのブロックに書けない、~21225 の Shift ブロックに書く」。
 
 ### 3. 「C 以降の比較を呼び出す」とは何をすることか 【要決定】
 
 スロット C, D, E… は `caa5216` で**数値側だけ**実装済み (`app.cmpExtra`、
-`compareExtras()` ~1242、`slotName()` ~1255 — Projection の表に行が増える)。
+`compareExtras()` ~1255、`slotName()` ~1268 — Projection の表に行が増える)。
 画像側は依然 A 対 B のみ。`showCompareSlots()` が実際にやっているのは
 `compareMode = CmpSplit` にすることだけで、**CmpSplit は 2枚の左右分割**だから、
 スロットが3つあっても画像は A と B しか出ない。
