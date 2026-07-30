@@ -9840,8 +9840,17 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // full resolution along its OWN axis and strides the orthogonal one, so no
     // column or row is ever left without data.
     const size_t PROJ_MAX_SAMPLES = 2000000;
-    int step = (int)std::max<size_t>(1, ((size_t)rw * rh) / PROJ_MAX_SAMPLES);
-    if (im->cfa) step = ((step + 1) / 2) * 2;   // keep the CFA phase intact
+    // A CFA stride must move by WHOLE mosaic cells AND visit every line of the
+    // cell it lands on. Rounding the stride up to an even number and then
+    // stepping by it did the opposite: ((1+1)/2)*2 is 2, so EVERY mosaiced
+    // image strided, the H pass saw only even rows and the V pass only even
+    // columns - and for RGGB that means Gb and B are never sampled by H, Gr
+    // and B never by V, so the B plane had no samples at all and its row
+    // simply disappeared from the table. Two of four planes, silently.
+    const int cell = im->cfa == 2 ? 4 : im->cfa ? 2 : 1;   // quad Bayer repeats every 4
+    // ...and the budget has to know that each step now covers `cell` lines
+    int step = (int)std::max<size_t>(1, ((size_t)rw * rh * cell) / PROJ_MAX_SAMPLES);
+    if (cell > 1) step = ((step + cell - 1) / cell) * cell;   // whole cells only
     auto accumulate = [&](int x, int y, bool toH) {
         const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
         int lo = 0, hi = P.nSeries;
@@ -9868,10 +9877,14 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             if (P.allRow) put(4, val);
         }
     };
+    // Each step lands on a mosaic cell and takes ALL of its lines, so every
+    // plane is sampled the same number of times whatever the stride.
     for (int y = 0; y < rh; y += step)          // H profile: every column
-        for (int x = 0; x < rw; x++) accumulate(x, y, true);
+        for (int dy = 0; dy < cell && y + dy < rh; dy++)
+            for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
     for (int y = 0; y < rh; y++)                // V profile: every row
-        for (int x = 0; x < rw; x += step) accumulate(x, y, false);
+        for (int x = 0; x < rw; x += step)
+            for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
     for (int s = 0; s < nAcc; s++) {
         for (int x = 0; x < rw; x++) {
@@ -19909,6 +19922,21 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "verifyselftest: V17 planes=%d allRow=%d (off: planes=%d allRow=%d)\n",
                         T2.nSeries, T2.allRow ? 1 : 0, planesOff, T.allRow ? 1 : 0);
                 check(offClean && planesOff == 4, "V17 four planes, and no pooled row unless asked");
+                // ...and all four actually have SAMPLES. The sample stride used
+                // to be forced even for CFA, so the H pass read only even rows
+                // and the V pass only even columns: for RGGB the B plane got
+                // nothing at all and its row vanished. The first version of
+                // this test could not see that - it skipped planes whose stats
+                // were invalid, which is exactly the ones the bug emptied.
+                bool allPlanes = true;
+                std::string missing;
+                for (int i = 0; i < 4; i++) {
+                    const bool ok3 = T2.fStat[i].valid && T2.hStat[i].valid && T2.vStat[i].valid;
+                    if (!ok3) { allPlanes = false; missing += T2.seriesNames[i]; missing += " "; }
+                }
+                fprintf(stderr, "verifyselftest: V17 planes with region+H+V samples: %s\n",
+                        allPlanes ? "all four" : ("MISSING " + missing).c_str());
+                check(allPlanes, "V17 every CFA plane is sampled by both passes");
                 check(T2.nSeries == 4 && T2.allRow,
                       "V17 the pooled row does not become a fifth plane");
                 // the pooled mean is the sample-weighted mean of the planes
