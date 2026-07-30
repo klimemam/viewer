@@ -197,6 +197,18 @@ struct ViewState {
     ImVec2 center = ImVec2(0, 0);     // image px at canvas center
 };
 
+// Where the Browse toolbar's two width-critical controls ended up, in screen x,
+// against the panel's own content edges. Recorded every frame so a selftest can
+// assert the thing a human reads off a screenshot: "the filter is on screen".
+// (Defined up here because every Browse INSTANCE carries one - see
+// App::BrowseInstance below.)
+struct RbToolbarGeom {
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
+    float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+    int   emptyLocalBtn = 0;               // the not-connected state's local entry
+    float rowX = 0, rowY = 0;              // centre of the first row submitted
+};
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;
@@ -479,6 +491,12 @@ struct App {
     int previewFrames = 0;
     int previewIndex = 0;
     std::string previewLabel;
+    // ...and which machine those paths live on. The preview slot is GLOBAL -
+    // one across every Browse instance (the app's one throwaway; two instances
+    // previewing = last click wins, exactly like clicking twice in one panel) -
+    // so the stepper cannot ask "the" browse panel for its host any more.
+    std::string previewHost;
+    int previewPort = 0;
     int nextSeqId = 1;
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
@@ -488,15 +506,17 @@ struct App {
     // remote viewing: one peer process per host, reached over ssh.
     // OWNERSHIP - remote::Session is documented not-thread-safe (remote.h), so
     // every Session in this program has exactly ONE thread that touches it:
-    //   rbSession  -> the browse worker (rbWorker), and nobody else. Not even a
-    //                 read: peerVersion / bytesReceived / alive are PUBLISHED
-    //                 into App::RemoteBrowse by the worker (RbResult) and the
-    //                 UI reads those plain values.
+    //   BrowseInstance::session -> that instance's browse worker (rbWorker),
+    //                 and nobody else. Not even a read: peerVersion /
+    //                 bytesReceived / alive are PUBLISHED into that instance's
+    //                 RemoteBrowse by the worker (RbResult) and the UI reads
+    //                 those plain values. One session per instance, one worker
+    //                 per instance - the singleton rule "one Session, one
+    //                 owning thread" generalises to "per place being viewed".
     //   uiSession  -> the UI thread (openRemote's meta+tile), and nobody else.
     //   rfWorker / mWorker each hold their own function-local Session.
     // A mutex only one of two racing parties takes protects nothing, which is
     // what the old shared app.remoteSession + app.sesMtx amounted to.
-    std::unique_ptr<remote::Session> rbSession;    // rbWorker's, exclusively
     remote::Session uiSession;                     // the UI thread's, exclusively
     std::string remoteExe;            // empty = ~/.viewer/viewer-serve (self-installed)
     std::string exePath;              // argv[0], for the local:// test peer
@@ -535,10 +555,10 @@ struct App {
         // merge and sweep fields, destroying a local Open Folder selection the
         // user was in the middle of filtering.
         uint32_t scanGen = 0;
-    } rbrowse;
-    // The connect / install / list sequence runs on THIS worker, never on the UI
-    // thread: a git clone on the far side takes seconds, and "Connect froze the
-    // app" is precisely the bug class this tool exists to avoid.
+    };
+    // The connect / install / list sequence runs on the INSTANCE's worker, never
+    // on the UI thread: a git clone on the far side takes seconds, and "Connect
+    // froze the app" is precisely the bug class this tool exists to avoid.
     // RbTreeList is an ordinary LIST whose answer lands in the tree cache
     // instead of replacing the listing: expanding a node must not navigate.
     // RbDisconnect stops the session on the thread that OWNS it: the status bar
@@ -572,14 +592,6 @@ struct App {
         bool alive = false;               // is the session still up AFTER this job?
         uint64_t rx = 0;                  // bytes received so far
     };
-    std::thread rbThread;
-    std::mutex rbMtx;                 // guards rbQueue / rbDone / rbPhase
-    std::vector<RbJob> rbQueue;
-    std::vector<RbResult> rbDone;
-    std::string rbPhase;              // what the worker is doing, for the UI
-    std::atomic<bool> rbBusy{ false };
-    std::atomic<bool> rbStop{ false };
-    std::string pendingRemoteOpen;    // opened once the session is up
     // Stacks a remote folder scan decided to open, one at a time: the next
     // stack starts only when the fetcher is idle, so the memory budget each
     // openRemoteStack computes reflects what the previous one actually loaded.
@@ -606,10 +618,98 @@ struct App {
         std::vector<remote::GlobHit> hits;
         bool truncated = false;
         int skippedDirs = 0;
-    } rbSearch;
+    };
+    // ==== ONE Browse instance: a view onto ONE place =========================
+    // Decision record: docs/todo-open.md item 17 ("instance-able views").
+    // The Browse panel stopped being a singleton: every instance holds a place
+    // (RemoteBrowse), the listing state that used to be ~21 function-local
+    // statics of drawPanelRemote and five g_rb* globals, and its OWN worker
+    // thread with its OWN Session. Local vs remote is where an instance
+    // STANDS, never a panel type - the place vocabulary of
+    // docs/browse-as-file-manager.md survives, only the panel count changed.
+    struct BrowseInstance {
+        // identity. num 1 is the primordial instance: it wears the original
+        // ImGui id "Browse###Remote" (existing layouts and the dock builder
+        // keep working) and is never destroyed, only hidden via app.showRemote
+        // - the last Browse closing behaves like the panel being hidden, so
+        // there is always a Browse to reopen. num >= 2 wear "Browse N###BrowseN"
+        // (stable across sessions: the number is saved) and are destroyed when
+        // their window closes.
+        int num = 1;
+        std::string wtitle;           // the ImGui window name, fixed at creation
+        bool open = true;             // window shown (num 1 mirrors app.showRemote)
+        bool focusReq = false;        // bring the window forward next frame
+        // the place, and everything listed there
+        RemoteBrowse b;
+        RemoteSearch search;
+        std::string pendingOpen;      // a pasted url, opened once the session is up
+        // ---- the worker: one thread, one Session, per instance --------------
+        // The Session is touched by THIS thread only; the UI reads the plain
+        // values the worker publishes (RbResult). Destroying an instance joins
+        // the thread first, so the Session's destruction is single-threaded too.
+        std::unique_ptr<remote::Session> session;   // the worker's, exclusively
+        std::thread thread;
+        std::mutex mtx;               // guards queue / done / phase
+        std::vector<RbJob> queue;
+        std::vector<RbResult> done;
+        std::string phase;            // what the worker is doing, for the UI
+        std::atomic<bool> busy{ false };
+        std::atomic<bool> stop{ false };
+        // ---- tree mode: this instance's expanded nodes and their children ---
+        std::map<std::string, std::vector<remote::Entry>> treeCache;
+        std::vector<std::string> expanded;     // absolute dirs currently open
+        std::vector<std::string> treePending;  // ...and those still being listed
+        int treeLists = 0;                     // node LISTs issued (selftest)
+        // ---- navigation history (mouse back/forward, Alt+Left / Alt+Right) --
+        std::vector<std::string> histBack, histFwd;
+        std::string histKey;          // host:port the history belongs to
+        bool histNav = false;         // set while back/forward itself navigates
+        // ---- the shape of the listing. Per instance; app.rbFlat / rbTree /
+        // rbAdvanced remain the persisted DEFAULTS a new instance starts from,
+        // and a toggle writes through to them (last toggle wins next start).
+        bool flat = false, tree = false, advanced = false;
+        // ---- panel state, formerly function-local statics of drawPanelRemote.
+        // keyboard cursor (row index into the built view, -1 = none)
+        int cursor = -1;
+        bool cursorScroll = false;    // bring it into view this frame
+        std::string curSig;           // host|dir|rev the cursor was built for
+        bool curFlat = false, curTree = false;
+        // sort spec, stashed from the table one frame late (see RB_COL_NAME)
+        int sortCol = 0;              // RB_COL_NAME
+        bool sortDesc = false;
+        // multi-select, by row index; sig says which listing it was built for
+        std::vector<char> sel;
+        int selAnchor = -1;
+        bool selFlat = false, selTree = false;
+        std::string selSig;
+        // filter / server search / path editing
+        char filter[256] = "";
+        char searchBuf[256] = "";
+        bool searchFocus = false;
+        char pathEdit[1024] = "";
+        bool pathEditing = false, pathFocus = false;
+        // tree click-toggle memory (a double-click cancels the first click)
+        std::string treeToggled;
+        bool treeToggledOpen = false;
+        // Properties popup: a snapshot, because the row may scroll out of the
+        // clipper (or the listing may refresh) while the popup is up
+        remote::Entry propsEntry;
+        std::string propsPath;
+        bool propsOpen = false;
+        bool propsNoSize = false;     // an expanded frame: no size/mtime of its own
+        // deferred panel actions - see rbDefer. Per instance: the queue fills
+        // only while THIS instance's rows are alive and drains when they die.
+        std::vector<std::function<void()>> deferred;
+        // selftest probes: where the toolbar and the cursor row landed on screen
+        RbToolbarGeom toolbar;
+        ImVec2 cursorRect[2] = { ImVec2(0, 0), ImVec2(0, 0) };
+        std::string cursorName;
+    };
+    // Never empty once rbMain() ran; [0] is always the primordial instance.
+    std::vector<std::unique_ptr<BrowseInstance>> browsePanels;
     bool showRemoteError = false;     // the full failure text, on demand
     // (there is deliberately no session mutex here any more: see the ownership
-    // note on rbSession/uiSession above. Nothing is shared, so nothing locks.)
+    // note on session/uiSession above. Nothing is shared, so nothing locks.)
     // where analysis runs. auto: remote data -> server, local -> local. server:
     // even a resident frame is measured server-side (one engine for a whole
     // batch). local-fetch: never use the server for compute (today's behavior).
@@ -724,11 +824,9 @@ struct App {
     // free. Cache keyed by absolute path, so it survives navigation; dropped
     // when the machine changes or on an explicit refresh.
     bool rbTree = false;                                        // persisted
-    std::map<std::string, std::vector<remote::Entry>> rbTreeCache;
-    std::vector<std::string> rbExpanded;      // absolute dirs currently open
-    std::vector<std::string> rbTreePending;   // ...and those still being listed
-    int rbTreeLists = 0;                      // node LISTs issued (selftest)
-    bool focusRemote = false;         // bring it forward when a menu item asks
+    // (the tree cache, expanded set and pending list live per Browse instance
+    // now - BrowseInstance::treeCache / expanded / treePending)
+    bool focusRemote = false;         // bring the ACTIVE Browse instance forward
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
@@ -1069,19 +1167,112 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                             int token = 0);
 static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port = 0);
 static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
-static void remoteBrowseTo(const std::string& dir);
-static void rbTreeForget();       // drop the tree's cached children
+static void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir);
+static void rbTreeForget(App::BrowseInstance& I);   // drop the tree's cached children
 static std::string placeUrl(const std::string& host, int port, const std::string& path);
-static void rbEnqueue(App::RbJob job);
+static void rbEnqueue(App::BrowseInstance& I, App::RbJob job);
 static void pumpRemoteBrowse();
 static void stopRbWorker();
 static std::string bootstrapScript();
 static std::string updateScript();
-static void startRemote(const std::string& hostSpec);
-static void drawPanelRemote();
+static void startRemote(App::BrowseInstance& I, const std::string& hostSpec);
+static void sessionRestoreBrowsePlace(int num, const std::string& url);
+static void drawPanelRemote(App::BrowseInstance& I);
 static bool deployPeer(const std::string& host, int port, bool force, std::string& log);
 static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
+
+// ---- Browse instances (docs/todo-open.md item 17: instance-able views) -----
+// The primordial instance. Lazy so it exists whenever anything asks - the
+// selftests, the menus and the first frame all funnel through here.
+static App::BrowseInstance& rbMain() {
+    if (app.browsePanels.empty()) {
+        auto p = std::make_unique<App::BrowseInstance>();
+        p->num = 1;
+        p->wtitle = "Browse###Remote";      // the singleton's id: layouts survive
+        p->flat = app.rbFlat;
+        p->tree = app.rbTree;
+        p->advanced = app.rbAdvanced;
+        app.browsePanels.push_back(std::move(p));
+    }
+    return *app.browsePanels[0];
+}
+static App::BrowseInstance* rbFindNum(int num) {
+    for (auto& p : app.browsePanels)
+        if (p->num == num) return p.get();
+    return nullptr;
+}
+// The instance that last had keyboard focus: what the File menu's remote
+// commands and the local-folder dialog aim at when no panel is naming itself.
+static int g_rbActiveNum = 1;
+static App::BrowseInstance& rbActive() {
+    if (App::BrowseInstance* p = rbFindNum(g_rbActiveNum)) return *p;
+    return rbMain();
+}
+// A new instance: the "+" in the panel and View > New Browse Panel. The number
+// is the smallest unused >= 2, so window ids stay stable across sessions.
+static App::BrowseInstance& rbNewInstance(int wantNum = 0) {
+    rbMain();                               // [0] is always the primordial one
+    int num = wantNum >= 2 ? wantNum : 2;
+    while (rbFindNum(num)) num++;
+    auto p = std::make_unique<App::BrowseInstance>();
+    p->num = num;
+    p->wtitle = "Browse " + std::to_string(num) + "###Browse" + std::to_string(num);
+    p->flat = app.rbFlat;                   // a new view starts from the prefs
+    p->tree = app.rbTree;
+    p->advanced = app.rbAdvanced;
+    p->open = true;
+    p->focusReq = true;
+    app.browsePanels.push_back(std::move(p));
+    return *app.browsePanels.back();
+}
+// Make an instance's window visible and bring it forward (what showRemote +
+// focusRemote did for the singleton). num 1 stays on app.showRemote: that is
+// the flag the session's "panels" line and View > Panels > Browse speak.
+static void rbShowInstance(App::BrowseInstance& I) {
+    if (I.num == 1) app.showRemote = true;
+    else I.open = true;
+    I.focusReq = true;
+}
+static bool rbInstanceShown(const App::BrowseInstance& I) {
+    return I.num == 1 ? app.showRemote : I.open;
+}
+// Is this window name a Browse instance? The main loop's shortcut table stands
+// down for the FOCUSED instance, whichever one that is.
+static bool rbIsBrowseWindowName(const char* n) {
+    return n && (strstr(n, "###Remote") != nullptr || strstr(n, "###Browse") != nullptr);
+}
+static void rbStopWorkerOf(App::BrowseInstance& I);   // defined with rbWorker
+// Destroy a closed instance (num >= 2 only): its worker stops cleanly first.
+// After the join the Session has exactly one toucher left - this thread - so
+// destroying it here keeps the ownership rule intact.
+static void rbDestroyInstance(int num) {
+    if (num == 1) return;                   // the primordial one only hides
+    for (size_t i = 0; i < app.browsePanels.size(); i++)
+        if (app.browsePanels[i]->num == num) {
+            rbStopWorkerOf(*app.browsePanels[i]);
+            if (g_rbActiveNum == num) g_rbActiveNum = 1;
+            app.browsePanels.erase(app.browsePanels.begin() + i);
+            return;
+        }
+}
+// Aggregations for the main loop's wake logic: "is ANY browse worker doing
+// something the window must keep animating for".
+static bool rbAnyBusy() {
+    for (auto& p : app.browsePanels) if (p->busy) return true;
+    return false;
+}
+static bool rbAnyDonePending() {
+    for (auto& p : app.browsePanels) {
+        std::lock_guard<std::mutex> lk(p->mtx);
+        if (!p->done.empty()) return true;
+    }
+    return false;
+}
+static bool rbAnyTreePending() {
+    for (auto& p : app.browsePanels) if (!p->treePending.empty()) return true;
+    return false;
+}
 
 static ImageDoc* cur() { return app.current >= 0 && app.current < (int)app.images.size() ? app.images[app.current].get() : nullptr; }
 
@@ -2814,7 +3005,7 @@ static void closeAll() {
     app.seqQueue.clear();
     app.seqRestore.clear();
     app.rbOpenQueue.clear();
-    app.pendingRemoteOpen.clear();
+    for (auto& bp : app.browsePanels) bp->pendingOpen.clear();
     app.ana.img = nullptr;
     for (int k = 0; k < 2; k++) {     // both A and B slots
         app.hist[k] = App::HistState{};
@@ -3939,6 +4130,19 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
       << (app.showProjection ? 1 : 0) << " " << (app.showLinearity ? 1 : 0) << " "
       << (app.showRemote ? 1 : 0) << "\n";
+    // Browse places (docs/todo-open.md item 10, user decision A5: auto-
+    // reconnect): one "rbplace <num> <url>" line per instance that stands
+    // somewhere. placeUrl keeps the port. On load each instance reconnects
+    // THROUGH ITS OWN WORKER, asynchronously - the UI never blocks on ssh,
+    // and a failure lands inline in that instance's error band. The num keeps
+    // "Browse 2###Browse2" the same window the saved layout dock knows.
+    // Unknown keys are skipped by older viewers, so this is additive.
+    for (const auto& bp : app.browsePanels) {
+        const App::RemoteBrowse& pb = bp->b;
+        if (!pb.connected && pb.host.empty() && pb.dir == "~") continue;
+        f << "rbplace " << bp->num << " "
+          << placeUrl(pb.host, pb.port, pb.dir) << "\n";
+    }
     // the whole dock arrangement, so a session reopens looking like it did
     if (const char* ini = ImGui::SaveIniSettingsToMemory()) {
         f << "layout_begin\n";
@@ -4425,6 +4629,14 @@ static std::string loadSession(const std::string& path) {
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
             app.showProjection = g2 != 0; app.showLinearity = h2 != 0; app.showRemote = i2 != 0;
+        }
+        else if (key == "rbplace") {
+            // "<num> <url>": where a Browse instance stood (item 10, A5).
+            // Reconnects asynchronously through that instance's own worker;
+            // a failure shows inline in that instance, never a global dialog.
+            int n = 1;
+            ls >> n;
+            sessionRestoreBrowsePlace(n, restOfLine(ls));
         }
         else if (key == "layout_begin") {
             std::string ini, l2;
@@ -6945,7 +7157,7 @@ static void seqMosaicChanged(const ImageDoc* im) {
 // wrong - the panel tag says plane=all instead.
 static void requestBrowseTemporal(const std::string& host,
                                   std::vector<std::string> files,
-                                  const std::string& label) {
+                                  const std::string& label, int port = 0) {
     if (files.empty()) return;
     sortFramesNumerically(files);
     App::ServerTemporal& S = app.srvTemporal;
@@ -6960,7 +7172,7 @@ static void requestBrowseTemporal(const std::string& host,
     App::MJob j;
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
-    j.url = makeRemoteUrl(host, files[0], app.rbrowse.port);
+    j.url = makeRemoteUrl(host, files[0], port);
     if (files.size() > 1)
         for (const auto& f : files) j.files.push_back(f);
     mEnqueue(std::move(j));
@@ -6968,26 +7180,31 @@ static void requestBrowseTemporal(const std::string& host,
     app.focusTemporal = true;
 }
 
-// ---- the connect/browse worker -------------------------------------------------
-static void rbSetPhase(const std::string& p) {
-    std::lock_guard<std::mutex> lk(app.rbMtx);
-    app.rbPhase = p;
+// ---- the connect/browse worker: ONE per Browse instance ------------------------
+// The instance's Session belongs to the instance's worker thread and to nobody
+// else - the singleton's "one Session, one owning thread" rule (1ac211e), now
+// held per place being viewed. N instances = N sessions x N owning threads;
+// still nothing shared, still nothing to lock beyond each instance's own queue.
+static void rbSetPhase(App::BrowseInstance& I, const std::string& p) {
+    std::lock_guard<std::mutex> lk(I.mtx);
+    I.phase = p;
 }
 
-static void rbWorker() {
-    while (!app.rbStop) {
+static void rbWorker(App::BrowseInstance* ip) {
+    App::BrowseInstance& I = *ip;
+    while (!I.stop) {
         App::RbJob job;
         bool have = false;
         {
-            std::lock_guard<std::mutex> lk(app.rbMtx);
-            if (!app.rbQueue.empty()) {
-                job = std::move(app.rbQueue.front());
-                app.rbQueue.erase(app.rbQueue.begin());
+            std::lock_guard<std::mutex> lk(I.mtx);
+            if (!I.queue.empty()) {
+                job = std::move(I.queue.front());
+                I.queue.erase(I.queue.begin());
                 have = true;
             }
         }
         if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-        app.rbBusy = true;
+        I.busy = true;
         App::RbResult r;
         r.kind = job.kind;
         r.host = job.host;
@@ -6996,8 +7213,8 @@ static void rbWorker() {
         r.gen = job.gen;              // the cancel token, for every kind that has one
         const std::string& exe = job.exe;   // snapshot taken at enqueue time
         if (job.kind == App::RbUpdatePeer) {
-            rbSetPhase("updating the peer on " + job.host + " (git)...");
-            if (app.rbSession) app.rbSession->stop();
+            rbSetPhase(I, "updating the peer on " + job.host + " (git)...");
+            if (I.session) I.session->stop();
             std::string log;
             r.ok = deployPeer(job.host, job.port, true, log);
             r.info = log;
@@ -7005,30 +7222,30 @@ static void rbWorker() {
         } else if (job.kind == App::RbDisconnect) {
             // stop() runs on the thread that owns the Session, never on the UI
             // thread that merely clicked the status bar
-            if (app.rbSession) app.rbSession->stop();
+            if (I.session) I.session->stop();
             r.ok = true;
         } else {
-            if (!app.rbSession) {
-                app.rbSession.reset(new remote::Session());
-                app.rbSession->setAbort(&app.rbStop);   // Quit interrupts a blocked read
+            if (!I.session) {
+                I.session.reset(new remote::Session());
+                I.session->setAbort(&I.stop);   // Quit interrupts a blocked read
             }
             std::string err;
-            bool alive = app.rbSession->alive() && app.rbSession->host() == job.host;
+            bool alive = I.session->alive() && I.session->host() == job.host;
             if (!alive) {
-                rbSetPhase(job.host.empty() ? "starting the local reader..."
-                                            : "connecting to " + job.host + "...");
-                alive = app.rbSession->startOn(job.host, job.port, exe, err);
+                rbSetPhase(I, job.host.empty() ? "starting the local reader..."
+                                               : "connecting to " + job.host + "...");
+                alive = I.session->startOn(job.host, job.port, exe, err);
                 if (!alive && !job.host.empty()) {
                     // not there: the server installs its own peer from the
                     // binaries branch. This is the multi-second step that used
                     // to freeze the window.
-                    rbSetPhase("installing the peer on " + job.host + "...");
+                    rbSetPhase(I, "installing the peer on " + job.host + "...");
                     std::string log;
                     bool got = deployPeer(job.host, job.port, false, log);
                     r.info = log;    // the UI thread owns g_bootstrapLog, not us
                     if (got) {
-                        rbSetPhase("connecting to " + job.host + "...");
-                        alive = app.rbSession->startOn(job.host, job.port, exe, err);
+                        rbSetPhase(I, "connecting to " + job.host + "...");
+                        alive = I.session->startOn(job.host, job.port, exe, err);
                     } else {
                         err = "could not install the peer on " + job.host + ":\n" + log;
                     }
@@ -7037,11 +7254,11 @@ static void rbWorker() {
             if (!alive) {
                 r.err = err.empty() ? "connection failed" : err;
             } else if (job.kind == App::RbScan) {
-                rbSetPhase("scanning " + job.dir + " for stacks...");
+                rbSetPhase(I, "scanning " + job.dir + " for stacks...");
                 bool trunc = false;
                 int skipped = 0;
-                if (app.rbSession->scan(job.dir, 6, 256, r.scanGroups,
-                                        trunc, skipped, err)) {
+                if (I.session->scan(job.dir, 6, 256, r.scanGroups,
+                                    trunc, skipped, err)) {
                     r.ok = true;
                     r.truncated = trunc;
                     r.skippedDirs = skipped;
@@ -7049,11 +7266,11 @@ static void rbWorker() {
                     r.err = err;
                 }
             } else if (job.kind == App::RbGlob) {
-                rbSetPhase("searching " + job.pattern + " under " + job.dir + "...");
+                rbSetPhase(I, "searching " + job.pattern + " under " + job.dir + "...");
                 bool trunc = false;
                 int skipped = 0;
-                if (app.rbSession->glob(job.dir, job.pattern, 6, 2000, r.hits,
-                                        trunc, skipped, err)) {
+                if (I.session->glob(job.dir, job.pattern, 6, 2000, r.hits,
+                                    trunc, skipped, err)) {
                     r.ok = true;
                     r.truncated = trunc;
                     r.skippedDirs = skipped;
@@ -7061,9 +7278,9 @@ static void rbWorker() {
                     r.err = err;
                 }
             } else {
-                rbSetPhase("listing " + job.dir + "...");
+                rbSetPhase(I, "listing " + job.dir + "...");
                 std::vector<remote::Entry> got;
-                if (app.rbSession->list(job.dir, got, err)) {
+                if (I.session->list(job.dir, got, err)) {
                     r.ok = true;
                     r.entries = std::move(got);
                 } else {
@@ -7073,48 +7290,54 @@ static void rbWorker() {
         }
         // Published from the owning thread with EVERY job kind: the UI reads
         // these plain values instead of ever naming the Session.
-        if (app.rbSession) {
-            r.peerVersion = app.rbSession->peerVersion();
-            r.alive = app.rbSession->alive();
-            r.rx = app.rbSession->bytesReceived();
+        if (I.session) {
+            r.peerVersion = I.session->peerVersion();
+            r.alive = I.session->alive();
+            r.rx = I.session->bytesReceived();
         }
-        rbSetPhase("");
+        rbSetPhase(I, "");
         {
-            std::lock_guard<std::mutex> lk(app.rbMtx);
-            app.rbDone.push_back(std::move(r));
+            std::lock_guard<std::mutex> lk(I.mtx);
+            I.done.push_back(std::move(r));
         }
-        app.rbBusy = false;
+        I.busy = false;
         glfwPostEmptyEvent();
     }
 }
 
-static void rbEnqueue(App::RbJob job) {
+static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
     // how the peer is invoked, frozen NOW on the UI thread that owns the string
     if (job.exe.empty())
         job.exe = app.remoteExe.empty()
             ? (job.host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
             : app.remoteExe;
     {
-        std::lock_guard<std::mutex> lk(app.rbMtx);
-        app.rbQueue.push_back(std::move(job));
+        std::lock_guard<std::mutex> lk(I.mtx);
+        I.queue.push_back(std::move(job));
     }
-    if (!app.rbThread.joinable()) app.rbThread = std::thread(rbWorker);
+    if (!I.thread.joinable()) I.thread = std::thread(rbWorker, &I);
 }
 
-static void stopRbWorker() {
-    app.rbStop = true;
-    if (app.rbThread.joinable()) app.rbThread.join();
+// Stop ONE instance's worker (closing its window, or shutdown). After the join
+// this thread is the Session's only toucher, so letting the unique_ptr destroy
+// it later is single-threaded by construction.
+static void rbStopWorkerOf(App::BrowseInstance& I) {
+    I.stop = true;
+    if (I.thread.joinable()) I.thread.join();
+}
+static void stopRbWorker() {          // shutdown: every instance's worker
+    for (auto& p : app.browsePanels) rbStopWorkerOf(*p);
 }
 
-// UI thread: apply what the worker produced.
-static void pumpRemoteBrowse() {
+// UI thread: apply what ONE instance's worker produced.
+static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
     std::vector<App::RbResult> batch;
     {
-        std::lock_guard<std::mutex> lk(app.rbMtx);
-        batch.swap(app.rbDone);
+        std::lock_guard<std::mutex> lk(I.mtx);
+        batch.swap(I.done);
     }
     for (auto& r : batch) {
-        App::RemoteBrowse& B = app.rbrowse;
+        App::RemoteBrowse& B = I.b;
         // What the worker saw of ITS session, applied for every job kind. The
         // old code cleared B.connected only for RbConnect, so a LIST that died
         // with the peer left the status bar showing a green link over a corpse.
@@ -7135,12 +7358,12 @@ static void pumpRemoteBrowse() {
                 App::RbJob j;
                 j.kind = App::RbConnect;
                 j.host = B.host; j.port = B.port; j.dir = B.dir;
-                rbEnqueue(std::move(j));
+                rbEnqueue(I, std::move(j));
             }
             continue;
         }
         if (r.kind == App::RbGlob) {
-            App::RemoteSearch& S = app.rbSearch;
+            App::RemoteSearch& S = I.search;
             if (r.gen != S.gen) continue;          // stopped or superseded: drop
             S.running = false;
             if (!r.ok) { toast("remote search: " + r.err, true); continue; }
@@ -7209,15 +7432,15 @@ static void pumpRemoteBrowse() {
         if (r.kind == App::RbTreeList) {
             // A node's children. It must NOT touch B.dir / B.entries / recents:
             // expanding a folder in the tree is not a navigation.
-            app.rbTreePending.erase(std::remove(app.rbTreePending.begin(),
-                                                app.rbTreePending.end(), r.dir),
-                                    app.rbTreePending.end());
-            if (r.ok) app.rbTreeCache[r.dir] = std::move(r.entries);
+            I.treePending.erase(std::remove(I.treePending.begin(),
+                                            I.treePending.end(), r.dir),
+                                I.treePending.end());
+            if (r.ok) I.treeCache[r.dir] = std::move(r.entries);
             else {
                 // an unreadable folder collapses again, with a reason
-                app.rbExpanded.erase(std::remove(app.rbExpanded.begin(),
-                                                 app.rbExpanded.end(), r.dir),
-                                     app.rbExpanded.end());
+                I.expanded.erase(std::remove(I.expanded.begin(),
+                                             I.expanded.end(), r.dir),
+                                 I.expanded.end());
                 toast(r.dir + ": " + r.err, true);
             }
             continue;
@@ -7230,8 +7453,9 @@ static void pumpRemoteBrowse() {
             if (!r.info.empty()) g_bootstrapLog = r.info;
             if (r.kind == App::RbConnect) {
                 B.connected = false;
-                app.showRemote = true;    // so the failure text has somewhere to live
-                app.focusRemote = true;
+                // so the failure text has somewhere to live - inline, in THE
+                // instance that failed, never a global dialog
+                rbShowInstance(I);
                 toast("remote: " + r.err, true);
             }
             continue;
@@ -7253,10 +7477,9 @@ static void pumpRemoteBrowse() {
         }
         if (r.kind == App::RbConnect && !B.connected) {
             B.connected = true;
-            rbTreeForget();               // another machine: other children entirely
+            rbTreeForget(I);              // another machine: other children entirely
             // a listing nobody can see is not a connection anyone believes in
-            app.showRemote = true;
-            app.focusRemote = true;
+            rbShowInstance(I);
             toast(r.host.empty() ? "browsing " PEER_HERE : "connected to " + r.host);
         }
         // An outdated peer ANSWERS perfectly well, so the install-on-failure
@@ -7274,14 +7497,19 @@ static void pumpRemoteBrowse() {
             App::RbJob j;
             j.kind = App::RbUpdatePeer;
             j.host = r.host; j.port = r.port;
-            rbEnqueue(std::move(j));
+            rbEnqueue(I, std::move(j));
         }
-        if (!app.pendingRemoteOpen.empty()) {   // a url was pasted with the host
-            std::string u = app.pendingRemoteOpen;
-            app.pendingRemoteOpen.clear();
+        if (!I.pendingOpen.empty()) {   // a url was pasted with the host
+            std::string u = I.pendingOpen;
+            I.pendingOpen.clear();
             openRemote(u);
         }
     }
+}
+// ...and every instance, once per UI frame.
+static void pumpRemoteBrowse() {
+    for (size_t i = 0; i < app.browsePanels.size(); i++)
+        pumpRemoteBrowseOne(*app.browsePanels[i]);
 }
 
 // ---- tree mode: expand / collapse one node ------------------------------------
@@ -7292,78 +7520,74 @@ static void pumpRemoteBrowse() {
 static bool rbHas(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
-static void rbTreeExpand(const std::string& dir) {
-    if (!rbHas(app.rbExpanded, dir)) app.rbExpanded.push_back(dir);
-    if (app.rbTreeCache.count(dir) || rbHas(app.rbTreePending, dir)) return;
-    app.rbTreePending.push_back(dir);
-    app.rbTreeLists++;
+static void rbTreeExpand(App::BrowseInstance& I, const std::string& dir) {
+    if (!rbHas(I.expanded, dir)) I.expanded.push_back(dir);
+    if (I.treeCache.count(dir) || rbHas(I.treePending, dir)) return;
+    I.treePending.push_back(dir);
+    I.treeLists++;
     App::RbJob j;
     j.kind = App::RbTreeList;
-    j.host = app.rbrowse.host;
-    j.port = app.rbrowse.port;
+    j.host = I.b.host;
+    j.port = I.b.port;
     j.dir = dir;
-    rbEnqueue(std::move(j));
+    rbEnqueue(I, std::move(j));
 }
-static void rbTreeCollapse(const std::string& dir) {
-    app.rbExpanded.erase(std::remove(app.rbExpanded.begin(), app.rbExpanded.end(), dir),
-                         app.rbExpanded.end());
+static void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir) {
+    I.expanded.erase(std::remove(I.expanded.begin(), I.expanded.end(), dir),
+                     I.expanded.end());
 }
 // A different machine, or "list this again": the cached children are stale.
-static void rbTreeForget() {
-    app.rbTreeCache.clear();
-    app.rbExpanded.clear();
-    app.rbTreePending.clear();
+static void rbTreeForget(App::BrowseInstance& I) {
+    I.treeCache.clear();
+    I.expanded.clear();
+    I.treePending.clear();
 }
 
 // ---- browse navigation history (mouse back/forward, Alt+Left / Alt+Right) ----
 // Only B.dir changes recorded through remoteBrowseTo are entries: tree
 // expansions and the search-results view are not places. Back/forward restore
-// the LOCATION only - no preview, no selection replay. File-scope so the keys
-// selftest can assert on the vectors themselves.
-static std::vector<std::string> g_rbHistBack, g_rbHistFwd;
-static std::string g_rbHistKey;      // host:port the history belongs to
-static bool g_rbHistNav = false;     // set while back/forward itself navigates
-static void rbHistOnNavigate(const std::string& toDir) {
-    if (!app.rbrowse.connected) return;
+// the LOCATION only - no preview, no selection replay. Per instance
+// (BrowseInstance::histBack / histFwd), so each panel walks its own past.
+static void rbHistOnNavigate(App::BrowseInstance& I, const std::string& toDir) {
+    if (!I.b.connected) return;
     // a different machine's directories are not this history's past
-    std::string key = app.rbrowse.host + ":" + std::to_string(app.rbrowse.port);
-    if (key != g_rbHistKey) { g_rbHistBack.clear(); g_rbHistFwd.clear(); g_rbHistKey = key; }
-    if (g_rbHistNav || toDir == app.rbrowse.dir) return;
-    g_rbHistBack.push_back(app.rbrowse.dir);
-    if (g_rbHistBack.size() > 64) g_rbHistBack.erase(g_rbHistBack.begin());
-    g_rbHistFwd.clear();             // a fresh navigation truncates the forward branch
+    std::string key = I.b.host + ":" + std::to_string(I.b.port);
+    if (key != I.histKey) { I.histBack.clear(); I.histFwd.clear(); I.histKey = key; }
+    if (I.histNav || toDir == I.b.dir) return;
+    I.histBack.push_back(I.b.dir);
+    if (I.histBack.size() > 64) I.histBack.erase(I.histBack.begin());
+    I.histFwd.clear();               // a fresh navigation truncates the forward branch
 }
-static void remoteBrowseTo(const std::string& dir);   // the funnel, just below
-static void rbHistGo(bool back) {
-    std::vector<std::string>& from = back ? g_rbHistBack : g_rbHistFwd;
-    std::vector<std::string>& to   = back ? g_rbHistFwd  : g_rbHistBack;
-    if (from.empty() || !app.rbrowse.connected) return;
+static void rbHistGo(App::BrowseInstance& I, bool back) {
+    std::vector<std::string>& from = back ? I.histBack : I.histFwd;
+    std::vector<std::string>& to   = back ? I.histFwd  : I.histBack;
+    if (from.empty() || !I.b.connected) return;
     std::string dest = from.back();
     from.pop_back();
-    to.push_back(app.rbrowse.dir);
-    g_rbHistNav = true;
-    remoteBrowseTo(dest);
-    g_rbHistNav = false;
+    to.push_back(I.b.dir);
+    I.histNav = true;
+    remoteBrowseTo(I, dest);
+    I.histNav = false;
 }
 
 // Browse one directory on the connected server (async: a dead link hangs the
 // worker, never the window).
-static void remoteBrowseTo(const std::string& dir) {
+static void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir) {
     // Going anywhere leaves the search results: they stand in for the listing,
     // so a listing that arrives underneath them cannot be seen. Every way of
     // navigating funnels through here, which is why the rule lives here and
     // not on each of the six things that move.
-    app.rbSearch.active = false;
+    I.search.active = false;
     // ...and every way of navigating is one funnel, which is also why the
     // back/forward history is recorded here and nowhere else. Only a change
     // of B.dir is an entry - tree expansion and the search view are not.
-    rbHistOnNavigate(dir);
+    rbHistOnNavigate(I, dir);
     App::RbJob j;
     j.kind = App::RbList;
-    j.host = app.rbrowse.host;
-    j.port = app.rbrowse.port;
+    j.host = I.b.host;
+    j.port = I.b.port;
     j.dir = dir;
-    rbEnqueue(std::move(j));
+    rbEnqueue(I, std::move(j));
 }
 
 // One canonical url for "this directory on this host", used by the places list
@@ -7377,32 +7601,48 @@ static std::string placeUrl(const std::string& host, int port, const std::string
 // Navigate to a places url. Same host and a live session: just browse there.
 // Anything else goes through the normal async connect - never a handshake on
 // the UI thread.
-static void goToPlace(const std::string& url) {
+static void goToPlace(App::BrowseInstance& I, const std::string& url) {
     std::string host, path;
     int port = 0;
     if (!remote::parseUrl(url, host, path, &port)) {
         toast("cannot parse place: " + url, true);
         return;
     }
-    if (app.rbrowse.connected && app.rbrowse.host == host && app.rbrowse.port == port) {
-        remoteBrowseTo(path);
+    if (I.b.connected && I.b.host == host && I.b.port == port) {
+        remoteBrowseTo(I, path);
         return;
     }
-    app.rbrowse = App::RemoteBrowse{};
-    app.rbrowse.host = host;
-    app.rbrowse.port = port;
+    I.b = App::RemoteBrowse{};
+    I.b.host = host;
+    I.b.port = port;
     App::RbJob j;
     j.kind = App::RbConnect;
     j.host = host;
     j.port = port;
     j.dir = path;
-    rbEnqueue(std::move(j));
+    rbEnqueue(I, std::move(j));
 }
 
-// Kick a server-side recursive find; the result lands in app.rbSearch through
-// the browse worker. Any previous search is superseded by the gen bump.
-static void remoteStartSearch(const std::string& root, const std::string& pattern) {
-    App::RemoteSearch& S = app.rbSearch;
+// One session "rbplace <num> <url>" line, applied: put that instance back on
+// its place and reconnect it through ITS OWN worker (item 10, decision A5 -
+// auto-reconnect, asynchronously; the UI never blocks on ssh, and a failure
+// lands inline in that instance's error band). Shared by the session reader
+// and the keys selftest's round-trip op, so the two cannot drift apart.
+static void sessionRestoreBrowsePlace(int num, const std::string& url) {
+    if (url.empty()) return;
+    App::BrowseInstance* I = num <= 1 ? &rbMain() : rbFindNum(num);
+    if (!I) {
+        I = &rbNewInstance(num);
+        I->focusReq = false;          // a restore is not a focus request
+    }
+    goToPlace(*I, url);
+}
+
+// Kick a server-side recursive find; the result lands in I.search through
+// the instance's worker. Any previous search is superseded by the gen bump.
+static void remoteStartSearch(App::BrowseInstance& I,
+                              const std::string& root, const std::string& pattern) {
+    App::RemoteSearch& S = I.search;
     S.gen++;
     S.running = true;
     S.active = true;
@@ -7413,25 +7653,25 @@ static void remoteStartSearch(const std::string& root, const std::string& patter
     S.skippedDirs = 0;
     App::RbJob j;
     j.kind = App::RbGlob;
-    j.host = app.rbrowse.host;
-    j.port = app.rbrowse.port;
+    j.host = I.b.host;
+    j.port = I.b.port;
     j.dir = root;
     j.pattern = pattern;
     j.gen = S.gen;
-    rbEnqueue(std::move(j));
+    rbEnqueue(I, std::move(j));
 }
 
 // The remote openFolder(): the worker asks the server to walk the subtree and
 // report every stack below it; the result feeds the picker / open queue on
 // the UI thread (pumpRemoteBrowse).
-static void remoteScanFolder(const std::string& root) {
+static void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
     App::RbJob j;
     j.kind = App::RbScan;
-    j.host = app.rbrowse.host;
-    j.port = app.rbrowse.port;
+    j.host = I.b.host;
+    j.port = I.b.port;
     j.dir = root;
-    j.gen = ++app.rbrowse.scanGen;    // cancel token, exactly as RbGlob has
-    rbEnqueue(std::move(j));
+    j.gen = ++I.b.scanGen;            // cancel token, exactly as RbGlob has
+    rbEnqueue(I, std::move(j));
 }
 
 // Chained opens from a folder scan: the next stack starts only when the remote
@@ -7447,9 +7687,10 @@ static void pumpRemoteOpenQueue() {
     app.loadBatchId = 0;
 }
 
-// File > Start Remote: connect (installing the peer if needed), then browse.
-// Everything slow happens on the worker; this returns immediately.
-static void startRemote(const std::string& hostSpec) {
+// File > Start Remote: connect (installing the peer if needed), then browse -
+// in the given instance. Everything slow happens on the instance's worker;
+// this returns immediately.
+static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
     std::string host = hostSpec, dir = "~";
     int port = 0;
     // accept a full url here too, so a pasted path still works
@@ -7461,26 +7702,26 @@ static void startRemote(const std::string& hostSpec) {
     if (dir.size() > 4 && isNpyName(dir)) {          // a pasted file path: open it
         size_t s = dir.find_last_of('/');
         std::string parent = s == std::string::npos ? "~" : dir.substr(0, s);
-        app.rbrowse = App::RemoteBrowse{};
-        app.rbrowse.host = host;
-        app.rbrowse.port = port;
+        I.b = App::RemoteBrowse{};
+        I.b.host = host;
+        I.b.port = port;
         App::RbJob j;
         j.kind = App::RbConnect; j.host = host; j.port = port; j.dir = parent;
-        rbEnqueue(std::move(j));
+        rbEnqueue(I, std::move(j));
         // opened once the worker has the session; opening it here would put the
         // ssh handshake back on the UI thread
-        app.pendingRemoteOpen = makeRemoteUrl(host, dir, port);
+        I.pendingOpen = makeRemoteUrl(host, dir, port);
         return;
     }
-    app.rbrowse = App::RemoteBrowse{};
-    app.rbrowse.host = host;
-    app.rbrowse.port = port;
+    I.b = App::RemoteBrowse{};
+    I.b.host = host;
+    I.b.port = port;
     App::RbJob j;
     j.kind = App::RbConnect;
     j.host = host;
     j.port = port;
     j.dir = dir;
-    rbEnqueue(std::move(j));
+    rbEnqueue(I, std::move(j));
 }
 
 // Close the transient preview, if one is still unpromoted.
@@ -7504,6 +7745,8 @@ static void dropPreview() {
     app.previewFrames = 0;
     app.previewIndex = 0;
     app.previewLabel.clear();
+    app.previewHost.clear();
+    app.previewPort = 0;
 }
 
 // Walk the previewed sequence without opening it. Each step replaces the one
@@ -7516,8 +7759,12 @@ static void stepPreviewFrame(int delta) {
         int n = (int)app.previewFiles.size();
         int want = std::clamp(app.previewIndex + delta, 0, n - 1);
         if (want == app.previewIndex) return;
-        std::string host = app.rbrowse.host;
-        int port = app.rbrowse.port;
+        // the machine the previewed paths live on rides WITH the preview
+        // (previewHost/previewPort): the slot is global across N Browse
+        // instances, so "the" browse panel's host is no longer a question
+        // that has one answer
+        std::string host = app.previewHost;
+        int port = app.previewPort;
         std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
         std::string label = app.previewLabel;
         app.previewIndex = want;
@@ -7526,6 +7773,8 @@ static void stepPreviewFrame(int delta) {
         app.previewFiles = std::move(files);
         app.previewIndex = want;
         app.previewLabel = std::move(label);
+        app.previewHost = host;
+        app.previewPort = port;
     } else if (app.previewFrames >= 2) {
         int want = std::clamp(app.previewIndex + delta, 0, app.previewFrames - 1);
         if (want == app.previewIndex) return;
@@ -7827,7 +8076,7 @@ static void openPath(const std::string& path) {
         // machine passes, and what a half-remembered path pasted on the command
         // line usually is. startRemote keeps the ssh handshake off this thread.
         if (isNpyName(path)) openRemote(path);
-        else                 startRemote(path);
+        else                 startRemote(rbActive(), path);
         return;
     }
     std::string low = path;
@@ -7884,9 +8133,11 @@ static void browseLocalFolder(std::string p) {
     if (p.empty()) return;
     std::replace(p.begin(), p.end(), '\\', '/');
     while (p.size() > 1 && p.back() == '/') p.pop_back();
-    startRemote("local://" + p);
-    app.showRemote = true;
-    app.focusRemote = true;
+    // the folder lands in the instance the user last worked in - with one
+    // panel open that is exactly the old behaviour
+    App::BrowseInstance& I = rbActive();
+    startRemote(I, "local://" + p);
+    rbShowInstance(I);
 }
 static void browseFolderDialog() {
     if (!pfd::settings::available()) {
@@ -14662,18 +14913,19 @@ struct RbRow {
 // earlier). A sort change therefore lands on the next frame - invisible, and
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
-// The keyboard cursor's ROW INDEX. Written by the listing, read by the
-// toolbar above it - which is why it is not a local of the block that moves it.
-static int  g_rbCursor = -1;
-static int  g_rbSortCol = RB_COL_NAME;
-static bool g_rbSortDesc = false;
+// (The keyboard cursor and the stashed sort spec were file-scope singletons
+// here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
+// BrowseInstance::cursor / sortCol / sortDesc.)
 
-static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+static void rbAddRows(const App::BrowseInstance& I,
+                      const std::string* dir, const std::vector<remote::Entry>& ents,
                       bool flat, bool tree, int depth, std::vector<RbRow>& out);
 
 // Grouped or flat, listing or tree, from the same entries. Free function so the
-// headless selftest drives exactly what the panel draws.
-static std::vector<RbRow> rbBuildView(const std::string* dir,
+// headless selftest drives exactly what the panel draws. The instance supplies
+// the tree's expanded set / cache and the per-level sort.
+static std::vector<RbRow> rbBuildView(const App::BrowseInstance& I,
+                                      const std::string* dir,
                                       const std::vector<remote::Entry>& entries,
                                       bool flat, bool tree) {
     std::vector<RbRow> v;
@@ -14699,10 +14951,11 @@ static std::vector<RbRow> rbBuildView(const std::string* dir,
         r.up = true;
         v.push_back(r);
     }
-    rbAddRows(dir, entries, flat, tree, 0, v);
+    rbAddRows(I, dir, entries, flat, tree, 0, v);
     return v;
 }
-static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& ents,
+static void rbAddRows(const App::BrowseInstance& I,
+                      const std::string* dir, const std::vector<remote::Entry>& ents,
                       bool flat, bool tree, int depth, std::vector<RbRow>& out) {
     if (depth > 24) return;                    // a symlink loop is not a tree
     std::vector<int> order(ents.size());
@@ -14715,12 +14968,12 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
             const remote::Entry& b = ents[ib];
             if (a.dir != b.dir) return a.dir;
             int cmp = 0;
-            switch (g_rbSortCol) {
+            switch (I.sortCol) {
                 case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
                 case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
                 default:           cmp = a.name.compare(b.name); break;
             }
-            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+            return I.sortDesc ? cmp > 0 : cmp < 0;
         });
     }
     for (int oi : order) {
@@ -14734,10 +14987,10 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
         { RbRow r; r.e = &e; r.dir = dir; r.depth = depth; out.push_back(r); }
         if (!tree || !e.dir) continue;
         std::string sub = *dir == "/" ? "/" + e.name : *dir + "/" + e.name;
-        if (!rbHas(app.rbExpanded, sub)) continue;
-        auto it = app.rbTreeCache.find(sub);
-        if (it != app.rbTreeCache.end())
-            rbAddRows(&it->first, it->second, flat, tree, depth + 1, out);
+        if (!rbHas(I.expanded, sub)) continue;
+        auto it = I.treeCache.find(sub);
+        if (it != I.treeCache.end())
+            rbAddRows(I, &it->first, it->second, flat, tree, depth + 1, out);
         else {
             // the LIST is still in flight: say so where the children will be
             static const remote::Entry busy = [] {
@@ -14750,11 +15003,11 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
 }
 
 // ---- deferred panel actions -------------------------------------------------
-// Every row the listing draws is an RbRow: RAW POINTERS into app.rbrowse.entries
-// and into the tree cache, held in a `view` vector that is rebuilt each frame
-// and read from the moment it is built until the table ends. An action that
-// REPLACES either container therefore cannot run where it is clicked - the rest
-// of the frame would read freed memory.
+// Every row the listing draws is an RbRow: RAW POINTERS into that instance's
+// b.entries and into its tree cache, held in a `view` vector that is rebuilt
+// each frame and read from the moment it is built until the table ends. An
+// action that REPLACES either container therefore cannot run where it is
+// clicked - the rest of the frame would read freed memory.
 //
 // The tree cache knew this ("a mid-frame clear would dangle every row below the
 // refresh button") and hand-rolled a one-flag deferral. The Places combo did
@@ -14766,31 +15019,52 @@ static void rbAddRows(const std::string* dir, const std::vector<remote::Entry>& 
 // So it is a rule now instead of three careful call sites: navigation, the tree
 // cache and the connection state are QUEUED here and run once `view` is dead.
 // A new button inherits the rule instead of having to remember it.
-static std::vector<std::function<void()>> g_rbDeferred;
-static void rbDefer(std::function<void()> f) { g_rbDeferred.push_back(std::move(f)); }
-static size_t rbDeferredPending() { return g_rbDeferred.size(); }
+//
+// PER INSTANCE, and why that is exactly as safe as the old global: the queue
+// fills only while ITS instance's rows are alive (rbDefer targets the instance
+// being drawn - g_rbDrawInst below) and drains in the same drawPanelRemote
+// invocation, after that instance's `view` has been destroyed. Panel draws
+// never nest, so when a queue runs NO instance has a live row vector: another
+// instance's rows exist only inside its own draw, which has either not begun
+// or already finished. An action from panel A that touched panel B's entries
+// would still run row-free - the guarantee never rested on which state is
+// replaced, only on when.
+static App::BrowseInstance* g_rbDrawInst = nullptr;   // the instance being drawn
+static void rbDefer(std::function<void()> f) {
+    App::BrowseInstance& I = g_rbDrawInst ? *g_rbDrawInst : rbMain();
+    I.deferred.push_back(std::move(f));
+}
+static size_t rbDeferredPending() {
+    return (g_rbDrawInst ? *g_rbDrawInst : rbMain()).deferred.size();
+}
 // RAII, so the panel's early returns run the queue too. Declared BEFORE `view`
 // in drawPanelRemote: reverse destruction order is what guarantees the rows are
 // already gone when the queue runs.
 struct RbDeferredActions {
+    App::BrowseInstance& I;
+    App::BrowseInstance* prev;        // draws never nest today; stay honest anyway
+    explicit RbDeferredActions(App::BrowseInstance& i) : I(i), prev(g_rbDrawInst) {
+        g_rbDrawInst = &i;
+    }
     ~RbDeferredActions() {
         std::vector<std::function<void()>> q;
-        q.swap(g_rbDeferred);          // an action may queue another
-        for (auto& f : q) f();
-    }
+        q.swap(I.deferred);            // an action may queue another...
+        for (auto& f : q) f();         // (...and it lands in I.deferred again:
+        g_rbDrawInst = prev;           // g_rbDrawInst still points here, so a
+    }                                  // re-queued action waits for the next draw)
 };
 // Every navigation the panel offers. remoteBrowseTo only enqueues a job today,
 // so this changes nothing that can be seen - it makes "the panel never
 // navigates mid-draw" true by construction rather than by inspection.
-static void rbGoTo(const std::string& dir) {
-    rbDefer([dir] { remoteBrowseTo(dir); });
+static void rbGoTo(App::BrowseInstance& I, const std::string& dir) {
+    rbDefer([&I, dir] { remoteBrowseTo(I, dir); });
 }
 
 // Bookmarks + recents. The ITEMS are their own function because they live in
 // two places: the disconnected state's full-width combo, and - once connected
 // - a small dropdown docked at the left edge of the path bar, where a file
 // manager keeps its address-bar chevron.
-static void drawRemotePlacesItems() {
+static void drawRemotePlacesItems(App::BrowseInstance& I) {
     // display only: a local place reads better as "[local] path" than as the
     // url scheme (the stored prefs string stays the url)
     auto placeLabel = [](const std::string& u) {
@@ -14804,7 +15078,7 @@ static void drawRemotePlacesItems() {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this bookmark");
         ImGui::SameLine();
         if (ImGui::Selectable(placeLabel(app.rbBookmarks[i]).c_str()))
-            rbDefer([u = app.rbBookmarks[i]] { goToPlace(u); });   // see rbDefer
+            rbDefer([&I, u = app.rbBookmarks[i]] { goToPlace(I, u); });   // see rbDefer
         ImGui::PopID();
     }
     if (rm >= 0) {
@@ -14816,32 +15090,23 @@ static void drawRemotePlacesItems() {
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
         ImGui::PushID(1000 + i);
         if (ImGui::Selectable(placeLabel(app.rbRecents[i]).c_str()))
-            rbDefer([u = app.rbRecents[i]] { goToPlace(u); });
+            rbDefer([&I, u = app.rbRecents[i]] { goToPlace(I, u); });
         ImGui::PopID();
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
         ImGui::TextDisabled("nothing yet - the * button bookmarks the open folder");
 }
-static void drawRemotePlacesCombo() {
+static void drawRemotePlacesCombo(App::BrowseInstance& I) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
                            ImGuiComboFlags_HeightLarge))
         return;
-    drawRemotePlacesItems();
+    drawRemotePlacesItems(I);
     ImGui::EndCombo();
 }
 
-// Where the Browse toolbar's two width-critical controls ended up, in screen x,
-// against the panel's own content edges. Recorded every frame so a selftest can
-// assert the thing a human reads off a screenshot: "the filter is on screen".
-struct RbToolbarGeom {
-    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
-    float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
-    int   emptyLocalBtn = 0;               // the not-connected state's local entry
-    float rowX = 0, rowY = 0;              // centre of the first row submitted
-};
-static RbToolbarGeom g_rbToolbar;
-static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
+// (RbToolbarGeom is defined next to ViewState now - each instance carries one.)
+static float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
 // --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
 // frame, after the GLFW backend has had its say: the backend overwrites the
 // mouse position from the OS cursor whenever the window counts as focused, and
@@ -14849,23 +15114,38 @@ static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
 // event queued between frames therefore lost the race about one run in six.
 static ImVec2 g_injMouse(-1, -1);   // <0: not injecting
 static int    g_injMouseBtn = -1;   // button held, -1 = none
-// Where the keyboard cursor's row was drawn this frame: the keys selftest aims
-// its synthetic clicks here, because a double-click only exists as real clicks.
-// The NAME rides along so a check can say "the cursor is on row X" without
-// guessing view indices (raw peer order in a listing, sorted in a tree).
-static ImVec2 g_rbCursorRect[2];
-static std::string g_rbCursorName;
+// (The cursor-row rectangle and name the keys selftest aims at moved into the
+// instance: BrowseInstance::cursorRect / cursorName. The selftest reads them
+// from its TARGET instance - g_rbKeysTarget, actions "target:N".)
+static int g_rbKeysTarget = 1;      // instance NUM the keys selftest drives
+static App::BrowseInstance& rbKeysT() {
+    if (App::BrowseInstance* p = rbFindNum(g_rbKeysTarget)) return *p;
+    return rbMain();
+}
 
-static void drawPanelRemote() {
-    App::RemoteBrowse& B = app.rbrowse;
+// The "+" affordance: one more Browse, docked nowhere in particular - the
+// same command View > New Browse Panel runs. Deferred: creating an instance
+// grows app.browsePanels, and the window loop is iterating it.
+static void rbPlusButton() {
+    if (ImGui::SmallButton("+##rbnew")) rbDefer([] { rbNewInstance(); });
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("new Browse panel - another view onto another place\n"
+                          "(View > New Browse Panel)");
+}
+
+static void drawPanelRemote(App::BrowseInstance& I) {
+    App::RemoteBrowse& B = I.b;
     // FIRST, so it is destroyed LAST - after `view` and after every row that
     // points into the browse state. Anything that replaces that state is queued
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree
     // next frame" deferral that covered the tree cache and nothing else.)
-    RbDeferredActions rbActions;
-    g_rbToolbar = RbToolbarGeom{};
-    g_rbToolbar.x0 = ImGui::GetCursorScreenPos().x;
-    g_rbToolbar.x1 = g_rbToolbar.x0 + ImGui::GetContentRegionAvail().x;
+    RbDeferredActions rbActions(I);
+    // the focused panel is the one the File menu's remote commands aim at
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+        g_rbActiveNum = I.num;
+    I.toolbar = RbToolbarGeom{};
+    I.toolbar.x0 = ImGui::GetCursorScreenPos().x;
+    I.toolbar.x1 = I.toolbar.x0 + ImGui::GetContentRegionAvail().x;
     ImGui::PushID("remotetree");
     if (!B.connected) {
         // The empty state used to offer ssh and nothing else, and then say
@@ -14876,17 +15156,25 @@ static void drawPanelRemote() {
         // it goes first.
         const float need = ImGui::CalcTextSize("Start Remote (ssh)...").x +
                            ImGui::GetStyle().FramePadding.x * 2;
-        if (ImGui::Button("Browse Local Folder...")) browseFolderDialog();
-        g_rbToolbar.emptyLocalBtn = 1;
+        if (ImGui::Button("Browse Local Folder...")) {
+            g_rbActiveNum = I.num;     // the dialog's result lands HERE
+            browseFolderDialog();
+        }
+        I.toolbar.emptyLocalBtn = 1;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("pick a folder on this machine and list it here -\n"
                               "same rows, same grouping, same server-side stats.\n"
                               "(File > Browse Folder (Local)... is the same command)");
         ImGui::SameLine();
         if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
-        if (ImGui::Button("Start Remote (ssh)...")) app.remoteDlgOpen = true;
-        if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
-        drawRemotePlacesCombo();
+        if (ImGui::Button("Start Remote (ssh)...")) {
+            g_rbActiveNum = I.num;     // the dialog connects THIS panel
+            app.remoteDlgOpen = true;
+        }
+        ImGui::SameLine();
+        rbPlusButton();
+        if (I.busy) { ImGui::SameLine(); ImGui::TextDisabled("connecting..."); }
+        drawRemotePlacesCombo(I);
         if (!B.err.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
             ImGui::PushTextWrapPos(0.0f);
@@ -14908,27 +15196,29 @@ static void drawPanelRemote() {
     // rare case. What is left permanently on screen is what browsing actually
     // needs - where am I (breadcrumbs) and narrow it down (toolbar + filter) -
     // and everything else is one click away under "more", with nothing removed.
-    bool& rbAdvanced = app.rbAdvanced;
+    bool& rbAdvanced = I.advanced;
     // Server-side search: a different thing from the filter (which only narrows
-    // what is already listed). Declared up here because the path bar's context
-    // menu can aim it at a folder.
-    static char rbSearchBuf[256] = "";
-    static bool rbSearchFocus = false;
+    // what is already listed). Referenced up here because the path bar's context
+    // menu can aim it at a folder. (These were function-local statics - one
+    // search box shared by every panel; per instance now.)
+    char* rbSearchBuf = I.searchBuf;
+    bool& rbSearchFocus = I.searchFocus;
     // set by "Search under here"; empty = this folder. On App::RemoteBrowse, so
     // it dies with the connection - see the field.
-    std::string& rbSearchRoot = app.rbrowse.searchRoot;
+    std::string& rbSearchRoot = B.searchRoot;
     // where we are, and how to leave
     bool atRoot = B.dir == "~" || B.dir == "/";
     auto rbGoParent = [&]() {
         if (atRoot) return;
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
-        rbGoTo(s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                : d.substr(0, s));
+        rbGoTo(I, s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
+                                                   : d.substr(0, s));
     };
     // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
-    static char rbPathEdit[1024];
-    static bool rbPathEditing = false, rbPathFocus = false;
+    char* rbPathEdit = I.pathEdit;
+    bool& rbPathEditing = I.pathEditing;
+    bool& rbPathFocus = I.pathFocus;
     if (!rbPathEditing) {
         struct Seg { std::string label, path; };
         std::vector<Seg> segs;
@@ -14955,7 +15245,7 @@ static void drawPanelRemote() {
         if (ImGui::SmallButton("v##placesbtn")) ImGui::OpenPopup("placespop");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("places (bookmarks + recent)");
         if (ImGui::BeginPopup("placespop")) {
-            drawRemotePlacesItems();
+            drawRemotePlacesItems(I);
             ImGui::EndPopup();
         }
         ImGui::SameLine(0, 6);
@@ -14980,7 +15270,7 @@ static void drawPanelRemote() {
                     ImGui::NewLine();
             }
             if (ImGui::TextLink(segs[k].label.c_str()))
-                rbGoTo(segs[k].path);
+                rbGoTo(I, segs[k].path);
             // Right-click used to jump straight into path editing. It is a menu
             // now: the actions that take a FOLDER as their subject all belong on
             // the bar that names the folder.
@@ -14989,7 +15279,7 @@ static void drawPanelRemote() {
                 // the same item a folder ROW carries, aimed at a folder that is
                 // not in any listing - the one you are inside, or an ancestor
                 if (ImGui::MenuItem("Open folder (all stacks below)"))
-                    remoteScanFolder(target);
+                    remoteScanFolder(I, target);
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
                     rbSearchFocus = true;
@@ -15023,8 +15313,12 @@ static void drawPanelRemote() {
         // itself is the affordance, not another button in the row
         if (!segs.empty()) ImGui::SameLine(0, 4);
         {
-            float editW = std::max(ImGui::GetContentRegionAvail().x -
-                                   (app.rbBusy ? ImGui::CalcTextSize("(listing...)").x + 8 : 0),
+            // the "+" (one more Browse) holds the bar's right edge - the
+            // click-to-edit run pays for it
+            const float plusW = ImGui::CalcTextSize("+").x +
+                                ImGui::GetStyle().FramePadding.x * 2 + 6;
+            float editW = std::max(ImGui::GetContentRegionAvail().x - plusW -
+                                   (I.busy ? ImGui::CalcTextSize("(listing...)").x + 8 : 0),
                                    ImGui::GetFontSize() * 1.5f);
             if (ImGui::InvisibleButton("##pathedit", ImVec2(editW, ImGui::GetTextLineHeight())))
                 editReq = true;
@@ -15034,16 +15328,18 @@ static void drawPanelRemote() {
                                   "(right-clicking a folder name works too)");
             }
         }
-        if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+        if (I.busy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+        ImGui::SameLine(0, 4);
+        rbPlusButton();
         if (editReq) {
-            snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
+            snprintf(rbPathEdit, sizeof I.pathEdit, "%s", d.c_str());
             rbPathEditing = true;
             rbPathFocus = true;
         }
     } else {
         if (rbPathFocus) { ImGui::SetKeyboardFocusHere(); rbPathFocus = false; }
         ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 4);
-        bool entered = ImGui::InputText("##rbpath", rbPathEdit, sizeof rbPathEdit,
+        bool entered = ImGui::InputText("##rbpath", rbPathEdit, sizeof I.pathEdit,
                                         ImGuiInputTextFlags_EnterReturnsTrue);
         if (entered) {
             std::string p = rbPathEdit;
@@ -15051,7 +15347,7 @@ static void drawPanelRemote() {
             while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
             while (p.size() > 1 && p.back() == '/') p.pop_back();
             rbPathEditing = false;
-            rbGoTo(p.empty() ? "~" : p);
+            rbGoTo(I, p.empty() ? "~" : p);
         } else if (ImGui::IsItemDeactivated()) {
             rbPathEditing = false;    // Esc (ImGui reverts the text) or focus loss
         }
@@ -15072,25 +15368,25 @@ static void drawPanelRemote() {
     }
     // The listing as ROWS: grouped (one row per sequence) or flat (one row per
     // frame), listing or tree. Rebuilt every frame - see rbBuildView.
-    std::vector<RbRow> view = rbBuildView(&B.dir, B.entries, app.rbFlat, app.rbTree);
+    std::vector<RbRow> view = rbBuildView(I, &B.dir, B.entries, I.flat, I.tree);
     // Multi-select (Ctrl / Shift + click on file rows), indexed by ROW. A
     // navigation or a refresh invalidates the indices, so it resets rather
     // than pointing at different rows. A grouped/flat TOGGLE does not: the
     // selection carries across by owning entry, so expanding a selected
     // sequence selects its frames and collapsing them selects the sequence.
-    static std::vector<char> rbSel;
-    static int rbSelAnchor = -1;               // row index of the last click
-    static bool rbSelFlat = false;             // which view rbSel was built for
-    static bool rbSelTree = false;
+    std::vector<char>& rbSel = I.sel;
+    int& rbSelAnchor = I.selAnchor;            // row index of the last click
+    bool& rbSelFlat = I.selFlat;               // which view rbSel was built for
+    bool& rbSelTree = I.selTree;
     {
-        static std::string selSig;
+        std::string& selSig = I.selSig;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
         if (sig != selSig) {
             selSig = sig;
             rbSel.assign(view.size(), 0);
             rbSelAnchor = -1;
-        } else if (rbSelFlat != app.rbFlat || rbSelTree != app.rbTree) {
-            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, rbSelFlat, rbSelTree);
+        } else if (rbSelFlat != I.flat || rbSelTree != I.tree) {
+            std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, rbSelFlat, rbSelTree);
             std::vector<const remote::Entry*> sel;
             for (size_t i = 0; i < old.size() && i < rbSel.size(); i++)
                 if (rbSel[i]) sel.push_back(old[i].e);
@@ -15099,16 +15395,16 @@ static void drawPanelRemote() {
                 if (std::find(sel.begin(), sel.end(), view[i].e) != sel.end()) rbSel[i] = 1;
             rbSelAnchor = -1;
         }
-        rbSelFlat = app.rbFlat;
-        rbSelTree = app.rbTree;
+        rbSelFlat = I.flat;
+        rbSelTree = I.tree;
         // an expand or a collapse moved every row below it: start clean
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
     // The first click of a double-click on a TREE folder toggles it; when the
     // second click turns out to be a navigation, that toggle has to be undone.
     // So the toggle remembers itself: path + the state it replaced.
-    static std::string rbTreeToggled;          // path of the last click-toggle
-    static bool rbTreeToggledOpen = false;     // its expansion BEFORE that click
+    std::string& rbTreeToggled = I.treeToggled;    // path of the last click-toggle
+    bool& rbTreeToggledOpen = I.treeToggledOpen;   // its expansion BEFORE that click
     // What a plain click does: show a throwaway PREVIEW of a file / of a
     // sequence's poster frame - nothing is registered - or, on a folder,
     // SELECT it (list) / toggle it in place (tree). Entering a folder is the
@@ -15121,11 +15417,11 @@ static void drawPanelRemote() {
         if (r.isDir()) {
             // In a TREE the single click still opens the folder where it is -
             // and remembers itself, so a double-click can cancel it (below).
-            if (app.rbTree) {
+            if (I.tree) {
                 rbTreeToggled = r.full();
-                rbTreeToggledOpen = rbHas(app.rbExpanded, rbTreeToggled);
-                if (rbTreeToggledOpen) rbTreeCollapse(rbTreeToggled);
-                else rbTreeExpand(rbTreeToggled);
+                rbTreeToggledOpen = rbHas(I.expanded, rbTreeToggled);
+                if (rbTreeToggledOpen) rbTreeCollapse(I, rbTreeToggled);
+                else rbTreeExpand(I, rbTreeToggled);
             }
             // list: the click selects the row (cursor + anchor, set by the
             // caller); the listing does not move
@@ -15161,6 +15457,8 @@ static void drawPanelRemote() {
         // failing open on every press of its buttons and of , / .
         if (!live) return;
         app.previewFiles = std::move(seq);
+        app.previewHost = B.host;      // the global slot must know its machine:
+        app.previewPort = B.port;      // N instances, N possible hosts
         if (!app.previewFiles.empty()) {
             app.previewIndex = seqAt;
             app.previewLabel = std::move(seqLabel);
@@ -15174,15 +15472,15 @@ static void drawPanelRemote() {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }
         if (r.isDir()) {
-            if (viaDouble && app.rbTree && rbTreeToggled == r.full()) {
+            if (viaDouble && I.tree && rbTreeToggled == r.full()) {
                 // undo the half-gesture: restore the expansion the first click
                 // changed, so navigating in does not also leave the old view
                 // toggled behind the user's back
-                if (rbTreeToggledOpen) rbTreeExpand(rbTreeToggled);
-                else rbTreeCollapse(rbTreeToggled);
+                if (rbTreeToggledOpen) rbTreeExpand(I, rbTreeToggled);
+                else rbTreeCollapse(I, rbTreeToggled);
                 rbTreeToggled.clear();
             }
-            rbGoTo(r.full());
+            rbGoTo(I, r.full());
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -15243,7 +15541,7 @@ static void drawPanelRemote() {
         if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
         return w;
     };
-    static char rbFilter[256] = "";
+    char* rbFilter = I.filter;
     {
         // One toolbar row: navigation first (back / forward / up / home /
         // refresh, compact), then the two view toggles, then the filter. The
@@ -15257,14 +15555,14 @@ static void drawPanelRemote() {
             if (on) ImGui::PopStyleColor();
             return clicked;
         };
-        ImGui::BeginDisabled(g_rbHistBack.empty());
-        if (ImGui::SmallButton("<##rbback")) rbDefer([] { rbHistGo(true); });
+        ImGui::BeginDisabled(I.histBack.empty());
+        if (ImGui::SmallButton("<##rbback")) rbDefer([&I] { rbHistGo(I, true); });
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("back (Alt+Left, mouse button 4)");
         rbFlow(rbBtnW(">"));
-        ImGui::BeginDisabled(g_rbHistFwd.empty());
-        if (ImGui::SmallButton(">##rbfwd")) rbDefer([] { rbHistGo(false); });
+        ImGui::BeginDisabled(I.histFwd.empty());
+        if (ImGui::SmallButton(">##rbfwd")) rbDefer([&I] { rbHistGo(I, false); });
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("forward (Alt+Right, mouse button 5)");
@@ -15275,27 +15573,27 @@ static void drawPanelRemote() {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("parent folder (Backspace)");
         rbFlow(rbBtnW("~"));
-        if (ImGui::SmallButton("~##rbhome")) rbGoTo("~");
+        if (ImGui::SmallButton("~##rbhome")) rbGoTo(I, "~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
         rbFlow(rbBtnW("refresh"));
         if (ImGui::SmallButton("refresh")) {
-            rbDefer([] { rbTreeForget(); });        // in order: forget, then list
-            rbGoTo(B.dir);
+            rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
+            rbGoTo(I, B.dir);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
         // Grouped <-> flat. No round trip: the peer already sent every member.
         rbFlow(rbBtnW("grp") + rbBtnW("flat") + 1);
-        if (rbSegBtn("grp##rbview", !app.rbFlat) && app.rbFlat) {
-            app.rbFlat = false;
+        if (rbSegBtn("grp##rbview", !I.flat) && I.flat) {
+            I.flat = app.rbFlat = false;   // this panel now; the pref = the default
             app.prefsDirty = true;
             savePrefs();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("grouped: a numbered sequence is ONE row");
         ImGui::SameLine(0, 1);
-        if (rbSegBtn("flat##rbview", app.rbFlat) && !app.rbFlat) {
-            app.rbFlat = true;
+        if (rbSegBtn("flat##rbview", I.flat) && !I.flat) {
+            I.flat = app.rbFlat = true;
             app.prefsDirty = true;
             savePrefs();
         }
@@ -15304,19 +15602,19 @@ static void drawPanelRemote() {
                               "date are not in the listing reply - those cells stay blank)");
         // List <-> tree. Expanding a node costs ONE list, once.
         rbFlow(rbBtnW("list") + rbBtnW("tree") + 1);
-        if (rbSegBtn("list##rblist", !app.rbTree) && app.rbTree) {
+        if (rbSegBtn("list##rblist", !I.tree) && I.tree) {
             // Leaving the tree with something under the cursor: the listing
             // opens on THAT folder. Walking down a tree is how you got to a
             // folder five levels deep; dropping back to the root on the way out
             // throws away the only thing the trip was for. A file under the
             // cursor means the folder holding it.
-            if (g_rbCursor >= 0 && g_rbCursor < (int)view.size()) {
-                const RbRow& r = view[g_rbCursor];
+            if (I.cursor >= 0 && I.cursor < (int)view.size()) {
+                const RbRow& r = view[I.cursor];
                 std::string want = r.ph || r.up ? std::string()
                                  : r.isDir()    ? r.full() : *r.dir;
-                if (!want.empty() && want != B.dir) rbGoTo(want);   // deferred
+                if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
             }
-            app.rbTree = false;
+            I.tree = app.rbTree = false;
             app.prefsDirty = true;
             savePrefs();
         }
@@ -15324,8 +15622,8 @@ static void drawPanelRemote() {
             ImGui::SetTooltip("list: one folder at a time\n(a double-click or Enter "
                               "enters a folder; a click selects it)");
         ImGui::SameLine(0, 1);
-        if (rbSegBtn("tree##rbtree", app.rbTree) && !app.rbTree) {
-            app.rbTree = true;
+        if (rbSegBtn("tree##rbtree", I.tree) && !I.tree) {
+            I.tree = app.rbTree = true;
             app.prefsDirty = true;
             savePrefs();
         }
@@ -15352,9 +15650,9 @@ static void drawPanelRemote() {
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
                                          ImGui::GetFontSize() * 4));
         ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
-                                 rbFilter, sizeof rbFilter);
-        g_rbToolbar.filterL = ImGui::GetItemRectMin().x;
-        g_rbToolbar.filterR = ImGui::GetItemRectMax().x;
+                                 rbFilter, sizeof I.filter);
+        I.toolbar.filterL = ImGui::GetItemRectMin().x;
+        I.toolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("filters the listing below without asking the server\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
@@ -15363,7 +15661,7 @@ static void drawPanelRemote() {
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
     shown.reserve(view.size());
-    if (!app.rbTree || !rbFilter[0]) {
+    if (!I.tree || !rbFilter[0]) {
         for (int i = 0; i < (int)view.size(); i++)
             if (view[i].up || !rbFilter[0] || globListMatch(rbFilter, view[i].name()))
                 shown.push_back(i);      // a filter narrows the listing, not the exit
@@ -15388,13 +15686,13 @@ static void drawPanelRemote() {
     // cursor's row index into a screen position: with any sort but the default
     // the two disagreed, so the clipper was told to keep a different row alive
     // than the one the cursor was on and SetScrollHereY never fired. The spec
-    // itself is stashed from the table one frame earlier (g_rbSortCol), exactly
+    // itself is stashed from the table one frame earlier (I.sortCol), exactly
     // as the tree builder needs it - see RB_COL_NAME.
     // Directories sort before files no matter the key: this is a browser, not a
     // table of numbers. In TREE mode the sort has already happened per level,
     // inside the builder; sorting the flattened tree here would tear children
     // away from their parents.
-    if (!app.rbTree)
+    if (!I.tree)
         std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
             const RbRow& a = view[ia];
             const RbRow& b = view[ib];
@@ -15405,12 +15703,12 @@ static void drawPanelRemote() {
             uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
             int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
             int cmp = 0;
-            switch (g_rbSortCol) {
+            switch (I.sortCol) {
                 case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
                 case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
                 default:           cmp = a.name().compare(b.name()); break;
             }
-            return g_rbSortDesc ? cmp > 0 : cmp < 0;
+            return I.sortDesc ? cmp > 0 : cmp < 0;
         });
     if (rbFilter[0]) {
         rbFlow(ImGui::CalcTextSize("9999/9999").x);
@@ -15420,10 +15718,11 @@ static void drawPanelRemote() {
     rbFlow(rbAdvW);
     if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
         rbAdvanced = !rbAdvanced;
+        app.rbAdvanced = rbAdvanced;   // the pref is the next panel's default
         app.prefsDirty = true;
         savePrefs();
     }
-    g_rbToolbar.moreR = ImGui::GetItemRectMax().x;
+    I.toolbar.moreR = ImGui::GetItemRectMax().x;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("the connection, the places list and the server-side\n"
                           "recursive search - the things a browse does not need\n"
@@ -15435,13 +15734,13 @@ static void drawPanelRemote() {
         const char* rbEndLbl = B.host.empty() ? "close browse##rbdisc" : "disconnect##rbdisc";
         rbFlow(rbBtnW(rbEndLbl));        // same flow rule as row 2: never clipped
         if (ImGui::SmallButton(rbEndLbl)) {
-            rbDefer([] {                 // another machine, other children
+            rbDefer([&I] {               // another machine, other children
                 app.uiSession.stop();    // ours to stop; the worker's is a job
                 App::RbJob j;
                 j.kind = App::RbDisconnect;
-                rbEnqueue(std::move(j));
-                app.rbrowse = App::RemoteBrowse{};
-                rbTreeForget();
+                rbEnqueue(I, std::move(j));
+                I.b = App::RemoteBrowse{};
+                rbTreeForget(I);
             });
             ImGui::PopID();
             return;
@@ -15471,7 +15770,7 @@ static void drawPanelRemote() {
             // (It used to exist only on a folder ROW, so opening the directory
             // being browsed meant going up a level to find its own name.)
             rbFlow(rbBtnW("open folder"));
-            if (ImGui::SmallButton("open folder")) remoteScanFolder(B.dir);
+            if (ImGui::SmallButton("open folder")) remoteScanFolder(I, B.dir);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
                                   "which stacks to open:\n%s", B.dir.c_str());
@@ -15482,30 +15781,30 @@ static void drawPanelRemote() {
                                          ImGui::GetFontSize() * 4));
         bool go = ImGui::InputTextWithHint("##rbsearch",
                                            "search server (recursive): frame_* or **/dark.npy",
-                                           rbSearchBuf, sizeof rbSearchBuf,
+                                           rbSearchBuf, sizeof I.searchBuf,
                                            ImGuiInputTextFlags_EnterReturnsTrue);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
                               "bare text matches anywhere in the relative path;\n"
                               "* and ? glob across '/'");
         rbFlow(rbBtnW("Stop##rbsearch"));
-        if (app.rbSearch.running) {
+        if (I.search.running) {
             if (ImGui::SmallButton("Stop##rbsearch")) {
-                app.rbSearch.gen++;               // in-flight result becomes stale
-                app.rbSearch.running = false;
+                I.search.gen++;               // in-flight result becomes stale
+                I.search.running = false;
             }
         } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
-            remoteStartSearch(rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
+            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
         }
         if (!rbSearchRoot.empty()) {
             ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
             rbFlow(rbBtnW("x##sroot"));
             if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
         }
-    } else if (!rbSearchRoot.empty() || app.rbSearch.running) {
+    } else if (!rbSearchRoot.empty() || I.search.running) {
         // a search aimed or running is state the user set: never silently
         // hidden by a fold, even though the row that made it is folded away
-        if (app.rbSearch.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
+        if (I.search.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
         else ImGui::TextDisabled("search aimed at: %s  (\"more\")", rbSearchRoot.c_str());
     }
     {   // "Open N selected as stack" - enabled only when the v3 metadata proves
@@ -15584,7 +15883,7 @@ static void drawPanelRemote() {
                         leaf = leaf.substr(sl2 + 1);
                     requestBrowseTemporal(B.host, files,
                                           leaf + " (" + std::to_string(files.size()) +
-                                          " selected)");
+                                          " selected)", B.port);
                 }
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -15646,8 +15945,8 @@ static void drawPanelRemote() {
                                "update the viewer", pv, (int)rp::VERSION);
     }
     ImGui::Separator();
-    if (app.rbSearch.active) {         // search results stand in for the listing
-        App::RemoteSearch& S = app.rbSearch;
+    if (I.search.active) {         // search results stand in for the listing
+        App::RemoteSearch& S = I.search;
         auto joinS = [&S](const std::string& rel) {
             return S.root == "/" ? "/" + rel : S.root + "/" + rel;
         };
@@ -15679,13 +15978,13 @@ static void drawPanelRemote() {
                 if (ImGui::Selectable(lb.c_str())) {
                     std::string full = joinS(h.rel);
                     if (h.dir) {
-                        rbGoTo(full);
+                        rbGoTo(I, full);
                     } else if (isNpyName(h.rel)) {
                         openRemote(makeRemoteUrl(B.host, full, B.port));
                     } else {
                         // not servable: at least go where it lives
                         size_t sl = full.find_last_of('/');
-                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                        rbGoTo(I, sl == std::string::npos || sl == 0 ? "/"
                                                                  : full.substr(0, sl));
                     }
                 }
@@ -15693,7 +15992,7 @@ static void drawPanelRemote() {
                     std::string full = joinS(h.rel);
                     if (!h.dir && ImGui::MenuItem("Go to containing folder")) {
                         size_t sl = full.find_last_of('/');
-                        rbGoTo(sl == std::string::npos || sl == 0 ? "/"
+                        rbGoTo(I, sl == std::string::npos || sl == 0 ? "/"
                                                                  : full.substr(0, sl));
                     }
                     if (ImGui::MenuItem("Copy path")) {
@@ -15718,16 +16017,17 @@ static void drawPanelRemote() {
     // parent. Gated on IsAnyItemActive so the filter box, the path field and
     // the search field keep every key they type; disjoint from the , / . frame
     // stepping under the listing, which owns different keys entirely.
-    int& rbCursor = g_rbCursor;          // row index, or -1 = no cursor yet
-    static bool rbCursorScroll = false;  // bring it into view this frame
+    int& rbCursor = I.cursor;          // row index, or -1 = no cursor yet
+    bool& rbCursorScroll = I.cursorScroll;  // bring it into view this frame
     {
-        static std::string curSig;
-        static bool curFlat = false, curTree = false;
+        std::string& curSig = I.curSig;
+        bool& curFlat = I.curFlat;
+        bool& curTree = I.curTree;
         std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
         if (sig != curSig) { curSig = sig; rbCursor = -1; }
-        else if (curFlat != app.rbFlat || curTree != app.rbTree) {
+        else if (curFlat != I.flat || curTree != I.tree) {
             // follow the row across a grouped/flat or list/tree toggle
-            std::vector<RbRow> old = rbBuildView(&B.dir, B.entries, curFlat, curTree);
+            std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, curFlat, curTree);
             const remote::Entry* was = rbCursor >= 0 && rbCursor < (int)old.size()
                                      ? old[rbCursor].e : nullptr;
             rbCursor = -1;
@@ -15736,8 +16036,8 @@ static void drawPanelRemote() {
                     if (view[i].e == was) { rbCursor = (int)i; break; }
             rbCursorScroll = rbCursor >= 0;
         }
-        curFlat = app.rbFlat;
-        curTree = app.rbTree;
+        curFlat = I.flat;
+        curTree = I.tree;
         if (rbCursor >= (int)view.size()) rbCursor = -1;
     }
     int rbCursorPos = -1;                // ...where it sits on SCREEN
@@ -15803,22 +16103,22 @@ static void drawPanelRemote() {
         // Right / Left expand and collapse the folder under the cursor. Only in
         // tree mode: in the flat listing there is nothing to open in place.
         // (Alt+arrow is history navigation, below - not a tree toggle.)
-        if (app.rbTree && !ImGui::GetIO().KeyAlt &&
+        if (I.tree && !ImGui::GetIO().KeyAlt &&
             rbCursor >= 0 && rbCursor < (int)view.size() &&
             view[rbCursor].isDir()) {
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
-                rbTreeExpand(view[rbCursor].full());
+                rbTreeExpand(I, view[rbCursor].full());
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
-                rbTreeCollapse(view[rbCursor].full());
+                rbTreeCollapse(I, view[rbCursor].full());
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) rbGoParent();
         // Alt+Left / Alt+Right: the browser's own back / forward, the keyboard
         // mirror of mouse buttons 4 / 5 (below, which also work when the panel
         // is merely hovered). Deferred like every other navigation.
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_LeftArrow))
-            rbDefer([] { rbHistGo(true); });
+            rbDefer([&I] { rbHistGo(I, true); });
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow))
-            rbDefer([] { rbHistGo(false); });
+            rbDefer([&I] { rbHistGo(I, false); });
     }
     // Mouse back / forward, scoped to this panel (hovered or focused) so a
     // future second browser can own its own history. The vendored backend
@@ -15826,16 +16126,16 @@ static void drawPanelRemote() {
     // keys selftest's mback / mfwd, which inject exactly those.
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
         ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) {
-        if (ImGui::IsMouseClicked(3)) rbDefer([] { rbHistGo(true); });
-        if (ImGui::IsMouseClicked(4)) rbDefer([] { rbHistGo(false); });
+        if (ImGui::IsMouseClicked(3)) rbDefer([&I] { rbHistGo(I, true); });
+        if (ImGui::IsMouseClicked(4)) rbDefer([&I] { rbHistGo(I, false); });
     }
     // The listing scrolls on its own so the header above never leaves the view.
     // Properties target: a snapshot, because the row may scroll out of the
     // clipper (or the listing may refresh) while the popup is up.
-    static remote::Entry rbPropsEntry;
-    static std::string rbPropsPath;
-    static bool rbPropsOpen = false;
-    static bool rbPropsNoSize = false;   // an expanded frame: no size/mtime of its own
+    remote::Entry& rbPropsEntry = I.propsEntry;
+    std::string& rbPropsPath = I.propsPath;
+    bool& rbPropsOpen = I.propsOpen;
+    bool& rbPropsNoSize = I.propsNoSize; // an expanded frame: no size/mtime of its own
     // footer space for the preview scrub bar: RESERVED even when no preview is
     // alive, so starting one never shifts the rows under the cursor (a bar
     // that appeared above the list moved every row mid-double-click)
@@ -15906,11 +16206,11 @@ static void drawPanelRemote() {
         // same one-frame contract the tree builder has always had.
         if (const ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs()) {
             if (sp->SpecsCount > 0) {
-                g_rbSortCol = (int)sp->Specs[0].ColumnUserID;
-                g_rbSortDesc = sp->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                I.sortCol = (int)sp->Specs[0].ColumnUserID;
+                I.sortDesc = sp->Specs[0].SortDirection == ImGuiSortDirection_Descending;
             } else {
-                g_rbSortCol = RB_COL_NAME;
-                g_rbSortDesc = false;
+                I.sortCol = RB_COL_NAME;
+                I.sortDesc = false;
             }
         }
         ImGuiListClipper clip;
@@ -15949,9 +16249,9 @@ static void drawPanelRemote() {
             // context menu (a placeholder "(listing...)" row has none, the ".."
             // row has none, and a tree still fetching a node can put one at the
             // top)
-            if (!r.ph && !r.up && g_rbToolbar.rowY <= 0) {
-                g_rbToolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
-                g_rbToolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
+            if (!r.ph && !r.up && I.toolbar.rowY <= 0) {
+                I.toolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
+                I.toolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
             }
             if (shown[row] == rbCursor) {
                 // the keyboard cursor: an outline, not a fill - the fill means
@@ -15960,9 +16260,9 @@ static void drawPanelRemote() {
                 ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
                                                     ImGui::GetItemRectMax(),
                                                     IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
-                g_rbCursorRect[0] = ImGui::GetItemRectMin();
-                g_rbCursorRect[1] = ImGui::GetItemRectMax();
-                g_rbCursorName = rname;
+                I.cursorRect[0] = ImGui::GetItemRectMin();
+                I.cursorRect[1] = ImGui::GetItemRectMax();
+                I.cursorName = rname;
             }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
@@ -15977,7 +16277,7 @@ static void drawPanelRemote() {
                     float a = std::min(h * 0.16f, gut * 0.30f);
                     // in a tree it also SAYS which way the node is: › closed,
                     // v open, the one glyph carrying both meanings
-                    if (app.rbTree && rbHas(app.rbExpanded, r.full())) {
+                    if (I.tree && rbHas(I.expanded, r.full())) {
                         rdl->AddLine(ImVec2(cxm - a, cym - a * 0.5f), ImVec2(cxm, cym + a * 0.5f), c, 1.4f);
                         rdl->AddLine(ImVec2(cxm, cym + a * 0.5f), ImVec2(cxm + a, cym - a * 0.5f), c, 1.4f);
                     } else {
@@ -16039,7 +16339,7 @@ static void drawPanelRemote() {
                 std::string full = r.full();
                 if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
-                        remoteScanFolder(full);
+                        remoteScanFolder(I, full);
                     if (ImGui::MenuItem("Search under here")) {
                         rbSearchRoot = full;      // the search row shows and clears it
                         rbSearchFocus = true;
@@ -16071,7 +16371,7 @@ static void drawPanelRemote() {
                         size_t sl2 = leaf.find_last_of('/');
                         if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
                             leaf = leaf.substr(sl2 + 1);
-                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name);
+                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name, B.port);
                     }
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
@@ -16131,8 +16431,8 @@ static void drawPanelRemote() {
                 // one thing --browse-keys-selftest asserts about this column
                 // (nothing is printed at all when the column is dropped)
                 if (colDate) {
-                    g_rbToolbar.dateCellW = cellW;
-                    g_rbToolbar.dateTextW = std::max(g_rbToolbar.dateTextW,
+                    I.toolbar.dateCellW = cellW;
+                    I.toolbar.dateTextW = std::max(I.toolbar.dateTextW,
                                                      ImGui::CalcTextSize(ts.c_str()).x);
                 }
                 // the short form drops a field, so the full stamp stays one
@@ -17371,20 +17671,27 @@ static void drawSequenceModal() {
   #define SC_MOD "Ctrl"
 #endif
 
-// Is what we are looking at somewhere else? The session being up counts, and so
-// does an image that came from one: a dropped connection does not make the
-// pixels local. Drives the icon variant and the "[host]" in the title.
+// Is what we are looking at somewhere else? A session being up counts (any
+// Browse instance), and so does an image that came from one: a dropped
+// connection does not make the pixels local. Drives the icon variant and the
+// "[host]" in the title.
 static bool viewingRemote() {
     const ImageDoc* im = cur();
-    return app.rbrowse.connected || (im && !im->remoteUrl.empty());
+    for (const auto& p : app.browsePanels)
+        if (p->b.connected) return true;
+    return im && !im->remoteUrl.empty();
 }
 
 // The host behind that, or "" for the local peer. The peer protocol is the same
 // either way - deliberately - but the ANSWER to "is this somewhere else?" is
 // not, and the title bar and the taskbar icon are answers to that question.
+// With N instances the ACTIVE one answers first, then any connected remote.
 static std::string viewingHost() {
     if (!viewingRemote()) return {};
-    if (!app.rbrowse.host.empty()) return app.rbrowse.host;
+    if (!app.browsePanels.empty() && !rbActive().b.host.empty() && rbActive().b.connected)
+        return rbActive().b.host;
+    for (const auto& p : app.browsePanels)
+        if (p->b.connected && !p->b.host.empty()) return p->b.host;
     const ImageDoc* im = cur();
     if (im && !im->remoteUrl.empty()) {
         std::string h, p;
@@ -17528,10 +17835,12 @@ static void drawMenuBar(GLFWwindow* win) {
                               "happens in the Browse panel: click a file to look\n"
                               "at it, double-click to open it, \"open folder\" for\n"
                               "every stack below the folder you are in.");
-        if (ImGui::MenuItem("Update remote peer", nullptr, false, app.rbrowse.connected)) {
+        if (ImGui::MenuItem("Update remote peer", nullptr, false,
+                            rbActive().b.connected)) {
+            App::BrowseInstance& I = rbActive();   // the panel last worked in
             App::RbJob j; j.kind = App::RbUpdatePeer;
-            j.host = app.rbrowse.host; j.port = app.rbrowse.port;
-            rbEnqueue(std::move(j));
+            j.host = I.b.host; j.port = I.b.port;
+            rbEnqueue(I, std::move(j));
         }
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
         {   // recovery: the autosave is written on exit, on crash and every 60 s
@@ -17758,6 +18067,12 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
             ImGui::MenuItem("Browse", nullptr, &app.showRemote);
+            // a SECOND (third, ...) view onto another place - each Browse
+            // window stands somewhere of its own (docs/todo-open.md item 17)
+            if (ImGui::MenuItem("New Browse Panel")) rbNewInstance();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("another Browse window with its own place -\n"
+                                  "browse two folders or two machines side by side");
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
@@ -17948,7 +18263,9 @@ static void drawRemoteOpenModal() {
         app.prefsDirty = true;
         savePrefs();
         ImGui::CloseCurrentPopup();
-        startRemote(hostbuf);         // errors arrive as toasts and in the panel
+        // errors arrive as toasts and inline in the instance that connects -
+        // the one the user was last working in
+        startRemote(rbActive(), hostbuf);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
@@ -17965,7 +18282,7 @@ static void drawRemoteErrorWindow() {
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Remote connection details", &app.showRemoteError)) {
-        const App::RemoteBrowse& B = app.rbrowse;
+        const App::RemoteBrowse& B = rbActive().b;
         std::string all = "host: " + (B.host.empty() ? std::string("(none)") : B.host) + "\n";
         if (!B.err.empty()) all += B.err + "\n";
         if (!g_bootstrapLog.empty()) all += "\ninstall log:\n" + g_bootstrapLog;
@@ -18116,6 +18433,15 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 // chkcursor:N (view index), chkatrow:NAME (the cursor row's name), chkback:N,
 // chkfwd:N, chkexp:N, chkfocus:0|1 - any FAIL fails the run.
 //
+// INSTANCES (item 17): every stateful action and check drives the TARGET
+// instance (target:N switches it; 1 = the primordial panel). newpanel creates
+// a second Browse aimed at <dir>/scanroot and targets it; reconnect
+// re-connects the target to <dir> post-"disc"; closep closes the target's
+// window (extras are destroyed, the last one hides); hidep / showp drive
+// app.showRemote (the View menu's flag); filt:S types S into the target's
+// filter; chkfilt:S ("-" = empty), chkpanels:N (instance count), chkshown:N
+// (windows visible), chksel:N (rows selected in the target).
+//
 // w<px> floats the panel at an exact width and then asserts what a human would
 // otherwise have to read off a screenshot: that the filter box and the "more"
 // button are still INSIDE the panel, and that the filter is wide enough to type
@@ -18195,6 +18521,35 @@ static std::string g_browseKeysActs =
     // at every docked width, and Escape must close a menu and a context popup.
     "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
     "rctx,esc,fmenu,esc,disc,"
+    // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
+    // singleton). Reconnect the primordial panel, then open a SECOND Browse
+    // standing in a DIFFERENT place at the same moment - the one sentence a
+    // singleton can never make true (one App::rbrowse.dir = one place, ever).
+    "reconnect,waitdir:rb,chkpanels:1,"
+    "newpanel,chkpanels:2,waitdir:scanroot,chkdir:scanroot,"
+    "target:1,chkdir:rb,"
+    // independence: a filter typed into one panel does not narrow the other
+    "filt:frame,chkfilt:frame,target:2,chkfilt:-,"
+    // the keyboard belongs to the FOCUSED instance: panel 2 holds focus (it
+    // was just created), so Down moves ITS cursor and leaves panel 1's alone
+    "down,down,chkatrow:10lx,chkfocus:1,target:1,chkcursor:-1,target:2,"
+    // selection is per instance too
+    "ctrlclick,chksel:1,target:1,chksel:0,target:2,"
+    // ...and so is the history: navigating panel 2 records nothing in panel 1
+    "dbl,waitdir:10lx,chkback:1,target:1,chkback:0,"
+    // focus back on panel 1: the same keys now move ITS cursor, and panel 2's
+    // (reset to -1 by its own navigation) stays put
+    "focus,chkfocus:1,down,chkcursor:0,target:2,chkcursor:-1,"
+    // a session round-trip (item 10, decision A5): both places are written as
+    // rbplace lines, every instance is torn down, and the restore reconnects
+    // BOTH - each through its own worker - to where they stood
+    "sessrt,chkpanels:2,target:1,waitdir:rb,target:2,waitdir:10lx,"
+    // closing the second leaves the first fully working...
+    "closep,chkpanels:1,target:1,chkdir:rb,focus,down,down,"
+    "chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    // ...and the LAST one closing only hides: View > Panels > Browse reopens
+    // it with its place, listing and cursor intact
+    "hidep,chkshown:0,showp,chkshown:1,chkdir:rb,focus,up,chkatrow:..,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -19561,11 +19916,11 @@ int main(int argc, char** argv) {
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 120.0) {
             pumpRemoteBrowse();
-            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
-            if (!app.rbrowse.err.empty()) break;
+            if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
+            if (!rbMain().b.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        const App::RemoteBrowse& B = app.rbrowse;
+        const App::RemoteBrowse& B = rbMain().b;
         bool ok = B.connected && B.host.empty() && !B.entries.empty() &&
                   app.showRemote;
         fprintf(stderr, "localbrowseselftest: connected=%d host='%s' dir=%s "
@@ -19607,15 +19962,15 @@ int main(int argc, char** argv) {
         std::string dir = g_browseSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
         while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
-        startRemote("local://" + dir);
+        startRemote(rbMain(), "local://" + dir);
         double t0 = glfwGetTime();
         while (glfwGetTime() - t0 < 120.0) {
             pumpRemoteBrowse();
-            if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
-            if (!app.rbrowse.err.empty()) break;
+            if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
+            if (!rbMain().b.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        const App::RemoteBrowse& B = app.rbrowse;
+        const App::RemoteBrowse& B = rbMain().b;
         if (!B.connected || B.entries.empty()) {
             fprintf(stderr, "browseselftest: no listing for %s (%s)\n",
                     dir.c_str(), B.err.c_str());
@@ -19634,8 +19989,8 @@ int main(int argc, char** argv) {
                 nMembers += (int)e.members.size();
                 if (!g) g = &e;
             }
-            std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
-            std::vector<RbRow> fv = rbBuildView(&B.dir, B.entries, true, false);
+            std::vector<RbRow> gv = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+            std::vector<RbRow> fv = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
             // ...plus the one ".." row the listing always carries (row 0,
             // under every sort - it is navigation, not a listed entry)
             int gUp = 0, fUp = 0;
@@ -19682,8 +20037,8 @@ int main(int argc, char** argv) {
             bool queued = false, aliveOk = false;
             size_t pend0 = rbDeferredPending();
             {
-                RbDeferredActions guard;
-                std::vector<RbRow> rows = rbBuildView(&B.dir, B.entries, false, false);
+                RbDeferredActions guard(rbMain());
+                std::vector<RbRow> rows = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
                 rbDefer([&] { ranAt = marker; });     // what picking a place queues
                 marker = 1;
                 queued = rbDeferredPending() == pend0 + 1 && ranAt == -1;
@@ -19716,24 +20071,24 @@ int main(int argc, char** argv) {
                 ok = false;
             } else {
                 std::string subPath = dir + "/" + sub;
-                int before = app.rbTreeLists;
+                int before = rbMain().treeLists;
                 // nothing is listed until it is asked for
-                bool lazy0 = app.rbTreeCache.empty();
-                rbTreeExpand(subPath);
+                bool lazy0 = rbMain().treeCache.empty();
+                rbTreeExpand(rbMain(), subPath);
                 double t1 = glfwGetTime();
                 while (glfwGetTime() - t1 < 120.0) {
                     pumpRemoteBrowse();
-                    if (app.rbTreeCache.count(subPath)) break;
+                    if (rbMain().treeCache.count(subPath)) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                int afterExpand = app.rbTreeLists;
-                std::vector<RbRow> tv = rbBuildView(&B.dir, B.entries, false, true);
+                int afterExpand = rbMain().treeLists;
+                std::vector<RbRow> tv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
                 // the children sit directly under their folder, one level in
                 int at = -1;
                 for (int i = 0; i < (int)tv.size(); i++)
                     if (tv[i].isDir() && tv[i].name() == sub) { at = i; break; }
-                size_t nKids = app.rbTreeCache.count(subPath)
-                             ? app.rbTreeCache[subPath].size() : 0;
+                size_t nKids = rbMain().treeCache.count(subPath)
+                             ? rbMain().treeCache[subPath].size() : 0;
                 int kidsUnder = 0;
                 bool contiguous = at >= 0;
                 for (int i = at + 1; i < (int)tv.size() && tv[i].depth > tv[at].depth; i++)
@@ -19744,18 +20099,18 @@ int main(int argc, char** argv) {
                 for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
                     if (tv[i].full() != subPath + "/" + tv[i].name()) paths = false;
                 // collapse: rows go, the cache stays
-                rbTreeCollapse(subPath);
-                std::vector<RbRow> cv = rbBuildView(&B.dir, B.entries, false, true);
+                rbTreeCollapse(rbMain(), subPath);
+                std::vector<RbRow> cv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
                 // ...back to the listed entries, plus the ".." row every shape
                 // carries (it is navigation, not a listed entry)
                 size_t cvListed = 0;
                 for (const auto& r : cv) if (!r.up) cvListed++;
                 bool collapsed = cvListed == B.entries.size() &&
-                                 app.rbTreeCache.count(subPath) == 1;
+                                 rbMain().treeCache.count(subPath) == 1;
                 // re-expand: no second round trip
-                rbTreeExpand(subPath);
-                int afterAgain = app.rbTreeLists;
-                std::vector<RbRow> rv = rbBuildView(&B.dir, B.entries, false, true);
+                rbTreeExpand(rbMain(), subPath);
+                int afterAgain = rbMain().treeLists;
+                std::vector<RbRow> rv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
                 bool freeAgain = afterAgain == afterExpand && rv.size() == tv.size();
                 // and a grandchild: the recursion must indent, not flatten
                 int deep = 0, atDeep = -1;
@@ -19763,14 +20118,14 @@ int main(int argc, char** argv) {
                     for (int i = at + 1; i <= at + kidsUnder && i < (int)tv.size(); i++)
                         if (tv[i].isDir()) { atDeep = i; break; }
                 if (atDeep >= 0) {
-                    rbTreeExpand(rv[atDeep].full());
+                    rbTreeExpand(rbMain(), rv[atDeep].full());
                     double t2 = glfwGetTime();
                     while (glfwGetTime() - t2 < 120.0) {
                         pumpRemoteBrowse();
-                        if (app.rbTreeCache.count(rv[atDeep].full())) break;
+                        if (rbMain().treeCache.count(rv[atDeep].full())) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
-                    std::vector<RbRow> dv = rbBuildView(&B.dir, B.entries, false, true);
+                    std::vector<RbRow> dv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
                     for (const auto& q : dv) if (q.depth == 2) deep++;
                 }
                 bool treeOk = lazy0 && afterExpand == before + 1 && nKids > 0 &&
@@ -19786,7 +20141,7 @@ int main(int argc, char** argv) {
                         paths ? 1 : 0, (int)cv.size(), collapsed ? 1 : 0,
                         afterAgain - afterExpand, deep, treeOk ? "ok" : "FAIL");
                 if (!treeOk) ok = false;
-                rbTreeForget();
+                rbTreeForget(rbMain());
             }
         }
         {   // ".." belongs to the LISTING only. In a tree the parent is already
@@ -19796,7 +20151,7 @@ int main(int argc, char** argv) {
             // that appeared only outside the home directory is what shifted
             // every row by one on the way in and out.
             auto rows = [&](bool flat, bool tree) {
-                return rbBuildView(&B.dir, B.entries, flat, tree);
+                return rbBuildView(rbMain(), &B.dir, B.entries, flat, tree);
             };
             std::vector<RbRow> lv = rows(false, false), tv = rows(false, true);
             std::vector<RbRow> fv2 = rows(true, false);
@@ -19822,7 +20177,7 @@ int main(int argc, char** argv) {
             // include the CURRENT directory itself (a stack whose name has no
             // folder prefix), which is exactly what the old row-only entry
             // could not reach without first going up a level.
-            remoteScanFolder(B.dir);
+            remoteScanFolder(rbMain(), B.dir);
             double t1 = glfwGetTime();
             while (glfwGetTime() - t1 < 120.0) {
                 pumpRemoteBrowse();
@@ -19868,15 +20223,15 @@ int main(int argc, char** argv) {
                 // safe to read the worker's session directly HERE and only
                 // here: the selftest drives the pump by hand and the queue is
                 // drained, so rbWorker is parked in its 50 ms sleep
-                uint64_t rb0 = app.rbSession ? app.rbSession->bytesReceived() : 0;
+                uint64_t rb0 = rbMain().session ? rbMain().session->bytesReceived() : 0;
                 size_t nimg0 = app.images.size();
                 openRemote("local://" + B.dir + "/" + file, true);
                 pumpRemoteBrowse();          // pick up anything the worker said
                 uint64_t uiRx = app.uiSession.bytesReceived();
-                uint64_t rbRx = app.rbSession ? app.rbSession->bytesReceived() : 0;
+                uint64_t rbRx = rbMain().session ? rbMain().session->bytesReceived() : 0;
                 bool sepOk = uiIdle0 && app.uiSession.alive() && uiRx > 0 &&
                              rbRx == rb0 && app.images.size() == nimg0 + 1 &&
-                             (void*)app.rbSession.get() != (void*)&app.uiSession;
+                             (void*)rbMain().session.get() != (void*)&app.uiSession;
                 fprintf(stderr, "browseselftest: session ownership: ui session idle "
                                 "before=%d, open %s -> ui rx %llu B (alive=%d), browse "
                                 "worker rx %llu -> %llu B (unmoved=%d), distinct "
@@ -19884,7 +20239,7 @@ int main(int argc, char** argv) {
                         uiIdle0 ? 1 : 0, file.c_str(), (unsigned long long)uiRx,
                         app.uiSession.alive() ? 1 : 0, (unsigned long long)rb0,
                         (unsigned long long)rbRx, rbRx == rb0 ? 1 : 0,
-                        (void*)app.rbSession.get() != (void*)&app.uiSession ? 1 : 0,
+                        (void*)rbMain().session.get() != (void*)&app.uiSession ? 1 : 0,
                         sepOk ? "ok" : "FAIL");
                 if (!sepOk) ok = false;
                 dropPreview();
@@ -19898,14 +20253,14 @@ int main(int argc, char** argv) {
             // only from a name that HAS a folder part, so a bare member name
             // parses its first digit run as a LEVEL, and a lit stack gets
             // proposed at 0 - which is the dark-reference value.
-            remoteBrowseTo(dir + "/scanroot/10lx");
+            remoteBrowseTo(rbMain(), dir + "/scanroot/10lx");
             double t1 = glfwGetTime();
             while (glfwGetTime() - t1 < 120.0) {
                 pumpRemoteBrowse();
                 if (B.dir == dir + "/scanroot/10lx" && !B.entries.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            std::vector<RbRow> gv = rbBuildView(&B.dir, B.entries, false, false);
+            std::vector<RbRow> gv = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
             const RbRow* grp = nullptr;
             for (const auto& r : gv) if (r.isGroup()) { grp = &r; break; }
             if (!grp) {
@@ -19945,15 +20300,15 @@ int main(int argc, char** argv) {
             // token since it was written; RbScan carried none at all.
             app.folderPick.clear();
             app.folderPickOpen = false;
-            remoteScanFolder(B.dir);
-            uint32_t genAt = app.rbrowse.scanGen;
-            app.rbrowse.scanGen++;            // exactly what the cancel button does
+            remoteScanFolder(rbMain(), B.dir);
+            uint32_t genAt = rbMain().b.scanGen;
+            rbMain().b.scanGen++;            // exactly what the cancel button does
             double t3 = glfwGetTime();
             bool sawScan = false;
             while (glfwGetTime() - t3 < 60.0) {
                 {   // wait for the worker to actually produce the scan result
-                    std::lock_guard<std::mutex> lk(app.rbMtx);
-                    for (const auto& rr : app.rbDone)
+                    std::lock_guard<std::mutex> lk(rbMain().mtx);
+                    for (const auto& rr : rbMain().done)
                         if (rr.kind == App::RbScan && rr.gen == genAt) sawScan = true;
                 }
                 pumpRemoteBrowse();
@@ -19996,7 +20351,7 @@ int main(int argc, char** argv) {
             std::string bdir = bomb.u8string();
             std::replace(bdir.begin(), bdir.end(), '\\', '/');
             double bt0 = glfwGetTime();
-            remoteBrowseTo(bdir);
+            remoteBrowseTo(rbMain(), bdir);
             double t2 = glfwGetTime();
             while (glfwGetTime() - t2 < 120.0) {
                 pumpRemoteBrowse();
@@ -20112,19 +20467,19 @@ int main(int argc, char** argv) {
             refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
         }
         // connect the browser, then fire the SAME call the group row's menu makes
-        startRemote("local://" + dir);
+        startRemote(rbMain(), "local://" + dir);
         double t0 = glfwGetTime();
         bool fired = false, ok = true;
         while (glfwGetTime() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpMeasure();
-            if (app.rbrowse.connected && !fired) {
+            if (rbMain().b.connected && !fired) {
                 std::string leaf = dir.substr(dir.find_last_of('/') + 1);
-                requestBrowseTemporal(app.rbrowse.host, files, leaf + "/frame_???.npy");
+                requestBrowseTemporal(rbMain().b.host, files, leaf + "/frame_???.npy", rbMain().b.port);
                 fired = true;
             }
             if (fired && !app.srvTemporal.pending) break;
-            if (!app.rbrowse.err.empty()) break;
+            if (!rbMain().b.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         App::ServerTemporal& S = app.srvTemporal;
@@ -21744,7 +22099,7 @@ int main(int argc, char** argv) {
         // openRemote mints the frame-axis stack itself and openRemoteStack used
         // to return before it could say which folder it came from.
         closeAll();
-        startRemote("local://" + dir);
+        startRemote(rbMain(), "local://" + dir);
         {
             double t0 = glfwGetTime();
             bool scanSent = false;
@@ -21753,10 +22108,10 @@ int main(int argc, char** argv) {
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
                 pumpSequenceAndQueue();
-                if (app.rbrowse.connected && !scanSent) {
+                if (rbMain().b.connected && !scanSent) {
                     App::RbJob j; j.kind = App::RbScan;
-                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = dir;
-                    rbEnqueue(std::move(j));
+                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = dir;
+                    rbEnqueue(rbMain(), std::move(j));
                     scanSent = true;
                 }
                 if (app.folderPickOpen && app.folderPickRemote) {
@@ -21765,11 +22120,11 @@ int main(int argc, char** argv) {
                     snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
                     pickerAccept();
                 }
-                if (scanSent && !app.rbBusy && !app.seqs.empty() && !app.folderPickOpen &&
+                if (scanSent && !rbMain().busy && !app.seqs.empty() && !app.folderPickOpen &&
                     app.rbOpenQueue.empty() && app.rfPending == 0 &&
                     app.seriesPending.empty())
                     break;
-                if (!app.rbrowse.err.empty()) break;
+                if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
@@ -21849,7 +22204,7 @@ int main(int argc, char** argv) {
                                                 : scanroot.substr(0, sl)) + "/rb/scanroot";
         }
         int seqsNow = (int)app.seqs.size();
-        startRemote("local://" + scanroot);
+        startRemote(rbMain(), "local://" + scanroot);
         double t0 = glfwGetTime();
         bool scanSent = false, closed = false;
         int rsid = 0, rfLeft = -1;
@@ -21858,11 +22213,11 @@ int main(int argc, char** argv) {
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
             pumpSequenceAndQueue();
-            if (app.rbrowse.connected && !scanSent) {
+            if (rbMain().b.connected && !scanSent) {
                 App::RbJob j;
                 j.kind = App::RbScan;
-                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
-                rbEnqueue(std::move(j));
+                j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                rbEnqueue(rbMain(), std::move(j));
                 scanSent = true;
             }
             if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
@@ -21875,12 +22230,12 @@ int main(int argc, char** argv) {
                 for (const auto& jj : app.rfQueue) if (jj.seqId == rsid) rfLeft++;
                 break;
             }
-            if (!app.rbrowse.err.empty()) break;
+            if (!rbMain().b.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (!closed) {
             fprintf(stderr, "closeselftest: FAILED - never caught a stack mid-fetch (%s)\n",
-                    app.rbrowse.err.c_str());
+                    rbMain().b.err.c_str());
             ok = false;
         } else {
             // the in-flight job (and the rest of the queue) gets 2 s to land;
@@ -21946,8 +22301,8 @@ int main(int argc, char** argv) {
         {   // the same, for the REMOTE open queue: accept a scan of N stacks and
             // Close All while stack 1 is still transferring
             closeAll();
-            app.rbrowse = App::RemoteBrowse{};
-            startRemote("local://" + scanroot);
+            rbMain().b = App::RemoteBrowse{};
+            startRemote(rbMain(), "local://" + scanroot);
             double t3 = glfwGetTime();
             bool sent = false, caught = false;
             int rq0 = 0;
@@ -21956,11 +22311,11 @@ int main(int argc, char** argv) {
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
                 pumpSequenceAndQueue();
-                if (app.rbrowse.connected && !sent) {
+                if (rbMain().b.connected && !sent) {
                     App::RbJob j;
                     j.kind = App::RbScan;
-                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
-                    rbEnqueue(std::move(j));
+                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                    rbEnqueue(rbMain(), std::move(j));
                     sent = true;
                 }
                 if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
@@ -21969,12 +22324,12 @@ int main(int argc, char** argv) {
                     caught = true;
                     break;
                 }
-                if (!app.rbrowse.err.empty()) break;
+                if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             if (!caught) {
                 fprintf(stderr, "closeselftest: FAILED - never caught a queued remote "
-                                "open (%s)\n", app.rbrowse.err.c_str());
+                                "open (%s)\n", rbMain().b.err.c_str());
                 ok = false;
             } else {
                 closeAll();
@@ -22260,7 +22615,7 @@ int main(int argc, char** argv) {
             size_t sl = scanroot.find_last_of('/');
             scanroot = (sl == std::string::npos ? std::string(".")
                                                 : scanroot.substr(0, sl)) + "/rb/scanroot";
-            startRemote("local://" + scanroot);
+            startRemote(rbMain(), "local://" + scanroot);
             double t0 = glfwGetTime();
             bool scanSent = false, closed = false;
             int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
@@ -22269,11 +22624,11 @@ int main(int argc, char** argv) {
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
                 pumpSequenceAndQueue();
-                if (app.rbrowse.connected && !scanSent) {
+                if (rbMain().b.connected && !scanSent) {
                     App::RbJob j;
                     j.kind = App::RbScan;
-                    j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = scanroot;
-                    rbEnqueue(std::move(j));
+                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                    rbEnqueue(rbMain(), std::move(j));
                     scanSent = true;
                 }
                 if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
@@ -22295,7 +22650,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                if (!app.rbrowse.err.empty()) break;
+                if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             double t1 = glfwGetTime();
@@ -22471,30 +22826,30 @@ int main(int argc, char** argv) {
             size_t sl2 = scanroot2.find_last_of('/');
             scanroot2 = (sl2 == std::string::npos ? std::string(".")
                                                   : scanroot2.substr(0, sl2)) + "/rb/scanroot";
-            app.rbrowse = App::RemoteBrowse{};
-            startRemote("local://" + scanroot2);
+            rbMain().b = App::RemoteBrowse{};
+            startRemote(rbMain(), "local://" + scanroot2);
             double t0b = glfwGetTime();
             while (glfwGetTime() - t0b < 120.0) {
                 pumpRemoteBrowse();
-                if (app.rbrowse.connected && !app.rbrowse.entries.empty()) break;
-                if (!app.rbrowse.err.empty()) break;
+                if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
+                if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             std::vector<std::string> f10;
-            for (const auto& e : app.rbrowse.entries)
+            for (const auto& e : rbMain().b.entries)
                 if (e.dir && e.name == "10lx") {
                     // list it, then take its frames
-                    remoteBrowseTo(scanroot2 + "/10lx");
+                    remoteBrowseTo(rbMain(), scanroot2 + "/10lx");
                     double t1b = glfwGetTime();
                     while (glfwGetTime() - t1b < 120.0) {
                         pumpRemoteBrowse();
-                        if (app.rbrowse.dir == scanroot2 + "/10lx") break;
+                        if (rbMain().b.dir == scanroot2 + "/10lx") break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
-                    for (const auto& e2 : app.rbrowse.entries)
+                    for (const auto& e2 : rbMain().b.entries)
                         if (e2.group)
                             for (const auto& m : e2.members)
-                                f10.push_back(app.rbrowse.dir + "/" + m);
+                                f10.push_back(rbMain().b.dir + "/" + m);
                     break;
                 }
             if (f10.size() < 3) {
@@ -22528,7 +22883,7 @@ int main(int argc, char** argv) {
                       "V14 the commitment is released when the frame lands");
             }
             stopRbWorker();
-            app.rbStop = false;
+            for (auto& bp : app.browsePanels) bp->stop = false;
             closeAll();
         }
 
@@ -24613,7 +24968,7 @@ int main(int argc, char** argv) {
     if (!g_scanSelftest.empty()) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
-        startRemote("local://" + dir);
+        startRemote(rbMain(), "local://" + dir);
         double t0 = glfwGetTime();
         bool scanSent = false;
         while (glfwGetTime() - t0 < 120.0) {
@@ -24621,26 +24976,26 @@ int main(int argc, char** argv) {
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
             pumpSequenceAndQueue();
-            if (app.rbrowse.connected && !scanSent) {
+            if (rbMain().b.connected && !scanSent) {
                 App::RbJob j; j.kind = App::RbScan;
-                j.host = app.rbrowse.host; j.port = app.rbrowse.port; j.dir = dir;
-                rbEnqueue(std::move(j));
+                j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = dir;
+                rbEnqueue(rbMain(), std::move(j));
                 scanSent = true;
             }
             // headless "Load selected": accept the picker with everything checked,
             // through the SAME function the Load button calls
             if (app.folderPickOpen && app.folderPickRemote) pickerAccept();
-            if (scanSent && !app.rbBusy && !app.seqs.empty() &&
+            if (scanSent && !rbMain().busy && !app.seqs.empty() &&
                 app.rbOpenQueue.empty() && app.rfPending == 0) break;
-            if (!app.rbrowse.err.empty()) break;
+            if (!rbMain().b.err.empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         for (const auto& si : app.seqs)
             fprintf(stderr, "scanselftest: stack '%s' expected=%d\n",
                     si.name.c_str(), si.expectedFrames);
-        bool ok = !app.seqs.empty() && app.rbrowse.err.empty();
+        bool ok = !app.seqs.empty() && rbMain().b.err.empty();
         fprintf(stderr, "scanselftest: %d stack(s): %s\n", (int)app.seqs.size(),
-                ok ? "ok" : ("FAILED " + app.rbrowse.err).c_str());
+                ok ? "ok" : ("FAILED " + rbMain().b.err).c_str());
         stopRbWorker();
         stopSequenceLoader();
         // opening stacks spun up the fetch and measure workers too; an unjoined
@@ -25294,16 +25649,16 @@ int main(int argc, char** argv) {
         std::string d = g_browseKeys;
         std::replace(d.begin(), d.end(), '\\', '/');
         while (d.size() > 1 && d.back() == '/') d.pop_back();
-        startRemote("local://" + d);
+        startRemote(rbMain(), "local://" + d);
         app.showRemote = true;
         // Scripted row indices assume the DEFAULT view: the user's real prefs
         // must not leak a flat/tree/advanced state into what "down,down,down"
         // lands on. With rbtree left on, a click+double-click pair on a folder
         // row expanded it in place and its children took over the row indices
         // every later action was aimed at - reproduced, two hours of forensics.
-        app.rbFlat = false;
-        app.rbTree = false;
-        app.rbAdvanced = false;
+        rbMain().flat = app.rbFlat = false;
+        rbMain().tree = app.rbTree = false;
+        rbMain().advanced = app.rbAdvanced = false;
         // Key REPEAT is a human affordance; for injected keys it is a race.
         // Each scripted press is held for ~one frame, but a trickle-delayed
         // release across a slow frame (texture uploads after a stack lands)
@@ -25314,7 +25669,8 @@ int main(int argc, char** argv) {
             if (j == std::string::npos) j = g_browseKeysActs.size();
             if (j > i) keyActs.push_back(g_browseKeysActs.substr(i, j - i));
         }
-        fprintf(stderr, "browsekeys: %d action(s) on %s\n", (int)keyActs.size(), d.c_str());
+        fprintf(stderr, "browsekeys: %d action(s) on %s (sizeof(BrowseInstance)=%zu)\n",
+                (int)keyActs.size(), d.c_str(), sizeof(App::BrowseInstance));
     }
 
     std::vector<double> benchMs;
@@ -25382,7 +25738,7 @@ int main(int argc, char** argv) {
         // One rule, computed once, applied to every key the panel claims.
         ImGuiWindow* nav = ImGui::GetCurrentContext()->NavWindow;
         bool remoteFocused = nav && nav->RootWindow &&
-                             strcmp(nav->RootWindow->Name, "Browse###Remote") == 0;
+                             rbIsBrowseWindowName(nav->RootWindow->Name);
         if (!io.WantTextInput && !popupOpen) {
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
@@ -25555,23 +25911,50 @@ int main(int argc, char** argv) {
         }
 
         if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
-        if (app.showRemote) {
-            if (app.focusRemote) { ImGui::SetNextWindowFocus(); app.focusRemote = false; }
-            // --browse-keys-selftest's "w<px>" action: float the panel at an
-            // exact width so the toolbar's flow layout can be asserted at the
-            // widths a human would drag it to. Off (0) in every other run.
-            if (g_rbForceW > 0) {
-                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
-                ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
-                                        ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
-                                         ImGuiCond_Always);
+        // Browse: N windows, one per instance. Instance 1 is "Browse###Remote"
+        // (the singleton's id, so layouts and the dock builder keep working)
+        // and only ever HIDES - View > Panels > Browse and the session's
+        // "panels" line speak app.showRemote for it, exactly as before. The
+        // others are "Browse N###BrowseN" and closing one destroys it (worker
+        // joined first). Destruction is collected and done AFTER the loop:
+        // the loop is iterating the vector it would mutate.
+        {
+            rbMain();                       // the primordial instance exists
+            int destroyNum = 0;
+            for (size_t bi = 0; bi < app.browsePanels.size(); bi++) {
+                App::BrowseInstance& I = *app.browsePanels[bi];
+                bool primordial = I.num == 1;
+                bool& show = primordial ? app.showRemote : I.open;
+                // an extra whose flag is already down (the window's X last
+                // frame, or a scripted close) is destroyed here too - any
+                // path that clears `open` closes the instance
+                if (!show) { if (!primordial) destroyNum = I.num; continue; }
+                // app.focusRemote = "bring the ACTIVE browse forward" (the
+                // Temporal panel hands focus back through it); focusReq is an
+                // instance asking for itself
+                if (I.focusReq || (app.focusRemote && I.num == g_rbActiveNum)) {
+                    ImGui::SetNextWindowFocus();
+                    I.focusReq = false;
+                    if (I.num == g_rbActiveNum) app.focusRemote = false;
+                }
+                // --browse-keys-selftest's "w<px>" action: float the panel at
+                // an exact width so the toolbar's flow layout can be asserted
+                // at the widths a human would drag it to. Off (0) otherwise.
+                if (g_rbForceW > 0 && primordial) {
+                    ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+                    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
+                                            ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
+                                             ImGuiCond_Always);
+                }
+                if (!primordial)
+                    ImGui::SetNextWindowSize(ImVec2(420 * uiScale, 520 * uiScale),
+                                             ImGuiCond_FirstUseEver);
+                if (ImGui::Begin(I.wtitle.c_str(), &show)) drawPanelRemote(I);
+                ImGui::End();
+                if (!show && !primordial) destroyNum = I.num;
             }
-            // Renamed "Browse" (it browses local folders too, via the local
-            // peer), with the ImGui ID pinned by the ### suffix so the title
-            // can change again without orphaning docked layouts.
-            if (ImGui::Begin("Browse###Remote", &app.showRemote)) drawPanelRemote();
-            ImGui::End();
+            if (destroyNum) rbDestroyInstance(destroyNum);
         }
         if (app.showMessages) {
             ImGui::SetNextWindowSize(ImVec2(720 * uiScale, 300 * uiScale), ImGuiCond_FirstUseEver);
@@ -25664,10 +26047,15 @@ int main(int argc, char** argv) {
             // Remote link indicator, VSCode-style: the leftmost thing on the
             // status bar, always present while a server is involved. A toast
             // expires; "am I connected?" must be answerable at any moment.
-            {
+            // One segment per Browse INSTANCE that has anything to say (a
+            // phase, a connection or a failure) - with one panel open this is
+            // byte-for-byte the old bar.
+            for (size_t sbi = 0; sbi < app.browsePanels.size(); sbi++) {
+                App::BrowseInstance& SI = *app.browsePanels[sbi];
+                ImGui::PushID((int)(9100 + SI.num));
                 std::string phase;
-                { std::lock_guard<std::mutex> lk(app.rbMtx); phase = app.rbPhase; }
-                const App::RemoteBrowse& B = app.rbrowse;
+                { std::lock_guard<std::mutex> lk(SI.mtx); phase = SI.phase; }
+                const App::RemoteBrowse& B = SI.b;
                 if (!phase.empty()) {
                     // The spinner and the phase text both live in cells of a
                     // FIXED width. The font is proportional, so "|" and "/" are
@@ -25699,11 +26087,11 @@ int main(int argc, char** argv) {
                     if (ImGui::SmallButton("cancel##rb")) {
                         // the in-flight ssh still finishes - but its result is
                         // now stale on arrival instead of destructive
-                        app.rbrowse.scanGen++;
-                        app.rbSearch.gen++;
-                        app.rbSearch.running = false;
-                        std::lock_guard<std::mutex> lk(app.rbMtx);
-                        app.rbQueue.clear();
+                        SI.b.scanGen++;
+                        SI.search.gen++;
+                        SI.search.running = false;
+                        std::lock_guard<std::mutex> lk(SI.mtx);
+                        SI.queue.clear();
                         // The click must land NOW. The worker is still inside
                         // its blocking call and cannot notice the bump until
                         // the server answers, so the spinner kept saying
@@ -25711,8 +26099,8 @@ int main(int argc, char** argv) {
                         // the button doing nothing. "cancelling" is the honest
                         // phase: the remote side IS still working, only its
                         // answer is already condemned.
-                        if (!app.rbPhase.empty())
-                            app.rbPhase = "cancelling (the server is still finishing)...";
+                        if (!SI.phase.empty())
+                            SI.phase = "cancelling (the server is still finishing)...";
                     }
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
@@ -25736,8 +26124,8 @@ int main(int argc, char** argv) {
                         app.uiSession.stop();     // ours to stop
                         App::RbJob j;             // the worker's is the worker's
                         j.kind = App::RbDisconnect;
-                        rbEnqueue(std::move(j));
-                        app.rbrowse = App::RemoteBrowse{};
+                        rbEnqueue(SI, std::move(j));
+                        SI.b = App::RemoteBrowse{};
                     }
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
@@ -25756,6 +26144,7 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("|");
                     ImGui::SameLine();
                 }
+                ImGui::PopID();
             }
             ImGui::TextUnformatted(st);
             // compare is a persistent state: a toast that expires is not enough
@@ -25924,7 +26313,7 @@ int main(int argc, char** argv) {
         // the window stops repainting and Windows paints it white and calls it
         // "not responding", which is exactly what a spinner is supposed to deny.
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
-                    app.rbBusy || app.mPending > 0 ||
+                    rbAnyBusy() || app.mPending > 0 ||
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
@@ -26010,8 +26399,8 @@ int main(int argc, char** argv) {
             bool typing = ImGui::GetIO().WantTextInput;
             // A worker that starts between the busy check above and this wait
             // must not leave the window unpainted: re-check before skipping.
-            glfwWaitEventsTimeout(app.rbBusy || app.mPending > 0 ? 0.05 : 1.0);
-            bool working = app.rbBusy || app.mPending > 0 || app.rfPending > 0 || app.seqRunning;
+            glfwWaitEventsTimeout(rbAnyBusy() || app.mPending > 0 ? 0.05 : 1.0);
+            bool working = rbAnyBusy() || app.mPending > 0 || app.rfPending > 0 || app.seqRunning;
             // Results a worker has FINISHED but no frame has integrated yet, and
             // modals waiting for a frame to open them. Without these the remote
             // scan's picker never appeared: the worker went idle (working=false),
@@ -26019,7 +26408,7 @@ int main(int argc, char** argv) {
             // inside the frame, so the result that would have opened the dialog
             // sat in rbDone until the user happened to move the mouse. Twice.
             if (!working) {
-                { std::lock_guard<std::mutex> lk(app.rbMtx); working |= !app.rbDone.empty(); }
+                working |= rbAnyDonePending();
                 { std::lock_guard<std::mutex> lk(app.rfMtx); working |= !app.rfDone.empty(); }
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
@@ -26034,7 +26423,7 @@ int main(int argc, char** argv) {
                 working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
-                working |= !app.rbTreePending.empty();
+                working |= rbAnyTreePending();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
@@ -26165,14 +26554,14 @@ int main(int argc, char** argv) {
                 return ImGuiKey_None;
             };
             if (!reproReady) {
-                if (app.rbrowse.connected && !app.rbrowse.entries.empty()) {
+                if (rbKeysT().b.connected && !rbKeysT().b.entries.empty()) {
                     reproReady = true;
-                    app.focusRemote = true;      // = clicking the panel
+                    rbMain().focusReq = true;    // = clicking the panel
                     fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
-                            (int)app.rbrowse.entries.size());
+                            (int)rbKeysT().b.entries.size());
                 } else if (glfwGetTime() - reproT0 > 60.0) {
                     fprintf(stderr, "browsekeys: no listing for %s (%s)\n",
-                            g_browseKeys.c_str(), app.rbrowse.err.c_str());
+                            g_browseKeys.c_str(), rbKeysT().b.err.c_str());
                     break;
                 }
             } else if (keyAct < keyActs.size()) {
@@ -26225,8 +26614,8 @@ int main(int argc, char** argv) {
                     // every action names what the panel is showing when it runs,
                     // so a crash log ends on the action that caused it
                     fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d imgs=%d preview=%s\n",
-                            (int)keyAct, a.c_str(), app.rbrowse.dir.c_str(),
-                            (int)app.rbrowse.entries.size(), (int)app.images.size(),
+                            (int)keyAct, a.c_str(), rbKeysT().b.dir.c_str(),
+                            (int)rbKeysT().b.entries.size(), (int)app.images.size(),
                             app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
                     fflush(stderr);
                 }
@@ -26241,9 +26630,9 @@ int main(int argc, char** argv) {
                     // buttons 4 / 5 (ImGui 3 / 4) over the listing: the history
                     // handler is gated on the panel being hovered or focused.
                     if (keyPhase == 0)
-                        g_injMouse = ImVec2((g_rbCursorRect[0].x + g_rbCursorRect[1].x) * 0.5f +
+                        g_injMouse = ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
                                             (op == "click" ? 40.0f : 0.0f),
-                                            (g_rbCursorRect[0].y + g_rbCursorRect[1].y) * 0.5f);
+                                            (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
                     else if (keyPhase == 1 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, true);
                     else if (keyPhase == 2)
@@ -26261,19 +26650,103 @@ int main(int argc, char** argv) {
                     else if (keyPhase == 1) { rio.AddKeyEvent(k2, false);
                                               rio.AddKeyEvent(ImGuiMod_Alt, false); }
                 } else if (keyPhase == 0) {
-                    if (a == "more")       app.rbAdvanced = !app.rbAdvanced;
-                    else if (a == "flat")  app.rbFlat = !app.rbFlat;
-                    else if (a == "tree")  app.rbTree = !app.rbTree;
+                    if (a == "more")       rbKeysT().advanced = !rbKeysT().advanced;
+                    else if (a == "flat")  rbKeysT().flat = !rbKeysT().flat;
+                    else if (a == "tree")  rbKeysT().tree = !rbKeysT().tree;
                     else if (a == "viewreset") {
                         // an ABSOLUTE state pin: the toggles above are relative,
                         // and a segment that assumes grouped+list must not
                         // depend on the parity of every toggle before it
-                        app.rbFlat = false;
-                        app.rbTree = false;
-                        app.rbAdvanced = false;
-                        rbTreeForget();
+                        rbKeysT().flat = false;
+                        rbKeysT().tree = false;
+                        rbKeysT().advanced = false;
+                        rbTreeForget(rbKeysT());
                     }
-                    else if (a == "focus") app.focusRemote = true;
+                    else if (a == "focus") rbShowInstance(rbKeysT());
+                    // ---- Browse INSTANCES (item 17) ------------------------
+                    else if (a == "reconnect") {
+                        // reconnect the target to the test dir (post-"disc"),
+                        // with a clean history - the checks below assert what
+                        // the OTHER panel's navigation adds to it (nothing)
+                        std::string kd = g_browseKeys;
+                        std::replace(kd.begin(), kd.end(), '\\', '/');
+                        while (kd.size() > 1 && kd.back() == '/') kd.pop_back();
+                        rbKeysT().histBack.clear();
+                        rbKeysT().histFwd.clear();
+                        startRemote(rbKeysT(), "local://" + kd);
+                    }
+                    else if (a == "newpanel") {
+                        // exactly what "+" / View > New Browse Panel do, then
+                        // aim it at a DIFFERENT place than instance 1's
+                        std::string kd = g_browseKeys;
+                        std::replace(kd.begin(), kd.end(), '\\', '/');
+                        while (kd.size() > 1 && kd.back() == '/') kd.pop_back();
+                        App::BrowseInstance& NI = rbNewInstance();
+                        g_rbKeysTarget = NI.num;
+                        startRemote(NI, "local://" + kd + "/scanroot");
+                    }
+                    else if (op == "target") g_rbKeysTarget = arg;
+                    else if (a == "closep") {
+                        // the window's X: extras are destroyed by the frame loop
+                        if (rbKeysT().num != 1) rbKeysT().open = false;
+                        else app.showRemote = false;
+                    }
+                    else if (a == "hidep") app.showRemote = false;
+                    else if (a == "showp") rbShowInstance(rbMain());
+                    else if (op == "filt")
+                        snprintf(rbKeysT().filter, sizeof rbKeysT().filter,
+                                 "%s", sarg.c_str());
+                    else if (op == "chkfilt")
+                        chk(std::string(rbKeysT().filter) ==
+                            (sarg == "-" ? std::string() : sarg),
+                            std::string("filter=\"") + rbKeysT().filter + "\"");
+                    else if (op == "chkpanels")
+                        chk((int)app.browsePanels.size() == arg,
+                            "panels=" + std::to_string((int)app.browsePanels.size()));
+                    else if (op == "chkshown") {
+                        int shown2 = 0;
+                        for (auto& bp : app.browsePanels)
+                            if (rbInstanceShown(*bp)) shown2++;
+                        chk(shown2 == arg, "shown=" + std::to_string(shown2));
+                    }
+                    else if (op == "chksel") {
+                        int nsel = 0;
+                        for (char c2 : rbKeysT().sel) if (c2) nsel++;
+                        chk(nsel == arg, "sel=" + std::to_string(nsel));
+                    }
+                    else if (a == "sessrt") {
+                        // item 10 round-trip: write the session, tear every
+                        // instance down, then replay the rbplace lines through
+                        // the SAME helper the session reader uses. The checks
+                        // that follow prove both instances reconnect - through
+                        // their own workers - to the places they stood at.
+                        std::ostringstream ss2;
+                        writeSessionTo(ss2);
+                        std::vector<std::pair<int, std::string>> places;
+                        std::istringstream is2(ss2.str());
+                        std::string l2;
+                        while (std::getline(is2, l2))
+                            if (l2.rfind("rbplace ", 0) == 0) {
+                                std::istringstream pl(l2.substr(8));
+                                int n2 = 0;
+                                pl >> n2;
+                                std::string u2;
+                                std::getline(pl, u2);
+                                while (!u2.empty() && u2.front() == ' ') u2.erase(0, 1);
+                                places.emplace_back(n2, u2);
+                            }
+                        while (app.browsePanels.size() > 1)
+                            rbDestroyInstance(app.browsePanels.back()->num);
+                        rbMain().b = App::RemoteBrowse{};
+                        rbTreeForget(rbMain());
+                        fprintf(stderr, "browsekeys: sessrt saved %d rbplace "
+                                        "line(s), all instances torn down\n",
+                                (int)places.size());
+                        for (auto& pr : places)
+                            sessionRestoreBrowsePlace(pr.first, pr.second);
+                        g_rbKeysTarget = 1;
+                    }
+                    // --------------------------------------------------------
                     else if (a == "rawopen") {
                         App::PendingGroup pg;
                         pg.files = { "a.raw", "b.raw" };
@@ -26295,7 +26768,7 @@ int main(int argc, char** argv) {
                         if (g_popupChecks < 2)
                             g_popupCheck[g_popupChecks++] = g_rawPopupAlive ? 1 : 0;
                     }
-                    else if (a == "disc") { app.rbrowse = App::RemoteBrowse{}; rbTreeForget(); }
+                    else if (a == "disc") { rbKeysT().b = App::RemoteBrowse{}; rbTreeForget(rbKeysT()); }
                     else if (a == "fmenu") {
                         // A real click on the menu bar's "File". The move, the
                         // press and the release get a phase each: ImGui trickles
@@ -26308,10 +26781,10 @@ int main(int argc, char** argv) {
                                                 ImGui::CalcTextSize("File").x * 0.5f,
                                                 mb->Pos.y + mb->Size.y * 0.5f);
                         }
-                    } else if (a == "rctx" && g_rbToolbar.rowY > 0) {
+                    } else if (a == "rctx" && rbKeysT().toolbar.rowY > 0) {
                         // ...and the other half of the defect: a right-click
                         // context popup on a listing row.
-                        g_injMouse = ImVec2(g_rbToolbar.rowX, g_rbToolbar.rowY);
+                        g_injMouse = ImVec2(rbKeysT().toolbar.rowX, rbKeysT().toolbar.rowY);
                     }
                     else if (a == "blur")  { g_browseKeysBlur = true;
                                              g_navKeyAtBlur = g_navKeyGlobal;
@@ -26322,17 +26795,17 @@ int main(int argc, char** argv) {
                         // item does - fired directly because a menu item cannot
                         // be scripted, the focus consequences are identical
                         if (!app.previewFiles.empty())
-                            requestBrowseTemporal(app.rbrowse.host, app.previewFiles,
-                                                  "svtemp");
+                            requestBrowseTemporal(app.previewHost, app.previewFiles,
+                                                  "svtemp", app.previewPort);
                     }
-                    else if (op == "chkfocus") {   // the Browse panel owns the keys
+                    else if (op == "chkfocus") {   // the TARGET instance owns the keys
                         ImGuiWindow* nw = ImGui::GetCurrentContext()->NavWindow;
-                        bool f2 = nw && strstr(nw->Name, "###Remote") != nullptr;
+                        bool f2 = nw && rbKeysT().wtitle == nw->Name;
                         chk(f2 == (arg != 0), nw ? nw->Name : "(no nav window)");
                     }
                     else if (op == "waitdir") {    // navigation lands async
                         static double waitD0 = 0;
-                        std::string d3 = app.rbrowse.dir;
+                        std::string d3 = rbKeysT().b.dir;
                         size_t sl3 = d3.find_last_of('/');
                         bool at = (sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg;
                         if (at) { chk(true, "dir=" + d3); waitD0 = 0; }
@@ -26356,8 +26829,8 @@ int main(int argc, char** argv) {
                         // ...and the slot really holds frame K, not just the label
                         if (at && app.previewFiles.size() >= 2)
                             at = pv->remoteUrl ==
-                                 makeRemoteUrl(app.rbrowse.host,
-                                               app.previewFiles[arg], app.rbrowse.port);
+                                 makeRemoteUrl(app.previewHost,
+                                               app.previewFiles[arg], app.previewPort);
                         else if (at) at = pv->remoteFrame == arg;   // frame axis
                         chk(at, pv ? pv->remoteUrl : "-");
                     } else if (op == "chkopen") {            // registered, nothing else
@@ -26417,22 +26890,22 @@ int main(int argc, char** argv) {
                             "missing=[" + missing + "] surplus=[" + extra + "]");
                     }
                     else if (op == "chkdir") {     // the leaf of the browsed dir
-                        std::string d3 = app.rbrowse.dir;
+                        std::string d3 = rbKeysT().b.dir;
                         size_t sl3 = d3.find_last_of('/');
                         chk((sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg,
                             "dir=" + d3);
                     }
-                    else if (op == "chkcursor") chk(g_rbCursor == arg,
-                                                    "cursor=" + std::to_string(g_rbCursor));
-                    else if (op == "chkatrow") chk(g_rbCursorName == sarg,
-                                                   "cursor row=" + g_rbCursorName);
-                    else if (op == "chkback") chk((int)g_rbHistBack.size() == arg,
-                                                  "back=" + std::to_string((int)g_rbHistBack.size()) +
-                                                  " fwd=" + std::to_string((int)g_rbHistFwd.size()));
-                    else if (op == "chkfwd")  chk((int)g_rbHistFwd.size() == arg,
-                                                  "back=" + std::to_string((int)g_rbHistBack.size()) +
-                                                  " fwd=" + std::to_string((int)g_rbHistFwd.size()));
-                    else if (op == "chkexp")  chk((int)app.rbExpanded.size() == arg);
+                    else if (op == "chkcursor") chk(rbKeysT().cursor == arg,
+                                                    "cursor=" + std::to_string(rbKeysT().cursor));
+                    else if (op == "chkatrow") chk(rbKeysT().cursorName == sarg,
+                                                   "cursor row=" + rbKeysT().cursorName);
+                    else if (op == "chkback") chk((int)rbKeysT().histBack.size() == arg,
+                                                  "back=" + std::to_string((int)rbKeysT().histBack.size()) +
+                                                  " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
+                    else if (op == "chkfwd")  chk((int)rbKeysT().histFwd.size() == arg,
+                                                  "back=" + std::to_string((int)rbKeysT().histBack.size()) +
+                                                  " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
+                    else if (op == "chkexp")  chk((int)rbKeysT().expanded.size() == arg);
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
@@ -26463,7 +26936,7 @@ int main(int argc, char** argv) {
                     // View > Panels > Browse lands here with nothing open, and
                     // it must not be a remote-only dead end: the panel browses
                     // this disk too, so it has to say so without the File menu.
-                    bool hasLocal = g_rbToolbar.emptyLocalBtn != 0;
+                    bool hasLocal = rbKeysT().toolbar.emptyLocalBtn != 0;
                     if (!hasLocal) keysCheckBad++;
                     fprintf(stderr, "browsekeys: empty state offers a local browse: %s\n",
                             hasLocal ? "ok" : "FAIL");
@@ -26473,7 +26946,7 @@ int main(int argc, char** argv) {
                     // the "more" button are inside the panel, and the filter is
                     // wide enough to hold a glob. Both used to be submitted past
                     // the right edge at the panel's default docked width.
-                    const RbToolbarGeom& g = g_rbToolbar;
+                    const RbToolbarGeom& g = rbKeysT().toolbar;
                     float slack = 1.0f;             // one pixel of rounding
                     bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
                                   g.moreR <= g.x1 + slack;
