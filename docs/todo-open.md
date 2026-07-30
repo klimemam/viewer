@@ -786,6 +786,15 @@ Projection の wide / per-axis 両方にスロット行。extras は B と同じ
 (タイル表示 / 順次点滅) と、「決めること」の4点。
 Shift+C で呼び出す話は項目25-3。
 
+### 状態更新 2 (2026-07-30): 不具合5件を `ed14f86` で修正、本来の姿は docs/compare-n.md
+
+Files の文字バッジ / スロットの follow-frame (`followFrame` に一本化、
+per-slot divergence) / OFF が A 単独 (タイルは Split のみ) / 既定 B が文字持ちを
+飛ばす + 明示指名は昇格 / fit が画面上の最大寸法 / A=B の「paused」表示 /
+Shift+C と Shift+\ の二重予約解消 (項目25-2)。**あるべき形の議論は
+docs/compare-n.md** — スロット = stack への参照 + follow、B は slots[0]、
+上限 A+B+6、増分 I1..I5。下の「決めること」はそちらに吸収。
+
 ### 今の作りが 2 に固定されている場所 (数えた。数値側は上のとおり解消済み)
 
 - ~~`App::compareBUid` — B ひとつぶんの uid。C を置く場所が無い~~ → `cmpExtra` で解消
