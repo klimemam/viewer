@@ -1365,6 +1365,15 @@ static void setCompareB(const ImageDoc* d) {
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
 }
 
+// The uid holding the B SEAT: the live pin, or the remembered one after an
+// exit path cleared it (A9: compare off and on returns to the same B). The
+// Files letters are seat assignments, so they key on this - never on cmpB(),
+// which answers null while compare is off or while A stands on the pin, and
+// a letter that vanishes there reads as the assignment being lost.
+static uint64_t bSeatUid() {
+    return app.compareBUid ? app.compareBUid : app.lastCompareBUid;
+}
+
 // The B side FOR THE STATISTICS PANELS: the compare partner, but only when it
 // has pixels to measure - a remote preview placeholder has none.
 static ImageDoc* abStatsB() {
@@ -1639,6 +1648,37 @@ static void cycleCompare() {
                                              "'auto blink' in Inspector)");
 }
 
+// ESC, one step OUTWARD per press, innermost claim first (user report,
+// 2026-07-30: 「抜ける方法が自明ではない．ESCボタンでぬける，でよいのは？」):
+//   1. an open popup / menu takes it (the ClosePopupsExceptModals pass)
+//   2. an active text item takes it (reverts the edit)
+//   3. a selected annotation / ROI is deselected, and ONLY that
+//   4. an active comparison is switched off, and ONLY that
+// Steps 1 and 2 are the gates on the shortcut block that calls this
+// (!popupOpen, !io.WantTextInput) - by the time it runs, ESC belongs to the
+// canvas state. Steps 3 and 4 live HERE, as one dispatch, so a single press
+// can never do two of them at once; the return value is what the press
+// consumed, which is how --abstats-selftest proves that ordering.
+enum class EscTook { Nothing, RoiDeselected, CompareOff };
+static EscTook escapePressed() {
+    if (app.selectedAnn != 0) {          // back to All - the old ESC meaning
+        app.selectedAnn = 0;
+        return EscTook::RoiDeselected;
+    }
+    if (app.compareMode != App::CmpOff) {
+        // OUT of the comparison, keeping the seats: the B pin survives
+        // (compareBUid / lastCompareBUid) and the slot letters stay armed
+        // (cmpExtra) - settled A9 behavior, compare off and on returns to
+        // the same pair. The toast says so, or leaving reads as losing the
+        // setup; the Files letters stay visible too, dimmed (see the badge
+        // rule in drawFileList).
+        app.compareMode = App::CmpOff;
+        toast("comparison off - B/C assignments kept (C to resume)");
+        return EscTook::CompareOff;
+    }
+    return EscTook::Nothing;
+}
+
 // Pin the frame you are looking at as B, then walk A somewhere else: this is how
 // you compare frame 12 against frame 13 of one stack, or a source against its
 // processed result.
@@ -1696,27 +1736,23 @@ static std::string abStatusChipText() {
 // What the A/B item on a Files row offers, for the frame or stack that row
 // would hand to B.
 //
-// The row you are LOOKING AT is A, and "B = A" is not a comparison: resolveB()
-// answers null for it, so the old menu simply disabled the item there. That is
-// the row everyone right-clicks first - you point at the thing you are working
-// on - and a grey line with no reason on it reads as "this feature is broken",
-// which is how it was reported. So that row is offered the other half of the
-// pair instead, and both states say why.
+// The row you are LOOKING AT is A - the cursor, not a seat - and it offers
+// NOTHING. It used to offer "Swap A and B" there, and that line was care
+// nobody needed (user report, 2026-07-30: 「swapはショートカットキーで対応
+// されているから右クリックメニューでのケアは不要では」): the swap lives on
+// Shift+\ , the View menu and the status-bar button, and selecting B's row
+// simply makes it A - the pin survives, resolveB going quiet while A stands
+// on B is shipped behavior (A8). Every other row is the simple pair the user
+// asked to read: "Set as compare B" and the slot item.
 //
 // Out here rather than in the menu so it can be checked without a frame
 // (--abstats-selftest, A7).
 enum AbRowItem {
     AbSetB,        // a different image: it can become B
-    AbSwap,        // this row IS A and a B exists: swapping is the useful move
-    AbSwapNoB,     // this row IS A, compare is ON, but there is no B yet
-    AbNone         // this row IS A and compare is OFF: no A/B item at all -
-                   // a greyed "Swap" about a mode that is not running reads
-                   // as broken, not as disabled (user report, 2026-07-30)
+    AbNone         // this row IS A: no A/B item at all
 };
 static AbRowItem abRowItem(const ImageDoc* pick) {
-    if (pick != cur()) return AbSetB;
-    if (app.compareMode == App::CmpOff) return AbNone;
-    return cmpB() ? AbSwap : AbSwapNoB;
+    return pick != cur() ? AbSetB : AbNone;
 }
 
 static void computeMinMax(ImageDoc& im) {
@@ -2074,18 +2110,43 @@ static void markAllTexDirty() {
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
 static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
-// The A/B display range. Mode 2 fits BOTH sides to the union of what the two
-// current frames actually contain, recomputed as you step - the "auto but the
-// same auto on both sides" a stack-vs-stack comparison needs. cur() is never
-// B (resolveB guarantees it), so none of this recurses.
+// The compare display range - and "compare" means EVERY pane, not just the
+// A/B pair: two images stretched differently cannot be compared, and with
+// tiles that holds for slot C exactly as it holds for B (report 2026-07-30,
+// 「Auto FitするのがA,BまででCが変わらない」). Mode 2 fits every compared
+// side to the union of what the current frames actually contain, recomputed
+// as you step. Mode 1 means "the reference side dictates": A's black-white
+// for every other letter. The slots join only while compare is ON - the
+// letters survive compare-off as seats, but a seat is not a comparison.
+// cur() is never B or a slot (resolveB / resolveSlots guarantee it), so none
+// of this recurses.
 static bool abRange(const ImageDoc& im, float& lo, float& hi) {
     if (app.compareRangeMode == 0) return false;
     ImageDoc* a = cur();
+    if (!a) return false;
     ImageDoc* b = cmpB();
-    if (!a || !b || (&im != a && &im != b)) return false;
+    // who is being compared: A, B if it resolves, every resolved slot. A tiled
+    // canvas can hold A + C + D with no B at all, so B is optional - what is
+    // required is that there be someone besides A to compare WITH.
+    ImageDoc* parts[2 + 14];    // A + B + every slot letter (SLOT_LETTERS)
+    int np = 0;
+    parts[np++] = a;
+    if (b) parts[np++] = b;
+    if (app.compareMode != App::CmpOff && !app.cmpExtra.empty())
+        for (const ResolvedSlot& rs : resolveSlots())
+            if (rs.doc != b && np < (int)(sizeof parts / sizeof *parts))
+                parts[np++] = rs.doc;
+    if (np < 2) return false;
+    bool member = false;
+    for (int i = 0; i < np; i++) if (parts[i] == &im) member = true;
+    if (!member) return false;
     if (app.compareRangeMode == 1) { lo = a->black; hi = a->white; return true; }
-    lo = std::min(a->vmin, b->vmin);          // union of the CONTENT, not of the
-    hi = std::max(a->vmax, b->vmax);          // two stretches
+    lo = parts[0]->vmin;                      // union of the CONTENT, not of the
+    hi = parts[0]->vmax;                      // stretches
+    for (int i = 1; i < np; i++) {
+        lo = std::min(lo, parts[i]->vmin);
+        hi = std::max(hi, parts[i]->vmax);
+    }
     return hi > lo;
 }
 static float effBlack(const ImageDoc& im) {
@@ -5660,7 +5721,7 @@ static void selectImage(int idx) {
     // it. Nothing is needed here: resolveB already answers null while A sits on
     // B, so the comparison goes quiet for exactly as long as you are standing
     // on it and comes back, still pinned, when you step away. Shift+\ (or the
-    // row's "Swap A and B") is how you swap - on purpose.
+    // status bar's "swap A/B") is how you swap - on purpose.
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
     // Held-down frame stepping: B's caches cost real milliseconds per step
@@ -8467,7 +8528,21 @@ static int g_tilePanesDrawn = -1;
 static float g_tilePaneX0[16] = {}, g_tilePaneW[16] = {};
 static float g_tileCanvasW = 0;    // what it had to work with, when it refused
 
+// What the pane badges ACTUALLY said on the last frame drawCanvas drew, one
+// "letter|context|name;" entry per badge, as drawn (i.e. after any eliding).
+// Same reasoning as g_tilePanesDrawn: this machine cannot screenshot GL, so
+// --tile-selftest T12 asserts the composition as state.
+static std::string g_paneBadgeProbe;
+static std::string elideFront(const std::string& s, size_t keep);   // fwd
+// The batch a document belongs to - the context line of the two-line identity
+// (the footer already leads with it; the pane badges follow the same rule).
+static std::string batchNameOf(const ImageDoc* d) {
+    if (d) for (const auto& b : app.batches) if (b.id == d->batchId) return b.name;
+    return std::string();
+}
+
 static void drawCanvas(ImVec2 avail) {
+    g_paneBadgeProbe.clear();
     // DPI/font-aware ruler geometry (fixed px constants break on 150-200% Windows scaling)
     const float s = app.uiScale;
     const float RULER_H = ImGui::GetFontSize() + 5.0f * s;
@@ -8526,7 +8601,8 @@ static void drawCanvas(ImVec2 avail) {
             slots.clear();
         }
     }
-    // A shared range moves as you step (mode 2 refits to the frame pair), and a
+    // A shared range moves as you step (mode 2 refits to the compared frames,
+    // slots included), and a
     // texture built with the old one is a wrong picture, not a stale label - so
     // both sides are checked against what they would be built with NOW.
     for (ImageDoc* d : { im, imB })
@@ -9037,28 +9113,50 @@ static void drawCanvas(ImVec2 avail) {
         {
             const ImU32 colA = IM_COL32(120, 200, 255, 255), colB = IM_COL32(255, 190, 120, 255);
             const float pad = 4.0f * s;
-            // A badge must never sit over B's pixels (or the reverse), so each one
-            // is fitted to its own side: elide the name, then drop it entirely.
+            // Each pane carries the SAME two-line identity the footer below
+            // establishes: line 1 = letter + batch (the context, dimmer),
+            // line 2 = the file name (the subject) - user report 2026-07-30,
+            // 「一行目にBatch名，二行目がファイル名」. The letter keeps the
+            // slot colour (it is what tells the panes apart); the name takes
+            // the footer's own neutral ink. A badge must never sit over a
+            // neighbour's pixels, so each line is fitted to its own pane:
+            // elide the FRONT (the tail is what tells two captures apart),
+            // then drop the line entirely - and the plate covers only the
+            // rows its surviving lines need, because it sits over the image.
             auto badge = [&](float x0, float x1, bool rightAlign, const char* tag,
-                             const std::string& nm, ImU32 col) {
+                             const std::string& ctx, const std::string& nm, ImU32 col) {
                 float avail = x1 - x0 - pad * 2;
-                std::string t = std::string(tag) + "  " + nm;
-                if (ImGui::CalcTextSize(t.c_str()).x > avail) {          // middle-elide
-                    std::string best = tag;
-                    for (size_t keep = nm.size(); keep >= 6; keep--) {
-                        std::string cand = std::string(tag) + "  " + nm.substr(0, keep / 2) +
-                                           "..." + nm.substr(nm.size() - (keep - keep / 2));
-                        if (ImGui::CalcTextSize(cand.c_str()).x <= avail) { best = cand; break; }
+                float tagW = ImGui::CalcTextSize(tag).x;
+                if (tagW > avail) return;                     // no room at all
+                const float gap = 8.0f * s;
+                std::string l1 = ctx, l2 = nm;
+                auto fitLine = [&](std::string& t, float room) {
+                    if (t.empty() || ImGui::CalcTextSize(t.c_str()).x <= room) return;
+                    for (size_t keep = t.size() > 4 ? t.size() - 1 : 0; keep >= 4; keep--) {
+                        std::string cand = elideFront(t, keep);
+                        if (ImGui::CalcTextSize(cand.c_str()).x <= room) { t = cand; return; }
                     }
-                    t = best;
-                }
-                ImVec2 ts = ImGui::CalcTextSize(t.c_str());
-                if (ts.x > avail) return;                                 // no room at all
-                float bx = rightAlign ? x1 - ts.x - pad * 2 : x0;
+                    t.clear();                    // narrower than "...abcd": drop it
+                };
+                fitLine(l1, avail - tagW - gap);
+                fitLine(l2, avail);
+                const float lh = ImGui::GetTextLineHeight();
+                float w1 = tagW + (l1.empty() ? 0.0f : gap + ImGui::CalcTextSize(l1.c_str()).x);
+                float w2 = l2.empty() ? 0.0f : ImGui::CalcTextSize(l2.c_str()).x;
+                float bw = std::max(w1, w2);
+                float bh = lh * (l2.empty() ? 1 : 2) + pad;
+                float bx = rightAlign ? x1 - bw - pad * 2 : x0;
                 float by = canvasP0.y + 6 * s;
-                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + ts.x + pad * 2, by + ts.y + pad),
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw + pad * 2, by + bh),
                                   IM_COL32(0, 0, 0, 180), 3.0f * s);
-                dl->AddText(ImVec2(bx + pad, by + pad * 0.5f), col, t.c_str());
+                dl->AddText(ImVec2(bx + pad, by + pad * 0.5f), col, tag);
+                if (!l1.empty())
+                    dl->AddText(ImVec2(bx + pad + tagW + gap, by + pad * 0.5f),
+                                IM_COL32(150, 158, 166, 220), l1.c_str());
+                if (!l2.empty())
+                    dl->AddText(ImVec2(bx + pad, by + pad * 0.5f + lh),
+                                IM_COL32(210, 216, 226, 235), l2.c_str());
+                g_paneBadgeProbe += std::string(tag) + "|" + l1 + "|" + l2 + ";";
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
             // C, D, E...: one hue each. "Which pane is D" has to be answerable
@@ -9072,7 +9170,8 @@ static void drawCanvas(ImVec2 avail) {
             // so its badge - not four badges over one full-frame image - is what
             // has to be on screen.
             if (flashB) {
-                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", imB->name + "  (hold B)", colB);
+                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", batchNameOf(imB),
+                      imB->name + "  (hold B)", colB);
             } else if (tiled) {
                 const int nAB = imB ? 2 : 1;                 // how many letters are A/B
                 for (int i = 0; i < (int)slots.size(); i++) {
@@ -9082,7 +9181,7 @@ static void drawCanvas(ImVec2 avail) {
                     // a diverged side is the last frame its stack had, not A's
                     // partner - the same [stale] statement the panels make
                     badge(paneP0(i).x + 6 * s, paneP0(i).x + paneSz(i).x, false,
-                          slots[i].tag.c_str(),
+                          slots[i].tag.c_str(), batchNameOf(slots[i].doc),
                           slots[i].stale ? slots[i].doc->name + "  [stale]"
                                          : slots[i].doc->name, c);
                     if (i)   // the gutter band, the same one the A/B divider fills
@@ -9113,14 +9212,17 @@ static void drawCanvas(ImVec2 avail) {
                 // blink comparison tells you nothing about WHICH one differs
                 ImageDoc* d = app.flipShowB ? imB : im;
                 badge(canvasP0.x + 6 * s, canvasP1.x, false,
-                      app.flipShowB ? "B" : "A",
+                      app.flipShowB ? "B" : "A", batchNameOf(d),
                       d->name + (app.flipAuto ? "   (auto)" : "   (B / Space to toggle)"),
                       app.flipShowB ? colB : colA);
                 // a coloured edge so peripheral vision registers the switch too
                 dl->AddRect(canvasP0, canvasP1, app.flipShowB ? colB : colA, 0, 0, 3.0f * s);
             } else if (app.compareMode == App::CmpDiff) {
+                // the operation is the context line; the pair of names is the
+                // subject (two batches may meet here, so neither claims line 1)
                 badge(canvasP0.x + 6 * s, canvasP1.x, false,
-                      app.diffAbs ? "|A-B|" : "A-B", im->name + "  -  " + imB->name,
+                      app.diffAbs ? "|A-B|" : "A-B", std::string(),
+                      im->name + "  -  " + imB->name,
                       IM_COL32(220, 225, 235, 255));
                 if (!diffMode) {
                     const char* msg = "difference needs A and B to be the same size";
@@ -9169,13 +9271,18 @@ static void drawCanvas(ImVec2 avail) {
                     }
                 }
             } else if (split) {
-                badge(paneAp0.x + 6 * s, paneAp0.x + paneAsz.x, false, "A", im->name, colA);
-                badge(paneBp0.x + 6 * s, paneBp0.x + paneBsz.x, false, "B", imB->name, colB);
+                badge(paneAp0.x + 6 * s, paneAp0.x + paneAsz.x, false, "A",
+                      batchNameOf(im), im->name, colA);
+                badge(paneBp0.x + 6 * s, paneBp0.x + paneBsz.x, false, "B",
+                      batchNameOf(imB), imB->name, colB);
                 dl->AddRectFilled(ImVec2(splitX - GUTTER, canvasP0.y), ImVec2(splitX + GUTTER, canvasP1.y),
                                   hot ? IM_COL32(120, 132, 148, 255) : IM_COL32(60, 66, 74, 255));
             } else {
-                badge(canvasP0.x + 6 * s, wipeX, false, "A", im->name, colA);
-                badge(wipeX + 8 * s, canvasP1.x - 6 * s, true, "B", imB->name, colB);
+                // the wipe's two labels follow the same two-line format
+                badge(canvasP0.x + 6 * s, wipeX, false, "A",
+                      batchNameOf(im), im->name, colA);
+                badge(wipeX + 8 * s, canvasP1.x - 6 * s, true, "B",
+                      batchNameOf(imB), imB->name, colB);
                 dl->AddLine(ImVec2(wipeX, canvasP0.y), ImVec2(wipeX, canvasP1.y),
                             IM_COL32(255, 255, 255, hot ? 255 : 200), 1.5f * s);
             }
@@ -10027,16 +10134,19 @@ static void drawInspector() {
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip(
-                        "How the two sides are STRETCHED while comparing. Display only -\n"
-                        "both keep their own numbers and get them back when compare ends.\n"
-                        "  auto over both (union), the default: both re-fit to min/max\n"
-                        "    across A and B, so neither side clips and neither is\n"
-                        "    favoured. Two stacks at different exposures need this - B\n"
-                        "    against A's range alone saturates into a single bin.\n"
-                        "  B uses A's range: one range, A's, and it does not move while\n"
-                        "    you step A. Right when B really is measured against A.\n"
+                        "How the compared sides are STRETCHED - every pane, slots\n"
+                        "included, not just A and B. Display only - each keeps its own\n"
+                        "numbers and gets them back when compare ends.\n"
+                        "  auto over both (union), the default: every compared side\n"
+                        "    re-fits to min/max across A, B and the slots, so no side\n"
+                        "    clips and none is favoured. Two stacks at different\n"
+                        "    exposures need this - B against A's range alone saturates\n"
+                        "    into a single bin.\n"
+                        "  B uses A's range: one range, A's, for every other letter,\n"
+                        "    and it does not move while you step A. Right when the\n"
+                        "    others really are measured against A.\n"
                         "  each keeps its own: comparing SHAPES at wildly different\n"
-                        "    exposures - the one case where the two are not directly\n"
+                        "    exposures - the one case where the sides are not directly\n"
                         "    comparable, and it says so.");
                 if (app.compareRangeMode == 0 &&
                     (b->black != im->black || b->white != im->white)) {
@@ -10286,8 +10396,15 @@ static const char* abRangeSaid(bool haveB) {
     // Compare menu still sets the mode and the default is 2 regardless, so all
     // three combinations came out labelled with a range that was not in force.
     if (app.linkRange) return "linked range, all open images";
-    if (!haveB) return "black-white range";
-    return app.compareRangeMode == 2 ? "A and B combined range" : "A's black-white range";
+    // Slots past B widen the union (abRange spans every compared pane), so
+    // "A and B combined" undersells what the axis covers the moment C joins.
+    // The letters count only while compare is on - a seat is not a comparison.
+    const bool slots = app.compareMode != App::CmpOff && !compareExtras().empty();
+    if (!haveB && !slots) return "black-white range";
+    if (app.compareRangeMode == 2)
+        return slots ? "combined range, all compared images"
+                     : "A and B combined range";
+    return "A's black-white range";
 }
 
 // The histogram's x axis label, built in one place so --range-selftest can
@@ -17162,30 +17279,17 @@ static void drawFileList() {
                               "side by side. Wipe, split, difference and blink stay\n"
                               "A against B - those only mean two.");
     };
-    auto compareBItem = [&compareSlotItem](ImageDoc* pick) {
-        compareSlotItem(pick);
-        switch (abRowItem(pick)) {
-        case AbSetB:
-            if (ImGui::MenuItem("Set as compare B")) {
-                setCompareB(pick);
-                if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-            }
-            break;
-        case AbSwap:
-            if (ImGui::MenuItem("Swap A and B", "Shift+\\")) swapCompare();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("This row is A - the image on screen.\n"
-                                  "Swapping sends it to B and brings B here as A.");
-            break;
-        case AbSwapNoB:
-            ImGui::MenuItem("Swap A and B", "Shift+\\", false, false);
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("This row is A - the image on screen, so it cannot\n"
-                                  "also be B. Right-click a DIFFERENT row to set B.");
-            break;
-        case AbNone:
-            break;
+    // Returns whether it put anything in the menu, so a caller can skip the
+    // separator that would otherwise lead an empty group: the CURRENT row -
+    // A itself - contributes no compare items at all (see abRowItem).
+    auto compareBItem = [&compareSlotItem](ImageDoc* pick) -> bool {
+        if (abRowItem(pick) != AbSetB) return false;
+        if (ImGui::MenuItem("Set as compare B")) {
+            setCompareB(pick);
+            if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
         }
+        compareSlotItem(pick);
+        return true;
     };
     // Group by source folder. Opening a folder of folders gives one stack per
     // subfolder, which reads fine - but opening several leaf folders in a row
@@ -17249,7 +17353,8 @@ static void drawFileList() {
         // slot nobody can find again (defect 2026-07-30).
         auto rowWithMeta = [](const ImageDoc& d, const char* label, bool selected,
                               const char* extra = nullptr,
-                              const std::string& badge = std::string()) -> bool {
+                              const std::string& badge = std::string(),
+                              bool badgeDim = false) -> bool {
             const ImGuiStyle& st = ImGui::GetStyle();
             char meta[96];
             snprintf(meta, sizeof meta, "%dx%d %dch %s%s", d.w, d.h, d.ch, d.dtype.c_str(),
@@ -17276,15 +17381,20 @@ static void drawFileList() {
                 float h = ImGui::GetTextLineHeight();
                 ImVec2 tp(m.x + 2 * app.uiScale,
                           m.y + (ImGui::GetItemRectSize().y - h) * 0.5f);
-                ImGui::GetWindowDrawList()->AddText(tp, IM_COL32(120, 190, 255, 255),
-                                                    badge.c_str());
-                // ...and as state the selftest can read (S4)
+                // dim = "armed, not active": compare is off, the seats are
+                // kept. Same ink, lower alpha - one lettering system.
+                ImGui::GetWindowDrawList()->AddText(
+                    tp, badgeDim ? IM_COL32(120, 190, 255, 110)
+                                 : IM_COL32(120, 190, 255, 255), badge.c_str());
+                // ...and as state the selftest can read (S4/S6) - the dim
+                // state is part of what was drawn, so it is recorded, not
+                // inferable from a colour the probe cannot see
                 const char* p = label;
                 while (*p == ' ') p++;
                 std::string t(p);
                 size_t hh = t.find("##");
                 if (hh != std::string::npos) t.resize(hh);
-                g_filesBadgeProbe += t + "=" + badge + ";";
+                g_filesBadgeProbe += t + "=" + badge + (badgeDim ? "(dim);" : ";");
             }
             if (room) {   // draw-list, not an item: the row must stay the last item
                 ImVec2 m = ImGui::GetItemRectMin();
@@ -17306,13 +17416,27 @@ static void drawFileList() {
           if (head.seqId == 0) {
             int i = stack.front();
             ImGui::PushID(i);
-            const ImageDoc* bnow = cmpB();
-            // Two marks meet on this row and both stay: the slot letters
-            // (B/C/D... - which comparison seat this image holds) and the
-            // [preview] tag (the ONE transient slot must not read as a
+            // Two marks meet on this row and both stay: the compare letters
+            // and the [preview] tag (the ONE transient slot must not read as a
             // registered file - a single click in Browse "adding a file to
             // Files" was reported as exactly that misreading).
-            std::string badge = std::string(bnow == &head ? "B" : "") + slotOf(&head);
+            //
+            // One lettering system, two kinds of letter, one asymmetric rule -
+            // do NOT "simplify" the asymmetry away, it is the spec:
+            //   - B/C/D... are SEATS (assignments). They show whenever
+            //     assigned: full ink while a comparison runs, dimmed while
+            //     compare is off ("armed, not active" - user report
+            //     2026-07-30, 「B,Cは薄く表示」). B's seat is the PIN
+            //     (bSeatUid), never cmpB(): the letter must not vanish while
+            //     A stands on the pin (paused) or while compare is off.
+            //   - A is the CURSOR, not a seat (docs/compare-n.md §1). It
+            //     marks the current row only while a comparison is ACTIVE:
+            //     compare off means nothing is being compared, so no A.
+            const bool cmpOn = app.compareMode != App::CmpOff;
+            std::string badge;
+            if (cmpOn && i == app.current) badge += "A";
+            if (bSeatUid() && head.uid == bSeatUid()) badge += "B";
+            badge += slotOf(&head);
             char lb[512];
             // the leading spaces reserve the badge's ground: two per letter,
             // and at least the two the rows have always had
@@ -17320,7 +17444,7 @@ static void drawFileList() {
                      "", head.name.c_str(), head.preview ? "   [preview]" : "", i);
             if (head.preview) ImGui::PushStyleColor(ImGuiCol_Text,
                                                     ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            bool rowHit = rowWithMeta(head, lb, i == app.current, nullptr, badge);
+            bool rowHit = rowWithMeta(head, lb, i == app.current, nullptr, badge, !cmpOn);
             if (head.preview) ImGui::PopStyleColor();
             if (head.preview && ImGui::IsItemHovered())
                 ImGui::SetTooltip("a throwaway preview - the one slot the Browse panel\n"
@@ -17333,8 +17457,7 @@ static void drawFileList() {
             // a standalone frame hangs off the batch directly, so it gets the
             // move menu itself (stacks move via seqctx below)
             if (ImGui::BeginPopupContextItem("imgctx")) {
-                compareBItem(app.images[i].get());
-                ImGui::Separator();
+                if (compareBItem(app.images[i].get())) ImGui::Separator();
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
                 ImGui::EndPopup();
@@ -17357,13 +17480,21 @@ static void drawFileList() {
           for (int k = 0; k < (int)stack.size(); k++)
               if (stack[k] == app.current) { pos = k; active = true; }
           ImGui::PushID(head.seqId);
-          // Every letter this stack holds. B is a FRAME, and so is a slot's
-          // pin: the stack is where they LIVE, so the stack row carries them -
-          // in B-then-slot order, the order the letters read everywhere else.
-          const ImageDoc* bnow = cmpB();
+          // Every letter this stack holds, in A-then-B-then-slot order - the
+          // order the letters read everywhere else. B is a FRAME, and so is a
+          // slot's pin: the stack is where they LIVE, so the stack row
+          // carries them. Same asymmetric rule as the frame rows above (and
+          // do not "simplify" it): the seats (B/C/D..., keyed on the PIN via
+          // bSeatUid, never on cmpB()) show whenever assigned - dimmed while
+          // compare is off; A is the cursor and marks the active stack only
+          // while a comparison is running.
+          const bool cmpOn = app.compareMode != App::CmpOff;
+          std::string badge = cmpOn && active ? "A" : "";
           bool stackHasB = false;
-          if (bnow) for (int idx : stack) if (app.images[idx].get() == bnow) stackHasB = true;
-          std::string badge = stackHasB ? "B" : "";
+          if (bSeatUid())
+              for (int idx : stack)
+                  if (app.images[idx]->uid == bSeatUid()) stackHasB = true;
+          if (stackHasB) badge += "B";
           for (size_t k = 0; k < app.cmpExtra.size(); k++)
               for (int idx : stack)
                   if (app.images[idx]->uid == app.cmpExtra[k]) { badge += slotName(k); break; }
@@ -17400,7 +17531,7 @@ static void drawFileList() {
               else
                   snprintf(frames, sizeof frames, "  %df", (int)stack.size());
           }
-          if (rowWithMeta(head, lb, active, frames, badge)) {
+          if (rowWithMeta(head, lb, active, frames, badge, !cmpOn)) {
               selectImage(stack[pos]);
               if (app.fitOnSwitch) app.fitRequested = true;
           }
@@ -17424,14 +17555,14 @@ static void drawFileList() {
             }
             ImGui::Separator();
             {   // B = the frame this stack is showing; with "B follows A's
-                // frame number" on, it tracks A from there anyway.
+                // frame number" on, it tracks A from there anyway. The stack
+                // A stands in gets no compare group (and no stray separator).
                 ImageDoc* bpick = app.images[stack.front()].get();
                 if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
                     app.images[si->lastImageIdx]->seqId == si->id)
                     bpick = app.images[si->lastImageIdx].get();
-                compareBItem(bpick);
+                if (compareBItem(bpick)) ImGui::Separator();
             }
-            ImGui::Separator();
             // The series (系列) this stack is in, or could be. Multi-select is
             // a later phase; until then this menu is how a stack joins a sweep
             // without going through the Linearity panel.
@@ -24449,9 +24580,11 @@ int main(int argc, char** argv) {
         // ---- A7: the Files row's A/B item is never a dead grey line ----------
         // Reported from the shipped build: "Set as compare B" is greyed out.
         // It was greyed on exactly one row - the CURRENT one, which is the row
-        // you right-click first - and nothing said so. The rule now: a row that
-        // is not A offers "Set as compare B"; the row that IS A offers the swap
-        // instead, and only that one may be disabled (no B to swap with).
+        // you right-click first - and nothing said so. The rule now (user
+        // ruling, 2026-07-30): a row that is not A offers "Set as compare B"
+        // and the slot item, the simple pair; the row that IS A offers
+        // NOTHING - the swap lives on Shift+\ and the status bar, and a menu
+        // line for it was care nobody needed.
         {   // A6 closed one stack; multi/ has three, so two are still open
             check(app.seqs.size() >= 2, "A7 fixture: two stacks still open");
             std::vector<int> fa, fb;
@@ -24469,19 +24602,19 @@ int main(int argc, char** argv) {
                         (int)abRowItem(app.images[fb.front()].get()));
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 another row offers Set as compare B");
-                // With compare OFF the current row now offers NOTHING - a
-                // greyed "Swap" about a mode that is not running read as
-                // broken (user report). AbSwapNoB is only for compare-on.
+                // The current row offers NOTHING, in every mode: it is A -
+                // the cursor - and the swap that used to sit here lives on
+                // Shift+\ and the status bar (user ruling, 2026-07-30).
                 check(abRowItem(app.images[fa.front()].get()) == AbNone,
-                      "A7 compare off: the current row offers no dead item");
+                      "A7 compare off: the current row offers no items");
                 // ...and turning compare on changes NOTHING about another row:
                 // the user read the greying as "compare has to be armed first".
                 app.compareMode = App::CmpWipe;
                 ensureCompareB();
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 compare on: another row still offers Set as compare B");
-                check(abRowItem(app.images[fa.front()].get()) == AbSwap,
-                      "A7 compare on: the current row offers a LIVE swap");
+                check(abRowItem(app.images[fa.front()].get()) == AbNone,
+                      "A7 compare on: the current row STILL offers no items (was Swap)");
                 // every other frame of A's own stack is still a legal B
                 if (fa.size() > 1)
                     check(abRowItem(app.images[fa[1]].get()) == AbSetB,
@@ -24669,6 +24802,76 @@ int main(int argc, char** argv) {
             fprintf(stderr, "abstatsselftest: S5 chip after stepping off: '%s'\n", chip.c_str());
             check(chip.find("B:") != std::string::npos,
                   "S5 ...and stepping off resumes the pair");
+
+            // S6: ESC steps outward one claim per press, and the Files letters
+            // are SEATS: full ink while a comparison runs, visible but dimmed
+            // while compare is off, with A - the cursor, not a seat - on the
+            // current row exactly while a comparison is active. (User report
+            // 2026-07-30: ESCで抜ける + 「FilesパネルのB,Cは薄く表示」.)
+            {
+                f0 = framesOfSeq(sid0);
+                f1 = framesOfSeq(sid1);
+                selectImage(f0[0]);
+                setCompareB(app.images[f1[0]].get());
+                app.compareMode = App::CmpWipe;
+                app.cmpExtra.clear();
+                if (lone) addCompareSlot(lone);       // slot C = the lone frame
+                app.selectedAnn = 0;
+                const App::SeqInfo* s6a = seqInfo(sid0);
+                const App::SeqInfo* s6b = seqInfo(sid1);
+                std::string row0 = s6a ? s6a->name : "?";
+                std::string row1 = s6b ? s6b->name : "?";
+                filesFrame();
+                fprintf(stderr, "abstatsselftest: S6 badges (comparing): '%s'\n",
+                        g_filesBadgeProbe.c_str());
+                check(g_filesBadgeProbe.find(row0 + "=A;") != std::string::npos,
+                      "S6 comparing: the current row wears the A badge, full ink");
+                check(g_filesBadgeProbe.find(row1 + "=B;") != std::string::npos,
+                      "S6 comparing: the B seat reads B, full ink");
+                if (lone)
+                    check(g_filesBadgeProbe.find(lone->name + "=C;") != std::string::npos,
+                          "S6 comparing: slot C reads C, full ink");
+                // ESC with an ROI selected AND compare on: the first press
+                // releases the ROI and ONLY that - one press, one step.
+                app.selectedAnn = 4242;               // white-box: a selected ROI
+                EscTook took = escapePressed();
+                check(took == EscTook::RoiDeselected && app.selectedAnn == 0 &&
+                      app.compareMode == App::CmpWipe,
+                      "S6 first ESC deselects the ROI, and nothing else");
+                uint64_t pinBefore = app.compareBUid;
+                size_t slotsBefore = app.cmpExtra.size();
+                took = escapePressed();
+                check(took == EscTook::CompareOff && app.compareMode == App::CmpOff,
+                      "S6 second ESC exits compare, and only compare");
+                check(app.compareBUid == pinBefore && app.cmpExtra.size() == slotsBefore,
+                      "S6 ...keeping the B pin and the slot letters (seats survive)");
+                check(escapePressed() == EscTook::Nothing,
+                      "S6 a third ESC has nothing left to take");
+                // compare OFF: the seats stay visible, dimmed ("armed, not
+                // active"); A is not a seat and is gone entirely
+                filesFrame();
+                fprintf(stderr, "abstatsselftest: S6 badges (compare off): '%s'\n",
+                        g_filesBadgeProbe.c_str());
+                check(g_filesBadgeProbe.find(row1 + "=B(dim);") != std::string::npos,
+                      "S6 compare off: the B seat stays visible, dimmed");
+                if (lone)
+                    check(g_filesBadgeProbe.find(lone->name + "=C(dim);") != std::string::npos,
+                          "S6 compare off: slot C stays visible, dimmed");
+                check(g_filesBadgeProbe.find("=A") == std::string::npos,
+                      "S6 compare off: no A badge - the cursor is not a seat");
+                // C resumes: the SAME letters come back at full ink - the
+                // round trip kept the seats (A9's pair, now visible)
+                cycleCompare();                        // Off -> wipe
+                check(app.compareMode == App::CmpWipe, "S6 C resumes the comparison");
+                filesFrame();
+                fprintf(stderr, "abstatsselftest: S6 badges (resumed): '%s'\n",
+                        g_filesBadgeProbe.c_str());
+                check(cmpB() && cmpB()->uid == pinBefore,
+                      "S6 ...with the same B (A9: the pair returns)");
+                check(g_filesBadgeProbe.find(row0 + "=A;") != std::string::npos &&
+                      g_filesBadgeProbe.find(row1 + "=B;") != std::string::npos,
+                      "S6 ...and the letters are back at full ink");
+            }
         }
 
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
@@ -25001,6 +25204,160 @@ int main(int argc, char** argv) {
             check(fabsf(app.view.zoom - ez3) <= 1e-4f &&
                   fabsf(app.view.center.x - a->w * 0.5f) <= 0.5f,
                   "T10 compare off: fit is A's, unchanged");
+        }
+
+        // ---- T11: the display-range link spans EVERY pane --------------------
+        // (report 2026-07-30: 「表示値域がAuto FitするのがA,BまででCが変わら
+        // ない」.) Two images stretched differently cannot be compared - with
+        // tiles that goes for every pane. Union mode must fit A, B AND each
+        // slot to one union; "B uses A's" must hand A's range to the slots
+        // too (the reference side dictates); per-own stays per-own.
+        {
+            app.rangeScope = 1;
+            app.linkRange = false;
+            bool saveFollow = app.compareFollowFrame;
+            app.compareFollowFrame = false;   // pin = resolved doc, so the
+                                              // asserts read the pinned images
+            ImageDoc *ta = nullptr, *tb = nullptr, *tc = nullptr;
+            for (auto& d : app.images) {      // three distinct open images
+                if (!ta) { ta = d.get(); continue; }
+                if (!tb) { tb = d.get(); continue; }
+                tc = d.get(); break;
+            }
+            check(ta && tb && tc, "T11 fixture: three images");
+            if (ta && tb && tc) {
+                int ai = -1;
+                for (int i = 0; i < (int)app.images.size(); i++)
+                    if (app.images[i].get() == ta) ai = i;
+                selectImage(ai);
+                app.cmpExtra.clear();
+                setCompareB(tb);
+                addCompareSlot(tc);
+                app.compareMode = App::CmpSplit;
+                check(cur() == ta && cmpB() == tb && compareExtras().size() == 1 &&
+                      compareExtras()[0] == tc, "T11 fixture: A, B and slot C armed");
+                // distinct content ranges and distinct own stretches, so a pane
+                // left on its own range cannot pass by luck
+                ta->vmin = 10;  ta->vmax = 100;  ta->black = 12;  ta->white = 90;
+                tb->vmin = 0;   tb->vmax = 50;   tb->black = 1;   tb->white = 40;
+                tc->vmin = -5;  tc->vmax = 200;  tc->black = 0;   tc->white = 1;
+                app.compareRangeMode = 2;               // union auto
+                fprintf(stderr, "tileselftest: T11 union: A %.6g..%.6g  B %.6g..%.6g  "
+                                "C %.6g..%.6g  (want -5..200 on all three)\n",
+                        effBlack(*ta), effWhite(*ta), effBlack(*tb), effWhite(*tb),
+                        effBlack(*tc), effWhite(*tc));
+                check(effBlack(*ta) == -5 && effWhite(*ta) == 200 &&
+                      effBlack(*tb) == -5 && effWhite(*tb) == 200,
+                      "T11 union mode: A and B span the union of all three");
+                check(effBlack(*tc) == -5 && effWhite(*tc) == 200,
+                      "T11 union mode: slot C spans the SAME union, not its own");
+                app.compareRangeMode = 1;               // the reference dictates
+                fprintf(stderr, "tileselftest: T11 B-uses-A: A %.6g..%.6g  B %.6g..%.6g  "
+                                "C %.6g..%.6g  (want 12..90 on all three)\n",
+                        effBlack(*ta), effWhite(*ta), effBlack(*tb), effWhite(*tb),
+                        effBlack(*tc), effWhite(*tc));
+                check(effBlack(*tb) == 12 && effWhite(*tb) == 90,
+                      "T11 B-uses-A: B is stretched to A's black-white");
+                check(effBlack(*tc) == 12 && effWhite(*tc) == 90,
+                      "T11 B-uses-A: slot C uses A's range too");
+                app.compareRangeMode = 0;               // each keeps its own
+                check(effBlack(*ta) == 12 && effWhite(*ta) == 90 &&
+                      effBlack(*tb) == 1 && effWhite(*tb) == 40 &&
+                      effBlack(*tc) == 0 && effWhite(*tc) == 1,
+                      "T11 per-own mode: every pane keeps its own stretch");
+                // ...and the label names what the range covers: a label that
+                // undersells what it covers is wrong the moment C joins
+                app.compareRangeMode = 2;
+                std::string said = abRangeSaid(true);
+                fprintf(stderr, "tileselftest: T11 label with slot C: '%s'\n", said.c_str());
+                check(said.find("compared images") != std::string::npos,
+                      "T11 the union label names the slots, not just A and B");
+                app.cmpExtra.clear();
+                said = abRangeSaid(true);
+                check(said == std::string("A and B combined range"),
+                      "T11 ...and stays 'A and B' when only A and B compare");
+            }
+            app.compareFollowFrame = saveFollow;
+        }
+
+        // ---- T12: what the pane badges SAY - two lines, letter+batch / name --
+        // (user report 2026-07-30: 「一行目にBatch名，二行目がファイル名」.)
+        // Real ImGui frames through drawCanvas; the composition is asserted
+        // from g_paneBadgeProbe exactly as the geometry is from
+        // g_tilePanesDrawn - this machine cannot screenshot GL.
+        {
+            bool saveFollow = app.compareFollowFrame;
+            app.compareFollowFrame = false;   // pin = resolved doc, as in T11
+            ImageDoc *ta = nullptr, *tb = nullptr, *tc = nullptr;
+            for (auto& d : app.images) {
+                if (!ta) { ta = d.get(); continue; }
+                if (!tb) { tb = d.get(); continue; }
+                tc = d.get(); break;
+            }
+            int ai = -1;
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i].get() == ta) ai = i;
+            selectImage(ai);
+            app.cmpExtra.clear();
+            setCompareB(tb);
+            addCompareSlot(tc);
+            app.compareMode = App::CmpSplit;
+            auto canvasFrame = [&](float w, float h) {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+                    ImGui::Begin("CanvasProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawCanvas(ImGui::GetContentRegionAvail());
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T12 tiled badges: '%s'\n",
+                    g_paneBadgeProbe.c_str());
+            std::string wa = "A|" + batchNameOf(ta) + "|" + ta->name + ";";
+            std::string wb = "B|" + batchNameOf(tb) + "|" + tb->name + ";";
+            std::string wc = "C|" + batchNameOf(tc) + "|" + tc->name + ";";
+            check(!batchNameOf(ta).empty(),
+                  "T12 fixture: the images belong to a named batch");
+            check(g_paneBadgeProbe.find(wa) != std::string::npos &&
+                  g_paneBadgeProbe.find(wb) != std::string::npos &&
+                  g_paneBadgeProbe.find(wc) != std::string::npos,
+                  "T12 tiles: every pane reads letter+batch over the file name");
+            // the wipe's two overlay labels follow the same two-line format
+            app.compareMode = App::CmpWipe;
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T12 wipe badges: '%s'\n",
+                    g_paneBadgeProbe.c_str());
+            check(g_paneBadgeProbe.find(wa) != std::string::npos &&
+                  g_paneBadgeProbe.find(wb) != std::string::npos,
+                  "T12 wipe: both sides carry the same two-line identity");
+            // a NARROW pane elides from the front (elideFront) or drops the
+            // line - it never overflows into the neighbour's pixels
+            canvasFrame(220.0f, 500.0f);
+            size_t ap = g_paneBadgeProbe.find("A|");
+            std::string aline2;
+            if (ap != std::string::npos) {
+                std::string entry = g_paneBadgeProbe.substr(
+                    ap, g_paneBadgeProbe.find(';', ap) - ap);
+                size_t p1 = entry.find('|');
+                size_t p2 = entry.find('|', p1 + 1);
+                aline2 = entry.substr(p2 + 1);
+            }
+            fprintf(stderr, "tileselftest: T12 narrow wipe: A's name line drawn "
+                            "as '%s' (full '%s')\n", aline2.c_str(), ta->name.c_str());
+            check(ap != std::string::npos, "T12 narrow: the A badge itself survives");
+            check(aline2 != ta->name &&
+                  (aline2.empty() || aline2.compare(0, 3, "...") == 0),
+                  "T12 narrow: the name elides from the front or drops, never overflows");
+            app.compareMode = App::CmpSplit;
+            app.compareFollowFrame = saveFollow;
         }
 
         fprintf(stderr, "tileselftest: %s\n", ok ? "ok" : "FAILED");
@@ -25882,7 +26239,10 @@ int main(int argc, char** argv) {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && app.selectedAnn >= 0)
                 deleteAnn(app.selectedAnn);
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) app.selectedAnn = 0;   // back to All
+            // ESC steps outward: deselect the ROI, or - nothing selected -
+            // leave the comparison, seats kept. ONE dispatch (escapePressed),
+            // never two handlers racing on the same press.
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) escapePressed();
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 app.view.zoom = std::clamp(app.view.zoom * 2.0f, 1.0f / 512, 256.0f);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
