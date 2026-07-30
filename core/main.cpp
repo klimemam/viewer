@@ -12274,16 +12274,18 @@ static std::vector<RbRow> rbBuildView(const std::string* dir,
                                       bool flat, bool tree) {
     std::vector<RbRow> v;
     v.reserve(entries.size() + 1);
-    // ".." belongs to the LISTING, not to the tree: a tree already shows the
-    // parent, so a row pointing at it is a duplicate. In the listing the
-    // current folder is all there is, and the only ways out (the toolbar's
-    // "up", Backspace) both live outside the list the eye is following.
+    // "..", in BOTH shapes. The first version of this excluded the tree on the
+    // grounds that a tree already shows the parent - it does not. The tree is
+    // rooted at the folder being browsed and only ever DESCENDS: it shows
+    // children and grandchildren, never an ancestor. So in the tree, exactly as
+    // in the listing, the only ways out are the toolbar's "up" and Backspace,
+    // both of which live outside the list the eye is following.
     //
     // It used to exist and was removed because it appeared only outside the
     // home directory and so shifted every row by one on the way in and out.
     // The fix for that is to always be row 0 - at the root it is present and
     // dead rather than absent - not to have no row at all.
-    if (!tree) {
+    {
         static remote::Entry upEnt;        // read-only, stable: rows hold pointers
         upEnt.name = "..";
         upEnt.dir = true;
@@ -12857,6 +12859,7 @@ static void drawPanelRemote() {
         std::vector<char> keep(view.size(), 0);
         int need = -1;                 // an ancestor shallower than this is wanted
         for (int i = (int)view.size() - 1; i >= 0; i--) {
+            if (view[i].up) { keep[i] = 1; continue; }   // a filter never hides the exit
             bool m = !view[i].ph && globListMatch(rbFilter, view[i].name());
             if (m || (need >= 0 && view[i].depth < need)) {
                 keep[i] = 1;
@@ -16531,7 +16534,11 @@ int main(int argc, char** argv) {
                 // collapse: rows go, the cache stays
                 rbTreeCollapse(subPath);
                 std::vector<RbRow> cv = rbBuildView(&B.dir, B.entries, false, true);
-                bool collapsed = cv.size() == B.entries.size() &&
+                // ...back to the listed entries, plus the ".." row every shape
+                // carries (it is navigation, not a listed entry)
+                size_t cvListed = 0;
+                for (const auto& r : cv) if (!r.up) cvListed++;
+                bool collapsed = cvListed == B.entries.size() &&
                                  app.rbTreeCache.count(subPath) == 1;
                 // re-expand: no second round trip
                 rbTreeExpand(subPath);
@@ -16583,18 +16590,19 @@ int main(int argc, char** argv) {
             std::vector<RbRow> fv2 = rows(true, false);
             bool listHas = !lv.empty() && lv[0].up && lv[0].name() == "..";
             bool flatHas = !fv2.empty() && fv2[0].up;
-            bool treeNone = true;
-            for (const auto& r : tv) if (r.up) treeNone = false;
+            int treeUps = 0;
+            for (const auto& r : tv) if (r.up) treeUps++;
+            bool treeHas = !tv.empty() && tv[0].up && treeUps == 1;
             // ...and it is a directory row, so the arrow keys step onto it
             // without previewing it and Enter leaves rather than opening
             bool asDir = listHas && lv[0].isDir() && !lv[0].isGroup();
             int ups = 0;
             for (const auto& r : lv) if (r.up) ups++;
-            bool upOk = listHas && flatHas && treeNone && asDir && ups == 1;
+            bool upOk = listHas && flatHas && treeHas && asDir && ups == 1;
             fprintf(stderr, "browseselftest: \"..\": listing row0=%d flat row0=%d "
-                            "tree has none=%d draws as a folder=%d exactly one=%d: %s\n",
-                    listHas ? 1 : 0, flatHas ? 1 : 0, treeNone ? 1 : 0, asDir ? 1 : 0,
-                    ups, upOk ? "ok" : "FAIL");
+                            "tree row0=%d (x%d) draws as a folder=%d exactly one=%d: %s\n",
+                    listHas ? 1 : 0, flatHas ? 1 : 0, treeHas ? 1 : 0, treeUps,
+                    asDir ? 1 : 0, ups, upOk ? "ok" : "FAIL");
             if (!upOk) ok = false;
         }
         {   // "Open folder" on the folder being browsed: the same call the
