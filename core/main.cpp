@@ -9059,6 +9059,11 @@ static void drawAnalysisPlots() {
 
 // Numeric cell: fixed column width + right alignment, so digits keep their
 // position while flipping through frames (values must be comparable at a glance).
+// U+03C3, as UTF-8 bytes. A macro rather than a literal at each use, because
+// "\xcf\x83f" is read as \xcf followed by the three-digit escape \x83f - the
+// letter after the escape has to be a separate string, and getting that wrong
+// is a warning, not an error.
+#define SIGMA "\xcf\x83"
 static void textNum(const char* fmt, double v) {
     char buf[64];
     snprintf(buf, sizeof buf, fmt, v);
@@ -10178,10 +10183,15 @@ static void drawPanelProjection() {
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-            static const char* WH[9] = { "sigma_f", "sigma_v", "sigma_h",
-                                         "sigma_f %", "sigma_v %", "sigma_h %",
-                                         "p-p f", "p-p v", "p-p h" };
-            for (int c = 0; c < 9; c++)
+            // ONE mean, not three: over a rectangle the region mean, the mean
+            // of the row means and the mean of the column means are the same
+            // number. The old per-axis table printed it twice.
+            // the literal is split after each escape: "\xcf\x83f" would be read
+            // as \xcf followed by the 3-digit escape \x83f, which is not a byte
+            static const char* WH[10] = { "mean", SIGMA "f", SIGMA "v", SIGMA "h",
+                                          SIGMA "f %", SIGMA "v %", SIGMA "h %",
+                                          "p-p f", "p-p v", "p-p h" };
+            for (int c = 0; c < 10; c++)
                 ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
             // the header abbreviations are not self-evident, and this table is
@@ -10199,6 +10209,10 @@ static void drawPanelProjection() {
                     ImGui::TableNextRow();
                     if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
+                    ImGui::TableNextColumn();
+                    if (f.valid)       textNum("%.6g", f.mean);
+                    else if (hh.valid) textNum("%.6g", hh.mean);
+                    else               ImGui::TextDisabled("-");
                     const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
                     for (int k = 0; k < 3; k++) {
                         ImGui::TableNextColumn();
@@ -10223,7 +10237,7 @@ static void drawPanelProjection() {
         ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
     } else
     {
-    int nCols = (anySide ? 3 : 2) + 4;
+    int nCols = (anySide ? 3 : 2) + 5;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
         // one row per (side, axis, plane). The table's axis is the QUANTITY, so
@@ -10234,9 +10248,15 @@ static void drawPanelProjection() {
                                     ImGui::GetFontSize() * 1.6f);
         ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
+        // sigma-f rides next to the mean on every row: the profile sigma beside
+        // it is a spread of MEANS, and without the region's own sigma there is
+        // nothing to judge it against. The axis column already says which
+        // profile the bare sigma belongs to, so it needs no letter of its own -
+        // naming it "sigma h,v" would say both when each row is only one.
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("sigma", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("sigma %", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(SIGMA "f", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(SIGMA, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(SIGMA " %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
         auto rows = [&](const App::ProjState& S, const char* sideName, bool horizontal) {
@@ -10248,6 +10268,9 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
                 ImGui::TableNextColumn(); textNum("%.6g", st.mean);
+                ImGui::TableNextColumn();
+                if (S.fStat[s].valid) textNum("%.6g", S.fStat[s].sd);
+                else                  ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); textNum("%.6g", st.sd);
                 ImGui::TableNextColumn(); textNum("%.3f", st.pct);
                 ImGui::TableNextColumn(); textNum("%.6g", st.pp);
@@ -16386,6 +16409,12 @@ int main(int argc, char** argv) {
         ImFontGlyphRangesBuilder b;
         b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
         b.AddChar((ImWchar)0x2025);
+        // GetGlyphRangesJapanese covers Latin-1 and the kana/kanji but NOT
+        // Greek, so a table of noise figures could only write "sigma_f" where
+        // it means one symbol. (Unicode has no subscript f or v, so the axis
+        // letter rides alongside the symbol rather than under it.)
+        b.AddChar((ImWchar)0x03C3);        // sigma
+        b.AddChar((ImWchar)0x03BC);        // mu
         b.BuildRanges(&fontRanges);
     }
     ImFont* jp = fontPath.empty() ? nullptr
