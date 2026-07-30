@@ -13584,13 +13584,21 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         if (si < sizeof g_tchart.pts / sizeof g_tchart.pts[0])
             g_tchart.pts[si] = (int)pts.size();
     };
+    // The current-frame position. DASHED, because it is a reference, not data
+    // - drawn solid it read as a second curve ("frame 0 のところに黄色いやつ",
+    // user report), which is exactly the confusion the dashed-is-reference
+    // rule exists to prevent. It is also named in the legend now: an unlabelled
+    // vertical line cannot be told from a series by looking.
+    const ImU32 MARKER_INK = IM_COL32(255, 184, 77, 200);
     auto marker = [&](const PlotRect& tp, const ImageDoc* d, size_t si) {
         if (!tp.ok || !d) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float x = axUse && si < axs.size() ? (float)axs[si].at((float)d->seqIndex)
                                            : (float)d->seqIndex;
         float mxp = tp.at(x, tp.ymin).x;
-        dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
+        ImVec2 seg[2] = { ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y) };
+        float dash = 5 * app.uiScale;
+        addDashedPolyline(dl, seg, 2, MARKER_INK, 1.0f, dash, dash);
     };
     // the legend names only the curves that exist; the slots that have none are
     // named in their own line under the plot, with the reason
@@ -13603,6 +13611,8 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             t += "  n=" + std::to_string(s.t->frames) + "/" + std::to_string(s.t->expected);
         leg.push_back({ t, s.ink });
     }
+    // ...and the one non-data mark on the plot is named like everything else
+    leg.push_back({ "current frame", MARKER_INK });
 
     const ImGuiStyle& st = ImGui::GetStyle();
     const float minSide = AB_MIN_SIDE * app.uiScale;
