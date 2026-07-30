@@ -688,9 +688,6 @@ struct App {
         bool searchFocus = false;
         char pathEdit[1024] = "";
         bool pathEditing = false, pathFocus = false;
-        // tree click-toggle memory (a double-click cancels the first click)
-        std::string treeToggled;
-        bool treeToggledOpen = false;
         // Properties popup: a snapshot, because the row may scroll out of the
         // clipper (or the listing may refresh) while the popup is up
         remote::Entry propsEntry;
@@ -704,6 +701,9 @@ struct App {
         RbToolbarGeom toolbar;
         ImVec2 cursorRect[2] = { ImVec2(0, 0), ImVec2(0, 0) };
         std::string cursorName;
+        // ...and the centre of the cursor row's chevron hit zone (tree dir
+        // rows only; x < 0 = the row has no chevron), for "chevclick"
+        ImVec2 cursorChev = ImVec2(-1, -1);
     };
     // Never empty once rbMain() ran; [0] is always the primordial instance.
     std::vector<std::unique_ptr<BrowseInstance>> browsePanels;
@@ -15400,14 +15400,9 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         // an expand or a collapse moved every row below it: start clean
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
-    // The first click of a double-click on a TREE folder toggles it; when the
-    // second click turns out to be a navigation, that toggle has to be undone.
-    // So the toggle remembers itself: path + the state it replaced.
-    std::string& rbTreeToggled = I.treeToggled;    // path of the last click-toggle
-    bool& rbTreeToggledOpen = I.treeToggledOpen;   // its expansion BEFORE that click
     // What a plain click does: show a throwaway PREVIEW of a file / of a
     // sequence's poster frame - nothing is registered - or, on a folder,
-    // SELECT it (list) / toggle it in place (tree). Entering a folder is the
+    // SELECT it (cursor + anchor, set by the caller). Entering a folder is the
     // double-click (or Enter): click and double-click were indistinguishable
     // on folder rows, which is what made the pair unusable ("もったいない").
     // Factored out because the keyboard (arrow keys) does the same thing.
@@ -15415,16 +15410,13 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }     // dead at the root, by rbGoParent
         if (r.isDir()) {
-            // In a TREE the single click still opens the folder where it is -
-            // and remembers itself, so a double-click can cancel it (below).
-            if (I.tree) {
-                rbTreeToggled = r.full();
-                rbTreeToggledOpen = rbHas(I.expanded, rbTreeToggled);
-                if (rbTreeToggledOpen) rbTreeCollapse(I, rbTreeToggled);
-                else rbTreeExpand(I, rbTreeToggled);
-            }
-            // list: the click selects the row (cursor + anchor, set by the
-            // caller); the listing does not move
+            // Selection only, in BOTH shapes. The tree's expand/collapse
+            // belongs to the CHEVRON hit zone (and to Right/Left) - the name
+            // has no click-time side effect, so the first click of a
+            // double-click changes nothing on screen. Its predecessor toggled
+            // here and CANCELLED on the second click (the ce02f12 latch):
+            // state-correct at the end, but the expand was rendered between
+            // the clicks, and a flash the eye sees is a flash however it ends.
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -15466,20 +15458,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     };
     // What a double-click (and Enter) does: a REGISTERED open. A sequence row
     // opens the whole stack; a folder is entered; a frame promotes the preview
-    // it just made. viaDouble: the gesture's FIRST click already ran
-    // rbActivateRow, so a tree folder's in-place toggle has to be taken back.
-    auto rbOpenRow = [&](const RbRow& r, bool viaDouble = false) {
+    // it just made. A folder's first click was selection only (above), so
+    // entering has nothing to take back - no expand happened, none is undone.
+    auto rbOpenRow = [&](const RbRow& r) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }
         if (r.isDir()) {
-            if (viaDouble && I.tree && rbTreeToggled == r.full()) {
-                // undo the half-gesture: restore the expansion the first click
-                // changed, so navigating in does not also leave the old view
-                // toggled behind the user's back
-                if (rbTreeToggledOpen) rbTreeExpand(I, rbTreeToggled);
-                else rbTreeCollapse(I, rbTreeToggled);
-                rbTreeToggled.clear();
-            }
             rbGoTo(I, r.full());
             return;
         }
@@ -16245,6 +16229,23 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            // The glyph gutter's geometry, shared by the drawing below and by
+            // the tree's chevron HIT ZONE - the zone must split exactly where
+            // the pixels say it does. All inside the leading spaces the label
+            // reserves, so rows with and without a chevron keep their names
+            // aligned and nothing about the row indices moves.
+            const ImVec2 rowMin = ImGui::GetItemRectMin();
+            const float rowH   = ImGui::GetTextLineHeight();
+            const float rowGut = ImGui::CalcTextSize("  ").x;   // never touch the name
+            const float rowInd = ImGui::CalcTextSize("   ").x * (float)r.depth;
+            // TREE dir rows own a chevron: expansion is ITS verb, not the
+            // name's. ".." is navigation, not a listing node - no chevron.
+            // Groups never expand in place (grouped<->flat is a view toggle),
+            // so they get none either.
+            const bool chevRow = I.tree && r.isDir() && !r.up;
+            // the zone: everything left of the name (indent + gutter)
+            const bool chevHit = chevRow && ImGui::IsItemHovered() &&
+                                 ImGui::GetIO().MousePos.x < rowMin.x + rowInd + rowGut;
             // where a selftest aims a right-click: the first row that HAS a
             // context menu (a placeholder "(listing...)" row has none, the ".."
             // row has none, and a tree still fetching a node can put one at the
@@ -16263,34 +16264,54 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 I.cursorRect[0] = ImGui::GetItemRectMin();
                 I.cursorRect[1] = ImGui::GetItemRectMax();
                 I.cursorName = rname;
+                I.cursorChev = chevRow
+                    ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
+                             (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
+                    : ImVec2(-1.0f, -1.0f);
             }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
-                ImVec2 p = ImGui::GetItemRectMin();
-                float h = ImGui::GetTextLineHeight();
-                float gut = ImGui::CalcTextSize("  ").x;      // never touch the name
-                float indent = ImGui::CalcTextSize("   ").x * (float)r.depth;
-                float y = p.y + (ImGui::GetItemRectSize().y - h) * 0.5f;
-                float cxm = p.x + indent + gut * 0.45f, cym = y + h * 0.5f;
-                if (r.isDir()) {      // › chevron, the way a tree hints "enter me"
+                float y = rowMin.y + (ImGui::GetItemRectSize().y - rowH) * 0.5f;
+                float cxm = rowMin.x + rowInd + rowGut * 0.45f, cym = y + rowH * 0.5f;
+                if (chevRow) {
+                    // the tree's chevron is a CONTROL now, so it says so: a
+                    // small filled triangle, > closed / v open, brightening
+                    // under the mouse. Same anchor as the hint glyph below -
+                    // the name column does not know the difference.
+                    ImU32 c = chevHit ? IM_COL32(212, 218, 224, 255)
+                                      : IM_COL32(150, 158, 166, 190);
+                    float a = std::min(rowH * 0.22f, rowGut * 0.50f);
+                    if (rbHas(I.expanded, r.full()))
+                        rdl->AddTriangleFilled(ImVec2(cxm - a, cym - a * 0.5f),
+                                               ImVec2(cxm + a, cym - a * 0.5f),
+                                               ImVec2(cxm, cym + a * 0.7f), c);
+                    else
+                        rdl->AddTriangleFilled(ImVec2(cxm - a * 0.5f, cym - a),
+                                               ImVec2(cxm - a * 0.5f, cym + a),
+                                               ImVec2(cxm + a * 0.7f, cym), c);
+                } else if (r.isDir()) {   // › chevron, the way a row hints "enter me"
+                    // (list-view dirs and the ".." row: a hint, not a control)
                     ImU32 c = IM_COL32(150, 158, 166, 170);
-                    float a = std::min(h * 0.16f, gut * 0.30f);
-                    // in a tree it also SAYS which way the node is: › closed,
-                    // v open, the one glyph carrying both meanings
-                    if (I.tree && rbHas(I.expanded, r.full())) {
-                        rdl->AddLine(ImVec2(cxm - a, cym - a * 0.5f), ImVec2(cxm, cym + a * 0.5f), c, 1.4f);
-                        rdl->AddLine(ImVec2(cxm, cym + a * 0.5f), ImVec2(cxm + a, cym - a * 0.5f), c, 1.4f);
-                    } else {
-                        rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
-                        rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
-                    }
+                    float a = std::min(rowH * 0.16f, rowGut * 0.30f);
+                    rdl->AddLine(ImVec2(cxm - a * 0.5f, cym - a), ImVec2(cxm + a * 0.5f, cym), c, 1.4f);
+                    rdl->AddLine(ImVec2(cxm + a * 0.5f, cym), ImVec2(cxm - a * 0.5f, cym + a), c, 1.4f);
                 } else {              // stack: three hairlines, barely there
                     ImU32 c = IM_COL32(130, 165, 200, 150);
-                    float w = std::min(h * 0.36f, gut * 0.8f);
+                    float w = std::min(rowH * 0.36f, rowGut * 0.8f);
                     for (int k = -1; k <= 1; k++)
-                        rdl->AddLine(ImVec2(cxm - w * 0.5f, cym + k * h * 0.18f),
-                                     ImVec2(cxm + w * 0.5f, cym + k * h * 0.18f), c, 1.0f);
+                        rdl->AddLine(ImVec2(cxm - w * 0.5f, cym + k * rowH * 0.18f),
+                                     ImVec2(cxm + w * 0.5f, cym + k * rowH * 0.18f), c, 1.0f);
                 }
+            }
+            // The chevron's verb, on the PRESS: one click, one toggle, right
+            // now. There is no double-click meaning on this zone (a fast pair
+            // is two toggles), so nothing here is ever optimistic and nothing
+            // ever needs cancelling - the anti-flash guarantee is structural.
+            if (chevHit && !r.ph && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                std::string full = r.full();
+                if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
+                else rbTreeExpand(I, full);
+                rbCursor = ei;          // the mouse also places the keyboard
             }
             if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
@@ -16328,12 +16349,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
             // its first click just made - and a FOLDER is entered, in the
-            // listing and in the tree alike (the single click only selects /
-            // toggles, so the two gestures finally mean different things).
+            // listing and in the tree alike (the single click only selects,
+            // so the two gestures finally mean different things).
             // ".." stays single-click: it is the exit, not a folder row.
-            if (servable && !r.up && ImGui::IsItemHovered() &&
+            // !chevHit: on the chevron a fast pair is two toggles, never a
+            // navigation - the zones split the verbs.
+            if (servable && !r.up && !chevHit && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                rbOpenRow(r, true);
+                rbOpenRow(r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
@@ -18424,14 +18447,18 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 // left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx,
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
 // img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
-// the cursor's row - a double-click only exists as clicks); mback / mfwd
+// the cursor's row - a double-click only exists as clicks); chevclick (a click
+// on the cursor row's tree chevron, asserting the toggle landed at once);
+// mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
 // viewreset (absolute grouped+list+folded state - the toggles are relative);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
 // leaf is LEAF); and the assertions chkimg:N (count + NAMES), chkpv:N,
 // chkidx:K, chkopen:S, chkcur, chkcurn:NAME, chknames:SPEC, chkdir:LEAF,
 // chkcursor:N (view index), chkatrow:NAME (the cursor row's name), chkback:N,
-// chkfwd:N, chkexp:N, chkfocus:0|1 - any FAIL fails the run.
+// chkfwd:N, chkexp:N, exparm / chkexpn:0 (a per-frame watch: the armed path
+// was never expanded on ANY frame in between), chkfocus:0|1 - any FAIL fails
+// the run.
 //
 // INSTANCES (item 17): every stateful action and check drives the TARGET
 // instance (target:N switches it; 1 = the primordial panel). newpanel creates
@@ -18461,6 +18488,16 @@ static int g_navKeyAtBlur = -1, g_navKeyYieldAtBlur = -1;   // snapshot at "blur
 // root-level modal asks to open.
 static int g_popupCheck[2] = { -1, -1 };
 static int g_popupChecks = 0;
+// Tree double-click purity evidence: "exparm" arms a PER-FRAME watch on the
+// cursor row's path; until "chkexpn:0" every frame probes
+// rbHas(expanded, path). An end-state check (chkexp) cannot see a flash -
+// an expand executed on click one and cancelled on click two is state-
+// correct at the end but was RENDERED between the clicks, and the eye sees
+// every frame. hits counts the frames the path stood expanded.
+static std::string g_expNeverPath;      // armed path; empty = not watching
+static int g_expNeverHits = 0;          // frames rbHas(expanded, path) was true
+static int g_expNeverFrames = 0;        // frames watched
+static int g_chevPreExp = -1;           // "chevclick": expanded count pre-press
 static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
@@ -18501,10 +18538,19 @@ static std::string g_browseKeysActs =
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
     "home,down,down,dbl,waitdir:expset,chkfwd:0,back,waitdir:rb,"
-    // ...in a TREE the single click still toggles in place, but the second
-    // click of a double-click cancels that toggle on its way in: the folder
-    // is entered and NOT left expanded in the old view.
-    "tree,home,down,dbl,waitdir:digitset,chkexp:0,tree,back,waitdir:rb,"
+    // ...in a TREE the verbs have hit ZONES (Explorer's pane): the NAME
+    // never expands - not even between the two clicks of a double-click.
+    // exparm / chkexpn:0 probe EVERY frame of the gesture: the ce02f12 latch
+    // (expand on click one, cancel on click two) ended state-correct but
+    // RENDERED the expand mid-gesture, and this is the check it cannot pass.
+    "tree,home,down,chkatrow:digitset,exparm,dbl,waitdir:digitset,"
+    "chkexpn:0,chkexp:0,back,waitdir:rb,"
+    // ...the CHEVRON is the expand verb: one click toggles in place, at once
+    // (chevclick itself asserts the toggle beat the double-click window), a
+    // second collapses; a NAME click is selection only - cursor placed,
+    // nothing toggled, nowhere navigated.
+    "home,down,chkatrow:digitset,chevclick,chkexp:1,chevclick,chkexp:0,"
+    "click,chkexp:0,chkdir:rb,chkatrow:digitset,tree,"
     // ---- Enter on a multi-selection opens EVERY selected row, each group
     // as its own stack (the action-row button is the MERGE; this is the other
     // one - only the cursor's row used to open).
@@ -26565,6 +26611,14 @@ int main(int argc, char** argv) {
                     break;
                 }
             } else if (keyAct < keyActs.size()) {
+                // the armed never-expanded watch (see g_expNeverPath): probed
+                // HERE, once per frame, whatever the current action or phase -
+                // this block runs before the frame's draw, so each probe reads
+                // exactly the state the previous frame rendered
+                if (!g_expNeverPath.empty()) {
+                    g_expNeverFrames++;
+                    if (rbHas(rbKeysT().expanded, g_expNeverPath)) g_expNeverHits++;
+                }
                 const std::string& a = keyActs[keyAct];
                 // "op:arg" actions (checks, waits); op == a when there is no ':'
                 size_t kColon = a.find(':');
@@ -26620,25 +26674,41 @@ int main(int argc, char** argv) {
                     fflush(stderr);
                 }
                 if (op == "dbl" || op == "click" || op == "ctrlclick" ||
-                    op == "mback" || op == "mfwd") {
+                    op == "chevclick" || op == "mback" || op == "mfwd") {
                     // A real gesture into the real queue, aimed at the row the
                     // keyboard cursor is on - a double-click only exists as real
                     // clicks. "click" lands 40 px right of "dbl" (same row: rows
                     // span the table) so a click that follows a double-click can
                     // never chain into a triple. "ctrlclick" holds Ctrl around
-                    // the click (multi-select). mback / mfwd press mouse
+                    // the click (multi-select). "chevclick" lands on the cursor
+                    // row's CHEVRON (the tree's expand hit zone) and asserts the
+                    // toggle landed within two frames of the press - a toggle
+                    // deferred past the double-click window would still be
+                    // unexpanded here. mback / mfwd press mouse
                     // buttons 4 / 5 (ImGui 3 / 4) over the listing: the history
                     // handler is gated on the panel being hovered or focused.
-                    if (keyPhase == 0)
-                        g_injMouse = ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
-                                            (op == "click" ? 40.0f : 0.0f),
-                                            (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
+                    if (keyPhase == 0) {
+                        if (op == "chevclick" && rbKeysT().cursorChev.x < 0)
+                            chk(false, "cursor row has no chevron");
+                        g_injMouse = op == "chevclick"
+                            ? rbKeysT().cursorChev
+                            : ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
+                                     (op == "click" ? 40.0f : 0.0f),
+                                     (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
+                    }
                     else if (keyPhase == 1 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    else if (keyPhase == 1 && op == "chevclick")
+                        g_chevPreExp = (int)rbKeysT().expanded.size();
                     else if (keyPhase == 2)
                         g_injMouseBtn = op == "mback" ? 3 : op == "mfwd" ? 4 : 0;
                     else if (keyPhase == 3) g_injMouseBtn = -1;
                     else if (keyPhase == 4 && op == "dbl") g_injMouseBtn = 0;
+                    else if (keyPhase == 4 && op == "chevclick")
+                        chk((int)rbKeysT().expanded.size() != g_chevPreExp,
+                            "expanded " + std::to_string(g_chevPreExp) + " -> " +
+                            std::to_string((int)rbKeysT().expanded.size()) +
+                            " by two frames after the press");
                     else if (keyPhase == 5 && op == "dbl") g_injMouseBtn = -1;
                     else if (keyPhase == 5 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, false);
@@ -26906,6 +26976,21 @@ int main(int argc, char** argv) {
                                                   "back=" + std::to_string((int)rbKeysT().histBack.size()) +
                                                   " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
                     else if (op == "chkexp")  chk((int)rbKeysT().expanded.size() == arg);
+                    else if (a == "exparm") {
+                        // arm the per-frame watch on the CURSOR row's path -
+                        // the row the next gesture will be aimed at
+                        const std::string& d4 = rbKeysT().b.dir;
+                        g_expNeverPath = (d4 == "/" ? "/" : d4 + "/") +
+                                         rbKeysT().cursorName;
+                        g_expNeverHits = g_expNeverFrames = 0;
+                    }
+                    else if (op == "chkexpn") {
+                        chk(g_expNeverHits == arg && g_expNeverFrames > 0,
+                            g_expNeverPath + " expanded on " +
+                            std::to_string(g_expNeverHits) + "/" +
+                            std::to_string(g_expNeverFrames) + " watched frame(s)");
+                        g_expNeverPath.clear();
+                    }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
