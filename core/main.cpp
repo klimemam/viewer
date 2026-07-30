@@ -943,8 +943,18 @@ struct App {
         // statistics of the profiles themselves (sigma of column means = column FPN)
         struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
         Stats hStat[4], vStat[4];
+        // ...and of the REGION itself. sigma of the column means says how much
+        // the columns differ; this says how much the pixels do. Reading the two
+        // profile sigmas without it is reading a ratio with no denominator -
+        // and it is the third quantity the row/column noise split needs.
+        Stats fStat[4];
         bool roiUsed = false;
     } proj[2];                        // 0 = A, 1 = B (compare)
+    // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.
+    // Wide = one row per plane with sigma_f / sigma_v / sigma_h across it, which
+    // keeps a plane's three numbers on ONE line - and leaves the row axis free
+    // for the sides, which is where extra frames or slots will have to go.
+    int projStatLayout = 0;
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
     int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
@@ -3664,6 +3674,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "cmprange " << app.compareRangeMode << "\n";
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
+    f << "projstatlayout " << app.projStatLayout << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
@@ -4102,6 +4113,8 @@ static std::string loadSession(const std::string& path) {
                                      app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
                                      app.histPlane = std::clamp(app.histPlane, -1, 3); }
         else if (key == "roichannel") ls >> app.roiChannel;
+        else if (key == "projstatlayout") { ls >> app.projStatLayout;
+                                            app.projStatLayout = std::clamp(app.projStatLayout, 0, 2); }
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
                                            >> app.projYHi >> h >> v;
@@ -9639,6 +9652,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     }
     std::vector<std::vector<int>> hN(P.nSeries, std::vector<int>(rw, 0));
     std::vector<std::vector<int>> vN(P.nSeries, std::vector<int>(rh, 0));
+    // region moments, gathered from the SAME samples the H pass visits (every
+    // column, every step-th row) - so the region sigma and the profile sigmas
+    // describe one and the same set of pixels
+    double fSum[4] = {}, fSum2[4] = {};
+    size_t fN[4] = {};
+    double fMn[4] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
+    double fMx[4] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
     bool useMax = app.projMode == 1, useMin = app.projMode == 2;
     if (useMax || useMin)
         for (int s = 0; s < P.nSeries; s++) {
@@ -9663,6 +9683,11 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             else if (useMin) acc = std::min(acc, val);
             else acc += val;
             (toH ? hN[s][x] : vN[s][y])++;
+            if (toH) {           // one pass only, or every pixel counts twice
+                fSum[s] += val; fSum2[s] += (double)val * val; fN[s]++;
+                fMn[s] = std::min(fMn[s], (double)val);
+                fMx[s] = std::max(fMx[s], (double)val);
+            }
         }
     };
     for (int y = 0; y < rh; y += step)          // H profile: every column
@@ -9685,6 +9710,17 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
+    for (int s = 0; s < P.nSeries; s++) {
+        App::ProjState::Stats& f = P.fStat[s];
+        f = {};
+        if (!fN[s]) continue;
+        f.mean = fSum[s] / fN[s];
+        double var = fSum2[s] / fN[s] - f.mean * f.mean;
+        f.sd = sqrt(var > 0 ? var : 0);
+        f.mn = fMn[s]; f.mx = fMx[s]; f.pp = f.mx - f.mn;
+        f.pct = f.mean != 0 ? f.sd / fabs(f.mean) * 100.0 : 0.0;
+        f.valid = true;
+    }
     // statistics OF THE PROFILE itself: the spread of column means is column FPN,
     // the spread of row means is row FPN / banding - that is the number people
     // actually want out of a projection, and eyeballing a curve cannot give it.
@@ -9810,7 +9846,15 @@ static void drawPanelProjection() {
     // reserve the statistics table first: the plots must not push it off-panel
     int statRows = (P.nSeries + (Bim ? PB.nSeries : 0)) * plots;
     float lineH = ImGui::GetTextLineHeightWithSpacing();
+    // wide draws one row per PLANE per side; per-axis draws one per axis too
+    const bool wideGuess = app.projStatLayout == 1 ||
+                           (app.projStatLayout == 0 &&
+                            ImGui::GetContentRegionAvail().x >=
+                                ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 9 +
+                                ImGui::GetStyle().CellPadding.x * 22);
+    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0);
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
+                 + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
                  + lineH;                                  // footnote
     if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
@@ -9978,6 +10022,90 @@ static void drawPanelProjection() {
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
+    // WIDE puts a plane's three sigmas on one line (region, row means, column
+    // means) and spends the row axis on the SIDES instead of the axes. That is
+    // the axis that has to grow: A and B are two rows today, and more slots or
+    // more frames are more rows - whereas the quantities per plane are a fixed
+    // nine. Auto falls back to the per-axis rows when the nine number columns
+    // would not fit, because a table that scrolls sideways is not a table.
+    const float wideNeed = ImGui::GetFontSize() * (Bim ? 1.6f : 0.0f) +
+                           ImGui::GetFontSize() * 2.4f + numColW() * 9 +
+                           ImGui::GetStyle().CellPadding.x * 22;
+    bool wide = app.projStatLayout == 1 ||
+                (app.projStatLayout == 0 && ImGui::GetContentRegionAvail().x >= wideNeed);
+    {
+        const char* modes[3] = { "auto", "wide", "per axis" };
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
+        if (ImGui::BeginCombo("layout##projstat", modes[std::clamp(app.projStatLayout, 0, 2)])) {
+            for (int i = 0; i < 3; i++)
+                if (ImGui::Selectable(modes[i], app.projStatLayout == i)) {
+                    app.projStatLayout = i;
+                    app.prefsDirty = true;
+                }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("wide: one row per plane - region, row-mean and column-mean\n"
+                              "sigma side by side, so a plane reads on one line.\n"
+                              "per axis: one row per axis, as before.\n"
+                              "auto: wide whenever the columns fit.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", wide ? "wide" : "per axis");
+    }
+    if (wide) {
+        // sigma_f = the REGION's own sigma (how much the pixels differ)
+        // sigma_v = sigma of the row means    (horizontal banding / row FPN)
+        // sigma_h = sigma of the column means (vertical striping / column FPN)
+        int wCols = (Bim ? 1 : 0) + 1 + 9;
+        if (ImGui::BeginTable("projstatw", wCols, ImGuiTableFlags_SizingFixedFit |
+                                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+            if (Bim)
+                ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
+                                        ImGui::GetFontSize() * 1.6f);
+            ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
+            static const char* WH[9] = { "sigma_f", "sigma_v", "sigma_h",
+                                         "sigma_f %", "sigma_v %", "sigma_h %",
+                                         "p-p f", "p-p v", "p-p h" };
+            for (int c = 0; c < 9; c++)
+                ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableHeadersRow();
+            // the header abbreviations are not self-evident, and this table is
+            // the one people will read numbers off into a report
+            if (ImGui::TableGetHoveredColumn() >= (Bim ? 2 : 1))
+                ImGui::SetTooltip("f = the whole region     v = the row means (horizontal banding)\n"
+                                  "h = the column means (vertical striping)\n"
+                                  "%% is sigma / mean.  p-p is max - min.  All values in DN.");
+            auto wrow = [&](const App::ProjState& S, const char* sideName) {
+                for (int i = 0; i < S.nSeries; i++) {
+                    const App::ProjState::Stats& f = S.fStat[i];
+                    const App::ProjState::Stats& hh = S.hStat[i];
+                    const App::ProjState::Stats& vv = S.vStat[i];
+                    if (!f.valid && !hh.valid && !vv.valid) continue;
+                    ImGui::TableNextRow();
+                    if (Bim) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
+                    const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
+                    for (int k = 0; k < 3; k++) {
+                        ImGui::TableNextColumn();
+                        if (trio[k]->valid) textNum("%.6g", trio[k]->sd); else ImGui::TextDisabled("-");
+                    }
+                    for (int k = 0; k < 3; k++) {
+                        ImGui::TableNextColumn();
+                        if (trio[k]->valid) textNum("%.3f", trio[k]->pct); else ImGui::TextDisabled("-");
+                    }
+                    for (int k = 0; k < 3; k++) {
+                        ImGui::TableNextColumn();
+                        if (trio[k]->valid) textNum("%.6g", trio[k]->pp); else ImGui::TextDisabled("-");
+                    }
+                }
+            };
+            wrow(P, "A");
+            if (Bim) wrow(PB, "B");
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
+    } else
+    {
     int nCols = (Bim ? 3 : 2) + 4;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
@@ -10013,6 +10141,7 @@ static void drawPanelProjection() {
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
+    }
 }
 
 // ---- linearity ---------------------------------------------------------------
