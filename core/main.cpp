@@ -3339,7 +3339,13 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
 //     tiles would each start on a different Bayer phase and every per-plane
 //     statistic over the montage would be wrong
 //   - it says n of N: a partially loaded stack must not look complete
-static bool montageROI(bool horizontal, std::string& err) {
+// perFrameAuto: each tile is normalised to ITS OWN finite min..max, mapped to
+// 0..1. That makes an exposure sweep readable - under one shared range the dark
+// frames are black squares - but it also means the pixels STOP BEING DN: a
+// normalised montage is a picture for looking, not a measurement, and it says
+// so in its name, its note and its unit-less display range. A constant tile
+// (max == min) maps to 0.5 - the middle, not a lie about being dark or bright.
+static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = false) {
     ImageDoc* im = cur();
     if (!im) { err = "no image"; return false; }
     if (im->seqId == 0) { err = "not a stack: montage lays out the frames of one stack"; return false; }
@@ -3375,24 +3381,52 @@ static bool montageROI(bool horizontal, std::string& err) {
             float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
             memcpy(dp, sp, (size_t)rw * ch * sizeof(float));
         }
+        if (perFrameAuto) {
+            // this tile's own finite range - the whole tile, planes included:
+            // per-plane normalisation would silently rebalance the CFA mosaic
+            float lo = FLT_MAX, hi = -FLT_MAX;
+            for (int y = 0; y < rh; y++) {
+                const float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+                for (int x = 0; x < rw * ch; x++)
+                    if (std::isfinite(dp[x])) { lo = std::min(lo, dp[x]); hi = std::max(hi, dp[x]); }
+            }
+            const float span = hi - lo;
+            for (int y = 0; y < rh; y++) {
+                float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+                for (int x = 0; x < rw * ch; x++) {
+                    if (!std::isfinite(dp[x])) continue;
+                    dp[x] = span > 0 ? (dp[x] - lo) / span : 0.5f;
+                }
+            }
+        }
     }
     // the montage inherits the CFA description only if the phase survived, which
     // the even-snap above guarantees; the pattern itself is unchanged
     out->cfa = im->cfa; out->cfaPattern = im->cfaPattern;
-    out->black = im->black; out->white = im->white;
-    out->vmin = im->vmin; out->vmax = im->vmax;
+    if (perFrameAuto) {
+        out->dtype = "f32";              // whatever the source was, this is not it
+        out->black = 0.0f; out->white = 1.0f;
+        out->vmin = 0.0f;  out->vmax = 1.0f;
+    } else {
+        out->black = im->black; out->white = im->white;
+        out->vmin = im->vmin; out->vmax = im->vmax;
+    }
     out->batchId = im->batchId;
     const App::SeqInfo* si = seqInfo(im->seqId);
     int expected = si && si->expectedFrames > 0 ? si->expectedFrames : n;
     char nm[512];
     snprintf(nm, sizeof nm, "%s  ROI %dx%d x%d%s %s", si ? si->name.c_str() : im->name.c_str(),
              rw, rh, n, n < expected ? (" of " + std::to_string(expected)).c_str() : "",
-             horizontal ? "(montage H)" : "(montage V)");
+             perFrameAuto ? (horizontal ? "(montage H, per-frame range)"
+                                        : "(montage V, per-frame range)")
+                          : (horizontal ? "(montage H)" : "(montage V)"));
     out->name = nm;
     out->note = std::string("ROI (") + std::to_string(rx) + "," + std::to_string(ry) + ") " +
                 std::to_string(rw) + "x" + std::to_string(rh) + " from " +
                 std::to_string(n) + (n < expected ? " of " + std::to_string(expected) : "") +
-                " frame(s)" + (snapped ? ", snapped to the CFA phase" : "");
+                " frame(s)" + (snapped ? ", snapped to the CFA phase" : "") +
+                (perFrameAuto ? "; per-frame auto range: each tile mapped to 0..1 - "
+                                "values are NOT DN, view only" : "");
     out->texDirty = true;
     addImage(std::move(out));
     if (n < expected)
@@ -8945,10 +8979,19 @@ static void drawCanvas(ImVec2 avail) {
                 const bool roiOk = ra && ra->type == 0;
                 if (ImGui::BeginMenu("Montage ROI across the stack", inStack && roiOk)) {
                     std::string merr;
+                    // one toggle for both orientations, not four menu lines
+                    static bool mPerFrame = false;
                     if (ImGui::MenuItem("side by side (horizontal)"))
-                        if (!montageROI(true, merr)) toast(merr, true);
+                        if (!montageROI(true, merr, mPerFrame)) toast(merr, true);
                     if (ImGui::MenuItem("stacked (vertical)"))
-                        if (!montageROI(false, merr)) toast(merr, true);
+                        if (!montageROI(false, merr, mPerFrame)) toast(merr, true);
+                    ImGui::Separator();
+                    ImGui::MenuItem("per-frame auto range", nullptr, &mPerFrame);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("each tile normalised to its own min..max (0..1):\n"
+                                          "an exposure sweep reads instead of the dark frames\n"
+                                          "going black. The values stop being DN - the montage\n"
+                                          "says so in its name and note. View only.");
                     ImGui::EndMenu();
                 }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !(inStack && roiOk))
@@ -20985,6 +21028,40 @@ int main(int argc, char** argv) {
                 int erw = im->cfa ? 10 : 9, erh = im->cfa ? 8 : 7;
                 check(v->w == erw && v->h == erh * n, "E10 ...H = ROI height x frames");
                 check((int)app.images.size() == mid + 1, "E10 ...one image added");
+            }
+            // ---- E11: per-frame auto range - a picture, and it says so ------
+            {
+                selectImage(fr[0]);
+                app.selectedAnn = ann.id;
+                std::string err2;
+                bool madeN = montageROI(true, err2, true);
+                check(madeN, "E11 per-frame montage is produced");
+                if (madeN) {
+                    ImageDoc* mN = app.images.back().get();
+                    int erw2 = im->cfa ? 10 : 9, erh2 = im->cfa ? 8 : 7;
+                    // every tile spans exactly 0..1: its own min hit 0, max hit 1
+                    bool spans = true;
+                    for (int k = 0; k < (int)fr.size() && spans; k++) {
+                        float lo = FLT_MAX, hi = -FLT_MAX;
+                        for (int y = 0; y < erh2; y++)
+                            for (int x = 0; x < erw2; x++) {
+                                float vpx = mN->data[((size_t)y * mN->w + (k * erw2 + x)) * mN->ch];
+                                if (!std::isfinite(vpx)) continue;
+                                lo = std::min(lo, vpx); hi = std::max(hi, vpx);
+                            }
+                        if (fabsf(lo) > 1e-6f || fabsf(hi - 1.0f) > 1e-6f) spans = false;
+                    }
+                    check(spans, "E11 every tile is mapped to exactly 0..1");
+                    check(mN->black == 0.0f && mN->white == 1.0f,
+                          "E11 the display range is the normalised one");
+                    check(mN->name.find("per-frame range") != std::string::npos,
+                          "E11 the name says per-frame range");
+                    check(mN->note.find("NOT DN") != std::string::npos,
+                          "E11 the note says the values are not DN");
+                    // ...and the ordinary montage still copies raw pixels
+                    // (E9 pinned that; this asserts the flag defaults off)
+                    check(mN->dtype == "f32", "E11 dtype is f32, whatever the source was");
+                }
             }
         }
         fprintf(stderr, "exportselftest: %s\n", ok ? "ok" : "FAILED");
