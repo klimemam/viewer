@@ -10580,7 +10580,10 @@ static void drawPanelProjection() {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
         // sigma_v = sigma of the row means    (horizontal banding / row FPN)
         // sigma_h = sigma of the column means (vertical striping / column FPN)
-        int wCols = (anySide ? 1 : 0) + 1 + 9;
+        // side? + ch + the ten value columns below - keep this equal to the
+        // number of TableSetupColumn calls or ImGui asserts and the table is
+        // drawn wrong. It went out of step when "mean" was added back.
+        int wCols = (anySide ? 1 : 0) + 1 + 10;
         if (ImGui::BeginTable("projstatw", wCols, ImGuiTableFlags_SizingFixedFit |
                                                   ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
             if (anySide)
@@ -10592,9 +10595,14 @@ static void drawPanelProjection() {
             // number. The old per-axis table printed it twice.
             // the literal is split after each escape: "\xcf\x83f" would be read
             // as \xcf followed by the 3-digit escape \x83f, which is not a byte
-            static const char* WH[10] = { "mean", SIGMA "f", SIGMA "v", SIGMA "h",
-                                          SIGMA "f %", SIGMA "v %", SIGMA "h %",
-                                          "p-p f", "p-p v", "p-p h" };
+            // Spelled out rather than initialled. "sigma-f" needs the footnote
+            // to be read at all; "sigma (frame)" is read on sight, and these
+            // are numbers people copy into a report where the header travels
+            // with them.
+            static const char* WH[10] = { "mean",
+                                          SIGMA " (frame)", SIGMA " (row)", SIGMA " (col)",
+                                          SIGMA " (frame) %", SIGMA " (row) %", SIGMA " (col) %",
+                                          "p-p frame", "p-p row", "p-p col" };
             for (int c = 0; c < 10; c++)
                 ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
@@ -10637,7 +10645,8 @@ static void drawPanelProjection() {
             });
             ImGui::EndTable();
         }
-        ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
+        ImGui::TextDisabled("frame = the whole region; row = the row means (banding); "
+                            "col = the column means (striping). DN");
         projSayPlaneMismatch();
     } else
     {
@@ -10658,10 +10667,13 @@ static void drawPanelProjection() {
         // profile the bare sigma belongs to, so it needs no letter of its own -
         // naming it "sigma h,v" would say both when each row is only one.
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn(SIGMA "f", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn(SIGMA, ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn(SIGMA " %", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(SIGMA " (frame)", ImGuiTableColumnFlags_WidthFixed, numColW());
+        // A bare sigma here means "of the means named in the axis column", and
+        // nothing on the header said so. Each row IS one axis, so the header
+        // cannot name a single one - it names the relationship instead.
+        ImGui::TableSetupColumn(SIGMA " (this axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn(SIGMA " (axis) %", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("p-p (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
         auto rows1 = [&](const App::ProjState& S, const char* sideName, int s, bool horizontal) {
             {
@@ -10690,7 +10702,9 @@ static void drawPanelProjection() {
             });
         ImGui::EndTable();
     }
-    ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
+    ImGui::TextDisabled(SIGMA " (frame) = the whole region.  " SIGMA " (this axis) = of the means "
+                        "in the axis column:\n"
+                        "column means = column FPN, row means = row FPN. DN");
     projSayPlaneMismatch();
     }
 }
