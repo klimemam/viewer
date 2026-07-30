@@ -10688,13 +10688,20 @@ static void drawPanelProjection() {
     // 1-channel. Then A gets four rows and B gets one, and nothing on screen
     // says why - the reader concludes B has no planes rather than that B was
     // never told it is a mosaic. Say it.
-    struct SideRef { const App::ProjState* S; std::string name; };
+    struct SideRef { const App::ProjState* S; std::string name; bool stale; };
     std::vector<SideRef> sides;
-    sides.push_back({ &P, "A" });
-    if (Bim) sides.push_back({ &PB, "B" });
+    sides.push_back({ &P, "A", false });
+    // B is stale while the step throttle holds its recompute back, or when
+    // follow-frame found no partner; a slot is stale when ITS follow diverged.
+    // The user's ruling (A4): a lagging number may lag if it is VISIBLY not
+    // current - so the stale side's cells draw dimmed, not in the same ink as
+    // fresh ones.
+    if (Bim) sides.push_back({ &PB, "B",
+                               bStale || (abStepBusy() && app.proj[1].uid != 0) });
     for (const ResolvedSlot& rs : xslots)
         if (rs.idx < app.projExtra.size())
-            sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx) });
+            sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx),
+                              slotFollowDiverged(rs.idx) || abStepBusy() });
     {   // a diverged slot's rows are the last frame its stack had - say so with
         // the same sentence the B side gets (g_abFollowDiverged, above)
         std::string div;
@@ -10724,6 +10731,10 @@ static void drawPanelProjection() {
             ImGui::SetTooltip("\"Bayer\" is set per IMAGE (Inspector > Interpret), not per\n"
                               "sensor. A side loaded without it stays one plane, so the\n"
                               "rows are not comparable until both are told the same thing.");
+    };
+    auto sideIsStale = [&](const char* name) {
+        for (const auto& sr : sides) if (sr.name == name) return sr.stale;
+        return false;
     };
     auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*, int)>& row) {
         if (app.projStatOrder == 0) {
@@ -10842,8 +10853,11 @@ static void drawPanelProjection() {
                 n6(f, f.sd, sf, sizeof sf);  n6(vv, vv.sd, sv, sizeof sv);  n6(hh, hh.sd, sh, sizeof sh);
                 n6(f, f.pct, qf, sizeof qf); n6(vv, vv.pct, qv, sizeof qv); n6(hh, hh.pct, qh, sizeof qh);
                 n6(f, f.pp, pf, sizeof pf);  n6(vv, vv.pp, pv2, sizeof pv2); n6(hh, hh.pp, ph, sizeof ph);
-                snprintf(b, sizeof b, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-                         side, S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph);
+                // a stale side's numbers carry the caveat INTO the paste - a
+                // dimmed pixel does not survive the clipboard, the word does
+                snprintf(b, sizeof b, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                         side, sideIsStale(side) ? " (stale)" : "",
+                         S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph);
                 tsv += b;
                 nRows++;
             });
@@ -10920,7 +10934,11 @@ static void drawPanelProjection() {
                 }
             };
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+                const bool st = sideIsStale(side);
+                if (st) ImGui::PushStyleColor(ImGuiCol_Text,
+                                              ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
                 wrow1(S, side, i);
+                if (st) ImGui::PopStyleColor();
             });
             ImGui::EndTable();
         }
@@ -10972,13 +10990,20 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn(); textStat(st.pp);
             }
         };
+        auto dimmed = [&](const App::ProjState& S, const char* side, int i, bool horiz) {
+            const bool st = sideIsStale(side);
+            if (st) ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            rows1(S, side, i, horiz);
+            if (st) ImGui::PopStyleColor();
+        };
         if (app.showProjH)
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {
-                rows1(S, side, i, true);
+                dimmed(S, side, i, true);
             });
         if (app.showProjV)
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {
-                rows1(S, side, i, false);
+                dimmed(S, side, i, false);
             });
         ImGui::EndTable();
     }
