@@ -7809,6 +7809,86 @@ static void drawRawModal() {
     ImGui::EndPopup();
 }
 
+// ---------------- side-by-side tiles: the pane geometry --------------------
+// More than two compare slots means side by side and nothing else. A wipe, a
+// draggable split, a difference and a blink each mean exactly TWO images -
+// there is no honest three-image version of any of them - so those four keep
+// doing what they always did with A and B, and the extras get tiles.
+//
+// This lives out here, free of ImGui and of any frame state, because the
+// geometry IS the feature: --tile-selftest has to be able to assert the
+// rectangles without opening a window (this machine cannot screenshot GL).
+struct TilePane { float x0 = 0, w = 0; };
+
+// A pane narrower than this is not a comparison, it is a sliver: the badge that
+// says WHICH image it holds no longer fits, and two 40 px strips of a sensor
+// cannot be judged against each other. Say so rather than draw them.
+static float tileMinPaneW(float uiScale) { return 110.0f * uiScale; }
+
+// n equal-width panes across [x0, x0+width), separated by a band of 2*gutter -
+// the same band the A/B divider occupies, so the two layouts read as relatives.
+//
+// Equal width is the rule, not a simplification: app.splitFrac exists for A
+// against B, and applied to five panes it would make one of them a sliver.
+// Returns false, and leaves `out` empty, when the panes would be too narrow.
+static bool tileLayout(float x0, float width, int n, float gutter, float minPaneW,
+                       std::vector<TilePane>& out) {
+    out.clear();
+    if (n <= 0) return false;
+    const float paneW = (width - (n - 1) * 2.0f * gutter) / (float)n;
+    if (!(paneW >= minPaneW)) return false;      // written so a NaN fails too
+    out.reserve(n);
+    for (int i = 0; i < n; i++)
+        out.push_back({ x0 + i * (paneW + 2.0f * gutter), paneW });
+    return true;
+}
+
+// The ONE mapping every pane uses. Zoom and centre come from the view, never
+// from the pane: two images of the same scene at different magnifications,
+// side by side, is exactly how a reader compares sharpness or noise between
+// them and reaches a wrong conclusion. A pane that cannot show its image at
+// the shared zoom clips - it is never quietly rescaled.
+static ImVec2 tileMap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, float ix, float iy) {
+    return ImVec2(p0.x + sz.x * 0.5f + (ix - center.x) * zoom,
+                  p0.y + sz.y * 0.5f + (iy - center.y) * zoom);
+}
+static ImVec2 tileUnmap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, ImVec2 sc) {
+    return ImVec2(center.x + (sc.x - p0.x - sz.x * 0.5f) / zoom,
+                  center.y + (sc.y - p0.y - sz.y * 0.5f) / zoom);
+}
+
+// Who gets a pane, in slot order: A, then B if compare is armed and has one,
+// then every extra slot. The letter travels WITH the document so a badge can
+// never drift from the slot list that produced it.
+struct TileSlot { ImageDoc* doc; std::string tag; };
+static std::vector<TileSlot> tileSlots() {
+    std::vector<TileSlot> out;
+    ImageDoc* a = cur();
+    if (!a) return out;
+    out.push_back({ a, "A" });
+    if (ImageDoc* b = cmpB()) out.push_back({ b, "B" });
+    for (ImageDoc* d : compareExtras()) out.push_back({ d, slotOf(d) });
+    return out;
+}
+// Tiling engages only when there is a third slot to show, and only in the two
+// modes that already mean "side by side": Split, and compare-off - where the
+// slots are the only thing on screen asking for panes. Wipe, difference and
+// blink are two-image modes and are left alone.
+static bool tileEngaged() {
+    return cur() && !compareExtras().empty() &&
+           (app.compareMode == App::CmpSplit || app.compareMode == App::CmpOff);
+}
+
+// What drawCanvas ACTUALLY tiled on the last frame it drew: -1 = it did not
+// tile, 0 = it wanted to and refused because the panes would be slivers. A
+// geometry function that computes the right rectangles and a canvas that never
+// calls it look identical from a green build - and from a screenshot this
+// machine cannot take - so the frame writes down what it drew and
+// --bench-tiles reads it back.
+static int g_tilePanesDrawn = -1;
+static float g_tilePaneX0[16] = {}, g_tilePaneW[16] = {};
+static float g_tileCanvasW = 0;    // what it had to work with, when it refused
+
 static void drawCanvas(ImVec2 avail) {
     // DPI/font-aware ruler geometry (fixed px constants break on 150-200% Windows scaling)
     const float s = app.uiScale;
@@ -7843,13 +7923,42 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
+    const float GUTTER = 3.0f * s;
+    // ---- more than two slots: tile them, side by side -------------------------
+    // The tiled layout REPLACES the A/B split when it engages (see the `split`
+    // line below): the same gesture, one pane per slot, one shared view.
+    std::vector<TileSlot> slots;
+    std::vector<TilePane> tiles;
+    bool tiled = false;
+    std::string tileNarrow;             // why there are no tiles, when there are none
+    if (tileEngaged()) {
+        slots = tileSlots();
+        const float minW = tileMinPaneW(s);
+        tiled = tileLayout(canvasP0.x, canvasSize.x, (int)slots.size(),
+                           GUTTER, minW, tiles);
+        if (!tiled) {
+            // Degrade by SAYING SO. Slivers of five images side by side look
+            // like a comparison and cannot be read as one.
+            char m[224];
+            snprintf(m, sizeof m,
+                     "%d compare panes need at least %.0f px each - this canvas is "
+                     "%.0f px. Widen the window, or drop a slot.",
+                     (int)slots.size(), minW, canvasSize.x);
+            tileNarrow = m;
+            slots.clear();
+        }
+    }
     // A shared range moves as you step (mode 2 refits to the frame pair), and a
     // texture built with the old one is a wrong picture, not a stale label - so
     // both sides are checked against what they would be built with NOW.
     for (ImageDoc* d : { im, imB })
         if (d && (d->texBlack != effBlack(*d) || d->texWhite != effWhite(*d)))
             d->texDirty = true;
-    const bool split = imB && app.compareMode == App::CmpSplit;
+    // ...and so is every extra slot: a tile is on screen exactly as much as B is
+    for (const TileSlot& t : slots)
+        if (t.doc && (t.doc->texBlack != effBlack(*t.doc) || t.doc->texWhite != effWhite(*t.doc)))
+            t.doc->texDirty = true;
+    const bool split = imB && app.compareMode == App::CmpSplit && !tiled;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
     const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
                           imB->w == im->w && imB->h == im->h;
@@ -7866,7 +7975,6 @@ static void drawCanvas(ImVec2 avail) {
     if (split) app.splitFrac = std::clamp(app.splitFrac, 0.12f, 0.88f);
     float splitX = canvasP0.x + canvasSize.x * app.splitFrac;   // pane boundary (split)
     float wipeX  = canvasP0.x + canvasSize.x * app.wipeFrac;    // divider (wipe)
-    const float GUTTER = 3.0f * s;
     ImVec2 paneAp0 = canvasP0, paneAsz = canvasSize, paneBp0 = canvasP0, paneBsz = canvasSize;
     if (split) {
         // no artificial floor here: the pane the image is centred on must be the
@@ -7875,36 +7983,58 @@ static void drawCanvas(ImVec2 avail) {
         paneBp0.x = std::min(splitX + GUTTER, canvasP1.x - 1.0f);
         paneBsz.x = std::max(canvasP1.x - paneBp0.x, 1.0f);
     }
+    // Panes BY INDEX. 0 = A, 1 = B: with no extras there are exactly the two the
+    // split has always had (identical rectangles unless split is on), and `bool`
+    // still indexes them, so every A/B call site below reads as it always did.
+    // With extras there is one pane per slot, in slot order.
+    std::vector<ImVec2> paneOrg, paneDim;
+    if (tiled) {
+        for (const TilePane& t : tiles) {
+            paneOrg.push_back(ImVec2(t.x0, canvasP0.y));
+            paneDim.push_back(ImVec2(t.w, canvasSize.y));
+        }
+    } else {
+        paneOrg = { paneAp0, paneBp0 };
+        paneDim = { paneAsz, paneBsz };
+    }
+    const int paneCount = (int)paneOrg.size();
     // In split mode the pane under the cursor defines image coordinates; in wipe
     // mode both images occupy the same pane, so there is nothing to switch.
-    auto paneP0 = [&](bool b) { return b ? paneBp0 : paneAp0; };
-    auto paneSz = [&](bool b) { return b ? paneBsz : paneAsz; };
-    auto mapIn = [&](bool b, float ix, float iy) {
-        ImVec2 p = paneP0(b), z = paneSz(b);
-        return ImVec2(p.x + z.x * 0.5f + (ix - app.view.center.x) * app.view.zoom,
-                      p.y + z.y * 0.5f + (iy - app.view.center.y) * app.view.zoom);
+    auto paneP0 = [&](int i) { return paneOrg[std::clamp(i, 0, paneCount - 1)]; };
+    auto paneSz = [&](int i) { return paneDim[std::clamp(i, 0, paneCount - 1)]; };
+    auto mapIn = [&](int p, float ix, float iy) {
+        return tileMap(paneP0(p), paneSz(p), app.view.center, app.view.zoom, ix, iy);
     };
-    auto unmapIn = [&](bool b, ImVec2 sc) {
-        ImVec2 p = paneP0(b), z = paneSz(b);
-        return ImVec2(app.view.center.x + (sc.x - p.x - z.x * 0.5f) / app.view.zoom,
-                      app.view.center.y + (sc.y - p.y - z.y * 0.5f) / app.view.zoom);
+    auto unmapIn = [&](int p, ImVec2 sc) {
+        return tileUnmap(paneP0(p), paneSz(p), app.view.center, app.view.zoom, sc);
     };
     auto inBPane = [&](ImVec2 sc) { return split && sc.x >= paneBp0.x; };
+    // Which pane the pointer is in: tiled, the last one whose left edge it has
+    // passed, so the gutter belongs to the pane on its left instead of to nobody.
+    auto paneAt = [&](ImVec2 sc) -> int {
+        if (!tiled) return inBPane(sc) ? 1 : 0;
+        int k = 0;
+        for (int i = 0; i < paneCount; i++) if (sc.x >= paneOrg[i].x) k = i;
+        return k;
+    };
     // "fit" must fit the pane the image is drawn in, not the whole canvas. A is
-    // the reference, so fit A's pane; B is the same view by construction.
-    ImVec2 fitSize = split ? ImVec2(paneAsz.x, canvasSize.y) : canvasSize;
+    // the reference, so fit A's pane; every other pane is the same view by
+    // construction - which is the point, and why fit is not computed per pane.
+    ImVec2 fitSize = (tiled || split) ? ImVec2(paneSz(0).x, canvasSize.y) : canvasSize;
     if (im && app.fitRequested) { fitToCanvas(fitSize); app.fitRequested = false; }
 
-    auto imgToScr = [&](float ix, float iy) { return mapIn(false, ix, iy); };
-    auto scrToImg = [&](ImVec2 sc) { return unmapIn(inBPane(sc), sc); };
+    auto imgToScr = [&](float ix, float iy) { return mapIn(0, ix, iy); };
+    auto scrToImg = [&](ImVec2 sc) { return unmapIn(paneAt(sc), sc); };
     // A drag must stay in the pane it started in. Re-resolving per call would jump
     // the coordinates by half a canvas the moment the cursor crosses the boundary,
     // collapsing the ROI being drawn (or teleporting the one being moved).
-    static bool dragPaneB = false;
-    auto dragToImg = [&](ImVec2 sc) { return unmapIn(dragPaneB, sc); };
+    static int dragPane = 0;
+    auto dragToImg = [&](ImVec2 sc) { return unmapIn(dragPane, sc); };
 
-    // the divider is grabbed anywhere along its height, not just on the handle
-    bool onDivider = imB && app.compareMode != App::CmpDiff &&
+    // the divider is grabbed anywhere along its height, not just on the handle.
+    // Tiled there is no divider: the panes are equal by rule, and splitFrac
+    // belongs to the two-pane case alone.
+    bool onDivider = imB && !tiled && app.compareMode != App::CmpDiff &&
                      fabsf(io.MousePos.x - (split ? splitX : wipeX)) <= 7.0f * s &&
                      io.MousePos.y >= canvasP0.y && io.MousePos.y <= canvasP1.y;
     if (onDivider && (hovered || ImGui::IsItemActive())) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -7952,7 +8082,7 @@ static void drawCanvas(ImVec2 avail) {
     }
     if (im) {
         if (ImGui::IsItemActivated()) {
-            dragPaneB = inBPane(io.MousePos);      // latched for the whole drag
+            dragPane = paneAt(io.MousePos);        // latched for the whole drag
             drag0 = dragToImg(io.MousePos);
             dragMoved = false;
             dragAnnId = -1; dragCorner = -1; tmpActive = false;
@@ -8063,9 +8193,10 @@ static void drawCanvas(ImVec2 avail) {
                 float wheel = std::clamp(io.MouseWheel, -3.0f, 3.0f);   // tame trackpad inertia
                 ImVec2 mImg = scrToImg(io.MousePos);
                 float z = std::clamp(app.view.zoom * powf(1.25f, wheel), 1.0f / 512, 256.0f);
-                // anchor in the pane under the cursor: in split mode the image is
-                // centred on its pane, not on the canvas
-                ImVec2 ap0 = paneP0(inBPane(io.MousePos)), asz = paneSz(inBPane(io.MousePos));
+                // anchor in the pane under the cursor: in split (and tiled) mode
+                // the image is centred on its pane, not on the canvas
+                const int wp = paneAt(io.MousePos);
+                ImVec2 ap0 = paneP0(wp), asz = paneSz(wp);
                 app.view.center.x = mImg.x - (io.MousePos.x - ap0.x - asz.x * 0.5f) / z;
                 app.view.center.y = mImg.y - (io.MousePos.y - ap0.y - asz.y * 0.5f) / z;
                 app.view.zoom = z;
@@ -8182,22 +8313,31 @@ static void drawCanvas(ImVec2 avail) {
     app.hoverX = app.hoverY = -1;
     app.hoverInB = false;
     if (im && hovered) {
-        bool inB = inBPane(io.MousePos);
-        const ImageDoc* ref = inB && imB ? imB : im;
-        ImVec2 q = unmapIn(inB, io.MousePos);
+        const int p = paneAt(io.MousePos);
+        const bool inB = imB && p == 1 && (split || tiled);
+        // The status readout can name A and B and nothing else. Over a C/D/E
+        // pane it would print A's DN under A's label - a wrong number, in a
+        // tool whose entire job is the number - so it prints none. (Interim:
+        // the extra slots are drawn, not yet inspected.)
+        const bool readable = !tiled || p < (imB ? 2 : 1);
+        const ImageDoc* ref = inB ? imB : im;
+        ImVec2 q = unmapIn(p, io.MousePos);
         int ix = (int)floorf(q.x), iy = (int)floorf(q.y);
-        if (ix >= 0 && iy >= 0 && ix < ref->w && iy < ref->h) {
-            app.hoverX = ix; app.hoverY = iy; app.hoverInB = inB && imB != nullptr;
+        if (readable && ix >= 0 && iy >= 0 && ix < ref->w && iy < ref->h) {
+            app.hoverX = ix; app.hoverY = iy; app.hoverInB = inB;
         }
     }
 
     // ---- draw canvas ----
+    g_tilePanesDrawn = tileNarrow.empty() ? -1 : 0;   // 0: wanted tiles, too narrow
+    g_tileCanvasW = canvasSize.x;
     dl->AddRectFilled(canvasP0, canvasP1, IM_COL32(12, 14, 16, 255));
     dl->PushClipRect(canvasP0, canvasP1, true);
     // One image and its overlays, drawn through the given pane's mapping. Used
-    // once when compare is off, twice (A and B) when it is on.
-    auto drawImageOnly = [&](ImageDoc* d, bool b) {
-        auto map = [&](float ix, float iy) { return mapIn(b, ix, iy); };
+    // once when compare is off, twice (A and B) when it is on, once per slot
+    // when the extra slots are tiled.
+    auto drawImageOnly = [&](ImageDoc* d, int p) {
+        auto map = [&](float ix, float iy) { return mapIn(p, ix, iy); };
         if (d->texDirty) rebuildTexture(*d);
         else touchTex(*d);                 // keep it resident: it is on screen
         setFilter(*d, app.view.zoom >= 1.0f);
@@ -8208,11 +8348,11 @@ static void drawCanvas(ImVec2 avail) {
     // Overlays are drawn ONCE per pane. In wipe mode both images share one pane,
     // so drawing them per image would double the alpha of every ROI fill and grid
     // line right of the divider - a brightness step exactly where you are looking.
-    auto drawOverlays = [&](ImageDoc* d, bool b) {
-        auto map = [&](float ix, float iy) { return mapIn(b, ix, iy); };
+    auto drawOverlays = [&](ImageDoc* d, int p) {
+        auto map = [&](float ix, float iy) { return mapIn(p, ix, iy); };
         // pixel grid at high zoom
         if (app.showGrid && app.view.zoom >= 8.0f) {
-            ImVec2 tl = unmapIn(b, canvasP0), br = unmapIn(b, canvasP1);
+            ImVec2 tl = unmapIn(p, canvasP0), br = unmapIn(p, canvasP1);
             int x0 = std::max(0, (int)floorf(tl.x)), x1 = std::min(d->w, (int)ceilf(br.x));
             int y0 = std::max(0, (int)floorf(tl.y)), y1 = std::min(d->h, (int)ceilf(br.y));
             ImU32 gc = IM_COL32(120, 120, 120, 70);
@@ -8269,39 +8409,54 @@ static void drawCanvas(ImVec2 avail) {
     if (im) {
         if (flipMode) {
             ImageDoc* d = app.flipShowB ? imB : im;
-            drawImageOnly(d, false);
-            drawOverlays(d, false);
+            drawImageOnly(d, 0);
+            drawOverlays(d, 0);
         } else if (flashB) {
-            drawImageOnly(imB, false);
-            drawOverlays(imB, false);
+            drawImageOnly(imB, 0);
+            drawOverlays(imB, 0);
         } else if (diffMode) {
             ensureDiffTexture(*im, *imB);
             if (app.diff.tex) {
-                ImVec2 p0 = mapIn(false, 0, 0);
-                ImVec2 p1 = mapIn(false, (float)app.diff.w, (float)app.diff.h);
+                ImVec2 p0 = mapIn(0, 0, 0);
+                ImVec2 p1 = mapIn(0, (float)app.diff.w, (float)app.diff.h);
                 dl->AddImage((ImTextureID)(intptr_t)app.diff.tex, p0, p1);
                 dl->AddRect(p0, p1, IM_COL32(90, 100, 110, 255));
             }
-            drawOverlays(im, false);
+            drawOverlays(im, 0);
+        } else if (tiled) {
+            // One pane per slot, in slot order, all on the SAME view. Each is
+            // clipped to its own pane, so a pane that cannot hold its image at
+            // the shared zoom shows less of it - never a different zoom.
+            g_tilePanesDrawn = (int)slots.size();
+            for (int i = 0; i < (int)slots.size(); i++) {
+                dl->PushClipRect(paneP0(i), ImVec2(paneP0(i).x + paneSz(i).x, canvasP1.y), true);
+                drawImageOnly(slots[i].doc, i);
+                drawOverlays(slots[i].doc, i);
+                dl->PopClipRect();
+                if (i < 16) { g_tilePaneX0[i] = paneP0(i).x; g_tilePaneW[i] = paneSz(i).x; }
+            }
         } else if (split) {
             dl->PushClipRect(paneAp0, ImVec2(paneAp0.x + paneAsz.x, canvasP1.y), true);
-            drawImageOnly(im, false); drawOverlays(im, false);
+            drawImageOnly(im, 0); drawOverlays(im, 0);
             dl->PopClipRect();
             dl->PushClipRect(paneBp0, ImVec2(paneBp0.x + paneBsz.x, canvasP1.y), true);
-            drawImageOnly(imB, true); drawOverlays(imB, true);
+            drawImageOnly(imB, 1); drawOverlays(imB, 1);
             dl->PopClipRect();
         } else if (wipe) {
-            drawImageOnly(im, false);                   // A everywhere...
+            drawImageOnly(im, 0);                       // A everywhere...
             dl->PushClipRect(ImVec2(wipeX, canvasP0.y), canvasP1, true);
-            drawImageOnly(imB, false);                  // ...B over the right side
+            drawImageOnly(imB, 0);                      // ...B over the right side
             dl->PopClipRect();
-            drawOverlays(im, false);                    // ...and one set of overlays
+            drawOverlays(im, 0);                        // ...and one set of overlays
         } else {
-            drawImageOnly(im, false);
-            drawOverlays(im, false);
+            drawImageOnly(im, 0);
+            drawOverlays(im, 0);
         }
-        // ---- compare chrome: A/B badges + the divider you drag ----
-        if (imB) {
+        // ---- compare chrome: slot badges + the divider you drag ----
+        // The badge lives out here, not inside `if (imB)`: a tiled canvas can
+        // hold A + C + D with no B at all, and every pane still has to say
+        // which slot and which file it is.
+        {
             const ImU32 colA = IM_COL32(120, 200, 255, 255), colB = IM_COL32(255, 190, 120, 255);
             const float pad = 4.0f * s;
             // A badge must never sit over B's pixels (or the reverse), so each one
@@ -8328,7 +8483,44 @@ static void drawCanvas(ImVec2 avail) {
                 dl->AddText(ImVec2(bx + pad, by + pad * 0.5f), col, t.c_str());
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
-            if (flipMode) {
+            // C, D, E...: one hue each. "Which pane is D" has to be answerable
+            // from the badge alone - A's blue and B's orange stay where they are.
+            static const ImU32 TILE_COLS[6] = {
+                IM_COL32(105, 220, 130, 255), IM_COL32(200, 120, 255, 255),
+                IM_COL32(90, 220, 220, 255),  IM_COL32(255, 150, 200, 255),
+                IM_COL32(180, 200, 90, 255),  IM_COL32(255, 120, 120, 255),
+            };
+            // Hold-B outranks the tiles: it deliberately takes the whole canvas,
+            // so its badge - not four badges over one full-frame image - is what
+            // has to be on screen.
+            if (flashB) {
+                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", imB->name + "  (hold B)", colB);
+            } else if (tiled) {
+                const int nAB = imB ? 2 : 1;                 // how many letters are A/B
+                for (int i = 0; i < (int)slots.size(); i++) {
+                    ImU32 c = slots[i].tag == "A" ? colA
+                            : slots[i].tag == "B" ? colB
+                            : TILE_COLS[std::max(0, i - nAB) % 6];
+                    badge(paneP0(i).x + 6 * s, paneP0(i).x + paneSz(i).x, false,
+                          slots[i].tag.c_str(), slots[i].doc->name, c);
+                    if (i)   // the gutter band, the same one the A/B divider fills
+                        dl->AddRectFilled(ImVec2(paneP0(i).x - 2 * GUTTER, canvasP0.y),
+                                          ImVec2(paneP0(i).x, canvasP1.y),
+                                          IM_COL32(60, 66, 74, 255));
+                }
+            } else if (!imB) {
+                // compare is on but B is gone (closed, renamed, never picked):
+                // say so instead of rendering exactly like compare-off
+                if (app.compareMode != App::CmpOff) {
+                    const char* msg = "compare is on, but no B image - View > Compare A/B > B image";
+                    ImVec2 ts = ImGui::CalcTextSize(msg);
+                    float y = canvasP0.y + 6 * s;
+                    dl->AddRectFilled(ImVec2(canvasP0.x + 6 * s, y),
+                                      ImVec2(canvasP0.x + 6 * s + ts.x + 12 * s, y + ts.y + 6 * s),
+                                      IM_COL32(90, 60, 20, 210), 3.0f * s);
+                    dl->AddText(ImVec2(canvasP0.x + 12 * s, y + 3 * s), IM_COL32(255, 200, 120, 255), msg);
+                }
+            } else if (flipMode) {
                 // which side is on screen has to be readable at a glance, or a
                 // blink comparison tells you nothing about WHICH one differs
                 ImageDoc* d = app.flipShowB ? imB : im;
@@ -8388,8 +8580,6 @@ static void drawCanvas(ImVec2 avail) {
                                     IM_COL32(255, 235, 120, 255), cs);
                     }
                 }
-            } else if (flashB) {
-                badge(canvasP0.x + 6 * s, canvasP1.x, false, "B", imB->name + "  (hold B)", colB);
             } else if (split) {
                 badge(paneAp0.x + 6 * s, paneAp0.x + paneAsz.x, false, "A", im->name, colA);
                 badge(paneBp0.x + 6 * s, paneBp0.x + paneBsz.x, false, "B", imB->name, colB);
@@ -8401,8 +8591,10 @@ static void drawCanvas(ImVec2 avail) {
                 dl->AddLine(ImVec2(wipeX, canvasP0.y), ImVec2(wipeX, canvasP1.y),
                             IM_COL32(255, 255, 255, hot ? 255 : 200), 1.5f * s);
             }
-            // grab handle: a stubby bar at mid-height, the thing you aim at
-            if (!flashB && !flipMode && app.compareMode != App::CmpDiff) {
+            // grab handle: a stubby bar at mid-height, the thing you aim at.
+            // There is none when the panes are tiled: nothing is draggable, and
+            // a handle you cannot move is worse than no handle.
+            if (imB && !tiled && !flashB && !flipMode && app.compareMode != App::CmpDiff) {
                 float dx = split ? splitX : wipeX;
                 float hy = (canvasP0.y + canvasP1.y) * 0.5f, hh = 22 * s, hw = 5 * s;
                 dl->AddRectFilled(ImVec2(dx - hw, hy - hh), ImVec2(dx + hw, hy + hh),
@@ -8411,16 +8603,38 @@ static void drawCanvas(ImVec2 avail) {
                     dl->AddLine(ImVec2(dx + o * s, hy - hh * 0.4f), ImVec2(dx + o * s, hy + hh * 0.4f),
                                 IM_COL32(40, 44, 50, 255), 1.0f * s);
             }
-        } else if (app.compareMode != App::CmpOff) {
-            // compare is on but B is gone (closed, renamed, never picked): say so
-            // instead of rendering exactly like compare-off
-            const char* msg = "compare is on, but no B image - View > Compare A/B > B image";
-            ImVec2 ts = ImGui::CalcTextSize(msg);
-            float y = canvasP0.y + 6 * s;
-            dl->AddRectFilled(ImVec2(canvasP0.x + 6 * s, y),
-                              ImVec2(canvasP0.x + 6 * s + ts.x + 12 * s, y + ts.y + 6 * s),
-                              IM_COL32(90, 60, 20, 210), 3.0f * s);
-            dl->AddText(ImVec2(canvasP0.x + 12 * s, y + 3 * s), IM_COL32(255, 200, 120, 255), msg);
+            // Slots asked for and not shown: never silently. Either the canvas
+            // is too narrow for them, or the mode is one of the four that mean
+            // exactly two images - and in both cases the missing letters are
+            // the surprise that has to be named.
+            std::string unshown = tileNarrow;
+            const bool twoOnlyMode = app.compareMode == App::CmpWipe ||
+                                     app.compareMode == App::CmpDiff ||
+                                     app.compareMode == App::CmpFlip;
+            if (unshown.empty() && twoOnlyMode) {
+                size_t nx = compareExtras().size();
+                if (nx) {
+                    const char* mode = app.compareMode == App::CmpWipe ? "wipe"
+                                     : app.compareMode == App::CmpDiff ? "difference" : "blink";
+                    char m[192];
+                    snprintf(m, sizeof m, "%d extra slot%s not shown: %s compares exactly "
+                                          "two images. Use Split for side by side.",
+                             (int)nx, nx == 1 ? " is" : "s are", mode);
+                    unshown = m;
+                }
+            }
+            if (!unshown.empty()) {
+                // bottom RIGHT: the badges own the top, and the difference
+                // colour bar owns the bottom left
+                ImVec2 ts = ImGui::CalcTextSize(unshown.c_str());
+                float x = std::max(canvasP0.x + 6 * s, canvasP1.x - ts.x - 18 * s);
+                float y = canvasP1.y - ts.y - 10 * s;
+                dl->AddRectFilled(ImVec2(x, y - 3 * s),
+                                  ImVec2(std::min(x + ts.x + 12 * s, canvasP1.x - 6 * s),
+                                         y + ts.y + 3 * s),
+                                  IM_COL32(90, 60, 20, 210), 3.0f * s);
+                dl->AddText(ImVec2(x + 6 * s, y), IM_COL32(255, 200, 120, 255), unshown.c_str());
+            }
         }
         // Remote preview: say so ON the image. Measuring a 1/3-sampled preview
         // without knowing it is how a wrong number gets written down.
@@ -8462,25 +8676,32 @@ static void drawCanvas(ImVec2 avail) {
         if (step < 1) step = 1;
         // Top ruler (X): once per pane. A single ruler across both panes would
         // label pane B with pane A's coordinates - a ruler that lies.
-        auto xRuler = [&](bool b) {
-            ImVec2 p0 = paneP0(b), sz = paneSz(b);
+        //
+        // How far the ticks run: A's width, as it always has. Tiled, the widest
+        // image on screen - the panes share ONE coordinate system, so stopping
+        // at A's width would leave a wider D unlabelled where it still has pixels.
+        float tickMaxX = (float)im->w;
+        if (tiled) for (const TileSlot& t : slots) tickMaxX = std::max(tickMaxX, (float)t.doc->w);
+        auto xRuler = [&](int p) {
+            ImVec2 p0 = paneP0(p), sz = paneSz(p);
             dl->PushClipRect(ImVec2(p0.x, origin.y), ImVec2(p0.x + sz.x, origin.y + RULER_H), true);
-            float ix0 = unmapIn(b, p0).x, ix1 = unmapIn(b, ImVec2(p0.x + sz.x, p0.y)).x;
+            float ix0 = unmapIn(p, p0).x, ix1 = unmapIn(p, ImVec2(p0.x + sz.x, p0.y)).x;
             for (float t = floorf(ix0 / step) * step; t <= ix1; t += step) {
-                if (t < 0 || t > im->w) continue;
-                float sx = mapIn(b, t, 0).x;
+                if (t < 0 || t > tickMaxX) continue;
+                float sx = mapIn(p, t, 0).x;
                 dl->AddLine(ImVec2(sx, origin.y + RULER_H - TICK), ImVec2(sx, origin.y + RULER_H), tickCol);
                 char lb[32]; snprintf(lb, 32, "%.0f", t);
                 dl->AddText(ImVec2(sx + 3 * s, origin.y + 2), txtCol, lb);
             }
             if (app.hoverX >= 0) {
-                float sx = mapIn(b, (float)app.hoverX + 0.5f, 0).x;
+                float sx = mapIn(p, (float)app.hoverX + 0.5f, 0).x;
                 dl->AddLine(ImVec2(sx, origin.y), ImVec2(sx, origin.y + RULER_H), markCol, 1.5f);
             }
             dl->PopClipRect();
         };
-        xRuler(false);
-        if (split) xRuler(true);
+        xRuler(0);
+        if (split) xRuler(1);
+        else if (tiled) for (int i = 1; i < (int)slots.size(); i++) xRuler(i);
         // left ruler (Y)
         dl->PushClipRect(ImVec2(origin.x, canvasP0.y), ImVec2(origin.x + RULER_W, canvasP1.y), true);
         {
@@ -15257,6 +15478,7 @@ static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Brows
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
+static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
 static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
@@ -15340,6 +15562,8 @@ static void printUsage() {
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
+        "  --bench-tiles               ...with A, B and two extra slots tiled side by\n"
+        "                              side, and report the panes the canvas drew\n"
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
@@ -15347,6 +15571,7 @@ static void printUsage() {
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
+        "  --tile-selftest <dir>       side-by-side compare panes: geometry, print, exit\n"
         "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
@@ -15427,7 +15652,7 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--sequence expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame") {
             next();                                // consumed in main(), not an error
-        } else if (a == "--bench-step") {
+        } else if (a == "--bench-step" || a == "--bench-tiles") {
             /* consumed in main(): no value */
         } else if (a == "--no-ab-throttle") {
             g_abNoThrottle = true;     // measure what the B-slot throttle saves
@@ -15465,6 +15690,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
+        } else if (a == "--tile-selftest") {
+            g_tileSelftest = next();               // handled in main()
         } else if (a == "--export-selftest") {
             g_exportSelftest = next();             // handled in main()
         } else if (a == "--series-selftest") {
@@ -16303,6 +16530,13 @@ int main(int argc, char** argv) {
     bool benchStep = false;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-step")) benchStep = true;
+    // --bench-tiles: arm two EXTRA compare slots for the bench, so the frames it
+    // renders go through the tiled side-by-side path, and report the pane
+    // rectangles drawCanvas actually produced. --tile-selftest proves the
+    // geometry is right; this proves the canvas is the thing using it.
+    bool benchTiles = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--bench-tiles")) benchTiles = true;
     app.exePath = argv[0];
     // the out-of-the-box A/B range mode, read before anything can override it:
     // --range-selftest checks it, and prefs on the machine running the test
@@ -20552,6 +20786,236 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // ---- side-by-side tiles: the pane geometry, asserted ----------------------
+    // A layout cannot be verified by looking at it here: this machine captures a
+    // pure white client area for anything OpenGL draws. So the layout is verified
+    // as arithmetic. Four slots (A, B, C, D) are built, and the rectangles
+    // tileLayout() hands drawCanvas are checked for count, equal width, no
+    // overlap, staying inside the canvas, slot order, and ONE zoom across all of
+    // them - the last being the rule that matters most, because two images of one
+    // scene at two magnifications side by side is how a reader compares sharpness
+    // and concludes the wrong thing.
+    if (!g_tileSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "tileselftest: %-64s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        openFolder(g_tileSelftest);
+        loadAll();
+        if (app.images.size() < 4) {
+            fprintf(stderr, "tileselftest: need 4 images under %s\n", g_tileSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+
+        // ---- T1: the slot list is A, then B, then the extras in order --------
+        selectImage(0);
+        setCompareB(app.images[1].get());
+        app.cmpExtra.clear();
+        addCompareSlot(app.images[2].get());
+        addCompareSlot(app.images[3].get());
+        app.compareMode = App::CmpSplit;
+        std::vector<ImageDoc*> ex = compareExtras();
+        check(ex.size() == 2 && ex[0] == app.images[2].get() && ex[1] == app.images[3].get(),
+              "T1 two extra slots, in the order they were added");
+        check(slotOf(app.images[2].get()) == "C" && slotOf(app.images[3].get()) == "D",
+              "T1 the extras are lettered C and D");
+        std::vector<TileSlot> sl = tileSlots();
+        fprintf(stderr, "tileselftest: T1 slots =");
+        for (const TileSlot& t : sl)
+            fprintf(stderr, "  %s:%s", t.tag.c_str(), t.doc->name.c_str());
+        fputc('\n', stderr);
+        check(sl.size() == 4, "T1 four panes: A, B and the two extras");
+        check(sl.size() == 4 && sl[0].tag == "A" && sl[1].tag == "B" &&
+              sl[2].tag == "C" && sl[3].tag == "D",
+              "T1 the badges are in slot order A B C D");
+        check(sl.size() == 4 && sl[0].doc == cur() && sl[1].doc == cmpB() &&
+              sl[2].doc == ex[0] && sl[3].doc == ex[1],
+              "T1 the documents are in slot order too");
+        {   // no image may hold two panes: a thing compared with itself is not one
+            bool dup = false;
+            for (size_t i = 0; i < sl.size(); i++)
+                for (size_t j = i + 1; j < sl.size(); j++)
+                    if (sl[i].doc == sl[j].doc) dup = true;
+            check(!dup, "T1 no image occupies two panes");
+        }
+
+        // ---- T2: which modes tile, and which four must not -------------------
+        // Wipe, difference and blink each mean exactly two images. Tiling them
+        // would be a third thing on a canvas that only has room for a pair.
+        check(tileEngaged(), "T2 Split with extras tiles");
+        app.compareMode = App::CmpOff;
+        check(tileEngaged(), "T2 compare-off with extras tiles: nothing else wants the canvas");
+        app.compareMode = App::CmpWipe;
+        check(!tileEngaged(), "T2 wipe does not tile: it compares exactly two");
+        app.compareMode = App::CmpDiff;
+        check(!tileEngaged(), "T2 difference does not tile: it compares exactly two");
+        app.compareMode = App::CmpFlip;
+        check(!tileEngaged(), "T2 blink does not tile: it compares exactly two");
+        app.compareMode = App::CmpSplit;
+        {   // and with no extras at all, the plain A/B split is untouched
+            std::vector<uint64_t> keep = app.cmpExtra;
+            app.cmpExtra.clear();
+            check(!tileEngaged(), "T2 two slots: the A/B split keeps the canvas");
+            app.cmpExtra = keep;
+            check(tileEngaged(), "T2 fixture: the extras are back");
+        }
+
+        // ---- T3: the rectangles ----------------------------------------------
+        const float X0 = 100.0f, W = 1600.0f, GUT = 3.0f, MINW = 110.0f;
+        std::vector<TilePane> pn;
+        bool laid = tileLayout(X0, W, (int)sl.size(), GUT, MINW, pn);
+        check(laid, "T3 four panes fit a 1600 px canvas");
+        check(pn.size() == sl.size(), "T3 one pane per slot, no more and no fewer");
+        for (const TilePane& t : pn)
+            fprintf(stderr, "tileselftest: T3 pane x0=%.3f w=%.3f x1=%.3f\n",
+                    t.x0, t.w, t.x0 + t.w);
+        if (laid && pn.size() == 4) {
+            float wmin = pn[0].w, wmax = pn[0].w;
+            for (const TilePane& t : pn) { wmin = std::min(wmin, t.w); wmax = std::max(wmax, t.w); }
+            check(wmax - wmin <= 1e-3f, "T3 the panes are equal width");
+            bool ordered = true, gaps = true, disjoint = true;
+            for (size_t i = 0; i + 1 < pn.size(); i++) {
+                if (!(pn[i].x0 < pn[i + 1].x0)) ordered = false;
+                if (pn[i].x0 + pn[i].w > pn[i + 1].x0 + 1e-3f) disjoint = false;
+                if (fabsf((pn[i + 1].x0 - (pn[i].x0 + pn[i].w)) - 2.0f * GUT) > 1e-3f) gaps = false;
+            }
+            check(ordered, "T3 the panes run left to right in slot order");
+            check(disjoint, "T3 no two panes overlap");
+            check(gaps, "T3 one gutter band between neighbours, all the same width");
+            check(fabsf(pn.front().x0 - X0) <= 1e-3f, "T3 the first pane starts at the canvas edge");
+            check(pn.back().x0 + pn.back().w <= X0 + W + 1e-3f,
+                  "T3 the last pane ends inside the canvas");
+            float used = (float)(pn.size() - 1) * 2.0f * GUT;
+            for (const TilePane& t : pn) used += t.w;
+            check(fabsf(used - W) <= 1e-2f, "T3 panes plus gutters account for the whole width");
+            check(pn.front().w >= MINW, "T3 every pane is at least the usable minimum");
+        }
+
+        // ---- T4: ONE view. Not one per pane ----------------------------------
+        if (laid && pn.size() == 4) {
+            const ImVec2 CEN(321.5f, 214.25f);
+            const float Z = 2.75f, PY = 40.0f, PH = 900.0f;
+            bool zoomSame = true, centreSame = true, sameOffset = true, roundTrip = true;
+            ImVec2 ref0(0, 0);
+            for (size_t i = 0; i < pn.size(); i++) {
+                ImVec2 p0(pn[i].x0, PY), sz(pn[i].w, PH);
+                // the scale this pane draws at, read off the mapping itself
+                ImVec2 a = tileMap(p0, sz, CEN, Z, 100.0f, 100.0f);
+                ImVec2 b = tileMap(p0, sz, CEN, Z, 110.0f, 130.0f);
+                if (fabsf((b.x - a.x) / 10.0f - Z) > 1e-3f) zoomSame = false;
+                if (fabsf((b.y - a.y) / 30.0f - Z) > 1e-3f) zoomSame = false;
+                // the view centre sits at the pane centre in every pane
+                ImVec2 c = tileUnmap(p0, sz, CEN, Z, ImVec2(p0.x + sz.x * 0.5f, PY + PH * 0.5f));
+                if (fabsf(c.x - CEN.x) > 1e-3f || fabsf(c.y - CEN.y) > 1e-3f) centreSame = false;
+                // ...so one image point lands at the same place WITHIN each pane
+                ImVec2 off(a.x - p0.x, a.y - p0.y);
+                if (i == 0) ref0 = off;
+                else if (fabsf(off.x - ref0.x) > 1e-3f || fabsf(off.y - ref0.y) > 1e-3f)
+                    sameOffset = false;
+                ImVec2 back = tileUnmap(p0, sz, CEN, Z, a);
+                if (fabsf(back.x - 100.0f) > 1e-3f || fabsf(back.y - 100.0f) > 1e-3f)
+                    roundTrip = false;
+            }
+            check(zoomSame, "T4 every pane draws at the view zoom, in x and in y");
+            check(centreSame, "T4 every pane is centred on the view centre");
+            check(sameOffset, "T4 an image point lands identically inside every pane");
+            check(roundTrip, "T4 screen -> image -> screen round trips per pane");
+        }
+
+        // ---- T5: splitFrac belongs to the A/B pair, and only to it -----------
+        {
+            std::vector<TilePane> before, after;
+            app.splitFrac = 0.5f;
+            tileLayout(X0, W, 4, GUT, MINW, before);
+            app.splitFrac = 0.9f;                 // the divider dragged hard right
+            tileLayout(X0, W, 4, GUT, MINW, after);
+            bool same = before.size() == after.size();
+            for (size_t i = 0; same && i < before.size(); i++)
+                if (fabsf(before[i].x0 - after[i].x0) > 1e-4f ||
+                    fabsf(before[i].w - after[i].w) > 1e-4f) same = false;
+            fprintf(stderr, "tileselftest: T5 splitFrac 0.5 -> 0.9: pane0 w %.3f -> %.3f\n",
+                    before.empty() ? 0.0f : before[0].w, after.empty() ? 0.0f : after[0].w);
+            check(same, "T5 the divider cannot make one of four panes a sliver");
+            app.splitFrac = 0.5f;
+        }
+
+        // ---- T6: degrade by saying so, not by drawing slivers ----------------
+        {
+            std::vector<TilePane> p2;
+            check(!tileLayout(X0, 300.0f, 4, GUT, MINW, p2) && p2.empty(),
+                  "T6 four panes in 300 px: refused, and no rectangles handed back");
+            check(!tileLayout(X0, W, 16, GUT, MINW, p2) && p2.empty(),
+                  "T6 sixteen panes in 1600 px: refused");
+            check(tileLayout(X0, W, 8, GUT, MINW, p2) && p2.size() == 8,
+                  "T6 eight panes in 1600 px still fit");
+            check(!tileLayout(X0, W, 0, GUT, MINW, p2), "T6 zero panes is not a layout");
+            check(tileLayout(X0, W, 1, GUT, MINW, p2) && p2.size() == 1 &&
+                  fabsf(p2[0].w - W) <= 1e-3f && fabsf(p2[0].x0 - X0) <= 1e-3f,
+                  "T6 one pane is the whole canvas, no gutter");
+            bool counts = true;
+            for (int n = 1; n <= 8; n++)
+                if (!tileLayout(X0, W, n, GUT, MINW, p2) || (int)p2.size() != n) counts = false;
+            check(counts, "T6 one to eight slots: the pane count always equals the slot count");
+            // the exact width where it gives up, stated rather than implied
+            float edge = (float)(4 - 1) * 2.0f * GUT + 4.0f * MINW;
+            check(tileLayout(X0, edge + 0.5f, 4, GUT, MINW, p2) &&
+                  !tileLayout(X0, edge - 0.5f, 4, GUT, MINW, p2),
+                  "T6 the cutoff is exactly n*minPane + gutters");
+            check(tileMinPaneW(1.0f) == MINW && tileMinPaneW(2.0f) == 2.0f * MINW,
+                  "T6 the minimum pane width scales with the UI, like every other size");
+        }
+
+        // ---- T7: a closed slot stops existing, and the rest keep their letters
+        {
+            const uint64_t uidA = sl[0].doc->uid, uidB = sl[1].doc->uid, uidD = sl[3].doc->uid;
+            int di = -1;
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i]->uid == uidD) di = i;
+            check(di >= 0, "T7 fixture: D is a live image");
+            if (di >= 0) {
+                selectImage(di);
+                closeCurrent(true);               // that image, and only that one
+                int ai = -1, bi = -1;
+                for (int i = 0; i < (int)app.images.size(); i++) {
+                    if (app.images[i]->uid == uidA) ai = i;
+                    if (app.images[i]->uid == uidB) bi = i;
+                }
+                if (ai >= 0) selectImage(ai);
+                if (bi >= 0) setCompareB(app.images[bi].get());
+                app.compareMode = App::CmpSplit;
+                std::vector<TileSlot> s2 = tileSlots();
+                fprintf(stderr, "tileselftest: T7 after closing D:");
+                for (const TileSlot& t : s2) fprintf(stderr, "  %s", t.tag.c_str());
+                fputc('\n', stderr);
+                check(s2.size() == 3, "T7 closing D leaves three panes");
+                check(s2.size() == 3 && s2[0].tag == "A" && s2[1].tag == "B" &&
+                      s2[2].tag == "C", "T7 ...and A, B, C keep their letters");
+                std::vector<TilePane> p3;
+                check(tileLayout(X0, W, (int)s2.size(), GUT, MINW, p3) && p3.size() == 3,
+                      "T7 the layout follows the slot list down to three");
+            }
+        }
+
+        fprintf(stderr, "tileselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
     if (!g_scanSelftest.empty()) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
@@ -20820,6 +21284,14 @@ int main(int argc, char** argv) {
         app.showHistogram = app.showTemporal = app.showProjection = true;
         app.showLinearity = true;      // ...which now includes the series selector
         benchMs.reserve(benchFrames);
+    }
+    if (benchTiles) {
+        // ...except here. Every panel open squeezes the canvas to its 50 px
+        // floor, where four panes are correctly REFUSED - which is the one
+        // thing this run is not trying to measure.
+        app.showFiles = app.showInspector = app.showRois = app.showAnalysis = false;
+        app.showHistogram = app.showTemporal = app.showProjection = false;
+        app.showLinearity = false;
     }
     double lastFrameEnd = glfwGetTime();
     // The frame body lives in a callable so it can also run from the window
@@ -21406,6 +21878,18 @@ int main(int argc, char** argv) {
                          app.folderPickOpen || app.rfPending > 0 ||
                          app.pendingCompare >= 0) &&
                         glfwGetTime() < 600.0;
+            // ...and only once the folder HAS loaded can the slots be armed: at
+            // setup time app.images is still empty for a folder argument
+            if (benchTiles && !benchWarm && app.cmpExtra.empty() && app.images.size() >= 4) {
+                selectImage(0);
+                setCompareB(app.images[1].get());
+                addCompareSlot(app.images[2].get());
+                addCompareSlot(app.images[3].get());
+                app.compareMode = App::CmpSplit;
+                fprintf(stderr, "benchtiles: armed %d extra slot(s), %d image(s), engaged=%d\n",
+                        (int)app.cmpExtra.size(), (int)app.images.size(),
+                        tileEngaged() ? 1 : 0);
+            }
         }
         bool active = app.wakeFrames > 0 || frameT0 < g_wakeUntil;
         if (active || busy) {
@@ -21789,6 +22273,14 @@ int main(int argc, char** argv) {
                 "bench: frames=%zu mean=%.2fms median=%.2fms p95=%.2fms max=%.2fms (%.0f fps median)\n",
                 s.size(), sum / s.size(), s[s.size() / 2], s[(size_t)(s.size() * 0.95)],
                 s.back(), 1000.0 / std::max(s[s.size() / 2], 1e-6));
+    }
+    if (benchTiles) {
+        fprintf(stderr, "benchtiles: drawCanvas tiled %d pane(s) on the last frame "
+                        "(canvas %.0f px; -1 = not tiled, 0 = refused as too narrow)\n",
+                g_tilePanesDrawn, g_tileCanvasW);
+        for (int i = 0; i < g_tilePanesDrawn && i < 16; i++)
+            fprintf(stderr, "benchtiles: pane %d x0=%.2f w=%.2f\n",
+                    i, g_tilePaneX0[i], g_tilePaneW[i]);
     }
 
     // it captures main's locals by reference, and teardown can still fire callbacks
