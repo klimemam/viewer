@@ -52,6 +52,19 @@ qb[(qy == 1) & (qx == 0)] = 30000   # Gb
 qb[(qy == 1) & (qx == 1)] = 12000   # B blocks dark
 (out / f"cfa_quad_rggb_{W}x{H}_bayer16.raw").write_bytes(qb.astype("<u2").tobytes())
 
+# BIG Bayer RGGB u16 npy (2064x1032 = 2.13 Mpx): large enough that the
+# histogram's sample stride exceeds 1 (total/1M = 2) and the ROI-stats stride
+# is 10 - exactly the sizes where a strided LINEAR index on an even width
+# never lands on an odd column and silently empties the Gr and B planes
+# (--verify-selftest V18). Planes are flat at distinct levels so a sampler
+# that reads the wrong pixels cannot return the right per-plane means.
+big = np.empty((1032, 2064), np.uint16)
+big[0::2, 0::2] = 100   # R
+big[0::2, 1::2] = 300   # Gr
+big[1::2, 0::2] = 500   # Gb
+big[1::2, 1::2] = 900   # B
+np.save(out / "cfa_big_rggb_2064x1032_u16.npy", big)
+
 # slanted edge (~7 deg, ~1.2px gaussian-ish transition) for iso12233/e-sfr
 ang = np.deg2rad(7.0)
 dist = (xx - W / 2) - np.tan(ang) * (yy - H / 2)

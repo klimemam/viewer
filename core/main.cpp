@@ -8889,38 +8889,50 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     for (int s = 0; s < 4; s++) H.seriesNames[s] = cfa ? CFA_SERIES[s] : CH_SERIES[s];
     float inv = 256.0f / std::max(H.white - H.black, 1e-20f);
     size_t total = (size_t)rw * rh;
-    size_t step = std::max<size_t>(1, total / 1000000);   // sample <= ~1M px
+    // A CFA sample stride has to move by WHOLE mosaic cells and take every
+    // pixel of the cell it lands on - the shape 47eec0c settled on for the
+    // Projection pass. This loop used to stride a LINEAR index p with
+    // x = rx + p % rw: the moment step and rw were both even (a sensor width
+    // essentially always is; step first turns even at 2 Mpx - 1920x1080 is
+    // already past it), p stayed even, x stayed even, and no odd column was
+    // ever read. For RGGB that gave Gr and B ZERO samples while R and Gb kept
+    // printing normal numbers, so nothing on screen showed it.
+    const int cell = cfa ? (im->cfa == 2 ? 4 : 2) : 1;   // quad Bayer repeats every 4
+    // ...and the budget has to know that each landing covers `cell` rows
+    size_t step = std::max<size_t>(1, total * cell / 1000000);   // sample <= ~1M px
+    if (cell > 1) step = ((step + cell - 1) / cell) * cell;      // whole cells only
     size_t below = 0, above = 0, cnt = 0, values = 0;
     double sum[4] = {}, sum2[4] = {};
     size_t n[4] = {};
-    for (size_t p = 0; p < total; p += step) {
-        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
-        const float* src = &im->data[((size_t)y * im->w + x) * im->ch];
-        if (cfa) {
-            float v = src[0];
-            if (std::isfinite(v)) {
-                int s = cfaChannelAt(*im, x, y);
-                float t = (v - H.black) * inv;
-                if (t < 0) { below++; H.bins[s][0]++; }
-                else if (t >= 256) { above++; H.bins[s][255]++; }
-                else H.bins[s][(int)t]++;
-                sum[s] += v; sum2[s] += (double)v * v; n[s]++;
-                values++;
+    for (int y0 = 0; y0 < rh; y0 += (int)step)
+        for (int y = y0; y < y0 + cell && y < rh; y++)
+            for (int x = 0; x < rw; x++) {
+                const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
+                if (cfa) {
+                    float v = src[0];
+                    if (std::isfinite(v)) {
+                        int s = cfaChannelAt(*im, rx + x, ry + y);
+                        float t = (v - H.black) * inv;
+                        if (t < 0) { below++; H.bins[s][0]++; }
+                        else if (t >= 256) { above++; H.bins[s][255]++; }
+                        else H.bins[s][(int)t]++;
+                        sum[s] += v; sum2[s] += (double)v * v; n[s]++;
+                        values++;
+                    }
+                } else {
+                    for (int c = 0; c < H.nSeries; c++) {
+                        float v = src[c];
+                        if (!std::isfinite(v)) continue;
+                        float t = (v - H.black) * inv;
+                        if (t < 0) { below++; H.bins[c][0]++; }
+                        else if (t >= 256) { above++; H.bins[c][255]++; }
+                        else H.bins[c][(int)t]++;
+                        sum[c] += v; sum2[c] += (double)v * v; n[c]++;
+                        values++;
+                    }
+                }
+                cnt++;
             }
-        } else {
-            for (int c = 0; c < H.nSeries; c++) {
-                float v = src[c];
-                if (!std::isfinite(v)) continue;
-                float t = (v - H.black) * inv;
-                if (t < 0) { below++; H.bins[c][0]++; }
-                else if (t >= 256) { above++; H.bins[c][255]++; }
-                else H.bins[c][(int)t]++;
-                sum[c] += v; sum2[c] += (double)v * v; n[c]++;
-                values++;
-            }
-        }
-        cnt++;
-    }
     for (int s = 0; s < H.nSeries; s++) {          // always-on mean / std
         if (!n[s]) { H.mean[s] = H.sd[s] = 0; continue; }
         double m = sum[s] / n[s], var = sum2[s] / n[s] - m * m;
@@ -12476,29 +12488,39 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
     if (rw < 1 || rh < 1) return s;
     bool cfa = im.ch == 1 && im.cfa != 0;
     size_t total = (size_t)rw * rh;
-    size_t step = std::max<size_t>(1, total / 200000);      // cap the cost per ROI
+    // Whole mosaic cells, never a strided linear index (the 47eec0c shape,
+    // same as recomputeHistogramIfNeeded): with x = rx + p % rw, an even step
+    // on an even-width ROI never landed on an odd column, so from 0.4 Mpx
+    // (800x500) the per-plane rows for Gr and B (RGGB) went silently empty
+    // while R and Gb kept printing normal numbers.
+    const int cell = cfa ? (im.cfa == 2 ? 4 : 2) : 1;       // quad Bayer: 4
+    // each landing covers `cell` rows, so the budget has to know that
+    size_t step = std::max<size_t>(1, total * cell / 200000);   // cap the cost per ROI
+    if (cell > 1) step = ((step + cell - 1) / cell) * cell;     // whole cells only
     double sum = 0, sum2 = 0, mn = DBL_MAX, mx = -DBL_MAX;
     size_t n = 0;
-    for (size_t p = 0; p < total; p += step) {
-        int x = rx + (int)(p % rw), y = ry + (int)(p / rw);
-        const float* src = &im.data[((size_t)y * im.w + x) * im.ch];
-        if (cfa) {
-            if (chSel >= 0 && cfaChannelAt(im, x, y) != chSel) continue;
-            float v = src[0];
-            if (!std::isfinite(v)) continue;
-            sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
-        } else if (chSel >= 0 && chSel < im.ch) {
-            float v = src[chSel];
-            if (!std::isfinite(v)) continue;
-            sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
-        } else {
-            for (int c = 0; c < im.ch; c++) {
-                float v = src[c];
-                if (!std::isfinite(v)) continue;
-                sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+    for (int y0 = 0; y0 < rh; y0 += (int)step)
+        for (int y = y0; y < y0 + cell && y < rh; y++)
+            for (int x = 0; x < rw; x++) {
+                const int ax = rx + x, ay = ry + y;
+                const float* src = &im.data[((size_t)ay * im.w + ax) * im.ch];
+                if (cfa) {
+                    if (chSel >= 0 && cfaChannelAt(im, ax, ay) != chSel) continue;
+                    float v = src[0];
+                    if (!std::isfinite(v)) continue;
+                    sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+                } else if (chSel >= 0 && chSel < im.ch) {
+                    float v = src[chSel];
+                    if (!std::isfinite(v)) continue;
+                    sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+                } else {
+                    for (int c = 0; c < im.ch; c++) {
+                        float v = src[c];
+                        if (!std::isfinite(v)) continue;
+                        sum += v; sum2 += (double)v * v; mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); n++;
+                    }
+                }
             }
-        }
-    }
     if (!n) return s;
     s.mean = sum / n;
     double var = sum2 / n - s.mean * s.mean;
@@ -20581,6 +20603,116 @@ int main(int argc, char** argv) {
             app.folderRecipeValid = false;
             rawDlg.open = false; rawDlg.forQueue = false;
             std::filesystem::remove_all(rroot, rec);
+        }
+
+        {   // ---- V18: histogram and ROI stats sample every CFA plane --------
+            // Same family as V17's projection defect, different mechanism.
+            // Both loops strided a LINEAR pixel index (x = rx + p % rw): once
+            // step and rw are both even - a sensor width essentially always is
+            // - p stays even, x stays even, and no odd column is ever read.
+            // For RGGB that empties Gr and B while the surviving planes keep
+            // printing normal numbers, so nothing on screen says half the
+            // sensor is missing. Assert every plane has samples and the counts
+            // are close, at sizes where the stride exceeds 1. V17's lesson
+            // kept: never skip planes with invalid stats - the bug empties
+            // exactly those.
+            app.selectedAnn = 0;                          // whole image
+            auto planeN = [](const App::HistState& HS, int s) {
+                size_t nn = 0;
+                for (int b = 0; b < 256; b++) nn += HS.bins[s][b];
+                return nn;
+            };
+            auto mkCfa = [](int W2, int H2, int mode) {   // mode: 1=Bayer 2=Quad
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "v18"; d->w = W2; d->h = H2; d->ch = 1;
+                d->cfa = mode; d->cfaPattern = 0; d->dtype = "f32";
+                static const float LVL[4] = { 100, 300, 500, 900 };
+                d->data.resize((size_t)W2 * H2);
+                for (int y = 0; y < H2; y++)
+                    for (int x = 0; x < W2; x++) {
+                        int cx = mode == 2 ? (x >> 1) & 1 : x & 1;
+                        int cy = mode == 2 ? (y >> 1) & 1 : y & 1;
+                        d->data[(size_t)y * W2 + x] = LVL[CFA_MAP[0][cy * 2 + cx]];
+                    }
+                d->uid = app.nextUid++;
+                return d;
+            };
+            // The size ladder pins the onset of each stride: the last clean
+            // size, the first even stride (where the old loops went blind),
+            // one odd stride (which never broke - the bias is NOT monotonic
+            // in pixels), and a quad Bayer size whose stride hits 0 mod 4.
+            bool histAll = true, histBal = true, roiAll = true, roiBal = true;
+            const struct { int w, h, mode; } rungs[] = {
+                { 800,  499,  1 },   // roi step 1 - last clean ROI size
+                { 800,  500,  1 },   // roi step 2 - the ROI-stats onset (0.4 Mpx)
+                { 2000, 999,  1 },   // hist step 1 - last clean histogram size
+                { 2000, 1000, 1 },   // hist step 2 - the histogram onset (2 Mpx)
+                { 2000, 1500, 1 },   // hist step 3 (odd: even columns come back)
+                { 2000, 2000, 1 },   // hist step 4
+                { 2048, 2048, 2 },   // quad: hist step 4, roi step 20, both 0 mod 4
+            };
+            for (const auto& r : rungs) {
+                auto d = mkCfa(r.w, r.h, r.mode);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                size_t hn[4], hmin = SIZE_MAX, hmax = 0, rn[4], rmin = SIZE_MAX, rmax = 0;
+                for (int s = 0; s < 4; s++) {
+                    hn[s] = planeN(T, s);
+                    hmin = std::min(hmin, hn[s]); hmax = std::max(hmax, hn[s]);
+                    rn[s] = roiBasicStatsUncached(*d, 0, 0, r.w, r.h, s).n;
+                    rmin = std::min(rmin, rn[s]); rmax = std::max(rmax, rn[s]);
+                }
+                fprintf(stderr, "verifyselftest: V18 %dx%d %s: hist n R=%zu Gr=%zu "
+                                "Gb=%zu B=%zu | roi n R=%zu Gr=%zu Gb=%zu B=%zu\n",
+                        r.w, r.h, r.mode == 2 ? "quad" : "bayer",
+                        hn[0], hn[1], hn[2], hn[3], rn[0], rn[1], rn[2], rn[3]);
+                if (!hmin) histAll = false;
+                if (hmin < hmax - hmax / 25) histBal = false;   // within 4%
+                if (!rmin) roiAll = false;
+                if (rmin < rmax - rmax / 25) roiBal = false;
+            }
+            check(histAll, "V18 histogram samples every CFA plane");
+            check(histBal, "V18 histogram plane sample counts are close");
+            check(roiAll, "V18 ROI stats sample every CFA plane");
+            check(roiBal, "V18 ROI stats plane sample counts are close");
+            // ...and through the real loader, on the fixture gen_testdata.py
+            // writes for exactly this: flat RGGB planes at 100/300/500/900 in
+            // a 2064x1032 (2.13 Mpx) frame, so a sampler that reads the wrong
+            // pixels cannot return the right per-plane means.
+            std::string berr;
+            auto big = decodeNpy((std::filesystem::path(g_verifySelftest).parent_path() /
+                                  "cfa_big_rggb_2064x1032_u16.npy").u8string(), berr);
+            check(big != nullptr, "V18 big Bayer fixture loads");
+            if (big) {
+                big->cfa = 1; big->cfaPattern = 0;         // RGGB
+                big->uid = app.nextUid++;
+                static const double LVL[4] = { 100, 300, 500, 900 };
+                App::HistState T{};
+                recomputeHistogramIfNeeded(big.get(), T);
+                bool hOk = true, hmOk = true;
+                std::string hMiss;
+                for (int s = 0; s < 4; s++) {
+                    if (!planeN(T, s)) { hOk = false; hMiss += T.seriesNames[s]; hMiss += " "; }
+                    if (fabs(T.mean[s] - LVL[s]) > 1e-3) hmOk = false;
+                }
+                fprintf(stderr, "verifyselftest: V18 fixture hist: %s; mean R=%.6g "
+                                "Gr=%.6g Gb=%.6g B=%.6g (want 100/300/500/900)\n",
+                        hOk ? "all four planes sampled" : ("MISSING " + hMiss).c_str(),
+                        T.mean[0], T.mean[1], T.mean[2], T.mean[3]);
+                check(hOk, "V18 fixture histogram sees all four planes");
+                check(hmOk, "V18 fixture histogram means hit the plane levels");
+                bool rOk = true, rmOk = true;
+                std::string rMiss;
+                for (int s = 0; s < 4; s++) {
+                    RoiStat rs = roiBasicStatsUncached(*big, 0, 0, big->w, big->h, s);
+                    if (!rs.valid || !rs.n) { rOk = false; rMiss += CFA_CH_NAMES[s]; rMiss += " "; }
+                    else if (fabs(rs.mean - LVL[s]) > 1e-3) rmOk = false;
+                }
+                fprintf(stderr, "verifyselftest: V18 fixture roi: %s\n",
+                        rOk ? "all four planes sampled" : ("MISSING " + rMiss).c_str());
+                check(rOk, "V18 fixture ROI stats see all four planes");
+                check(rmOk, "V18 fixture ROI means hit the plane levels");
+            }
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
