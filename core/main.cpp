@@ -21172,6 +21172,13 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_P)) gotoStack(-1);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) gotoFrame(0, true, true);
             if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_E)) gotoFrame(0, true, false);
+            // Shift+C / Shift+\ : the comparison PAST B. It has to be a chord -
+            // the plain-key block below is gated on KeyMods == None, so a Shift
+            // test inside it can never be true. (It was written there first,
+            // and the item was simply dead.)
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_C) ||
+                ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_Backslash))
+                showCompareSlots();
         }
         if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
@@ -21181,10 +21188,7 @@ int main(int argc, char** argv) {
             // C is an alias: ImGuiKey_Backslash follows the US scancode, which is
             // not where "\" sits on a JIS keyboard
             if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false) ||
-                ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-                if (ImGui::GetIO().KeyShift) showCompareSlots();   // C, D, E...
-                else                         cycleCompare();       // A against B
-            }
+                ImGui::IsKeyPressed(ImGuiKey_C, false)) cycleCompare();
             // B is hold-to-see-B (handled in drawCanvas); Shift+B pins A as B.
             // In blink mode it is a toggle instead - "ぱちぱち" needs a tap, not
             // a held key. Space doubles as the toggle there (it only pans while
