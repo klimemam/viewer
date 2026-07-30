@@ -168,11 +168,46 @@ delta 列は**持たない**(delta は2項の画面上の演算。ファイル�
   (projForEachRow はパネル内 lambda であり、walk の規則 — side-major、
   all は最後 — を仕様として共有する。)
 
-## 8. 検証 — `--export-tsv-selftest <dir>`
+## 8. per-frame x 軸 — フレーム番号を物理量に置き換える
+
+stack のフレームは大抵、物理量(経過時間・露光・温度)に対応する。Temporal の
+per-frame チャートに **カンマ / 空白 / タブ区切りの数値リストを貼り付けて
+x 軸にできる**ようにする。設計は家風が決める:
+
+- **軸は「単位を持つ量」**。入力は NAME + UNIT + 値リストの3点セット
+  (series が stack レベルのパラメータに持つものの per-frame 版、
+  docs/series-plan.md と同じ語彙)。**単位は決して既定しない** — name/unit の
+  無い Apply は拒否する。
+- **パース**: `,`・空白・タブ・改行すべて区切り(Excel 列とスクリプト出力の
+  両方が来る)。非数値トークンは**位置つきエラー**で列挙し、黙って飛ばさない。
+  読めない値は 0 ではなく「不成立」(canon)。
+- **個数の正直さ**: リスト長 ≠ フレーム数なら「12 values for 24 frames」と
+  **両方の数字**を言って適用を拒否。部分ロード stack は **expected total** と
+  比較し、そう言う。値 i は seqIndex i に付く。非単調は正常(温度は往復する)
+  — 折れ線はフレーム順に辿るだけ。
+- **スコープ**: stack 毎(`SeqInfo::axisName/axisUnit/axisVals`)。セッションに
+  追加キー `seqaxisvals/seqaxisunit/seqaxisname` で保存(古い viewer は
+  読み飛ばす — 形式の常道)。A/B/slot はそれぞれ自分の軸を持つ。**重ねる
+  チャートの x 軸は1本**: 曲線を持つ全 slot が同じ量(name+unit 一致。値は
+  違ってよい — それが重ねる意味)を持つときだけ使い、そうでなければフレーム
+  番号に落として理由を言う。
+- **解決は1関数** `frameAxisOf(seqId)`: チャートも export も selftest も
+  ここから読む。設定済みでもフレーム数と合わなくなった軸は「なぜ使わないか」
+  つきでフレーム番号に落ちる。
+- **export が運ぶ**(§3.3 に追記): per-frame セクションの `frame` 列の隣に
+  `<name> [<unit>]` 列として乗る(軸が有効なときだけ)。`frame` 列は残す —
+  マッピングの主キーはフレーム番号である。
+- **UI**: チャート近くの `x axis...` ボタン → popup(name / unit / 値の
+  multiline、Apply=検証、Clear=フレーム番号へ)。チャートの x ラベルは有効時
+  `<name> (<unit>)`、無効時 `frame number (index in sequence)`。
+
+## 9. 検証 — `--export-tsv-selftest <dir>`
 
 文字列に対して assert する(この機体は GL を screenshot できない):
 provenance 行のフィールド、セクションの並びと各矩形の列数、CFA stack での
 plane 行 R/Gr/Gb/B、ヘッダの単位、部分 stack での n=X/Y、**数値がパネルの
 state struct と同じ文字列に整形されること**(再導出ではなく同一 struct 読み)、
 temporal/profile の region 食い違いが NOTE になること、CSV の quoting。
-壊した時に落ちることも証明する(region ラベル偽装、plane 欠落)。
+per-frame x 軸: 3種の区切りのパース、位置つきエラー、個数不一致の拒否文言
+(両方の数字)、単位必須、`frameAxisOf` が適用値を返すこと、export 列、
+セッション往復。壊した時に落ちることも証明する(region ラベル偽装、plane 欠落)。
