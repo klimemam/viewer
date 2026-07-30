@@ -835,7 +835,7 @@ A がフレーム k、B がフレーム k−1 を映している瞬間、その�
 
 ---
 
-## 11. 環境の重要事実 (両エージェントが独立に確認)
+## 付録. 環境の重要事実 (両エージェントが独立に確認)
 
 **この Windows 機は現在 OpenGL のクライアント領域を一切キャプチャできない。**
 `CopyFromScreen` / `BitBlt+CAPTUREBLT` / `BitBlt(GetWindowDC)` / `PrintWindow` の
