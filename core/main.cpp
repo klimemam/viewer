@@ -322,6 +322,7 @@ struct App {
     // that does. docs/todo-open.md item 19 holds the shape this should
     // eventually take.
     std::vector<uint64_t> cmpExtra;          // uids, in slot order (C, D, ...)
+    uint64_t lastCompareBUid = 0;            // the B last CHOSEN, kept across compare being off
     struct SlotWant { int frame; std::string path; };
     std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
     int pendingCompare = -1;          // --compare, applied once two images exist
@@ -966,6 +967,13 @@ struct App {
     // keeps a plane's three numbers on ONE line - and leaves the row axis free
     // for the sides, which is where extra frames or slots will have to go.
     int projStatLayout = 0;
+    // Decimals in the profile-statistics table. -1 = significant digits (%g,
+    // the old behaviour), 0..6 = fixed places. Interim, and the reason is
+    // alignment rather than precision: %g gives every cell its own length, so
+    // a column of numbers can be neither scanned down nor pasted into a report
+    // as a column. What the app should do about number formats in GENERAL is
+    // docs/todo-open.md.
+    int projDecimals = -1;
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
     int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
@@ -1095,6 +1103,10 @@ static std::string abDocLabel(const ImageDoc* d);
 static void setCompareB(const ImageDoc* d) {
     // making a preview the B side IS using it: promote before it can vanish
     if (d && d->preview) promotePreview(const_cast<ImageDoc*>(d));
+    // Remember the last B that was CHOSEN, and keep remembering it after
+    // compare is switched off. Turning compare back on should return to the
+    // pair you were working with, not to whatever happens to be adjacent.
+    if (d) app.lastCompareBUid = d->uid;
     app.compareBUid = d ? d->uid : 0;
     app.compareB = d ? d->name : std::string();
     app.compareBSeq = d && d->seqId != 0 ? d->seqIndex : -1;
@@ -1294,7 +1306,12 @@ static void ensureCompareB() {
     if (resolveB()) return;       // mode-independent: called before the mode changes
     setCompareB(nullptr);
     if (app.images.empty()) return;
-    // the image you were just looking at is the one you mean to compare against
+    // 1. the B you last chose, if it is still open. Coming back to a comparison
+    //    should come back to the SAME comparison.
+    if (app.lastCompareBUid)
+        for (const auto& d : app.images)
+            if (d->uid == app.lastCompareBUid && d.get() != cur()) { setCompareB(d.get()); return; }
+    // 2. otherwise the image you were just looking at
     // (after Process > demosaic that is the source, not images[0])
     if (app.prevImageUid)
         for (const auto& d : app.images)
@@ -1303,6 +1320,21 @@ static void ensureCompareB() {
         int j = (app.current + 1 + i) % (int)app.images.size();
         if (app.images[j].get() != cur()) { setCompareB(app.images[j].get()); break; }
     }
+}
+
+// Shift+C: bring up the comparison BEYOND B. The slots already show in the
+// statistics tables; what this does is put the images on screen next to each
+// other, which is the one image layout that means more than two. Wipe,
+// difference and blink are left alone - they mean exactly two, and cycling
+// into them with four slots open would quietly show two of them.
+static void showCompareSlots() {
+    if (app.cmpExtra.empty()) {
+        toast("no slots past B yet - Files: right-click a row, \"Add as compare slot C\"", true);
+        return;
+    }
+    if (app.compareMode == App::CmpOff) ensureCompareB();
+    app.compareMode = App::CmpSplit;      // the side-by-side family
+    toast("side by side: A, B and " + std::to_string(app.cmpExtra.size()) + " more");
 }
 
 static void cycleCompare() {
@@ -3755,7 +3787,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->path << "\n";
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
-    f << "projstatlayout " << app.projStatLayout << "\n";
+    f << "projstatlayout " << app.projStatLayout << " " << app.projDecimals << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
@@ -4207,8 +4239,9 @@ static std::string loadSession(const std::string& path) {
                                      app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
                                      app.histPlane = std::clamp(app.histPlane, -1, 3); }
         else if (key == "roichannel") ls >> app.roiChannel;
-        else if (key == "projstatlayout") { ls >> app.projStatLayout;
-                                            app.projStatLayout = std::clamp(app.projStatLayout, 0, 2); }
+        else if (key == "projstatlayout") { int dp = -1; ls >> app.projStatLayout >> dp;
+                                            app.projStatLayout = std::clamp(app.projStatLayout, 0, 2);
+                                            app.projDecimals = std::clamp(dp, -1, 6); }
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
                                            >> app.projYHi >> h >> v;
@@ -9072,6 +9105,15 @@ static void textNum(const char* fmt, double v) {
     if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w));
     ImGui::TextUnformatted(buf);
 }
+// One value cell of the profile-statistics table. The whole point of the
+// setting is that a COLUMN is uniform, so the format is decided in one place
+// rather than at each of the twenty call sites.
+static void textStat(double v) {
+    char fmt[8];
+    if (app.projDecimals < 0) snprintf(fmt, sizeof fmt, "%%.6g");
+    else                      snprintf(fmt, sizeof fmt, "%%.%df", app.projDecimals);
+    textNum(fmt, v);
+}
 static void textNumStr(const std::string& s) {
     float w = ImGui::CalcTextSize(s.c_str()).x;
     float avail = ImGui::GetContentRegionAvail().x;
@@ -10171,6 +10213,23 @@ static void drawPanelProjection() {
                               "auto: wide whenever the columns fit.");
         ImGui::SameLine();
         ImGui::TextDisabled("%s", wide ? "wide" : "per axis");
+        ImGui::SameLine();
+        static const char* DP[8] = { "sig. digits", "0", "1", "2", "3", "4", "5", "6" };
+        int dpIdx = app.projDecimals < 0 ? 0 : app.projDecimals + 1;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f);
+        if (ImGui::BeginCombo("decimals##projstat", DP[std::clamp(dpIdx, 0, 7)])) {
+            for (int i = 0; i < 8; i++)
+                if (ImGui::Selectable(DP[i], dpIdx == i)) {
+                    app.projDecimals = i == 0 ? -1 : i - 1;
+                    app.prefsDirty = true;
+                }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("fixed decimals make a COLUMN scannable, and pasteable\n"
+                              "into a report as a column. \"sig. digits\" is the old\n"
+                              "behaviour: every cell picks its own length, so no two\n"
+                              "rows line up.");
     }
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
@@ -10210,21 +10269,21 @@ static void drawPanelProjection() {
                     if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
                     ImGui::TableNextColumn();
-                    if (f.valid)       textNum("%.6g", f.mean);
-                    else if (hh.valid) textNum("%.6g", hh.mean);
+                    if (f.valid)       textStat(f.mean);
+                    else if (hh.valid) textStat(hh.mean);
                     else               ImGui::TextDisabled("-");
                     const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
                     for (int k = 0; k < 3; k++) {
                         ImGui::TableNextColumn();
-                        if (trio[k]->valid) textNum("%.6g", trio[k]->sd); else ImGui::TextDisabled("-");
+                        if (trio[k]->valid) textStat(trio[k]->sd); else ImGui::TextDisabled("-");
                     }
                     for (int k = 0; k < 3; k++) {
                         ImGui::TableNextColumn();
-                        if (trio[k]->valid) textNum("%.3f", trio[k]->pct); else ImGui::TextDisabled("-");
+                        if (trio[k]->valid) textStat(trio[k]->pct); else ImGui::TextDisabled("-");
                     }
                     for (int k = 0; k < 3; k++) {
                         ImGui::TableNextColumn();
-                        if (trio[k]->valid) textNum("%.6g", trio[k]->pp); else ImGui::TextDisabled("-");
+                        if (trio[k]->valid) textStat(trio[k]->pp); else ImGui::TextDisabled("-");
                     }
                 }
             };
@@ -10267,13 +10326,13 @@ static void drawPanelProjection() {
                 if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", st.mean);
+                ImGui::TableNextColumn(); textStat(st.mean);
                 ImGui::TableNextColumn();
-                if (S.fStat[s].valid) textNum("%.6g", S.fStat[s].sd);
+                if (S.fStat[s].valid) textStat(S.fStat[s].sd);
                 else                  ImGui::TextDisabled("-");
-                ImGui::TableNextColumn(); textNum("%.6g", st.sd);
-                ImGui::TableNextColumn(); textNum("%.3f", st.pct);
-                ImGui::TableNextColumn(); textNum("%.6g", st.pp);
+                ImGui::TableNextColumn(); textStat(st.sd);
+                ImGui::TableNextColumn(); textStat(st.pct);
+                ImGui::TableNextColumn(); textStat(st.pp);
             }
         };
         if (app.showProjH) {
@@ -20541,6 +20600,29 @@ int main(int argc, char** argv) {
                         check(back, "A8 ...and B is still B when A steps away");
                     }
                 }
+                // A9: turning compare off and on again returns to the SAME
+                // pair. ensureCompareB used to reach for the previously VIEWED
+                // image, which after a bit of navigating is rarely the B you
+                // chose - so the comparison you were working with quietly
+                // became a different one.
+                {
+                    uint64_t chosen = app.compareBUid;
+                    if (chosen) {
+                        app.compareMode = App::CmpOff;
+                        setCompareB(nullptr);                 // as switching off does
+                        selectImage(app.current);             // ...and navigate a little
+                        ensureCompareB();
+                        // ...and read it with compare ON: cmpB() answers null
+                        // whenever the mode is off, whatever B holds
+                        app.compareMode = App::CmpWipe;
+                        ImageDoc* back2 = cmpB();
+                        fprintf(stderr, "abstatsselftest: A9 off then on: chose #%llu, came back #%llu\n",
+                                (unsigned long long)chosen,
+                                (unsigned long long)(back2 ? back2->uid : 0));
+                        check(back2 && back2->uid == chosen,
+                              "A9 compare off and on returns to the same B");
+                    }
+                }
             }
         }
 
@@ -20900,7 +20982,10 @@ int main(int argc, char** argv) {
             // C is an alias: ImGuiKey_Backslash follows the US scancode, which is
             // not where "\" sits on a JIS keyboard
             if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false) ||
-                ImGui::IsKeyPressed(ImGuiKey_C, false)) cycleCompare();
+                ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+                if (ImGui::GetIO().KeyShift) showCompareSlots();   // C, D, E...
+                else                         cycleCompare();       // A against B
+            }
             // B is hold-to-see-B (handled in drawCanvas); Shift+B pins A as B.
             // In blink mode it is a toggle instead - "ぱちぱち" needs a tap, not
             // a held key. Space doubles as the toggle there (it only pans while
