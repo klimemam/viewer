@@ -459,9 +459,11 @@ struct App {
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
     // Where that preview came from, so the browser can step through the
-    // sequence without opening it: the group's member paths and the index
-    // currently shown. Cleared with the preview.
+    // sequence without opening it: the group's member paths (one file per
+    // frame), or the frame count of the ONE previewed file (frame axis), and
+    // the index currently shown. Cleared with the preview.
     std::vector<std::string> previewFiles;
+    int previewFrames = 0;
     int previewIndex = 0;
     std::string previewLabel;
     int nextSeqId = 1;
@@ -1040,7 +1042,7 @@ static const char* peerTag(const std::string& host) {
 static std::string peerLabel(const std::string& host) {
     return host.empty() ? std::string(PEER_HERE) : host;
 }
-static bool openRemote(const std::string& url, bool asPreview = false);
+static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
@@ -2731,6 +2733,7 @@ static void closeAll() {
     app.loadBatchId = 0;
     app.previewUid = 0;
     app.previewFiles.clear();
+    app.previewFrames = 0;
     app.previewLabel.clear();
     app.current = -1;
     // compare state refers to docs that no longer exist; leaving it would let a
@@ -3735,7 +3738,7 @@ static void restoreFull() {
     toast("restored full frame");
 }
 
-static bool openRemote(const std::string& url, bool asPreview);   // fwd (default: first decl)
+static bool openRemote(const std::string& url, bool asPreview, int frame);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
 static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port);   // defaults: first decl
@@ -7148,6 +7151,37 @@ static void rbTreeForget() {
     app.rbTreePending.clear();
 }
 
+// ---- browse navigation history (mouse back/forward, Alt+Left / Alt+Right) ----
+// Only B.dir changes recorded through remoteBrowseTo are entries: tree
+// expansions and the search-results view are not places. Back/forward restore
+// the LOCATION only - no preview, no selection replay. File-scope so the keys
+// selftest can assert on the vectors themselves.
+static std::vector<std::string> g_rbHistBack, g_rbHistFwd;
+static std::string g_rbHistKey;      // host:port the history belongs to
+static bool g_rbHistNav = false;     // set while back/forward itself navigates
+static void rbHistOnNavigate(const std::string& toDir) {
+    if (!app.rbrowse.connected) return;
+    // a different machine's directories are not this history's past
+    std::string key = app.rbrowse.host + ":" + std::to_string(app.rbrowse.port);
+    if (key != g_rbHistKey) { g_rbHistBack.clear(); g_rbHistFwd.clear(); g_rbHistKey = key; }
+    if (g_rbHistNav || toDir == app.rbrowse.dir) return;
+    g_rbHistBack.push_back(app.rbrowse.dir);
+    if (g_rbHistBack.size() > 64) g_rbHistBack.erase(g_rbHistBack.begin());
+    g_rbHistFwd.clear();             // a fresh navigation truncates the forward branch
+}
+static void remoteBrowseTo(const std::string& dir);   // the funnel, just below
+static void rbHistGo(bool back) {
+    std::vector<std::string>& from = back ? g_rbHistBack : g_rbHistFwd;
+    std::vector<std::string>& to   = back ? g_rbHistFwd  : g_rbHistBack;
+    if (from.empty() || !app.rbrowse.connected) return;
+    std::string dest = from.back();
+    from.pop_back();
+    to.push_back(app.rbrowse.dir);
+    g_rbHistNav = true;
+    remoteBrowseTo(dest);
+    g_rbHistNav = false;
+}
+
 // Browse one directory on the connected server (async: a dead link hangs the
 // worker, never the window).
 static void remoteBrowseTo(const std::string& dir) {
@@ -7156,6 +7190,10 @@ static void remoteBrowseTo(const std::string& dir) {
     // navigating funnels through here, which is why the rule lives here and
     // not on each of the six things that move.
     app.rbSearch.active = false;
+    // ...and every way of navigating is one funnel, which is also why the
+    // back/forward history is recorded here and nowhere else. Only a change
+    // of B.dir is an entry - tree expansion and the search view are not.
+    rbHistOnNavigate(dir);
     App::RbJob j;
     j.kind = App::RbList;
     j.host = app.rbrowse.host;
@@ -7299,28 +7337,41 @@ static void dropPreview() {
     // the sequence it belonged to goes with it (stepPreviewFrame restores its
     // own copy across the openRemote inside a step)
     app.previewFiles.clear();
+    app.previewFrames = 0;
     app.previewIndex = 0;
     app.previewLabel.clear();
 }
 
 // Walk the previewed sequence without opening it. Each step replaces the one
 // preview slot, so browsing a 300-frame capture costs one frame of transfer at
-// a time - the whole point of previewing rather than opening.
+// a time - the whole point of previewing rather than opening. A stack of
+// numbered files steps across previewFiles; a frame-axis file steps the frame
+// index inside the one file it previews (openRemote re-derives that state).
 static void stepPreviewFrame(int delta) {
-    if (app.previewFiles.size() < 2) return;
-    int n = (int)app.previewFiles.size();
-    int want = std::clamp(app.previewIndex + delta, 0, n - 1);
-    if (want == app.previewIndex) return;
-    std::string host = app.rbrowse.host;
-    int port = app.rbrowse.port;
-    std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
-    std::string label = app.previewLabel;
-    app.previewIndex = want;
-    // a failed step must not restore the list over a preview that is now gone
-    if (!openRemote(makeRemoteUrl(host, files[want], port), true)) return;
-    app.previewFiles = std::move(files);
-    app.previewIndex = want;
-    app.previewLabel = std::move(label);
+    if (app.previewFiles.size() >= 2) {
+        int n = (int)app.previewFiles.size();
+        int want = std::clamp(app.previewIndex + delta, 0, n - 1);
+        if (want == app.previewIndex) return;
+        std::string host = app.rbrowse.host;
+        int port = app.rbrowse.port;
+        std::vector<std::string> files = app.previewFiles;   // openRemote drops the preview
+        std::string label = app.previewLabel;
+        app.previewIndex = want;
+        // a failed step must not restore the list over a preview that is now gone
+        if (!openRemote(makeRemoteUrl(host, files[want], port), true)) return;
+        app.previewFiles = std::move(files);
+        app.previewIndex = want;
+        app.previewLabel = std::move(label);
+    } else if (app.previewFrames >= 2) {
+        int want = std::clamp(app.previewIndex + delta, 0, app.previewFrames - 1);
+        if (want == app.previewIndex) return;
+        for (const auto& d : app.images)
+            if (d->uid == app.previewUid && d->preview) {
+                std::string url = d->remoteUrl;   // openRemote frees the doc
+                openRemote(url, true, want);
+                return;
+            }
+    }
 }
 
 // Returns false when nothing was opened. It has four failure returns AFTER
@@ -7329,7 +7380,7 @@ static void stepPreviewFrame(int delta) {
 // so a failed open left a scrub bar with 2+ entries and previewUid == 0 - a
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
-static bool openRemote(const std::string& url, bool asPreview) {
+static bool openRemote(const std::string& url, bool asPreview, int frame) {
     std::string host, rpath;
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) {
@@ -7344,6 +7395,7 @@ static bool openRemote(const std::string& url, bool asPreview) {
     if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return false; }
     remote::Meta m;
     if (!app.uiSession.meta(rpath, m, err)) { toast("remote: " + err, true); return false; }
+    frame = std::clamp(frame, 0, std::max(0, (int)m.frames - 1));
 
     // First view: the whole frame decimated to something a screen can show. A
     // zoom or a pan asks for a better tile; nothing else on screen costs a byte.
@@ -7351,7 +7403,7 @@ static bool openRemote(const std::string& url, bool asPreview) {
     std::vector<float> px;
     int tw = 0, th = 0, tch = 0;
     std::string dt;
-    if (!app.uiSession.tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
+    if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
         toast("remote: " + err, true);
         return false;
     }
@@ -7360,7 +7412,8 @@ static bool openRemote(const std::string& url, bool asPreview) {
         return false;
     }
     auto doc = std::make_unique<ImageDoc>();
-    doc->name = baseName(rpath) + (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
+    doc->name = baseName(rpath) + (frame > 0 ? " #" + std::to_string(frame) : "") +
+                (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
     doc->path = url;
     doc->dtype = dt;
     doc->w = tw; doc->h = th; doc->ch = tch;
@@ -7369,7 +7422,7 @@ static bool openRemote(const std::string& url, bool asPreview) {
                 (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
     doc->uid = app.nextUid++;
     doc->remoteUrl = url;
-    doc->remoteFrame = 0;
+    doc->remoteFrame = frame;
     doc->remoteStep = step;
     doc->remoteFrames = (int)m.frames;
     doc->preview = asPreview;
@@ -7398,7 +7451,19 @@ static bool openRemote(const std::string& url, bool asPreview) {
     app.imagesRev++;
     selectImage((int)app.images.size() - 1);
     app.fitRequested = true;
-    if (asPreview) app.previewUid = app.images.back()->uid;
+    if (asPreview) {
+        app.previewUid = app.images.back()->uid;
+        // A frame axis makes the file previewable as a sequence too: the same
+        // scrub the browser gives a stack of numbered files, stepping the
+        // frame index inside this one file instead of a member list. Without
+        // it the frames past the first were unreachable short of opening -
+        // and a frame-axis stack has no group row to flatten.
+        if (m.frames > 1) {
+            app.previewFrames = (int)m.frames;
+            app.previewIndex = frame;
+            app.previewLabel = baseName(rpath);
+        }
+    }
     // The full-resolution follow-up. Registered opens always get it. A preview
     // gets it too when the frame is cheap enough to just have (small file or
     // fast link - "problem-free" full fetch, verbatim), but only at LOW
@@ -7412,8 +7477,9 @@ static bool openRemote(const std::string& url, bool asPreview) {
     // A frame axis makes this a stack: prefetch the rest in the background, and
     // they become ordinary local frames as they land - temporal analysis, frame
     // stepping, every analyzer, all unchanged. Processing stays local by design;
-    // the remote side only ever ships pixels. A PREVIEW is only ever its first
-    // frame: the rest of the stack is exactly the buffering promotion defers.
+    // the remote side only ever ships pixels. A PREVIEW only ever holds ONE
+    // frame (the scrub above replaces it in place): the rest of the stack is
+    // exactly the buffering promotion defers.
     if (m.frames > 1 && !asPreview) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
@@ -7531,7 +7597,16 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
 static void promotePreview(ImageDoc* d) {
     if (!d || !d->preview) return;
     d->preview = false;
-    if (app.previewUid == d->uid) app.previewUid = 0;
+    if (app.previewUid == d->uid) {
+        app.previewUid = 0;
+        // the browse scrub belonged to the transient; a registered stack steps
+        // frames through the sequence UI instead - a bar left behind here
+        // walked previews next to the registered copy, one orphan per step
+        app.previewFiles.clear();
+        app.previewFrames = 0;
+        app.previewIndex = 0;
+        app.previewLabel.clear();
+    }
     std::string host, rpath;
     int port = 0;
     remote::parseUrl(d->remoteUrl, host, rpath, &port);
@@ -7556,14 +7631,15 @@ static void promotePreview(ImageDoc* d) {
         si.cfaType = d->cfa; si.cfaPattern = d->cfaPattern;       // planes travel too
         app.seqs.push_back(si);
         d->seqId = si.id;
-        d->seqIndex = 0;
+        d->seqIndex = d->remoteFrame;    // the scrub may have parked it mid-stack
         maybeRequestServerTemporal(si.id);
         size_t perFrame = (size_t)d->w * d->h * d->ch * sizeof(float) *
                           (d->remoteStep > 1 ? (size_t)d->remoteStep * d->remoteStep : 1);
         size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
         int fit = (int)std::min<size_t>((size_t)d->remoteFrames - 1,
                                         perFrame ? room / perFrame : 0);
-        for (int i = 1; i <= fit; i++) {
+        for (int i = 0, q = 0; i < d->remoteFrames && q < fit; i++) {
+            if (i == d->remoteFrame) continue;   // that frame is already resident
             App::RFetchJob j;
             j.url = d->remoteUrl;
             j.name = baseName(rpath) + " #" + std::to_string(i);
@@ -7572,6 +7648,7 @@ static void promotePreview(ImageDoc* d) {
             j.frame = i;
             j.bytes = perFrame;
             rfEnqueue(std::move(j));
+            q++;
         }
     }
     app.imagesRev++;
@@ -13320,13 +13397,11 @@ static void rbGoTo(const std::string& dir) {
     rbDefer([dir] { remoteBrowseTo(dir); });
 }
 
-// Bookmarks + recents in one dropdown. Available connected or not: picking a
-// place while disconnected is exactly how a session starts next morning.
-static void drawRemotePlacesCombo() {
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
-                           ImGuiComboFlags_HeightLarge))
-        return;
+// Bookmarks + recents. The ITEMS are their own function because they live in
+// two places: the disconnected state's full-width combo, and - once connected
+// - a small dropdown docked at the left edge of the path bar, where a file
+// manager keeps its address-bar chevron.
+static void drawRemotePlacesItems() {
     // display only: a local place reads better as "[local] path" than as the
     // url scheme (the stored prefs string stays the url)
     auto placeLabel = [](const std::string& u) {
@@ -13357,6 +13432,13 @@ static void drawRemotePlacesCombo() {
     }
     if (app.rbBookmarks.empty() && app.rbRecents.empty())
         ImGui::TextDisabled("nothing yet - the * button bookmarks the open folder");
+}
+static void drawRemotePlacesCombo() {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (!ImGui::BeginCombo("##places", "places  (bookmarks + recent)",
+                           ImGuiComboFlags_HeightLarge))
+        return;
+    drawRemotePlacesItems();
     ImGui::EndCombo();
 }
 
@@ -13378,6 +13460,12 @@ static float g_rbForceW = 0;      // >0: selftest forces the panel to this width
 // event queued between frames therefore lost the race about one run in six.
 static ImVec2 g_injMouse(-1, -1);   // <0: not injecting
 static int    g_injMouseBtn = -1;   // button held, -1 = none
+// Where the keyboard cursor's row was drawn this frame: the keys selftest aims
+// its synthetic clicks here, because a double-click only exists as real clicks.
+// The NAME rides along so a check can say "the cursor is on row X" without
+// guessing view indices (raw peer order in a listing, sorted in a tree).
+static ImVec2 g_rbCursorRect[2];
+static std::string g_rbCursorName;
 
 static void drawPanelRemote() {
     App::RemoteBrowse& B = app.rbrowse;
@@ -13473,16 +13561,37 @@ static void drawPanelRemote() {
             i = s + 1;
         }
         bool editReq = false;
+        // The places dropdown sits at the LEFT EDGE of the path bar - a file
+        // manager's address-bar chevron - instead of being a band of its own.
+        if (ImGui::SmallButton("v##placesbtn")) ImGui::OpenPopup("placespop");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("places (bookmarks + recent)");
+        if (ImGui::BeginPopup("placespop")) {
+            drawRemotePlacesItems();
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine(0, 6);
+        // The path reads as a PATH: flat text segments with separators, click
+        // to go there. It was a chain of SmallButtons - boxes in a row - which
+        // the user named as exactly the kind of implementation-shaped UI this
+        // panel had accumulated (「パスを四角の連続で表示するとか」). The link
+        // wears the ordinary text color; hover underlines it.
+        ImGui::PushStyleColor(ImGuiCol_TextLink, ImGui::GetStyle().Colors[ImGuiCol_Text]);
         for (size_t k = 0; k < segs.size(); k++) {
             ImGui::PushID((int)k);
             if (k) {
-                ImGui::SameLine(0, 2);
+                // the root "/" IS the separator; printing another would say "//"
+                if (k > 1 || segs[0].label != "/") {
+                    ImGui::SameLine(0, 0);
+                    ImGui::TextDisabled("/");
+                }
+                ImGui::SameLine(0, 0);
                 // capture paths run long: wrap instead of clipping the tail off
                 if (ImGui::GetContentRegionAvail().x <
                     ImGui::CalcTextSize(segs[k].label.c_str()).x + ImGui::GetFontSize())
                     ImGui::NewLine();
             }
-            if (ImGui::SmallButton(segs[k].label.c_str())) rbGoTo(segs[k].path);
+            if (ImGui::TextLink(segs[k].label.c_str()))
+                rbGoTo(segs[k].path);
             // Right-click used to jump straight into path editing. It is a menu
             // now: the actions that take a FOLDER as their subject all belong on
             // the bar that names the folder.
@@ -13520,10 +13629,22 @@ static void drawPanelRemote() {
                                   segs[k].path.c_str());
             ImGui::PopID();
         }
-        if (!segs.empty()) ImGui::SameLine();
-        if (ImGui::SmallButton("edit##path")) editReq = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("type or paste a path (right-clicking a crumb works too)");
+        ImGui::PopStyleColor();
+        // the empty run after the last segment enters edit mode - the bar
+        // itself is the affordance, not another button in the row
+        if (!segs.empty()) ImGui::SameLine(0, 4);
+        {
+            float editW = std::max(ImGui::GetContentRegionAvail().x -
+                                   (app.rbBusy ? ImGui::CalcTextSize("(listing...)").x + 8 : 0),
+                                   ImGui::GetFontSize() * 1.5f);
+            if (ImGui::InvisibleButton("##pathedit", ImVec2(editW, ImGui::GetTextLineHeight())))
+                editReq = true;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+                ImGui::SetTooltip("click to type or paste a path\n"
+                                  "(right-clicking a folder name works too)");
+            }
+        }
         if (app.rbBusy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
         if (editReq) {
             snprintf(rbPathEdit, sizeof rbPathEdit, "%s", d.c_str());
@@ -13594,18 +13715,31 @@ static void drawPanelRemote() {
         // an expand or a collapse moved every row below it: start clean
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
-    // What a plain click does: enter a folder, or show a throwaway PREVIEW of
-    // a file / of a sequence's poster frame. Nothing is registered. Factored
-    // out because the keyboard (arrow keys) has to do exactly the same thing.
+    // The first click of a double-click on a TREE folder toggles it; when the
+    // second click turns out to be a navigation, that toggle has to be undone.
+    // So the toggle remembers itself: path + the state it replaced.
+    static std::string rbTreeToggled;          // path of the last click-toggle
+    static bool rbTreeToggledOpen = false;     // its expansion BEFORE that click
+    // What a plain click does: show a throwaway PREVIEW of a file / of a
+    // sequence's poster frame - nothing is registered - or, on a folder,
+    // SELECT it (list) / toggle it in place (tree). Entering a folder is the
+    // double-click (or Enter): click and double-click were indistinguishable
+    // on folder rows, which is what made the pair unusable ("もったいない").
+    // Factored out because the keyboard (arrow keys) does the same thing.
     auto rbActivateRow = [&](const RbRow& r) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }     // dead at the root, by rbGoParent
         if (r.isDir()) {
-            // In a TREE a folder opens where it is; the listing still enters it.
+            // In a TREE the single click still opens the folder where it is -
+            // and remembers itself, so a double-click can cancel it (below).
             if (app.rbTree) {
-                if (rbHas(app.rbExpanded, r.full())) rbTreeCollapse(r.full());
-                else rbTreeExpand(r.full());
-            } else rbGoTo(r.full());
+                rbTreeToggled = r.full();
+                rbTreeToggledOpen = rbHas(app.rbExpanded, rbTreeToggled);
+                if (rbTreeToggledOpen) rbTreeCollapse(rbTreeToggled);
+                else rbTreeExpand(rbTreeToggled);
+            }
+            // list: the click selects the row (cursor + anchor, set by the
+            // caller); the listing does not move
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -13644,11 +13778,24 @@ static void drawPanelRemote() {
         }
     };
     // What a double-click (and Enter) does: a REGISTERED open. A sequence row
-    // opens the whole stack; a frame promotes the preview it just made.
-    auto rbOpenRow = [&](const RbRow& r) {
+    // opens the whole stack; a folder is entered; a frame promotes the preview
+    // it just made. viaDouble: the gesture's FIRST click already ran
+    // rbActivateRow, so a tree folder's in-place toggle has to be taken back.
+    auto rbOpenRow = [&](const RbRow& r, bool viaDouble = false) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }
-        if (r.isDir()) { rbGoTo(r.full()); return; }
+        if (r.isDir()) {
+            if (viaDouble && app.rbTree && rbTreeToggled == r.full()) {
+                // undo the half-gesture: restore the expansion the first click
+                // changed, so navigating in does not also leave the old view
+                // toggled behind the user's back
+                if (rbTreeToggledOpen) rbTreeExpand(rbTreeToggled);
+                else rbTreeCollapse(rbTreeToggled);
+                rbTreeToggled.clear();
+            }
+            rbGoTo(r.full());
+            return;
+        }
         if (!isNpyName(r.name())) return;
         if (r.isGroup()) {
             dropPreview();                   // the poster frame did its job
@@ -13659,8 +13806,24 @@ static void drawPanelRemote() {
             openRemoteStack(B.host, files, stackNameFor(*r.dir, r.e->name), B.port);
             return;
         }
+        // A single file: promote ITS preview when that is what the slot holds.
+        // The old form promoted whatever preview happened to be live - a stale
+        // slot made a double-click register a file nobody pointed at - and
+        // when none was live (a failed open, a slot emptied by a promote-on-
+        // measure) it did NOTHING at all, which is the other way a double-
+        // click "opened a frame or nothing" instead of what it was aimed at.
+        std::string u = makeRemoteUrl(B.host, r.full(), B.port);
+        ImageDoc* pv = nullptr;
         for (const auto& di : app.images)
-            if (di->uid == app.previewUid && di->preview) promotePreview(di.get());
+            if (di->uid == app.previewUid && di->preview) pv = di.get();
+        if (pv && pv->remoteUrl == u) { promotePreview(pv); return; }
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->remoteUrl == u && !app.images[i]->preview) {
+                selectImage(i);              // already registered: show it
+                return;
+            }
+        dropPreview();                       // a stale preview is not this row's
+        openRemote(u, false);
     };
     // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
     // narrow it down. Everything else is behind "more".
@@ -13693,13 +13856,37 @@ static void drawPanelRemote() {
     };
     static char rbFilter[256] = "";
     {
+        // One toolbar row: navigation first (back / forward / up / home /
+        // refresh, compact), then the two view toggles, then the filter. The
+        // half of a two-state toggle that is ON wears the active fill, so the
+        // pair never changes width when clicked (a swapping label reflowed the
+        // row it sat in - same defect family as the more/less fold button).
+        auto rbSegBtn = [&](const char* lb, bool on) {
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            bool clicked = ImGui::SmallButton(lb);
+            if (on) ImGui::PopStyleColor();
+            return clicked;
+        };
+        ImGui::BeginDisabled(g_rbHistBack.empty());
+        if (ImGui::SmallButton("<##rbback")) rbDefer([] { rbHistGo(true); });
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("back (Alt+Left, mouse button 4)");
+        rbFlow(rbBtnW(">"));
+        ImGui::BeginDisabled(g_rbHistFwd.empty());
+        if (ImGui::SmallButton(">##rbfwd")) rbDefer([] { rbHistGo(false); });
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("forward (Alt+Right, mouse button 5)");
+        rbFlow(rbBtnW("up"));
         ImGui::BeginDisabled(atRoot);
         if (ImGui::SmallButton("up")) rbGoParent();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("parent folder (Backspace)");
-        rbFlow(rbBtnW("home"));
-        if (ImGui::SmallButton("home")) rbGoTo("~");
+        rbFlow(rbBtnW("~"));
+        if (ImGui::SmallButton("~##rbhome")) rbGoTo("~");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
         rbFlow(rbBtnW("refresh"));
         if (ImGui::SmallButton("refresh")) {
@@ -13708,55 +13895,56 @@ static void drawPanelRemote() {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
-        rbFlow(rbBtnW("open folder"));
-        // Open Folder for the folder you are IN. It used to exist only on a
-        // folder ROW, so opening the directory being browsed meant going up a
-        // level to find its own name in the parent's listing - and if that
-        // directory was the home or the root, there was no level to go up to.
-        if (ImGui::SmallButton("open folder")) remoteScanFolder(B.dir);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
-                              "which stacks to open:\n%s", B.dir.c_str());
-        rbFlow(rbBtnW("grouped"));
         // Grouped <-> flat. No round trip: the peer already sent every member.
-        if (ImGui::SmallButton(app.rbFlat ? "flat##rbview" : "grouped##rbview")) {
-            app.rbFlat = !app.rbFlat;
+        rbFlow(rbBtnW("grp") + rbBtnW("flat") + 1);
+        if (rbSegBtn("grp##rbview", !app.rbFlat) && app.rbFlat) {
+            app.rbFlat = false;
             app.prefsDirty = true;
             savePrefs();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(app.rbFlat
-                ? "flat: every frame is its own row.\nclick to collapse numbered "
-                  "sequences back into one row each.\n(per-frame size and date are "
-                  "not in the listing reply - those cells stay blank)"
-                : "grouped: a numbered sequence is ONE row.\nclick to list its frames "
-                  "individually (no request to the server).");
-        rbFlow(rbBtnW("tree"));
+            ImGui::SetTooltip("grouped: a numbered sequence is ONE row");
+        ImGui::SameLine(0, 1);
+        if (rbSegBtn("flat##rbview", app.rbFlat) && !app.rbFlat) {
+            app.rbFlat = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("flat: every frame is its own row\n(per-frame size and "
+                              "date are not in the listing reply - those cells stay blank)");
         // List <-> tree. Expanding a node costs ONE list, once.
-        if (ImGui::SmallButton(app.rbTree ? "tree##rbtree" : "list##rbtree")) {
+        rbFlow(rbBtnW("list") + rbBtnW("tree") + 1);
+        if (rbSegBtn("list##rblist", !app.rbTree) && app.rbTree) {
             // Leaving the tree with something under the cursor: the listing
             // opens on THAT folder. Walking down a tree is how you got to a
             // folder five levels deep; dropping back to the root on the way out
             // throws away the only thing the trip was for. A file under the
             // cursor means the folder holding it.
-            if (app.rbTree && g_rbCursor >= 0 && g_rbCursor < (int)view.size()) {
+            if (g_rbCursor >= 0 && g_rbCursor < (int)view.size()) {
                 const RbRow& r = view[g_rbCursor];
                 std::string want = r.ph || r.up ? std::string()
                                  : r.isDir()    ? r.full() : *r.dir;
                 if (!want.empty() && want != B.dir) rbGoTo(want);   // deferred
             }
-            app.rbTree = !app.rbTree;
+            app.rbTree = false;
             app.prefsDirty = true;
             savePrefs();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(app.rbTree
-                ? "tree: a folder opens IN PLACE (click it; Right/Left also do).\n"
-                  "double-click or Enter still goes INTO it.\neach node is listed "
-                  "once and kept - collapsing costs nothing to undo.\nclick to go "
-                  "back to one folder at a time."
-                : "list: one folder at a time, a click enters it.\nclick to expand "
-                  "folders in place instead.");
+            ImGui::SetTooltip("list: one folder at a time\n(a double-click or Enter "
+                              "enters a folder; a click selects it)");
+        ImGui::SameLine(0, 1);
+        if (rbSegBtn("tree##rbtree", app.rbTree) && !app.rbTree) {
+            app.rbTree = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("tree: a folder opens IN PLACE (click it; Right/Left "
+                              "also do).\ndouble-click or Enter goes INTO it.\neach "
+                              "node is listed once and kept - collapsing costs "
+                              "nothing to undo.");
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
@@ -13889,8 +14077,15 @@ static void drawPanelRemote() {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
                                   curUrl.c_str());
-            rbFlow(ImGui::GetFontSize() * 8);
-            drawRemotePlacesCombo();
+            // Open Folder for the folder you are IN. Neither navigation nor
+            // narrowing, so it lives here with the other on-request tools.
+            // (It used to exist only on a folder ROW, so opening the directory
+            // being browsed meant going up a level to find its own name.)
+            rbFlow(rbBtnW("open folder"));
+            if (ImGui::SmallButton("open folder")) remoteScanFolder(B.dir);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
+                                  "which stacks to open:\n%s", B.dir.c_str());
         }
         if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
         const float srchTailW = rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
@@ -14179,13 +14374,48 @@ static void drawPanelRemote() {
             // folders would then dive into the first one and never come back
             if (!view[rbCursor].isDir()) rbActivateRow(view[rbCursor]);
         }
-        if (rbCursor >= 0 && rbCursor < (int)view.size() &&
-            (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
-            rbOpenRow(view[rbCursor]);
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+            int nSel = 0;
+            for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
+                if (rbSel[i]) nSel++;
+            if (nSel >= 2) {
+                // Enter on a multi-selection opens EVERY selected row - each
+                // group as its own stack, each file as itself. This is the
+                // OTHER thing from the action row's "Open N selected as
+                // stack", which MERGES the selection into one stack; opening
+                // three checked groups used to open only the cursor's one.
+                dropPreview();               // the posters did their job
+                int skipped = 0;
+                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                    if (!rbSel[i]) continue;
+                    const RbRow& r = view[i];
+                    if (r.ph || r.up || r.isDir() || !isNpyName(r.name())) {
+                        skipped++;           // named below, never silent
+                        continue;
+                    }
+                    if (r.isGroup()) {
+                        std::vector<std::string> files;
+                        for (const auto& m : r.e->members) files.push_back(r.join(m));
+                        openRemoteStack(B.host, files,
+                                        stackNameFor(*r.dir, r.e->name), B.port);
+                    } else {
+                        openRemote(makeRemoteUrl(B.host, r.full(), B.port));
+                    }
+                }
+                if (skipped)
+                    toast(std::to_string(skipped) +
+                          " selected item(s) skipped (folders / not .npy)", true);
+                rbSel.assign(view.size(), 0);          // the selection is consumed
+            } else if (rbCursor >= 0 && rbCursor < (int)view.size()) {
+                rbOpenRow(view[rbCursor]);
+            }
+        }
         // Right / Left expand and collapse the folder under the cursor. Only in
         // tree mode: in the flat listing there is nothing to open in place.
-        if (app.rbTree && rbCursor >= 0 && rbCursor < (int)view.size() &&
+        // (Alt+arrow is history navigation, below - not a tree toggle.)
+        if (app.rbTree && !ImGui::GetIO().KeyAlt &&
+            rbCursor >= 0 && rbCursor < (int)view.size() &&
             view[rbCursor].isDir()) {
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
                 rbTreeExpand(view[rbCursor].full());
@@ -14193,6 +14423,22 @@ static void drawPanelRemote() {
                 rbTreeCollapse(view[rbCursor].full());
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) rbGoParent();
+        // Alt+Left / Alt+Right: the browser's own back / forward, the keyboard
+        // mirror of mouse buttons 4 / 5 (below, which also work when the panel
+        // is merely hovered). Deferred like every other navigation.
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_LeftArrow))
+            rbDefer([] { rbHistGo(true); });
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow))
+            rbDefer([] { rbHistGo(false); });
+    }
+    // Mouse back / forward, scoped to this panel (hovered or focused) so a
+    // future second browser can own its own history. The vendored backend
+    // forwards GLFW buttons 4 / 5 as ImGui buttons 3 / 4 - verified by the
+    // keys selftest's mback / mfwd, which inject exactly those.
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) {
+        if (ImGui::IsMouseClicked(3)) rbDefer([] { rbHistGo(true); });
+        if (ImGui::IsMouseClicked(4)) rbDefer([] { rbHistGo(false); });
     }
     // The listing scrolls on its own so the header above never leaves the view.
     // Properties target: a snapshot, because the row may scroll out of the
@@ -14325,6 +14571,9 @@ static void drawPanelRemote() {
                 ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
                                                     ImGui::GetItemRectMax(),
                                                     IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
+                g_rbCursorRect[0] = ImGui::GetItemRectMin();
+                g_rbCursorRect[1] = ImGui::GetItemRectMax();
+                g_rbCursorName = rname;
             }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
@@ -14356,7 +14605,7 @@ static void drawPanelRemote() {
             }
             if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
-                bool canSel = !r.isDir() && ei < (int)rbSel.size();
+                bool canSel = !r.up && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
                     rbSel[ei] ^= 1;                    // toggle, plain click still opens
                     rbSelAnchor = ei;
@@ -14367,20 +14616,35 @@ static void drawPanelRemote() {
                         if (shown[k] == rbSelAnchor) a = k;
                     if (a < 0) a = row;
                     for (int k = std::min(a, row); k <= std::max(a, row); k++)
-                        if (!view[shown[k]].isDir() && (size_t)shown[k] < rbSel.size())
+                        if (!view[shown[k]].up && (size_t)shown[k] < rbSel.size())
                             rbSel[shown[k]] = 1;
-                } else {
+                } else if (!sio.KeyCtrl && !sio.KeyShift &&
+                           sio.MouseClickedLastCount[ImGuiMouseButton_Left] < 2) {
+                    // (Ctrl / Shift on a row that cannot join the selection -
+                    // ".." - must not fall through and act as a plain click:
+                    // Ctrl+clicking the exit walked up a directory.)
+                    // < 2: the RELEASE half of a double-click is not a new
+                    // click. Selectable returns true on release, so the second
+                    // click of a double-click landed here too - one frame
+                    // after rbOpenRow had already consumed the gesture - and
+                    // re-previewed the poster frame NEXT TO the freshly opened
+                    // stack ("一枚目とStackが2つFilesに登録される"), or a
+                    // second copy of the file just promoted. Only a first
+                    // click previews.
                     rbActivateRow(r);
                     rbSelAnchor = ei;
                 }
                 rbCursor = ei;          // the keyboard picks up where the mouse left off
             }
-            // Double-click = a registered open (the VSCode pinning gesture).
-            // The first of the two clicks already made the preview; this
-            // promotes it - or, for a stack row, opens the whole stack.
-            if (servable && !r.isDir() && ImGui::IsItemHovered() &&
+            // Double-click = a registered open (the VSCode pinning gesture):
+            // a stack row opens the whole stack, a frame promotes the preview
+            // its first click just made - and a FOLDER is entered, in the
+            // listing and in the tree alike (the single click only selects /
+            // toggles, so the two gestures finally mean different things).
+            // ".." stays single-click: it is the exit, not a folder row.
+            if (servable && !r.up && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                rbOpenRow(r);
+                rbOpenRow(r, true);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
@@ -14494,8 +14758,12 @@ static void drawPanelRemote() {
     }
     // Preview scrub bar lives BELOW the listing, in space reserved above:
     // appearing must never move the rows (double-click depends on it).
-    if (app.previewFiles.size() >= 2) {
-        int n = (int)app.previewFiles.size();
+    // previewFiles = a stack of numbered files; previewFrames = one file with
+    // a frame axis. Either way the bar walks it, one fetched frame at a time.
+    int pvN = app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
+                                           : app.previewFrames;
+    if (pvN >= 2) {
+        int n = pvN;
         ImGui::PushID("pvstep");
         if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
         ImGui::SameLine();
@@ -14852,10 +15120,24 @@ static void drawFileList() {
           if (head.seqId == 0) {
             int i = stack.front();
             char lb[512];
-            snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
+            // The ONE transient slot must not read as a registered file: it
+            // wears its nature in the row itself, not only in the batch header
+            // above. A single click in Browse "adding a file to Files" was
+            // reported as exactly this misreading - the click only previews,
+            // but the row it produced looked like every registered row.
+            if (head.preview) snprintf(lb, 512, "  %s   [preview]##%d", head.name.c_str(), i);
+            else              snprintf(lb, 512, "  %s##%d", head.name.c_str(), i);
             ImGui::PushID(i);
             const ImageDoc* bnow = cmpB();
-            if (rowWithMeta(head, lb, i == app.current, nullptr, bnow == &head)) {
+            if (head.preview) ImGui::PushStyleColor(ImGuiCol_Text,
+                                                    ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            bool rowHit = rowWithMeta(head, lb, i == app.current, nullptr, bnow == &head);
+            if (head.preview) ImGui::PopStyleColor();
+            if (head.preview && ImGui::IsItemHovered())
+                ImGui::SetTooltip("a throwaway preview - the one slot the Browse panel\n"
+                                  "reuses; the next click there replaces it. Double-click /\n"
+                                  "Enter in Browse (or measuring it) registers it for real.");
+            if (rowHit) {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
@@ -15931,9 +16213,17 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx, esc
-// and
-// w<px>.
+// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx,
+// esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
+// img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
+// the cursor's row - a double-click only exists as clicks); mback / mfwd
+// (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
+// viewreset (absolute grouped+list+folded state - the toggles are relative);
+// waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
+// leaf is LEAF); and the assertions chkimg:N (count + NAMES), chkpv:N,
+// chkidx:K, chkopen:S, chkcur, chkcurn:NAME, chknames:SPEC, chkdir:LEAF,
+// chkcursor:N (view index), chkatrow:NAME (the cursor row's name), chkback:N,
+// chkfwd:N, chkexp:N, chkfocus:0|1 - any FAIL fails the run.
 //
 // w<px> floats the panel at an exact width and then asserts what a human would
 // otherwise have to read off a screenshot: that the filter box and the "more"
@@ -15958,6 +16248,54 @@ static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,more,down,back,"
+    // ---- what PREVIEW means for a stack row (docs/todo-open.md items 1/26).
+    // Floated first (w400): the click actions aim real mouse events at the
+    // cursor row's rectangle, and the user's saved layout must not decide
+    // where that is. A grouped row previews as a poster + a 24-frame scrub,
+    // ONE slot throughout; , / . step it; the server-temporal request may
+    // surface the Temporal panel but must NOT steal the keys (chkfocus - the
+    // scrub going dead right after asking for stats was defect 1).
+    // (waitdir first: the prefix ends on "back", and keys fired before that
+    // listing lands would walk the OLD rows and be reset mid-sequence.)
+    "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,"
+    "chkimg:1,chkpv:24,chkidx:0,period,chkidx:1,chknames:frame_001.npy[pv],"
+    "comma,chkidx:0,svtemp,chkfocus:1,period,chkidx:1,comma,chkidx:0,"
+    // Double-click = the stack opens exactly ONCE, poster dropped, nothing
+    // else registered. The release half of the double-click used to re-run
+    // the single-click path and park the poster NEXT TO the stack
+    // (「一枚目とStackが2つFilesに登録される」) - the NAMES prove it stays gone.
+    "dbl,waitimg:24,chkopen:1,chkimg:24,chknames:frame_###.npy*24,"
+    // ...same overlap on a single-file row: promote once, no duplicate
+    // preview, and Enter afterwards re-shows the open file instead of doing
+    // nothing (the old final branch) or opening a second copy.
+    "home,down,down,down,down,down,down,chkpv:0,dbl,chkimg:25,"
+    "chknames:frame_###.npy*24+dark.npy,enter,chkimg:25,chkcurn:dark.npy,"
+    // ...and a group whose numbering starts at 9 (padset): grouping, preview
+    // scrub and the double-click open all work by POSITION, not by the
+    // parsed number (the user's "連番の開始が0じゃないから?" hypothesis).
+    "home,down,down,down,down,enter,waitdir:padset,down,down,chkpv:3,chkidx:0,"
+    "period,chkidx:1,dbl,waitimg:28,chkopen:2,chkimg:28,"
+    "chknames:frame_###.npy*24+dark.npy+f_9.npy+f_10.npy+f_11.npy,"
+    "back,waitdir:rb,"
+    // ---- folder rows: click SELECTS (cursor moves, nothing opens),
+    // double-click ENTERS; mouse back/forward and Alt+Left/Right walk the
+    // history; a fresh navigation truncates the forward branch.
+    "home,down,chkatrow:digitset,click,chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkback:5,"
+    "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
+    "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
+    "home,down,down,dbl,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    // ...in a TREE the single click still toggles in place, but the second
+    // click of a double-click cancels that toggle on its way in: the folder
+    // is entered and NOT left expanded in the old view.
+    "tree,home,down,dbl,waitdir:digitset,chkexp:0,tree,back,waitdir:rb,"
+    // ---- Enter on a multi-selection opens EVERY selected row, each group
+    // as its own stack (the action-row button is the MERGE; this is the other
+    // one - only the cursor's row used to open).
+    "home,down,down,down,enter,waitdir:gainset,down,down,ctrlclick,down,ctrlclick,"
+    "enter,waitimg:44,chkopen:4,"
+    "chknames:frame_###.npy*24+dark.npy+f_9.npy+f_10.npy+f_11.npy"
+    "+gain10_00#.npy*8+gain20_00#.npy*8,"
+    "back,waitdir:rb,"
     // ...then hand focus back to nobody and repeat four of the same keys: the
     // main view must own them again, or the gate would be "the arrows are dead"
     // rather than "the panel owns them while it has focus"
@@ -22035,6 +22373,19 @@ int main(int argc, char** argv) {
         while (d.size() > 1 && d.back() == '/') d.pop_back();
         startRemote("local://" + d);
         app.showRemote = true;
+        // Scripted row indices assume the DEFAULT view: the user's real prefs
+        // must not leak a flat/tree/advanced state into what "down,down,down"
+        // lands on. With rbtree left on, a click+double-click pair on a folder
+        // row expanded it in place and its children took over the row indices
+        // every later action was aimed at - reproduced, two hours of forensics.
+        app.rbFlat = false;
+        app.rbTree = false;
+        app.rbAdvanced = false;
+        // Key REPEAT is a human affordance; for injected keys it is a race.
+        // Each scripted press is held for ~one frame, but a trickle-delayed
+        // release across a slow frame (texture uploads after a stack lands)
+        // crossed the 275 ms delay and stepped the cursor twice per Down.
+        ImGui::GetIO().KeyRepeatDelay = 10.0f;
         for (size_t i = 0, j; i <= g_browseKeysActs.size(); i = j + 1) {
             j = g_browseKeysActs.find(',', i);
             if (j == std::string::npos) j = g_browseKeysActs.size();
@@ -22308,7 +22659,17 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
         if (app.showTemporal) {
-            if (app.focusTemporal) { ImGui::SetNextWindowFocus(); app.focusTemporal = false; }
+            if (app.focusTemporal) {
+                // Surface the tab so the browser-fired result is visible - but
+                // give the keyboard straight back to the Browse panel (next
+                // frame: its Begin ran earlier this one). Leaving focus here is
+                // what killed the , / . preview scrub and the arrow keys right
+                // after asking for server stats: the panel the user was
+                // browsing in silently stopped being the panel that hears them.
+                ImGui::SetNextWindowFocus();
+                app.focusTemporal = false;
+                app.focusRemote = true;
+            }
             if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
@@ -22411,6 +22772,15 @@ int main(int argc, char** argv) {
                         app.rbSearch.running = false;
                         std::lock_guard<std::mutex> lk(app.rbMtx);
                         app.rbQueue.clear();
+                        // The click must land NOW. The worker is still inside
+                        // its blocking call and cannot notice the bump until
+                        // the server answers, so the spinner kept saying
+                        // "scanning..." long after the cancel - which read as
+                        // the button doing nothing. "cancelling" is the honest
+                        // phase: the remote side IS still working, only its
+                        // answer is already condemned.
+                        if (!app.rbPhase.empty())
+                            app.rbPhase = "cancelling (the server is still finishing)...";
                     }
                     ImGui::SameLine();
                     ImGui::TextDisabled("|");
@@ -22863,6 +23233,8 @@ int main(int argc, char** argv) {
                 if (a == "end")   return ImGuiKey_End;
                 if (a == "back")  return ImGuiKey_Backspace;
                 if (a == "esc")   return ImGuiKey_Escape;
+                if (a == "comma")  return ImGuiKey_Comma;    // preview scrub
+                if (a == "period") return ImGuiKey_Period;
                 return ImGuiKey_None;
             };
             if (!reproReady) {
@@ -22878,17 +23250,102 @@ int main(int argc, char** argv) {
                 }
             } else if (keyAct < keyActs.size()) {
                 const std::string& a = keyActs[keyAct];
-                if (keyPhase == 0) {
+                // "op:arg" actions (checks, waits); op == a when there is no ':'
+                size_t kColon = a.find(':');
+                std::string op = a.substr(0, kColon == std::string::npos ? a.size() : kColon);
+                int arg = kColon == std::string::npos ? -1 : atoi(a.c_str() + kColon + 1);
+                std::string sarg = kColon == std::string::npos ? std::string()
+                                                               : a.substr(kColon + 1);
+                // what the preview / double-click checks assert against: the
+                // live preview doc (if any), the scrub length, and the NAMES of
+                // everything open - "2 images appeared" cannot say which one
+                // was the stray, the names can
+                auto pvDoc = []() -> ImageDoc* {
+                    for (const auto& d : app.images)
+                        if (d->uid == app.previewUid && d->preview) return d.get();
+                    return nullptr;
+                };
+                auto scrubLen = []() {   // mirrors the scrub bar: files, or frame axis
+                    return app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
+                                                        : app.previewFrames;
+                };
+                auto imgNames = []() {
+                    std::string s;
+                    for (const auto& d : app.images) {
+                        if (!s.empty()) s += ",";
+                        s += d->name;
+                        if (d->preview) s += "[pv]";
+                    }
+                    return s;
+                };
+                // a chk* line prints the state it judged, ok or FAIL - and a
+                // FAIL fails the run (keysCheckBad feeds the summary gate)
+                auto chk = [&](bool cond, const std::string& extra = std::string()) {
+                    fprintf(stderr, "browsekeys: %-18s -> imgs=%d seqs=%d pv=%d scrub=%d "
+                                    "idx=%d cur=%s%s%s: %s\n",
+                            a.c_str(), (int)app.images.size(), (int)app.seqs.size(),
+                            pvDoc() ? 1 : 0, scrubLen(), app.previewIndex,
+                            cur() ? cur()->name.c_str() : "-",
+                            extra.empty() ? "" : "  ", extra.c_str(),
+                            cond ? "ok" : "FAIL");
+                    fflush(stderr);
+                    if (!cond) keysCheckBad++;
+                };
+                bool hold = false;                 // waitimg: stay on this action
+                static size_t klogged = (size_t)-1;
+                if (keyPhase == 0 && klogged != keyAct) {
+                    klogged = keyAct;
                     // every action names what the panel is showing when it runs,
                     // so a crash log ends on the action that caused it
-                    fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d preview=%s\n",
+                    fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d imgs=%d preview=%s\n",
                             (int)keyAct, a.c_str(), app.rbrowse.dir.c_str(),
-                            (int)app.rbrowse.entries.size(),
+                            (int)app.rbrowse.entries.size(), (int)app.images.size(),
                             app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
                     fflush(stderr);
+                }
+                if (op == "dbl" || op == "click" || op == "ctrlclick" ||
+                    op == "mback" || op == "mfwd") {
+                    // A real gesture into the real queue, aimed at the row the
+                    // keyboard cursor is on - a double-click only exists as real
+                    // clicks. "click" lands 40 px right of "dbl" (same row: rows
+                    // span the table) so a click that follows a double-click can
+                    // never chain into a triple. "ctrlclick" holds Ctrl around
+                    // the click (multi-select). mback / mfwd press mouse
+                    // buttons 4 / 5 (ImGui 3 / 4) over the listing: the history
+                    // handler is gated on the panel being hovered or focused.
+                    if (keyPhase == 0)
+                        g_injMouse = ImVec2((g_rbCursorRect[0].x + g_rbCursorRect[1].x) * 0.5f +
+                                            (op == "click" ? 40.0f : 0.0f),
+                                            (g_rbCursorRect[0].y + g_rbCursorRect[1].y) * 0.5f);
+                    else if (keyPhase == 1 && op == "ctrlclick")
+                        rio.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    else if (keyPhase == 2)
+                        g_injMouseBtn = op == "mback" ? 3 : op == "mfwd" ? 4 : 0;
+                    else if (keyPhase == 3) g_injMouseBtn = -1;
+                    else if (keyPhase == 4 && op == "dbl") g_injMouseBtn = 0;
+                    else if (keyPhase == 5 && op == "dbl") g_injMouseBtn = -1;
+                    else if (keyPhase == 5 && op == "ctrlclick")
+                        rio.AddKeyEvent(ImGuiMod_Ctrl, false);
+                } else if (op == "altleft" || op == "altright") {
+                    // the keyboard mirror of mouse back/forward
+                    ImGuiKey k2 = op == "altleft" ? ImGuiKey_LeftArrow : ImGuiKey_RightArrow;
+                    if (keyPhase == 0) { rio.AddKeyEvent(ImGuiMod_Alt, true);
+                                         rio.AddKeyEvent(k2, true); }
+                    else if (keyPhase == 1) { rio.AddKeyEvent(k2, false);
+                                              rio.AddKeyEvent(ImGuiMod_Alt, false); }
+                } else if (keyPhase == 0) {
                     if (a == "more")       app.rbAdvanced = !app.rbAdvanced;
                     else if (a == "flat")  app.rbFlat = !app.rbFlat;
                     else if (a == "tree")  app.rbTree = !app.rbTree;
+                    else if (a == "viewreset") {
+                        // an ABSOLUTE state pin: the toggles above are relative,
+                        // and a segment that assumes grouped+list must not
+                        // depend on the parity of every toggle before it
+                        app.rbFlat = false;
+                        app.rbTree = false;
+                        app.rbAdvanced = false;
+                        rbTreeForget();
+                    }
                     else if (a == "focus") app.focusRemote = true;
                     else if (a == "rawopen") {
                         App::PendingGroup pg;
@@ -22929,10 +23386,127 @@ int main(int argc, char** argv) {
                         // context popup on a listing row.
                         g_injMouse = ImVec2(g_rbToolbar.rowX, g_rbToolbar.rowY);
                     }
-                    else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (a == "blur")  { g_browseKeysBlur = true;
                                              g_navKeyAtBlur = g_navKeyGlobal;
                                              g_navKeyYieldAtBlur = g_navKeyYielded; }
+                    else if (a == "img0")  selectImage(0);
+                    else if (a == "svtemp") {
+                        // what the group row's "Temporal stats (server)" context
+                        // item does - fired directly because a menu item cannot
+                        // be scripted, the focus consequences are identical
+                        if (!app.previewFiles.empty())
+                            requestBrowseTemporal(app.rbrowse.host, app.previewFiles,
+                                                  "svtemp");
+                    }
+                    else if (op == "chkfocus") {   // the Browse panel owns the keys
+                        ImGuiWindow* nw = ImGui::GetCurrentContext()->NavWindow;
+                        bool f2 = nw && strstr(nw->Name, "###Remote") != nullptr;
+                        chk(f2 == (arg != 0), nw ? nw->Name : "(no nav window)");
+                    }
+                    else if (op == "waitdir") {    // navigation lands async
+                        static double waitD0 = 0;
+                        std::string d3 = app.rbrowse.dir;
+                        size_t sl3 = d3.find_last_of('/');
+                        bool at = (sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg;
+                        if (at) { chk(true, "dir=" + d3); waitD0 = 0; }
+                        else if (waitD0 == 0) { waitD0 = glfwGetTime(); hold = true; }
+                        else if (glfwGetTime() - waitD0 < 60.0) hold = true;
+                        else { chk(false, "dir=" + d3); waitD0 = 0; }
+                    }
+                    else if (op == "waitimg") {    // fetches land between frames
+                        static double waitT0 = 0;
+                        if ((int)app.images.size() >= arg) { chk(true); waitT0 = 0; }
+                        else if (waitT0 == 0) { waitT0 = glfwGetTime(); hold = true; }
+                        else if (glfwGetTime() - waitT0 < 60.0) hold = true;
+                        else { chk(false, imgNames()); waitT0 = 0; }   // timed out
+                    }
+                    else if (op == "chkimg")  chk((int)app.images.size() == arg, imgNames());
+                    else if (op == "chkpv")                  // a live preview, LOOKED AT
+                        chk(pvDoc() && cur() == pvDoc() && scrubLen() == arg);
+                    else if (op == "chkidx") {               // the scrub sits at K...
+                        ImageDoc* pv = pvDoc();
+                        bool at = pv && app.previewIndex == arg && arg < scrubLen();
+                        // ...and the slot really holds frame K, not just the label
+                        if (at && app.previewFiles.size() >= 2)
+                            at = pv->remoteUrl ==
+                                 makeRemoteUrl(app.rbrowse.host,
+                                               app.previewFiles[arg], app.rbrowse.port);
+                        else if (at) at = pv->remoteFrame == arg;   // frame axis
+                        chk(at, pv ? pv->remoteUrl : "-");
+                    } else if (op == "chkopen") {            // registered, nothing else
+                        bool okc = !pvDoc() && app.previewUid == 0 &&
+                                   (int)app.seqs.size() == arg && app.previewFiles.empty();
+                        for (const auto& d : app.images)     // no stray poster frame
+                            if (d->preview) okc = false;
+                        chk(okc, imgNames());
+                    }
+                    else if (op == "chkcur")  chk(pvDoc() && cur() == pvDoc());
+                    else if (op == "chkcurn") chk(cur() && cur()->name == sarg);
+                    else if (op == "chknames") {
+                        // spec: pat[*N](+pat[*N])...; '#' matches one digit; a
+                        // doc that is still a preview wears a [pv] suffix. The
+                        // open images must match the multiset EXACTLY - the
+                        // point is to NAME the surplus image, not to count it.
+                        auto patMatch = [](const std::string& p, const std::string& s) {
+                            if (p.size() != s.size()) return false;
+                            for (size_t x = 0; x < p.size(); x++)
+                                if (p[x] == '#' ? !isdigit((unsigned char)s[x])
+                                                : p[x] != s[x]) return false;
+                            return true;
+                        };
+                        std::vector<std::string> have;
+                        for (const auto& d : app.images)
+                            have.push_back(d->name + (d->preview ? "[pv]" : ""));
+                        std::string missing;
+                        for (size_t x = 0, y; x <= sarg.size(); x = y + 1) {
+                            y = sarg.find('+', x);
+                            if (y == std::string::npos) y = sarg.size();
+                            if (y == x) { if (y == sarg.size()) break; continue; }
+                            std::string item = sarg.substr(x, y - x);
+                            int n = 1;
+                            size_t st = item.rfind('*');
+                            if (st != std::string::npos && st + 1 < item.size() &&
+                                isdigit((unsigned char)item[st + 1])) {
+                                n = atoi(item.c_str() + st + 1);
+                                item.erase(st);
+                            }
+                            for (int q = 0; q < n; q++) {
+                                bool found = false;
+                                for (size_t h = 0; h < have.size(); h++)
+                                    if (patMatch(item, have[h])) {
+                                        have.erase(have.begin() + h);
+                                        found = true;
+                                        break;
+                                    }
+                                if (!found)
+                                    missing += (missing.empty() ? "" : ",") + item;
+                            }
+                            if (y == sarg.size()) break;
+                        }
+                        std::string extra;
+                        for (const auto& h : have)
+                            extra += (extra.empty() ? "" : ",") + h;
+                        chk(missing.empty() && extra.empty(),
+                            "missing=[" + missing + "] surplus=[" + extra + "]");
+                    }
+                    else if (op == "chkdir") {     // the leaf of the browsed dir
+                        std::string d3 = app.rbrowse.dir;
+                        size_t sl3 = d3.find_last_of('/');
+                        chk((sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg,
+                            "dir=" + d3);
+                    }
+                    else if (op == "chkcursor") chk(g_rbCursor == arg,
+                                                    "cursor=" + std::to_string(g_rbCursor));
+                    else if (op == "chkatrow") chk(g_rbCursorName == sarg,
+                                                   "cursor row=" + g_rbCursorName);
+                    else if (op == "chkback") chk((int)g_rbHistBack.size() == arg,
+                                                  "back=" + std::to_string((int)g_rbHistBack.size()) +
+                                                  " fwd=" + std::to_string((int)g_rbHistFwd.size()));
+                    else if (op == "chkfwd")  chk((int)g_rbHistFwd.size() == arg,
+                                                  "back=" + std::to_string((int)g_rbHistBack.size()) +
+                                                  " fwd=" + std::to_string((int)g_rbHistFwd.size()));
+                    else if (op == "chkexp")  chk((int)app.rbExpanded.size() == arg);
+                    else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
@@ -22990,7 +23564,7 @@ int main(int argc, char** argv) {
                             (inside && usable && dateOk) ? "ok" : "FAIL");
                     fflush(stderr);
                 }
-                if (++keyPhase >= 8) { keyPhase = 0; keyAct++; }
+                if (!hold && ++keyPhase >= 8) { keyPhase = 0; keyAct++; }
             } else if (++reproIdle > 20) {
                 // KEY ROUTING. The Browse panel binds Down/Up/Left/Right/Home/
                 // End for its rows and the main loop's shortcut table binds the
