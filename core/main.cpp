@@ -9640,11 +9640,18 @@ static void drawPanelHistogram() {
                     // it crossed that fill - the dash pattern was B's only cue.
                     // Mono B gets a cool tint so it reads against A's grey; the
                     // coloured cases already differ by hue per plane.
+                    //
+                    // ...and B is drawn SOLID, like the profile and temporal
+                    // curves. A dash reads as a broken curve rather than as
+                    // "this one is B", and a histogram is dense enough that the
+                    // dashes close up at one zoom and open at the next. A is a
+                    // filled bar, B is an outline in its own ink: the fill and
+                    // the hue already carry the distinction the dash was for.
                     ImU32 col = a < 0 ? ODD_COL
                               : (cfaHist ? CFA_COLS[a]
-                                         : (H.nSeries == 1 ? IM_COL32(120, 190, 255, 235)
-                                                           : RGB_COLS[a]));
-                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 2);
+                                         : (H.nSeries == 1 ? AB_B_INK
+                                                           : abLiftInk(RGB_COLS[a], 0.45f)));
+                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 1);
                 }
             dl->PopClipRect();
         };
@@ -9955,8 +9962,8 @@ static void drawPanelProjection() {
     const bool wideGuess = app.projStatLayout == 1 ||
                            (app.projStatLayout == 0 &&
                             ImGui::GetContentRegionAvail().x >=
-                                ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 9 +
-                                ImGui::GetStyle().CellPadding.x * 22);
+                                ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 10 +
+                                ImGui::GetStyle().CellPadding.x * 24);
     if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries;
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
@@ -10137,8 +10144,8 @@ static void drawPanelProjection() {
     // nine. Auto falls back to the per-axis rows when the nine number columns
     // would not fit, because a table that scrolls sideways is not a table.
     const float wideNeed = ImGui::GetFontSize() * (Bim ? 1.6f : 0.0f) +
-                           ImGui::GetFontSize() * 2.4f + numColW() * 9 +
-                           ImGui::GetStyle().CellPadding.x * 22;
+                           ImGui::GetFontSize() * 2.4f + numColW() * 10 +
+                           ImGui::GetStyle().CellPadding.x * 24;
     bool wide = app.projStatLayout == 1 ||
                 (app.projStatLayout == 0 && ImGui::GetContentRegionAvail().x >= wideNeed);
     {
