@@ -948,17 +948,23 @@ struct App {
         int mode = -1, cfa = -1, cfaPattern = -1;
         int rx = 0, ry = 0, rw = 0, rh = 0;
         int nSeries = 0;
-        const char* seriesNames[4] = {};
-        std::vector<float> h[4], v[4];    // per series: mean along columns / rows
+        // 5, not 4: slot 4 is the optional "all" row - every pixel of the ROI
+        // regardless of plane. The canon forbids MIXING planes inside a
+        // per-plane statistic, so this is a DIFFERENT measurement and is
+        // labelled "all", never drawn as a fifth plane. nSeries stays the plane
+        // count; allRow says whether slot 4 is filled.
+        const char* seriesNames[5] = {};
+        std::vector<float> h[5], v[5];    // per series: mean along columns / rows
         float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
         // statistics of the profiles themselves (sigma of column means = column FPN)
         struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
-        Stats hStat[4], vStat[4];
+        Stats hStat[5], vStat[5];
         // ...and of the REGION itself. sigma of the column means says how much
         // the columns differ; this says how much the pixels do. Reading the two
         // profile sigmas without it is reading a ratio with no denominator -
         // and it is the third quantity the row/column noise split needs.
-        Stats fStat[4];
+        Stats fStat[5];
+        bool allRow = false;              // slot 4 holds the plane-mixed row
         bool roiUsed = false;
     } proj[2];                        // 0 = A, 1 = B (compare)
     std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
@@ -974,6 +980,13 @@ struct App {
     // as a column. What the app should do about number formats in GENERAL is
     // docs/todo-open.md.
     int projDecimals = -1;
+    // an extra row over every pixel of the ROI, planes mixed. Off by default:
+    // it is a different measurement from the per-plane rows and reading it as
+    // a fifth plane is exactly the mistake the canon's iron rule exists to stop.
+    bool projAllRow = false;
+    // 0 = side major (A's planes, then B's), 1 = channel major (R: A then B,
+    // then Gr: ...). Comparing one plane across sides wants the second.
+    int projStatOrder = 0;
     int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
     bool showProjH = true, showProjV = true;
     int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
@@ -3787,7 +3800,8 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->path << "\n";
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
-    f << "projstatlayout " << app.projStatLayout << " " << app.projDecimals << "\n";
+    f << "projstatlayout " << app.projStatLayout << " " << app.projDecimals << " "
+      << (app.projAllRow ? 1 : 0) << " " << app.projStatOrder << "\n";
     f << "projection " << app.projMode << " " << app.projYMode << " " << app.projYLo << " "
       << app.projYHi << " " << (app.showProjH ? 1 : 0) << " " << (app.showProjV ? 1 : 0) << "\n";
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
@@ -4239,9 +4253,12 @@ static std::string loadSession(const std::string& path) {
                                      app.abStatsLayout = std::clamp(app.abStatsLayout, 0, 2);
                                      app.histPlane = std::clamp(app.histPlane, -1, 3); }
         else if (key == "roichannel") ls >> app.roiChannel;
-        else if (key == "projstatlayout") { int dp = -1; ls >> app.projStatLayout >> dp;
+        else if (key == "projstatlayout") { int dp = -1, ar = 0, so = 0;
+                                            ls >> app.projStatLayout >> dp >> ar >> so;
                                             app.projStatLayout = std::clamp(app.projStatLayout, 0, 2);
-                                            app.projDecimals = std::clamp(dp, -1, 6); }
+                                            app.projDecimals = std::clamp(dp, -1, 6);
+                                            app.projAllRow = ar != 0;
+                                            app.projStatOrder = std::clamp(so, 0, 1); }
         else if (key == "projection") { int h = 1, v = 1;
                                         ls >> app.projMode >> app.projYMode >> app.projYLo
                                            >> app.projYHi >> h >> v;
@@ -9793,23 +9810,29 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     static const char* CH_N[4] = { "ch0", "ch1", "ch2", "ch3" };
     P.nSeries = cfa ? 4 : std::min(im->ch, 3);
     for (int s = 0; s < 4; s++) P.seriesNames[s] = cfa ? CFA_N[s] : CH_N[s];
+    // slot 4 is "all" - only worth having when there is more than one plane to
+    // mix, and only when asked for
+    P.allRow = app.projAllRow && P.nSeries > 1;
+    P.seriesNames[4] = "all";
+    const int nAcc = P.nSeries + (P.allRow ? 1 : 0);   // rows the passes fill
 
-    for (int s = 0; s < P.nSeries; s++) {
+    for (int s = 0; s < nAcc; s++) {
         P.h[s].assign(rw, 0.0f);
         P.v[s].assign(rh, 0.0f);
     }
-    std::vector<std::vector<int>> hN(P.nSeries, std::vector<int>(rw, 0));
-    std::vector<std::vector<int>> vN(P.nSeries, std::vector<int>(rh, 0));
+    if (!P.allRow) { P.h[4].clear(); P.v[4].clear(); P.fStat[4] = {}; P.hStat[4] = {}; P.vStat[4] = {}; }
+    std::vector<std::vector<int>> hN(nAcc, std::vector<int>(rw, 0));
+    std::vector<std::vector<int>> vN(nAcc, std::vector<int>(rh, 0));
     // region moments, gathered from the SAME samples the H pass visits (every
     // column, every step-th row) - so the region sigma and the profile sigmas
     // describe one and the same set of pixels
-    double fSum[4] = {}, fSum2[4] = {};
-    size_t fN[4] = {};
-    double fMn[4] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
-    double fMx[4] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
+    double fSum[5] = {}, fSum2[5] = {};
+    size_t fN[5] = {};
+    double fMn[5] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
+    double fMx[5] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
     bool useMax = app.projMode == 1, useMin = app.projMode == 2;
     if (useMax || useMin)
-        for (int s = 0; s < P.nSeries; s++) {
+        for (int s = 0; s < nAcc; s++) {
             std::fill(P.h[s].begin(), P.h[s].end(), useMax ? -FLT_MAX : FLT_MAX);
             std::fill(P.v[s].begin(), P.v[s].end(), useMax ? -FLT_MAX : FLT_MAX);
         }
@@ -9823,19 +9846,26 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
         int lo = 0, hi = P.nSeries;
         if (cfa) { lo = cfaChannelAt(*im, rx + x, ry + y); hi = lo + 1; }
-        for (int s = lo; s < hi; s++) {
-            float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
-            if (!std::isfinite(val)) continue;
-            float& acc = toH ? P.h[s][x] : P.v[s][y];
+        // every value goes into its own plane's row, and - when asked for -
+        // into the pooled "all" row as well. Pooling here rather than in a
+        // second pass keeps the two rows over EXACTLY the same samples.
+        auto put = [&](int slot, float val) {
+            float& acc = toH ? P.h[slot][x] : P.v[slot][y];
             if (useMax) acc = std::max(acc, val);
             else if (useMin) acc = std::min(acc, val);
             else acc += val;
-            (toH ? hN[s][x] : vN[s][y])++;
+            (toH ? hN[slot][x] : vN[slot][y])++;
             if (toH) {           // one pass only, or every pixel counts twice
-                fSum[s] += val; fSum2[s] += (double)val * val; fN[s]++;
-                fMn[s] = std::min(fMn[s], (double)val);
-                fMx[s] = std::max(fMx[s], (double)val);
+                fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
+                fMn[slot] = std::min(fMn[slot], (double)val);
+                fMx[slot] = std::max(fMx[slot], (double)val);
             }
+        };
+        for (int s = lo; s < hi; s++) {
+            float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
+            if (!std::isfinite(val)) continue;
+            put(s, val);
+            if (P.allRow) put(4, val);
         }
     };
     for (int y = 0; y < rh; y += step)          // H profile: every column
@@ -9843,7 +9873,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     for (int y = 0; y < rh; y++)                // V profile: every row
         for (int x = 0; x < rw; x += step) accumulate(x, y, false);
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
-    for (int s = 0; s < P.nSeries; s++) {
+    for (int s = 0; s < nAcc; s++) {
         for (int x = 0; x < rw; x++) {
             if (!hN[s][x]) { P.h[s][x] = std::numeric_limits<float>::quiet_NaN(); continue; }
             if (!useMax && !useMin) P.h[s][x] /= hN[s][x];
@@ -9858,7 +9888,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
-    for (int s = 0; s < P.nSeries; s++) {
+    for (int s = 0; s < nAcc; s++) {
         App::ProjState::Stats& f = P.fStat[s];
         f = {};
         if (!fN[s]) continue;
@@ -9872,7 +9902,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // statistics OF THE PROFILE itself: the spread of column means is column FPN,
     // the spread of row means is row FPN / banding - that is the number people
     // actually want out of a projection, and eyeballing a curve cannot give it.
-    for (int s = 0; s < P.nSeries; s++) {
+    for (int s = 0; s < nAcc; s++) {
         for (int axis = 0; axis < 2; axis++) {
             const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
             App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
@@ -10003,7 +10033,11 @@ static void drawPanelProjection() {
     int extraSeries = 0;
     for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
         extraSeries += app.projExtra[i].nSeries;
-    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries) * plots;
+    // ...plus one pooled "all" row per side when it is switched on
+    int allRows = (P.allRow ? 1 : 0) + (Bim && PB.allRow ? 1 : 0);
+    for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+        if (app.projExtra[i].allRow) allRows++;
+    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries + allRows) * plots;
     float lineH = ImGui::GetTextLineHeightWithSpacing();
     // wide draws one row per PLANE per side; per-axis draws one per axis too
     const bool wideGuess = app.projStatLayout == 1 ||
@@ -10011,7 +10045,7 @@ static void drawPanelProjection() {
                             ImGui::GetContentRegionAvail().x >=
                                 ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 10 +
                                 ImGui::GetStyle().CellPadding.x * 24);
-    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries;
+    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries + allRows;
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
@@ -10184,6 +10218,34 @@ static void drawPanelProjection() {
     // "side" exists as a column the moment there is more than one side, which
     // is B or any extra slot
     const bool anySide = Bim || !extras.empty();
+    // Every row of both tables comes from here, so the two layouts can never
+    // disagree about which rows exist or what order they are in. Side major
+    // keeps one capture's planes together; channel major puts R:A directly
+    // above R:B, which is what comparing ONE plane across sides wants. The
+    // pooled "all" row is always last of its group - it is not a plane, and
+    // sorting it among them would invite reading it as one.
+    struct SideRef { const App::ProjState* S; std::string name; };
+    std::vector<SideRef> sides;
+    sides.push_back({ &P, "A" });
+    if (Bim) sides.push_back({ &PB, "B" });
+    for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+        sides.push_back({ &app.projExtra[i], slotName(i) });
+    int maxSeries = 0;
+    for (const auto& sr : sides) maxSeries = std::max(maxSeries, sr.S->nSeries);
+    auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*, int)>& row) {
+        if (app.projStatOrder == 0) {
+            for (const auto& sr : sides) {
+                for (int i = 0; i < sr.S->nSeries; i++) row(*sr.S, sr.name.c_str(), i);
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4);
+            }
+        } else {
+            for (int i = 0; i < maxSeries; i++)
+                for (const auto& sr : sides)
+                    if (i < sr.S->nSeries) row(*sr.S, sr.name.c_str(), i);
+            for (const auto& sr : sides)
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4);
+        }
+    };
     // WIDE puts a plane's three sigmas on one line (region, row means, column
     // means) and spends the row axis on the SIDES instead of the axes. That is
     // the axis that has to grow: A and B are two rows today, and more slots or
@@ -10230,6 +10292,29 @@ static void drawPanelProjection() {
                               "into a report as a column. \"sig. digits\" is the old\n"
                               "behaviour: every cell picks its own length, so no two\n"
                               "rows line up.");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("all", &app.projAllRow)) app.prefsDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("adds one row over EVERY pixel of the ROI, planes mixed.\n"
+                              "It is a different measurement from the per-plane rows,\n"
+                              "not a fifth plane - mixing planes inside a per-plane\n"
+                              "figure is the thing the plane split exists to prevent.");
+        if (anySide) {
+            ImGui::SameLine();
+            static const char* ORD[2] = { "side, then ch", "ch, then side" };
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+            if (ImGui::BeginCombo("order##projstat", ORD[std::clamp(app.projStatOrder, 0, 1)])) {
+                for (int i = 0; i < 2; i++)
+                    if (ImGui::Selectable(ORD[i], app.projStatOrder == i)) {
+                        app.projStatOrder = i;
+                        app.prefsDirty = true;
+                    }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("\"ch, then side\" puts R:A directly above R:B, which is\n"
+                                  "what you want when comparing ONE plane across sides.");
+        }
     }
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
@@ -10259,12 +10344,12 @@ static void drawPanelProjection() {
                 ImGui::SetTooltip("f = the whole region     v = the row means (horizontal banding)\n"
                                   "h = the column means (vertical striping)\n"
                                   "%% is sigma / mean.  p-p is max - min.  All values in DN.");
-            auto wrow = [&](const App::ProjState& S, const char* sideName) {
-                for (int i = 0; i < S.nSeries; i++) {
+            auto wrow1 = [&](const App::ProjState& S, const char* sideName, int i) {
+                {
                     const App::ProjState::Stats& f = S.fStat[i];
                     const App::ProjState::Stats& hh = S.hStat[i];
                     const App::ProjState::Stats& vv = S.vStat[i];
-                    if (!f.valid && !hh.valid && !vv.valid) continue;
+                    if (!f.valid && !hh.valid && !vv.valid) return;
                     ImGui::TableNextRow();
                     if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
@@ -10287,10 +10372,9 @@ static void drawPanelProjection() {
                     }
                 }
             };
-            wrow(P, "A");
-            if (Bim) wrow(PB, "B");
-            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
-                wrow(app.projExtra[i], slotName(i).c_str());
+            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+                wrow1(S, side, i);
+            });
             ImGui::EndTable();
         }
         ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
@@ -10318,10 +10402,10 @@ static void drawPanelProjection() {
         ImGui::TableSetupColumn(SIGMA " %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
-        auto rows = [&](const App::ProjState& S, const char* sideName, bool horizontal) {
-            for (int s = 0; s < S.nSeries; s++) {
+        auto rows1 = [&](const App::ProjState& S, const char* sideName, int s, bool horizontal) {
+            {
                 const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
-                if (!st.valid) continue;
+                if (!st.valid) return;
                 ImGui::TableNextRow();
                 if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
@@ -10335,16 +10419,14 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn(); textStat(st.pp);
             }
         };
-        if (app.showProjH) {
-            rows(P, "A", true);  if (Bim) rows(PB, "B", true);
-            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
-                rows(app.projExtra[i], slotName(i).c_str(), true);
-        }
-        if (app.showProjV) {
-            rows(P, "A", false); if (Bim) rows(PB, "B", false);
-            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
-                rows(app.projExtra[i], slotName(i).c_str(), false);
-        }
+        if (app.showProjH)
+            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+                rows1(S, side, i, true);
+            });
+        if (app.showProjV)
+            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+                rows1(S, side, i, false);
+            });
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
@@ -19777,6 +19859,71 @@ int main(int argc, char** argv) {
             }
             fprintf(stderr, "verifyselftest: V11 analysis units: %s\n", got.c_str());
             check(uOk, "V11 the Analysis grid quotes pixel values in DN");
+        }
+
+        {   // ---- V17: the pooled "all" row is a different measurement -------
+            // It must pool the SAME samples the plane rows saw - not re-scan,
+            // not sample differently - or the row that is supposed to be the
+            // whole picture disagrees with the parts it is made of. And it must
+            // never be counted as a plane: nSeries is the plane count, allRow
+            // is a separate flag, because a fifth "plane" is exactly the
+            // reading the CFA split exists to prevent.
+            ImageDoc* im0 = cur();
+            if (im0 && im0->w > 1) {
+                int savedCfa = im0->cfa, savedPat = im0->cfaPattern;
+                bool savedAll = app.projAllRow;
+                im0->cfa = 1; im0->cfaPattern = 0;          // treat it as RGGB
+                app.selectedAnn = 0;                        // whole image
+                app.projAllRow = false;
+                App::ProjState T{};
+                recomputeProjectionIfNeeded(im0, T);
+                int planesOff = T.nSeries;
+                bool offClean = !T.allRow;
+                app.projAllRow = true;
+                App::ProjState T2{};
+                recomputeProjectionIfNeeded(im0, T2);
+                fprintf(stderr, "verifyselftest: V17 planes=%d allRow=%d (off: planes=%d allRow=%d)\n",
+                        T2.nSeries, T2.allRow ? 1 : 0, planesOff, T.allRow ? 1 : 0);
+                check(offClean && planesOff == 4, "V17 four planes, and no pooled row unless asked");
+                check(T2.nSeries == 4 && T2.allRow,
+                      "V17 the pooled row does not become a fifth plane");
+                // the pooled mean is the sample-weighted mean of the planes
+                double num = 0; size_t den = 0;
+                bool allValid = T2.fStat[4].valid;
+                for (int i = 0; i < 4; i++) {
+                    if (!T2.fStat[i].valid) continue;
+                    num += T2.fStat[i].mean * (double)T2.h[i].size();
+                    den += T2.h[i].size();
+                }
+                double want = den ? num / den : 0;
+                double got = T2.fStat[4].mean;
+                fprintf(stderr, "verifyselftest: V17 pooled mean %.9g, planes combined %.9g\n",
+                        got, want);
+                check(allValid && fabs(got - want) < fabs(want) * 1e-3 + 1e-6,
+                      "V17 the pooled row is the planes pooled, not a second scan");
+                // ...and the pooled spread obeys the law of total variance:
+                // pooled var = mean of the plane variances + variance of the
+                // plane means. (NOT ">= the widest plane": pooling takes the
+                // MEAN of the variances, so one very noisy plane among quiet
+                // ones legitimately pools narrower than itself.)
+                double mv = 0, mm = 0; int nv = 0;
+                for (int i = 0; i < 4; i++)
+                    if (T2.fStat[i].valid) { mv += T2.fStat[i].sd * T2.fStat[i].sd;
+                                             mm += T2.fStat[i].mean; nv++; }
+                if (nv) { mv /= nv; mm /= nv; }
+                double between = 0;
+                for (int i = 0; i < 4; i++)
+                    if (T2.fStat[i].valid)
+                        between += (T2.fStat[i].mean - mm) * (T2.fStat[i].mean - mm);
+                if (nv) between /= nv;
+                double wantVar = mv + between, gotVar = T2.fStat[4].sd * T2.fStat[4].sd;
+                fprintf(stderr, "verifyselftest: V17 pooled var %.9g, within %.9g + between %.9g = %.9g\n",
+                        gotVar, mv, between, wantVar);
+                check(fabs(gotVar - wantVar) < wantVar * 1e-3 + 1e-9,
+                      "V17 pooled variance = within-plane + between-plane");
+                im0->cfa = savedCfa; im0->cfaPattern = savedPat;
+                app.projAllRow = savedAll;
+            }
         }
 
         // ---- V16: the raw recipe belongs to the Open that answered for it ------
