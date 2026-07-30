@@ -383,9 +383,17 @@ ROI ごとの mean/std/min/max は **ROIs** パネルの表です。
 マーカー)。フレーム間のドリフト・フリッカ確認に使えます。EMVA 1288 の温度/固定パターン分離と
 同じ考え方ですが、単一シーケンスからの簡易版です。
 
-- **`Copy per-frame stats`** で、常駐している全フレームの表(ファイル名・パス・plane 毎の
-  mean と sigma [DN]・H/V 射影の非一様性 [%])が TSV でクリップボードに入ります。
-  **σ_t の列はありません** —— σ_t は stack の属性であって frame の属性ではないからです
+- **`Copy (TSV)` / `Save (CSV)...`** で、temporal summary(plane 毎の σ_t/σ_fpn/σ_tot)・
+  同じ画像/ROI の **H/V profile statistics**(Projection パネルの数値そのまま)・per-frame 表
+  (plane 毎の mean / sigma [DN]、行/列プロファイルの非一様性 [%])が provenance ヘッダ付きの
+  **1つの文書**として出ます(`#` 見出しのセクション、各セクションは矩形 ——
+  docs/export-design.md)。per-frame 行に **σ_t の列はありません** —— σ_t は stack の
+  属性であって frame の属性ではないからです。compare 中は A/B/slot 全側が side 列付きで
+  載ります。temporal と profile の測定領域が違うとき(サーバ集計は常に全面)は両方を明記します
+- **`x axis...`** で per-frame チャートの横軸をフレーム番号から実量(経過時間・露光・温度
+  など)に差し替えられます: 名前・単位・値リスト(カンマ/空白/タブ区切り、1フレーム1値)を
+  貼って Apply。個数がフレーム数と合わなければ両方の数字を言って拒否します。stack 毎に
+  保存され(セッション往復可)、export の per-frame 表にも列として載ります
 - リモートの塊は**サーバ側で集計**され、`[server <ホスト>, N frames]` と出ます
   (`File > Sequence loading > Remote processing` で切替)。
   開いてすらいない連番も Browse パネルの「Temporal stats (server)」から測れて、

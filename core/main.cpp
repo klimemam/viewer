@@ -211,6 +211,7 @@ struct App {
     std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
     std::unique_ptr<pfd::save_file> saveDlg;
     std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    std::unique_ptr<pfd::save_file> texportDlg; // Temporal > Save (CSV)...
     std::unique_ptr<pfd::save_file> pngDlg;    // Image > Save view as PNG
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
@@ -220,6 +221,8 @@ struct App {
     // next to folderDlg.
     std::string pendingCsv;                    // built at click time: the results may
                                                // change while the OS dialog is open
+    std::string pendingTexport;                // Temporal export, same rule: built at
+                                               // click time, written when the dialog lands
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
@@ -406,6 +409,16 @@ struct App {
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
+        // Per-frame X axis for the Temporal chart: what frame i physically IS
+        // (elapsed time, exposure, temperature). NAME + UNIT + one value per
+        // frame - a bare list of numbers cannot label an axis, so all three
+        // are required, exactly as a series carries name/unit/value for its
+        // stack-level parameter one layer up (docs/series-plan.md). This is
+        // legitimately per-STACK (unlike `level`): the axis maps THIS stack's
+        // frame numbers and nothing else. Empty axisVals = not set - and the
+        // unit is never defaulted (unset is unset, never assumed).
+        std::string axisName, axisUnit;
+        std::vector<double> axisVals;     // axisVals[i] belongs to seqIndex i
         // NO level here. The value a stack was captured at is meaningless
         // without the parameter's NAME and UNIT, and both of those belong to
         // the series - so the value does too (Series::Member::value). Keeping
@@ -833,7 +846,11 @@ struct App {
     // pattern. It travels with the restore entry and is applied when the stack
     // is actually created.
     struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern;
-                        std::string name; };
+                        std::string name;
+                        // the session's per-frame x axis, applied with the name
+                        // once the stack exists (same window, same fix)
+                        std::string axisName, axisUnit;
+                        std::vector<double> axisVals; };
     std::vector<SeqRestore> seqRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
@@ -923,7 +940,7 @@ struct App {
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
     bool anyFileDialog() const {      // see the note on csvDlg
-        return openDlg || saveDlg || csvDlg || pngDlg || folderDlg;
+        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
@@ -3991,8 +4008,19 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // AFTER seqload: for a folder stack the SeqInfo only exists once the
             // rescan ran, and a name applied before that lands on nothing. The
             // name may be user-given ("25C dark") - it must survive the session.
-            if (const App::SeqInfo* sqi = seqInfo(d->seqId))
+            if (const App::SeqInfo* sqi = seqInfo(d->seqId)) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
+                // the per-frame x axis, additive keys an older viewer skips.
+                // Values first and EXACTLY (fmtExact): this is an axis data is
+                // plotted against. Name and unit last on their lines: spaces.
+                if (!sqi->axisVals.empty()) {
+                    f << "seqaxisvals";
+                    for (double v : sqi->axisVals) f << " " << fmtExact(v);
+                    f << "\n";
+                    f << "seqaxisunit " << sqi->axisUnit << "\n";
+                    f << "seqaxisname " << sqi->axisName << "\n";
+                }
+            }
         } else {
             // A stack whose sibling rescan is still QUEUED has no SeqInfo yet
             // (seqRestore is drained one at a time, over many frames), so the
@@ -4441,6 +4469,41 @@ static std::string loadSession(const std::string& path) {
                     if (it->uid == cur()->uid) { it->name = nm; break; }
             }
         }
+        // The per-frame x axis, three additive keys riding the image line above
+        // exactly as seqname does (SeqInfo now, or the queued restore entry for
+        // a folder stack). STRICT values: an unreadable token drops the whole
+        // axis - a plotted axis with an invented 0 in it is worse than none.
+        else if (key == "seqaxisvals" || key == "seqaxisunit" || key == "seqaxisname") {
+            if (!lastImageOk || !cur()) continue;
+            App::SeqInfo* si2 = cur()->seqId != 0 ? seqInfo(cur()->seqId) : nullptr;
+            App::SeqRestore* sr = nullptr;
+            if (!si2)
+                for (auto it = app.seqRestore.rbegin(); it != app.seqRestore.rend(); ++it)
+                    if (it->uid == cur()->uid) { sr = &*it; break; }
+            if (!si2 && !sr) continue;
+            if (key == "seqaxisvals") {
+                std::vector<double> vals;
+                bool bad = false;
+                std::string tok;
+                while (ls >> tok) {
+                    char* end = nullptr;
+                    double v = strtod(tok.c_str(), &end);
+                    if (!end || *end != '\0' || !std::isfinite(v)) { bad = true; break; }
+                    vals.push_back(v);
+                }
+                if (bad || vals.empty()) {
+                    fprintf(stderr, "session: seqaxisvals unreadable - x axis dropped\n");
+                    if (si2) si2->axisVals.clear(); else sr->axisVals.clear();
+                } else if (si2) si2->axisVals = std::move(vals);
+                else sr->axisVals = std::move(vals);
+            } else if (key == "seqaxisunit") {
+                std::string u = restOfLine(ls);
+                if (si2) si2->axisUnit = u; else sr->axisUnit = u;
+            } else {
+                std::string n = restOfLine(ls);
+                if (si2) si2->axisName = n; else sr->axisName = n;
+            }
+        }
         // MIGRATION of the old per-stack level. saveSession has never written
         // this key (verified over the whole history: no commit ever emitted
         // it), so it fires only for hand-written or third-party files. Note the
@@ -4529,7 +4592,7 @@ static std::string loadSession(const std::string& path) {
                 std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
                 // queued, not started: see App::seqRestore
                 if (files.size() >= 2)
-                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat, {} });
+                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat, {}, {}, {}, {} });
             }
         }
         else if (key == "ann") {
@@ -5310,10 +5373,17 @@ static void pumpSequenceAndQueue() {
         for (int i = 0; i < (int)app.images.size(); i++)
             if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
                 startSequenceLoad(i, r.files, r.pattern);
-                // the session's seqname, applied now that the stack exists
-                if (!r.name.empty() && app.images[i]->seqId != 0)
-                    if (App::SeqInfo* si2 = seqInfo(app.images[i]->seqId))
-                        si2->name = r.name;
+                // the session's seqname (and per-frame x axis), applied now
+                // that the stack exists
+                if (app.images[i]->seqId != 0)
+                    if (App::SeqInfo* si2 = seqInfo(app.images[i]->seqId)) {
+                        if (!r.name.empty()) si2->name = r.name;
+                        if (!r.axisVals.empty()) {
+                            si2->axisName = r.axisName;
+                            si2->axisUnit = r.axisUnit;
+                            si2->axisVals = std::move(r.axisVals);
+                        }
+                    }
                 break;
             }
         return;                 // let it start before chaining anything else
@@ -7856,6 +7926,17 @@ static void pollFileDialog() {           // called once per frame from the main 
         }
         app.csvDlg.reset();
         app.pendingCsv.clear();
+    }
+    if (app.texportDlg && app.texportDlg->ready(0)) {
+        std::string p = app.texportDlg->result();
+        if (!p.empty()) {
+            if (p.find('.') == std::string::npos) p += ".csv";
+            std::ofstream f(pathFromUtf8(p), std::ios::binary);
+            if (f) { f << app.pendingTexport; toast("temporal statistics exported: " + baseName(p)); }
+            else toast("cannot write: " + baseName(p), true);
+        }
+        app.texportDlg.reset();
+        app.pendingTexport.clear();
     }
     if (app.pngDlg && app.pngDlg->ready(0)) {
         std::string p = app.pngDlg->result();
@@ -12145,6 +12226,45 @@ static void drawPanelLinearity() {
     }
 }
 
+// The x axis one stack's per-frame data is plotted (and exported) against:
+// the custom axis when it is set AND still covers every frame, else the frame
+// index. ONE resolver for the chart, the export and the selftest, so they can
+// never disagree about which axis is in force. `why` names the reason a SET
+// axis is not usable (frame count changed since it was applied).
+struct FrameAxis {
+    bool custom = false;
+    std::string name, unit;
+    const std::vector<double>* vals = nullptr;   // by seqIndex
+    std::string label;                           // ready for beginPlot's x label
+    std::string why;
+    double at(double seqIndex) const {           // mapping: value i <- seqIndex i
+        int i = (int)(seqIndex + 0.5);
+        return custom && i >= 0 && i < (int)vals->size() ? (*vals)[i] : seqIndex;
+    }
+};
+static FrameAxis frameAxisOf(int seqId) {
+    FrameAxis a;
+    a.label = "frame number (index in sequence)";
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!si || si->axisVals.empty()) return a;
+    int n = (int)framesOfSeq(seqId).size();
+    int N = std::max(si->expectedFrames, n);
+    if ((int)si->axisVals.size() != N) {
+        char b[128];
+        snprintf(b, sizeof b, "custom x axis ignored: %d value(s) for %d frame(s) - "
+                              "plotted on frame index",
+                 (int)si->axisVals.size(), N);
+        a.why = b;
+        return a;
+    }
+    a.custom = true;
+    a.name = si->axisName;
+    a.unit = si->axisUnit;
+    a.vals = &si->axisVals;
+    a.label = si->axisName + " (" + si->axisUnit + ")";
+    return a;
+}
+
 // Server-computed temporal stats: shown for a remote stack under a policy that
 // lets the server compute. The numbers come over the wire in seconds; they are
 // never quietly recomputed locally (that would change a displayed measurement,
@@ -12193,24 +12313,35 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
         ImGui::EndTable();
     }
     if (!S.frameMean.empty()) {
+        // the custom per-frame x axis applies to the server's series too: the
+        // mapping is by frame number, and the server's x IS the frame number
+        FrameAxis ax = frameAxisOf(si->id);
+        if (!ax.why.empty())
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", ax.why.c_str());
         float mn = FLT_MAX, mx = -FLT_MAX;
         for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        float fx0 = S.idx.empty() ? 0 : S.idx.front(), fx1 = S.idx.empty() ? 1 : S.idx.back();
+        float fx0 = FLT_MAX, fx1 = -FLT_MAX;
+        for (float ix : S.idx) {
+            float x = (float)ax.at(ix);
+            fx0 = std::min(fx0, x); fx1 = std::max(fx1, x);
+        }
+        if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
         float tAvail = ImGui::GetContentRegionAvail().y - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
         // the axis names the region that was actually measured. It said "ROI"
         // unconditionally while requestServerTemporal never puts a rect on the
         // wire - and the detached view one screen down already says "frame".
-        PlotRect tp = beginPlot("frame number",
+        PlotRect tp = beginPlot(ax.custom ? ax.label.c_str() : "frame number",
                                 S.roiUsed ? "ROI mean value [DN]" : "frame mean value [DN]",
-                                fx0, fx1, mn, mx, true, false, std::max(tAvail, 70.0f * app.uiScale));
+                                fx0, fx1, mn, mx, !ax.custom, false, std::max(tAvail, 70.0f * app.uiScale));
         if (tp.ok) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(tp.p0, tp.p1, true);
             for (size_t i = 1; i < S.frameMean.size(); i++)
-                dl->AddLine(tp.at(S.idx[i - 1], S.frameMean[i - 1]),
-                            tp.at(S.idx[i], S.frameMean[i]), IM_COL32(105, 180, 240, 255), 1.5f);
+                dl->AddLine(tp.at((float)ax.at(S.idx[i - 1]), S.frameMean[i - 1]),
+                            tp.at((float)ax.at(S.idx[i]), S.frameMean[i]),
+                            IM_COL32(105, 180, 240, 255), 1.5f);
             if (ImageDoc* c2 = cur()) {
-                float mxp = tp.at((float)c2->seqIndex, tp.ymin).x;
+                float mxp = tp.at((float)ax.at((float)c2->seqIndex), tp.ymin).x;
                 dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
             }
             dl->PopClipRect();
@@ -12303,26 +12434,165 @@ static void drawBrowseTemporal() {
     }
 }
 
-// Per-frame S1 stats of a stack as TSV on the clipboard, one row per frame:
-// file, path, per-plane spatial mean/sigma, and the H/V projection non-
-// uniformity (sigma of the column-mean / row-mean profile, as % of the plane
-// mean - shading and banding in one number each). Deliberately NO temporal
-// columns: sigma_t is a property of the stack, not of a frame (a per-frame
-// "temporal noise" would be a category error - see docs/stats-taxonomy.md).
-static void copyPerFrameStats(int seqId) {
+// ---- per-frame x axis (Temporal chart / export) -----------------------------
+// Parse a pasted list of numbers: comma, space, tab and newline all separate
+// (the user pastes an Excel column or a script's output - both shapes must
+// work). A non-numeric token is a POSITIONED error, never a silent skip and
+// never a zero: unreadable is unset (docs/terminology.md).
+static bool parseAxisValues(const std::string& text, std::vector<double>& out,
+                            std::string& err) {
+    out.clear();
+    err.clear();
+    auto sep = [](char c) {
+        return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    size_t i = 0;
+    int tok = 0, nBad = 0;
+    std::string bad;
+    while (i < text.size()) {
+        while (i < text.size() && sep(text[i])) i++;
+        if (i >= text.size()) break;
+        size_t j = i;
+        while (j < text.size() && !sep(text[j])) j++;
+        std::string t = text.substr(i, j - i);
+        tok++;
+        char* end = nullptr;
+        double v = strtod(t.c_str(), &end);
+        if (!end || *end != '\0' || !std::isfinite(v)) {
+            nBad++;
+            if (nBad <= 3) {
+                char b[96];
+                snprintf(b, sizeof b, "%svalue %d ('%.24s') is not a number",
+                         bad.empty() ? "" : ";  ", tok, t.c_str());
+                bad += b;
+            }
+        } else out.push_back(v);
+        i = j;
+    }
+    if (nBad) {
+        if (nBad > 3) bad += ";  ...";
+        err = bad;
+        out.clear();
+        return false;
+    }
+    return !out.empty();
+}
+
+// Attach a per-frame x axis to a stack. All three parts are required (an axis
+// is a quantity with a unit; the unit is never defaulted), and the value count
+// must equal the stack's frame count - against the EXPECTED total for a
+// partially loaded stack. A mismatch refuses with both numbers: a partial
+// mapping silently truncating either side is the classic quiet lie.
+static bool applyFrameAxis(int seqId, const char* name, const char* unit,
+                           const std::string& text, std::string& err) {
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!si) { err = "not a stack"; return false; }
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string nm = trim(name ? name : ""), un = trim(unit ? unit : "");
+    if (nm.empty() || un.empty()) {
+        err = "the axis needs a NAME and a UNIT - a bare list of numbers "
+              "cannot label an axis (the unit is never assumed)";
+        return false;
+    }
+    std::vector<double> vals;
+    if (!parseAxisValues(text, vals, err)) {
+        if (err.empty()) err = "no values";
+        return false;
+    }
+    int n = (int)framesOfSeq(seqId).size();
+    int N = std::max(si->expectedFrames, n);
+    if ((int)vals.size() != N) {
+        char b[192];
+        snprintf(b, sizeof b, "%d value(s) for %d frame(s)%s - not applied: value i "
+                              "maps to frame i, and a partial mapping would silently "
+                              "lie about the rest",
+                 (int)vals.size(), N, si->expectedFrames > n ? " (expected total)" : "");
+        err = b;
+        return false;
+    }
+    si->axisName = nm;
+    si->axisUnit = un;
+    si->axisVals = std::move(vals);
+    return true;
+}
+
+// ---- Temporal export: one document, two sinks (docs/export-design.md) -------
+// A CSV/TSV document under construction. ONE builder produces the cells; the
+// delimiter is the only thing the two sinks disagree about. TSV: tabs (and
+// newlines) inside a cell are squashed to spaces. CSV: RFC 4180 minimal - a
+// cell containing the delimiter, a quote or a newline is quoted and its quotes
+// doubled. Decimal point is always '.' (snprintf's C locale IS the contract),
+// digits are %.9g: the display's decimals setting is about scanning columns,
+// an export is about reproducing numbers.
+static std::string expCell(std::string s, char delim) {
+    if (delim != ',') {
+        for (char& c : s)
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        return s;
+    }
+    if (s.find_first_of(",\"\n\r") == std::string::npos) return s;
+    std::string q = "\"";
+    for (char c : s) {
+        if (c == '"') q += '"';
+        q += c;
+    }
+    q += '"';
+    return q;
+}
+struct ExportDoc {
+    std::string out;
+    char delim;
+    explicit ExportDoc(char d) : delim(d) {}
+    void comment(const std::string& s) { out += "# " + s + "\n"; }
+    void row(const std::vector<std::string>& cells) {
+        for (size_t i = 0; i < cells.size(); i++) {
+            if (i) out += delim;
+            out += expCell(cells[i], delim);
+        }
+        out += "\n";
+    }
+};
+static std::string expNum(double v) {
+    char b[40];
+    snprintf(b, sizeof b, "%.9g", v);
+    return b;
+}
+
+// Per-frame S1 statistics of ONE stack as one rectangle: a header row and a
+// row per RESIDENT frame, with per-plane spatial mean/sigma and the H/V
+// profile non-uniformity of that frame (sigma of the column-mean / row-mean
+// profile as % of the plane mean - the same sigma_col/sigma_row vocabulary as
+// the profile-statistics section). Everything in a row is computable from that
+// frame alone - deliberately NO temporal columns: sigma_t is a property of
+// the stack, not of a frame (a per-frame "temporal noise" would be a category
+// error - see docs/stats-taxonomy.md 3). Full-pixel scan of the region, so an
+// independent numpy implementation can reproduce every number
+// (--framestats-selftest prints exactly this block).
+struct PerFrameBlock {
+    int rows = 0, skipped = 0;
+    bool roiUsed = false;
+    int rx = 0, ry = 0, rw = 0, rh = 0;   // the region the rows describe
+};
+static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
+    PerFrameBlock res;
     // the ROI convention every other measurement uses: selected rect, else full
     int rx = 0, ry = 0, rw = 0, rh = 0;
-    bool roiUsed = false;
     if (App::Ann* a = findAnn(app.selectedAnn))
-        if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; roiUsed = true; }
+        if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; res.roiUsed = true; }
     std::vector<int> fr = framesOfSeq(seqId);
-    int nPl = 0, skipped = 0;
+    // the custom per-frame x axis rides along as its own column, name and unit
+    // in the header - the frame column stays: the mapping is BY frame number,
+    // and a row that dropped it could not state what its axis value belongs to
+    const FrameAxis ax = frameAxisOf(seqId);
+    int nPl = 0;
     bool cfa = false;
-    std::string out;
-    char b[512];
     for (int idx : fr) {
         const ImageDoc* d = app.images[idx].get();
-        if (d->data.empty() || d->remoteStep > 1) { skipped++; continue; }   // previews lie
+        if (d->data.empty() || d->remoteStep > 1) { res.skipped++; continue; }   // previews lie
         int W = d->w, H = d->h, C = d->ch;
         int x0 = std::clamp(rx, 0, W - 1), y0 = std::clamp(ry, 0, H - 1);
         int ww = rw <= 0 ? W - x0 : std::min(rw, W - x0);
@@ -12330,17 +12600,19 @@ static void copyPerFrameStats(int seqId) {
         if (!nPl) {                                    // header from the first frame
             cfa = d->cfa != 0;
             nPl = cfa ? 4 : std::min(C, 4);
-            out = "file\tpath\tframe";
+            res.rx = x0; res.ry = y0; res.rw = ww; res.rh = hh;
+            std::vector<std::string> h = { "frame", "file" };
+            if (ax.custom) h.insert(h.begin() + 1, ax.name + " [" + ax.unit + "]");
             for (int p = 0; p < nPl; p++) {
                 static const char* CHN[4] = { "ch0", "ch1", "ch2", "ch3" };
                 const char* pn = cfa ? CFA_CH_NAMES[p] : (C > 1 ? CHN[p] : "");
                 std::string sfx = *pn ? std::string("_") + pn : std::string();
-                snprintf(b, sizeof b,
-                         "\tmean%s [DN]\tsigma%s [DN]\tHproj sigma%s [%%]\tVproj sigma%s [%%]",
-                         sfx.c_str(), sfx.c_str(), sfx.c_str(), sfx.c_str());
-                out += b;
+                h.push_back("mean" + sfx + " [DN]");
+                h.push_back("sigma" + sfx + " [DN]");
+                h.push_back("sigma_col" + sfx + " [%]");
+                h.push_back("sigma_row" + sfx + " [%]");
             }
-            out += "\n";
+            doc.row(h);
         }
         double sum[4] = {}, sum2[4] = {};
         size_t cnt[4] = {};
@@ -12359,9 +12631,8 @@ static void copyPerFrameStats(int seqId) {
                     rowS[(size_t)p * hh + y] += v; rowN[(size_t)p * hh + y]++;
                 }
         }
-        snprintf(b, sizeof b, "%s\t%s\t%d", d->name.c_str(),
-                 d->path.empty() ? "-" : d->path.c_str(), d->seqIndex);
-        out += b;
+        std::vector<std::string> r = { std::to_string(d->seqIndex), d->name };
+        if (ax.custom) r.insert(r.begin() + 1, expNum(ax.at(d->seqIndex)));
         for (int p = 0; p < nPl; p++) {
             double m = cnt[p] ? sum[p] / (double)cnt[p] : 0.0;
             double var = cnt[p] > 1
@@ -12379,19 +12650,32 @@ static void copyPerFrameStats(int seqId) {
                 double pv = std::max(0.0, ps2 / pc - pmn * pmn) * (pc / (pc - 1.0));
                 return sqrt(pv) / fabs(m) * 100.0;
             };
-            snprintf(b, sizeof b, "\t%.6g\t%.6g\t%.4g\t%.4g", m, sqrt(var),
-                     profCv(colS, colN, (size_t)p * ww, ww),
-                     profCv(rowS, rowN, (size_t)p * hh, hh));
-            out += b;
+            r.push_back(expNum(m));
+            r.push_back(expNum(sqrt(var)));
+            r.push_back(expNum(profCv(colS, colN, (size_t)p * ww, ww)));
+            r.push_back(expNum(profCv(rowS, rowN, (size_t)p * hh, hh)));
         }
-        out += "\n";
+        doc.row(r);
+        res.rows++;
     }
-    if (out.empty()) { toast("no resident frames to tabulate", true); return; }
-    ImGui::SetClipboardText(out.c_str());
+    return res;
+}
+
+// The old per-frame clipboard surface, kept as the thin wrapper the
+// --framestats-selftest contract rides on: the per-frame block, alone, as TSV.
+// The Temporal panel's buttons now go through buildTemporalExport instead
+// (docs/export-design.md), whose per-frame section is this very block.
+static void copyPerFrameStats(int seqId) {
+    ExportDoc doc('\t');
+    PerFrameBlock r = exportPerFrameBlock(seqId, doc);
+    if (!r.rows) { toast("no resident frames to tabulate", true); return; }
+    ImGui::SetClipboardText(doc.out.c_str());
+    char b[160];
     snprintf(b, sizeof b, "copied %d frame row(s) (%s)%s%s",
-             (int)fr.size() - skipped, roiUsed ? "selected ROI" : "whole frame",
-             skipped ? " - " : "", skipped ? (std::to_string(skipped) + " not resident").c_str() : "");
-    toast(b, skipped != 0);
+             r.rows, r.roiUsed ? "selected ROI" : "whole frame",
+             r.skipped ? " - " : "",
+             r.skipped ? (std::to_string(r.skipped) + " not resident").c_str() : "");
+    toast(b, r.skipped != 0);
 }
 
 // One side's temporal numbers, wherever they came from. The A/B table takes
@@ -12454,6 +12738,395 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
 // (docs/ab-stats-plan.md 5).
 static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
     return a && b && a->ch == b->ch;
+}
+
+// ---- the unified Temporal export (docs/export-design.md) --------------------
+// Everything the Temporal question is answered with, in ONE document: the
+// stack statistics (sigma_t / sigma_fpn / sigma_tot per plane), the H/V
+// profile statistics of the same image/ROI (from the Projection state - the
+// SAME structs that panel draws, never re-derived), and the per-frame S1
+// series. Labelled '#' sections, each section its own rectangle: the three
+// tables have different row axes, and one rectangle would either put sigma_t
+// on frame rows (the category error stats-taxonomy.md 3 forbids) or pad
+// itself unreadable. Every compare side rides along with a side column - an
+// export that silently dropped B would not reproduce the screen.
+struct TExpSide {
+    std::string letter;
+    ImageDoc* doc = nullptr;
+    AbTemporal t;
+    const App::ProjState* proj = nullptr;
+    std::string srvHost;          // when t.fromServer: which machine measured
+    uint64_t nonFinite = 0;       // local temporal: samples excluded, and said so
+    size_t dropped = 0;           // local temporal: samples with < 2 valid frames
+};
+static std::vector<TExpSide> temporalExportSides() {
+    std::vector<TExpSide> out;
+    ImageDoc* im = cur();
+    if (!im) return out;
+    recomputeTemporalIfNeeded(im, app.temporal[0]);
+    recomputeProjectionIfNeeded(im, app.proj[0]);
+    {
+        TExpSide A;
+        A.letter = "A";
+        A.doc = im;
+        A.t = abTemporalOf(im, app.temporal[0], app.srvTemporal);
+        A.proj = &app.proj[0];
+        if (A.t.fromServer) A.srvHost = app.srvTemporal.host;
+        else if (A.t.valid) { A.nonFinite = app.temporal[0].nonFinite; A.dropped = app.temporal[0].dropped; }
+        out.push_back(std::move(A));
+    }
+    ImageDoc* Bim = abStatsB();
+    if (Bim) {
+        recomputeTemporalIfNeeded(Bim, app.temporal[1]);
+        recomputeProjectionIfNeeded(Bim, app.proj[1]);
+        TExpSide B;
+        B.letter = "B";
+        B.doc = Bim;
+        B.t = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
+        B.proj = &app.proj[1];
+        if (B.t.fromServer) B.srvHost = app.srvTemporalB.host;
+        else if (B.t.valid) { B.nonFinite = app.temporal[1].nonFinite; B.dropped = app.temporal[1].dropped; }
+        out.push_back(std::move(B));
+    }
+    // the extra compare slots, resolved exactly as the two panels resolve them
+    app.temporalExtra.resize(app.cmpExtra.size());
+    app.projExtra.resize(app.cmpExtra.size());
+    static const App::ServerTemporal NO_SERVER;   // extras are local-only
+    for (const ResolvedSlot& rs : resolveSlots()) {
+        if (rs.doc == Bim) continue;
+        if (rs.idx >= app.temporalExtra.size()) continue;
+        recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
+        recomputeProjectionIfNeeded(rs.doc, app.projExtra[rs.idx]);
+        TExpSide X;
+        X.letter = slotName(rs.idx);
+        X.doc = rs.doc;
+        X.t = abTemporalOf(rs.doc, app.temporalExtra[rs.idx], NO_SERVER);
+        X.proj = &app.projExtra[rs.idx];
+        if (X.t.valid) { X.nonFinite = app.temporalExtra[rs.idx].nonFinite; X.dropped = app.temporalExtra[rs.idx].dropped; }
+        out.push_back(std::move(X));
+    }
+    return out;
+}
+
+// The region a side's TEMPORAL numbers describe, and the one its PROFILES do.
+// They are stated separately because they can genuinely differ: the server
+// aggregate never takes a ROI (whole frame), while the projection follows the
+// selection - and the export must state both, not paper over it (the "server
+// temporal is whole-frame but labels said ROI" history).
+static std::string expRegionTemporal(const TExpSide& s) {
+    if (!s.t.valid) return "-";
+    char b[96];
+    if (s.t.roiUsed) snprintf(b, sizeof b, "ROI (%d,%d) %dx%d", s.t.rx, s.t.ry, s.t.rw, s.t.rh);
+    else snprintf(b, sizeof b, "whole image (%dx%d)", s.doc->w, s.doc->h);
+    return b;
+}
+static std::string expRegionProfile(const TExpSide& s) {
+    const App::ProjState& P = *s.proj;
+    char b[96];
+    if (P.roiUsed) snprintf(b, sizeof b, "ROI (%d,%d) %dx%d", P.rx, P.ry, P.rw, P.rh);
+    else snprintf(b, sizeof b, "whole image (%dx%d)", P.rw, P.rh);
+    return b;
+}
+static bool expRegionsMatch(const TExpSide& s) {
+    if (!s.t.valid) return true;                 // nothing measured, nothing to clash
+    const App::ProjState& P = *s.proj;
+    if (s.t.roiUsed != P.roiUsed) return false;
+    if (!s.t.roiUsed) return true;               // both whole image
+    return s.t.rx == P.rx && s.t.ry == P.ry && s.t.rw == P.rw && s.t.rh == P.rh;
+}
+
+static std::string buildTemporalExport(char delim) {
+    std::vector<TExpSide> sides = temporalExportSides();
+    if (sides.empty()) return std::string();
+    ExportDoc doc(delim);
+
+    // ---- provenance: a number without it cannot go in a report ----
+    doc.comment("temporal + H/V profile statistics");
+    {
+        char ts[32] = "";
+        time_t now = time(nullptr);
+        if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+        doc.comment(std::string("app: viewer 0.1  |  generated: ") + ts);
+    }
+    {
+        std::string s = "sides: ";
+        for (size_t i = 0; i < sides.size(); i++) {
+            if (i) s += ", ";
+            s += sides[i].letter;
+        }
+        doc.comment(s);
+    }
+    const char* pmodes[3] = { "mean", "max", "min" };
+    const char* reduce = pmodes[std::clamp(app.projMode, 0, 2)];
+    for (const TExpSide& s : sides) {
+        const ImageDoc* d = s.doc;
+        char b[512];
+        snprintf(b, sizeof b, "%s: %s  |  path: %s", s.letter.c_str(),
+                 abDocLabel(d).c_str(), d->path.empty() ? "-" : d->path.c_str());
+        doc.comment(b);
+        std::string cfa = d->cfa
+            ? std::string(CFA_PATTERNS[d->cfaPattern & 3]) + (d->cfa == 2 ? " quad" : "") + " (4 planes)"
+            : std::string("none");
+        if (!s.t.isStack) {
+            snprintf(b, sizeof b, "%s: %dx%d %s  |  CFA: %s  |  not a stack "
+                                  "(single frame: no temporal rows)",
+                     s.letter.c_str(), d->w, d->h, d->dtype.c_str(), cfa.c_str());
+            doc.comment(b);
+        } else {
+            snprintf(b, sizeof b, "%s: %dx%d %s  |  CFA: %s  |  frames n=%d/%d  |  "
+                                  "temporal source: %s%s%s",
+                     s.letter.c_str(), d->w, d->h, d->dtype.c_str(), cfa.c_str(),
+                     s.t.frames, std::max(s.t.expected, s.t.frames),
+                     s.t.valid ? (s.t.fromServer ? "server" : "local") : "none (",
+                     s.t.fromServer && !s.srvHost.empty() ? (" " + s.srvHost).c_str() : "",
+                     s.t.valid ? "" : (std::string(s.t.note) + ")").c_str());
+            doc.comment(b);
+            snprintf(b, sizeof b, "%s temporal region: %s", s.letter.c_str(),
+                     expRegionTemporal(s).c_str());
+            doc.comment(b);
+        }
+        snprintf(b, sizeof b, "%s profile region: %s  |  reduce: %s", s.letter.c_str(),
+                 expRegionProfile(s).c_str(), reduce);
+        doc.comment(b);
+        if (!expRegionsMatch(s)) {
+            snprintf(b, sizeof b, "NOTE: side %s: temporal and profile statistics were "
+                                  "measured over DIFFERENT regions (see above)",
+                     s.letter.c_str());
+            doc.comment(b);
+        }
+        // the swept parameter, when this stack is a series member: the one
+        // piece of +meta the file does not carry (docs/stats-taxonomy.md)
+        if (App::Series* S = seriesOfStack(d->seqId))
+            for (const auto& m : S->members)
+                if (m.seqId == d->seqId) {
+                    std::string v = std::isfinite(m.value)
+                        ? expNum(m.value) + (S->unit[0] ? std::string(" ") + S->unit : std::string())
+                        : std::string("(value not set)");
+                    snprintf(b, sizeof b, "%s series: %s  |  %s = %s", s.letter.c_str(),
+                             S->name.c_str(),
+                             S->paramName.empty() ? "value" : S->paramName.c_str(),
+                             v.c_str());
+                    doc.comment(b);
+                    break;
+                }
+    }
+
+    // ---- section 1: the stack statistics --------------------------------
+    doc.comment("== temporal summary (stack statistics; sigma_t is a property of "
+                "the stack, never of a frame) ==");
+    doc.row({ "side", "ch", "n", "N", "sigma_t [DN]", "sigma_fpn [DN]",
+              "sigma_tot [DN]", "source" });
+    bool anyLocal = false;
+    for (const TExpSide& s : sides) {
+        if (!s.t.valid) continue;
+        anyLocal |= !s.t.fromServer;
+        std::string src = s.t.fromServer
+            ? (s.srvHost.empty() ? std::string("server") : "server " + s.srvHost)
+            : std::string("local");
+        for (int p = 0; p < s.t.nPl; p++)
+            doc.row({ s.letter, s.t.nPl > 1 ? LIN_PLANES[p] : "all",
+                      std::to_string(s.t.frames),
+                      std::to_string(std::max(s.t.expected, s.t.frames)),
+                      expNum(s.t.sigT[p]), expNum(s.t.sigS[p]), expNum(s.t.sigTot[p]),
+                      src });
+    }
+    doc.comment("sigma_t = sqrt(mean per-pixel temporal variance); sigma_fpn = "
+                "spatial sigma of the per-pixel temporal means (includes scene "
+                "detail unless the region is flat; no sigma_t^2/N subtraction); "
+                "sigma_tot = quadrature sum");
+    if (anyLocal)
+        doc.comment("local values are computed on a sampled grid (up to 40000 "
+                    "samples, whole CFA cells); the per-frame section scans every "
+                    "pixel, so levels can differ slightly");
+    for (const TExpSide& s : sides) {
+        char b[256];
+        if (s.t.isStack && !s.t.valid) {
+            snprintf(b, sizeof b, "side %s: no temporal rows - %s", s.letter.c_str(),
+                     s.t.note);
+            doc.comment(b);
+        }
+        if (s.nonFinite || s.dropped) {
+            snprintf(b, sizeof b, "side %s: non-finite samples (excluded) = %llu; "
+                                  "%zu sample(s) had < 2 valid frames",
+                     s.letter.c_str(), (unsigned long long)s.nonFinite, s.dropped);
+            doc.comment(b);
+        }
+    }
+
+    // ---- section 2: the H/V profile statistics --------------------------
+    {
+        char b[128];
+        snprintf(b, sizeof b, "== H/V profile statistics (the Projection panel's "
+                              "numbers; reduce = %s) ==", reduce);
+        doc.comment(b);
+    }
+    doc.row({ "side", "ch", "mean [DN]", "sigma_frame [DN]", "sigma_row [DN]",
+              "sigma_col [DN]", "sigma_frame [%]", "sigma_row [%]", "sigma_col [%]",
+              "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]" });
+    bool anyAllRow = false;
+    for (const TExpSide& s : sides) {
+        const App::ProjState& P = *s.proj;
+        // side-major, pooled "all" last of its side - the same walk the panel's
+        // two layouts share (projForEachRow), spelled once more here because
+        // that walk is a lambda inside the panel. The rule, not the code, is
+        // what the two exports share (docs/export-design.md 7).
+        auto prow = [&](int i) {
+            const App::ProjState::Stats& f = P.fStat[i];
+            const App::ProjState::Stats& vv = P.vStat[i];
+            const App::ProjState::Stats& hh = P.hStat[i];
+            if (!f.valid && !hh.valid && !vv.valid) return;
+            auto n9 = [](const App::ProjState::Stats& st, double v) {
+                return st.valid ? expNum(v) : std::string("-");
+            };
+            doc.row({ s.letter, P.seriesNames[i],
+                      n9(f, f.mean), n9(f, f.sd), n9(vv, vv.sd), n9(hh, hh.sd),
+                      n9(f, f.pct), n9(vv, vv.pct), n9(hh, hh.pct),
+                      n9(f, f.pp), n9(vv, vv.pp), n9(hh, hh.pp) });
+        };
+        for (int i = 0; i < P.nSeries; i++) prow(i);
+        if (P.allRow) { prow(4); anyAllRow = true; }
+    }
+    doc.comment("sigma_frame = the whole region's own sigma; sigma_row = sigma of "
+                "the row means (horizontal banding); sigma_col = sigma of the "
+                "column means (vertical striping); % is sigma / mean; pp is max - min");
+    if (anyAllRow)
+        doc.comment("the 'all' row pools every pixel regardless of plane - a "
+                    "different measurement, never a fifth plane");
+
+    // ---- section 3: the per-frame series (bulk last) ---------------------
+    doc.comment("== per-frame statistics (S1 per frame - the drift / flicker "
+                "material; resident frames only) ==");
+    for (const TExpSide& s : sides) {
+        if (!s.t.isStack) continue;
+        ExportDoc sub(delim);
+        PerFrameBlock r = exportPerFrameBlock(s.doc->seqId, sub);
+        char reg[96];
+        if (r.roiUsed) snprintf(reg, sizeof reg, "ROI (%d,%d) %dx%d", r.rx, r.ry, r.rw, r.rh);
+        else snprintf(reg, sizeof reg, "whole frame (%dx%d)", r.rw, r.rh);
+        int expected = std::max(s.t.expected, r.rows + r.skipped);
+        char b[384];
+        snprintf(b, sizeof b, "-- side %s: %s  |  region: %s  |  resident %d of %d "
+                              "frame(s) --",
+                 s.letter.c_str(), abDocLabel(s.doc).c_str(), reg, r.rows, expected);
+        doc.comment(b);
+        if (r.rows) doc.out += sub.out;
+        else doc.comment("(no resident frames)");
+    }
+    return doc.out;
+}
+
+// The Temporal panel's export surface: one builder, two sinks. This replaced
+// the per-frame-only "Copy per-frame stats": the numbers a report needs
+// travel together (docs/export-design.md).
+static void temporalExportButtons() {
+    if (ImGui::SmallButton("Copy (TSV)")) {
+        std::string s = buildTemporalExport('\t');
+        if (s.empty()) toast("nothing to export", true);
+        else {
+            ImGui::SetClipboardText(s.c_str());
+            toast("temporal + profile statistics copied (TSV)");
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("temporal summary, H/V profile statistics and the\n"
+                          "per-frame table as ONE tab-separated document with a\n"
+                          "provenance header - every section a rectangle, for\n"
+                          "Excel. Covers every compare side that is on screen.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(app.texportDlg != nullptr);
+    if (ImGui::SmallButton("Save (CSV)...")) {
+        std::string s = buildTemporalExport(',');
+        if (s.empty()) toast("nothing to export", true);
+        else if (!pfd::settings::available())
+            toast("no file-dialog backend found (install zenity or kdialog)", true);
+        else {
+            // built NOW: the numbers may change while the OS dialog is open
+            app.pendingTexport = std::move(s);
+            app.texportDlg = std::make_unique<pfd::save_file>(
+                "Save temporal statistics (CSV)", "temporal_stats.csv",
+                std::vector<std::string>{ "CSV (*.csv)", "*.csv" });
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the same document as Copy (TSV), comma-separated,\n"
+                          "to a file - the content is built when you click,\n"
+                          "exactly like Export curves.");
+}
+
+// The "x axis..." popup: paste a comma / space / tab separated list of numbers
+// and the Temporal chart plots the per-frame curve against THAT instead of the
+// frame index - frames of a stack usually correspond to a physical quantity
+// (elapsed time, exposure, temperature), and with a real axis the drift chart
+// becomes a measurement plot. Name + unit + values, applied per STACK
+// (each stack has its own axis or none), session-saved.
+static void frameAxisPopupButton(ImageDoc* im) {
+    if (!im || im->seqId == 0) return;
+    if (ImGui::SmallButton("x axis..."))
+        ImGui::OpenPopup("temporal_xaxis");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("plot the per-frame curve against a real quantity\n"
+                          "(elapsed time, exposure, temperature...): paste one\n"
+                          "value per frame, comma / space / tab separated.\n"
+                          "Applies to THIS stack; each stack has its own axis.");
+    static int forSeq = -1;
+    static char nm[64], un[32];
+    static char vbuf[16384];
+    static std::string err;
+    if (ImGui::BeginPopup("temporal_xaxis")) {
+        App::SeqInfo* si = seqInfo(im->seqId);
+        if (forSeq != im->seqId) {          // (re)seed from the stack on open
+            forSeq = im->seqId;
+            err.clear();
+            snprintf(nm, sizeof nm, "%s", si ? si->axisName.c_str() : "");
+            snprintf(un, sizeof un, "%s", si ? si->axisUnit.c_str() : "");
+            vbuf[0] = 0;
+            if (si) {
+                std::string s;
+                for (size_t i = 0; i < si->axisVals.size(); i++) {
+                    if (i) s += ", ";
+                    s += fmtExact(si->axisVals[i]);
+                }
+                snprintf(vbuf, sizeof vbuf, "%s", s.c_str());
+            }
+        }
+        int n = (int)framesOfSeq(im->seqId).size();
+        int N = si ? std::max(si->expectedFrames, n) : n;
+        ImGui::TextDisabled("x axis for %s: one value per frame (%d expected)",
+                            abDocLabel(im).c_str(), N);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+        ImGui::InputText("name", nm, sizeof nm);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        ImGui::InputText("unit", un, sizeof un);
+        ImGui::InputTextMultiline("##axisvals", vbuf, sizeof vbuf,
+                                  ImVec2(ImGui::GetFontSize() * 22, ImGui::GetFontSize() * 6));
+        if (ImGui::Button("Apply")) {
+            std::string e;
+            if (applyFrameAxis(im->seqId, nm, un, vbuf, e)) {
+                err.clear();
+                forSeq = -1;
+                toast("x axis applied: " + std::string(nm) + " (" + un + ")");
+                ImGui::CloseCurrentPopup();
+            } else err = e;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!si || si->axisVals.empty());
+        if (ImGui::Button("Clear")) {
+            if (si) { si->axisName.clear(); si->axisUnit.clear(); si->axisVals.clear(); }
+            err.clear();
+            forSeq = -1;
+            toast("x axis cleared: frame index");
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        if (!err.empty()) {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26);
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", err.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::EndPopup();
+    } else if (forSeq == im->seqId) forSeq = -1;   // closed: reseed next open
 }
 
 // What the Temporal chart actually laid out, last frame. This machine cannot
@@ -12596,12 +13269,9 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[A: %s, B: %s - %s]",
                            regionOf(A), regionOf(B),
                            A.fromServer || B.fromServer ? "server + local" : "local");
-    if (A.isStack) {   // there are no per-frame rows to copy off a lone frame
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("One row per resident frame of A's stack, tab-separated.");
-    }
+    ImGui::SameLine();
+    temporalExportButtons();   // covers every side on screen, not only A
+    if (A.isStack) { ImGui::SameLine(); frameAxisPopupButton(im); }
     // B's server aggregate is never fired automatically - one explicit press,
     // one remote job (docs/ab-stats-plan.md 4).
     if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
@@ -12648,12 +13318,49 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     const float tblWant = rowH * (3 * nPlanes + 1)      // + the header row
                         + gst.ScrollbarSize             // ScrollX reserves one
                         + gst.CellPadding.y * 2;
+    // ---- custom per-frame x axes, one per slot's stack. ONE plot has ONE x
+    // axis: the custom axis is used only when every slot that has a curve
+    // carries the same QUANTITY (same name and unit - the values may differ,
+    // that is the point of plotting them together); otherwise everything falls
+    // back to the frame index and a notice says why, rather than plotting
+    // incommensurables on one line. Decided here because that notice is one of
+    // the lines the table must leave room for.
+    auto axHasCurve = [](const AbTemporal& t) {
+        return t.mean && t.idx && t.mean->size() >= 2 && t.idx->size() >= 2;
+    };
+    std::vector<const ImageDoc*> axDocs = { im, Bim };
+    std::vector<bool> axHas = { axHasCurve(A), axHasCurve(B) };
+    std::vector<std::string> axLetters = { "A", "B" };
+    for (const TExtra& x : XS) {
+        axDocs.push_back(x.doc);
+        axHas.push_back(axHasCurve(x.t));
+        axLetters.push_back(x.letter);
+    }
+    std::vector<FrameAxis> axs(axDocs.size());
+    for (size_t i = 0; i < axDocs.size(); i++)
+        if (axDocs[i] && axDocs[i]->seqId != 0)
+            axs[i] = frameAxisOf(axDocs[i]->seqId);
+    bool axAny = false, axUse = false;
+    std::string axLabel;
+    {
+        bool all = true, first = true;
+        std::string n0, u0;
+        for (size_t i = 0; i < axDocs.size(); i++) {
+            if (!axHas[i]) continue;
+            if (!axs[i].custom) { all = false; continue; }
+            axAny = true;
+            if (first) { n0 = axs[i].name; u0 = axs[i].unit; axLabel = axs[i].label; first = false; }
+            else if (axs[i].name != n0 || axs[i].unit != u0) all = false;
+        }
+        axUse = axAny && all;
+    }
     // every notice line that will follow the table, counted before it is drawn
     // (none of them wrap, so each is exactly one line)
     std::string slotDiv;    // slots whose follow-frame found no partner frame
     for (const TExtra& x : XS)
         if (x.diverged) { if (!slotDiv.empty()) slotDiv += ", "; slotDiv += x.letter; }
     int notices = 0;
+    if (axAny && !axUse) notices++;
     if (g_abFollowDiverged) notices++;
     if (!slotDiv.empty()) notices++;
     if (A.valid && B.valid && A.nPl != B.nPl) notices++;
@@ -12758,6 +13465,17 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (A.fromServer || B.fromServer)
         ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
                             B.fromServer ? "server" : "local");
+    if (axAny && !axUse) {
+        std::string what;
+        for (size_t i = 0; i < axDocs.size(); i++) {
+            if (!axHas[i]) continue;
+            if (!what.empty()) what += "; ";
+            what += axLetters[i] + ": " + (axs[i].custom ? axs[i].label : "frame index");
+        }
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "custom x axes differ (%s) - one plot has one axis: "
+                           "plotted on frame index", what.c_str());
+    }
 
     // ---- per-frame mean over time: one curve per compare slot, one axis ----
     // What each slot puts on the chart and, when it puts nothing there, WHY.
@@ -12817,8 +13535,13 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         }
         nHas++;
         for (float v : *s.t->mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        fx0 = std::min(fx0, s.t->idx->front());
-        fx1 = std::max(fx1, s.t->idx->back());
+        // min/max over the MAPPED positions, never front/back: a custom axis
+        // (temperature up and down) is legitimately non-monotonic
+        for (float ix : *s.t->idx) {
+            float x = axUse ? (float)axs[i].at(ix) : ix;
+            fx0 = std::min(fx0, x);
+            fx1 = std::max(fx1, x);
+        }
     }
     if (!nHas) {
         // Nothing to plot on ANY side. Say which side and why, rather than
@@ -12851,17 +13574,22 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         std::vector<ImVec2> pts;
         pts.reserve(s.t->mean->size());
-        for (size_t i = 0; i < s.t->mean->size() && i < s.t->idx->size(); i++)
-            pts.push_back(tp.at((*s.t->idx)[i], (*s.t->mean)[i]));
+        for (size_t i = 0; i < s.t->mean->size() && i < s.t->idx->size(); i++) {
+            float x = axUse && si < axs.size() ? (float)axs[si].at((*s.t->idx)[i])
+                                               : (*s.t->idx)[i];
+            pts.push_back(tp.at(x, (*s.t->mean)[i]));
+        }
         if (pts.size() < 2) return;
         dl->AddPolyline(pts.data(), (int)pts.size(), ink, 0, 1.5f);
         if (si < sizeof g_tchart.pts / sizeof g_tchart.pts[0])
             g_tchart.pts[si] = (int)pts.size();
     };
-    auto marker = [&](const PlotRect& tp, const ImageDoc* d) {
+    auto marker = [&](const PlotRect& tp, const ImageDoc* d, size_t si) {
         if (!tp.ok || !d) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        float mxp = tp.at((float)d->seqIndex, tp.ymin).x;
+        float x = axUse && si < axs.size() ? (float)axs[si].at((float)d->seqIndex)
+                                           : (float)d->seqIndex;
+        float mxp = tp.at(x, tp.ymin).x;
         dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
     };
     // the legend names only the curves that exist; the slots that have none are
@@ -12892,9 +13620,9 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                  - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
-    const char* xlab = "frame number (index in sequence)";
+    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in sequence)";
     if (!side) {
-        PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+        PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, !axUse, false, plotH);
         if (tp.ok) {
             g_tchart.plotted = true;
             g_tchart.plotTop = tp.p0.y; g_tchart.plotBot = tp.p1.y;
@@ -12903,7 +13631,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             for (size_t i = 0; i < slots.size(); i++) curve(tp, i, slots[i].ink);
             // the "you are here" marker is A's frame index, and a lone frame
             // has none - a line at 0 would name a frame of somebody's stack
-            if (A.isStack) marker(tp, im);
+            if (A.isStack) marker(tp, im, 0);
             dl->PopClipRect();
         }
         temporalLegendRow(leg, true);
@@ -12921,14 +13649,14 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                                      ImGuiWindowFlags_NoScrollWithMouse);
             drawABBand(slots[i].letter.c_str(), slots[i].label, slots[i].stale);
             {   // same limits in every panel, by construction
-                PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+                PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, !axUse, false, plotH);
                 if (tp.ok) {
                     if (!g_tchart.plotted) { g_tchart.plotted = true; g_tchart.plotTop = tp.p0.y; }
                     g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     dl->PushClipRect(tp.p0, tp.p1, true);
                     curve(tp, i, temporalSlotInk(0));   // its own panel: A's stroke
-                    marker(tp, slots[i].doc);
+                    marker(tp, slots[i].doc, i);
                     dl->PopClipRect();
                 }
             }
@@ -12959,13 +13687,12 @@ static void drawPanelTemporal() {
     if (im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
         if (drawServerTemporal(si)) {         // remote stack, computed on the server
-            // the per-frame table still works here - over the frames that are
-            // resident locally; the copy says how many that is
-            if (ImGui::SmallButton("Copy per-frame stats"))
-                copyPerFrameStats(im->seqId);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("One row per RESIDENT frame (fetched so far),\n"
-                                  "tab-separated for Excel.");
+            // the export works here too: the summary carries the server's
+            // numbers, the per-frame section covers the frames that are
+            // RESIDENT locally and says how many that is
+            temporalExportButtons();
+            ImGui::SameLine();
+            frameAxisPopupButton(im);
             return;
         }
         recomputeTemporalIfNeeded(im, app.temporal[0]);
@@ -12983,13 +13710,9 @@ static void drawPanelTemporal() {
                                 T.roiUsed ? "selected ROI" : "whole image",
                                 T.nPl > 1 ? "CFA planes" : "plane=all");
         ImGui::SameLine();
-        if (ImGui::SmallButton("Copy per-frame stats"))
-            copyPerFrameStats(im->seqId);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("One row per resident frame, tab-separated for Excel:\n"
-                              "file, path, per-plane mean and sigma [DN], and the\n"
-                              "H/V projection non-uniformity [%% of mean].\n"
-                              "Uses the selected ROI if there is one.");
+        temporalExportButtons();
+        ImGui::SameLine();
+        frameAxisPopupButton(im);
         ImGui::Separator();
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
@@ -13028,10 +13751,21 @@ static void drawPanelTemporal() {
                                    "%s%zu sample(s) had < 2 valid frames",
                                    (unsigned long long)T.nonFinite,
                                    T.dropped ? ";  " : "", T.dropped);
-            // per-frame mean over time
+            // per-frame mean over time - against the custom x axis when this
+            // stack carries one (a real quantity per frame), else frame index.
+            // Non-monotonic values are fine: the polyline follows frame order,
+            // which is why the range is min/max and never front/back.
+            FrameAxis ax = frameAxisOf(im->seqId);
+            if (!ax.why.empty())
+                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", ax.why.c_str());
             float mn = FLT_MAX, mx = -FLT_MAX;
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-            float fx0 = T.idx.empty() ? 0 : T.idx.front(), fx1 = T.idx.empty() ? 1 : T.idx.back();
+            float fx0 = FLT_MAX, fx1 = -FLT_MAX;
+            for (float ix : T.idx) {
+                float x = (float)ax.at(ix);
+                fx0 = std::min(fx0, x); fx1 = std::max(fx1, x);
+            }
+            if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
             char yl[80];
             // the per-frame mean is a LEVEL, not a noise statistic, so it is
             // legitimately pooled - but it still has to say so next to a table
@@ -13044,8 +13778,8 @@ static void drawPanelTemporal() {
             g_tchart.nSlots = 1;
             g_tchart.slot[0] = 'A';
             g_tchart.winBot = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
-            PlotRect tp = beginPlot("frame number (index in sequence)", yl,
-                                    fx0, fx1, mn, mx, true, false,
+            PlotRect tp = beginPlot(ax.label.c_str(), yl,
+                                    fx0, fx1, mn, mx, !ax.custom, false,
                                     std::max(tAvail, 70.0f * app.uiScale));
             if (tp.ok) {
                 g_tchart.plotted = true;
@@ -13054,11 +13788,11 @@ static void drawPanelTemporal() {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 dl->PushClipRect(tp.p0, tp.p1, true);
                 for (size_t i = 1; i < T.frameMean.size(); i++)
-                    dl->AddLine(tp.at(T.idx[i - 1], T.frameMean[i - 1]),
-                                tp.at(T.idx[i], T.frameMean[i]),
+                    dl->AddLine(tp.at((float)ax.at(T.idx[i - 1]), T.frameMean[i - 1]),
+                                tp.at((float)ax.at(T.idx[i]), T.frameMean[i]),
                                 IM_COL32(105, 220, 130, 255), 1.5f);
                 if (ImageDoc* c2 = cur()) {   // marker for the frame on screen
-                    float mxp = tp.at((float)c2->seqIndex, tp.ymin).x;
+                    float mxp = tp.at((float)ax.at((float)c2->seqIndex), tp.ymin).x;
                     dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y),
                                 IM_COL32(255, 184, 77, 200));
                 }
@@ -17248,6 +17982,7 @@ static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats c
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
 static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
+static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal export document, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
@@ -17492,6 +18227,8 @@ static void parseCli(int argc, char** argv) {
             g_rangeSelftest = next();
         } else if (a == "--framestats-selftest") {
             g_fstatSelftest = true;                // handled in main() after loading
+        } else if (a == "--export-tsv-selftest") {
+            g_exportTsvSelftest = next();          // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
@@ -23927,6 +24664,314 @@ int main(int argc, char** argv) {
         fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
         if (app.seqThread.joinable()) app.seqThread.join();
         return bad ? 1 : 0;
+    }
+
+    // The Temporal panel's unified export, verifiable without a human
+    // (docs/export-design.md 8). This machine cannot screenshot GL, so the
+    // assertions are on the STRING the buttons put on the clipboard: the
+    // provenance fields, the section order, the per-plane rows, the units,
+    // n-of-N honesty, the region statements (including the temporal-vs-profile
+    // mismatch a server aggregate produces), the CSV dialect - and that the
+    // numbers are the panel's own state FORMATTED, not re-derived. Plus the
+    // per-frame x axis: parsing, the count-mismatch refusal, the resolver the
+    // chart draws from, the export column and the session round-trip.
+    if (!g_exportTsvSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "texportselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        openFolder(g_exportTsvSelftest);
+        loadAll();
+        if (app.seqs.empty()) {
+            fprintf(stderr, "texportselftest: no stack loaded under %s\n",
+                    g_exportTsvSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+        const size_t npos = std::string::npos;
+        int sid = app.seqs[0].id;
+        std::vector<int> fr = framesOfSeq(sid);
+        selectImage(fr.front());
+        ImageDoc* im = cur();
+        auto has = [&](const std::string& doc2, const std::string& what) {
+            return doc2.find(what) != npos;
+        };
+
+        // ---- E1: whole image, full stack, compare off ----
+        std::string tsv = buildTemporalExport('\t');
+        fputs(tsv.c_str(), stdout);   // the document itself, for eyeballs and diffs
+        fprintf(stderr, "texportselftest: E1 document: %zu bytes, %d lines, "
+                        "stack '%s' %dx%d %s cfa=%d frames=%d\n",
+                tsv.size(), (int)std::count(tsv.begin(), tsv.end(), '\n'),
+                abDocLabel(im).c_str(), im->w, im->h, im->dtype.c_str(),
+                im->cfa, (int)fr.size());
+        check(has(tsv, "# temporal + H/V profile statistics"), "E1 title line");
+        check(has(tsv, "# app: viewer "), "E1 provenance: app + version");
+        check(has(tsv, "# sides: A"), "E1 provenance: sides listed");
+        char pb[512];
+        snprintf(pb, sizeof pb, "# A: %s  |  path: ", abDocLabel(im).c_str());
+        check(has(tsv, pb), "E1 provenance: stack name and path");
+        snprintf(pb, sizeof pb, "%dx%d %s", im->w, im->h, im->dtype.c_str());
+        check(has(tsv, pb), "E1 provenance: size and dtype");
+        check(has(tsv, "CFA: RGGB (4 planes)"), "E1 provenance: CFA pattern named");
+        snprintf(pb, sizeof pb, "frames n=%d/%d", (int)fr.size(), (int)fr.size());
+        check(has(tsv, pb), "E1 n of N on a full stack");
+        check(has(tsv, "# A temporal region: whole image") &&
+              has(tsv, "# A profile region: whole image"),
+              "E1 both regions stated, whole image");
+        size_t p1 = tsv.find("== temporal summary");
+        size_t p2 = tsv.find("== H/V profile statistics");
+        size_t p3 = tsv.find("== per-frame statistics");
+        check(p1 != npos && p2 != npos && p3 != npos && p1 < p2 && p2 < p3,
+              "E1 three sections in the designed order");
+        {   // CFA planes never mixed: one row per plane, in both scalar tables
+            bool sum4 = true, prof4 = true;
+            for (const char* pl : { "R", "Gr", "Gb", "B" }) {
+                std::string row = std::string("\nA\t") + pl + "\t";
+                size_t s2 = tsv.find(row, p1);
+                sum4 &= s2 != npos && s2 < p2;
+                size_t s3 = tsv.find(row, p2);
+                prof4 &= s3 != npos && s3 < p3;
+            }
+            check(sum4, "E1 summary: per-plane rows R/Gr/Gb/B");
+            check(prof4, "E1 profile stats: per-plane rows R/Gr/Gb/B");
+        }
+        check(has(tsv, "sigma_t [DN]") && has(tsv, "sigma_fpn [DN]") &&
+              has(tsv, "sigma_tot [DN]"), "E1 summary header units named");
+        check(has(tsv, "sigma_frame [DN]") && has(tsv, "sigma_col [%]") &&
+              has(tsv, "sigma_row [%]") && has(tsv, "mean [DN]"),
+              "E1 profile/per-frame header units named");
+        check(has(tsv, "no sigma_t^2/N subtraction"),
+              "E1 sigma_fpn states exactly what it is");
+        // every section is a rectangle: all non-# lines in a section carry the
+        // same number of cells as their header
+        auto rect = [&](const std::string& d2, size_t from, size_t to, const char* what) {
+            int want = -1;
+            bool good = true;
+            // `from` points INTO the section-marker comment line: start at the
+            // first full line after it
+            size_t i = d2.find('\n', from);
+            i = i == npos ? to : i + 1;
+            while (i < to && i < d2.size()) {
+                size_t e = d2.find('\n', i);
+                if (e == npos || e > to) e = to;
+                if (e > i && d2[i] != '#') {
+                    int tabs = (int)std::count(d2.begin() + i, d2.begin() + e, '\t');
+                    if (want < 0) want = tabs;
+                    else if (tabs != want) good = false;
+                }
+                i = e + 1;
+            }
+            check(good && want > 0, what);
+        };
+        rect(tsv, p1, p2, "E1 summary section is a rectangle");
+        rect(tsv, p2, p3, "E1 profile section is a rectangle");
+        rect(tsv, p3, tsv.size(), "E1 per-frame section is a rectangle");
+        {   // per-frame block: one row per resident frame, honesty line present
+            snprintf(pb, sizeof pb, "resident %d of %d frame(s)", (int)fr.size(),
+                     (int)fr.size());
+            check(tsv.find(pb, p3) != npos, "E1 per-frame block: resident n of N");
+        }
+
+        // ---- E2: numbers are the panel's state formatted, not re-derived ----
+        const App::TemporalState& T = app.temporal[0];
+        check(T.valid && T.seqId == sid && T.nPl == 4, "E2 fixture: temporal state valid, 4 planes");
+        {
+            char n1[48], n2[48];
+            snprintf(n1, sizeof n1, "%.9g", T.tempNoise[0]);
+            snprintf(n2, sizeof n2, "%.9g", T.fixedPattern[0]);
+            std::string sumRow = std::string("\nA\tR\t") + std::to_string(T.frames) + "\t" +
+                                 std::to_string(T.frames) + "\t" + n1 + "\t" + n2 + "\t";
+            size_t at = tsv.find(sumRow, p1);
+            fprintf(stderr, "texportselftest: E2 summary row R: sigma_t=%s sigma_fpn=%s\n",
+                    n1, n2);
+            check(at != npos && at < p2,
+                  "E2 sigma_t / sigma_fpn are temporal[0]'s numbers verbatim");
+            const App::ProjState& P = app.proj[0];
+            char m9[48], f9[48], v9[48], h9[48];
+            snprintf(m9, sizeof m9, "%.9g", P.fStat[0].mean);
+            snprintf(f9, sizeof f9, "%.9g", P.fStat[0].sd);
+            snprintf(v9, sizeof v9, "%.9g", P.vStat[0].sd);
+            snprintf(h9, sizeof h9, "%.9g", P.hStat[0].sd);
+            std::string prow = std::string("\nA\tR\t") + m9 + "\t" + f9 + "\t" + v9 + "\t" + h9 + "\t";
+            size_t pat = tsv.find(prow, p2);
+            check(pat != npos && pat < p3,
+                  "E2 profile row R is proj[0]'s stats verbatim");
+        }
+
+        // ---- E3: partial-stack honesty (n of N against the EXPECTED total) --
+        if (App::SeqInfo* si = seqInfo(sid)) si->expectedFrames = (int)fr.size() + 3;
+        {
+            std::string tsvP = buildTemporalExport('\t');
+            snprintf(pb, sizeof pb, "frames n=%d/%d", (int)fr.size(), (int)fr.size() + 3);
+            check(has(tsvP, pb), "E3 partial stack says n of N, not n of n");
+        }
+        if (App::SeqInfo* si = seqInfo(sid)) si->expectedFrames = 0;
+
+        // ---- E4: ROI selected - both regions state it, no mismatch note ----
+        {
+            App::Ann a;
+            a.id = app.nextAnnId++;
+            a.type = 0;
+            a.x = 4; a.y = 4; a.w = 32; a.h = 24;
+            a.label = "roi";
+            app.anns.push_back(a);
+            app.selectedAnn = a.id;
+            app.annRev++;
+        }
+        std::string tsvR = buildTemporalExport('\t');
+        check(has(tsvR, "# A temporal region: ROI (4,4) 32x24"),
+              "E4 temporal region states the ROI");
+        check(has(tsvR, "# A profile region: ROI (4,4) 32x24"),
+              "E4 profile region states the ROI");
+        check(!has(tsvR, "DIFFERENT regions"),
+              "E4 matching regions carry no mismatch NOTE");
+
+        // ---- E5: a server aggregate is whole-frame while the profiles follow
+        // the ROI: the export states BOTH regions and flags the mismatch ----
+        {
+            App::ServerTemporal& S = app.srvTemporal;
+            S = App::ServerTemporal{};
+            S.valid = true;
+            S.seqId = sid;
+            S.host = "testhost";
+            S.frames = (int)fr.size();
+            S.nPl = 1;
+            S.tempNoise[0] = 1.25; S.fixedPattern[0] = 2.5; S.totalNoise[0] = 2.795;
+        }
+        {
+            std::string tsvS = buildTemporalExport('\t');
+            check(has(tsvS, "# A temporal region: whole image"),
+                  "E5 server temporal region = whole image");
+            check(has(tsvS, "# A profile region: ROI (4,4) 32x24"),
+                  "E5 profile region still the ROI");
+            check(has(tsvS, "DIFFERENT regions"), "E5 mismatch NOTE present");
+            check(has(tsvS, "\tserver testhost"), "E5 source column: server + host");
+            size_t q1 = tsvS.find("== temporal summary");
+            check(q1 != npos && tsvS.find("\nA\tall\t", q1) != npos,
+                  "E5 pooled server reply labelled plane=all");
+        }
+        app.srvTemporal = App::ServerTemporal{};
+
+        // ---- E6: the CSV sink - same content, different dialect ----
+        {
+            std::string csv = buildTemporalExport(',');
+            check(std::count(csv.begin(), csv.end(), '\n') ==
+                  std::count(tsvR.begin(), tsvR.end(), '\n'),
+                  "E6 CSV and TSV have the same line count");
+            check(csv.find('\t') == npos, "E6 CSV carries no tabs");
+            check(expCell("a,b", ',') == "\"a,b\"" &&
+                  expCell("a\"b", ',') == "\"a\"\"b\"" &&
+                  expCell("a\tb", '\t') == "a b",
+                  "E6 cell quoting rules (RFC 4180 minimal / tab squash)");
+        }
+
+        // ---- E7: the per-frame x axis --------------------------------------
+        {
+            std::vector<double> v;
+            std::string err;
+            bool c1 = parseAxisValues("10,20,30,40,50", v, err) && v.size() == 5 && v[2] == 30;
+            bool c2 = parseAxisValues("10 20 30 40 50", v, err) && v.size() == 5;
+            bool c3 = parseAxisValues("10\t20\t30\t40\t50", v, err) && v.size() == 5;
+            bool c4 = parseAxisValues("10, 20\t30\n40 50", v, err) && v.size() == 5;
+            check(c1 && c2 && c3 && c4, "E7 comma / space / tab / mixed all parse");
+            bool bad = !parseAxisValues("10,20,x,40,1e", v, err);
+            fprintf(stderr, "texportselftest: E7 parse error: %s\n", err.c_str());
+            check(bad && has(err, "value 3") && has(err, "'x'") && has(err, "value 5") &&
+                  has(err, "'1e'") && v.empty(),
+                  "E7 non-numeric tokens: positioned errors, no silent skip");
+            check(!applyFrameAxis(sid, "temp", "", "10 20 30 40 50", err) &&
+                  has(err, "UNIT"), "E7 the unit is never defaulted");
+            bool mm = !applyFrameAxis(sid, "temp", "C", "10 20 30", err);
+            fprintf(stderr, "texportselftest: E7 count mismatch: %s\n", err.c_str());
+            check(mm && has(err, "3 value(s)") && has(err, "5 frame(s)"),
+                  "E7 count mismatch refused with BOTH numbers");
+            check(applyFrameAxis(sid, "temp", "C", "10, 20, 30, 40, 50", err),
+                  "E7 a complete axis applies");
+            FrameAxis ax = frameAxisOf(sid);
+            check(ax.custom && ax.label == "temp (C)" && ax.vals &&
+                  (*ax.vals)[4] == 50 && ax.at(2) == 30,
+                  "E7 the chart's resolver serves the applied values");
+            std::string tsvX = buildTemporalExport('\t');
+            check(has(tsvX, "\ttemp [C]\t"), "E7 export per-frame header carries name + unit");
+            check(has(tsvX, "\n0\t10\t") && has(tsvX, "\n4\t50\t"),
+                  "E7 export rows carry the axis value for their frame");
+            // count honesty at USE time: the resolver refuses a stale axis
+            if (App::SeqInfo* si = seqInfo(sid)) si->axisVals = { 1.0, 2.0, 3.0 };
+            FrameAxis ax2 = frameAxisOf(sid);
+            check(!ax2.custom && has(ax2.why, "3 value(s)") && has(ax2.why, "5 frame(s)"),
+                  "E7 a stale axis falls back to frame index and says why");
+            if (App::SeqInfo* si = seqInfo(sid)) si->axisVals = { 10, 20, 30, 40, 50 };
+        }
+
+        // ---- E8: the axis survives a session round-trip ----
+        {
+            std::error_code ec;
+            std::string sess = (std::filesystem::temp_directory_path(ec) /
+                                "viewer_texport.vsession").u8string();
+            saveSession(sess, true);
+            std::string lerr = loadSession(sess);
+            loadAll();
+            double tn = glfwGetTime();
+            while (glfwGetTime() - tn < 60.0 &&
+                   (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            loadAll();
+            bool found = false;
+            for (const auto& si : app.seqs)
+                if (si.axisName == "temp" && si.axisUnit == "C" &&
+                    si.axisVals.size() == 5 && si.axisVals[4] == 50)
+                    found = true;
+            fprintf(stderr, "texportselftest: E8 reloaded %zu stack(s), load err '%s'\n",
+                    app.seqs.size(), lerr.c_str());
+            check(lerr.empty() && found, "E8 x axis survives a session round-trip");
+            std::filesystem::remove(std::filesystem::u8path(sess), ec);
+        }
+
+        // ---- E9: compare on - every side rides along under its letter ----
+        if (app.seqs.size() >= 2) {
+            selectImage(framesOfSeq(app.seqs[0].id).front());
+            std::vector<int> frB = framesOfSeq(app.seqs[1].id);
+            app.compareRangeMode = 1;
+            setCompareB(app.images[frB.front()].get());
+            app.compareMode = App::CmpSplit;
+            std::string tsv2 = buildTemporalExport('\t');
+            check(has(tsv2, "# sides: A, B"), "E9 sides list carries B");
+            size_t q1 = tsv2.find("== temporal summary");
+            size_t q2 = tsv2.find("== H/V profile statistics");
+            size_t q3 = tsv2.find("== per-frame statistics");
+            check(q1 != npos && q2 != npos && tsv2.find("\nB\tR\t", q1) != npos &&
+                  tsv2.find("\nB\tR\t", q1) < q2, "E9 summary: B's plane rows present");
+            check(q2 != npos && q3 != npos && tsv2.find("\nB\tR\t", q2) != npos &&
+                  tsv2.find("\nB\tR\t", q2) < q3, "E9 profile stats: B rows present");
+            check(q3 != npos && tsv2.find("-- side B:", q3) != npos,
+                  "E9 per-frame block for B present");
+            char nb[48];
+            snprintf(nb, sizeof nb, "%.9g", app.temporal[1].tempNoise[0]);
+            check(has(tsv2, std::string("\nB\tR\t") + std::to_string(app.temporal[1].frames) +
+                            "\t" + std::to_string(app.temporal[1].frames) + "\t" + nb + "\t"),
+                  "E9 B's sigma_t is temporal[1]'s number, not A's relabelled");
+            check(app.temporal[1].tempNoise[0] != app.temporal[0].tempNoise[0],
+                  "E9 fixture: A and B really differ");
+            app.compareMode = App::CmpOff;
+        } else check(false, "E9 needs 2 stacks under the fixture dir");
+
+        fprintf(stderr, "texportselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+        return ok ? 0 : 1;
     }
 
     // The per-frame table, verifiable without a human: load the stack given on
