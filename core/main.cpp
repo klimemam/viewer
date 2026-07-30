@@ -1411,10 +1411,14 @@ static void swapCompare() {
 enum AbRowItem {
     AbSetB,        // a different image: it can become B
     AbSwap,        // this row IS A and a B exists: swapping is the useful move
-    AbSwapNoB      // this row IS A and there is no B yet: nothing to swap with
+    AbSwapNoB,     // this row IS A, compare is ON, but there is no B yet
+    AbNone         // this row IS A and compare is OFF: no A/B item at all -
+                   // a greyed "Swap" about a mode that is not running reads
+                   // as broken, not as disabled (user report, 2026-07-30)
 };
 static AbRowItem abRowItem(const ImageDoc* pick) {
     if (pick != cur()) return AbSetB;
+    if (app.compareMode == App::CmpOff) return AbNone;
     return cmpB() ? AbSwap : AbSwapNoB;
 }
 
@@ -15219,6 +15223,8 @@ static void drawFileList() {
                 ImGui::SetTooltip("This row is A - the image on screen, so it cannot\n"
                                   "also be B. Right-click a DIFFERENT row to set B.");
             break;
+        case AbNone:
+            break;
         }
     };
     // Group by source folder. Opening a folder of folders gives one stack per
@@ -22326,8 +22332,11 @@ int main(int argc, char** argv) {
                         (int)abRowItem(app.images[fb.front()].get()));
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 another row offers Set as compare B");
-                check(abRowItem(app.images[fa.front()].get()) == AbSwapNoB,
-                      "A7 the current row offers the swap, not a dead Set-as-B");
+                // With compare OFF the current row now offers NOTHING - a
+                // greyed "Swap" about a mode that is not running read as
+                // broken (user report). AbSwapNoB is only for compare-on.
+                check(abRowItem(app.images[fa.front()].get()) == AbNone,
+                      "A7 compare off: the current row offers no dead item");
                 // ...and turning compare on changes NOTHING about another row:
                 // the user read the greying as "compare has to be armed first".
                 app.compareMode = App::CmpWipe;
