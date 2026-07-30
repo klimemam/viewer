@@ -1159,6 +1159,7 @@ static void stopRbWorker();
 static std::string bootstrapScript();
 static std::string updateScript();
 static void startRemote(App::BrowseInstance& I, const std::string& hostSpec);
+static void sessionRestoreBrowsePlace(int num, const std::string& url);
 static void drawPanelRemote(App::BrowseInstance& I);
 static bool deployPeer(const std::string& host, int port, bool force, std::string& log);
 static bool isNpyName(const std::string& n);
@@ -4112,6 +4113,19 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
       << (app.showProjection ? 1 : 0) << " " << (app.showLinearity ? 1 : 0) << " "
       << (app.showRemote ? 1 : 0) << "\n";
+    // Browse places (docs/todo-open.md item 10, user decision A5: auto-
+    // reconnect): one "rbplace <num> <url>" line per instance that stands
+    // somewhere. placeUrl keeps the port. On load each instance reconnects
+    // THROUGH ITS OWN WORKER, asynchronously - the UI never blocks on ssh,
+    // and a failure lands inline in that instance's error band. The num keeps
+    // "Browse 2###Browse2" the same window the saved layout dock knows.
+    // Unknown keys are skipped by older viewers, so this is additive.
+    for (const auto& bp : app.browsePanels) {
+        const App::RemoteBrowse& pb = bp->b;
+        if (!pb.connected && pb.host.empty() && pb.dir == "~") continue;
+        f << "rbplace " << bp->num << " "
+          << placeUrl(pb.host, pb.port, pb.dir) << "\n";
+    }
     // the whole dock arrangement, so a session reopens looking like it did
     if (const char* ini = ImGui::SaveIniSettingsToMemory()) {
         f << "layout_begin\n";
@@ -4587,6 +4601,14 @@ static std::string loadSession(const std::string& path) {
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
             app.showProjection = g2 != 0; app.showLinearity = h2 != 0; app.showRemote = i2 != 0;
+        }
+        else if (key == "rbplace") {
+            // "<num> <url>": where a Browse instance stood (item 10, A5).
+            // Reconnects asynchronously through that instance's own worker;
+            // a failure shows inline in that instance, never a global dialog.
+            int n = 1;
+            ls >> n;
+            sessionRestoreBrowsePlace(n, restOfLine(ls));
         }
         else if (key == "layout_begin") {
             std::string ini, l2;
@@ -7529,6 +7551,21 @@ static void goToPlace(App::BrowseInstance& I, const std::string& url) {
     j.port = port;
     j.dir = path;
     rbEnqueue(I, std::move(j));
+}
+
+// One session "rbplace <num> <url>" line, applied: put that instance back on
+// its place and reconnect it through ITS OWN worker (item 10, decision A5 -
+// auto-reconnect, asynchronously; the UI never blocks on ssh, and a failure
+// lands inline in that instance's error band). Shared by the session reader
+// and the keys selftest's round-trip op, so the two cannot drift apart.
+static void sessionRestoreBrowsePlace(int num, const std::string& url) {
+    if (url.empty()) return;
+    App::BrowseInstance* I = num <= 1 ? &rbMain() : rbFindNum(num);
+    if (!I) {
+        I = &rbNewInstance(num);
+        I->focusReq = false;          // a restore is not a focus request
+    }
+    goToPlace(*I, url);
 }
 
 // Kick a server-side recursive find; the result lands in I.search through
@@ -17632,8 +17669,12 @@ static std::string g_browseKeysActs =
     // focus back on panel 1: the same keys now move ITS cursor, and panel 2's
     // (reset to -1 by its own navigation) stays put
     "focus,chkfocus:1,down,chkcursor:0,target:2,chkcursor:-1,"
+    // a session round-trip (item 10, decision A5): both places are written as
+    // rbplace lines, every instance is torn down, and the restore reconnects
+    // BOTH - each through its own worker - to where they stood
+    "sessrt,chkpanels:2,target:1,waitdir:rb,target:2,waitdir:10lx,"
     // closing the second leaves the first fully working...
-    "closep,chkpanels:1,target:1,chkdir:rb,focus,down,"
+    "closep,chkpanels:1,target:1,chkdir:rb,focus,down,down,"
     "chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
     // ...and the LAST one closing only hides: View > Panels > Browse reopens
     // it with its place, listing and cursor intact
@@ -25461,6 +25502,38 @@ int main(int argc, char** argv) {
                         int nsel = 0;
                         for (char c2 : rbKeysT().sel) if (c2) nsel++;
                         chk(nsel == arg, "sel=" + std::to_string(nsel));
+                    }
+                    else if (a == "sessrt") {
+                        // item 10 round-trip: write the session, tear every
+                        // instance down, then replay the rbplace lines through
+                        // the SAME helper the session reader uses. The checks
+                        // that follow prove both instances reconnect - through
+                        // their own workers - to the places they stood at.
+                        std::ostringstream ss2;
+                        writeSessionTo(ss2);
+                        std::vector<std::pair<int, std::string>> places;
+                        std::istringstream is2(ss2.str());
+                        std::string l2;
+                        while (std::getline(is2, l2))
+                            if (l2.rfind("rbplace ", 0) == 0) {
+                                std::istringstream pl(l2.substr(8));
+                                int n2 = 0;
+                                pl >> n2;
+                                std::string u2;
+                                std::getline(pl, u2);
+                                while (!u2.empty() && u2.front() == ' ') u2.erase(0, 1);
+                                places.emplace_back(n2, u2);
+                            }
+                        while (app.browsePanels.size() > 1)
+                            rbDestroyInstance(app.browsePanels.back()->num);
+                        rbMain().b = App::RemoteBrowse{};
+                        rbTreeForget(rbMain());
+                        fprintf(stderr, "browsekeys: sessrt saved %d rbplace "
+                                        "line(s), all instances torn down\n",
+                                (int)places.size());
+                        for (auto& pr : places)
+                            sessionRestoreBrowsePlace(pr.first, pr.second);
+                        g_rbKeysTarget = 1;
                     }
                     // --------------------------------------------------------
                     else if (a == "rawopen") {
