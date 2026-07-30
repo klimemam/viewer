@@ -14577,6 +14577,455 @@ static void drawPanelRemote() {
     ImGui::PopID();
 }
 
+// ==== derive a stack from a stack (docs/todo-open.md item 0) ================
+// A NEW stack from a subset of an existing one, so two stacks with mismatched
+// membership can be lined up and compared frame by frame. COPY-ONLY by user
+// decision: the source stays intact, and a chosen frame's pixels are copied
+// from the resident ImageDoc - NEVER re-read from disk and NEVER re-fetched
+// from the remote. A re-fetch would give remote-sourced stacks a second code
+// path and a second answer to the same question, which is the defect class
+// TODO_one_implementation.md exists to stamp out. One path, both origins.
+//
+// The structure is deliberately two-phase, because the copy is a stopgap for
+// reference-sharing (one frame in several stacks, which today's single
+// ImageDoc::seqId forbids):
+//   - buildDerivePlan  = WHICH frames are chosen (pure, no mutation)
+//   - applyDerivePlan  = HOW a chosen frame becomes a member; the copy lives
+//     in materializeDerivedFrame and ONLY there, so replacing copies with
+//     references replaces one function, not the dialog and not the tests.
+
+// One member of a stack, as the FILE LIST knows it. For a remote folder stack
+// the membership is SeqInfo::remoteFiles - matching must work before (or
+// whether) the frames arrive, or the feature is useless exactly where it is
+// needed. imageIdx then says whether that member is actually resident; a
+// decimated preview (remoteStep > 1) is not pixels and does not count.
+struct DeriveEntry {
+    std::string base;             // basename: the name-matching key
+    int seqIndex = 0;             // the frame number: the number-matching key
+    int imageIdx = -1;            // index into app.images, or -1 = not resident
+};
+static std::vector<DeriveEntry> stackMembers(int seqId) {
+    std::vector<DeriveEntry> out;
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (si && !si->remoteFiles.empty()) {
+        for (int i = 0; i < (int)si->remoteFiles.size(); i++)
+            out.push_back({ baseName(si->remoteFiles[i]), i, -1 });
+        for (int k = 0; k < (int)app.images.size(); k++) {
+            const ImageDoc* d = app.images[k].get();
+            if (d->seqId != seqId || d->remoteStep > 1) continue;
+            for (auto& e : out)
+                if (e.seqIndex == d->seqIndex && e.imageIdx < 0) { e.imageIdx = k; break; }
+        }
+    } else {
+        for (int k = 0; k < (int)app.images.size(); k++) {
+            const ImageDoc* d = app.images[k].get();
+            if (d->seqId != seqId || d->remoteStep > 1) continue;
+            out.push_back({ baseName(d->path.empty() ? d->name : d->path),
+                            d->seqIndex, k });
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const DeriveEntry& a, const DeriveEntry& b) {
+                      return a.seqIndex < b.seqIndex;
+                  });
+    }
+    return out;
+}
+
+// The matching rules item 0 lists. Hand-picked is the required escape hatch.
+enum { DR_NAME_IN = 0, DR_NAME_OUT, DR_IDX_IN, DR_IDX_OUT, DR_RANGE, DR_PICK };
+
+struct DerivePlan {
+    int srcSeqId = 0, otherSeqId = 0, rule = DR_NAME_IN;
+    int lo = 0, hi = 0;                    // DR_RANGE, inclusive
+    struct Pick { int srcImageIdx; int newIndex; std::string base; };
+    std::vector<Pick> picks;               // resident frames to copy, in order
+    // Counts in BOTH directions, computed against the membership lists above.
+    // One-directional counts read as "aligned" when they are not.
+    int srcKnown = 0;                      // members known here (file list or resident)
+    int srcMatched = 0;                    // members the rule takes
+    int pairs = 0;                         // members with a counterpart over there
+    int otherKnown = 0, otherUnmatched = 0;
+    int notResident = 0;                   // taken by the rule, but not loaded:
+                                           // REPORTED and left out, never fetched
+    // per-source-member echo for the dialog's table (parallel to stackMembers)
+    std::vector<char> taken;
+    std::vector<int> newIndexOf;           // -1 = not taken
+};
+
+// WHICH frames are chosen. Pure: reads memberships, mutates nothing.
+// DR_NAME_IN adopts the OTHER stack's frame number for each matched name:
+// two stacks that were renumbered by their own opens (a stack with missing
+// files loads as a contiguous 0..n-1) pair the WRONG files silently today -
+// after adoption, the same name carries the same number on both sides, which
+// is what lets compareFollowFrame stop diverging. Every other rule keeps the
+// source's numbers (there is no counterpart to adopt).
+static DerivePlan buildDerivePlan(int srcSeqId, int rule, int otherSeqId,
+                                  int lo, int hi, const std::vector<char>* pick) {
+    DerivePlan P;
+    P.srcSeqId = srcSeqId; P.rule = rule; P.otherSeqId = otherSeqId;
+    P.lo = lo; P.hi = hi;
+    std::vector<DeriveEntry> src = stackMembers(srcSeqId);
+    P.srcKnown = (int)src.size();
+    std::vector<DeriveEntry> oth;
+    if (rule <= DR_IDX_OUT) {
+        oth = stackMembers(otherSeqId);
+        P.otherKnown = (int)oth.size();
+    }
+    // an other-side member pairs with AT MOST ONE member here, so duplicate
+    // basenames stay honest and the reverse count stays exact
+    std::vector<char> used(oth.size(), 0);
+    P.taken.assign(src.size(), 0);
+    P.newIndexOf.assign(src.size(), -1);
+    for (int i = 0; i < (int)src.size(); i++) {
+        const DeriveEntry& e = src[i];
+        bool take = false;
+        int newIndex = e.seqIndex;
+        int j = -1;
+        switch (rule) {
+        case DR_NAME_IN: case DR_NAME_OUT:
+            for (int k = 0; k < (int)oth.size(); k++)
+                if (!used[k] && oth[k].base == e.base) { j = k; break; }
+            take = (rule == DR_NAME_IN) == (j >= 0);
+            if (j >= 0) { used[j] = 1; P.pairs++; }
+            if (rule == DR_NAME_IN && j >= 0) newIndex = oth[j].seqIndex;
+            break;
+        case DR_IDX_IN: case DR_IDX_OUT:
+            for (int k = 0; k < (int)oth.size(); k++)
+                if (!used[k] && oth[k].seqIndex == e.seqIndex) { j = k; break; }
+            take = (rule == DR_IDX_IN) == (j >= 0);
+            if (j >= 0) { used[j] = 1; P.pairs++; }
+            break;
+        case DR_RANGE: take = e.seqIndex >= lo && e.seqIndex <= hi; break;
+        case DR_PICK:  take = pick && i < (int)pick->size() && (*pick)[i]; break;
+        }
+        if (!take) continue;
+        P.srcMatched++;
+        P.taken[i] = 1;
+        P.newIndexOf[i] = newIndex;
+        if (e.imageIdx < 0) { P.notResident++; continue; }
+        P.picks.push_back({ e.imageIdx, newIndex, e.base });
+    }
+    for (char u : used) if (!u) P.otherUnmatched++;
+    std::sort(P.picks.begin(), P.picks.end(),
+              [](const DerivePlan::Pick& a, const DerivePlan::Pick& b) {
+                  return a.newIndex < b.newIndex;
+              });
+    return P;
+}
+
+// The rule, in words - it goes into the derived stack's NAME (the montage
+// naming is the precedent: a derived thing names its origin and its rule).
+static std::string deriveRuleText(const DerivePlan& P) {
+    const App::SeqInfo* o = seqInfo(P.otherSeqId);
+    const std::string on = o ? "\"" + o->name + "\"" : "?";
+    char b[64];
+    switch (P.rule) {
+    case DR_NAME_IN:  return "same names as " + on;
+    case DR_NAME_OUT: return "names not in " + on;
+    case DR_IDX_IN:   return "same frame numbers as " + on;
+    case DR_IDX_OUT:  return "frame numbers not in " + on;
+    case DR_RANGE:    snprintf(b, sizeof b, "frames %d\xE2\x80\xA5%d", P.lo, P.hi);
+                      return b;
+    default:          return "picked by hand";
+    }
+}
+
+// HOW a chosen frame becomes a member: TODAY, a deep copy of the resident
+// pixels. This is the single function reference-sharing will replace.
+static ImageDoc* materializeDerivedFrame(const ImageDoc& s, int seqId, int seqIndex,
+                                         int batchId, const std::string& note) {
+    auto d = std::make_unique<ImageDoc>();
+    d->name = s.name; d->path = s.path; d->dtype = s.dtype;
+    d->w = s.w; d->h = s.h; d->ch = s.ch;
+    d->data = s.data;                     // the pixels, copied from RAM
+    d->vmin = s.vmin; d->vmax = s.vmax;
+    d->black = s.black; d->white = s.white;   // frames stay directly comparable
+    d->cfa = s.cfa; d->cfaPattern = s.cfaPattern; d->cfaColorize = s.cfaColorize;
+    d->rawDtype = s.rawDtype; d->rawInterp = s.rawInterp;
+    d->rawOffset = s.rawOffset; d->rawLE = s.rawLE;
+    d->srcW = s.srcW; d->srcH = s.srcH; d->cropX = s.cropX; d->cropY = s.cropY;
+    d->displayLut = s.displayLut;
+    d->npzMember = s.npzMember;
+    d->remoteUrl = s.remoteUrl; d->remoteFrame = s.remoteFrame;  // provenance only
+    d->note = note;    // the SAME note on every frame: a stack-constant row, so
+                       // the Inspector never gains or loses a line mid-stack
+    d->seqId = seqId; d->seqIndex = seqIndex; d->batchId = batchId;
+    d->texDirty = true;
+    d->uid = app.nextUid++;
+    ImageDoc* out = d.get();
+    app.images.push_back(std::move(d));
+    app.imagesRev++;
+    return out;
+}
+
+// Create the derived stack. Returns its seqId, or 0 when there is nothing to
+// copy. The source is not touched. The derived stack joins NO series - the
+// canon says membership is explicit (Series::members is the only truth), and a
+// derived stack is a different measurement subject. expectedFrames = what was
+// actually copied: the stack is complete AS ITSELF; what the rule matched but
+// could not copy is said in the note and by the caller, not smuggled into n/N.
+static int applyDerivePlan(const DerivePlan& P, bool intoNewBatch) {
+    const App::SeqInfo* src = seqInfo(P.srcSeqId);
+    if (!src || P.picks.empty()) return 0;
+    const std::string srcName = src->name;
+    const std::string rule = deriveRuleText(P);
+    App::SeqInfo si;
+    si.id = app.nextSeqId++;
+    si.cfaType = src->cfaType; si.cfaPattern = src->cfaPattern;  // planes travel;
+                                                    // whole frames, never mixed
+    si.expectedFrames = (int)P.picks.size();
+    // No remote fields on purpose: every member is resident by construction,
+    // so the derived stack behaves identically whether the source was local
+    // or remote - same panels, same measurements, same answers.
+    char nm[512];
+    snprintf(nm, sizeof nm, "%s (%s: %d of %d)", srcName.c_str(), rule.c_str(),
+             (int)P.picks.size(), P.srcKnown);
+    si.name = nm;
+    int batchId = app.images[P.picks[0].srcImageIdx]->batchId;
+    if (intoNewBatch)
+        batchId = newBatch(uniqueBatchName(batchNameOf(batchId) + " (derived)"));
+    std::string note = "derived from \"" + srcName + "\" - " + rule + ": " +
+                       std::to_string((int)P.picks.size()) + " of " +
+                       std::to_string(P.srcKnown) + " frame(s) copied";
+    if (P.notResident > 0)
+        note += "; " + std::to_string(P.notResident) +
+                " matched frame(s) were not loaded and were left out";
+    app.seqs.push_back(si);            // `src` may dangle past this line
+    for (const auto& pk : P.picks)
+        materializeDerivedFrame(*app.images[pk.srcImageIdx], si.id, pk.newIndex,
+                                batchId, note);
+    return si.id;
+}
+
+// ---- the dialog ------------------------------------------------------------
+struct DeriveModalState {
+    bool open = false;
+    int srcSeqId = 0;
+    int rule = DR_NAME_IN;
+    int otherSeqId = 0;
+    int lo = 0, hi = 0;
+    bool intoNewBatch = false;
+    std::vector<char> pick;               // DR_PICK, parallel to stackMembers(src)
+};
+static DeriveModalState g_derive;
+
+static void deriveModalOpen(int seqId) {
+    DeriveModalState& D = g_derive;
+    D = DeriveModalState();
+    D.srcSeqId = seqId;
+    // the other stack defaults to B's stack when B is pinned - lining a stack
+    // up against B is the reason this dialog exists
+    for (const auto& d : app.images)
+        if (app.compareBUid && d->uid == app.compareBUid && d->seqId != 0 &&
+            d->seqId != seqId) { D.otherSeqId = d->seqId; break; }
+    if (!D.otherSeqId)
+        for (const auto& s : app.seqs)
+            if (s.id != seqId) { D.otherSeqId = s.id; break; }
+    std::vector<DeriveEntry> ms = stackMembers(seqId);
+    D.pick.assign(ms.size(), 1);
+    D.lo = 0;
+    D.hi = 0;
+    for (const auto& e : ms) D.hi = std::max(D.hi, e.seqIndex);
+    if (!D.otherSeqId) D.rule = DR_RANGE;   // nothing to match against
+    D.open = true;
+}
+
+static void drawDeriveModal() {
+    DeriveModalState& D = g_derive;
+    const char* POPUP = "Derive stack###derivemodal";
+    if (D.open && !ImGui::IsPopupOpen(POPUP)) ImGui::OpenPopup(POPUP);
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(600 * app.uiScale, 560 * app.uiScale),
+                             ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(POPUP, nullptr, ImGuiWindowFlags_None)) return;
+    if (!D.open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+    const App::SeqInfo* src = seqInfo(D.srcSeqId);
+    if (!src) {   // the source stack was closed under the dialog
+        D.open = false;
+        ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+        return;
+    }
+    std::vector<DeriveEntry> ms = stackMembers(D.srcSeqId);
+    if (D.pick.size() != ms.size()) D.pick.resize(ms.size(), 1);
+    int resident = 0;
+    for (const auto& e : ms) if (e.imageIdx >= 0) resident++;
+    ImGui::TextWrapped("from: %s", src->name.c_str());
+    int expected = std::max(src->expectedFrames, (int)ms.size());
+    if (resident < expected)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                           "%d of %d frame(s) loaded - matching uses the file list, "
+                           "but only loaded frames can be copied", resident, expected);
+    else
+        ImGui::TextDisabled("%d frame(s), all loaded", resident);
+    ImGui::Separator();
+
+    // the rule (item 0's list; hand-picked is the escape hatch)
+    bool haveOther = false;
+    for (const auto& s : app.seqs) if (s.id != D.srcSeqId) { haveOther = true; break; }
+    ImGui::BeginDisabled(!haveOther);
+    ImGui::RadioButton("keep frames whose file name is also in the other stack",
+                       &D.rule, DR_NAME_IN);
+    ImGui::RadioButton("keep frames whose file name is NOT in the other stack",
+                       &D.rule, DR_NAME_OUT);
+    ImGui::RadioButton("keep frames whose frame number is also in the other stack",
+                       &D.rule, DR_IDX_IN);
+    ImGui::RadioButton("keep frames whose frame number is NOT in the other stack",
+                       &D.rule, DR_IDX_OUT);
+    ImGui::EndDisabled();
+    if (!haveOther)
+        ImGui::TextDisabled("(no other stack is open to match against)");
+    ImGui::RadioButton("keep a frame number range", &D.rule, DR_RANGE);
+    ImGui::RadioButton("pick frames by hand", &D.rule, DR_PICK);
+
+    if (D.rule <= DR_IDX_OUT) {
+        // the other stack. B's stack is the prefill; any stack can be chosen.
+        const App::SeqInfo* osel = seqInfo(D.otherSeqId);
+        if (!osel || D.otherSeqId == D.srcSeqId) {
+            D.otherSeqId = 0;
+            for (const auto& s : app.seqs)
+                if (s.id != D.srcSeqId) { D.otherSeqId = s.id; break; }
+            osel = seqInfo(D.otherSeqId);
+        }
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22);
+        if (ImGui::BeginCombo("other stack", osel ? osel->name.c_str() : "-")) {
+            for (const auto& s : app.seqs) {
+                if (s.id == D.srcSeqId) continue;
+                char lb[360];
+                snprintf(lb, sizeof lb, "%s###drv%d", s.name.c_str(), s.id);
+                if (ImGui::Selectable(lb, s.id == D.otherSeqId)) D.otherSeqId = s.id;
+            }
+            ImGui::EndCombo();
+        }
+        if (const App::SeqInfo* o2 = seqInfo(D.otherSeqId)) {
+            std::vector<DeriveEntry> oms = stackMembers(D.otherSeqId);
+            int ores = 0;
+            for (const auto& e : oms) if (e.imageIdx >= 0) ores++;
+            int oexp = std::max(o2->expectedFrames, (int)oms.size());
+            if (ores < oexp)
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                                   "other stack: %d of %d frame(s) loaded", ores, oexp);
+        }
+    } else if (D.rule == DR_RANGE) {
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+        ImGui::InputInt("from##drlo", &D.lo);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+        ImGui::InputInt("to (frame numbers, inclusive)##drhi", &D.hi);
+    }
+
+    DerivePlan P = buildDerivePlan(D.srcSeqId, D.rule, D.otherSeqId,
+                                   D.lo, D.hi, &D.pick);
+    ImGui::Separator();
+    // counts, in BOTH directions - one-directional counts read as "aligned"
+    if (D.rule <= DR_IDX_OUT) {
+        const App::SeqInfo* o2 = seqInfo(D.otherSeqId);
+        ImGui::Text("%d of %d frame(s) here have a counterpart over there",
+                    P.pairs, P.srcKnown);
+        ImGui::Text("%d of the other stack's %d have no counterpart here",
+                    P.otherUnmatched, P.otherKnown);
+        if (D.rule == DR_NAME_IN && o2)
+            ImGui::TextDisabled("matched frames take \"%s\"'s frame numbers, so\n"
+                                "A/B follow-frame pairs the same file on both sides",
+                                o2->name.c_str());
+    }
+    if (P.notResident > 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                           "%d matched frame(s) are not loaded: they are left out "
+                           "of the copy, never re-fetched", P.notResident);
+    size_t bytes = 0;
+    for (const auto& pk : P.picks) {
+        const ImageDoc& d0 = *app.images[pk.srcImageIdx];
+        bytes += (size_t)d0.w * d0.h * d0.ch * sizeof(float);
+    }
+    ImGui::Text("will copy %d frame(s)%s (%.1f MB); the source stack is not touched",
+                (int)P.picks.size(), D.rule == DR_PICK ? " (ticked below)" : "",
+                bytes / (1024.0 * 1024.0));
+
+    // the member list: in PICK mode the first column is live, otherwise it
+    // echoes what the rule decided - what will be copied is on screen before
+    // it happens, never only after
+    float listH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeight() * 3.4f;
+    if (listH < ImGui::GetFrameHeight() * 4) listH = ImGui::GetFrameHeight() * 4;
+    if (ImGui::BeginTable("derivelist", 5,
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerV,
+                          ImVec2(0, listH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("copy", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("file", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("frame #", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("-> #", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("pixels", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)ms.size(); i++) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            if (D.rule == DR_PICK) {
+                bool v = D.pick[i] != 0;
+                if (ImGui::Checkbox("##p", &v)) D.pick[i] = v ? 1 : 0;
+            } else {
+                bool v = P.taken[i] != 0;
+                ImGui::BeginDisabled(true);
+                ImGui::Checkbox("##p", &v);
+                ImGui::EndDisabled();
+            }
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ms[i].base.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", ms[i].seqIndex);
+            ImGui::TableNextColumn();
+            if (P.taken[i] && ms[i].imageIdx >= 0) ImGui::Text("%d", P.newIndexOf[i]);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            if (ms[i].imageIdx >= 0) ImGui::TextDisabled("loaded");
+            else ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "not loaded");
+        }
+        ImGui::EndTable();
+    }
+    if (D.rule == DR_PICK) {
+        if (ImGui::SmallButton("all")) std::fill(D.pick.begin(), D.pick.end(), (char)1);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("none")) std::fill(D.pick.begin(), D.pick.end(), (char)0);
+    }
+    ImGui::Checkbox("copy into a NEW batch", &D.intoNewBatch);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(off: same batch as the source)");
+
+    bool can = !P.picks.empty();
+    ImGui::BeginDisabled(!can);
+    if (ImGui::Button("Create stack", ImVec2(140 * app.uiScale, 0))) {
+        DerivePlan Pf = P;
+        int id = applyDerivePlan(Pf, D.intoNewBatch);
+        if (id) {
+            char m[256];
+            if (Pf.notResident > 0)
+                snprintf(m, sizeof m, "derived stack: %d frame(s) copied; %d matched "
+                         "but not loaded were left out; source unchanged",
+                         (int)Pf.picks.size(), Pf.notResident);
+            else
+                snprintf(m, sizeof m, "derived stack: %d frame(s) copied; "
+                         "source unchanged", (int)Pf.picks.size());
+            toast(m, Pf.notResident > 0);
+        }
+        D.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110 * app.uiScale, 0))) {
+        D.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!can) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("nothing to copy: the rule selects no loaded frame");
+    }
+    ImGui::EndPopup();
+}
+
 // One heading in the Files panel: a batch, the stacks under it, and the folder
 // its first stack came from. Grouped by BATCH, not by folder - a batch is one
 // open action, named by the user (the folder name is only the starting value),
@@ -14695,6 +15144,7 @@ static void drawFileList() {
     int pendingSerUngroup = 0, pendingSerClose = 0, pendingSerRename = 0;
     std::string pendingSerName;
     int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
+    int pendingDeriveSeq = 0;   // opens the Derive stack dialog after the walk
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -15023,6 +15473,18 @@ static void drawFileList() {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
+            // A NEW stack from a subset of this one - the dialog offers the
+            // matching rules (same names / numbers as another stack, a range,
+            // hand-picked). Copies frames; this stack is not touched.
+            if (ImGui::MenuItem("Derive stack (copy a subset)..."))
+                pendingDeriveSeq = si->id;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Make a NEW stack from a subset of this one - e.g. only\n"
+                                  "the frames that also exist in another stack - so two\n"
+                                  "stacks with mismatched membership can be compared\n"
+                                  "frame by frame. Frames are COPIED; this stack keeps\n"
+                                  "every frame it has.");
+            ImGui::Separator();
             {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
                 if (const App::Series* mine = seriesOfStack(si->id))
                     ImGui::TextDisabled("in series \"%s\": moving it alone leaves it",
@@ -15159,6 +15621,7 @@ static void drawFileList() {
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
+    if (pendingDeriveSeq) deriveModalOpen(pendingDeriveSeq);
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {
@@ -15942,6 +16405,7 @@ static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser t
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
+static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack from stack, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -16039,6 +16503,7 @@ static void printUsage() {
         "  --tile-selftest <dir>       side-by-side compare panes: geometry, print, exit\n"
         "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
+        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -16153,6 +16618,8 @@ static void parseCli(int argc, char** argv) {
             g_browseKeysActs = next();             // override the canned action list
         } else if (a == "--verify-selftest") {
             g_verifySelftest = next();             // handled in main()
+        } else if (a == "--derive-selftest") {
+            g_deriveSelftest = next();             // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {
@@ -20726,6 +21193,258 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // ---- derive a stack from a stack (docs/todo-open.md item 0) ---------------
+    // Two synthesised stacks: A = f_000..f_007 (8 frames, pixel value = number),
+    // B = f_000,001,002,004,006,007,009 (gaps at 3 and 5, one alien file, pixel
+    // value = number + 100). B loads with CONTIGUOUS 0..6 frame numbers, which
+    // is what makes today's follow-frame both silently mispair and diverge.
+    // What has to hold:
+    //   D1/D2  match counts are right in BOTH directions (both derive directions)
+    //   D3     BEFORE deriving, follow-frame mispairs silently and then diverges
+    //          - proven present first, or D6 would be vacuous
+    //   D4     derived stack: frames in seqIndex order, numbers adopted from the
+    //          other stack, pixels copied from the SOURCE even after the source's
+    //          FILES ARE DELETED - the copy comes from RAM, never a re-read
+    //   D5     the source stack is intact (copy-only, by user decision)
+    //   D6     after deriving, follow-frame pairs the same FILE on both sides and
+    //          never diverges - the reason the feature exists
+    //   D7     membership is the FILE LIST: matched-but-not-resident frames are
+    //          counted, reported and left out - never fetched
+    //   D8     range + hand-picked rules; new batch on request; no series joined
+    if (!g_deriveSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "deriveselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        auto writeNpy = [](const std::string& path, int w, int h, float v) {
+            char dict[128];
+            snprintf(dict, sizeof dict,
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                     h, w);
+            std::string hdr = dict;
+            size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+            hdr.append(pad, ' ');
+            hdr += '\n';
+            std::ofstream f(pathFromUtf8(path), std::ios::binary);
+            uint16_t hl = (uint16_t)hdr.size();
+            f.write("\x93NUMPY\x01\x00", 8);
+            f.write((const char*)&hl, 2);
+            f.write(hdr.data(), (std::streamsize)hdr.size());
+            std::vector<float> px((size_t)w * h, v);
+            f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+        };
+        // The scratch area is a subdirectory this test CREATES, never the
+        // directory it was handed. The first version did remove_all on the
+        // argument itself, and the first time the suite pointed it at the
+        // shared `multi` fixture it deleted it - every multi-based test then
+        // failed with "picker did not open". A test may only destroy what it
+        // made.
+        std::string root = g_deriveSelftest;
+        std::replace(root.begin(), root.end(), '\\', '/');
+        while (!root.empty() && root.back() == '/') root.pop_back();
+        root += "/derive-scratch";
+        std::string rootA = root + "/A", rootB = root + "/B";
+        std::error_code ec;
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        std::filesystem::create_directories(pathFromUtf8(rootA), ec);
+        std::filesystem::create_directories(pathFromUtf8(rootB), ec);
+        for (int i = 0; i < 8; i++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "f_%03d.npy", i);
+            writeNpy(rootA + "/" + nm, 4, 4, (float)i);
+        }
+        const int bNums[] = { 0, 1, 2, 4, 6, 7, 9 };
+        for (int n : bNums) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "f_%03d.npy", n);
+            writeNpy(rootB + "/" + nm, 4, 4, 100.0f + n);
+        }
+        app.seqLoadMode = 1;                    // always load numbered runs
+        closeAll();
+        openFolder(rootA);
+        loadAll();
+        int seqA = app.seqs.empty() ? 0 : app.seqs.front().id;
+        openFolder(rootB);
+        loadAll();
+        int seqB = 0;
+        for (const auto& s : app.seqs) if (s.id != seqA) seqB = s.id;
+        {   // ---- D0: the fixture is what the comment above claims -----------
+            std::vector<int> fb = framesOfSeq(seqB);
+            bool contiguous = true;
+            for (int k = 0; k < (int)fb.size(); k++)
+                if (app.images[fb[k]]->seqIndex != k) contiguous = false;
+            fprintf(stderr, "deriveselftest: D0 stacks=%zu A=%zu frames B=%zu frames "
+                            "(B renumbered contiguously: %d)\n",
+                    app.seqs.size(), framesOfSeq(seqA).size(), fb.size(),
+                    contiguous ? 1 : 0);
+            check(app.seqs.size() == 2 && framesOfSeq(seqA).size() == 8 &&
+                  fb.size() == 7 && contiguous,
+                  "D0 fixture: 8-frame A, 7-frame B with gaps renumbered 0..6");
+        }
+        {   // ---- D1/D2: match counts, in BOTH directions ---------------------
+            DerivePlan P = buildDerivePlan(seqA, DR_NAME_IN, seqB, 0, 0, nullptr);
+            fprintf(stderr, "deriveselftest: D1 A vs B by name: %d of %d here paired, "
+                            "%d of B's %d without counterpart, %d to copy\n",
+                    P.pairs, P.srcKnown, P.otherUnmatched, P.otherKnown,
+                    (int)P.picks.size());
+            check(P.pairs == 6 && P.srcKnown == 8 && P.srcMatched == 6 &&
+                  P.otherKnown == 7 && P.otherUnmatched == 1 &&
+                  (int)P.picks.size() == 6 && P.notResident == 0,
+                  "D1 counts both ways: 6 of 8 match; 1 of B's 7 unmatched");
+            DerivePlan R = buildDerivePlan(seqB, DR_NAME_IN, seqA, 0, 0, nullptr);
+            check(R.pairs == 6 && R.srcKnown == 7 && R.otherKnown == 8 &&
+                  R.otherUnmatched == 2 && (int)R.picks.size() == 6,
+                  "D2 reverse: 6 of 7 match; 2 of A's 8 unmatched");
+        }
+        {   // ---- D3: the defect, present BEFORE the derive -------------------
+            setCompareB(app.images[framesOfSeq(seqB).front()].get());
+            app.compareMode = App::CmpWipe;
+            selectImage(framesOfSeq(seqA)[3]);          // f_003
+            ImageDoc* b3 = resolveB();
+            bool mispair = b3 && !g_abFollowDiverged &&
+                           baseName(b3->path) == "f_004.npy";
+            fprintf(stderr, "deriveselftest: D3 A#3 (f_003) follows to %s, diverged=%d\n",
+                    b3 ? baseName(b3->path).c_str() : "(null)",
+                    g_abFollowDiverged ? 1 : 0);
+            check(mispair, "D3 today: same-number follow pairs the WRONG file, silently");
+            selectImage(framesOfSeq(seqA)[7]);          // f_007: B has no #7
+            resolveB();
+            check(g_abFollowDiverged, "D3 today: follow-frame diverges past B's numbers");
+        }
+        // the source's files go away NOW: what follows must never touch disk
+        std::filesystem::remove_all(pathFromUtf8(rootA), ec);
+        std::string nameA = seqInfo(seqA)->name;
+        int imagesBefore = (int)app.images.size();
+        int derived = 0;
+        {   // ---- D4: derive A' = A matched to B by name ----------------------
+            DerivePlan P = buildDerivePlan(seqA, DR_NAME_IN, seqB, 0, 0, nullptr);
+            derived = applyDerivePlan(P, false);
+            std::vector<int> fd = framesOfSeq(derived);
+            bool ascending = true, adopted = true;
+            for (int k = 0; k < (int)fd.size(); k++) {
+                if (k > 0 && app.images[fd[k]]->seqIndex <=
+                             app.images[fd[k - 1]]->seqIndex) ascending = false;
+                if (app.images[fd[k]]->seqIndex != k) adopted = false;
+            }
+            check(derived != 0 && fd.size() == 6, "D4 derived stack has the 6 matches");
+            check(ascending, "D4 derived frames sit in seqIndex order");
+            check(adopted, "D4 matched frames adopted B's numbers (0..5)");
+            bool pixels = false, noteSame = true;
+            std::string note0 = fd.empty() ? "" : app.images[fd[0]]->note;
+            for (int idx : fd) {
+                const ImageDoc& d = *app.images[idx];
+                if (d.seqIndex == 3)
+                    pixels = baseName(d.path) == "f_004.npy" &&
+                             fabsf(d.data[0] - 4.0f) < 1e-6f;
+                if (d.note != note0 || d.note.empty()) noteSame = false;
+            }
+            check(pixels, "D4 pixels copied from the SOURCE, files already deleted");
+            check(noteSame, "D4 every derived frame carries the same origin note");
+            const App::SeqInfo* dsi = seqInfo(derived);
+            bool named = dsi && dsi->name.find(nameA) == 0 &&
+                         dsi->name.find("same names as") != std::string::npos &&
+                         dsi->name.find("6 of 8") != std::string::npos;
+            fprintf(stderr, "deriveselftest: D4 derived name: %s\n",
+                    dsi ? dsi->name.c_str() : "(null)");
+            check(named, "D4 the derived stack names its origin and its rule");
+        }
+        {   // ---- D5: the source is intact ------------------------------------
+            check(framesOfSeq(seqA).size() == 8 && seqInfo(seqA) &&
+                  seqInfo(seqA)->name == nameA &&
+                  (int)app.images.size() == imagesBefore + 6,
+                  "D5 source stack untouched; exactly 6 docs were added");
+        }
+        {   // ---- D6: follow-frame no longer diverges - the reason this exists
+            bool follows = true, sameFile = true, paired = true;
+            for (int idx : framesOfSeq(derived)) {
+                selectImage(idx);
+                ImageDoc* b = resolveB();
+                if (!b || g_abFollowDiverged) { follows = false; continue; }
+                if (baseName(b->path) != baseName(cur()->path)) sameFile = false;
+                if (fabsf(b->data[0] - (cur()->data[0] + 100.0f)) > 1e-4f) paired = false;
+            }
+            check(follows, "D6 follow-frame never diverges across the derived stack");
+            check(sameFile, "D6 A/B now show the SAME file on both sides");
+            check(paired, "D6 the paired pixels really are the counterpart's");
+        }
+        {   // ---- D7: membership is the FILE LIST, copies are the resident ----
+            App::SeqInfo* sa = seqInfo(seqA);
+            sa->remoteFiles.clear();
+            for (int i = 0; i < 8; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "f_%03d.npy", i);
+                sa->remoteFiles.push_back(rootA + "/" + nm);
+            }
+            sa->remoteFiles.push_back(rootA + "/f_009.npy");   // listed, never fetched
+            sa->expectedFrames = 9;
+            DerivePlan P = buildDerivePlan(seqA, DR_NAME_IN, seqB, 0, 0, nullptr);
+            fprintf(stderr, "deriveselftest: D7 file-list match: %d of %d paired, "
+                            "%d matched, %d not resident, %d to copy\n",
+                    P.pairs, P.srcKnown, P.srcMatched, P.notResident,
+                    (int)P.picks.size());
+            check(P.srcKnown == 9 && P.pairs == 7 && P.srcMatched == 7 &&
+                  P.notResident == 1 && (int)P.picks.size() == 6 &&
+                  P.otherUnmatched == 0,
+                  "D7 matching works on the file list, beyond resident frames");
+            int nid = applyDerivePlan(P, false);
+            const App::SeqInfo* dsi = seqInfo(nid);
+            bool honest = dsi && framesOfSeq(nid).size() == 6 &&
+                          dsi->expectedFrames == 6 &&
+                          !framesOfSeq(nid).empty() &&
+                          app.images[framesOfSeq(nid).front()]->note.find(
+                              "not loaded") != std::string::npos;
+            check(honest, "D7 the miss is reported in the note, not fetched");
+            sa->remoteFiles.clear();                 // leave the source honest
+            sa->expectedFrames = 8;
+        }
+        {   // ---- D8: range, hand-picked, new batch, no series ----------------
+            DerivePlan Pr = buildDerivePlan(seqB, DR_RANGE, 0, 2, 5, nullptr);
+            bool rangeOk = (int)Pr.picks.size() == 4;
+            for (const auto& pk : Pr.picks)
+                if (pk.newIndex < 2 || pk.newIndex > 5) rangeOk = false;
+            check(rangeOk, "D8 range rule keeps exactly the numbers 2..5");
+            int serId = newSeries(batchOfStack(seqB), "derive-test sweep");
+            if (App::Series* S = seriesById(serId)) {
+                App::Series::Member m;
+                m.seqId = seqB;
+                S->members.push_back(m);
+            }
+            std::vector<char> mask(7, 0);
+            mask[0] = mask[6] = 1;                   // f_000 and the alien f_009
+            DerivePlan Pp = buildDerivePlan(seqB, DR_PICK, 0, 0, 0, &mask);
+            int bBatch = app.images[framesOfSeq(seqB).front()]->batchId;
+            int nid = applyDerivePlan(Pp, true);
+            std::vector<int> fd = framesOfSeq(nid);
+            bool picked = fd.size() == 2 &&
+                          baseName(app.images[fd[0]]->path) == "f_000.npy" &&
+                          baseName(app.images[fd[1]]->path) == "f_009.npy";
+            check(picked, "D8 hand-picked rule copies exactly the ticked frames");
+            check(!fd.empty() && app.images[fd[0]]->batchId != bBatch,
+                  "D8 'into a new batch' really is a new batch");
+            check(framesOfSeq(seqB).size() == 7, "D8 picking from B left B whole");
+            check(seriesOfStack(seqB) != nullptr && seriesOfStack(nid) == nullptr,
+                  "D8 the derived stack joins NO series (membership is explicit)");
+        }
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        fprintf(stderr, "deriveselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
     // ---- A/B statistics caches (docs/ab-stats-plan.md, section 6) -------------
     // The five statistics panels keep TWO cache slots now: 0 = A (the current
     // frame), 1 = B (the compare side). Headless, what has to hold:
@@ -22696,6 +23415,7 @@ int main(int argc, char** argv) {
         drawRawModal();
         drawSequenceModal();
         drawSeriesModal();
+        drawDeriveModal();
         drawFolderPickModal();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
