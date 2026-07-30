@@ -9241,7 +9241,26 @@ struct PlotRect {
         return ImVec2(p0.x + (x - xmin) / (xmax - xmin) * (p1.x - p0.x),
                       p1.y - (y - ymin) / (ymax - ymin) * (p1.y - p0.y));
     }
+    // screen -> data, the exact inverse of at() - a box-zoom is only honest if
+    // the rectangle the user drew maps back to precisely the range they get
+    ImVec2 unmap(ImVec2 sc) const {
+        return ImVec2(xmin + (sc.x - p0.x) / std::max(p1.x - p0.x, 1e-6f) * (xmax - xmin),
+                      ymin + (p1.y - sc.y) / std::max(p1.y - p0.y, 1e-6f) * (ymax - ymin));
+    }
 };
+
+// A drag rectangle in screen space -> the data ranges it spans. Pure, so the
+// selftest can pin the mapping without a mouse. Returns false for a drag too
+// small to be an intention (a click with jitter must not zoom into nothing).
+static bool zoomRangeFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
+                              float& x0, float& x1, float& y0, float& y1) {
+    if (!pr.ok) return false;
+    if (fabsf(a.x - b.x) < 4.0f || fabsf(a.y - b.y) < 4.0f) return false;
+    ImVec2 da = pr.unmap(a), db = pr.unmap(b);
+    x0 = std::min(da.x, db.x); x1 = std::max(da.x, db.x);
+    y0 = std::min(da.y, db.y); y1 = std::max(da.y, db.y);
+    return x1 > x0 && y1 > y0;
+}
 
 // ImDrawList has no dashed line, and the A/B panels need one: hue is already
 // spoken for by the CFA plane (R/Gr/Gb/B each own a colour), so the DASH is the
@@ -13341,18 +13360,45 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         if (axDocs[i] && axDocs[i]->seqId != 0)
             axs[i] = frameAxisOf(axDocs[i]->seqId);
     bool axAny = false, axUse = false;
-    std::string axLabel;
+    std::string axLabel, axBorrowed;
     {
-        bool all = true, first = true;
-        std::string n0, u0;
+        // Two different reasons a side can fail the one-axis rule, and they
+        // deserve different treatment:
+        //   conflict - two sides carry DIFFERENT custom axes. Incommensurable;
+        //              the fallback to frame index stands.
+        //   missing  - a side simply has no axis of its own. Starting an A/B
+        //              compare against an axis-less B used to throw the whole
+        //              chart back to frame index - the user read it as "A/B
+        //              比較を始めるとX Axisがクリアされちゃう". Follow-frame
+        //              already pairs sides BY FRAME NUMBER, so lending the
+        //              reference axis to an axis-less side of the same length
+        //              asserts nothing follow-frame has not already assumed.
+        //              Lent, not silently: the notice names who borrowed.
+        bool conflict = false;
+        int ref = -1;
         for (size_t i = 0; i < axDocs.size(); i++) {
-            if (!axHas[i]) continue;
-            if (!axs[i].custom) { all = false; continue; }
+            if (!axHas[i] || !axs[i].custom) continue;
             axAny = true;
-            if (first) { n0 = axs[i].name; u0 = axs[i].unit; axLabel = axs[i].label; first = false; }
-            else if (axs[i].name != n0 || axs[i].unit != u0) all = false;
+            if (ref < 0) { ref = (int)i; axLabel = axs[i].label; }
+            else if (axs[i].name != axs[ref].name || axs[i].unit != axs[ref].unit)
+                conflict = true;
         }
-        axUse = axAny && all;
+        if (axAny && !conflict) {
+            bool lendOk = true;
+            for (size_t i = 0; i < axDocs.size(); i++) {
+                if (!axHas[i] || axs[i].custom) continue;
+                // same length = value k exists for every frame k the side has;
+                // anything else would invent positions
+                size_t nSide = axDocs[i] && axDocs[i]->seqId != 0
+                             ? framesOfSeq(axDocs[i]->seqId).size() : 0;
+                if (axs[ref].vals && nSide == axs[ref].vals->size()) {
+                    axs[i] = axs[ref];
+                    if (!axBorrowed.empty()) axBorrowed += ", ";
+                    axBorrowed += axLetters[i];
+                } else lendOk = false;
+            }
+            axUse = lendOk;
+        }
     }
     // every notice line that will follow the table, counted before it is drawn
     // (none of them wrap, so each is exactly one line)
@@ -13361,6 +13407,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         if (x.diverged) { if (!slotDiv.empty()) slotDiv += ", "; slotDiv += x.letter; }
     int notices = 0;
     if (axAny && !axUse) notices++;
+    if (!axBorrowed.empty()) notices++;
     if (g_abFollowDiverged) notices++;
     if (!slotDiv.empty()) notices++;
     if (A.valid && B.valid && A.nPl != B.nPl) notices++;
@@ -13475,6 +13522,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
                            "custom x axes differ (%s) - one plot has one axis: "
                            "plotted on frame index", what.c_str());
+    }
+    if (!axBorrowed.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "%s: no x axis of its own - plotted on A's (paired by frame "
+                           "number, as follow-frame already assumes)", axBorrowed.c_str());
     }
 
     // ---- per-frame mean over time: one curve per compare slot, one axis ----
@@ -13631,6 +13683,53 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
     const char* xlab = axUse ? axLabel.c_str() : "frame number (index in sequence)";
+    // Box-zoom. Drag a rectangle on the chart to narrow both ranges to it;
+    // double-click resets. The state is keyed to WHAT is on the axes (A's
+    // document and the x label): a zoom in seconds must not survive a switch
+    // to a different stack or axis, where the same numbers mean something
+    // else. While zoomed the chart says so - a magnified chart that does not
+    // announce itself reads as the whole signal.
+    static bool tzOn = false;
+    static float tzX0 = 0, tzX1 = 1, tzY0 = 0, tzY1 = 1;
+    static std::string tzSig;
+    {
+        std::string sig = std::string(xlab) + "|" +
+                          std::to_string(im ? (unsigned long long)im->uid : 0ULL);
+        if (sig != tzSig) { tzSig = sig; tzOn = false; }
+    }
+    if (tzOn) { fx0 = tzX0; fx1 = tzX1; mn = tzY0; mx = tzY1; }
+    static ImVec2 tzDragA;              // where the current drag began
+    static bool tzDragging = false;
+    auto zoomUI = [&](const PlotRect& tp) {
+        if (!tp.ok) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const bool hov = ImGui::IsMouseHoveringRect(tp.p0, tp.p1) &&
+                         ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+        if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            tzOn = false; tzDragging = false;
+        }
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            tzDragA = ImGui::GetMousePos(); tzDragging = true;
+        }
+        if (tzDragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            ImVec2 b2 = ImGui::GetMousePos();
+            dl->AddRectFilled(tzDragA, b2, IM_COL32(120, 190, 255, 30));
+            dl->AddRect(tzDragA, b2, IM_COL32(120, 190, 255, 160));
+        }
+        if (tzDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            tzDragging = false;
+            float x0, x1, y0, y1;
+            if (zoomRangeFromDrag(tp, tzDragA, ImGui::GetMousePos(), x0, x1, y0, y1)) {
+                tzX0 = x0; tzX1 = x1; tzY0 = y0; tzY1 = y1; tzOn = true;
+            }
+        }
+        if (tzOn) {
+            const char* zt = "zoomed - double-click to reset";
+            ImVec2 ts = ImGui::CalcTextSize(zt);
+            dl->AddText(ImVec2(tp.p1.x - ts.x - 4 * app.uiScale, tp.p0.y + 2 * app.uiScale),
+                        AB_AMBER32, zt);
+        }
+    };
     if (!side) {
         PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, !axUse, false, plotH);
         if (tp.ok) {
@@ -13643,6 +13742,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             // has none - a line at 0 would name a frame of somebody's stack
             if (A.isStack) marker(tp, im, 0);
             dl->PopClipRect();
+            zoomUI(tp);
         }
         temporalLegendRow(leg, true);
     } else {
@@ -13668,6 +13768,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                     curve(tp, i, temporalSlotInk(0));   // its own panel: A's stroke
                     marker(tp, slots[i].doc, i);
                     dl->PopClipRect();
+                    zoomUI(tp);         // shared limits: a zoom in one panel zooms all
                 }
             }
             ImGui::EndChild();
@@ -24930,6 +25031,29 @@ int main(int argc, char** argv) {
             check(!ax2.custom && has(ax2.why, "3 value(s)") && has(ax2.why, "5 frame(s)"),
                   "E7 a stale axis falls back to frame index and says why");
             if (App::SeqInfo* si = seqInfo(sid)) si->axisVals = { 10, 20, 30, 40, 50 };
+        }
+
+        {   // ---- E10: the box-zoom mapping is the exact inverse of the plot's
+            PlotRect pr;
+            pr.p0 = ImVec2(100, 50); pr.p1 = ImVec2(500, 250);
+            pr.xmin = 0; pr.xmax = 23; pr.ymin = 990; pr.ymax = 1010;
+            pr.ok = true;
+            ImVec2 sc = pr.at(7.0f, 1003.0f);
+            ImVec2 da = pr.unmap(sc);
+            check(fabsf(da.x - 7.0f) < 1e-3f && fabsf(da.y - 1003.0f) < 1e-3f,
+                  "E10 unmap is the exact inverse of at");
+            // a drag rectangle spans exactly the range it drew, whichever
+            // corner the drag started from
+            float x0, x1, y0, y1;
+            bool okz = zoomRangeFromDrag(pr, pr.at(5, 995), pr.at(15, 1005), x0, x1, y0, y1);
+            bool okz2 = zoomRangeFromDrag(pr, pr.at(15, 1005), pr.at(5, 995), x0, x1, y0, y1);
+            check(okz && okz2 && fabsf(x0 - 5) < 1e-3f && fabsf(x1 - 15) < 1e-3f &&
+                  fabsf(y0 - 995) < 1e-3f && fabsf(y1 - 1005) < 1e-3f,
+                  "E10 the drag rectangle becomes exactly its data range");
+            // a jittered click is not an intention
+            check(!zoomRangeFromDrag(pr, ImVec2(200, 100), ImVec2(202, 140), x0, x1, y0, y1) &&
+                  !zoomRangeFromDrag(pr, ImVec2(200, 100), ImVec2(280, 102), x0, x1, y0, y1),
+                  "E10 a click with jitter does not zoom into nothing");
         }
 
         // ---- E8: the axis survives a session round-trip ----
