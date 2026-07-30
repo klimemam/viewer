@@ -15066,7 +15066,18 @@ static void drawPanelTemporal() {
     // exactly that - INCLUDING A. Handing this branch only stacks is how a
     // lone-frame A used to leave the whole panel blank while B, a full stack
     // with a perfectly good time axis, went unplotted.
-    if (ImageDoc* Bim = abStatsB()) { drawTemporalAB(im, Bim); return; }
+    if (ImageDoc* Bim = abStatsB()) {
+        drawTemporalAB(im, Bim);
+        // The frame-linearity section only fits the single-stack view, but a
+        // section that silently VANISHES when compare is on reads as "the
+        // feature does not exist" (user report, day one). The header stays,
+        // and says what to do.
+        if (ImGui::CollapsingHeader("Linearity (frame axis)"))
+            ImGui::TextDisabled("shown in the single-stack view. Press ESC to leave the\n"
+                                "comparison (the B/C seats are kept) and fit side A;\n"
+                                "C brings the comparison back afterwards.");
+        return;
+    }
     if (im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
         if (drawServerTemporal(si)) {         // remote stack, computed on the server
@@ -15076,6 +15087,10 @@ static void drawPanelTemporal() {
             temporalExportButtons();
             ImGui::SameLine();
             frameAxisPopupButton(im);
+            if (ImGui::CollapsingHeader("Linearity (frame axis)"))
+                ImGui::TextDisabled("needs locally resident frames: this stack is measured\n"
+                                    "on the server, and the fit reads pixels. Open the\n"
+                                    "frames locally (double-click in Browse) to fit them.");
             return;
         }
         recomputeTemporalIfNeeded(im, app.temporal[0]);
