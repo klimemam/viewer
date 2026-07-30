@@ -49,6 +49,7 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>              // the detached double-fork in spawnDetached
 #endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>           // sysctlbyname for the physical-memory budget
@@ -4450,10 +4451,26 @@ static void saveSession(std::string path, bool quiet = false) {
 
 static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
 
-// ---- crash / exit safety net -------------------------------------------------
-// The work that is expensive to redo is the arrangement (which files, which
-// ROIs, which range), not the pixels: autosave it so a crash costs nothing.
-static std::string autosavePath() {
+// ---- instance identity (Open in new window, todo-open item 28 / A7) ---------
+// Two viewers used to share ONE autosave file: whichever exited last overwrote
+// the other's session. Every instance now claims a numbered slot at startup,
+// via a lock file beside the autosave. The first instance keeps the historic
+// name autosave.vsession (existing sessions and muscle memory unbroken); later
+// ones get autosave-2.vsession, -3, ... The lock holds the owner's PID: a lock
+// whose PID is no longer alive is stale - a crash leaves one behind on purpose,
+// because "stale lock" is precisely what marks that autosave as reclaimable
+// (and offerable by the recovery scan below).
+static int g_instanceSlot = 1;            // which autosave-N this run owns
+static std::string g_instanceLockPath;    // the lock we hold (empty = none)
+// --secondary: this window was spawned by "Open in new window". Secondary
+// windows READ prefs but never WRITE them - last-writer-wins over one file is
+// how a scratch window would overwrite the layout the main one meant to keep.
+// Two copies started BY HAND both stay "first" for prefs, which is exactly
+// today's behaviour and accepted: the lock files still keep their AUTOSAVES
+// apart, and that is the collision that eats data.
+static bool g_secondary = false;
+
+static std::string viewerConfigDir() {
     std::error_code ec;
     std::filesystem::path cfg;
 #if defined(_WIN32)
@@ -4465,7 +4482,120 @@ static std::string autosavePath() {
     cfg /= "viewer";
     std::filesystem::create_directories(cfg, ec);
     if (ec) return {};
-    return (cfg / "autosave.vsession").u8string();
+    return cfg.u8string();
+}
+
+static unsigned long currentPid() {
+#if defined(_WIN32)
+    return (unsigned long)GetCurrentProcessId();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
+static bool pidAlive(unsigned long pid) {
+    if (!pid) return false;
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED;  // alive, just not ours
+    DWORD code = 0;
+    bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+#else
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+#endif
+}
+
+// slot 1 = the name every existing session and script already knows
+static std::string slotAutosaveName(int n) {
+    return n <= 1 ? "autosave.vsession"
+                  : "autosave-" + std::to_string(n) + ".vsession";
+}
+static std::string slotLockPath(const std::string& dir, int n) {
+    return dir + "/autosave-" + std::to_string(n) + ".lock";
+}
+static unsigned long lockPid(const std::string& lockPath) {   // 0 = unreadable
+    std::vector<uint8_t> b;
+    if (!readFileBytes(lockPath, b)) return 0;
+    return strtoul(std::string(b.begin(), b.end()).c_str(), nullptr, 10);
+}
+// O_EXCL IS the claim: two instances racing for one slot cannot both win it.
+static bool createLockExcl(const std::string& lockPath, unsigned long pid) {
+#if defined(_WIN32)
+    int fd = _wopen(pathFromUtf8(lockPath).wstring().c_str(),
+                    _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    int fd = open(pathFromUtf8(lockPath).c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+#endif
+    if (fd < 0) return false;
+    std::string s = std::to_string(pid);
+#if defined(_WIN32)
+    _write(fd, s.data(), (unsigned)s.size());
+    _close(fd);
+#else
+    ssize_t ign = write(fd, s.data(), s.size()); (void)ign;
+    close(fd);
+#endif
+    return true;
+}
+// Claim the lowest free slot under dir. A slot is free when its lock is absent
+// or stale (its PID is dead). Losing the re-claim race to another starting
+// instance just moves on to the next slot.
+static int claimAutosaveSlot(const std::string& dir, std::string& lockPathOut) {
+    unsigned long self = currentPid();
+    for (int n = 1; n <= 64; n++) {
+        std::string lp = slotLockPath(dir, n);
+        if (createLockExcl(lp, self)) { lockPathOut = lp; return n; }
+        if (pidAlive(lockPid(lp))) continue;       // that instance is running
+        std::error_code ec;                        // stale: reclaim it
+        std::filesystem::remove(pathFromUtf8(lp), ec);
+        if (createLockExcl(lp, self)) { lockPathOut = lp; return n; }
+    }
+    lockPathOut.clear();     // 64 live instances, or an unwritable config dir:
+    return 1;                // behave like the historic single instance
+}
+static void releaseAutosaveLock() {
+    if (g_instanceLockPath.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(pathFromUtf8(g_instanceLockPath), ec);
+    g_instanceLockPath.clear();
+}
+
+// ---- crash / exit safety net -------------------------------------------------
+// The work that is expensive to redo is the arrangement (which files, which
+// ROIs, which range), not the pixels: autosave it so a crash costs nothing.
+static std::string autosavePath() {
+    std::string dir = viewerConfigDir();
+    if (dir.empty()) return {};
+    return dir + "/" + slotAutosaveName(g_instanceSlot);
+}
+
+// The recovery offer: the NEWEST autosave under dir that no LIVE instance owns.
+// A lock held by selfPid is ours - offering our own previous session is the
+// historic "Restore last session"; a lock held by another live PID means that
+// window is running and rewriting its file right now, and restoring it would
+// fork a session that is still open. nameOut says WHICH file is being offered,
+// because with several candidates "last session" alone no longer names one.
+static std::string recoveryOfferIn(const std::string& dir, unsigned long selfPid,
+                                   std::string* nameOut) {
+    if (nameOut) nameOut->clear();
+    if (dir.empty()) return {};
+    std::string best, bestName;
+    std::filesystem::file_time_type bestT{};
+    std::error_code ec;
+    for (int n = 1; n <= 64; n++) {
+        std::string name = slotAutosaveName(n);
+        std::filesystem::path p = pathFromUtf8(dir + "/" + name);
+        if (!std::filesystem::exists(p, ec)) continue;
+        unsigned long owner = lockPid(slotLockPath(dir, n));
+        if (owner && owner != selfPid && pidAlive(owner)) continue;  // live, not us
+        std::filesystem::file_time_type t = std::filesystem::last_write_time(p, ec);
+        if (ec) continue;
+        if (best.empty() || t > bestT) { best = (dir + "/" + name); bestName = name; bestT = t; }
+    }
+    if (nameOut) *nameOut = bestName;
+    return best;
 }
 
 static void autosaveSession() {
@@ -4484,6 +4614,18 @@ static std::string prefsPath() {
 }
 
 static void savePrefs() {
+    if (g_secondary) {
+        // Secondary windows read prefs but never write them: prefs.txt is one
+        // file and last-writer-wins, so a spawned scratch window saving on exit
+        // would overwrite what the main window meant to keep. Said once, in the
+        // log rather than a toast: it is an explanation, not an event.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            app.msgLog.push_back({ "prefs are read-only in a secondary window", false });
+        }
+        return;
+    }
     std::string p = prefsPath();
     if (p.empty()) return;
     std::ofstream f(pathFromUtf8(p), std::ios::binary);
@@ -4564,6 +4706,141 @@ static void loadPrefs() {
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
     app.seqLoadMode = std::clamp(app.seqLoadMode, 0, 2);
     app.dispGamma = app.dispGamma > 1.5f ? 2.2f : 1.0f;
+}
+
+// ---- Open in new window (todo-open item 28) ---------------------------------
+// A second, INDEPENDENT viewer: separate process, separate cur(), separate
+// panels - the route the decision record chose over generalising cur(). The
+// spawn is a pure argv builder plus a detached exec, kept apart so
+// --newwin-selftest can assert the exact command line without starting one.
+static std::string selfExePath() {
+#if defined(_WIN32)
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return std::filesystem::path(buf).u8string();
+#else
+    char buf[4096];                    // Windows-primary; keep the Linux path built
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) { buf[n] = 0; return buf; }
+#endif
+    return app.exePath;                // argv[0]: right unless the cwd changed
+}
+
+// The command line that makes "the same image look the same" in the child:
+// - a stack passes its HEAD file, and --sequence always regroups the numbered
+//   siblings there without the picker;
+// - the CFA interpretation rides along when one is set (--bayer-pattern first:
+//   --cfa captures the pattern seen so far, see parseCli);
+// - --window-offset 40,40 cascades the child off its parent;
+// - --secondary makes the child's prefs read-only (see savePrefs).
+// Remote docs pass their ssh:// url - the CLI already parses it. Pure on
+// purpose: the selftest asserts the exact argv this returns.
+static std::vector<std::string> newWindowArgv(const ImageDoc* d) {
+    if (!d) return {};
+    const ImageDoc* head = d;
+    if (d->seqId != 0)                 // a stack reopens from its head file
+        for (const auto& o : app.images)
+            if (o && o->seqId == d->seqId && o->seqIndex < head->seqIndex)
+                head = o.get();
+    std::string target = !head->remoteUrl.empty() ? head->remoteUrl : head->path;
+    if (target.empty()) return {};     // nothing on disk behind this row
+    std::vector<std::string> av{ selfExePath(), "--secondary",
+                                 "--window-offset", "40,40" };
+    if (d->seqId != 0) { av.push_back("--sequence"); av.push_back("always"); }
+    if (d->cfa != 0) {
+        av.push_back("--bayer-pattern");
+        av.push_back(CFA_PATTERNS[d->cfaPattern & 3]);
+        av.push_back("--cfa");
+        av.push_back(d->cfa == 2 ? "quad" : "bayer");
+    }
+    av.push_back(target);
+    return av;
+}
+
+#if defined(_WIN32)
+// CreateProcessW takes ONE string: quote an argument the way CommandLineToArgvW
+// unquotes one (backslashes double before a quote; the quote itself escapes).
+static std::wstring quoteArgW(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+    std::wstring r = L"\"";
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') { bs++; continue; }
+        if (c == L'"') { r.append(bs * 2 + 1, L'\\'); r += L'"'; bs = 0; continue; }
+        r.append(bs, L'\\'); bs = 0; r += c;
+    }
+    r.append(bs * 2, L'\\');
+    r += L'"';
+    return r;
+}
+#endif
+
+// Detached on purpose: no inherited handles (a pipe rides along and ties the
+// child's lifetime to ours), its own process group, no console tie - closing
+// the window that spawned it must never take the child down. outPid is for the
+// selftest, which has to prove the child actually starts under these flags.
+static bool spawnDetached(const std::vector<std::string>& av,
+                          unsigned long* outPid = nullptr) {
+    if (av.empty()) return false;
+#if defined(_WIN32)
+    std::wstring cmd;
+    for (const auto& a : av) {
+        if (!cmd.empty()) cmd += L' ';
+        cmd += quoteArgW(pathFromUtf8(a).wstring());
+    }
+    std::vector<wchar_t> cl(cmd.begin(), cmd.end());
+    cl.push_back(0);                       // CreateProcessW may write into it
+    STARTUPINFOW si{}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(pathFromUtf8(av[0]).wstring().c_str(), cl.data(),
+                        nullptr, nullptr, FALSE /* inherit NO handles */,
+                        CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+                        nullptr, nullptr, &si, &pi))
+        return false;
+    if (outPid) *outPid = (unsigned long)pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);              // hold nothing of the child's
+    return true;
+#else
+    // double fork: the grandchild reparents to init, so no zombie ever waits on
+    // this process and no signal of ours reaches it
+    std::vector<char*> args;
+    for (const auto& a : av) args.push_back(const_cast<char*>(a.c_str()));
+    args.push_back(nullptr);
+    pid_t mid = fork();
+    if (mid < 0) return false;
+    if (mid == 0) {
+        setsid();
+        pid_t gc = fork();
+        if (gc == 0) { execv(args[0], args.data()); _exit(127); }
+        _exit(gc > 0 ? 0 : 1);
+    }
+    int st = 0;
+    waitpid(mid, &st, 0);
+    if (outPid) *outPid = 0;               // the grandchild's pid is not observable
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+#endif
+}
+
+static void openInNewWindow(const ImageDoc* d) {
+    std::vector<std::string> av = newWindowArgv(d);
+    if (av.empty()) {
+        toast("no file behind this row - it cannot reopen in a new window", true);
+        return;
+    }
+    if (!spawnDetached(av)) {
+        toast("could not start a new window", true);
+        return;
+    }
+    const std::string& target = av.back();
+    if (target.compare(0, 6, "ssh://") == 0) {
+        // the cost is visible: a second window is a second ssh session
+        std::string host, rp;
+        remote::parseUrl(target, host, rp);
+        toast("new window: opens its own connection to " + host);
+    } else {
+        toast("opening " + baseName(target) + " in a new window");
+    }
 }
 
 // Pre-rendered session text and a file already open for it. A SIGSEGV handler may
@@ -17501,6 +17778,9 @@ static void drawFileList() {
             // move menu itself (stacks move via seqctx below)
             if (ImGui::BeginPopupContextItem("imgctx")) {
                 if (compareBItem(app.images[i].get())) ImGui::Separator();
+                // a second, independent viewer on this frame (item 28)
+                if (ImGui::MenuItem("Open in new window"))
+                    openInNewWindow(app.images[i].get());
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
                 ImGui::EndPopup();
@@ -17606,6 +17886,10 @@ static void drawFileList() {
                     bpick = app.images[si->lastImageIdx].get();
                 if (compareBItem(bpick)) ImGui::Separator();
             }
+            // the whole stack again, independently: the child regroups the
+            // numbered siblings from the head file (item 28)
+            if (ImGui::MenuItem("Open in new window"))
+                openInNewWindow(app.images[stack.front()].get());
             // The series (系列) this stack is in, or could be. Multi-select is
             // a later phase; until then this menu is how a stack joins a sweep
             // without going through the Linearity panel.
@@ -18040,11 +18324,16 @@ static void drawMenuBar(GLFWwindow* win) {
             rbEnqueue(I, std::move(j));
         }
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
-        {   // recovery: the autosave is written on exit, on crash and every 60 s
-            std::string ap = autosavePath();
-            std::error_code aec;
-            bool has = !ap.empty() && std::filesystem::exists(std::filesystem::u8path(ap), aec);
-            if (ImGui::MenuItem("Restore last session", nullptr, false, has)) openPath(ap);
+        {   // recovery: the autosave is written on exit, on crash and every 60 s.
+            // With instance slots there can be several: scan them ALL, offer
+            // the newest one no LIVE window owns, and say which one it is -
+            // "last session" alone no longer names a single file.
+            std::string offerName;
+            std::string ap = recoveryOfferIn(viewerConfigDir(), currentPid(), &offerName);
+            bool has = !ap.empty();
+            std::string label = has ? "Restore last session (" + offerName + ")"
+                                    : std::string("Restore last session");
+            if (ImGui::MenuItem(label.c_str(), nullptr, false, has)) openPath(ap);
             if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
         ImGui::Separator();
@@ -18609,6 +18898,7 @@ static std::string g_seriesSelftest;    // --series-selftest <dir>: series invar
 static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
 static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal export document, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
+static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -18819,6 +19109,10 @@ static void printUsage() {
         "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
+        "  --newwin-selftest <dir>     instance autosave slots + spawn line, print, exit\n"
+        "  --window-offset <dx,dy>     shift the window off its default position (how\n"
+        "                              \"Open in new window\" cascades the child ~40 px)\n"
+        "  --secondary                 a spawned extra window: prefs are read-only\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n");
@@ -18895,9 +19189,10 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--sequence expects ask|always|never\n");
-        } else if (a == "--bench" || a == "--crash-test" || a == "--frame") {
+        } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
+                   a == "--window-offset") {
             next();                                // consumed in main(), not an error
-        } else if (a == "--bench-step" || a == "--bench-tiles") {
+        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--secondary") {
             /* consumed in main(): no value */
         } else if (a == "--no-ab-throttle") {
             g_abNoThrottle = true;     // measure what the B-slot throttle saves
@@ -18947,6 +19242,8 @@ static void parseCli(int argc, char** argv) {
             g_seriesSelftest = next();             // handled in main()
         } else if (a == "--sweepfile-selftest") {
             g_sweepFileSelftest = next();          // handled in main()
+        } else if (a == "--newwin-selftest") {
+            g_newwinSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | local-fetch
@@ -19763,13 +20060,21 @@ int main(int argc, char** argv) {
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
+    int winOffX = 0, winOffY = 0;
     for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--bench")) benchFrames = std::max(1, atoi(argv[i + 1]));
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
         // the window frame has to be decided before the window exists
         if (!strcmp(argv[i], "--frame")) cliFrame = !strcmp(argv[i + 1], "system") ? 0 : 1;
+        // "Open in new window" cascade: applied right after the window exists
+        if (!strcmp(argv[i], "--window-offset"))
+            sscanf(argv[i + 1], "%d,%d", &winOffX, &winOffY);
     }
+    // --secondary: spawned by "Open in new window". Known before loadPrefs so
+    // nothing between here and there can write prefs back (see savePrefs).
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--secondary")) g_secondary = true;
     // --bench-step: advance A by one frame before every benched frame. --bench
     // alone holds one image still, so every cache key stays hit and the loop
     // measures drawing only. The A/B question is the opposite one - what a
@@ -19791,6 +20096,16 @@ int main(int argc, char** argv) {
     // --range-selftest checks it, and prefs on the machine running the test
     // would otherwise decide what "the default" is
     g_abRangeDefault = app.compareRangeMode;
+    {   // Which autosave is OURS: claim the lowest free slot before anything
+        // reads or writes one - two windows sharing autosave.vsession is how
+        // the second one eats the first one's session (todo-open item 28/A7).
+        std::string cfgDir = viewerConfigDir();
+        if (!cfgDir.empty()) g_instanceSlot = claimAutosaveSlot(cfgDir, g_instanceLockPath);
+        // Selftests return from main() early and a normal quit has one exit
+        // path already; atexit covers them all. A CRASH skips it on purpose:
+        // the stale lock left behind is what marks that autosave reclaimable.
+        atexit(releaseAutosaveLock);
+    }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
     if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
@@ -19822,6 +20137,13 @@ int main(int argc, char** argv) {
     // the way out if a window manager makes a mess of the integrated one.
     window_frame::init(win);
     window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
+    if (winOffX || winOffY) {
+        // "Open in new window" passes --window-offset 40,40: the child must not
+        // land exactly on top of its parent, or nobody can tell it opened
+        int wx = 0, wy = 0;
+        glfwGetWindowPos(win, &wx, &wy);
+        glfwSetWindowPos(win, wx + winOffX, wy + winOffY);
+    }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
     installWakeCallbacks(win);        // before ImGui's backend: it chains to these
@@ -22619,6 +22941,177 @@ int main(int argc, char** argv) {
     // escape hatch, compare-B left dangling, prune's reference set, a move
     // issued mid-load, closeBatch against a queued remote open, and the
     // remote in-flight drop actually being the path that catches a fetch.
+    // ---- Open in new window: instance slots, recovery scan, prefs, spawn ----
+    // State assertions, no pixels: the lock protocol, the recovery offer, the
+    // read-only prefs of a secondary window, and the exact command line the
+    // Files menu would spawn - plus ONE real detached spawn, to prove the
+    // detach flags do not break launching at all.
+    if (!g_newwinSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "newwinselftest: %-56s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        std::error_code ec;
+        std::string dir = g_newwinSelftest + "/newwin-scratch";
+        std::filesystem::remove_all(pathFromUtf8(dir), ec);
+        std::filesystem::create_directories(pathFromUtf8(dir), ec);
+
+        // N1: an empty dir yields slot 1, and the lock names this process
+        std::string lock1;
+        int s1 = claimAutosaveSlot(dir, lock1);
+        check(s1 == 1 && lockPid(lock1) == currentPid(),
+              "N1 first claim takes slot 1, our PID in the lock");
+
+        // N2: slot 1 locked by a LIVE pid (our own stands in for another
+        // window) pushes the next claim to slot 2 - and slot 1 keeps the
+        // historic autosave name, so existing sessions stay untouched
+        std::string lock2;
+        int s2 = claimAutosaveSlot(dir, lock2);
+        check(s2 == 2 && lockPid(lock2) == currentPid(),
+              "N2 live lock on slot 1: next claim takes slot 2");
+        check(slotAutosaveName(1) == "autosave.vsession" &&
+              slotAutosaveName(2) == "autosave-2.vsession",
+              "N2 slot 1 keeps the historic autosave name");
+
+        // N3: releasing a slot frees it for the next claim
+        std::filesystem::remove(pathFromUtf8(lock2), ec);
+        std::string lock2b;
+        check(claimAutosaveSlot(dir, lock2b) == 2, "N3 released slot is claimed again");
+
+        // N4: one REAL detached spawn (--help: starts, prints, exits) - both
+        // the proof that the detach flags do not break launch, and the source
+        // of a genuinely dead PID for the stale-lock reclaim below
+        unsigned long deadPid = 0;
+        {
+            std::vector<std::string> av{ selfExePath(), "--help" };
+            bool sp = spawnDetached(av, &deadPid);
+#if defined(_WIN32)
+            bool exited = false;
+            DWORD code = (DWORD)-1;
+            if (sp && deadPid) {
+                HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, (DWORD)deadPid);
+                if (h) {
+                    exited = WaitForSingleObject(h, 15000) == WAIT_OBJECT_0;
+                    GetExitCodeProcess(h, &code);
+                    CloseHandle(h);
+                } else {
+                    exited = true;      // --help was gone before we could look:
+                    code = 0;           // it started (CreateProcess said so) and exited
+                }
+            }
+            check(sp && exited && code == 0,
+                  "N4 detached child (--help) started and exited 0");
+#else
+            check(sp, "N4 detached child (--help) started and exited");
+#endif
+            // slot 2's lock written BY HAND with the dead PID: stale, reclaimable
+            std::filesystem::remove(pathFromUtf8(lock2b), ec);
+            {
+                std::ofstream lf(pathFromUtf8(slotLockPath(dir, 2)), std::ios::binary);
+                lf << deadPid;
+            }
+            check(!pidAlive(deadPid), "N4 the joined child's PID reads as dead");
+            std::string lock2c;
+            int s2c = claimAutosaveSlot(dir, lock2c);
+            check(s2c == 2 && lockPid(lock2c) == currentPid(),
+                  "N4 stale lock reclaimed: slot 2 again, our PID");
+        }
+
+        // N5: the recovery scan offers the newest UNLOCKED autosave, by name.
+        // Here slot 2 is newer but held live (the lock from N4, selfPid=0 makes
+        // our own PID read as "another window"); slot 1 is older and free.
+        {
+            auto put = [&](const char* name, int hoursAgo) {
+                std::string p = dir + "/" + name;
+                { std::ofstream f(pathFromUtf8(p), std::ios::binary); f << "viewer-session 1\n"; }
+                std::filesystem::last_write_time(pathFromUtf8(p),
+                    std::filesystem::file_time_type::clock::now() - std::chrono::hours(hoursAgo), ec);
+            };
+            std::filesystem::remove(pathFromUtf8(slotLockPath(dir, 1)), ec);  // release slot 1
+            put("autosave.vsession", 2);        // older, unlocked
+            put("autosave-2.vsession", 1);      // newer, locked live
+            std::string nm;
+            std::string offer = recoveryOfferIn(dir, 0, &nm);
+            check(offer == dir + "/autosave.vsession" && nm == "autosave.vsession",
+                  "N5 newest is LOCKED live: scan offers the older, named");
+            offer = recoveryOfferIn(dir, currentPid(), &nm);
+            check(nm == "autosave-2.vsession",
+                  "N5 a lock we hold ourselves does not hide our own autosave");
+            std::filesystem::remove(pathFromUtf8(slotLockPath(dir, 2)), ec);
+            offer = recoveryOfferIn(dir, 0, &nm);
+            check(offer == dir + "/autosave-2.vsession" && nm == "autosave-2.vsession",
+                  "N5 lock gone: scan offers the newest and names it");
+        }
+
+        // N6: prefs are read-only in secondary mode - byte-identical file, and
+        // the refusal is one line in the Messages log
+        {
+            std::string pp = prefsPath();
+            std::vector<uint8_t> before, after;
+            bool hadBefore = readFileBytes(pp, before);
+            bool wasSecondary = g_secondary;
+            g_secondary = true;
+            app.prefsDirty = true;
+            savePrefs();
+            g_secondary = wasSecondary;
+            app.prefsDirty = false;
+            bool hadAfter = readFileBytes(pp, after);
+            check(hadBefore == hadAfter && before == after,
+                  "N6 secondary savePrefs leaves prefs.txt byte-identical");
+            bool noted = false;
+            for (const auto& m : app.msgLog)
+                if (m.text.find("read-only in a secondary window") != std::string::npos)
+                    noted = true;
+            check(noted, "N6 the refusal is one line in the Messages log");
+        }
+
+        // N7: the EXACT argv the Files menu would spawn, all four shapes
+        {
+            auto join = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& a : v) { if (!s.empty()) s += ' '; s += a; }
+                return s;
+            };
+            auto mk = [&](const char* path, int seq, int seqIdx, int cfa, int pat,
+                          const char* url) {
+                auto d = std::make_unique<ImageDoc>();
+                d->path = path; d->seqId = seq; d->seqIndex = seqIdx;
+                d->cfa = cfa; d->cfaPattern = pat;
+                if (url) d->remoteUrl = url;
+                app.images.push_back(std::move(d));
+                return app.images.back().get();
+            };
+            closeAll();
+            std::string exe = selfExePath();
+            ImageDoc* plain = mk("C:/data/dark_007.npy", 0, 0, 0, 0, nullptr);
+            ImageDoc* cfa   = mk("C:/data/flat_003.npy", 0, 0, 1, 2, nullptr);  // GRBG
+            mk("C:/data/s/frame_000.npy", 9, 0, 0, 0, nullptr);                 // head
+            ImageDoc* tail  = mk("C:/data/s/frame_001.npy", 9, 1, 0, 0, nullptr);
+            ImageDoc* rem   = mk("x.npy", 0, 0, 0, 0, "ssh://user@trc2/data/x.npy");
+            check(join(newWindowArgv(plain)) ==
+                  exe + " --secondary --window-offset 40,40 C:/data/dark_007.npy",
+                  "N7 local frame argv exact");
+            check(join(newWindowArgv(cfa)) ==
+                  exe + " --secondary --window-offset 40,40 --bayer-pattern GRBG"
+                        " --cfa bayer C:/data/flat_003.npy",
+                  "N7 CFA frame argv: pattern first, then --cfa");
+            check(join(newWindowArgv(tail)) ==
+                  exe + " --secondary --window-offset 40,40 --sequence always"
+                        " C:/data/s/frame_000.npy",
+                  "N7 stack argv: HEAD file + --sequence always");
+            check(join(newWindowArgv(rem)) ==
+                  exe + " --secondary --window-offset 40,40 ssh://user@trc2/data/x.npy",
+                  "N7 remote argv passes the ssh url");
+            closeAll();
+        }
+
+        std::filesystem::remove_all(pathFromUtf8(dir), ec);
+        fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
+        return ok ? 0 : 1;
+    }
+
     if (!g_verifySelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = glfwGetTime();
