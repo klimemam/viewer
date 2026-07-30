@@ -24885,7 +24885,14 @@ int main(int argc, char** argv) {
             bool c2 = parseAxisValues("10 20 30 40 50", v, err) && v.size() == 5;
             bool c3 = parseAxisValues("10\t20\t30\t40\t50", v, err) && v.size() == 5;
             bool c4 = parseAxisValues("10, 20\t30\n40 50", v, err) && v.size() == 5;
+            // the two shapes a vertical Excel-column paste actually produces:
+            // CRLF-separated lines, and comma-terminated lines
+            bool c5 = parseAxisValues("10\r\n20\r\n30\r\n40\r\n50", v, err) &&
+                      v.size() == 5 && v[4] == 50;
+            bool c6 = parseAxisValues("10,\n20,\n30,\n40,\n50", v, err) &&
+                      v.size() == 5 && v[0] == 10 && v[4] == 50;
             check(c1 && c2 && c3 && c4, "E7 comma / space / tab / mixed all parse");
+            check(c5 && c6, "E7 newline and comma+newline (Excel column paste) parse");
             bool bad = !parseAxisValues("10,20,x,40,1e", v, err);
             fprintf(stderr, "texportselftest: E7 parse error: %s\n", err.c_str());
             check(bad && has(err, "value 3") && has(err, "'x'") && has(err, "value 5") &&
