@@ -10731,6 +10731,52 @@ static void drawPanelProjection() {
                 ImGui::SetTooltip("\"ch, then side\" puts R:A directly above R:B, which is\n"
                                   "what you want when comparing ONE plane across sides.");
         }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy table (TSV)##projstat")) {
+            // The SAME walk both layouts draw from, so the clipboard can never
+            // disagree with the screen about which rows exist or their order.
+            // Full precision regardless of the display decimals: the display
+            // setting is about scanning columns, the clipboard is about
+            // reproducing numbers.
+            std::string tsv = "# projection profile statistics";
+            if (P.roiUsed) {
+                char r[96];
+                snprintf(r, sizeof r, "; ROI (%d,%d) %dx%d", P.rx, P.ry, P.rw, P.rh);
+                tsv += r;
+            } else tsv += "; whole image";
+            const char* pmodes[3] = { "mean", "max", "min" };
+            tsv += std::string("; reduce=") + pmodes[std::clamp(app.projMode, 0, 2)] + "; DN\n";
+            tsv += "side\tch\tmean\tsigma_frame\tsigma_row\tsigma_col\t"
+                   "sigma_frame_pct\tsigma_row_pct\tsigma_col_pct\t"
+                   "pp_frame\tpp_row\tpp_col\n";
+            int nRows = 0;
+            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+                const App::ProjState::Stats& f = S.fStat[i];
+                const App::ProjState::Stats& vv = S.vStat[i];
+                const App::ProjState::Stats& hh = S.hStat[i];
+                if (!f.valid && !hh.valid && !vv.valid) return;
+                char b[512];
+                auto n6 = [](const App::ProjState::Stats& st, double v, char* out, size_t cap) {
+                    if (st.valid) snprintf(out, cap, "%.9g", v);
+                    else          snprintf(out, cap, "-");
+                };
+                char m[40], sf[40], sv[40], sh[40], pf[40], pv2[40], ph[40], qf[40], qv[40], qh[40];
+                n6(f, f.mean, m, sizeof m);
+                n6(f, f.sd, sf, sizeof sf);  n6(vv, vv.sd, sv, sizeof sv);  n6(hh, hh.sd, sh, sizeof sh);
+                n6(f, f.pct, qf, sizeof qf); n6(vv, vv.pct, qv, sizeof qv); n6(hh, hh.pct, qh, sizeof qh);
+                n6(f, f.pp, pf, sizeof pf);  n6(vv, vv.pp, pv2, sizeof pv2); n6(hh, hh.pp, ph, sizeof ph);
+                snprintf(b, sizeof b, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                         side, S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph);
+                tsv += b;
+                nRows++;
+            });
+            ImGui::SetClipboardText(tsv.c_str());
+            toast("copied " + std::to_string(nRows) + " row(s) (TSV)");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("the table as tab-separated text, one row per side/plane,\n"
+                              "with a provenance line. Full precision - the decimals\n"
+                              "setting only affects the display.");
     }
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
