@@ -1003,7 +1003,10 @@ struct App {
     float linkBlack = 0, linkWhite = 1;
     // panel visibility (persisted with the ImGui layout)
     bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
-    bool showHistogram = true, showTemporal = true, showProjection = false;
+    // Projection is on by default, and its tab in FRONT of Histogram's: the
+    // row/column profiles are what this user looks at first. A saved session
+    // still restores whatever arrangement it recorded.
+    bool showHistogram = true, showTemporal = true, showProjection = true;
     bool resetLayout = false;
     std::string pendingLayout;        // dock settings from a session, applied next frame
     bool compactUi = true;            // dense spacing: this tool is table-heavy
@@ -15600,7 +15603,7 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("Reset layout")) {
                 app.showFiles = app.showInspector = app.showRois = true;
                 app.showAnalysis = app.showHistogram = app.showTemporal = true;
-                app.showProjection = false;
+                app.showProjection = true;
                 app.resetLayout = true;
             }
             ImGui::EndMenu();
@@ -22258,10 +22261,13 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Browse###Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
+            // tab order = dock order; Projection leads, and the explicit
+            // focus below makes it the SELECTED tab, not merely the leftmost
+            ImGui::DockBuilderDockWindow("Projection", bottom);
             ImGui::DockBuilderDockWindow("Histogram", bottom);
             ImGui::DockBuilderDockWindow("Temporal", bottom);
-            ImGui::DockBuilderDockWindow("Projection", bottom);
             ImGui::DockBuilderFinish(dockId);
+            ImGui::SetWindowFocus("Projection");
             // ROIs and Analysis stay floating (they follow the work, not the frame)
             ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
                                                vp->WorkPos.y + vp->WorkSize.y * 0.08f));
