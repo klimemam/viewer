@@ -17525,6 +17525,15 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 // chkcursor:N (view index), chkatrow:NAME (the cursor row's name), chkback:N,
 // chkfwd:N, chkexp:N, chkfocus:0|1 - any FAIL fails the run.
 //
+// INSTANCES (item 17): every stateful action and check drives the TARGET
+// instance (target:N switches it; 1 = the primordial panel). newpanel creates
+// a second Browse aimed at <dir>/scanroot and targets it; reconnect
+// re-connects the target to <dir> post-"disc"; closep closes the target's
+// window (extras are destroyed, the last one hides); hidep / showp drive
+// app.showRemote (the View menu's flag); filt:S types S into the target's
+// filter; chkfilt:S ("-" = empty), chkpanels:N (instance count), chkshown:N
+// (windows visible), chksel:N (rows selected in the target).
+//
 // w<px> floats the panel at an exact width and then asserts what a human would
 // otherwise have to read off a screenshot: that the filter box and the "more"
 // button are still INSIDE the panel, and that the filter is wide enough to type
@@ -17604,6 +17613,31 @@ static std::string g_browseKeysActs =
     // at every docked width, and Escape must close a menu and a context popup.
     "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
     "rctx,esc,fmenu,esc,disc,"
+    // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
+    // singleton). Reconnect the primordial panel, then open a SECOND Browse
+    // standing in a DIFFERENT place at the same moment - the one sentence a
+    // singleton can never make true (one App::rbrowse.dir = one place, ever).
+    "reconnect,waitdir:rb,chkpanels:1,"
+    "newpanel,chkpanels:2,waitdir:scanroot,chkdir:scanroot,"
+    "target:1,chkdir:rb,"
+    // independence: a filter typed into one panel does not narrow the other
+    "filt:frame,chkfilt:frame,target:2,chkfilt:-,"
+    // the keyboard belongs to the FOCUSED instance: panel 2 holds focus (it
+    // was just created), so Down moves ITS cursor and leaves panel 1's alone
+    "down,down,chkatrow:10lx,chkfocus:1,target:1,chkcursor:-1,target:2,"
+    // selection is per instance too
+    "ctrlclick,chksel:1,target:1,chksel:0,target:2,"
+    // ...and so is the history: navigating panel 2 records nothing in panel 1
+    "dbl,waitdir:10lx,chkback:1,target:1,chkback:0,"
+    // focus back on panel 1: the same keys now move ITS cursor, and panel 2's
+    // (reset to -1 by its own navigation) stays put
+    "focus,chkfocus:1,down,chkcursor:0,target:2,chkcursor:-1,"
+    // closing the second leaves the first fully working...
+    "closep,chkpanels:1,target:1,chkdir:rb,focus,down,"
+    "chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    // ...and the LAST one closing only hides: View > Panels > Browse reopens
+    // it with its place, listing and cursor intact
+    "hidep,chkshown:0,showp,chkshown:1,chkdir:rb,focus,up,chkatrow:..,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -24383,7 +24417,8 @@ int main(int argc, char** argv) {
             if (j == std::string::npos) j = g_browseKeysActs.size();
             if (j > i) keyActs.push_back(g_browseKeysActs.substr(i, j - i));
         }
-        fprintf(stderr, "browsekeys: %d action(s) on %s\n", (int)keyActs.size(), d.c_str());
+        fprintf(stderr, "browsekeys: %d action(s) on %s (sizeof(BrowseInstance)=%zu)\n",
+                (int)keyActs.size(), d.c_str(), sizeof(App::BrowseInstance));
     }
 
     std::vector<double> benchMs;
@@ -24638,7 +24673,10 @@ int main(int argc, char** argv) {
                 App::BrowseInstance& I = *app.browsePanels[bi];
                 bool primordial = I.num == 1;
                 bool& show = primordial ? app.showRemote : I.open;
-                if (!show) continue;
+                // an extra whose flag is already down (the window's X last
+                // frame, or a scripted close) is destroyed here too - any
+                // path that clears `open` closes the instance
+                if (!show) { if (!primordial) destroyNum = I.num; continue; }
                 // app.focusRemote = "bring the ACTIVE browse forward" (the
                 // Temporal panel hands focus back through it); focusReq is an
                 // instance asking for itself
@@ -25266,7 +25304,7 @@ int main(int argc, char** argv) {
             if (!reproReady) {
                 if (rbKeysT().b.connected && !rbKeysT().b.entries.empty()) {
                     reproReady = true;
-                    app.focusRemote = true;      // = clicking the panel
+                    rbMain().focusReq = true;    // = clicking the panel
                     fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
                             (int)rbKeysT().b.entries.size());
                 } else if (glfwGetTime() - reproT0 > 60.0) {
@@ -25372,7 +25410,59 @@ int main(int argc, char** argv) {
                         rbKeysT().advanced = false;
                         rbTreeForget(rbKeysT());
                     }
-                    else if (a == "focus") app.focusRemote = true;
+                    else if (a == "focus") rbShowInstance(rbKeysT());
+                    // ---- Browse INSTANCES (item 17) ------------------------
+                    else if (a == "reconnect") {
+                        // reconnect the target to the test dir (post-"disc"),
+                        // with a clean history - the checks below assert what
+                        // the OTHER panel's navigation adds to it (nothing)
+                        std::string kd = g_browseKeys;
+                        std::replace(kd.begin(), kd.end(), '\\', '/');
+                        while (kd.size() > 1 && kd.back() == '/') kd.pop_back();
+                        rbKeysT().histBack.clear();
+                        rbKeysT().histFwd.clear();
+                        startRemote(rbKeysT(), "local://" + kd);
+                    }
+                    else if (a == "newpanel") {
+                        // exactly what "+" / View > New Browse Panel do, then
+                        // aim it at a DIFFERENT place than instance 1's
+                        std::string kd = g_browseKeys;
+                        std::replace(kd.begin(), kd.end(), '\\', '/');
+                        while (kd.size() > 1 && kd.back() == '/') kd.pop_back();
+                        App::BrowseInstance& NI = rbNewInstance();
+                        g_rbKeysTarget = NI.num;
+                        startRemote(NI, "local://" + kd + "/scanroot");
+                    }
+                    else if (op == "target") g_rbKeysTarget = arg;
+                    else if (a == "closep") {
+                        // the window's X: extras are destroyed by the frame loop
+                        if (rbKeysT().num != 1) rbKeysT().open = false;
+                        else app.showRemote = false;
+                    }
+                    else if (a == "hidep") app.showRemote = false;
+                    else if (a == "showp") rbShowInstance(rbMain());
+                    else if (op == "filt")
+                        snprintf(rbKeysT().filter, sizeof rbKeysT().filter,
+                                 "%s", sarg.c_str());
+                    else if (op == "chkfilt")
+                        chk(std::string(rbKeysT().filter) ==
+                            (sarg == "-" ? std::string() : sarg),
+                            std::string("filter=\"") + rbKeysT().filter + "\"");
+                    else if (op == "chkpanels")
+                        chk((int)app.browsePanels.size() == arg,
+                            "panels=" + std::to_string((int)app.browsePanels.size()));
+                    else if (op == "chkshown") {
+                        int shown2 = 0;
+                        for (auto& bp : app.browsePanels)
+                            if (rbInstanceShown(*bp)) shown2++;
+                        chk(shown2 == arg, "shown=" + std::to_string(shown2));
+                    }
+                    else if (op == "chksel") {
+                        int nsel = 0;
+                        for (char c2 : rbKeysT().sel) if (c2) nsel++;
+                        chk(nsel == arg, "sel=" + std::to_string(nsel));
+                    }
+                    // --------------------------------------------------------
                     else if (a == "rawopen") {
                         App::PendingGroup pg;
                         pg.files = { "a.raw", "b.raw" };
@@ -25424,9 +25514,9 @@ int main(int argc, char** argv) {
                             requestBrowseTemporal(app.previewHost, app.previewFiles,
                                                   "svtemp", app.previewPort);
                     }
-                    else if (op == "chkfocus") {   // the Browse panel owns the keys
+                    else if (op == "chkfocus") {   // the TARGET instance owns the keys
                         ImGuiWindow* nw = ImGui::GetCurrentContext()->NavWindow;
-                        bool f2 = nw && strstr(nw->Name, "###Remote") != nullptr;
+                        bool f2 = nw && rbKeysT().wtitle == nw->Name;
                         chk(f2 == (arg != 0), nw ? nw->Name : "(no nav window)");
                     }
                     else if (op == "waitdir") {    // navigation lands async
