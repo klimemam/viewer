@@ -10670,8 +10670,9 @@ static void drawPanelProjection() {
         ImGui::TableSetupColumn(SIGMA " (frame)", ImGuiTableColumnFlags_WidthFixed, numColW());
         // A bare sigma here means "of the means named in the axis column", and
         // nothing on the header said so. Each row IS one axis, so the header
-        // cannot name a single one - it names the relationship instead.
-        ImGui::TableSetupColumn(SIGMA " (this axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
+        // cannot name a single one - it points at the axis column instead, and
+        // matches the two columns after it rather than reading "this axis".
+        ImGui::TableSetupColumn(SIGMA " (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(SIGMA " (axis) %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
@@ -10702,7 +10703,7 @@ static void drawPanelProjection() {
             });
         ImGui::EndTable();
     }
-    ImGui::TextDisabled(SIGMA " (frame) = the whole region.  " SIGMA " (this axis) = of the means "
+    ImGui::TextDisabled(SIGMA " (frame) = the whole region.  " SIGMA " (axis) = of the means "
                         "in the axis column:\n"
                         "column means = column FPN, row means = row FPN. DN");
     projSayPlaneMismatch();
