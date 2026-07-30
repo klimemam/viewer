@@ -940,6 +940,10 @@ struct App {
         bool valid = false;
         bool roiUsed = false;
     } temporal[2];                    // 0 = A, 1 = B (compare)
+    // ...and one per extra compare slot (C, D, E...), in cmpExtra order. Same
+    // cache, same key: a slot only pays for a recompute when its STACK or the
+    // ROI changes, so N slots cost N cached lookups per frame, not N passes.
+    std::vector<TemporalState> temporalExtra;
     // H/V projections (line profiles) of the selected ROI / whole image
     struct ProjState {
         const ImageDoc* img = nullptr;
@@ -11617,6 +11621,88 @@ static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
     return a && b && a->ch == b->ch;
 }
 
+// What the Temporal chart actually laid out, last frame. This machine cannot
+// screenshot OpenGL content (CopyFromScreen/BitBlt/PrintWindow give a white
+// client area), so "the chart is on screen" has to be an assertion on STATE:
+// the panel records how many points it stroked per slot, how tall the plot was,
+// and - the one the regression is really about - whether the plot rect ended up
+// INSIDE the panel or below its bottom edge. A chart laid out past the window
+// bottom is drawn, is reachable by scrolling, and is invisible: exactly the
+// report this probe exists to catch.
+struct TemporalChartProbe {
+    bool ran = false;            // the chart block was reached at all
+    bool plotted = false;        // beginPlot returned a usable rect
+    bool sideBySide = false;
+    float availBefore = 0;       // content height left when the chart block began
+    float plotTop = 0, plotBot = 0, winBot = 0;
+    int nSlots = 0;              // slots the panel considered (A, B, C, ...)
+    char slot[16] = {};          // 'A', 'B', 'C', ...
+    int pts[16] = {};            // points stroked for that slot (0 = no curve)
+    int nNoAxis = 0;             // slots that have no time axis and SAID so
+    char noAxisSlot[16] = {};
+};
+static TemporalChartProbe g_tchart;
+// The chart fits when its bottom edge is inside the panel. One text line of
+// slack: the caller reserves whole rows, and half a pixel of rounding must not
+// read as "off screen".
+static bool temporalChartVisible() {
+    return g_tchart.plotted && g_tchart.plotBot <= g_tchart.winBot + 1.0f;
+}
+
+// The ink each compare slot is stroked in when they share one plot. A, B and
+// the extras are SLOTS, not CFA planes, so hue is free here - the iron rule is
+// about mixing planes inside a statistic, and the per-frame mean is a pooled
+// level that says so on its axis. A keeps the neutral green every plot draws
+// in and B keeps the blue the shared legend flies, so nothing that already
+// reads as A or B changes colour when a C appears.
+static ImU32 temporalSlotInk(size_t i) {
+    static const ImU32 INK[] = {
+        IM_COL32(105, 220, 130, 255),   // A
+        IM_COL32(120, 190, 255, 230),   // B - AB_B_INK
+        IM_COL32(245, 170,  90, 255),   // C
+        IM_COL32(205, 140, 245, 255),   // D
+        IM_COL32(235, 225, 110, 255),   // E
+        IM_COL32(120, 225, 225, 255),   // F
+        IM_COL32(245, 130, 160, 255),   // G
+    };
+    return INK[i % (sizeof INK / sizeof INK[0])];
+}
+
+// The Temporal chart's legend. drawABLegendRow knows exactly two slots; this
+// one takes as many as the compare slots hold and WRAPS, because C/D/E push a
+// single row off the panel. Measuring and drawing are the same code (draw=false
+// only skips the ink), so the height reserved for the plot above is the height
+// the legend actually takes and adding a slot never moves the plot out from
+// under the cursor.
+struct TemporalLegendEntry { std::string text; ImU32 ink; };
+static float temporalLegendRow(const std::vector<TemporalLegendEntry>& e, bool draw) {
+    if (e.empty()) return 0.0f;
+    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
+    const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
+    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImU32 txt = IM_COL32(215, 222, 228, 255);
+    float x = 0;
+    int row = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        float w = sw + gap + ImGui::CalcTextSize(e[i].text.c_str()).x;
+        if (i && x + sep + w > availW) { row++; x = 0; }
+        else if (i) x += sep;
+        if (draw) {
+            float ex = p.x + x, ey = p.y + row * adv;
+            dl->AddLine(ImVec2(ex, ey + fh * 0.5f), ImVec2(ex + sw, ey + fh * 0.5f),
+                        e[i].ink, 1.6f);
+            dl->AddText(ImVec2(ex + sw + gap, ey), txt, e[i].text.c_str());
+        }
+        x += w;
+    }
+    float h = (row + 1) * adv;
+    // consume exactly h (ImGui adds one ItemSpacing after the Dummy)
+    if (draw) ImGui::Dummy(ImVec2(availW, std::max(h - ImGui::GetStyle().ItemSpacing.y, 1.0f)));
+    return h;
+}
+
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
 // (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
@@ -11626,6 +11712,27 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     recomputeTemporalIfNeeded(Bim, app.temporal[1]);
     AbTemporal A = abTemporalOf(im, app.temporal[0], app.srvTemporal);
     AbTemporal B = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
+    // The extra slots (C, D, E...). They ride on the CHART only: the table's
+    // axis is A | B | delta, and a delta has exactly two operands - the numeric
+    // side already gives every slot its own row in the Projection table, and
+    // this table would have to grow a column pair per slot to say the same
+    // thing. A curve costs one cached lookup and one polyline.
+    struct TExtra { ImageDoc* doc; std::string letter; AbTemporal t; };
+    std::vector<TExtra> XS;
+    {
+        std::vector<ImageDoc*> extras = compareExtras();   // prunes closed slots first
+        app.temporalExtra.resize(app.cmpExtra.size());
+        static const App::ServerTemporal NO_SERVER;        // extras are local-only
+        for (ImageDoc* d : extras) {
+            if (d == Bim) continue;      // B may also hold a numbered slot: one curve
+            size_t at = app.cmpExtra.size();       // its index in cmpExtra IS its letter
+            for (size_t i = 0; i < app.cmpExtra.size(); i++)
+                if (app.cmpExtra[i] == d->uid) { at = i; break; }
+            if (at >= app.temporalExtra.size()) continue;
+            recomputeTemporalIfNeeded(d, app.temporalExtra[at]);
+            XS.push_back({ d, slotName(at), abTemporalOf(d, app.temporalExtra[at], NO_SERVER) });
+        }
+    }
 
     const std::string uA = abValueUnit(im->dtype), uB = abValueUnit(Bim->dtype);
     // the UNIT is DN on both sides; the STORAGE can still differ, and a delta
@@ -11653,10 +11760,12 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "[A: %s, B: %s - %s]",
                            regionOf(A), regionOf(B),
                            A.fromServer || B.fromServer ? "server + local" : "local");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("One row per resident frame of A's stack, tab-separated.");
+    if (A.isStack) {   // there are no per-frame rows to copy off a lone frame
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy per-frame stats (A)")) copyPerFrameStats(im->seqId);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("One row per resident frame of A's stack, tab-separated.");
+    }
     // B's server aggregate is never fired automatically - one explicit press,
     // one remote job (docs/ab-stats-plan.md 4).
     if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
@@ -11686,8 +11795,45 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     std::string cQ = "quantity [" + unit + "]";
     std::string cD = "delta A-B [" + unit + "]";
 
-    if (ImGui::BeginTable("abtemporal", 5, ImGuiTableFlags_SizingFixedFit |
-                                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+    // One row set per CFA plane, so the table's height is known before it is
+    // opened - and it HAS to be. ImGuiTableFlags_ScrollX puts the table in a
+    // CHILD WINDOW, and a child-window table given the default outer_size takes
+    // the WHOLE of the panel's remaining height (imgui_tables.cpp BeginTableEx:
+    // CalcItemSize(outer_size, avail.x, use_child_window ? avail.y : 0)). That
+    // is the entire bug behind "compare shows numbers but no chart": the plain
+    // one-sided table below has no ScrollX, keeps its natural height and leaves
+    // the plot on screen, while the A/B table swallowed every pixel and the
+    // chart was laid out past the bottom edge of the panel - drawn, scrollable
+    // to, and invisible. The table now asks for exactly the rows it has, and
+    // never for more than it can spare from the chart.
+    const int nPlanes = std::max(A.nPl, B.nPl);
+    const ImGuiStyle& gst = ImGui::GetStyle();
+    const float rowH = ImGui::GetTextLineHeight() + gst.CellPadding.y * 2;
+    const float tblWant = rowH * (3 * nPlanes + 1)      // + the header row
+                        + gst.ScrollbarSize             // ScrollX reserves one
+                        + gst.CellPadding.y * 2;
+    // every notice line that will follow the table, counted before it is drawn
+    // (none of them wrap, so each is exactly one line)
+    int notices = 0;
+    if (g_abFollowDiverged) notices++;
+    if (A.valid && B.valid && A.nPl != B.nPl) notices++;
+    if (!A.valid || !B.valid) notices++;
+    if (dtypeMix) notices++;
+    if (!sameRegion) notices++;
+    else if (!canDelta && im->ch != Bim->ch) notices++;
+    if (A.fromServer || B.fromServer) notices++;
+    // the chart's floor: plot + its three rows of axis chrome + one legend row
+    const float chartMinH = 70.0f * app.uiScale + ImGui::GetFontSize() * 3
+                          + 12 * app.uiScale + ImGui::GetTextLineHeightWithSpacing();
+    const float tblRoom = ImGui::GetContentRegionAvail().y
+                        - notices * ImGui::GetTextLineHeightWithSpacing() - chartMinH;
+    const float tblH = std::min(tblWant, std::max(tblRoom, rowH * 3));
+    ImGuiTableFlags tblFlags = ImGuiTableFlags_SizingFixedFit |
+                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX;
+    // clamped short of its rows: they must stay REACHABLE, not clipped away
+    if (tblH < tblWant - 0.5f) tblFlags |= ImGuiTableFlags_ScrollY;
+
+    if (ImGui::BeginTable("abtemporal", 5, tblFlags, ImVec2(0, tblH))) {
         ImGui::TableSetupColumn(cQ.c_str(), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(hA, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(hB, ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -11701,7 +11847,8 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
             ImGui::TableNextColumn();
-            A.valid ? textNum("%.6g", a) : textNumStr("-");
+            if (A.valid) textNum("%.6g", a);
+            else textNumStr(A.isStack ? "-" : "- (not a stack)");
             ImGui::TableNextColumn();
             if (B.valid) textNum("%.6g", b);
             else textNumStr(B.isStack ? "-" : "- (not a stack)");
@@ -11720,7 +11867,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         // four sigma_t, and folding them into one row would put the iron rule
         // back (docs/terminology.md). When the two sides disagree about the
         // plane split, canDelta is already false and the columns stand alone.
-        int nPl = std::max(A.nPl, B.nPl);
+        const int nPl = nPlanes;   // the height reserved above counted these rows
         for (int p = 0; p < nPl; p++) {
             char k1[64], k2[64], k3[64];
             const char* sfx = nPl > 1 ? LIN_PLANES[p] : "";
@@ -11767,39 +11914,101 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
                             B.fromServer ? "server" : "local");
 
-    // ---- per-frame mean over time: A solid, B dashed, one shared axis ----
-    if (!A.mean || A.mean->empty()) return;
-    float mn = FLT_MAX, mx = -FLT_MAX, fx0 = FLT_MAX, fx1 = -FLT_MAX;
-    auto span = [&](const AbTemporal& s) {
-        if (!s.mean || s.mean->empty()) return;
-        for (float v : *s.mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        if (s.idx && !s.idx->empty()) {
-            fx0 = std::min(fx0, s.idx->front()); fx1 = std::max(fx1, s.idx->back());
-        }
+    // ---- per-frame mean over time: one curve per compare slot, one axis ----
+    // What each slot puts on the chart and, when it puts nothing there, WHY.
+    // The chart used to give up entirely the moment A had no series
+    // ("if (!A.mean || A.mean->empty()) return;") - so a B with a perfectly
+    // good time axis went unplotted because A did not have one, and the panel
+    // said nothing about either. A missing curve is a fact about the data and
+    // has to be stated; a blank space is a bug report waiting to be filed.
+    struct TSlot {
+        std::string letter, label, why;
+        const AbTemporal* t = nullptr;
+        const ImageDoc* doc = nullptr;
+        ImU32 ink = 0;
+        bool has = false;      // >= 2 measured frames: there is a time axis to plot
     };
-    span(A); span(B);
-    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
-    char yl[128];
-    const char* rlab = sameRegion && !A.roiUsed ? "frame" : "ROI";
-    if (im->dtype != Bim->dtype)
-        snprintf(yl, sizeof yl, "%s mean value (%s)  -  A %s / B %s, DTYPE MISMATCH",
-                 rlab, unit.c_str(), im->dtype.c_str(), Bim->dtype.c_str());
-    else snprintf(yl, sizeof yl, "%s mean value (%s)", rlab, unit.c_str());
-    const ImU32 CURVE = IM_COL32(105, 220, 130, 255);
+    std::vector<TSlot> slots;
+    auto addSlot = [&](const std::string& letter, const AbTemporal& t,
+                       const ImageDoc* d, size_t inkIdx) {
+        TSlot s;
+        s.letter = letter; s.label = abDocLabel(d); s.t = &t; s.doc = d;
+        s.ink = temporalSlotInk(inkIdx);
+        s.has = t.mean && t.idx && t.mean->size() >= 2 && t.idx->size() >= 2;
+        if (!s.has)
+            s.why = !t.isStack ? "a single frame has no time axis"
+                  : !t.valid   ? t.note
+                  : t.fromServer ? "the server aggregate returned no per-frame means"
+                                 : "fewer than 2 measured frames";
+        slots.push_back(s);
+    };
+    addSlot("A", A, im, 0);
+    addSlot("B", B, Bim, 1);
+    for (size_t i = 0; i < XS.size(); i++) addSlot(XS[i].letter, XS[i].t, XS[i].doc, 2 + i);
 
-    // tint = B is sharing A's plot and needs its own ink; alone in its own
-    // panel it is stroked exactly like A, so the two can be read against each
-    // other. (Same rule as the projection profiles - a dash pattern reads as a
-    // broken curve rather than as "this one is B".)
-    auto curve = [&](const PlotRect& tp, const AbTemporal& s, bool tint) {
-        if (!tp.ok || !s.mean || s.mean->size() < 2 || !s.idx) return;
+    g_tchart = TemporalChartProbe{};
+    g_tchart.ran = true;
+    g_tchart.availBefore = ImGui::GetContentRegionAvail().y;
+    g_tchart.winBot = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+    g_tchart.nSlots = (int)std::min(slots.size(), sizeof g_tchart.slot);
+    for (int i = 0; i < g_tchart.nSlots; i++) g_tchart.slot[i] = slots[i].letter[0];
+
+    float mn = FLT_MAX, mx = -FLT_MAX, fx0 = FLT_MAX, fx1 = -FLT_MAX;
+    int nHas = 0;
+    bool anyMosaic = false;
+    std::string noAxis;
+    for (size_t i = 0; i < slots.size(); i++) {
+        const TSlot& s = slots[i];
+        if (s.t->nPl > 1) anyMosaic = true;
+        if (!s.has) {
+            if (!noAxis.empty()) noAxis += ";   ";
+            noAxis += s.letter + " (" + elideFront(s.label, 22) + ") " + s.why;
+            if (g_tchart.nNoAxis < (int)sizeof g_tchart.noAxisSlot)
+                g_tchart.noAxisSlot[g_tchart.nNoAxis++] = s.letter[0];
+            continue;
+        }
+        nHas++;
+        for (float v : *s.t->mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        fx0 = std::min(fx0, s.t->idx->front());
+        fx1 = std::max(fx1, s.t->idx->back());
+    }
+    if (!nHas) {
+        // Nothing to plot on ANY side. Say which side and why, rather than
+        // leaving the space where a chart was.
+        ImGui::TextColored(AB_AMBER, "no per-frame chart: %s", noAxis.c_str());
+        ImGui::TextDisabled("a chart of frame index needs a STACK with at least two "
+                            "measured frames on one side (sigma_t is a property of a "
+                            "stack, never of a frame).");
+        return;
+    }
+    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
+    char yl[160];
+    const char* rlab = sameRegion && !A.roiUsed ? "frame" : "ROI";
+    // The per-frame mean is a LEVEL, not a noise statistic, so it is
+    // legitimately pooled over the mosaic - but sitting under a table that is
+    // split by plane it has to SAY it is pooled (docs/terminology.md).
+    const char* plab = anyMosaic ? ", plane=all" : "";
+    if (dtypeMix)
+        snprintf(yl, sizeof yl, "%s mean value (%s%s)  -  A %s / B %s, DTYPE MISMATCH",
+                 rlab, unit.c_str(), plab, im->dtype.c_str(), Bim->dtype.c_str());
+    else snprintf(yl, sizeof yl, "%s mean value (%s%s)", rlab, unit.c_str(), plab);
+
+    // Sharing one plot, every slot needs its own ink; alone in its own panel it
+    // is stroked exactly like A, so the panels can be read against each other.
+    // (Same rule as the projection profiles - a dash pattern reads as a broken
+    // curve rather than as "this one is B".)
+    auto curve = [&](const PlotRect& tp, size_t si, ImU32 ink) {
+        const TSlot& s = slots[si];
+        if (!tp.ok || !s.has) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         std::vector<ImVec2> pts;
-        pts.reserve(s.mean->size());
-        for (size_t i = 0; i < s.mean->size() && i < s.idx->size(); i++)
-            pts.push_back(tp.at((*s.idx)[i], (*s.mean)[i]));
+        pts.reserve(s.t->mean->size());
+        for (size_t i = 0; i < s.t->mean->size() && i < s.t->idx->size(); i++)
+            pts.push_back(tp.at((*s.t->idx)[i], (*s.t->mean)[i]));
         if (pts.size() < 2) return;
-        dl->AddPolyline(pts.data(), (int)pts.size(), tint ? AB_B_INK : CURVE, 0, 1.5f);
+        dl->AddPolyline(pts.data(), (int)pts.size(), ink, 0, 1.5f);
+        if (si < sizeof g_tchart.pts / sizeof g_tchart.pts[0])
+            g_tchart.pts[si] = (int)pts.size();
     };
     auto marker = [&](const PlotRect& tp, const ImageDoc* d) {
         if (!tp.ok || !d) return;
@@ -11807,62 +12016,82 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         float mxp = tp.at((float)d->seqIndex, tp.ymin).x;
         dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y), IM_COL32(255, 184, 77, 200));
     };
+    // the legend names only the curves that exist; the slots that have none are
+    // named in their own line under the plot, with the reason
+    std::vector<TemporalLegendEntry> leg;
+    for (const TSlot& s : slots) {
+        if (!s.has) continue;
+        std::string t = s.letter + ": " + elideFront(s.label, 22);
+        // a partially loaded stack never reads as a complete one, here either
+        if (s.t->expected > s.t->frames)
+            t += "  n=" + std::to_string(s.t->frames) + "/" + std::to_string(s.t->expected);
+        leg.push_back({ t, s.ink });
+    }
+
+    const ImGuiStyle& st = ImGui::GetStyle();
     const float minSide = AB_MIN_SIDE * app.uiScale;
     bool side = abSideBySide();
-    bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+    // side by side generalises to however many slots have a curve; the fallback
+    // threshold is per PANEL, which is what AB_MIN_SIDE has always measured
+    float perPanel = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x * (nHas - 1))
+                   / (float)nHas;
+    bool tooNarrow = side && perPanel < minSide;
     if (tooNarrow) side = false;
-    const std::string aLabel = abDocLabel(im), bLabel = abDocLabel(Bim);
     float tAvail = ImGui::GetContentRegionAvail().y
                  - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
                  - (tooNarrow ? abNarrowNoteH() : 0.0f)
-                 - (side ? 0.0f : abLegendH(aLabel, bLabel, false));
-    if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;
+                 - (side ? 0.0f : temporalLegendRow(leg, false))
+                 - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
+    if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
     const char* xlab = "frame number (index in sequence)";
     if (!side) {
         PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
         if (tp.ok) {
+            g_tchart.plotted = true;
+            g_tchart.plotTop = tp.p0.y; g_tchart.plotBot = tp.p1.y;
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(tp.p0, tp.p1, true);
-            curve(tp, A, false);
-            curve(tp, B, true);
-            marker(tp, im);
+            for (size_t i = 0; i < slots.size(); i++) curve(tp, i, slots[i].ink);
+            // the "you are here" marker is A's frame index, and a lone frame
+            // has none - a line at 0 would name a frame of somebody's stack
+            if (A.isStack) marker(tp, im);
             dl->PopClipRect();
         }
-        drawABLegendRow(aLabel, bLabel);
+        temporalLegendRow(leg, true);
     } else {
-        const ImGuiStyle& st = ImGui::GetStyle();
-        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        g_tchart.sideBySide = true;
         float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
                      + ImGui::GetTextLineHeight() + 8 * app.uiScale;
-        ImGui::BeginChild("##tempA", ImVec2(half, childH), false,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("A", aLabel);
-        {
-            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
-            if (tp.ok) {
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->PushClipRect(tp.p0, tp.p1, true);
-                curve(tp, A, false); marker(tp, im);
-                dl->PopClipRect();
+        bool first = true;
+        for (size_t i = 0; i < slots.size(); i++) {
+            if (!slots[i].has) continue;
+            if (!first) ImGui::SameLine();
+            first = false;
+            ImGui::BeginChild(("##temp" + slots[i].letter).c_str(), ImVec2(perPanel, childH),
+                              false, ImGuiWindowFlags_NoScrollbar |
+                                     ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand(slots[i].letter.c_str(), slots[i].label,
+                       slots[i].doc == Bim && g_abFollowDiverged);
+            {   // same limits in every panel, by construction
+                PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
+                if (tp.ok) {
+                    if (!g_tchart.plotted) { g_tchart.plotted = true; g_tchart.plotTop = tp.p0.y; }
+                    g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->PushClipRect(tp.p0, tp.p1, true);
+                    curve(tp, i, temporalSlotInk(0));   // its own panel: A's stroke
+                    marker(tp, slots[i].doc);
+                    dl->PopClipRect();
+                }
             }
+            ImGui::EndChild();
         }
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("##tempB", ImVec2(half, childH), false,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("B", abDocLabel(Bim), g_abFollowDiverged);
-        {   // same limits as A's plot, by construction
-            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, true, false, plotH);
-            if (tp.ok) {
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->PushClipRect(tp.p0, tp.p1, true);
-                curve(tp, B, false); marker(tp, Bim);   // its own plot: A's stroke
-                dl->PopClipRect();
-            }
-        }
-        ImGui::EndChild();
     }
+    // ...and the slots that contributed no curve, named, with the reason. A
+    // chart that quietly holds fewer curves than there are compare slots is
+    // indistinguishable from a broken one.
+    if (!noAxis.empty()) ImGui::TextColored(AB_AMBER, "no curve for %s", noAxis.c_str());
     if (tooNarrow) abNarrowNote();
 }
 
@@ -11870,14 +12099,17 @@ static void drawPanelTemporal() {
     // a browser-fired aggregate (files nobody opened) owns the panel until
     // dismissed - it is the freshest thing the user asked for and has no
     // current image to attach to
+    g_tchart = TemporalChartProbe{};   // stale probe data is worse than none
     if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
-    // Compare on, and A is a stack: the A|B|delta|delta% table. A B that is not
-    // a stack still gets its column, saying exactly that. With no B at all the
-    // panel is exactly what it always was.
-    if (ImageDoc* Bim = abStatsB())
-        if (im && im->seqId != 0) { drawTemporalAB(im, Bim); return; }
-    if (im && im->seqId != 0) {
+    if (!im) { ImGui::TextDisabled("no image"); return; }
+    // Compare on: the A|B|delta|delta% table and the shared chart. A side that
+    // is not a stack still gets its column and its line under the chart, saying
+    // exactly that - INCLUDING A. Handing this branch only stacks is how a
+    // lone-frame A used to leave the whole panel blank while B, a full stack
+    // with a perfectly good time axis, went unplotted.
+    if (ImageDoc* Bim = abStatsB()) { drawTemporalAB(im, Bim); return; }
+    if (im->seqId != 0) {
         App::SeqInfo* si = seqInfo(im->seqId);
         if (drawServerTemporal(si)) {         // remote stack, computed on the server
             // the per-frame table still works here - over the frames that are
@@ -11957,14 +12189,21 @@ static void drawPanelTemporal() {
             // the per-frame mean is a LEVEL, not a noise statistic, so it is
             // legitimately pooled - but it still has to say so next to a table
             // that is split by plane
-            snprintf(yl, sizeof yl, "ROI mean value (%s%s)", abValueUnit(im->dtype).c_str(),
-                     T.nPl > 1 ? ", all planes" : "");
+            snprintf(yl, sizeof yl, "%s mean value (%s%s)", T.roiUsed ? "ROI" : "frame",
+                     abValueUnit(im->dtype).c_str(), T.nPl > 1 ? ", plane=all" : "");
             float tAvail = ImGui::GetContentRegionAvail().y
                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+            g_tchart.ran = true;
+            g_tchart.nSlots = 1;
+            g_tchart.slot[0] = 'A';
+            g_tchart.winBot = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
             PlotRect tp = beginPlot("frame number (index in sequence)", yl,
                                     fx0, fx1, mn, mx, true, false,
                                     std::max(tAvail, 70.0f * app.uiScale));
             if (tp.ok) {
+                g_tchart.plotted = true;
+                g_tchart.plotTop = tp.p0.y; g_tchart.plotBot = tp.p1.y;
+                g_tchart.pts[0] = (int)T.frameMean.size();
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 dl->PushClipRect(tp.p0, tp.p1, true);
                 for (size_t i = 1; i < T.frameMean.size(); i++)
@@ -11979,8 +12218,16 @@ static void drawPanelTemporal() {
                 dl->PopClipRect();
             }
         }
+        return;
     }
-
+    // A lone frame, no compare: there is no time axis at all. Say so - the
+    // panel used to draw literally nothing here, which reads as a broken panel
+    // rather than as "this image is not a stack".
+    ImGui::Text("Temporal");
+    ImGui::Separator();
+    ImGui::TextDisabled("%s is a single frame: no time axis.", im->name.c_str());
+    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open a "
+                        "sequence, or set a stack as compare B.");
 }
 
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
@@ -20690,6 +20937,229 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "abstatsselftest: P3 lone-B checks skipped (%s/rgb_u8.npy "
                                 "not there)\n", root.c_str());
             }
+        }
+
+        // ---- T: the Temporal panel's CHART, laid out for real ----
+        // The report this group exists for is "with A and B on, Temporal shows
+        // the numbers and no chart". Nothing that only calls the recompute
+        // functions can see it: the numbers were right, the curve data was
+        // right, and the chart was drawn - past the bottom edge of the panel,
+        // because ImGuiTableFlags_ScrollX puts the A|B table in a child window
+        // and a child-window table with the default outer_size takes ALL the
+        // height the panel has left. So this group drives REAL ImGui frames and
+        // asserts on the layout the panel records (g_tchart). It has to be
+        // state, not pixels: this machine's screen capture returns a white
+        // client area for OpenGL content, and glReadPixels of a 1600x1000
+        // window is not a regression test anyone will keep running.
+        {
+            auto temporalFrame = [&](float w, float h) {
+                // two passes: the first settles the window, the second is the
+                // one whose layout is measured
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+                    ImGui::Begin("TemporalProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawPanelTemporal();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            auto ptsOf = [&](char letter) {
+                for (int i = 0; i < g_tchart.nSlots; i++)
+                    if (g_tchart.slot[i] == letter) return g_tchart.pts[i];
+                return -1;
+            };
+            auto saidNoAxis = [&](char letter) {
+                for (int i = 0; i < g_tchart.nNoAxis; i++)
+                    if (g_tchart.noAxisSlot[i] == letter) return true;
+                return false;
+            };
+            const int saveLayout = app.abStatsLayout, saveMode = app.compareMode;
+
+            // T1: two stacks, overlaid. Both curves on one axis, and the plot
+            // INSIDE the panel - the check the reported symptom needed.
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            app.abStatsLayout = App::AbOverlay;
+            abStatsFrame();
+            temporalFrame(560.0f, 440.0f);
+            fprintf(stderr, "abstatsselftest: T1 overlay 560x440: ran=%d plotted=%d "
+                            "slots=%d A=%d B=%d plot y %.1f..%.1f (window bottom %.1f) "
+                            "avail before chart=%.1f\n",
+                    g_tchart.ran ? 1 : 0, g_tchart.plotted ? 1 : 0, g_tchart.nSlots,
+                    ptsOf('A'), ptsOf('B'), g_tchart.plotTop, g_tchart.plotBot,
+                    g_tchart.winBot, g_tchart.availBefore);
+            check(g_tchart.ran && g_tchart.plotted,
+                  "T1 A and B both stacks: the chart is drawn");
+            check(ptsOf('A') >= 2 && ptsOf('B') >= 2,
+                  "T1 ...with data for BOTH sides on it");
+            check(temporalChartVisible(),
+                  "T1 ...and it lands inside the panel, not below it");
+            check(g_tchart.nNoAxis == 0, "T1 ...and neither side is reported axis-less");
+
+            // T1b: the same pair side by side. Two panels, both with a curve.
+            // The width is derived from AB_MIN_SIDE and the display scale, not
+            // typed in: below that threshold the layout is SUPPOSED to fall
+            // back to an overlay, and a hard-coded width would make this check
+            // a test of the machine's DPI setting.
+            app.abStatsLayout = App::AbSide;
+            const float sideW = AB_MIN_SIDE * app.uiScale * 2 + 120.0f;
+            temporalFrame(sideW, 440.0f);
+            fprintf(stderr, "abstatsselftest: T1b side-by-side %.0fx440 (uiScale %.2f): "
+                            "side=%d A=%d B=%d plot bottom=%.1f window bottom=%.1f\n",
+                    sideW, app.uiScale, g_tchart.sideBySide ? 1 : 0, ptsOf('A'),
+                    ptsOf('B'), g_tchart.plotBot, g_tchart.winBot);
+            check(g_tchart.sideBySide && ptsOf('A') >= 2 && ptsOf('B') >= 2,
+                  "T1b side by side: each side gets its own curve");
+            check(temporalChartVisible(), "T1b ...and both plots fit in the panel");
+            app.abStatsLayout = App::AbOverlay;
+
+            // T2: B is a lone frame. A's chart must survive, and the panel must
+            // SAY that B has no time axis - drawing nothing was the old answer
+            // to half of this, and saying nothing to the other half.
+            {
+                std::string root = g_abstatsSelftest;
+                std::replace(root.begin(), root.end(), '\\', '/');
+                while (!root.empty() && root.back() == '/') root.pop_back();
+                size_t sl = root.find_last_of('/');
+                root = sl == std::string::npos ? std::string(".") : root.substr(0, sl);
+                size_t before = app.images.size();
+                openPath(root + "/rgb_u8.npy");
+                loadAll();
+                if (app.images.size() > before) {
+                    ImageDoc* lone = app.images.back().get();
+                    selectImage(frA.front());
+                    setCompareB(lone);
+                    abStatsFrame();
+                    temporalFrame(560.0f, 440.0f);
+                    fprintf(stderr, "abstatsselftest: T2 lone-frame B: plotted=%d A=%d "
+                                    "B=%d noAxis=%d ('%c')\n",
+                            g_tchart.plotted ? 1 : 0, ptsOf('A'), ptsOf('B'),
+                            g_tchart.nNoAxis,
+                            g_tchart.nNoAxis ? g_tchart.noAxisSlot[0] : '-');
+                    check(g_tchart.plotted && ptsOf('A') >= 2,
+                          "T2 B a lone frame: A's chart is still drawn");
+                    check(ptsOf('B') == 0 && saidNoAxis('B'),
+                          "T2 ...and the panel says B has no time axis");
+                    check(temporalChartVisible(), "T2 ...and A's plot fits in the panel");
+
+                    // T2b: the mirror image - A is the lone frame, B the stack.
+                    // This used to leave the panel completely empty: the AB
+                    // branch was gated on A being a stack, and the fallback
+                    // wanted a stack too.
+                    int loneIdx = -1;
+                    for (int i = 0; i < (int)app.images.size(); i++)
+                        if (app.images[i].get() == lone) loneIdx = i;
+                    if (loneIdx >= 0) {
+                        selectImage(loneIdx);
+                        setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                        abStatsFrame();
+                        temporalFrame(560.0f, 440.0f);
+                        fprintf(stderr, "abstatsselftest: T2b lone-frame A: plotted=%d "
+                                        "A=%d B=%d noAxis=%d\n",
+                                g_tchart.plotted ? 1 : 0, ptsOf('A'), ptsOf('B'),
+                                g_tchart.nNoAxis);
+                        check(g_tchart.plotted && ptsOf('B') >= 2,
+                              "T2b A a lone frame: B's chart is drawn anyway");
+                        check(ptsOf('A') == 0 && saidNoAxis('A'),
+                              "T2b ...and the panel says A has no time axis");
+                    }
+                    // T6: NEITHER side has a time axis. There is no chart to
+                    // draw - and the panel has to SAY that, for both sides.
+                    // Leaving the space a chart used to occupy blank is the
+                    // defect, not the absence of the chart.
+                    size_t before2 = app.images.size();
+                    openPath(root + "/grad_u16.npy");
+                    loadAll();
+                    if (app.images.size() > before2) {
+                        ImageDoc* lone2 = app.images.back().get();
+                        int li = -1;
+                        for (int i = 0; i < (int)app.images.size(); i++)
+                            if (app.images[i].get() == lone) li = i;
+                        if (li >= 0) {
+                            selectImage(li);
+                            setCompareB(lone2);
+                            abStatsFrame();
+                            temporalFrame(560.0f, 440.0f);
+                            fprintf(stderr, "abstatsselftest: T6 two lone frames: ran=%d "
+                                            "plotted=%d noAxis=%d\n", g_tchart.ran ? 1 : 0,
+                                    g_tchart.plotted ? 1 : 0, g_tchart.nNoAxis);
+                            check(g_tchart.ran && !g_tchart.plotted &&
+                                  g_tchart.nNoAxis == 2 && saidNoAxis('A') && saidNoAxis('B'),
+                                  "T6 no time axis on either side: both say why, no chart");
+                        }
+                        selectImage((int)app.images.size() - 1);   // lone2, and only it
+                        closeCurrent(true);
+                    }
+                    selectImage((int)app.images.size() - 1);   // the lone frame ITSELF
+                    closeCurrent(true);                        // ...and only that one
+                } else {
+                    fprintf(stderr, "abstatsselftest: T2 skipped (%s/rgb_u8.npy not "
+                                    "there)\n", root.c_str());
+                }
+            }
+
+            // T3: a third stack in compare slot C gets a curve of its own.
+            if (app.seqs.size() >= 3) {
+                std::vector<int> frC = framesOfSeq(app.seqs[2].id);
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                app.cmpExtra.clear();
+                if (!frC.empty()) addCompareSlot(app.images[frC.front()].get());
+                abStatsFrame();
+                temporalFrame(560.0f, 440.0f);
+                fprintf(stderr, "abstatsselftest: T3 slot C: slots=%d A=%d B=%d C=%d\n",
+                        g_tchart.nSlots, ptsOf('A'), ptsOf('B'), ptsOf('C'));
+                check(g_tchart.nSlots == 3 && ptsOf('C') >= 2,
+                      "T3 an extra compare slot gets its own curve");
+                check(ptsOf('A') >= 2 && ptsOf('B') >= 2,
+                      "T3 ...without costing A or B theirs");
+                app.cmpExtra.clear();
+            }
+
+            // T5: a SHORT panel. The table may not have room for all its rows
+            // now, and the rule is that the chart keeps its floor and the table
+            // scrolls - not the other way round, which is how the chart got
+            // pushed off the panel in the first place.
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            app.abStatsLayout = App::AbOverlay;
+            abStatsFrame();
+            temporalFrame(560.0f, 300.0f);
+            fprintf(stderr, "abstatsselftest: T5 short panel 560x300: plotted=%d A=%d "
+                            "B=%d plot y %.1f..%.1f window bottom=%.1f\n",
+                    g_tchart.plotted ? 1 : 0, ptsOf('A'), ptsOf('B'),
+                    g_tchart.plotTop, g_tchart.plotBot, g_tchart.winBot);
+            check(g_tchart.plotted && ptsOf('A') >= 2 && ptsOf('B') >= 2,
+                  "T5 a short panel keeps both curves");
+            check(temporalChartVisible(),
+                  "T5 ...and the chart, not the table, keeps the room");
+
+            // T4: compare off - the one-sided panel still charts, and still
+            // fits. The A/B fix must not have moved the plain case.
+            app.compareMode = App::CmpOff;
+            abStatsFrame();
+            temporalFrame(560.0f, 440.0f);
+            fprintf(stderr, "abstatsselftest: T4 compare off: plotted=%d A=%d "
+                            "plot bottom=%.1f window bottom=%.1f\n",
+                    g_tchart.plotted ? 1 : 0, ptsOf('A'), g_tchart.plotBot,
+                    g_tchart.winBot);
+            check(g_tchart.plotted && ptsOf('A') >= 2 && temporalChartVisible(),
+                  "T4 compare off: the one-sided chart is drawn and fits");
+
+            app.abStatsLayout = saveLayout;
+            app.compareMode = saveMode;
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            abStatsFrame();
         }
 
         // ---- A6: compare off invalidates slot 1 once; closing B leaves nothing ----
