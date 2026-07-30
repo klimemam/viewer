@@ -650,6 +650,7 @@ struct App {
         // never silently becomes "lx".
         char unit[16] = "lx";
         int tablePlane = 0;               // which CFA plane the per-stack table shows
+        bool snrDb = false;               // SNR curve y axis: ratio (default) or dB
         bool fitValid = false, roiUsed = false;
         bool readFromDark = false;        // read noise measured, not extrapolated
         int nPl = 1, nPts = 0;
@@ -10980,6 +10981,153 @@ static void linRecompute(int seriesId) {
     L.computedRev = ++L.rev;
 }
 
+// The SNR curve: the rows linRecompute already measured, presented against the
+// noise they carry (docs/stats-taxonomy.md gap #2 - no new measurement, a new
+// presentation of the fit's own rows). One point per lit member per CFA plane,
+// planes never mixed. x = dark-corrected mean signal [DN], y = x / sigma_t,
+// dimensionless. The dark convention is linRecompute's own: a level-0 member is
+// a MEASUREMENT and wins (the same rule that decides readFromDark); without one
+// the FITTED offset is subtracted and *fromDark tells the caller to say
+// "extrapolated". Inclusion is the fit's rule verbatim (include && valid &&
+// finite level) - not re-derived - so a point excluded from the fit is excluded
+// here by the same test. The dark row itself is no point: zero signal has no
+// ratio, and the log axis could not place it anyway. *belowDark counts lit rows
+// whose corrected mean came out <= 0 (or whose sigma_t was 0) - they are
+// dropped, and the caller must SAY so, not hide them.
+struct LinSnrPt { int seqId; int plane; double x, snr; };
+static void linSnrPoints(const App::LinState& L, std::vector<LinSnrPt>& out,
+                         bool* fromDark, int* belowDark) {
+    out.clear();
+    const App::LinState::Row* darkRow = nullptr;
+    for (const auto& r : L.rows) {
+        if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+        if (fabs(r.level) <= 1e-9) { darkRow = &r; break; }   // linRecompute's dark rule
+    }
+    if (fromDark) *fromDark = darkRow != nullptr;
+    if (belowDark) *belowDark = 0;
+    for (const auto& r : L.rows) {
+        if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+        if (&r == darkRow) continue;
+        for (int p = 0; p < r.nPl && p < 4; p++) {
+            double dark = darkRow ? darkRow->mean[p] : L.offs[p];
+            double x = r.mean[p] - dark;
+            if (!(x > 0) || !(r.sigmaT[p] > 0)) { if (belowDark) (*belowDark)++; continue; }
+            out.push_back({ r.seqId, p, x, x / r.sigmaT[p] });
+        }
+    }
+}
+
+// beginPlot for the SNR curve's LOG axes: x is always log10 (the levels span
+// decades by design), y is log10 for the ratio view and stays linear for the dB
+// view (a dB is already a log). Bounds arrive LINEAR (x > 0; y > 0 when yLog);
+// the returned PlotRect lives in log10-x space, so callers map points with
+// at(log10(x), yLog ? log10(y) : ydB). Ticks sit on the 1-2-5 sequence per
+// decade with unlabeled minor lines at the remaining integers - log-paper, so
+// a slope-1/2 reference line reads as one.
+static PlotRect beginPlotLog(const char* xLabel, const char* yLabel,
+                             double xlo, double xhi, double ylo, double yhi,
+                             bool yLog, float height) {
+    xlo = log10(std::max(xlo, 1e-12)); xhi = log10(std::max(xhi, 1e-12));
+    if (yLog) { ylo = log10(std::max(ylo, 1e-12)); yhi = log10(std::max(yhi, 1e-12)); }
+    // breathing room so the end points sit off the frame, and a span floor so a
+    // single level still draws as a plot instead of a degenerate axis
+    auto pad = [](double& lo, double& hi, double minSpan, double frac) {
+        if (hi < lo) std::swap(lo, hi);
+        if (hi - lo < minSpan) { double c = (lo + hi) * 0.5; lo = c - minSpan * 0.5; hi = c + minSpan * 0.5; }
+        double span = hi - lo;
+        lo -= span * frac; hi += span * frac;
+    };
+    pad(xlo, xhi, 0.3, 0.05);
+    pad(ylo, yhi, yLog ? 0.3 : 1.0, 0.07);
+    // 1-2-5 majors (labels + grid) and 3,4,6..9 minors (grid only), in log space
+    auto logMajors = [](double lo, double hi, std::vector<double>& out) {
+        bool dense = hi - lo <= 3.5;              // decades only once it gets busy
+        static const double M[3] = { 1, 2, 5 };
+        for (int e = (int)floor(lo) - 1; e <= (int)ceil(hi); e++)
+            for (int i = 0; i < (dense ? 3 : 1); i++) {
+                double v = e + log10(M[i]);
+                if (v >= lo - 1e-9 && v <= hi + 1e-9) out.push_back(v);
+            }
+    };
+    auto logMinors = [](double lo, double hi, std::vector<double>& out) {
+        static const double M[6] = { 3, 4, 6, 7, 8, 9 };
+        for (int e = (int)floor(lo) - 1; e <= (int)ceil(hi); e++)
+            for (double m : M) {
+                double v = e + log10(m);
+                if (v >= lo - 1e-9 && v <= hi + 1e-9) out.push_back(v);
+            }
+    };
+    std::vector<double> xMaj, xMin, yMaj, yMin;
+    logMajors(xlo, xhi, xMaj); logMinors(xlo, xhi, xMin);
+    double ystep = 1;
+    if (yLog) { logMajors(ylo, yhi, yMaj); logMinors(ylo, yhi, yMin); }
+    else {
+        ystep = niceStep((float)((yhi - ylo) / 4.0));
+        for (double v = ceil(ylo / ystep) * ystep; v <= yhi + 1e-9; v += ystep)
+            yMaj.push_back(v);
+    }
+    PlotRect pr;
+    pr.xmin = (float)xlo; pr.xmax = (float)xhi;
+    pr.ymin = (float)ylo; pr.ymax = (float)yhi;
+
+    const float s = app.uiScale;
+    const float fh = ImGui::GetFontSize();
+    char tb[48];
+    float wy = 0.0f;                     // measure EVERY y label (see beginPlot)
+    for (double v : yMaj) {
+        fmtTick(tb, sizeof tb, yLog ? pow(10.0, v) : v, false);
+        wy = std::max(wy, ImGui::CalcTextSize(tb).x);
+    }
+    const float marginL = wy + 9 * s;
+    const float marginB = fh * 2 + 6 * s;
+    const float marginT = fh + 4 * s;
+
+    float wid = ImGui::GetContentRegionAvail().x;
+    ImVec2 org = ImGui::GetCursorScreenPos();
+    pr.p0 = ImVec2(org.x + marginL, org.y + marginT);
+    pr.p1 = ImVec2(org.x + wid, org.y + marginT + height);
+    if (pr.p1.x - pr.p0.x < 20 || height < 20) { ImGui::Dummy(ImVec2(wid, height)); return pr; }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg = IM_COL32(12, 14, 16, 255), grid = IM_COL32(46, 52, 58, 255),
+          gridMin = IM_COL32(30, 34, 38, 255), txt = IM_COL32(150, 160, 170, 255),
+          axis = IM_COL32(90, 100, 110, 255);
+    dl->AddRectFilled(pr.p0, pr.p1, bg);
+    for (double v : yMin) {              // minors under majors under labels
+        float y = pr.at(pr.xmin, (float)v).y;
+        dl->AddLine(ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y), gridMin);
+    }
+    for (double v : xMin) {
+        float x = pr.at((float)v, pr.ymin).x;
+        dl->AddLine(ImVec2(x, pr.p0.y), ImVec2(x, pr.p1.y), gridMin);
+    }
+    for (double v : yMaj) {
+        float y = pr.at(pr.xmin, (float)v).y;
+        dl->AddLine(ImVec2(pr.p0.x, y), ImVec2(pr.p1.x, y), grid);
+        fmtTick(tb, sizeof tb, yLog ? pow(10.0, v) : v, false);
+        ImVec2 ts = ImGui::CalcTextSize(tb);
+        dl->AddText(ImVec2(pr.p0.x - 5 * s - ts.x, y - fh * 0.5f), txt, tb);
+    }
+    for (double v : xMaj) {
+        float x = pr.at((float)v, pr.ymin).x;
+        dl->AddLine(ImVec2(x, pr.p0.y), ImVec2(x, pr.p1.y), grid);
+        fmtTick(tb, sizeof tb, pow(10.0, v), false);
+        ImVec2 ts = ImGui::CalcTextSize(tb);
+        dl->AddText(ImVec2(std::clamp(x - ts.x * 0.5f, pr.p0.x, pr.p1.x - ts.x),
+                           pr.p1.y + 2 * s), txt, tb);
+    }
+    dl->AddRect(pr.p0, pr.p1, axis);
+    dl->AddText(ImVec2(org.x, org.y), txt, yLabel ? yLabel : "y");
+    {
+        const char* xl = xLabel ? xLabel : "x";
+        ImVec2 ts = ImGui::CalcTextSize(xl);
+        dl->AddText(ImVec2((pr.p0.x + pr.p1.x - ts.x) * 0.5f, pr.p1.y + 2 * s + fh), txt, xl);
+    }
+    ImGui::Dummy(ImVec2(wid, height + marginT + marginB));
+    pr.ok = true;
+    return pr;
+}
+
 // SELFTEST ONLY - the one place in the program that creates a series without a
 // human. The canon forbids auto-creation because a guessed sweep is a lie that
 // fits; a headless test has nobody to press Create, so it presses it here, in
@@ -11504,6 +11652,154 @@ static void drawPanelLinearity() {
                         "LE = worst deviation from the fit | read noise %s", L.nPts,
                         L.readFromDark ? "measured in the level-0 stack"
                                        : "extrapolated (no dark stack)");
+
+    // ---- SNR curve: the same rows, the mean set against the noise it carries.
+    // A SECTION of this panel, not a new one: the material is the fit's own rows
+    // (docs/stats-taxonomy.md gap #2, and its §4 sends LM curves here first).
+    {
+        std::vector<LinSnrPt> sp;
+        bool snrDark = false;
+        int dropped = 0;
+        linSnrPoints(L, sp, &snrDark, &dropped);
+        if (ImGui::CollapsingHeader("SNR curve", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("dB##snrdb", &L.snrDb);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("y axis as 20*log10(SNR) instead of the plain ratio");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(sp.empty());
+            if (ImGui::SmallButton("Copy curve (TSV)")) {
+                // provenance rides along as a # comment, like every other copy
+                std::string tsv = "# SNR curve: series '" + S->name + "' (batch '" +
+                                  batchNameOf(S->batchId) + "') | " +
+                                  (L.roiUsed ? "selected ROI" : "whole frame") +
+                                  " | SNR = (mean - dark) / sigma_t per CFA plane | dark = " +
+                                  (snrDark ? "measured level-0 stack"
+                                           : "fitted offset (extrapolated)") + "\n";
+                char b[320];
+                snprintf(b, sizeof b, "value [%s]\tstack\tplane\tmean [DN]\tsignal [DN]\t"
+                                      "sigma_t [DN]\tSNR [-]\tSNR [dB]\tframes\n", S->unit);
+                tsv += b;
+                for (const auto& q : sp) {
+                    const App::LinState::Row* r = nullptr;
+                    for (const auto& rr : L.rows) if (rr.seqId == q.seqId) { r = &rr; break; }
+                    if (!r) continue;
+                    const App::SeqInfo* si = seqInfo(q.seqId);
+                    char fb[32];
+                    if (si && si->expectedFrames > r->frames)
+                        snprintf(fb, sizeof fb, "%d/%d", r->frames, si->expectedFrames);
+                    else snprintf(fb, sizeof fb, "%d", r->frames);
+                    snprintf(b, sizeof b, "%.6g\t%s\t%s\t%.6g\t%.6g\t%.6g\t%.6g\t%.6g\t%s\n",
+                             r->level, r->name.c_str(),
+                             L.nPl > 1 ? LIN_PLANES[q.plane] : "all", r->mean[q.plane],
+                             q.x, r->sigmaT[q.plane], q.snr, 20.0 * log10(q.snr), fb);
+                    tsv += b;
+                }
+                ImGui::SetClipboardText(tsv.c_str());
+                toast("SNR curve copied as TSV (provenance included)");
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            // the same measured-vs-extrapolated honesty the read noise column has
+            ImGui::TextDisabled(snrDark ? "| dark = measured level-0 stack"
+                                        : "| dark = fitted offset (extrapolated)");
+            if (!snrDark && ImGui::IsItemHovered())
+                ImGui::SetTooltip("No dark (level-0) stack in the series, so the signal is\n"
+                                  "the mean minus the FITTED offset - an extrapolation.\n"
+                                  "Add a dark stack to measure the black level instead.");
+            if (sp.empty()) {
+                ImGui::TextDisabled("no lit points: SNR needs a level with signal above dark.");
+            } else {
+                double x0 = DBL_MAX, x1 = 0, y0 = DBL_MAX, y1 = 0;
+                for (const auto& q : sp) {
+                    x0 = std::min(x0, q.x); x1 = std::max(x1, q.x);
+                    y0 = std::min(y0, q.snr); y1 = std::max(y1, q.snr);
+                }
+                double Kavg = 0;                  // for the shot-noise guide line
+                int nK = 0;
+                for (int p = 0; p < L.nPl; p++) if (L.ptcK[p] > 0) { Kavg += L.ptcK[p]; nK++; }
+                Kavg = nK ? Kavg / nK : 0;
+                const bool db = L.snrDb;
+                float snrH = std::max(110.0f * app.uiScale,
+                                      std::min(ImGui::GetContentRegionAvail().y * 0.40f,
+                                               ImGui::GetFontSize() * 18));
+                PlotRect pr = beginPlotLog("mean signal [DN] (dark-corrected)",
+                                           db ? "SNR [dB]" : "SNR [-]", x0, x1,
+                                           db ? 20.0 * log10(y0) : y0,
+                                           db ? 20.0 * log10(y1) : y1, !db, snrH);
+                if (pr.ok) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->PushClipRect(pr.p0, pr.p1, true);
+                    // the ideal shot-noise limit sqrt(signal/K): slope 1/2 in
+                    // log-log (10 dB/decade in dB). DASHED because it is a
+                    // REFERENCE - the data curves stay solid.
+                    if (Kavg > 0) {
+                        auto refY = [&](float t) {   // t = log10(signal)
+                            return db ? (float)(10.0 * (t - log10(Kavg)))
+                                      : (float)(0.5 * (t - log10(Kavg)));
+                        };
+                        ImVec2 seg[2] = { pr.at(pr.xmin, refY(pr.xmin)),
+                                          pr.at(pr.xmax, refY(pr.xmax)) };
+                        addDashedPolyline(dl, seg, 2, IM_COL32(170, 178, 186, 190), 1.4f,
+                                          7 * app.uiScale, 5 * app.uiScale);
+                    }
+                    for (int p = 0; p < L.nPl; p++) {   // per plane: line under points
+                        std::vector<const LinSnrPt*> ps;
+                        for (const auto& q : sp) if (q.plane == p) ps.push_back(&q);
+                        std::sort(ps.begin(), ps.end(),
+                                  [](const LinSnrPt* a, const LinSnrPt* b) { return a->x < b->x; });
+                        std::vector<ImVec2> line;
+                        for (const LinSnrPt* q : ps)
+                            line.push_back(pr.at((float)log10(q->x),
+                                                 db ? (float)(20.0 * log10(q->snr))
+                                                    : (float)log10(q->snr)));
+                        for (size_t i = 1; i < line.size(); i++)
+                            dl->AddLine(line[i - 1], line[i],
+                                        (LIN_COLS[p] & 0x00FFFFFF) | 0x60000000, 1.5f);
+                        for (const ImVec2& v : line) dl->AddCircleFilled(v, 3.5f, LIN_COLS[p]);
+                    }
+                    dl->PopClipRect();
+                }
+                if (L.nPl > 1)
+                    for (int p = 0; p < L.nPl; p++) {
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              ImGui::ColorConvertU32ToFloat4(LIN_COLS[p]));
+                        ImGui::TextUnformatted(LIN_PLANES[p]);
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                    }
+                ImGui::TextDisabled("%s- - ideal shot noise sqrt(signal/K), slope 1/2",
+                                    L.nPl > 1 ? "| " : "");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("SNR if photon shot noise were the only noise, from the\n"
+                                      "PTC gain K (averaged over the fitted planes). The gap\n"
+                                      "below it at low signal is read noise.");
+                ImGui::TextDisabled("%d point(s) | SNR = (mean - dark) / sigma_t, planes "
+                                    "never mixed", (int)sp.size());
+                // n of N, exactly where the table above says it: a sigma_t over a
+                // partial stack is a real measurement over fewer frames, and the
+                // curve must say so too
+                std::string part;
+                for (const auto& r : L.rows) {
+                    if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+                    const App::SeqInfo* si = seqInfo(r.seqId);
+                    if (si && si->expectedFrames > r.frames) {
+                        char pb[96];
+                        snprintf(pb, sizeof pb, "%s%s %d/%d", part.empty() ? "" : ", ",
+                                 r.name.c_str(), r.frames, si->expectedFrames);
+                        part += pb;
+                    }
+                }
+                if (!part.empty())
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                       "partial stacks (measured over resident frames): %s",
+                                       part.c_str());
+                if (dropped)
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                       "%d plane point(s) at or below dark level left out "
+                                       "(nothing positive to plot)", dropped);
+            }
+        }
+    }
 
     // ---- plots: the response, and the part of it that is NOT linear ----
     struct Pt { double x, y; int p; };
@@ -22854,7 +23150,7 @@ int main(int argc, char** argv) {
         // proposal the Create modal shows a human), unit = the prefill
         // (prefs linunit, "lx" unless the user changed it). That is the ONLY
         // auto-creation in the program and it lives behind this flag.
-        bool fitOk = false;
+        bool fitOk = false, snrOk = true;
         std::vector<int> bids;
         for (const auto& b : app.batches) bids.push_back(b.id);
         for (int bid : bids) {
@@ -22879,10 +23175,105 @@ int main(int argc, char** argv) {
             fprintf(stderr, "linselftest: %d points, fit %s\n", L.nPts,
                     L.fitValid ? "ok" : "FAILED");
             fitOk |= L.fitValid;
+
+            // ---- SNR curve, through the panel's own linSnrPoints (same rules,
+            // same code path - the selftest re-derives NOTHING) ---------------
+            if (L.fitValid) {
+                std::vector<LinSnrPt> sp;
+                bool fromDark = false;
+                int droppedPts = 0;
+                linSnrPoints(L, sp, &fromDark, &droppedPts);
+                auto rowOf = [&](int seqId) -> const App::LinState::Row* {
+                    for (const auto& rr : L.rows) if (rr.seqId == seqId) return &rr;
+                    return nullptr;
+                };
+                int perPl[4] = {};
+                for (const auto& q : sp) {
+                    const App::LinState::Row* r = rowOf(q.seqId);
+                    if (q.plane >= 0 && q.plane < 4) perPl[q.plane]++;
+                    fprintf(stderr, "linselftest: snr %-3s level=%.6g signal=%.6g snr=%.6g\n",
+                            L.nPl > 1 ? LIN_PLANES[q.plane] : "all", r ? r->level : -1.0,
+                            q.x, q.snr);
+                    // a point must map to an included, measured, levelled row -
+                    // the fit's own inclusion, never a wider one
+                    if (!r || !r->include || !r->valid || !std::isfinite(r->level)) {
+                        fprintf(stderr, "linselftest: snr point outside the fit's rows FAILED\n");
+                        snrOk = false;
+                    }
+                }
+                fprintf(stderr, "linselftest: snr %d point(s) (%d/%d/%d/%d per plane), "
+                                "dark %s, %d dropped\n", (int)sp.size(), perPl[0], perPl[1],
+                        perPl[2], perPl[3], fromDark ? "measured" : "extrapolated", droppedPts);
+                // one dark rule for the whole panel: the curve subtracts a
+                // MEASURED dark exactly when the read noise says readFromDark
+                if (fromDark != L.readFromDark) {
+                    fprintf(stderr, "linselftest: snr dark rule disagrees with "
+                                    "readFromDark FAILED\n");
+                    snrOk = false;
+                }
+                // ---- analytic ground truth of the linset fixture ------------
+                // gen_lin.py injects, per RGGB plane p: mean = SENS[p]*lv + 64,
+                // sigma_t^2 = 2.0*SENS[p]*lv + 3^2, 24 frames per level, dark at
+                // lv 0. So the curve must land on SNR = S/sqrt(2S+9), S=SENS[p]*lv.
+                // Tolerance: the plane sigma_t averages 1024 per-pixel variances
+                // of N=24 samples -> relative sd ~ sqrt(2/(N-1))/(2*sqrt(1024))
+                // ~ 0.46%; the worst realized deviation on this fixture measures
+                // 1.02% (~2.2 sigma). 3% is ~6.5 sigma - not a false-failure
+                // budget, while sigma_fpn in sigma_t's place (~x4.9) or a skipped
+                // dark correction (+107% at 10 lx) land far outside. The signal
+                // check is tighter (2%): plane means realize to ~0.05%.
+                static const double GT_SENS[4] = { 8.0, 10.0, 10.0, 6.0 };
+                static const double GT_LV[7] = { 0, 10, 20, 40, 80, 160, 320 };
+                bool isLinset = L.nPl == 4 && L.rows.size() == 7 &&
+                                S && std::string(S->unit) == "lx";
+                if (isLinset) {
+                    std::vector<double> lvs;
+                    for (const auto& r : L.rows) {
+                        if (!std::isfinite(r.level) || r.frames != 24) { isLinset = false; break; }
+                        lvs.push_back(r.level);
+                    }
+                    std::sort(lvs.begin(), lvs.end());
+                    for (int i = 0; isLinset && i < 7; i++) isLinset = lvs[i] == GT_LV[i];
+                }
+                if (isLinset) {
+                    bool aOk = true;
+                    if (!fromDark || sp.size() != 24 || perPl[0] != 6 || perPl[1] != 6 ||
+                        perPl[2] != 6 || perPl[3] != 6) {
+                        fprintf(stderr, "linselftest: snr expected 4 separate plane curves "
+                                        "of 6 dark-corrected points FAILED\n");
+                        aOk = false;
+                    }
+                    double worstX = 0, worstS = 0;
+                    for (const auto& q : sp) {
+                        const App::LinState::Row* r = rowOf(q.seqId);
+                        if (!r) continue;
+                        double Sg = GT_SENS[q.plane] * r->level;
+                        double expSnr = Sg / sqrt(2.0 * Sg + 9.0);
+                        double ex = fabs(q.x / Sg - 1.0), es = fabs(q.snr / expSnr - 1.0);
+                        worstX = std::max(worstX, ex);
+                        worstS = std::max(worstS, es);
+                        if (ex > 0.02 || es > 0.03) {
+                            fprintf(stderr, "linselftest: snr %s lv %.6g: signal %.6g "
+                                            "(expect %.6g), snr %.6g (expect %.6g) FAILED\n",
+                                    LIN_PLANES[q.plane], r->level, q.x, Sg, q.snr, expSnr);
+                            aOk = false;
+                        }
+                    }
+                    fprintf(stderr, "linselftest: snr analytic check (linset): worst "
+                                    "|signal err| %.3f%%, worst |SNR err| %.3f%% "
+                                    "(tol 2%% / 3%%) %s\n", worstX * 100, worstS * 100,
+                            aOk ? "ok" : "FAILED");
+                    if (!aOk) snrOk = false;
+                } else {
+                    fprintf(stderr, "linselftest: snr analytic check skipped "
+                                    "(not the linset signature)\n");
+                }
+            }
         }
         if (!fitOk) fprintf(stderr, "linselftest: no series could be fitted\n");
+        if (!snrOk) fprintf(stderr, "linselftest: SNR curve FAILED\n");
         if (app.seqThread.joinable()) app.seqThread.join();
-        return fitOk ? 0 : 1;
+        return (fitOk && snrOk) ? 0 : 1;
     }
 
     // --browse-keys-selftest: connect the local peer and open the panel; the
