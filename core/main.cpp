@@ -314,6 +314,16 @@ struct App {
     // While frames are being stepped faster than a person reads them, the B
     // caches are NOT recomputed (see selectImage). glfwGetTime() deadline.
     double abStepBusyUntil = 0;
+    // Compare slots BEYOND B: C, D, E... An interim shape, deliberately bolted
+    // ON TOP of A/B rather than replacing it - every existing mode (wipe,
+    // split, diff, flip) still means exactly two images and still works
+    // untouched. The extras are for the numeric side, which extends to N
+    // without argument, and for side-by-side, which is the one image layout
+    // that does. docs/todo-open.md item 19 holds the shape this should
+    // eventually take.
+    std::vector<uint64_t> cmpExtra;          // uids, in slot order (C, D, ...)
+    struct SlotWant { int frame; std::string path; };
+    std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
@@ -950,6 +960,7 @@ struct App {
         Stats fStat[4];
         bool roiUsed = false;
     } proj[2];                        // 0 = A, 1 = B (compare)
+    std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
     // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.
     // Wide = one row per plane with sigma_f / sigma_v / sigma_h across it, which
     // keeps a plane's three numbers on ONE line - and leaves the row axis free
@@ -1212,6 +1223,70 @@ static void renameBatch(int batchId, const std::string& want) {
 }
 
 static void selectImage(int idx);   // fwd (defined with the sequence helpers)
+
+// The extra slots, resolved and pruned in one place. A slot whose image was
+// closed simply stops existing - the same rule B follows - and A can never
+// occupy one, or a column would compare a thing with itself.
+static std::vector<ImageDoc*> compareExtras() {
+    std::vector<ImageDoc*> out;
+    const ImageDoc* a = cur();
+    for (size_t i = 0; i < app.cmpExtra.size();) {
+        ImageDoc* d = nullptr;
+        for (const auto& q : app.images) if (q->uid == app.cmpExtra[i]) { d = q.get(); break; }
+        if (!d) { app.cmpExtra.erase(app.cmpExtra.begin() + i); continue; }   // closed
+        if (d != a) out.push_back(d);
+        i++;
+    }
+    return out;
+}
+static const char* SLOT_LETTERS = "CDEFGHIJKLMNOP";
+static std::string slotName(size_t i) {
+    return std::string(1, i < strlen(SLOT_LETTERS) ? SLOT_LETTERS[i] : '?');
+}
+// Which letter this image already holds, or "" - so a row can say "remove"
+// instead of silently adding the same image twice.
+static std::string slotOf(const ImageDoc* d) {
+    if (!d) return "";
+    for (size_t i = 0; i < app.cmpExtra.size(); i++)
+        if (app.cmpExtra[i] == d->uid) return slotName(i);
+    return "";
+}
+static void addCompareSlot(ImageDoc* d) {
+    if (!d || d == cur()) return;
+    for (uint64_t u : app.cmpExtra) if (u == d->uid) return;
+    if (app.cmpExtra.size() >= strlen(SLOT_LETTERS)) {
+        toast("no free compare slot", true);
+        return;
+    }
+    app.cmpExtra.push_back(d->uid);
+    toast("slot " + slotName(app.cmpExtra.size() - 1) + " = " + abDocLabel(d));
+}
+static void removeCompareSlot(const ImageDoc* d) {
+    if (!d) return;
+    for (size_t i = 0; i < app.cmpExtra.size(); i++)
+        if (app.cmpExtra[i] == d->uid) { app.cmpExtra.erase(app.cmpExtra.begin() + i); return; }
+}
+
+// A session names its slots by path (+ frame, for a stack member); the images
+// arrive later and asynchronously, so this is retried until it lands or the
+// load settles. Same shape as the B fallback below it.
+static void pumpCompareSlotRestore() {
+    if (app.cmpSlotRestore.empty()) return;
+    for (size_t i = 0; i < app.cmpSlotRestore.size();) {
+        const auto& w = app.cmpSlotRestore[i];
+        ImageDoc* hit = nullptr;
+        for (const auto& d : app.images) {
+            if (d->path != w.path) continue;
+            if (w.frame >= 0 && d->seqId != 0 && d->seqIndex != w.frame) continue;
+            hit = d.get(); break;
+        }
+        if (!hit) { i++; continue; }
+        bool dup = false;
+        for (uint64_t u : app.cmpExtra) if (u == hit->uid) dup = true;
+        if (!dup) app.cmpExtra.push_back(hit->uid);
+        app.cmpSlotRestore.erase(app.cmpSlotRestore.begin() + i);
+    }
+}
 
 // Default B = the image next to A in the list: with two images open, "compare"
 // should just work without first picking a partner.
@@ -3672,6 +3747,12 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "rangescope " << app.rangeScope << "\n";
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
     f << "cmprange " << app.compareRangeMode << "\n";
+    // slots travel by the same NAME+frame pair B uses: uids do not survive a
+    // restart, and a path alone cannot tell two frames of one stack apart
+    for (uint64_t u : app.cmpExtra)
+        for (const auto& d : app.images)
+            if (d->uid == u)
+                f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->path << "\n";
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projstatlayout " << app.projStatLayout << "\n";
@@ -3706,6 +3787,15 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         }
         f << "layout_end\n";
     }
+    // A derived image (a ROI montage) has no file behind it, so isSavedLine
+    // drops it - correctly, since nothing could reload it. But dropping it in
+    // silence is the one thing this format does not do: say how many.
+    int derived = 0;
+    for (auto& d : app.images)
+        if (d->path.empty()) derived++;
+    if (derived)
+        fprintf(stderr, "session: %d derived image(s) not saved "
+                        "(no file to reload them from)\n", derived);
     for (auto& d : app.images) {
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
@@ -4106,6 +4196,10 @@ static std::string loadSession(const std::string& path) {
         else if (key == "rangescope") { ls >> app.rangeScope; }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
         else if (key == "cmprange") { ls >> app.compareRangeMode; }
+        else if (key == "cmpslot")  { int fi = -1; ls >> fi;
+                                      std::string pth; std::getline(ls, pth);
+                                      if (!pth.empty() && pth[0] == ' ') pth.erase(0, 1);
+                                      if (!pth.empty()) app.cmpSlotRestore.push_back({ fi, pth }); }
         // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own".
         // NOT onto the new default - it records a choice somebody actually made.
         else if (key == "cmpshare") { int on = 1; ls >> on; app.compareRangeMode = on ? 1 : 0; }
@@ -9763,7 +9857,15 @@ static void drawPanelProjection() {
     ImGui::SameLine(); ImGui::Checkbox("H", &app.showProjH);
     ImGui::SameLine(); ImGui::Checkbox("V", &app.showProjV);
     ImageDoc* Bim = abStatsB();
+    pumpCompareSlotRestore();
+    std::vector<ImageDoc*> extras = compareExtras();
+    app.projExtra.resize(extras.size());
     recomputeProjectionIfNeeded(im, app.proj[0]);
+    // The extras follow B's rule exactly: skipped while frames are being
+    // stepped, so N slots cannot turn a held arrow key into N recomputes.
+    if (!abStepBusy())
+        for (size_t i = 0; i < extras.size(); i++)
+            recomputeProjectionIfNeeded(extras[i], app.projExtra[i]);
     // skipped while frames are being stepped (see abStepBusy), except on the
     // first fill - an empty B plot would be worse than a stale one
     if (Bim && (!abStepBusy() || app.proj[1].uid == 0))
@@ -9844,7 +9946,10 @@ static void drawPanelProjection() {
     if (tooNarrow) side = false;
 
     // reserve the statistics table first: the plots must not push it off-panel
-    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0)) * plots;
+    int extraSeries = 0;
+    for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+        extraSeries += app.projExtra[i].nSeries;
+    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries) * plots;
     float lineH = ImGui::GetTextLineHeightWithSpacing();
     // wide draws one row per PLANE per side; per-axis draws one per axis too
     const bool wideGuess = app.projStatLayout == 1 ||
@@ -9852,7 +9957,7 @@ static void drawPanelProjection() {
                             ImGui::GetContentRegionAvail().x >=
                                 ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 9 +
                                 ImGui::GetStyle().CellPadding.x * 22);
-    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0);
+    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries;
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
@@ -10022,6 +10127,9 @@ static void drawPanelProjection() {
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
+    // "side" exists as a column the moment there is more than one side, which
+    // is B or any extra slot
+    const bool anySide = Bim || !extras.empty();
     // WIDE puts a plane's three sigmas on one line (region, row means, column
     // means) and spends the row axis on the SIDES instead of the axes. That is
     // the axis that has to grow: A and B are two rows today, and more slots or
@@ -10056,10 +10164,10 @@ static void drawPanelProjection() {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
         // sigma_v = sigma of the row means    (horizontal banding / row FPN)
         // sigma_h = sigma of the column means (vertical striping / column FPN)
-        int wCols = (Bim ? 1 : 0) + 1 + 9;
+        int wCols = (anySide ? 1 : 0) + 1 + 9;
         if (ImGui::BeginTable("projstatw", wCols, ImGuiTableFlags_SizingFixedFit |
                                                   ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
-            if (Bim)
+            if (anySide)
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
@@ -10071,7 +10179,7 @@ static void drawPanelProjection() {
             ImGui::TableHeadersRow();
             // the header abbreviations are not self-evident, and this table is
             // the one people will read numbers off into a report
-            if (ImGui::TableGetHoveredColumn() >= (Bim ? 2 : 1))
+            if (ImGui::TableGetHoveredColumn() >= (anySide ? 2 : 1))
                 ImGui::SetTooltip("f = the whole region     v = the row means (horizontal banding)\n"
                                   "h = the column means (vertical striping)\n"
                                   "%% is sigma / mean.  p-p is max - min.  All values in DN.");
@@ -10082,7 +10190,7 @@ static void drawPanelProjection() {
                     const App::ProjState::Stats& vv = S.vStat[i];
                     if (!f.valid && !hh.valid && !vv.valid) continue;
                     ImGui::TableNextRow();
-                    if (Bim) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
+                    if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
                     const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
                     for (int k = 0; k < 3; k++) {
@@ -10101,18 +10209,20 @@ static void drawPanelProjection() {
             };
             wrow(P, "A");
             if (Bim) wrow(PB, "B");
+            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+                wrow(app.projExtra[i], slotName(i).c_str());
             ImGui::EndTable();
         }
         ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
     } else
     {
-    int nCols = (Bim ? 3 : 2) + 4;
+    int nCols = (anySide ? 3 : 2) + 4;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
         // one row per (side, axis, plane). The table's axis is the QUANTITY, so
         // A and B cannot be a column pair here - they are rows, and the side
         // column says which is which (docs/ab-stats-plan.md 4).
-        if (Bim)
+        if (anySide)
             ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                     ImGui::GetFontSize() * 1.6f);
         ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
@@ -10127,7 +10237,7 @@ static void drawPanelProjection() {
                 const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
                 if (!st.valid) continue;
                 ImGui::TableNextRow();
-                if (Bim) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
+                if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
                 ImGui::TableNextColumn(); textNum("%.6g", st.mean);
@@ -10136,8 +10246,16 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn(); textNum("%.6g", st.pp);
             }
         };
-        if (app.showProjH) { rows(P, "A", true);  if (Bim) rows(PB, "B", true); }
-        if (app.showProjV) { rows(P, "A", false); if (Bim) rows(PB, "B", false); }
+        if (app.showProjH) {
+            rows(P, "A", true);  if (Bim) rows(PB, "B", true);
+            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+                rows(app.projExtra[i], slotName(i).c_str(), true);
+        }
+        if (app.showProjV) {
+            rows(P, "A", false); if (Bim) rows(PB, "B", false);
+            for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
+                rows(app.projExtra[i], slotName(i).c_str(), false);
+        }
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
@@ -13894,7 +14012,28 @@ static void drawFileList() {
     // The A/B item both kinds of row carry, by IDENTITY rather than by name:
     // the B-image menu lists names, and two batches full of frame_001.npy made
     // that a coin toss. `pick` is the frame this row would hand to B.
-    auto compareBItem = [](ImageDoc* pick) {
+    // The extra slots hang off the same row item. Shown as a plain entry rather
+    // than behind Shift+right-click: a modifier that changes what a menu
+    // contains is invisible until someone tells you about it, and the letter in
+    // the label ("Add as compare slot D") says what will happen before it does.
+    auto compareSlotItem = [](ImageDoc* pick) {
+        if (!pick || pick == cur()) return;
+        std::string held = slotOf(pick);
+        if (!held.empty()) {
+            if (ImGui::MenuItem(("Remove from compare slot " + held).c_str()))
+                removeCompareSlot(pick);
+            return;
+        }
+        std::string next = slotName(app.cmpExtra.size());
+        if (ImGui::MenuItem(("Add as compare slot " + next).c_str()))
+            addCompareSlot(pick);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("slots beyond B show up in the statistics tables and\n"
+                              "side by side. Wipe, split, difference and blink stay\n"
+                              "A against B - those only mean two.");
+    };
+    auto compareBItem = [&compareSlotItem](ImageDoc* pick) {
+        compareSlotItem(pick);
         switch (abRowItem(pick)) {
         case AbSetB:
             if (ImGui::MenuItem("Set as compare B")) {
