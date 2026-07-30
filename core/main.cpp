@@ -10224,14 +10224,36 @@ static void drawPanelProjection() {
     // above R:B, which is what comparing ONE plane across sides wants. The
     // pooled "all" row is always last of its group - it is not a plane, and
     // sorting it among them would invite reading it as one.
+    // CFA interpretation is a property of an IMAGE, not of the sensor: A can be
+    // set to Bayer in the Inspector while B, loaded another way, is still plain
+    // 1-channel. Then A gets four rows and B gets one, and nothing on screen
+    // says why - the reader concludes B has no planes rather than that B was
+    // never told it is a mosaic. Say it.
     struct SideRef { const App::ProjState* S; std::string name; };
     std::vector<SideRef> sides;
     sides.push_back({ &P, "A" });
     if (Bim) sides.push_back({ &PB, "B" });
     for (size_t i = 0; i < extras.size() && i < app.projExtra.size(); i++)
         sides.push_back({ &app.projExtra[i], slotName(i) });
-    int maxSeries = 0;
-    for (const auto& sr : sides) maxSeries = std::max(maxSeries, sr.S->nSeries);
+    int maxSeries = 0, minSeries = 99;
+    for (const auto& sr : sides) {
+        maxSeries = std::max(maxSeries, sr.S->nSeries);
+        minSeries = std::min(minSeries, sr.S->nSeries);
+    }
+    auto projSayPlaneMismatch = [&]() {
+        if (sides.size() < 2 || minSeries == maxSeries) return;
+        std::string few;
+        for (const auto& sr : sides)
+            if (sr.S->nSeries < maxSeries) { if (!few.empty()) few += ", "; few += sr.name; }
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "%s %s %d plane(s), not %d: its CFA interpretation differs",
+                           few.c_str(), few.find(',') == std::string::npos ? "has" : "have",
+                           minSeries, maxSeries);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("\"Bayer\" is set per IMAGE (Inspector > Interpret), not per\n"
+                              "sensor. A side loaded without it stays one plane, so the\n"
+                              "rows are not comparable until both are told the same thing.");
+    };
     auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*, int)>& row) {
         if (app.projStatOrder == 0) {
             for (const auto& sr : sides) {
@@ -10378,6 +10400,7 @@ static void drawPanelProjection() {
             ImGui::EndTable();
         }
         ImGui::TextDisabled("f = region, v = row means (banding), h = column means (striping); DN");
+        projSayPlaneMismatch();
     } else
     {
     int nCols = (anySide ? 3 : 2) + 5;
@@ -10430,6 +10453,7 @@ static void drawPanelProjection() {
         ImGui::EndTable();
     }
     ImGui::TextDisabled("sigma of the column means = column FPN; of the row means = row FPN");
+    projSayPlaneMismatch();
     }
 }
 
