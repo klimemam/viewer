@@ -5888,10 +5888,13 @@ static void resolveOnePendingSeries(const App::SeriesPending& P) {
         for (const auto& si : app.seqs) {
             if (seqId) break;
             if (!free4(si.id)) continue;
-            bool same = si.name == e.name ||
-                        (si.name.size() > e.name.size() + 10 &&
-                         si.name.compare(0, e.name.size(), e.name) == 0 &&
-                         si.name.compare(e.name.size(), 10, " [remote x") == 0);
+            // names no longer carry " [remote xN]" (C2), but sessions saved
+            // before that change do - accept both directions of the mismatch
+            auto bare = [](const std::string& n) {
+                size_t t = n.rfind(" [remote x");
+                return t == std::string::npos ? n : n.substr(0, t);
+            };
+            bool same = bare(si.name) == bare(e.name);
             if (same) { seqId = si.id; break; }
         }
         if (!seqId) { lost++; continue; }
@@ -8331,8 +8334,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         // came up as seven stacks with one name.
         if (!name.empty())
             if (App::SeqInfo* si = seqInfo(first->seqId))
-                si->name = name + " [remote x" +
-                           std::to_string(std::max(1, si->expectedFrames)) + "]";
+                si->name = name;   // origin and count live in columns, not the name (C2)
         noteGroupStack(token, first->seqId);
         return;
     }
@@ -8341,8 +8343,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     // A scan names the stack by its folder ("10lx/frame_#.npy"): seven stacks
     // all called frame_000.npy would be indistinguishable in every panel, and
     // the linearity Auto-levels reads the level from exactly this name.
-    si.name = !name.empty() ? name + " [remote x" + std::to_string(files.size()) + "]"
-              : baseName(files[0]) + " [remote x" + std::to_string(files.size()) + "]";
+    si.name = !name.empty() ? name : baseName(files[0]);
     si.remoteHost = host;             // folder stack: one file per frame
     si.remotePort = port;
     si.expectedFrames = (int)files.size();
@@ -9771,6 +9772,15 @@ static void drawCanvas(ImVec2 avail) {
                              ImVec2(canvasP0.x + canvasSize.x * 0.6f, topY + lh), true);
             dl->AddText(ImVec2(canvasP0.x, topY), IM_COL32(140, 148, 156, 190), ctx);
             dl->PopClipRect();
+        }
+        {   // zoom, right end of the context line (C3): the magnification is a
+            // property of the pixels being judged, so it lives beside them.
+            // Moved here FROM the status bar, not duplicated.
+            char zs[40];
+            if (app.view.zoom >= 0.095f) snprintf(zs, sizeof zs, "zoom %.0f%%", app.view.zoom * 100);
+            else                         snprintf(zs, sizeof zs, "zoom %.3g%%", app.view.zoom * 100);
+            ImVec2 zts = ImGui::CalcTextSize(zs);
+            dl->AddText(ImVec2(canvasP1.x - zts.x, topY), IM_COL32(140, 148, 156, 190), zs);
         }
         ImVec2 ts = ImGui::CalcTextSize(name);
         float nameW = std::min(ts.x, canvasSize.x * 0.45f);
@@ -23332,7 +23342,7 @@ int main(int argc, char** argv) {
             reportNames("remote", nm);
             bool namesOk = nm.size() == 7;
             for (int i = 0; namesOk && i < 7; i++)
-                namesOk = nm[i] == std::string(LV[i]) + "/capture.npy [remote x8]";
+                namesOk = nm[i] == std::string(LV[i]) + "/capture.npy";
             check("a remote frame-axis stack keeps it too", namesOk);
         }
         checkSeries("remote");
@@ -28009,12 +28019,12 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
                     snprintf(seqInfoStr, sizeof seqInfoStr, "  frame %d/%d", pos + 1, (int)fr.size());
                 }
-                char zs[32];
-                if (app.view.zoom >= 0.095f) snprintf(zs, 32, "%.0f%%", app.view.zoom * 100);
-                else                         snprintf(zs, 32, "%.3g%%", app.view.zoom * 100);
-                snprintf(st, 512, "%s%s   %dx%d %dch %s  |  zoom %s%s",
+                // zoom moved into the Image View footer (C3): magnification is
+                // a property of the pixels being looked at, so it sits beside
+                // them, not at the far edge of the screen
+                snprintf(st, 512, "%s%s   %dx%d %dch %s%s",
                          im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
-                         im->dtype.c_str(), zs, hover.c_str());
+                         im->dtype.c_str(), hover.c_str());
             }
             // Remote link indicator, VSCode-style: the leftmost thing on the
             // status bar, always present while a server is involved. A toast
