@@ -22,7 +22,7 @@
 "対応済み","C3 zoom%移設","ステータスバー→Image Viewフッター右上","cd41efe",""
 "対応済み","画像書出","dot-by-dotコピー/PNG保存/ROIモンタージュ","1641cea",""
 "対応済み","Temporalチャート復活","ScrollXテーブルが高さを食い潰していた","f57c6f0",""
-"Claudeで対応進行中","参照設計+Watch設計","reference-design.md / watch-design.md をFableが執筆中","ref-designブランチ予定","完了後ユーザーレビュー"
+"レビュー必要項目","参照+Watch設計文書【最重要】","flyweight方式(膜=ImageDoc維持・画素をFrameSourceに)/uid不変・srcId+rev新設/reloadは同一seqId下で再構成。段階6つ各出荷可","docs/reference-design.md, watch-design.md","未決4点は文書末尾: 未ロード参照/CFA解釈の所有/自動reload粒度/ポーリング間隔"
 "残課題","項目20 Watch実装","設計完了後。仕様確定済(通知→手動Reload/stack再構築/mtime+size)","todo-open #20","参照実装とセット"
 "残課題","項目6 検索の複数選択","検索結果にrbSel参加+Stack/Frame開き","todo-open #6","stack化順序はレビュー欄C4"
 "残課題","項目7 検索進捗","件数/現在地のインクリメンタル表示。peerのGLOB変更要","todo-open #7",""
@@ -52,3 +52,4 @@
 "レビュー必要項目","export-design.md","書出の形(セクション矩形)の追認","docs/export-design.md",""
 "レビュー必要項目","参照+Watch設計文書","執筆中→完成後に最重要レビュー","ref-design予定",""
 "レビュー必要項目","実機確認","見た目全般/別窓実操作/シェブロン/複数Browse/実ssh再接続/フレームリニアリティ表示","—","GLキャプチャ不可のため全て未目視"
+"残課題","TemporalStateキー欠陥","キャッシュキーにdata revisionが無い(main.cpp:7027) + forgetImageがtemporalExtraを見逃す(2183)","reference-design.md発見","参照化stage 5で同時修正予定だが独立して実バグ"
