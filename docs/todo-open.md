@@ -15,6 +15,9 @@
 
 **週末** (ユーザー主導・予定確定):
 - 参照設計 (seqId→共有参照。項目0のコピーを置き換え) + 項目20 Watch (仕様確定済み)
+  — **設計文書済み (ref-design ブランチ)**: docs/reference-design.md (データモデル・
+  identity・Close・セッション・derive 置換・移行6段) と docs/watch-design.md
+  (検知・スケジューラ・通知・reload・多窓)。実装は未着手
 
 **閉じた (追記 2026-07-30 深夜)**:
 - 項目28 別ウィンドウで開く — インスタンス別autosave(ロック+PID生存判定+stale回収)、
@@ -80,6 +83,10 @@ A/B のフレーム追従 (`compareFollowFrame`) は **B の stack に A と同�
 「参照だけ増やす」は現在のデータモデルでは**できない**ので、そこを期待しないこと。
 (できるようにするなら `seqId` を集合にする話になり、σ_t やセッション保存まで
 波及する。それは別案件。)
+**→ その別案件の設計が docs/reference-design.md になった** (週末枠)。要点:
+`seqId` は集合に**しない** — membership は今の ImageDoc のまま、画素だけを
+参照カウントされる FrameSource へ下ろす (flyweight)。コピーの置き換えは
+`materializeDerivedFrame` 1関数 (下の二相構造が予定どおり効く)。
 
 ### 抽出の規則 (ダイアログで選ばせる)
 
@@ -919,6 +926,11 @@ docs/compare-n.md** — スロット = stack への参照 + follow、B は slots
 > (自動更新はオプトイン)。部分更新された stack は**stack ごと作り直す**
 > (フレーム単位の差し替えはしない)。判定は mtime+size、書き込み途中の
 > ファイルは掴まない(サイズ2回連続一致で安定とみなす)。
+>
+> **機構の設計文書済み: docs/watch-design.md** (参照設計 docs/reference-design.md
+> の上)。検知はローカル std::filesystem / リモートは既存 LIST のグループ行
+> (bytes 合計 + 最新 mtime — 追加プロトコル無し、下の判定材料の節のとおり)。
+> 実装は未着手。
 
 「watch folder」は未着手機能として挙がっていたが、要件が増えたのでここに集約する。
 
