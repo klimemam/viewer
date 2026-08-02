@@ -150,6 +150,10 @@ struct FrameSource {
     float vmin = 0, vmax = 1;         // data min/max
     std::string path;
     std::string npzMember;            // array name when this came from a .npz
+    int fileFrame = 0;                // frame index within a multi-frame LOCAL file
+                                      // (npy frame axis; npz members too). With path +
+                                      // npzMember it completes the provenance a reload
+                                      // re-decodes - remoteFrame is the remote twin
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -474,6 +478,11 @@ struct App {
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
         int cfaType = 0, cfaPattern = 0;
+        // Data revision of the stack AS A SET of pixels: the reload walk (§3.2)
+        // bumps it whenever a member's source is swapped in place. Part of the
+        // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a
+        // reload that changes no shape (docs/reference-design.md §3.2).
+        int stackRev = 0;
         // Per-frame X axis for the Temporal chart: what frame i physically IS
         // (elapsed time, exposure, temperature). NAME + UNIT + one value per
         // frame - a bare list of numbers cannot label an axis, so all three
@@ -1103,6 +1112,10 @@ struct App {
         // what these numbers mean, and a cache that ignored it served the old
         // plane-mixed answer back.
         int cfa = -1, cfaPattern = -1;
+        // SeqInfo::stackRev at compute time - the DATA revision. Without it the
+        // key is (seqId, frames, ROI, CFA) and a reload that changes no shape
+        // hands back the dead pixels' sigma_t (docs/reference-design.md §3.2).
+        int stackRev = -1;
         int nPl = 1;                              // 4 when the frame is mosaiced
         uint64_t nonFinite = 0;                   // samples EXCLUDED, and said so
         size_t dropped = 0;                       // samples with < 2 valid frames
@@ -2238,6 +2251,11 @@ static void forgetImage(ImageDoc* im) {
         if (app.proj[k].img == im) { app.proj[k].img = nullptr; app.proj[k].uid = 0; }
         app.temporal[k].seqId = -1;
     }
+    // ...and the extra compare slots' states (C, D, ...): the same cache one
+    // layer out, missed here since the slots were added - reachable through a
+    // slot stack's preview->full swap even before reload existed
+    // (docs/reference-design.md §3.2)
+    for (auto& T : app.temporalExtra) T.seqId = -1;
     forgetTexture(im);
     app.imagesRev++;
 }
@@ -3914,6 +3932,7 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     im->name = displayName.empty() ? baseName(path) : displayName;
     FrameSource& S = *im->src;
     S.path = path;
+    S.fileFrame = frameIdx;           // provenance: WHICH frame of the file this is
     S.w = (int)W; S.h = (int)H; S.ch = (int)C;
     S.dtype = dtypeName;
     im->note = note;
@@ -7116,15 +7135,20 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         }
     }
     // keyed on the resolved rect; this pass costs samples x frames, so it must
-    // not run for annotation churn or mid-drag
-    if (T.seqId == im->seqId && T.frames == (int)f.size() &&
+    // not run for annotation churn or mid-drag. stackRev is the stack's DATA
+    // revision: a reload swaps pixels under an unchanged (seqId, frames, ROI,
+    // CFA) tuple, and without it this cache would hand back the dead pixels'
+    // sigma_t (docs/reference-design.md §3.2)
+    const App::SeqInfo* ksi = seqInfo(im->seqId);
+    const int kStackRev = ksi ? ksi->stackRev : 0;
+    if (T.seqId == im->seqId && T.frames == (int)f.size() && T.stackRev == kStackRev &&
         T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh &&
         T.cfa == im->cfa && T.cfaPattern == im->cfaPattern)
         return;
     if (app.annBusy && T.seqId == im->seqId) return;
     T.seqId = im->seqId; T.frames = (int)f.size();
     T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed;
-    T.cfa = im->cfa; T.cfaPattern = im->cfaPattern;
+    T.cfa = im->cfa; T.cfaPattern = im->cfaPattern; T.stackRev = kStackRev;
     T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
     for (int p = 0; p < 4; p++) T.tempNoise[p] = T.fixedPattern[p] = T.totalNoise[p] = 0;
     T.valid = false;
@@ -7612,6 +7636,163 @@ static void seqMosaicChanged(const ImageDoc* im) {
         }
     if (app.srvTemporal.seqId == si->id) requestServerTemporal(si->id, app.srvTemporal);
     if (app.srvTemporalB.seqId == si->id) requestServerTemporal(si->id, app.srvTemporalB);
+}
+
+// ---- reload from disk (docs/reference-design.md §3.2) --------------------------
+// THE one place pixels are replaced in place. Re-decodes a source from its own
+// provenance (path + npzMember + fileFrame + raw recipe), swaps the result into
+// the SAME FrameSource, then walks every membership that shares it: dataRev,
+// mirrors, forgetImage, texDirty per doc; stackRev, server-temporal re-fire and
+// the linearity rows per affected stack. Numbers share the fate of the pixels
+// they describe (5092c4b).
+//
+// Shape-change policy: reload means "same frame, new values". If the file now
+// holds different w/h/ch/dtype the reload PROCEEDS - what is on disk is a fact,
+// not an error - the mirrors resync and *noteOut says what changed, so the
+// caller's notice can. What DOES refuse: no local file behind the pixels
+// (remote-backed / montage / plugin output), an unreadable or undecodable file,
+// a vanished npz member, and a frame-axis index past the file's new frame count
+// (that frame no longer exists - there is no "same frame" to give new values
+// to). On any failure the source is untouched: old pixels stay, never a
+// half-swap.
+//
+// A cropped source re-applies its recorded crop rect to the fresh decode (the
+// crop is part of what these pixels ARE - §2.1 keeps it on the source); the
+// rect is clamped if the file shrank. CFA re-snapping is not attempted: the
+// recorded rect was snapped when the crop was made, and the mosaic is a
+// per-membership interpretation the source cannot see.
+static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& errOut,
+                         std::string* noteOut = nullptr) {
+    if (!src) { errOut = "no source"; return false; }
+    if (!src->remoteUrl.empty()) { errOut = "remote-backed"; return false; }
+    if (src->path.empty()) { errOut = "no file behind these pixels"; return false; }
+    std::unique_ptr<ImageDoc> nd;
+    std::string err;
+    if (src->rawDtype >= 0) {
+        RawDialog d;                       // the recipe, replayed against the file
+        d.path = src->path;
+        d.dtype = src->rawDtype; d.interp = src->rawInterp;
+        d.offset = src->rawOffset; d.littleEndian = src->rawLE;
+        d.w = src->srcW > 0 ? src->srcW : src->w;
+        d.h = src->srcH > 0 ? src->srcH : src->h;
+        if (src->cropX != 0 || src->cropY != 0 || src->w != d.w || src->h != d.h) {
+            d.cropOn = true;
+            d.cropX = src->cropX; d.cropY = src->cropY;
+            d.cropW = src->w; d.cropH = src->h;
+        }
+        nd = decodeRawFrame(d, err);
+    } else {
+        std::vector<uint8_t> npy;          // the .npy bytes, plain or extracted
+        if (!src->npzMember.empty()) {
+            std::vector<uint8_t> zip;
+            if (!readFileBytes(src->path, zip)) { errOut = "cannot read file"; return false; }
+            std::vector<NpzEntry> entries;
+            if (!npzList(zip, entries, err)) { errOut = err; return false; }
+            bool found = false;
+            for (const auto& e : entries)
+                if (e.name == src->npzMember + ".npy") {
+                    if (!npzExtract(zip, e, npy, err)) { errOut = err; return false; }
+                    found = true;
+                    break;
+                }
+            if (!found) {
+                errOut = "array \"" + src->npzMember + "\" is no longer in the file";
+                return false;
+            }
+        } else if (!readFileBytes(src->path, npy)) {
+            errOut = "cannot read file";
+            return false;
+        }
+        int frames = 1;
+        int64_t fs = 0;
+        nd = decodeNpyBuffer(npy, src->path, "", err, 0, frames, fs);
+        if (nd && src->fileFrame > 0) {    // frame-axis member: decode ITS frame
+            if (src->fileFrame >= frames) {
+                errOut = "file now has " + std::to_string(frames) + " frame(s); frame " +
+                         std::to_string(src->fileFrame) + " no longer exists";
+                return false;
+            }
+            nd = decodeNpyBuffer(npy, src->path, "", err, src->fileFrame, frames, fs);
+        }
+        // a crop made after load re-scoped this frame; the reload keeps that scope
+        if (nd && src->srcW > 0 &&
+            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW || src->h != src->srcH))
+            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
+    }
+    if (!nd) { errOut = err.empty() ? "decode failed" : err; return false; }
+    computeMinMax(*nd);
+    const FrameSource& N = *nd->src;
+    if (noteOut && (N.w != src->w || N.h != src->h || N.ch != src->ch || N.dtype != src->dtype)) {
+        char b[96];
+        snprintf(b, sizeof b, "%dx%d %dch %s -> %dx%d %dch %s", src->w, src->h, src->ch,
+                 src->dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
+        *noteOut = b;
+    }
+    // the swap: same srcId (identity), new pixels, rev +1, fresh Watch baseline
+    src->data = std::move(nd->src->data);
+    src->w = N.w; src->h = N.h; src->ch = N.ch;
+    src->dtype = N.dtype; src->vmin = N.vmin; src->vmax = N.vmax;
+    src->srcW = N.srcW; src->srcH = N.srcH; src->cropX = N.cropX; src->cropY = N.cropY;
+    src->rev++;
+    statSourceFile(*src);
+    // ---- the walk (§3.2): every membership sharing this source, in one step ----
+    std::vector<int> seqIds;
+    for (auto& d : app.images) {
+        if (d->src != src) continue;
+        d->dataRev++;                 // hist/proj/ROI/diff/auto-range keys unlatch
+        d->syncMirrors();
+        forgetImage(d.get());         // ana/hist/proj pointers + texLru + temporal
+        d->texDirty = true;
+        if (d->seqId != 0 && std::find(seqIds.begin(), seqIds.end(), d->seqId) == seqIds.end())
+            seqIds.push_back(d->seqId);
+    }
+    bool linHit = false;
+    for (int sid : seqIds) {
+        if (App::SeqInfo* si = seqInfo(sid)) si->stackRev++;   // the temporal key
+        // a server aggregate naming this stack now describes dead pixels:
+        // re-fire it (same shape as seqMosaicChanged above)
+        if (app.srvTemporal.seqId == sid) requestServerTemporal(sid, app.srvTemporal);
+        if (app.srvTemporalB.seqId == sid) requestServerTemporal(sid, app.srvTemporalB);
+        // the linearity rows measured over this stack describe the old pixels:
+        // drop them - rows of untouched stacks keep their live numbers - and
+        // the fit that included them goes too (closeStack's discipline)
+        for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
+            if (it->seqId == sid) { it = app.lin.rows.erase(it); linHit = true; }
+            else ++it;
+    }
+    if (linHit) linFitStale();
+    return true;
+}
+
+// Files right-click on a stack header: every member's source, re-read from
+// disk. A shared source is reloaded ONCE (the walk already updated every
+// membership it has). The summary counts both directions - never silent about
+// the failures - and names the first one.
+static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
+    std::vector<const FrameSource*> done;
+    int ok = 0, failed = 0;
+    std::string firstErr;
+    for (int idx : framesOfSeq(seqId)) {
+        const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
+        if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
+        done.push_back(s.get());
+        std::string err;
+        if (reloadSource(s, err)) ok++;
+        else {
+            failed++;
+            if (firstErr.empty())
+                firstErr = (s->path.empty() ? app.images[idx]->name
+                                            : baseName(s->path)) + ": " + err;
+        }
+    }
+    if (failedOut) *failedOut = failed;
+    char buf[320];
+    if (failed)
+        snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed - %s",
+                 ok, failed, firstErr.c_str());
+    else
+        snprintf(buf, sizeof buf, "reloaded %d frame(s), 0 failed", ok);
+    return buf;
 }
 
 // Temporal stats for a stack that is NOT opened: fired from the browser's group
@@ -18271,6 +18452,9 @@ static void drawFileList() {
     std::string pendingSerName;
     int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
     int pendingDeriveSeq = 0;   // opens the Derive stack dialog after the walk
+    // Reload from disk, deferred like the rest: reloadSource's walk calls
+    // forgetImage while the row loop still holds this frame's cached indices.
+    int pendingReloadImg = -1, pendingReloadSeq = 0;
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -18509,6 +18693,20 @@ static void drawFileList() {
                 // a second, independent viewer on this frame (item 28)
                 if (ImGui::MenuItem("Open in new window"))
                     openInNewWindow(app.images[i].get());
+                {   // manual reload (reference-design §3.2 / §8 row 5): re-read
+                    // this frame's file and swap the pixels in place
+                    const FrameSource& S = *app.images[i]->src;
+                    const bool remote = !S.remoteUrl.empty();
+                    const bool canReload = !remote && !S.path.empty();
+                    if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
+                        pendingReloadImg = i;
+                    if (!canReload && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(remote
+                            ? "remote-backed: these pixels come from the peer,\n"
+                              "not from a local file."
+                            : "no file behind these pixels - they were composed\n"
+                              "here (montage / plugin result).");
+                }
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
                 ImGui::EndPopup();
@@ -18618,6 +18816,23 @@ static void drawFileList() {
             // numbered siblings from the head file (item 28)
             if (ImGui::MenuItem("Open in new window"))
                 openInNewWindow(app.images[stack.front()].get());
+            {   // manual reload (reference-design §3.2 / §8 row 5): every
+                // member's file re-read, pixels swapped in place
+                bool anyLocal = false, anyRemote = false;
+                for (int idx : stack) {
+                    const FrameSource& S = *app.images[idx]->src;
+                    if (!S.remoteUrl.empty()) anyRemote = true;
+                    else if (!S.path.empty()) anyLocal = true;
+                }
+                if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
+                    pendingReloadSeq = si->id;
+                if (!anyLocal && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(anyRemote
+                        ? "remote-backed: these pixels come from the peer,\n"
+                          "not from local files."
+                        : "no files behind these pixels - they were composed\n"
+                          "here (montage / plugin result).");
+            }
             // The series (系列) this stack is in, or could be. Multi-select is
             // a later phase; until then this menu is how a stack joins a sweep
             // without going through the Linearity panel.
@@ -18813,6 +19028,20 @@ static void drawFileList() {
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
     if (pendingDeriveSeq) deriveModalOpen(pendingDeriveSeq);
+    if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size()) {
+        ImageDoc* d = app.images[pendingReloadImg].get();
+        std::string err, note;
+        if (reloadSource(d->src, err, &note))
+            toast("reloaded " + baseName(d->src->path) +
+                  (note.empty() ? "" : " - dimensions changed: " + note));
+        else
+            toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
+    }
+    if (pendingReloadSeq) {
+        int failed = 0;
+        std::string msg = reloadStackFromDisk(pendingReloadSeq, &failed);
+        toast(msg, failed > 0);
+    }
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {
@@ -19628,6 +19857,7 @@ static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal
 static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise linearity, synthetic, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
+static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -19977,6 +20207,8 @@ static void parseCli(int argc, char** argv) {
             g_sweepFileSelftest = next();          // handled in main()
         } else if (a == "--newwin-selftest") {
             g_newwinSelftest = next();             // handled in main()
+        } else if (a == "--reload-selftest") {
+            g_reloadSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | local-fetch
@@ -25023,6 +25255,302 @@ int main(int argc, char** argv) {
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "deriveselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // ---- reload from disk: the §3.2 walk, headless -----------------------------
+    // What has to hold when a frame's FILE is rewritten under a live stack:
+    //   R3/R4  identity survives the reload (uid, srcId), and EVERY membership
+    //          sharing the source gets new mirrors/dataRev in the same step
+    //   R7/R8  sigma_t is recomputed even when frame count, ROI and CFA are all
+    //          unchanged - SeqInfo::stackRev in the temporal key is what lets a
+    //          latched TemporalState notice the reload at all
+    //   R9     forgetImage forgets the extra compare-slot states too
+    //   R12    frame-axis provenance (fileFrame) reloads the RIGHT frame, and
+    //          refuses one the file no longer has
+    if (!g_reloadSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 120.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "reloadselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        // one 2-D f32 .npy: value v + ramp*k over the pixels (ramp 0 = flat)
+        auto writeNpy2 = [](const std::string& path, int w, int h, float v, float ramp) {
+            char dict[128];
+            snprintf(dict, sizeof dict,
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                     h, w);
+            std::string hdr = dict;
+            size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+            hdr.append(pad, ' ');
+            hdr += '\n';
+            std::ofstream f(pathFromUtf8(path), std::ios::binary);
+            uint16_t hl = (uint16_t)hdr.size();
+            f.write("\x93NUMPY\x01\x00", 8);
+            f.write((const char*)&hl, 2);
+            f.write(hdr.data(), (std::streamsize)hdr.size());
+            std::vector<float> px((size_t)w * h);
+            for (size_t k = 0; k < px.size(); k++) px[k] = v + ramp * (float)k;
+            f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+        };
+        // one frame-axis (F,h,w) f32 .npy: frame f is flat at base + 10*f
+        auto writeNpy3 = [](const std::string& path, int F, int w, int h, float base) {
+            char dict[128];
+            snprintf(dict, sizeof dict,
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }",
+                     F, h, w);
+            std::string hdr = dict;
+            size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+            hdr.append(pad, ' ');
+            hdr += '\n';
+            std::ofstream f(pathFromUtf8(path), std::ios::binary);
+            uint16_t hl = (uint16_t)hdr.size();
+            f.write("\x93NUMPY\x01\x00", 8);
+            f.write((const char*)&hl, 2);
+            f.write(hdr.data(), (std::streamsize)hdr.size());
+            for (int fr = 0; fr < F; fr++) {
+                std::vector<float> px((size_t)w * h, base + 10.0f * fr);
+                f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+            }
+        };
+        // the scratch area is a subdirectory this test CREATES, never the
+        // directory it was handed (the derive test's remove_all lesson)
+        std::string root = g_reloadSelftest;
+        std::replace(root.begin(), root.end(), '\\', '/');
+        while (!root.empty() && root.back() == '/') root.pop_back();
+        root += "/reload-scratch";
+        std::string stk = root + "/stk";
+        std::error_code ec;
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        std::filesystem::create_directories(pathFromUtf8(stk), ec);
+        for (int i = 0; i < 5; i++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "a_%03d.npy", i);
+            writeNpy2(stk + "/" + nm, 4, 4, (float)i, 0);
+            snprintf(nm, sizeof nm, "b_%03d.npy", i);
+            writeNpy2(stk + "/" + nm, 4, 4, 100.0f + i, 0);
+        }
+        writeNpy2(root + "/loose.npy", 4, 4, 7.0f, 0);
+        writeNpy3(root + "/c.npy", 5, 8, 8, 50.0f);
+        app.seqLoadMode = 1;
+        // R12 shrinks c.npy to (2,8,8), and a leading axis of 2 is ambiguous
+        // (it reads as channels by default). Pin the frame interpretation like
+        // --npy-axis frames does - reload re-decodes under the same setting.
+        app.npyAxis = 1;
+        closeAll();
+        openFolder(stk);
+        loadAll();
+        int seqA = 0, seqB = 0;
+        for (const auto& s : app.seqs) {
+            if (s.name.rfind("a_", 0) == 0) seqA = s.id;
+            if (s.name.rfind("b_", 0) == 0) seqB = s.id;
+        }
+        std::string lErr = loadNpy(root + "/loose.npy");
+        ImageDoc* loose = lErr.empty() ? app.images.back().get() : nullptr;
+        std::string cErr = loadNpy(root + "/c.npy");
+        int seqC = 0;
+        for (const auto& s : app.seqs)
+            if (s.id != seqA && s.id != seqB) seqC = s.id;
+        auto docOf = [&](int seqId, int seqIndex) -> ImageDoc* {
+            for (int idx : framesOfSeq(seqId))
+                if (app.images[idx]->seqIndex == seqIndex) return app.images[idx].get();
+            return nullptr;
+        };
+        ImageDoc* a2 = docOf(seqA, 2);
+        ImageDoc* c2 = docOf(seqC, 2);
+        {   // ---- R0: fixture + sharing, manufactured by hand ------------------
+            // app-level sharing arrives with the source registry (stage 2); the
+            // WALK must already handle it, so the test wires it up directly
+            if (a2 && loose) { loose->src = a2->src; loose->syncMirrors(); }
+            check(seqA && seqB && seqC && a2 && loose && c2 && cErr.empty() &&
+                  framesOfSeq(seqA).size() == 5 && framesOfSeq(seqB).size() == 5 &&
+                  framesOfSeq(seqC).size() == 5 && loose->seqId == 0 &&
+                  a2->src.use_count() == 2 && loose->px()[0] == 2.0f,
+                  "R0 fixture: 3 stacks + loose frame; sharing manufactured");
+            if (!a2 || !loose || !c2) {
+                fprintf(stderr, "reloadselftest: FAILED (fixture)\n");
+                stopRbWorker();
+                stopSequenceLoader();
+                stopRemoteFetcher();
+                stopMeasureWorker();
+                return 1;
+            }
+        }
+        {   // series over the stk batch (stacks A and B), values set by hand
+            int sid = selftestMakeSeries(a2->batchId, "lx");
+            if (App::Series* S = seriesById(sid))
+                for (auto& m : S->members) m.value = m.seqId == seqA ? 10.0 : 20.0;
+            linRecompute(sid);
+        }
+        float sig0 = 0, sigX0 = 0;
+        double hMean0 = 0;
+        {   // ---- R1: measurements over the OLD pixels -------------------------
+            recomputeHistogramIfNeeded(a2, app.hist[0]);
+            hMean0 = app.hist[0].mean[0];
+            recomputeProjectionIfNeeded(a2, app.proj[0]);
+            recomputeTemporalIfNeeded(a2, app.temporal[0]);
+            sig0 = (float)app.temporal[0].tempNoise[0];
+            // a compare slot's cache: the TemporalState forgetImage used to miss
+            app.temporalExtra.resize(1);
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
+            sigX0 = (float)app.temporalExtra[0].tempNoise[0];
+            fprintf(stderr, "reloadselftest: R1 sigma_t=%.4f slot=%.4f hist mean=%.2f "
+                            "fit=%s rows=%d\n", sig0, sigX0, hMean0,
+                    app.lin.fitValid ? "ok" : "none", (int)app.lin.rows.size());
+            check(fabsf(sig0 - 1.41421f) < 0.01f && sigX0 == sig0 &&
+                  fabs(hMean0 - 2.0) < 1e-4 && app.proj[0].uid == a2->uid &&
+                  app.lin.fitValid && app.lin.rows.size() == 2,
+                  "R1 pre: sigma_t / hist / proj / fit over the old pixels");
+        }
+        // ---- the event: one frame's FILE changes on disk -----------------------
+        uint64_t uid0 = a2->uid, srcId0 = a2->src->srcId;
+        int rev0 = a2->src->rev, dr0 = a2->dataRev, ldr0 = loose->dataRev;
+        int64_t mt0 = a2->src->mtime;
+        int srBefore = seqInfo(seqA)->stackRev;
+        a2->texDirty = false;
+        loose->texDirty = false;
+        // a full second, not a token pause: this stdlib reports last_write_time
+        // at SECONDS granularity, and a rewrite inside the same second would
+        // make the baseline refresh unobservable
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        writeNpy2(stk + "/a_002.npy", 4, 4, 200.0f, 0);
+        {
+            std::string err, note;
+            bool r = reloadSource(a2->src, err, &note);
+            check(r && note.empty(), "R2 reloadSource succeeds; same shape, no dims note");
+        }
+        fprintf(stderr, "reloadselftest: R3 rev %d->%d mtime %lld->%lld uid %d srcId %d\n",
+                rev0, a2->src->rev, (long long)mt0, (long long)a2->src->mtime,
+                a2->uid == uid0 ? 1 : 0, a2->src->srcId == srcId0 ? 1 : 0);
+        check(a2->uid == uid0 && a2->src->srcId == srcId0 && a2->src->rev == rev0 + 1 &&
+              a2->src->mtime != 0 && a2->src->mtime != mt0,
+              "R3 identity survives: uid/srcId kept, rev+1, mtime fresh");
+        check(a2->dataRev == dr0 + 1 && loose->dataRev == ldr0 + 1 &&
+              a2->px()[0] == 200.0f && loose->px()[0] == 200.0f &&
+              a2->vmin == 200.0f && loose->vmin == 200.0f && a2->w == 4,
+              "R4 walk: BOTH sharing docs' dataRev+mirrors, one step");
+        check(a2->texDirty && loose->texDirty,
+              "R5 walk: texDirty set on every sharing membership");
+        check(seqInfo(seqA)->stackRev == srBefore + 1 && seqInfo(seqB)->stackRev == 0,
+              "R10 stackRev bumped for the reloaded stack only");
+        {   // ---- R6: keyed caches died and recompute over the NEW pixels ------
+            bool dropped = app.hist[0].img == nullptr && app.proj[0].img == nullptr;
+            recomputeHistogramIfNeeded(a2, app.hist[0]);
+            recomputeProjectionIfNeeded(a2, app.proj[0]);
+            check(dropped && fabs(app.hist[0].mean[0] - 200.0) < 1e-4 &&
+                  app.proj[0].uid == a2->uid && app.proj[0].dataRev == a2->dataRev,
+                  "R6 hist/proj forgotten, recomputed over new pixels");
+        }
+        {   // ---- R7: sigma_t follows the pixels --------------------------------
+            recomputeTemporalIfNeeded(a2, app.temporal[0]);
+            float sig1 = (float)app.temporal[0].tempNoise[0];
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
+            float sigX1 = (float)app.temporalExtra[0].tempNoise[0];
+            fprintf(stderr, "reloadselftest: R7 sigma_t pre=%.4f post=%.4f slot post=%.4f "
+                            "(frame count and ROI unchanged)\n", sig0, sig1, sigX1);
+            check(fabsf(sig1 - 79.2126f) < 0.5f,
+                  "R7a A-slot sigma_t recomputed after the reload");
+            // the hole (§3.2): same seqId, same frame count, same ROI, same CFA -
+            // only SeqInfo::stackRev in the key can tell this cache its numbers
+            // describe pixels that no longer exist
+            check(fabsf(sigX1 - 79.2126f) < 0.5f,
+                  "R7b slot sigma_t is NOT the stale pre-reload value");
+        }
+        {   // ---- R8: stackRev ALONE unlatches the key (permanent mechanism
+            // proof - forgetImage also resets these states on today's paths, so
+            // R7b alone could pass for the wrong reason with both fixes in)
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
+            app.temporalExtra[0].tempNoise[0] = -12345.0;              // poison
+            seqInfo(seqA)->stackRev++;             // what a second reload does
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
+            check(fabs(app.temporalExtra[0].tempNoise[0] + 12345.0) > 1.0,
+                  "R8 stackRev alone unlatches the temporal key");
+        }
+        {   // ---- R9: forgetImage covers the slot states (§3.2 hole 2) ----------
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
+            forgetImage(a2);
+            check(app.temporalExtra[0].seqId == -1,
+                  "R9 forgetImage forgets the extra slot states too");
+        }
+        check(app.lin.rows.size() == 1 && app.lin.rows[0].seqId == seqB &&
+              !app.lin.fitValid,
+              "R11 lin: reloaded stack's row dropped, fit stale, B's kept");
+        {   // ---- R12: frame-axis provenance ------------------------------------
+            check(c2->src->fileFrame == 2 && c2->px()[0] == 70.0f,
+                  "R12a fileFrame provenance recorded at decode time");
+            writeNpy3(root + "/c.npy", 5, 8, 8, 500.0f);
+            std::string e2;
+            bool r2 = reloadSource(c2->src, e2);
+            check(r2 && c2->px()[0] == 520.0f,
+                  "R12b reload decodes THIS frame of the frame-axis file");
+            writeNpy3(root + "/c.npy", 2, 8, 8, 900.0f);
+            ImageDoc* c4 = docOf(seqC, 4);
+            int c4rev = c4->src->rev, c4dr = c4->dataRev;
+            std::string e3;
+            bool r3 = reloadSource(c4->src, e3);
+            fprintf(stderr, "reloadselftest: R12 vanished frame: %s\n", e3.c_str());
+            check(!r3 && e3.find("no longer exists") != std::string::npos &&
+                  c4->px()[0] == 90.0f && c4->src->rev == c4rev && c4->dataRev == c4dr,
+                  "R12c a frame the file no longer has is refused, pixels stay");
+            ImageDoc* c1 = docOf(seqC, 1);
+            std::string e4;
+            check(reloadSource(c1->src, e4) && c1->px()[0] == 910.0f,
+                  "R12d frames the shrunken file still has keep reloading");
+        }
+        {   // ---- R13: dimensions are facts, not errors --------------------------
+            writeNpy2(stk + "/a_004.npy", 6, 6, 300.0f, 0);
+            ImageDoc* a4 = docOf(seqA, 4);
+            int dr = a4->dataRev;
+            std::string e5, n5;
+            bool r5 = reloadSource(a4->src, e5, &n5);
+            fprintf(stderr, "reloadselftest: R13 dims note: %s\n", n5.c_str());
+            check(r5 && a4->w == 6 && a4->h == 6 && a4->dataRev == dr + 1 &&
+                  n5.find("->") != std::string::npos,
+                  "R13 dims change is a fact: reload proceeds and says so");
+        }
+        {   // ---- R14: failure is refused per frame and counted both ways --------
+            std::filesystem::remove(pathFromUtf8(stk + "/a_003.npy"), ec);
+            ImageDoc* a3 = docOf(seqA, 3);
+            int rv = a3->src->rev, dr = a3->dataRev;
+            std::string e6;
+            bool r6 = reloadSource(a3->src, e6);
+            check(!r6 && a3->px()[0] == 3.0f && a3->src->rev == rv && a3->dataRev == dr,
+                  "R14a a vanished file refuses; the old pixels stay");
+            int failed = 0;
+            std::string msg = reloadStackFromDisk(seqA, &failed);
+            fprintf(stderr, "reloadselftest: R14 summary: %s\n", msg.c_str());
+            check(failed == 1 && msg.rfind("reloaded 4 frame(s), 1 failed", 0) == 0 &&
+                  msg.find("a_003.npy") != std::string::npos,
+                  "R14b stack reload counts both directions, names the error");
+        }
+        {   // ---- R15: what reload is NOT offered for ----------------------------
+            auto rdoc = std::make_unique<ImageDoc>();
+            rdoc->src->remoteUrl = "ssh://host/x.npy";
+            rdoc->src->path = "x.npy";
+            std::string e7, e8;
+            bool r7 = reloadSource(rdoc->src, e7);
+            auto odoc = std::make_unique<ImageDoc>();       // montage/plugin: no path
+            bool r8 = reloadSource(odoc->src, e8);
+            check(!r7 && !r8 && e7 == "remote-backed" &&
+                  e8 == "no file behind these pixels",
+                  "R15 remote-backed and origin-less sources are refused");
+        }
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        fprintf(stderr, "reloadselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
         stopRemoteFetcher();
