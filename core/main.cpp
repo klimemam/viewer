@@ -154,6 +154,12 @@ struct FrameSource {
                                       // (npy frame axis; npz members too). With path +
                                       // npzMember it completes the provenance a reload
                                       // re-decodes - remoteFrame is the remote twin
+    int frameAxis = -1;               // npy layout provenance: 1 = the leading axis
+                                      // was consumed as a FRAME axis, 0 = it was not
+                                      // (single image / CHW), -1 = not an npy decode.
+                                      // Registry identity + replayed on reload, so an
+                                      // ambiguous (small-leading-axis) shape never
+                                      // silently reinterprets under a changed pref
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -203,8 +209,37 @@ static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // tuple, so re-opening still reads the new bytes - sharing never overrides
 // "re-open reads the disk". Remote sources carry mtime/fsize 0 and rely on the
 // url; server-side change detection is Watch's (stage 6).
+// Lock order: g_srcRegMtx is a LEAF lock - nothing else is ever acquired while
+// it is held. It serializes (a) the map itself and (b) every cross-thread read
+// or write of a REGISTERED source's shared fields: writers hold it across the
+// whole mutation (reloadSource's field swap + rekey, cropInPlace), and the seq
+// loader thread holds ONE continuous section from lookup through syncMirrors,
+// so no reader can ever see a half-swapped source. Compound steps use the
+// *Locked helpers to take it exactly once; never call a function that takes it
+// itself (cropInPlace!) while holding it - reloadSource re-crops its PRIVATE
+// fresh decode BEFORE locking for the swap.
 static std::mutex g_srcRegMtx;              // lookups also run on the seq loader thread
 static std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry;
+
+// The same file reached as "C:\data\F.npy" and "c:/data/f.npy" is ONE tuple:
+// canonicalize exactly once, HERE, where the key is built. The stored path is
+// provenance (reload and sessions read it verbatim) and is never rewritten.
+// URLs (ssh://, local://) pass through - they are not filesystem paths.
+static std::string srcKeyPath(const std::string& p) {
+    if (p.empty() || p.find("://") != std::string::npos) return p;
+    std::error_code ec;
+    std::filesystem::path c = std::filesystem::weakly_canonical(pathFromUtf8(p), ec);
+    if (ec) return p;
+    std::string s = c.make_preferred().u8string();
+#ifdef _WIN32
+    for (char& ch : s)      // Windows filesystems compare case-insensitively.
+                            // ASCII fold only: it covers the drive letter and
+                            // spelling divergences real callers produce, and
+                            // identical non-ASCII bytes still fold identically.
+        ch = (char)tolower((unsigned char)ch);
+#endif
+    return s;
+}
 
 static std::string srcIdentityKey(const FrameSource& s) {
     char t[160];
@@ -213,11 +248,13 @@ static std::string srcIdentityKey(const FrameSource& s) {
                  s.fileFrame, s.remoteFrame, s.rawDtype, s.rawInterp, s.rawOffset,
                  (int)s.rawLE, s.srcW, s.srcH,
                  (long long)s.mtime, (unsigned long long)s.fsize);
-    else                    // npy/npz: the file bytes decide, mtime+fsize name them
-        snprintf(t, sizeof t, "\n%d|%d\n\n%lld,%llu",
-                 s.fileFrame, s.remoteFrame,
+    else                    // npy/npz: the file bytes decide, mtime+fsize name
+                            // them; frameAxis keeps the two interpretations of
+                            // an ambiguous shape from collapsing onto one key
+        snprintf(t, sizeof t, "\n%d|%d\nax%d\n%lld,%llu",
+                 s.fileFrame, s.remoteFrame, s.frameAxis,
                  (long long)s.mtime, (unsigned long long)s.fsize);
-    return (s.path.empty() ? s.remoteUrl : s.path) + "\n" + s.npzMember + t;
+    return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" + s.npzMember + t;
 }
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
@@ -230,20 +267,32 @@ static bool srcShareable(const FrameSource& s) {
         return s.w == s.srcW && s.h == s.srcH && s.cropX == 0 && s.cropY == 0;
     return s.srcW == 0;               // npy: srcW only appears once cropped
 }
-static std::shared_ptr<FrameSource> srcRegistryFind(const std::string& key) {
-    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key) {
     auto it = g_srcRegistry.find(key);
     if (it == g_srcRegistry.end()) return nullptr;
     std::shared_ptr<FrameSource> sp = it->second.lock();
     if (!sp) { g_srcRegistry.erase(it); return nullptr; }   // died with its last stack
-    if (!srcShareable(*sp)) return nullptr;   // e.g. cropped in place while sole-owned
+    if (!srcShareable(*sp)) {         // e.g. cropped in place while sole-owned:
+        g_srcRegistry.erase(it);      // EVICT - a live occupant that stopped being
+        return nullptr;               // the frame must not squat the tuple's slot
+    }
     return sp;
 }
-static void srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
-    if (!s || !srcShareable(*s)) return;
-    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+// (no unlocked find wrapper on purpose: every reader needs more than the bare
+// lookup - mirrors, or an add - inside the SAME hold, per the note above)
+// Returns the live occupant when the tuple's slot is already taken - the
+// caller ADOPTS it (the seq worker can finish a decode after the UI thread
+// registered the same file: both stacks must end up sharing, not keep twin
+// residents) - and nullptr when s was registered or is not shareable.
+static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s) {
+    if (!s || !srcShareable(*s)) return nullptr;
     std::weak_ptr<FrameSource>& slot = g_srcRegistry[srcIdentityKey(*s)];
-    if (slot.expired()) slot = s;     // first resident wins; never displace a live one
+    if (std::shared_ptr<FrameSource> live = slot.lock()) {
+        if (live == s) return nullptr;             // already the registered one
+        if (srcShareable(*live)) return live;      // first resident wins: adopt it
+        // live but no longer the frame (cropped in place): reclaim the slot
+    }
+    slot = s;
     // dead rows hold no pixels but would pile up over many open/close cycles;
     // sweep amortised, whenever the map has doubled since the last sweep
     static size_t sweepAt = 256;
@@ -252,6 +301,11 @@ static void srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
             q = q->second.expired() ? g_srcRegistry.erase(q) : std::next(q);
         sweepAt = std::max<size_t>(256, g_srcRegistry.size() * 2);
     }
+    return nullptr;
+}
+static std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
+    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+    return srcRegistryAddLocked(s);
 }
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
@@ -302,11 +356,16 @@ struct ImageDoc {
 // shared fields from here would race a loader thread reading them).
 static bool shareOrRegisterSource(ImageDoc& d) {
     if (!srcShareable(*d.src)) return false;
-    if (std::shared_ptr<FrameSource> hit = srcRegistryFind(srcIdentityKey(*d.src))) {
+    // ONE hold of g_srcRegMtx across find + add + mirror sync: the worker's
+    // probe and reloadSource's swap take the same lock, so an adoption can
+    // neither interleave with a half-registered tuple nor capture a mid-swap
+    // source (see the lock-order note at g_srcRegMtx)
+    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+    if (std::shared_ptr<FrameSource> hit = srcRegistryFindLocked(srcIdentityKey(*d.src))) {
         if (hit != d.src) { d.src = std::move(hit); d.syncMirrors(); return true; }
         return false;                 // already the registered one (re-share path)
     }
-    srcRegistryAdd(d.src);
+    srcRegistryAddLocked(d.src);
     return false;
 }
 
@@ -2558,6 +2617,17 @@ static void pumpRemoteFetch() {
         S.vmin = d.vmin; S.vmax = d.vmax;        // measured on the worker
         S.rev++;      // in-place pixel replacement (§2.2's "reload" family):
                       // stage 1's only rev writer; the invalidation walk is stage 5
+        // §6.2: remoteStep=1 just made this source shareable, and it was
+        // guaranteed unregistered until now (step>1 sources never pass
+        // srcShareable, previews never register at all). Register it - or
+        // ADOPT a resident of the same url+frame that appeared meanwhile:
+        // this doc is the SOLE owner of an ex-preview source, the resident
+        // holds exactly the full-resolution bytes this fetch delivered, and
+        // the invalidation just below (mirrors, dataRev, forgetImage) is the
+        // same walk an adoption needs - so adopting changes no pixels and
+        // drops "same url opened twice" back to 1x resident bytes. Previews
+        // stay out of the registry entirely; promotion re-runs this.
+        if (!im->preview) shareOrRegisterSource(*im);
         im->syncMirrors();
         size_t p = im->name.find("  (1/");       // drop the preview marker
         if (p != std::string::npos) im->name.erase(p);
@@ -3584,7 +3654,12 @@ static void requestMeasure(int sel) {
 // the selection (or the zoom) from what the user is working on.
 static bool g_quietLoad = false;
 
-static void addImage(std::unique_ptr<ImageDoc> im) {
+// measured = true: the loader already ran computeMinMax (or adopted a measured
+// resident) BEFORE the source became discoverable in the registry. Do not
+// write vmin/vmax again here - the seq loader thread may be reading them
+// through an adoption, and shareOrRegisterSource's contract says adopters
+// never rewrite shared fields.
+static void addImage(std::unique_ptr<ImageDoc> im, bool measured = false) {
     if (im->batchId == 0) {
         if (app.loadBatchId) im->batchId = app.loadBatchId;
         else {
@@ -3604,7 +3679,7 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
     }
     im->uid = app.nextUid++;
     app.imagesRev++;
-    computeMinMax(*im);
+    if (!measured) computeMinMax(*im);
     defaultRange(*im);            // own range is always meaningful; link only overlays it
     im->texDirty = true;
     app.images.push_back(std::move(im));
@@ -3727,11 +3802,16 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
 // ---------------------------------------------------------------- .npz (zip)
 // Minimal zip reader for npz: central-directory walk, stored (0) and deflate (8),
 // with zip64 sizes. Inflate comes from miniz.
+// axisOverride: -1 = decide the ambiguous small-leading-axis case by the live
+// app.npyAxis pref (first decode); 0/1 = replay a RECORDED decision
+// (FrameSource::frameAxis) - reload must reproduce the interpretation the
+// pixels were born under, not whatever the global happens to be today.
 static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf,
                                                  const std::string& path,
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
-                                                 int& framesOut, int64_t& frameStrideOut);
+                                                 int& framesOut, int64_t& frameStrideOut,
+                                                 int axisOverride = -1);
 struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
 
 static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
@@ -3868,6 +3948,11 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
 
 // onlyMember != "" restores a single array (sessions record which one).
 static std::string loadNpz(const std::string& path, const std::string& onlyMember = "") {
+    // identity BEFORE the bytes: see decodeNpyFrame - the multi-second member
+    // decode below is exactly the window an overwrite would exploit
+    FrameSource zipStat;
+    zipStat.path = path;
+    statSourceFile(zipStat);
     std::vector<uint8_t> zip;
     if (!readFileBytes(path, zip)) return "cannot read file";
     std::vector<NpzEntry> entries;
@@ -3892,7 +3977,10 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
             // distinct in the registry tuple (§6.2). Identity is complete only
             // HERE (loadNpyBuffer knows no member name), so this is where the
             // member either joins a resident source or registers its own.
-            statSourceFile(*app.images[k]->src);
+            // (Measured before publishing: addImage inside loadNpyBuffer ran
+            // computeMinMax while the source was still private.)
+            app.images[k]->src->mtime = zipStat.mtime;   // the PRE-read stat:
+            app.images[k]->src->fsize = zipStat.fsize;   // identity binds those bytes
             shareOrRegisterSource(*app.images[k]);
         }
         loaded++;
@@ -3910,8 +3998,13 @@ static std::string loadNpy(const std::string& path) {
     int64_t fstride = 0;
     auto first = decodeNpyFrame(path, err, 0, frames, fstride);
     if (!first) return err.empty() ? "decode failed" : err;
-    shareOrRegisterSource(*first);      // §6.2: same file already resident -> share
-    if (frames <= 1) { addImage(std::move(first)); return {}; }
+    computeMinMax(*first);              // measure BEFORE publishing: no source
+                                        // in the registry ever shows the
+                                        // default 0/1 range to an adopter
+    shareOrRegisterSource(*first);      // §6.2: same file already resident ->
+                                        // share (adoption re-syncs the mirrors;
+                                        // either way the source is measured)
+    if (frames <= 1) { addImage(std::move(first), true); return {}; }
 
     App::SeqInfo info;
     info.id = app.nextSeqId++;
@@ -3920,7 +4013,7 @@ static std::string loadNpy(const std::string& path) {
     first->seqId = info.id;
     first->seqIndex = 0;
     int firstIdx = (int)app.images.size();
-    addImage(std::move(first));
+    addImage(std::move(first), true);
     info.lastImageIdx = firstIdx;
     const ImageDoc* ref = app.images[firstIdx].get();
     for (int f = 1; f < frames; f++) {
@@ -3930,7 +4023,8 @@ static std::string loadNpy(const std::string& path) {
         if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
         doc->seqId = info.id;
         doc->seqIndex = f;
-        if (!shareOrRegisterSource(*doc)) computeMinMax(*doc);   // §6.2
+        computeMinMax(*doc);            // measure BEFORE publishing, as above
+        shareOrRegisterSource(*doc);    // §6.2
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
         doc->texDirty = true;
         doc->uid = app.nextUid++;
@@ -3993,7 +4087,8 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  const std::string& path,
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
-                                                 int& framesOut, int64_t& frameStrideOut) {
+                                                 int& framesOut, int64_t& frameStrideOut,
+                                                 int axisOverride) {
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     framesOut = 1;
     frameStrideOut = 0;
@@ -4105,6 +4200,8 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     // image. app.npyAxis can force the ambiguous small-leading-axis case.
     std::string note;
     int64_t F = 1, sf = 0;
+    bool tookFrameAxis = false;         // the decision actually used - recorded
+                                        // on the source as frameAxis
     while (shape.size() > 4) {          // deeper than (F,H,W,C): take [0]
         if (shape[0] != 1) note = "showing [0] of leading axis";
         shape.erase(shape.begin());
@@ -4114,15 +4211,18 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
         F = shape[0]; sf = strides[0];
         shape.erase(shape.begin());
         strides.erase(strides.begin());
+        tookFrameAxis = true;
     } else if (shape.size() == 3) {
+        int ax = axisOverride >= 0 ? axisOverride : app.npyAxis;
         bool lastIsChannels = shape[2] <= 4;
         bool firstIsChannels = shape[0] <= 4;
         bool asFrames = !lastIsChannels &&
-                        (!firstIsChannels || app.npyAxis == 1);   // 1 = force frames
-        if (asFrames || (firstIsChannels && app.npyAxis == 1)) {
+                        (!firstIsChannels || ax == 1);   // 1 = force frames
+        if (asFrames || (firstIsChannels && ax == 1)) {
             F = shape[0]; sf = strides[0];
             shape.erase(shape.begin());
             strides.erase(strides.begin());
+            tookFrameAxis = true;
         }
     }
     int64_t H, W, C, sh, sw, sc;
@@ -4146,6 +4246,7 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     FrameSource& S = *im->src;
     S.path = path;
     S.fileFrame = frameIdx;           // which frame of the FILE: registry identity (§6.2) and reload provenance
+    S.frameAxis = tookFrameAxis ? 1 : 0;   // the layout decision, same two roles
     S.w = (int)W; S.h = (int)H; S.ch = (int)C;
     S.dtype = dtypeName;
     im->note = note;
@@ -4162,10 +4263,19 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
                                                 int64_t& frameStrideOut) {
+    // identity BEFORE the bytes: an overwrite completing during the read binds
+    // the OLD tuple to the OLD pixels - the safe direction, the next open of
+    // the NEW tuple misses the registry and re-decodes what is on disk
+    FrameSource st;
+    st.path = path;
+    statSourceFile(st);
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
     auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
-    if (im) statSourceFile(*im->src);      // a local file: record the Watch baseline
+    if (im) {                              // a local file: the Watch baseline
+        im->src->mtime = st.mtime;
+        im->src->fsize = st.fsize;
+    }
     return im;
 }
 static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
@@ -4249,6 +4359,10 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
         return fail("invalid raw format");
     if (d.w < 1 || d.h < 1 || d.w > 32768 || d.h > 32768)
         return fail("unsupported image size");   // sessions can carry unclamped values
+    // identity BEFORE the bytes: see decodeNpyFrame
+    FrameSource st;
+    st.path = d.path;
+    statSourceFile(st);
     std::vector<uint8_t> buf;
     if (!readFileBytes(d.path, buf)) return fail("cannot read file");
     const int elem = RAW_DTYPE_SIZE[d.dtype];
@@ -4320,7 +4434,8 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
     S.rawInterp = d.interp;
     S.rawOffset = d.offset;
     S.rawLE = d.littleEndian;
-    statSourceFile(S);                // a local file: record the Watch baseline
+    S.mtime = st.mtime;               // the PRE-read Watch baseline: identity
+    S.fsize = st.fsize;               // binds the bytes that were actually read
     im->syncMirrors();
     return im;
 }
@@ -4329,14 +4444,17 @@ static std::string loadRaw(const RawDialog& d) {
     std::string err;
     auto im = decodeRawFrame(d, err);
     if (!im) return err.empty() ? "decode failed" : err;
+    computeMinMax(*im);               // measure BEFORE publishing: no source in
+                                      // the registry ever shows the default 0/1
     shareOrRegisterSource(*im);       // §6.2: same file + same recipe -> share
+                                      // (adoption = an already-measured resident;
+                                      // a shared source is never remeasured here)
 
     if (d.replaceIdx >= 0 && d.replaceIdx < (int)app.images.size()) {
         // reinterpret in place: keep list position, selection and view
         ImageDoc* old = app.images[d.replaceIdx].get();
         if (app.ana.img == old) app.ana.img = nullptr;
         if (old->tex) glDeleteTextures(1, &old->tex);
-        computeMinMax(*im);
         defaultRange(*im);
         im->texDirty = true;
         forgetImage(old);
@@ -4344,7 +4462,7 @@ static std::string loadRaw(const RawDialog& d) {
         app.images[d.replaceIdx] = std::move(im);
         app.current = d.replaceIdx;
     } else {
-        addImage(std::move(im));
+        addImage(std::move(im), true);
     }
     return {};
 }
@@ -4364,6 +4482,16 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     if (im.src.use_count() > 1) {
         im.src = cloneSource(*im.src);
         app.imagesRev++;              // the Files share marks change with the split
+    } else {
+        // sole owner, mutated IN PLACE: this source stops being the full frame,
+        // so it leaves the registry NOW - a live occupant that fails
+        // srcShareable would otherwise squat the tuple's slot, and the same
+        // file could neither be adopted nor re-registered until this doc
+        // closed (the crop does not change any key field, so the key still
+        // names the slot the full-frame decode registered)
+        auto it = g_srcRegistry.find(srcIdentityKey(*im.src));
+        if (it != g_srcRegistry.end() && it->second.lock() == im.src)
+            g_srcRegistry.erase(it);
     }
     FrameSource& S = *im.src;
     if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
@@ -5928,11 +6056,20 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                     probe.rawDtype = recipe.dtype;   probe.rawInterp = recipe.interp;
                     probe.rawOffset = recipe.offset; probe.rawLE = recipe.littleEndian;
                     probe.srcW = recipe.w;           probe.srcH = recipe.h;
+                } else {
+                    probe.frameAxis = 0;   // folder members decode as single
+                                           // 2-D frames; a frame-axis file keys
+                                           // ax=1, misses here and self-heals
+                                           // at the adopt-on-collision add below
                 }
                 statSourceFile(probe);
-                if (probe.mtime || probe.fsize)
+                if (probe.mtime || probe.fsize) {
+                    // ONE continuous hold across find + syncMirrors: the reload
+                    // swap and crop hold the same lock for their whole mutation,
+                    // so these mirrors can never capture a half-swapped source
+                    std::lock_guard<std::mutex> lk(g_srcRegMtx);
                     if (std::shared_ptr<FrameSource> hit =
-                            srcRegistryFind(srcIdentityKey(probe))) {
+                            srcRegistryFindLocked(srcIdentityKey(probe))) {
                         doc = std::make_unique<ImageDoc>();
                         doc->src = std::move(hit);
                         doc->name = baseName(j.path);
@@ -5940,6 +6077,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                         doc->syncMirrors();   // vmin/vmax: already measured
                         adopted = true;
                     }
+                }
             }
             if (!doc) {
                 if (isRaw) {
@@ -5960,9 +6098,22 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             }
             if (!adopted) {
                 computeMinMax(*doc);  // pure: keep this off the UI thread (and
-                                      // off shared sources: theirs is done)
-                srcRegistryAdd(doc->src);   // the next same-folder open shares it
-                bytes += doc->px().size() * sizeof(float);
+                                      // off shared sources: theirs is done) -
+                                      // and BEFORE the add: no source in the
+                                      // registry ever shows the default 0/1
+                // the UI thread may have registered this very tuple between the
+                // probe miss and now: the add hands back the live occupant and
+                // this decode is discarded for it - both stacks of one tuple
+                // end up sharing. One hold across add + syncMirrors, as above.
+                std::lock_guard<std::mutex> lk(g_srcRegMtx);
+                if (std::shared_ptr<FrameSource> live = srcRegistryAddLocked(doc->src)) {
+                    doc->src = std::move(live);
+                    doc->syncMirrors();
+                    adopted = true;   // 0 new bytes (§7): the pixels were
+                                      // counted by the stack that decoded them
+                } else {
+                    bytes += doc->px().size() * sizeof(float);
+                }
             }
             {
                 std::lock_guard<std::mutex> lk(app.seqMtx);
@@ -6026,6 +6177,11 @@ static void pumpSequence() {
         auto& doc = pr.second;
         doc->seqId = app.seqLoadingId;
         doc->seqIndex = pr.first;
+        doc->syncMirrors();           // a reload striking while this frame sat
+                                      // in seqReady moved the source under it,
+                                      // and the reload walk covers only
+                                      // app.images - the landing itself adopts
+                                      // the source's CURRENT geometry
         if (doc->vmax <= doc->vmin) computeMinMax(*doc);   // worker normally did this
         if (ref) {
             doc->black = ref->black; doc->white = ref->white;
@@ -6050,7 +6206,14 @@ static void pumpSequence() {
         lastTemporalInvalidate = nowT;
         app.temporal[0].seqId = app.temporal[1].seqId = -1;
     }
-    if (!app.seqRunning && app.seqThread.joinable()) {
+    bool drained;
+    {
+        std::lock_guard<std::mutex> lk(app.seqMtx);
+        drained = app.seqReady.empty();
+    }
+    if (!app.seqRunning && app.seqThread.joinable() && drained) {
+        // count only after the queue drained: adoption makes the worker finish
+        // while frames still sit in seqReady, and "loaded 5" of 6 is a lie
         app.seqThread.join();
         int n = 0;
         for (const auto& d : app.images) if (d->seqId == app.seqLoadingId) n++;
@@ -7916,13 +8079,19 @@ static void seqMosaicChanged(const ImageDoc* im) {
 static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& errOut,
                          std::string* noteOut = nullptr) {
     if (!src) { errOut = "no source"; return false; }
-    if (!src->remoteUrl.empty()) { errOut = "remote-backed"; return false; }
-    if (src->path.empty()) { errOut = "no file behind these pixels"; return false; }
+    // local:// is LOCAL: a Browse-panel local open carries the on-disk path
+    // inside its url - the pixels are on this disk and reload reads that file.
+    // Only real remote schemes (a peer holds the bytes) refuse.
+    const bool localUrl = !src->remoteUrl.empty() &&
+                          src->remoteUrl.rfind("local://", 0) == 0;
+    if (!src->remoteUrl.empty() && !localUrl) { errOut = "remote-backed"; return false; }
+    const std::string fpath = localUrl ? src->remoteUrl.substr(8) : src->path;
+    if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
     std::unique_ptr<ImageDoc> nd;
     std::string err;
     if (src->rawDtype >= 0) {
         RawDialog d;                       // the recipe, replayed against the file
-        d.path = src->path;
+        d.path = fpath;
         d.dtype = src->rawDtype; d.interp = src->rawInterp;
         d.offset = src->rawOffset; d.littleEndian = src->rawLE;
         d.w = src->srcW > 0 ? src->srcW : src->w;
@@ -7932,12 +8101,18 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
             d.cropX = src->cropX; d.cropY = src->cropY;
             d.cropW = src->w; d.cropH = src->h;
         }
-        nd = decodeRawFrame(d, err);
+        nd = decodeRawFrame(d, err);       // stats BEFORE reading, like every loader
     } else {
+        // identity BEFORE the bytes: an overwrite completing during this read
+        // binds the OLD tuple to the OLD pixels - the safe direction. A
+        // local:// source keeps its url identity (mtime/fsize stay 0, exactly
+        // as the open path left them), so its registry key never moves.
+        FrameSource st;
+        if (!localUrl) { st.path = fpath; statSourceFile(st); }
         std::vector<uint8_t> npy;          // the .npy bytes, plain or extracted
         if (!src->npzMember.empty()) {
             std::vector<uint8_t> zip;
-            if (!readFileBytes(src->path, zip)) { errOut = "cannot read file"; return false; }
+            if (!readFileBytes(fpath, zip)) { errOut = "cannot read file"; return false; }
             std::vector<NpzEntry> entries;
             if (!npzList(zip, entries, err)) { errOut = err; return false; }
             bool found = false;
@@ -7951,21 +8126,27 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                 errOut = "array \"" + src->npzMember + "\" is no longer in the file";
                 return false;
             }
-        } else if (!readFileBytes(src->path, npy)) {
+        } else if (!readFileBytes(fpath, npy)) {
             errOut = "cannot read file";
             return false;
         }
         int frames = 1;
         int64_t fs = 0;
-        nd = decodeNpyBuffer(npy, src->path, "", err, 0, frames, fs);
+        // re-decode under the RECORDED axis interpretation (frameAxis), never
+        // the live global pref: these pixels were born under that decision,
+        // and `frames` below is the file's frame count under it - so the
+        // refusal message states a true count
+        nd = decodeNpyBuffer(npy, fpath, "", err, 0, frames, fs, src->frameAxis);
         if (nd && src->fileFrame > 0) {    // frame-axis member: decode ITS frame
             if (src->fileFrame >= frames) {
                 errOut = "file now has " + std::to_string(frames) + " frame(s); frame " +
                          std::to_string(src->fileFrame) + " no longer exists";
                 return false;
             }
-            nd = decodeNpyBuffer(npy, src->path, "", err, src->fileFrame, frames, fs);
+            nd = decodeNpyBuffer(npy, fpath, "", err, src->fileFrame, frames, fs,
+                                 src->frameAxis);
         }
+        if (nd) { nd->src->mtime = st.mtime; nd->src->fsize = st.fsize; }
         // a crop made after load re-scoped this frame; the reload keeps that scope
         if (nd && src->srcW > 0 &&
             (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW || src->h != src->srcH))
@@ -7980,13 +8161,36 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                  src->dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
         *noteOut = b;
     }
-    // the swap: same srcId (identity), new pixels, rev +1, fresh Watch baseline
-    src->data = std::move(nd->src->data);
-    src->w = N.w; src->h = N.h; src->ch = N.ch;
-    src->dtype = N.dtype; src->vmin = N.vmin; src->vmax = N.vmax;
-    src->srcW = N.srcW; src->srcH = N.srcH; src->cropX = N.cropX; src->cropY = N.cropY;
-    src->rev++;
-    statSourceFile(*src);
+    {   // the swap, in ONE hold of g_srcRegMtx: the worker reads a shared
+        // source only inside that lock (find + syncMirrors in one section), so
+        // no thread can see a half-swapped source. nd is PRIVATE here - its
+        // cropInPlace above took and released the lock on the fresh decode -
+        // so this scope acquires exactly one lock (see the note at g_srcRegMtx).
+        std::lock_guard<std::mutex> lk(g_srcRegMtx);
+        // re-key: the tuple embeds mtime/fsize, so the reloaded source MOVES to
+        // its new tuple's slot - a re-open of the changed file finds and shares
+        // it, and a restore of the old bytes misses and re-decodes the disk.
+        // Without this the stale row could hand post-reload pixels to a tuple
+        // that never contained them.
+        auto it = g_srcRegistry.find(srcIdentityKey(*src));
+        if (it != g_srcRegistry.end() && it->second.lock() == src)
+            g_srcRegistry.erase(it);
+        // same srcId (identity), new pixels, rev +1, the PRE-read Watch baseline
+        src->data = std::move(nd->src->data);
+        src->w = N.w; src->h = N.h; src->ch = N.ch;
+        src->dtype = N.dtype; src->vmin = N.vmin; src->vmax = N.vmax;
+        src->srcW = N.srcW; src->srcH = N.srcH; src->cropX = N.cropX; src->cropY = N.cropY;
+        if (N.frameAxis >= 0) src->frameAxis = N.frameAxis;   // the decision, replayed
+                                                              // (or forced by a now-
+                                                              // unambiguous new shape)
+        src->rev++;
+        src->mtime = N.mtime;
+        src->fsize = N.fsize;
+        srcRegistryAddLocked(src);    // the new tuple's slot. A live occupant
+                                      // (the same tuple decoded fresh meanwhile)
+                                      // wins: it already serves future opens,
+                                      // and both hold identical bytes.
+    }
     // ---- the walk (§3.2): every membership sharing this source, in one step ----
     std::vector<int> seqIds;
     for (auto& d : app.images) {
@@ -8018,19 +8222,43 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
 
 // Files right-click on a stack header: every member's source, re-read from
 // disk. A shared source is reloaded ONCE (the walk already updated every
-// membership it has). The summary counts both directions - never silent about
-// the failures - and names the first one.
+// membership it has). The summary counts BOTH directions and is never silent:
+// failures (with the first error), members whose dimensions changed (the
+// single-frame path toasts this - the batch path must not lose the fact), and
+// memberships OUTSIDE this stack that the walk refreshed through shared
+// sources - numbers moving in a stack the user never touched need a stated
+// cause.
 static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
     std::vector<const FrameSource*> done;
-    int ok = 0, failed = 0;
-    std::string firstErr;
+    int ok = 0, failed = 0, dims = 0, sharedN = 0;
+    std::string firstErr, firstDims;
+    std::vector<std::string> sharedNames;  // distinct holders, first one is named
     for (int idx : framesOfSeq(seqId)) {
         const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
         if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
         done.push_back(s.get());
-        std::string err;
-        if (reloadSource(s, err)) ok++;
-        else {
+        std::string err, note;
+        if (reloadSource(s, err, &note)) {
+            ok++;
+            if (!note.empty()) {
+                dims++;
+                if (firstDims.empty())
+                    firstDims = (s->path.empty() ? app.images[idx]->name
+                                                 : baseName(s->path)) + ": " + note;
+            }
+            // the walk just refreshed every membership of this source OUTSIDE
+            // this stack too (other stacks, loose frames)
+            for (const auto& d2 : app.images)
+                if (d2->src == s && d2->seqId != seqId) {
+                    sharedN++;
+                    std::string where = d2->name;
+                    if (d2->seqId != 0)
+                        if (const App::SeqInfo* si2 = seqInfo(d2->seqId)) where = si2->name;
+                    if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
+                        sharedNames.end())
+                        sharedNames.push_back(where);
+                }
+        } else {
             failed++;
             if (firstErr.empty())
                 firstErr = (s->path.empty() ? app.images[idx]->name
@@ -8038,13 +8266,24 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
         }
     }
     if (failedOut) *failedOut = failed;
-    char buf[320];
-    if (failed)
-        snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed - %s",
-                 ok, failed, firstErr.c_str());
-    else
-        snprintf(buf, sizeof buf, "reloaded %d frame(s), 0 failed", ok);
-    return buf;
+    char buf[256];
+    snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed", ok, failed);
+    std::string msg = buf;
+    if (failed) msg += " - " + firstErr;
+    if (dims) {
+        snprintf(buf, sizeof buf, " - %d changed dimensions (%s)", dims, firstDims.c_str());
+        msg += buf;
+    }
+    if (sharedN) {
+        snprintf(buf, sizeof buf, " - also refreshed %d shared frame(s) in \"%s\"",
+                 sharedN, sharedNames.empty() ? "" : sharedNames[0].c_str());
+        msg += buf;
+        if (sharedNames.size() > 1) {
+            snprintf(buf, sizeof buf, " (+%d more)", (int)sharedNames.size() - 1);
+            msg += buf;
+        }
+    }
+    return msg;
 }
 
 // Temporal stats for a stack that is NOT opened: fired from the browser's group
@@ -8761,10 +9000,12 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     computeMinMax(*doc);
     defaultRange(*doc);
     // §6.2: a full-resolution open (step == 1) of an already-resident url+frame
-    // shares that source; previews (step > 1) are not the frame and never
-    // register, so the in-place preview->full swap can only ever touch a
-    // sole-owned source.
-    shareOrRegisterSource(*doc);
+    // shares that source. A PREVIEW never registers OR adopts, whatever its
+    // step - it is a throwaway the next Browse click replaces, so it must not
+    // become anyone's counterpart in share marks or survival notices, and the
+    // in-place preview->full swap relies on ex-preview sources being
+    // sole-owned. Promotion runs this again for the doc that stays.
+    if (!asPreview) shareOrRegisterSource(*doc);
     doc->texDirty = true;
     app.images.push_back(std::move(doc));
     app.imagesRev++;
@@ -8935,6 +9176,13 @@ static void promotePreview(ImageDoc* d) {
         d->batchId = batchReuse(leaf.empty() ? (host.empty() ? "opened" : host) : leaf,
                                 host + ":" + dir);
     }
+    // §6.2: promotion is what makes this a REGISTERED open, so this is where
+    // an ex-preview source joins the registry (previews themselves never
+    // touch it). A source still at step > 1 is refused by srcShareable and
+    // registers later, when its full-resolution swap lands; a step-1 source
+    // adopting a resident here swaps to pixel-identical bytes (same url+frame,
+    // full resolution), so nothing on screen or in any cache is invalidated.
+    shareOrRegisterSource(*d);
     // the buffering the preview deferred, at REGISTERED priority now
     requestFullRemote(d);
     if (d->remoteFrames > 1 && d->seqId == 0) {
@@ -19033,7 +19281,10 @@ static void drawFileList() {
                 {   // manual reload (reference-design §3.2 / §8 row 5): re-read
                     // this frame's file and swap the pixels in place
                     const FrameSource& S = *app.images[i]->src;
-                    const bool remote = !S.remoteUrl.empty();
+                    // local:// is a file on THIS disk: reloadable. Only real
+                    // remote schemes (the peer holds the bytes) refuse.
+                    const bool remote = !S.remoteUrl.empty() &&
+                                        S.remoteUrl.rfind("local://", 0) != 0;
                     const bool canReload = !remote && !S.path.empty();
                     if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
                         pendingReloadImg = i;
@@ -19169,8 +19420,10 @@ static void drawFileList() {
                 bool anyLocal = false, anyRemote = false;
                 for (int idx : stack) {
                     const FrameSource& S = *app.images[idx]->src;
-                    if (!S.remoteUrl.empty()) anyRemote = true;
-                    else if (!S.path.empty()) anyLocal = true;
+                    // local:// embeds a path on this disk - that member reloads
+                    if (!S.remoteUrl.empty() &&
+                        S.remoteUrl.rfind("local://", 0) != 0) anyRemote = true;
+                    else if (!S.path.empty() || !S.remoteUrl.empty()) anyLocal = true;
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
                     pendingReloadSeq = si->id;
@@ -21601,6 +21854,16 @@ int main(int argc, char** argv) {
             for (int idx : framesOfSeq(seqId)) out.push_back(app.images[idx]->src->path);
             return out;
         };
+        // a shared source keeps the FIRST opener's path spelling (the registry
+        // canonicalizes identity, not provenance), so compare files as
+        // identities, not byte-for-byte strings
+        auto sameFilesInOrder = [&](const std::vector<std::string>& a,
+                                    const std::vector<std::string>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (srcKeyPath(a[i]) != srcKeyPath(b[i])) return false;
+            return true;
+        };
         auto joinBase = [&](const std::vector<std::string>& v) {
             std::string s;
             for (const auto& f : v) { s += s.empty() ? "" : ","; s += baseName(f); }
@@ -21709,7 +21972,7 @@ int main(int argc, char** argv) {
         if (mwant.size() != 1 || app.seqs.size() != seqsBefore + 1) {
             fprintf(stderr, "pickerselftest: UC2 FAILED - merge did not make ONE stack\n");
             ok = false;
-        } else if (mgot != mwant[0].files || (int)mgot.size() != total) {
+        } else if (!sameFilesInOrder(mgot, mwant[0].files) || (int)mgot.size() != total) {
             fprintf(stderr, "pickerselftest: UC2 FAILED - merged stack != union in natural order\n");
             ok = false;
         }
@@ -26102,8 +26365,9 @@ int main(int argc, char** argv) {
         writeNpy3(root + "/c.npy", 5, 8, 8, 50.0f);
         app.seqLoadMode = 1;
         // R12 shrinks c.npy to (2,8,8), and a leading axis of 2 is ambiguous
-        // (it reads as channels by default). Pin the frame interpretation like
-        // --npy-axis frames does - reload re-decodes under the same setting.
+        // (it reads as channels by default). Load under --npy-axis frames;
+        // reload replays the RECORDED interpretation regardless of the live
+        // pref - R18 pins exactly that.
         app.npyAxis = 1;
         closeAll();
         openFolder(stk);
@@ -26177,17 +26441,18 @@ int main(int argc, char** argv) {
         int srBefore = seqInfo(seqA)->stackRev;
         a2->texDirty = false;
         loose->texDirty = false;
-        // a full second, not a token pause: this stdlib reports last_write_time
-        // at SECONDS granularity, and a rewrite inside the same second would
-        // make the baseline refresh unobservable
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        // long enough to cross a write-time bucket on ANY filesystem this can
+        // run on: this stdlib reports last_write_time at seconds granularity,
+        // and FAT/exFAT scratch volumes round write times to 2-SECOND buckets -
+        // a 1.1 s pause landed in the same bucket ~45% of the time there
+        std::this_thread::sleep_for(std::chrono::milliseconds(2100));
         writeNpy2(stk + "/a_002.npy", 4, 4, 200.0f, 0);
         {
             std::string err, note;
             bool r = reloadSource(a2->src, err, &note);
             check(r && note.empty(), "R2 reloadSource succeeds; same shape, no dims note");
         }
-        fprintf(stderr, "reloadselftest: R3 rev %d->%d mtime %lld->%lld uid %d srcId %d\n",
+        fprintf(stderr, "reloadselftest: R3 rev %d->%d mtime %lld->%lld file_clock ticks uid %d srcId %d\n",
                 rev0, a2->src->rev, (long long)mt0, (long long)a2->src->mtime,
                 a2->uid == uid0 ? 1 : 0, a2->src->srcId == srcId0 ? 1 : 0);
         check(a2->uid == uid0 && a2->src->srcId == srcId0 && a2->src->rev == rev0 + 1 &&
@@ -26229,10 +26494,16 @@ int main(int argc, char** argv) {
             // R7b alone could pass for the wrong reason with both fixes in)
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
             app.temporalExtra[0].tempNoise[0] = -12345.0;              // poison
+            // negative control first: WITHOUT a bump the key must match and
+            // the cache must HOLD - otherwise a broken latch (always-recompute)
+            // would pass the bump half of this test vacuously
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
+            check(app.temporalExtra[0].tempNoise[0] == -12345.0,
+                  "R8a the latched cache HOLDS while stackRev is unchanged");
             seqInfo(seqA)->stackRev++;             // what a second reload does
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
             check(fabs(app.temporalExtra[0].tempNoise[0] + 12345.0) > 1.0,
-                  "R8 stackRev alone unlatches the temporal key");
+                  "R8b stackRev alone unlatches the temporal key");
         }
         {   // ---- R9: forgetImage covers the slot states (§3.2 hole 2) ----------
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
@@ -26290,6 +26561,11 @@ int main(int argc, char** argv) {
             check(failed == 1 && msg.rfind("reloaded 4 frame(s), 1 failed", 0) == 0 &&
                   msg.find("a_003.npy") != std::string::npos,
                   "R14b stack reload counts both directions, names the error");
+            // the walk also refreshed the loose frame sharing a_002's source -
+            // pixels OUTSIDE this stack changed, and the summary must say so
+            check(msg.find("also refreshed 1 shared frame(s) in \"loose.npy\"")
+                      != std::string::npos,
+                  "R14c cross-stack refresh is named, never silent");
         }
         {   // ---- R15: what reload is NOT offered for ----------------------------
             auto rdoc = std::make_unique<ImageDoc>();
@@ -26302,6 +26578,124 @@ int main(int argc, char** argv) {
             check(!r7 && !r8 && e7 == "remote-backed" &&
                   e8 == "no file behind these pixels",
                   "R15 remote-backed and origin-less sources are refused");
+        }
+        {   // ---- R16: reload RE-KEYS the registry ------------------------------
+            // the reloaded source carries a NEW tuple (fresh mtime/fsize); a
+            // re-open of the changed file must find it and share, not decode a
+            // resident duplicate of identical bytes
+            // reuse the source's OWN path spelling: the registry key holds the
+            // folder worker's spelling, and this test pins re-keying, not
+            // spelling canonicalization (R21 owns that)
+            size_t n0 = app.images.size();
+            std::string e16 = loadNpy(a2->src->path);
+            check(e16.empty() && app.images.size() == n0 + 1 &&
+                  app.images.back()->src == a2->src,
+                  "R16 re-open after reload adopts the SAME source (re-keyed)");
+        }
+        {   // ---- R17: an in-place crop leaves the registry; the slot reclaims --
+            ImageDoc* b1 = docOf(seqB, 1);
+            // capture the worker's path spelling BEFORE the crop, so the
+            // re-opens below hit the occupied slot, not a differently-spelled
+            // empty one
+            std::string bpath = b1->src->path;
+            cropInPlace(*b1, 1, 1, 2, 2);
+            check(b1 && b1->w == 2 && b1->src->srcW == 4,
+                  "R17a crop in place (sole owner keeps its source)");
+            size_t n0 = app.images.size();
+            std::string e17 = loadNpy(bpath);
+            ImageDoc* r1 = app.images.back().get();
+            check(e17.empty() && app.images.size() == n0 + 1 &&
+                  r1->src != b1->src && r1->w == 4,
+                  "R17b re-open after crop decodes the FULL frame fresh");
+            std::string e17b = loadNpy(bpath);
+            ImageDoc* r2 = app.images.back().get();
+            check(e17b.empty() && r2->src == r1->src,
+                  "R17c the tuple's slot was reclaimed: next open shares again");
+        }
+        {   // ---- R18: reload under the RECORDED axis interpretation -------------
+            // c.npy is (2,8,8) now; a leading axis of 2 is ambiguous. The fixture
+            // decoded c.npy as frames (npyAxis=1); flip the global pref: reload
+            // must still decode frames - provenance, not the live setting
+            app.npyAxis = 0;
+            ImageDoc* c1 = docOf(seqC, 1);
+            std::string e18;
+            bool r18 = reloadSource(c1->src, e18);
+            check(r18 && c1->px()[0] == 910.0f,
+                  "R18a reload keeps the recorded frame-axis interpretation");
+            ImageDoc* c4 = docOf(seqC, 4);
+            std::string e18b;
+            bool r18b = reloadSource(c4->src, e18b);
+            fprintf(stderr, "reloadselftest: R18 refusal: %s\n", e18b.c_str());
+            check(!r18b && e18b.find("file now has 2 frame(s)") != std::string::npos,
+                  "R18b refusal reports the count under the RECORDED interpretation");
+            app.npyAxis = 1;
+        }
+        {   // ---- R19: local:// is LOCAL - the url embeds a path on this disk ---
+            writeNpy2(root + "/lref.npy", 4, 4, 1.0f, 0);
+            auto ldoc = std::make_unique<ImageDoc>();
+            ldoc->src->path = ldoc->src->remoteUrl = "local://" + root + "/lref.npy";
+            ldoc->src->w = 4; ldoc->src->h = 4; ldoc->src->ch = 1;
+            ldoc->src->dtype = "f32";
+            ldoc->src->data.assign(16, -1.0f);
+            ldoc->syncMirrors();
+            std::string e19;
+            bool r19 = reloadSource(ldoc->src, e19);
+            check(r19 && ldoc->src->data[0] == 1.0f,
+                  "R19 local:// reloads from the embedded local path");
+        }
+        {   // ---- R20: the stack summary states a member's dims change ----------
+            writeNpy2(stk + "/b_002.npy", 6, 6, 400.0f, 0);
+            int failed20 = 0;
+            std::string msg = reloadStackFromDisk(seqB, &failed20);
+            fprintf(stderr, "reloadselftest: R20 summary: %s\n", msg.c_str());
+            check(failed20 == 0 && msg.find("changed dimensions") != std::string::npos &&
+                  msg.find("b_002") != std::string::npos,
+                  "R20 stack summary names the dims change");
+        }
+#ifdef _WIN32
+        {   // ---- R21: key canonicalization - spelling does not split the tuple -
+            std::string alt = stk + "/b_003.npy";
+            for (auto& c21 : alt) if (c21 == '/') c21 = '\\';
+            if (alt.size() > 1 && alt[1] == ':')
+                alt[0] = (char)toupper((unsigned char)alt[0]);
+            ImageDoc* b3 = docOf(seqB, 3);
+            size_t n0 = app.images.size();
+            std::string e21 = loadNpy(alt);
+            check(e21.empty() && app.images.size() == n0 + 1 &&
+                  app.images.back()->src == b3->src,
+                  "R21 a different path spelling adopts the same tuple");
+        }
+#endif
+        {   // ---- R22: add-on-collision hands back the resident -----------------
+            // the worker's post-decode state when the UI thread registered the
+            // same tuple between its probe miss and its add: the add must
+            // return the live occupant so the caller adopts it - both stacks
+            // of one tuple end up sharing, never twin residents
+            ImageDoc* b4 = docOf(seqB, 4);
+            auto dup = cloneSource(*b4->src);      // same tuple, private twin
+            std::shared_ptr<FrameSource> live = srcRegistryAdd(dup);
+            check(b4 && live == b4->src,
+                  "R22 srcRegistryAdd returns the live occupant to adopt");
+        }
+        {   // ---- R23: a frame still queued in seqReady lands with the source's
+            // CURRENT geometry - the reload walk covers only app.images, so the
+            // landing itself must resync what a reload moved under the queue
+            ImageDoc* b0 = docOf(seqB, 0);
+            auto qd = std::make_unique<ImageDoc>();
+            qd->src = b0->src;
+            qd->name = "queued";
+            qd->syncMirrors();
+            qd->w = 1; qd->h = 1;      // decode-time mirrors, made stale by hand
+            {
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.emplace_back(5, std::move(qd));
+            }
+            app.seqLoadingId = seqB;
+            pumpSequence();
+            ImageDoc* landed = app.images.back().get();
+            check(landed->name == "queued" && landed->w == b0->src->w &&
+                  landed->h == b0->src->h,
+                  "R23 pumpSequence lands queued docs with fresh mirrors");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "reloadselftest: %s\n", ok ? "ok" : "FAILED");
