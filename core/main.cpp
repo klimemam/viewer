@@ -20903,6 +20903,9 @@ int main(int argc, char** argv) {
 #else
         if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
 #endif
+        // scripted runs (bench, browse-keys) must neither read nor write the
+        // user's layout - same rule the exit path applies to autosave/prefs
+        if (benchFrames || !g_browseKeys.empty()) cfg.clear();
         if (!cfg.empty()) {
             cfg /= "viewer";
             std::filesystem::create_directories(cfg, ec);
@@ -28603,7 +28606,7 @@ int main(int argc, char** argv) {
                 refreshCrashSnapshot();
             }
             bool due = dirtySince >= 0 && nowA - dirtySince > 3.0 && nowA - lastAutosave > 5.0;
-            if (!benchFrames && due && !app.images.empty()) {
+            if (!benchFrames && g_browseKeys.empty() && due && !app.images.empty()) {
                 dirtySince = -1;
                 lastAutosave = nowA;
                 autosaveSession();
