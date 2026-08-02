@@ -28,6 +28,8 @@
 "残課題","browse-keys action相の時間上限","listing相には60s脱出があるがaction相は無制限。異常時にスイートが無限に待つ","main.cpp:28658 付近","E-6。小粒"
 "対応済み","UI検証マトリクス + selftest衛生修正","UI検証54項目(実行31/PASS31/FAIL0、較正証明つき)。検出したD-1=selftestが実layout.ini/autosaveを書く、を修正: スクリプト実行はlayoutを読みも書きもしない","docs/verify-ui.md","実機確認のみ7項目はD節に集約"
 "残課題","UI状態probe 2件(zoom%表示・ESCテキスト段)","状態がどこにも出ておらず自動検証不能。g_footerProbe/g_escProbe を足すと常時検証可能になる","docs/verify-ui.md E節","小粒。次のUI変更のついでに"
+"レビュー必要項目","Browse全機能の棚卸しと要否判定","上部21ウィジェット+リスト/列/キー/右クリック10項目を全数列挙し、残す/降格/統合/廃止を判定。重複3件(bookmark・open folder・copy paths)を発見。常設21→6個。判断6点は推奨つき","docs/browse-inventory.md","案A/B/Cの選択と同時に回答いただきたい"
+"Claudeで対応進行中","参照化 修正34件+再レビュー(クレジット切れで中断)","ref-integrate @ 28ef105 は全緑(3 selftest+tripwire+suite21)。再レビュー10体中4体完了・6体がクレジット切れで失敗。確認2件(UNCロック下IO・promotePreview無効化欠落)+未反証3件が残るためmain統合は保留","ref-integrate, review journal wf_19459efb-b82","クレジット回復後に残レンズ(lifecycle)と反証4件を再実行"
 "レビュー必要項目","Browse上部の再設計案(サーベイ済)","4系統20パターンのサーベイから収斂文法を抽出し3案提示。推奨=案A(定常1行+打鍵召喚チップ、入口統一でfilter/search二重入口が構成的に消滅)。未決6点は推奨既定値つき","docs/browse-topbar-design.md, browse-topbar-mockup.html","案の選択と未決6点の回答待ち。実装は選択後。比較モックアップは絵で確認可"
 "Claudeで対応進行中","参照化 stage2+3+5: 統合+レビュー修正","実装は3段とも完了しref-integrateへmerge済(suite21緑)。merge前敵対レビュー(49体)で36所見確認→2エージェントで修正中: 核心25件(registry再キー/crop占拠/preview登録/測定前公開/stat順序/mutex規律/local:拒否/npyAxis出自/FAT粒度) + 通知9件(closeBatch偽生存/tooltip誤帰属/chip解決不一致)","docs/reference-design.md, scratchpad review235","mainは検証済stage1のまま。全修正+再確認後に統合"
 "レビュー必要項目","部分reload後の混合世代stackの永続マーカー","stack reloadが部分失敗すると新旧世代が混ざるが、toast以外に痕跡が残らずσ_tが黙って2世代を混合する。source状態(remoteStep類似)として持つか、Watchの再poll任せか設計判断が必要","レビュー所見[24]","reload/Watch仕様の一部として要議論"
