@@ -25910,17 +25910,18 @@ int main(int argc, char** argv) {
         int srBefore = seqInfo(seqA)->stackRev;
         a2->texDirty = false;
         loose->texDirty = false;
-        // a full second, not a token pause: this stdlib reports last_write_time
-        // at SECONDS granularity, and a rewrite inside the same second would
-        // make the baseline refresh unobservable
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        // long enough to cross a write-time bucket on ANY filesystem this can
+        // run on: this stdlib reports last_write_time at seconds granularity,
+        // and FAT/exFAT scratch volumes round write times to 2-SECOND buckets -
+        // a 1.1 s pause landed in the same bucket ~45% of the time there
+        std::this_thread::sleep_for(std::chrono::milliseconds(2100));
         writeNpy2(stk + "/a_002.npy", 4, 4, 200.0f, 0);
         {
             std::string err, note;
             bool r = reloadSource(a2->src, err, &note);
             check(r && note.empty(), "R2 reloadSource succeeds; same shape, no dims note");
         }
-        fprintf(stderr, "reloadselftest: R3 rev %d->%d mtime %lld->%lld uid %d srcId %d\n",
+        fprintf(stderr, "reloadselftest: R3 rev %d->%d mtime %lld->%lld file_clock ticks uid %d srcId %d\n",
                 rev0, a2->src->rev, (long long)mt0, (long long)a2->src->mtime,
                 a2->uid == uid0 ? 1 : 0, a2->src->srcId == srcId0 ? 1 : 0);
         check(a2->uid == uid0 && a2->src->srcId == srcId0 && a2->src->rev == rev0 + 1 &&
@@ -25962,10 +25963,16 @@ int main(int argc, char** argv) {
             // R7b alone could pass for the wrong reason with both fixes in)
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
             app.temporalExtra[0].tempNoise[0] = -12345.0;              // poison
+            // negative control first: WITHOUT a bump the key must match and
+            // the cache must HOLD - otherwise a broken latch (always-recompute)
+            // would pass the bump half of this test vacuously
+            recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
+            check(app.temporalExtra[0].tempNoise[0] == -12345.0,
+                  "R8a the latched cache HOLDS while stackRev is unchanged");
             seqInfo(seqA)->stackRev++;             // what a second reload does
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);
             check(fabs(app.temporalExtra[0].tempNoise[0] + 12345.0) > 1.0,
-                  "R8 stackRev alone unlatches the temporal key");
+                  "R8b stackRev alone unlatches the temporal key");
         }
         {   // ---- R9: forgetImage covers the slot states (§3.2 hole 2) ----------
             recomputeTemporalIfNeeded(a2, app.temporalExtra[0]);       // latch
@@ -26023,6 +26030,11 @@ int main(int argc, char** argv) {
             check(failed == 1 && msg.rfind("reloaded 4 frame(s), 1 failed", 0) == 0 &&
                   msg.find("a_003.npy") != std::string::npos,
                   "R14b stack reload counts both directions, names the error");
+            // the walk also refreshed the loose frame sharing a_002's source -
+            // pixels OUTSIDE this stack changed, and the summary must say so
+            check(msg.find("also refreshed 1 shared frame(s) in \"loose.npy\"")
+                      != std::string::npos,
+                  "R14c cross-stack refresh is named, never silent");
         }
         {   // ---- R15: what reload is NOT offered for ----------------------------
             auto rdoc = std::make_unique<ImageDoc>();
@@ -26035,6 +26047,113 @@ int main(int argc, char** argv) {
             check(!r7 && !r8 && e7 == "remote-backed" &&
                   e8 == "no file behind these pixels",
                   "R15 remote-backed and origin-less sources are refused");
+        }
+        {   // ---- R16: reload RE-KEYS the registry ------------------------------
+            // the reloaded source carries a NEW tuple (fresh mtime/fsize); a
+            // re-open of the changed file must find it and share, not decode a
+            // resident duplicate of identical bytes
+            // reuse the source's OWN path spelling: the registry key holds the
+            // folder worker's spelling, and this test pins re-keying, not
+            // spelling canonicalization (R21 owns that)
+            size_t n0 = app.images.size();
+            std::string e16 = loadNpy(a2->src->path);
+            check(e16.empty() && app.images.size() == n0 + 1 &&
+                  app.images.back()->src == a2->src,
+                  "R16 re-open after reload adopts the SAME source (re-keyed)");
+        }
+        {   // ---- R17: an in-place crop leaves the registry; the slot reclaims --
+            ImageDoc* b1 = docOf(seqB, 1);
+            // capture the worker's path spelling BEFORE the crop, so the
+            // re-opens below hit the occupied slot, not a differently-spelled
+            // empty one
+            std::string bpath = b1->src->path;
+            cropInPlace(*b1, 1, 1, 2, 2);
+            check(b1 && b1->w == 2 && b1->src->srcW == 4,
+                  "R17a crop in place (sole owner keeps its source)");
+            size_t n0 = app.images.size();
+            std::string e17 = loadNpy(bpath);
+            ImageDoc* r1 = app.images.back().get();
+            check(e17.empty() && app.images.size() == n0 + 1 &&
+                  r1->src != b1->src && r1->w == 4,
+                  "R17b re-open after crop decodes the FULL frame fresh");
+            std::string e17b = loadNpy(bpath);
+            ImageDoc* r2 = app.images.back().get();
+            check(e17b.empty() && r2->src == r1->src,
+                  "R17c the tuple's slot was reclaimed: next open shares again");
+        }
+        {   // ---- R18: reload under the RECORDED axis interpretation -------------
+            // c.npy is (2,8,8) now; a leading axis of 2 is ambiguous. The fixture
+            // decoded c.npy as frames (npyAxis=1); flip the global pref: reload
+            // must still decode frames - provenance, not the live setting
+            app.npyAxis = 0;
+            ImageDoc* c1 = docOf(seqC, 1);
+            std::string e18;
+            bool r18 = reloadSource(c1->src, e18);
+            check(r18 && c1->px()[0] == 910.0f,
+                  "R18a reload keeps the recorded frame-axis interpretation");
+            ImageDoc* c4 = docOf(seqC, 4);
+            std::string e18b;
+            bool r18b = reloadSource(c4->src, e18b);
+            fprintf(stderr, "reloadselftest: R18 refusal: %s\n", e18b.c_str());
+            check(!r18b && e18b.find("file now has 2 frame(s)") != std::string::npos,
+                  "R18b refusal reports the count under the RECORDED interpretation");
+            app.npyAxis = 1;
+        }
+        {   // ---- R19: local:// is LOCAL - the url embeds a path on this disk ---
+            writeNpy2(root + "/lref.npy", 4, 4, 1.0f, 0);
+            auto ldoc = std::make_unique<ImageDoc>();
+            ldoc->src->path = ldoc->src->remoteUrl = "local://" + root + "/lref.npy";
+            ldoc->src->w = 4; ldoc->src->h = 4; ldoc->src->ch = 1;
+            ldoc->src->dtype = "f32";
+            ldoc->src->data.assign(16, -1.0f);
+            ldoc->syncMirrors();
+            std::string e19;
+            bool r19 = reloadSource(ldoc->src, e19);
+            check(r19 && ldoc->src->data[0] == 1.0f,
+                  "R19 local:// reloads from the embedded local path");
+        }
+        {   // ---- R20: the stack summary states a member's dims change ----------
+            writeNpy2(stk + "/b_002.npy", 6, 6, 400.0f, 0);
+            int failed20 = 0;
+            std::string msg = reloadStackFromDisk(seqB, &failed20);
+            fprintf(stderr, "reloadselftest: R20 summary: %s\n", msg.c_str());
+            check(failed20 == 0 && msg.find("changed dimensions") != std::string::npos &&
+                  msg.find("b_002") != std::string::npos,
+                  "R20 stack summary names the dims change");
+        }
+#ifdef _WIN32
+        {   // ---- R21: key canonicalization - spelling does not split the tuple -
+            std::string alt = stk + "/b_003.npy";
+            for (auto& c21 : alt) if (c21 == '/') c21 = '\\';
+            if (alt.size() > 1 && alt[1] == ':')
+                alt[0] = (char)toupper((unsigned char)alt[0]);
+            ImageDoc* b3 = docOf(seqB, 3);
+            size_t n0 = app.images.size();
+            std::string e21 = loadNpy(alt);
+            check(e21.empty() && app.images.size() == n0 + 1 &&
+                  app.images.back()->src == b3->src,
+                  "R21 a different path spelling adopts the same tuple");
+        }
+#endif
+        {   // ---- R23: a frame still queued in seqReady lands with the source's
+            // CURRENT geometry - the reload walk covers only app.images, so the
+            // landing itself must resync what a reload moved under the queue
+            ImageDoc* b0 = docOf(seqB, 0);
+            auto qd = std::make_unique<ImageDoc>();
+            qd->src = b0->src;
+            qd->name = "queued";
+            qd->syncMirrors();
+            qd->w = 1; qd->h = 1;      // decode-time mirrors, made stale by hand
+            {
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.emplace_back(5, std::move(qd));
+            }
+            app.seqLoadingId = seqB;
+            pumpSequence();
+            ImageDoc* landed = app.images.back().get();
+            check(landed->name == "queued" && landed->w == b0->src->w &&
+                  landed->h == b0->src->h,
+                  "R23 pumpSequence lands queued docs with fresh mirrors");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "reloadselftest: %s\n", ok ? "ok" : "FAILED");
