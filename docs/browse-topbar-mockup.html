@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Browse 上部レイアウト比較</title>
+<style>
+  body { background:#141619; color:#c8ccd2; font-family:"Segoe UI",Meiryo,sans-serif;
+         margin:24px; }
+  h1 { font-size:20px; font-weight:600; }
+  h2 { font-size:15px; font-weight:600; margin:28px 0 4px; color:#e8eaed; }
+  .sub { color:#8a919c; font-size:12.5px; margin:0 0 12px; }
+  .grid { display:flex; flex-wrap:wrap; gap:22px; align-items:flex-start; }
+  .card { background:#191c1f; border:1px solid #2a2e33; border-radius:6px; padding:14px; }
+  .card h3 { margin:0 0 10px; font-size:13.5px; color:#e8eaed; }
+  .card h3 .tag { font-size:11px; font-weight:400; color:#8a919c; margin-left:8px; }
+  .rows-badge { float:right; font-size:11px; padding:1px 8px; border-radius:8px; }
+  .bad  { background:#4a2f10; color:#e8a33d; }
+  .good { background:#173a1f; color:#5fbf6f; }
+  .mid  { background:#3a3417; color:#cdbb45; }
+
+  /* ---- ImGui 風パネル ---- */
+  .panel { width:460px; background:#1f2226; border:1px solid #35393f;
+           font-family:Consolas,"MS Gothic",monospace; font-size:12.5px; }
+  .panel.narrow { width:300px; }
+  .ptitle { background:#2a2d33; color:#c8ccd2; padding:3px 8px; font-size:12px;
+            border-bottom:1px solid #35393f; }
+  .prow { padding:3px 8px; display:flex; align-items:center; gap:5px;
+          white-space:nowrap; overflow:hidden; }
+  .btn { background:#33373d; border:1px solid #43484f; color:#c8ccd2;
+         padding:0 6px; border-radius:2px; font-size:12px; line-height:17px; }
+  .btn.dim { color:#7d848d; }
+  .seg { display:inline-flex; border:1px solid #43484f; border-radius:2px; overflow:hidden; }
+  .seg span { padding:0 6px; line-height:17px; font-size:12px; color:#7d848d; }
+  .seg .on { background:#2f5f9e; color:#e6ecf2; }
+  .inp { background:#131518; border:1px solid #43484f; color:#8a919c;
+         padding:0 6px; line-height:17px; font-size:12px; }
+  .crumb a { color:#6ea8dc; text-decoration:none; }
+  .crumb i  { color:#5c636c; font-style:normal; padding:0 2px; }
+  .host { color:#d8b45a; }
+  .muted { color:#7d848d; }
+  .count { color:#7d848d; }
+  .sep { border-top:1px solid #35393f; margin:2px 0; }
+  .frow { padding:2px 8px 2px 22px; color:#b7bcc3; white-space:nowrap; }
+  .frow.grp { padding-left:8px; color:#c8ccd2; }
+  .frow.sel { background:#2a4a75; color:#e6ecf2; }
+  .frow.dimmed { color:#565c64; }
+  .chev { color:#7d848d; }
+  .band { padding:3px 8px; font-size:12px; }
+  .band.err { background:#3c2415; color:#e8a33d; }
+  .band.ghost { border:1px dashed #5a4a28; color:#a08850; margin:2px 6px; }
+  .expand { background:#24272c; border-top:1px dashed #3c414a; }
+
+  /* 召喚チップ */
+  .listwrap { position:relative; }
+  .chip { position:absolute; top:2px; right:8px; background:#22262c;
+          border:1px solid #4a90d9; border-radius:3px; padding:2px 8px;
+          font-size:12px; color:#e6ecf2; box-shadow:0 2px 8px #0009; }
+  .chip .n { color:#7d848d; margin-left:6px; }
+  .chip .srv { color:#d8b45a; margin-left:6px; }
+  .chip .esc { color:#5c636c; margin-left:8px; font-size:11px; }
+
+  /* 注釈 */
+  .notes { margin:10px 0 0; padding:0 0 0 2px; list-style:none; width:460px; }
+  .notes li { font-size:12px; color:#9aa1ab; padding:1px 0 1px 16px; position:relative; }
+  .notes li::before { content:"—"; position:absolute; left:0; color:#5c636c; }
+  .notes li.warn { color:#d0a04a; } .notes li.warn::before { content:"⚠"; color:#d0a04a; }
+  .notes li.plus { color:#6fbf7f; } .notes li.plus::before { content:"＋"; color:#6fbf7f; }
+  .anno { position:relative; }
+  .anno .mark { position:absolute; right:-14px; top:0; bottom:0; width:8px;
+                border:1px solid #d29922; border-left:none; border-radius:0 3px 3px 0; }
+  .anno .mlab { position:absolute; right:-146px; top:50%; transform:translateY(-50%);
+                width:124px; font-size:10.5px; color:#d29922; line-height:1.25;
+                font-family:"Segoe UI",Meiryo,sans-serif; }
+  .cardpad { padding-right:150px; }
+
+  table.cmp { border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  table.cmp th, table.cmp td { border:1px solid #2f3338; padding:5px 12px; text-align:left; }
+  table.cmp th { background:#22252a; color:#e8eaed; font-weight:600; }
+  table.cmp td.g { color:#6fbf7f; } table.cmp td.b { color:#e8a33d; }
+  .rec { background:#173a1f22; border:1px solid #2c5f38; border-radius:6px;
+         padding:10px 14px; margin-top:16px; font-size:13px; color:#c9e4cf; width:fit-content; }
+  .kbd { background:#2c2f34; border:1px solid #43484f; border-bottom-width:2px;
+         border-radius:3px; padding:0 5px; font-size:11px; font-family:Consolas,monospace; }
+</style>
+</head>
+<body>
+<h1>Browse 上部 — 現状と3案の比較</h1>
+<p class="sub">docs/browse-topbar-design.md の3案を絵にしたもの。パネル幅は既定 460px、右端の橙マークは診断済みの問題箇所。行の中身・行数はコード棚卸し(main.cpp 16318-17090)に忠実。</p>
+
+<h2>現状 <span class="rows-badge bad">定常4行 + 出没帯</span></h2>
+<div class="grid">
+  <div class="card cardpad">
+    <h3>定常時(折りたたみ)</h3>
+    <div class="panel">
+      <div class="ptitle">Browse</div>
+      <div class="anno">
+        <div class="prow"><span class="btn dim">v</span>
+          <span class="crumb"><a>data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span>
+          <span class="muted">(listing...)</span><span style="flex:1"></span><span class="btn dim">+</span></div>
+        <div class="mark"></div><div class="mlab">1行5役: ジャンプ+現在地+編集+通信+パネル生成</div>
+      </div>
+      <div class="prow"><span class="btn">&lt;</span><span class="btn dim">&gt;</span><span class="btn">up</span>
+        <span class="btn dim">~</span><span class="btn dim">refresh</span>
+        <span class="seg"><span class="on">grp</span><span>flat</span></span>
+        <span class="seg"><span class="on">list</span><span>tree</span></span></div>
+      <div class="anno">
+        <div class="prow"><span class="inp" style="width:150px">filter</span>
+          <span class="count">34/512</span><span style="flex:1"></span><span class="btn dim">more</span></div>
+        <div class="mark"></div><div class="mlab">絞り込み入口①(常設・即時)</div>
+      </div>
+      <div class="band ghost">⇵ 出没帯: エラー / プロトコル警告 / 検索状態通知 — 現れるたび下の全行が上下</div>
+      <div class="anno">
+        <div class="prow"><span class="btn">Open selected</span><span class="btn">Temporal stats</span><span class="btn" style="max-width:64px;overflow:hidden;text-overflow:clip">Copy pat</span></div>
+        <div class="mark"></div><div class="mlab">既定幅271pxで右端が黙ってクリップ</div>
+      </div>
+      <div class="sep"></div>
+      <div class="frow grp"><span class="chev">&gt;</span> 20260721_night</div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+      <div class="frow">flat_0001-0120 <span class="count">[120]</span></div>
+      <div class="frow">note.txt</div>
+    </div>
+    <ul class="notes">
+      <li class="warn">「このパネルはどのマシンか」は more の中にしか無い(既定で不可視)</li>
+    </ul>
+  </div>
+
+  <div class="card cardpad">
+    <h3>more 展開時 <span class="tag">+3行</span></h3>
+    <div class="panel">
+      <div class="ptitle">Browse</div>
+      <div class="prow"><span class="btn dim">v</span>
+        <span class="crumb"><a>data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span>
+        <span style="flex:1"></span><span class="btn dim">+</span></div>
+      <div class="prow"><span class="btn">&lt;</span><span class="btn dim">&gt;</span><span class="btn">up</span>
+        <span class="btn dim">~</span><span class="btn dim">refresh</span>
+        <span class="seg"><span class="on">grp</span><span>flat</span></span>
+        <span class="seg"><span class="on">list</span><span>tree</span></span></div>
+      <div class="prow"><span class="inp" style="width:150px">filter</span>
+        <span class="count">34/512</span><span style="flex:1"></span><span class="btn">less</span></div>
+      <div class="expand">
+        <div class="prow"><span class="host">trc2 (ssh)</span><span style="flex:1"></span>
+          <span class="btn dim">disconnect</span><span class="btn dim">close browse</span></div>
+        <div class="prow"><span class="btn dim">*</span><span class="btn dim">open folder</span></div>
+        <div class="anno">
+          <div class="prow"><span class="inp" style="width:130px">search</span>
+            <span class="btn">Search</span><span class="muted">root: /data</span></div>
+          <div class="mark"></div><div class="mlab">絞り込み入口②(召喚・Enter確定・再帰) — ①と兄弟で並ぶ</div>
+        </div>
+      </div>
+      <div class="prow"><span class="btn">Open selected</span><span class="btn">Temporal stats</span><span class="btn" style="max-width:64px;overflow:hidden;text-overflow:clip">Copy pat</span></div>
+      <div class="sep"></div>
+      <div class="frow grp"><span class="chev">&gt;</span> 20260721_night</div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+    </div>
+  </div>
+</div>
+
+<h2>案A 「一行+召喚」 <span class="rows-badge good">定常1行</span></h2>
+<div class="grid">
+  <div class="card">
+    <h3>定常時 — 上部で読むものはパス1文だけ</h3>
+    <div class="panel">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>/data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span>
+        <span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="frow grp"><span class="chev">&gt;</span> 20260721_night</div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+      <div class="frow">flat_0001-0120 <span class="count">[120]</span></div>
+      <div class="frow">note.txt</div>
+      <div class="frow dimmed" style="margin-top:14px">type to filter · Ctrl+L path · <span class="kbd">…</span> menu</div>
+    </div>
+    <ul class="notes">
+      <li class="plus">ホストはルートクラム trc2: が一度だけ名乗る(ローカル時は無表示=沈黙)</li>
+      <li class="plus">接続メニュー(切断/再接続/bookmark)はクラム右クリック。異常はリスト内インライン</li>
+      <li>表示モード・refresh・~・+ は <span class="kbd">…</span> メニューとキーへ</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>打鍵=絞り込みチップ召喚(可逆) → <span class="kbd">Enter</span>=サーバ確定</h3>
+    <div class="panel">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>/data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span>
+        <span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="listwrap">
+        <div class="chip">dark_<span class="n">2/4</span><span class="esc">Esc</span></div>
+        <div class="frow sel">dark_0001-0480 <span class="count">[480]</span></div>
+        <div class="frow">dark_0481-0520 <span class="count">[40]</span></div>
+        <div class="frow dimmed" style="margin-top:10px">Enter: search server (recursive)…</div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:10px">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>/data</a><i>/</i><a>run42</a></span>
+        <span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="listwrap">
+        <div class="chip">dark_*<span class="srv">server ⟳</span><span class="esc">Esc</span></div>
+        <div class="frow">run42/1ms/dark_0001-0480 <span class="count">[480]</span></div>
+        <div class="frow">run42/5ms/dark_0001-0480 <span class="count">[480]</span></div>
+        <div class="frow">run43/1ms/dark_0001-0120 <span class="count">[120]</span></div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li class="plus">入口は1つ。打鍵中=クライアント側即時(選択と同じ可逆)、Enter=サーバ再帰(確定)</li>
+      <li class="plus">既存のクリック=選択/ダブルクリック=確定の文法にそのまま載る → 入口②が構成的に消滅</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>300px でも崩れない</h3>
+    <div class="panel narrow">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>…</a><i>/</i><a>dark_1ms</a></span>
+        <span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="listwrap">
+        <div class="chip">dark_<span class="n">2/4</span></div>
+        <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+        <div class="frow">dark_0481-0520 <span class="count">[40]</span></div>
+      </div>
+    </div>
+    <ul class="notes" style="width:300px">
+      <li>パスは中央省略、ナビ3個+…は固定。チップはリスト上に浮くので幅を奪わない</li>
+    </ul>
+  </div>
+</div>
+
+<h2>案B 「二段固定・単一スロット」 <span class="rows-badge mid">定常2行</span></h2>
+<div class="grid">
+  <div class="card">
+    <h3>通常 — 1行1役の2行</h3>
+    <div class="panel">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>/data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span></div>
+      <div class="prow"><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="inp" style="width:170px">filter (Ctrl+F)</span>
+        <span class="count">34/512</span><span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="frow grp"><span class="chev">&gt;</span> 20260721_night</div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+      <div class="frow">flat_0001-0120 <span class="count">[120]</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>検索召喚時 — 同一スロットを乗っ取る(2箱は同時に存在しない)</h3>
+    <div class="panel">
+      <div class="ptitle">trc2 — Browse</div>
+      <div class="prow"><span class="btn dim">v</span>
+        <span class="crumb"><a class="host">trc2:</a> <a>/data</a><i>/</i><a>run42</a><i>/</i><a>dark_1ms</a></span></div>
+      <div class="prow"><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="inp" style="width:140px;color:#e6ecf2">search: frame_**</span>
+        <span class="btn">Stop</span><span class="muted">範囲:この下</span><span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="frow">1ms/frame_0001.npy</div>
+      <div class="frow">5ms/frame_0001.npy</div>
+    </div>
+    <ul class="notes">
+      <li class="plus">絞り込みの発見可能性は最大(箱が見えている)</li>
+      <li class="warn">収斂値(1行)より1行重い。300px では filter 箱が窮屈。モード誤認の芽(ラベル+Escで抑える)</li>
+    </ul>
+  </div>
+</div>
+
+<h2>案C 「ローカル/リモート分離」 <span class="rows-badge mid">local 1行 / ssh 2行</span></h2>
+<div class="grid">
+  <div class="card">
+    <h3>ローカル専用パネル</h3>
+    <div class="panel">
+      <div class="ptitle">Browse (local)</div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a>C:</a><i>/</i><a>capt</a><i>/</i><a>run42</a></span>
+        <span style="flex:1"></span><span class="btn dim">…</span></div>
+      <div class="sep"></div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+      <div class="frow">note.txt</div>
+    </div>
+    <ul class="notes">
+      <li class="plus">server search が存在しないので入口は構成的に1つ。最軽量</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>リモート専用パネル</h3>
+    <div class="panel">
+      <div class="ptitle">Browse (ssh)</div>
+      <div class="prow"><span class="host">trc2</span><span class="muted">[ssh]</span>
+        <span style="flex:1"></span><span class="btn dim">切断</span><span class="btn dim">…</span></div>
+      <div class="prow"><span class="btn dim">v</span><span class="btn dim">&lt;</span><span class="btn dim">^</span>
+        <span class="crumb"><a>/data</a><i>/</i><a>run42</a></span></div>
+      <div class="sep"></div>
+      <div class="frow">dark_0001-0480 <span class="count">[480]</span></div>
+    </div>
+    <ul class="notes">
+      <li class="warn">「接続OKは沈黙」に違反 — OK状態にホスト行が恒久的に1行を支払う</li>
+      <li class="warn">即時絞り込み+召喚検索は結局必要 = 案Aの解を内包。文法の二重実装</li>
+      <li class="warn">サーベイ4系統で局所性によりパネルを分けた例はゼロ(二面板は転送動詞の産物)</li>
+    </ul>
+  </div>
+</div>
+
+<h2>まとめ</h2>
+<table class="cmp">
+  <tr><th></th><th>現状</th><th>案A</th><th>案B</th><th>案C</th></tr>
+  <tr><td>定常行数</td><td class="b">4 + 出没帯</td><td class="g">1</td><td>2</td><td>1 / 2</td></tr>
+  <tr><td>絞り込み入口</td><td class="b">2(filter/search)</td><td class="g">1(場所がエンジンを決める)</td><td class="g">1スロット(乗っ取り)</td><td class="b">1 / 2(remote側に再発)</td></tr>
+  <tr><td>ホスト表示</td><td class="b">折りたたみ内(不可視)</td><td class="g">ルートクラム+タイトル、OKは沈黙</td><td class="g">同左</td><td class="b">常設行(1行課金)</td></tr>
+  <tr><td>300px</td><td class="b">クリップ・折返し</td><td class="g">成立</td><td class="b">filter箱が窮屈</td><td>成立</td></tr>
+  <tr><td>主なリスク</td><td>—</td><td>発見可能性を習慣に賭ける</td><td>モード誤認</td><td>文法の二重実装・決定に逆行</td></tr>
+</table>
+
+<div class="rec"><b>推奨: 案A。</b> 「定常1行」を満たす唯一の案で、入口統一により項目14(二重入口)が構成的に消える。案Cの正当な動機(リモートの明示・ステール保持)は単一パネルのまま吸収できる。</div>
+</body>
+</html>
