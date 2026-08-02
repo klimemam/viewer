@@ -23,6 +23,7 @@
 "対応済み","画像書出","dot-by-dotコピー/PNG保存/ROIモンタージュ","1641cea",""
 "対応済み","Temporalチャート復活","ScrollXテーブルが高さを食い潰していた","f57c6f0",""
 "対応済み","参照化 stage1: FrameSource敷設","画素+出自を共有可能なFrameSourceへ分離(共有はまだ無し)。suite21本無変更で緑。敵対レビュー7体で潜在欠陥2件(npz基線/mosaicエイリアス)を検出し修正済み","880d2ae, docs/reference-design.md §2","挙動不変。cloneSource()がcrop CoWと共通"
+"レビュー必要項目","Browse上部の再設計案(サーベイ済)","4系統20パターンのサーベイから収斂文法を抽出し3案提示。推奨=案A(定常1行+打鍵召喚チップ、入口統一でfilter/search二重入口が構成的に消滅)。未決6点は推奨既定値つき","docs/browse-topbar-design.md","案の選択と未決6点の回答待ち。実装は選択後"
 "Claudeで対応進行中","参照化 stage2+3: 共有の発生 + derive参照化","source registry(同一tuple共有)/Files共有印/closeStack生存通知/compare同画素文/deriveのコピー→参照(~15行)。selftest拡張が合格基準","docs/reference-design.md §4,6","Fableエージェント並走中"
 "Claudeで対応進行中","参照化 stage5: reload walk + 手動Reload","reloadSourceの一箇所walk/temporal鍵にstackRev/temporalExtra forget修正/Files右クリックReload from disk。既知欠陥2件(7027鍵・2179forget)もここで塞ぐ","docs/reference-design.md §3.2","stage1のみ依存で並走。Watchの土台","docs/reference-design.md §8-9, watch-design.md","6段階、各段で suite 緑のまま出荷可"
 "残課題","項目20 Watch実装","設計完了後。仕様確定済(通知→手動Reload/stack再構築/mtime+size)","todo-open #20","参照実装とセット"
