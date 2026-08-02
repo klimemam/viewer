@@ -178,6 +178,15 @@ static void statSourceFile(FrameSource& s) {
     auto sz = std::filesystem::file_size(p, ec);
     s.fsize = ec ? 0 : (uint64_t)sz;
 }
+// A deep copy of s with its own identity: same content, fresh srcId, rev 0.
+// The two callers are the crop CoW (§2.2) and any ImageDoc copy that must not
+// alias a live source.
+static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
+    auto ns = std::make_shared<FrameSource>(s);   // same content...
+    ns->srcId = g_nextSrcId.fetch_add(1);         // ...own identity
+    ns->rev = 0;
+    return ns;
+}
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
 // range, interpretation) and per-view (texture) state.
@@ -208,6 +217,8 @@ struct ImageDoc {
     // fields because they are read on 240+ lines (docs/reference-design.md
     // §2.1). Only code that creates or mutates a source may write them, and it
     // must set both sides - normally by filling the source and calling this.
+    // NB: copying an ImageDoc copies this POINTER - the copy ALIASES the same
+    // source. A copy that must own its pixels takes cloneSource() (§2.2).
     std::shared_ptr<FrameSource> src = std::make_shared<FrameSource>();
     void syncMirrors() {
         w = src->w; h = src->h; ch = src->ch;
@@ -3647,8 +3658,13 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
         size_t before = app.images.size();
         std::string lErr = loadNpyBuffer(member, path, label);
         if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
-        for (size_t k = before; k < app.images.size(); k++)
+        for (size_t k = before; k < app.images.size(); k++) {
             app.images[k]->src->npzMember = arrayName;   // identity for session restore
+            // Watch baseline (§2.1): the npz FILE is the local file these pixels
+            // came from - src->path already names it; npzMember keeps members
+            // distinct in the future registry tuple (§6.2)
+            statSourceFile(*app.images[k]->src);
+        }
         loaded++;
         (e.method == 0 ? stored : deflated)++;
     }
@@ -4108,12 +4124,8 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     // CoW (§2.2): a crop re-scopes THIS stack's measurement subject, so pixels
     // shared with another stack must not change under it. Cannot fire in stage 1
     // (nothing shares a source yet) - the discipline ships with the field split.
-    if (im.src.use_count() > 1) {
-        auto ns = std::make_shared<FrameSource>(*im.src);   // same content...
-        ns->srcId = g_nextSrcId.fetch_add(1);               // ...own identity
-        ns->rev = 0;
-        im.src = std::move(ns);
-    }
+    if (im.src.use_count() > 1)
+        im.src = cloneSource(*im.src);
     FrameSource& S = *im.src;
     if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
     x = std::clamp(x, 0, im.w - 1);
@@ -20486,6 +20498,10 @@ static int remoteSelfTest(const char* exe, const char* path) {
         // local one of the same pixels disagree.
         if (ref.ch == 1) {
             ImageDoc mosaic = ref;                  // same pixels, declared Bayer
+            // the implicit copy ALIASES ref's source (one shared_ptr, two docs)
+            // - stage 1's invariant is one owner per source, and makeFrame's
+            // const-cast pointer must aim at a throwaway, not the live doc
+            mosaic.src = cloneSource(*mosaic.src);
             mosaic.cfa = 1;
             mosaic.cfaPattern = 0;                  // RGGB
             std::vector<std::pair<std::string, std::string>> local2;
