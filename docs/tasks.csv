@@ -22,7 +22,7 @@
 "対応済み","C3 zoom%移設","ステータスバー→Image Viewフッター右上","cd41efe",""
 "対応済み","画像書出","dot-by-dotコピー/PNG保存/ROIモンタージュ","1641cea",""
 "対応済み","Temporalチャート復活","ScrollXテーブルが高さを食い潰していた","f57c6f0",""
-"残課題","参照化+Watch 実装(設計確定済)","全判断確定(8/2): V1開始・CFA現状維持・自動reloadグローバル1つ・間隔提案値・Filesバイト列unique和・テクスチャ共有見送り。stage1(FrameSource敷設)から着手可","docs/reference-design.md §8-9, watch-design.md","6段階、各段で suite 緑のまま出荷可"
+"Claudeで対応進行中","参照化+Watch 実装(設計確定済)","stage1(FrameSource敷設・意味変化ゼロ)をFableエージェントで実装中。合格基準=既存suite21本が無変更で緑。以降 stage2/3→4→5→Watch と順次","docs/reference-design.md §8-9, watch-design.md","6段階、各段で suite 緑のまま出荷可"
 "残課題","項目20 Watch実装","設計完了後。仕様確定済(通知→手動Reload/stack再構築/mtime+size)","todo-open #20","参照実装とセット"
 "残課題","項目6 検索の複数選択","検索結果にrbSel参加+Stack/Frame開き","todo-open #6","stack化順序はレビュー欄C4"
 "残課題","項目7 検索進捗","件数/現在地のインクリメンタル表示。peerのGLOB変更要","todo-open #7",""
