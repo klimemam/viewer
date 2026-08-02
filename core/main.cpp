@@ -56,6 +56,7 @@
 #endif
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>              // residentImageBytes: dedupe by srcId
 #include <mutex>
 #include <limits>
 #include <iomanip>
@@ -137,10 +138,61 @@ static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
 }
 
 // ---------------------------------------------------------------- image model
-struct ImageDoc {
-    std::string name, path, dtype, note;
-    int w = 0, h = 0, ch = 1;
+// Per-FRAME state: the pixels and their provenance (docs/reference-design.md
+// §2.1). Held by ImageDoc through a shared_ptr so one frame can belong to
+// several stacks from stage 2 on; in stage 1 every source has exactly one
+// owner (use_count == 1) and behaviour is identical to the pre-split code.
+static std::atomic<uint64_t> g_nextSrcId{ 1 };
+struct FrameSource {
     std::vector<float> data;          // raw values, size w*h*ch
+    int w = 0, h = 0, ch = 1;
+    std::string dtype;
+    float vmin = 0, vmax = 1;         // data min/max
+    std::string path;
+    std::string npzMember;            // array name when this came from a .npz
+    // remote frames: opened as a decimated preview, replaced in place by the full
+    // frame when the background fetch lands - after that, indistinguishable from
+    // a local image. remoteStep > 1 means "still the preview".
+    std::string remoteUrl;
+    int remoteFrame = 0;
+    int remoteStep = 1;
+    std::string remoteErr;            // background fetch failed; preview is all we have
+    // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
+    int rawDtype = -1, rawInterp = 0, rawOffset = 0;
+    bool rawLE = true;
+    // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
+    int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
+    uint64_t srcId;                   // frame identity: accounting dedupe (§7)
+    int rev = 0;                      // +1 when the pixels are replaced wholesale (preview→full swap; later, reload)
+    int64_t mtime = 0;                // Watch baseline: disk state at decode time; 0 = unknown
+    uint64_t fsize = 0;
+    FrameSource() : srcId(g_nextSrcId.fetch_add(1)) {}
+};
+// Watch baseline (§2.1): what was on disk when these pixels were decoded.
+// Any failure (missing file, remote path) leaves 0 = unknown.
+static void statSourceFile(FrameSource& s) {
+    std::error_code ec;
+    auto p = pathFromUtf8(s.path);
+    auto t = std::filesystem::last_write_time(p, ec);
+    s.mtime = ec ? 0 : (int64_t)t.time_since_epoch().count();
+    auto sz = std::filesystem::file_size(p, ec);
+    s.fsize = ec ? 0 : (uint64_t)sz;
+}
+// A deep copy of s with its own identity: same content, fresh srcId, rev 0.
+// The two callers are the crop CoW (§2.2) and any ImageDoc copy that must not
+// alias a live source.
+static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
+    auto ns = std::make_shared<FrameSource>(s);   // same content...
+    ns->srcId = g_nextSrcId.fetch_add(1);         // ...own identity
+    ns->rev = 0;
+    return ns;
+}
+// One membership: "this frame as seen by this stack". Pixels and provenance
+// live in *src; what stays here is per-membership (identity, position, display
+// range, interpretation) and per-view (texture) state.
+struct ImageDoc {
+    std::string name, dtype, note;
+    int w = 0, h = 0, ch = 1;
     float vmin = 0, vmax = 1;         // data min/max
     float black = 0, white = 255;     // display range
     GLuint tex = 0;
@@ -154,27 +206,27 @@ struct ImageDoc {
     int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
     int cfaPattern = 0;               // index into CFA_PATTERNS
     bool cfaColorize = false;
-    // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
-    int rawDtype = -1, rawInterp = 0, rawOffset = 0;
-    bool rawLE = true;
-    // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
-    int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
-    std::string npzMember;            // array name when this came from a .npz
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
-    // remote frames: opened as a decimated preview, replaced in place by the full
-    // frame when the background fetch lands - after that, indistinguishable from
-    // a local image. remoteStep > 1 means "still the preview".
-    std::string remoteUrl;
-    int remoteFrame = 0;
-    int remoteStep = 1;
-    std::string remoteErr;            // background fetch failed; preview is all we have
     float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
 
-    float sample(int x, int y, int c) const { return data[((size_t)y * w + x) * ch + c]; }
+    // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
+    // fields because they are read on 240+ lines (docs/reference-design.md
+    // §2.1). Only code that creates or mutates a source may write them, and it
+    // must set both sides - normally by filling the source and calling this.
+    // NB: copying an ImageDoc copies this POINTER - the copy ALIASES the same
+    // source. A copy that must own its pixels takes cloneSource() (§2.2).
+    std::shared_ptr<FrameSource> src = std::make_shared<FrameSource>();
+    void syncMirrors() {
+        w = src->w; h = src->h; ch = src->ch;
+        dtype = src->dtype; vmin = src->vmin; vmax = src->vmax;
+    }
+    std::vector<float>&       px()       { return src->data; }
+    const std::vector<float>& px() const { return src->data; }
+    float sample(int x, int y, int c) const { return src->data[((size_t)y * w + x) * ch + c]; }
 };
 
 // CFA pattern tables: channel of each 2x2 cell position (cy*2+cx); 0=R 1=Gr 2=Gb 3=B
@@ -1379,7 +1431,7 @@ static uint64_t bSeatUid() {
 // has pixels to measure - a remote preview placeholder has none.
 static ImageDoc* abStatsB() {
     ImageDoc* b = cmpB();
-    if (!b || b->w < 1 || b->h < 1 || b->data.empty()) return nullptr;
+    if (!b || b->w < 1 || b->h < 1 || b->px().empty()) return nullptr;
     return b;
 }
 
@@ -1583,7 +1635,7 @@ static void pumpCompareSlotRestore() {
         const auto& w = app.cmpSlotRestore[i];
         ImageDoc* hit = nullptr;
         for (const auto& d : app.images) {
-            if (d->path != w.path) continue;
+            if (d->src->path != w.path) continue;
             if (w.frame >= 0 && d->seqId != 0 && d->seqIndex != w.frame) continue;
             hit = d.get(); break;
         }
@@ -1758,12 +1810,13 @@ static AbRowItem abRowItem(const ImageDoc* pick) {
 
 static void computeMinMax(ImageDoc& im) {
     float mn = FLT_MAX, mx = -FLT_MAX;
-    for (float v : im.data) {
+    for (float v : im.px()) {
         if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
     }
     if (mn > mx) { mn = 0; mx = 1; }
     if (mn == mx) mx = mn + 1;
-    im.vmin = mn; im.vmax = mx;
+    im.src->vmin = mn; im.src->vmax = mx;   // the source's truth...
+    im.vmin = mn; im.vmax = mx;             // ...and the doc's mirror of it
 }
 // Effective display range: the shared value when linking is on, the image's own
 // otherwise. Linking never overwrites an image's range (defined below with App).
@@ -1929,7 +1982,7 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
     int px = 0, py = 0;
     for (size_t p = 0; p < (size_t)im.w * im.h; p++, px++) {
         if (px == im.w) { px = 0; py++; }
-        const float* src = &im.data[p * im.ch];
+        const float* src = &im.px()[p * im.ch];
         float r, g, b;
         if (lut) {
             float x = std::clamp((src[0] - ib) * inv, 0.0f, 1.0f);
@@ -2280,7 +2333,7 @@ static void rfEnqueue(App::RFetchJob job) {
 }
 
 static void requestFullRemote(const ImageDoc* d, bool low = false) {
-    if (d->remoteUrl.empty() || d->remoteStep <= 1) return;
+    if (d->src->remoteUrl.empty() || d->src->remoteStep <= 1) return;
     {
         std::lock_guard<std::mutex> lk(app.rfMtx);
         for (auto it = app.rfQueue.begin(); it != app.rfQueue.end(); ++it)
@@ -2297,12 +2350,12 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
             }
     }
     App::RFetchJob j;
-    j.url = d->remoteUrl; j.frame = d->remoteFrame; j.uid = d->uid;
+    j.url = d->src->remoteUrl; j.frame = d->src->remoteFrame; j.uid = d->uid;
     j.low = low;
     // the full frame REPLACES the decimated one, so only the growth is new
     {
-        size_t have = d->data.size() * sizeof(float);
-        size_t full = have * (size_t)d->remoteStep * d->remoteStep;
+        size_t have = d->px().size() * sizeof(float);
+        size_t full = have * (size_t)d->src->remoteStep * d->src->remoteStep;
         j.bytes = full > have ? full - have : 0;
     }
     rfEnqueue(std::move(j));
@@ -2341,13 +2394,15 @@ static void pumpRemoteFetch() {
             }
             auto doc = std::make_unique<ImageDoc>();
             doc->name = d.name;
-            doc->path = d.url;
-            doc->remoteUrl = d.url;
-            doc->remoteFrame = d.frame;
-            doc->dtype = d.dtype;
-            doc->w = d.w; doc->h = d.h; doc->ch = d.ch;
-            doc->data = std::move(d.data);
-            doc->vmin = d.vmin; doc->vmax = d.vmax;
+            FrameSource& S = *doc->src;          // fresh source (remote: no stat)
+            S.path = d.url;
+            S.remoteUrl = d.url;
+            S.remoteFrame = d.frame;
+            S.dtype = d.dtype;
+            S.w = d.w; S.h = d.h; S.ch = d.ch;
+            S.data = std::move(d.data);
+            S.vmin = d.vmin; S.vmax = d.vmax;
+            doc->syncMirrors();
             doc->seqId = d.seqId; doc->seqIndex = d.seqIndex;
             doc->uid = app.nextUid++;
             doc->texDirty = true;
@@ -2370,20 +2425,24 @@ static void pumpRemoteFetch() {
         for (auto& q : app.images) if (q->uid == d.uid) { im = q.get(); break; }
         if (!im) continue;                       // closed while fetching
         if (!d.err.empty()) {
-            im->remoteErr = d.err;
+            im->src->remoteErr = d.err;
             toast("remote: " + d.err, true);
             continue;
         }
-        int stepBefore = im->remoteStep;
-        im->data = std::move(d.data);
-        im->w = d.w; im->h = d.h; im->ch = d.ch;
-        im->dtype = d.dtype;
-        im->remoteStep = 1;
-        im->remoteErr.clear();
+        int stepBefore = im->src->remoteStep;
+        FrameSource& S = *im->src;
+        S.data = std::move(d.data);
+        S.w = d.w; S.h = d.h; S.ch = d.ch;
+        S.dtype = d.dtype;
+        S.remoteStep = 1;
+        S.remoteErr.clear();
+        S.vmin = d.vmin; S.vmax = d.vmax;        // measured on the worker
+        S.rev++;      // in-place pixel replacement (§2.2's "reload" family):
+                      // stage 1's only rev writer; the invalidation walk is stage 5
+        im->syncMirrors();
         size_t p = im->name.find("  (1/");       // drop the preview marker
         if (p != std::string::npos) im->name.erase(p);
         im->dataRev++;
-        im->vmin = d.vmin; im->vmax = d.vmax;    // measured on the worker
         im->texDirty = true;
         forgetImage(im);                         // caches hold the preview's numbers
         if (stepBefore > 1) {
@@ -3178,7 +3237,7 @@ static void toggleBand(bool horizontal) {
 // swap it would silently cover 1/9 of the intended area and every panel would
 // measure the wrong region. Placing annotations waits for the real pixels.
 static bool annBlockedOnPreview() {
-    if (cur() && cur()->remoteStep > 1) {
+    if (cur() && cur()->src->remoteStep > 1) {
         toast("preview: wait for full resolution before placing ROIs/pins", true);
         return true;
     }
@@ -3197,7 +3256,7 @@ static psFrame makeFrame(const ImageDoc& im) {
     psFrame f = {};
     f.w = (uint32_t)im.w; f.h = (uint32_t)im.h; f.ch = (uint32_t)im.ch;
     f.dtype = PS_DTYPE_F32; f.loc = PS_MEM_CPU;
-    f.data = (void*)im.data.data();
+    f.data = (void*)im.px().data();
     f.pitch_bytes = (size_t)im.w * im.ch * sizeof(float);
     f.black = effBlack(im); f.white = effWhite(im);
     f.cfa_type = im.cfa; f.cfa_pattern = im.cfaPattern;   // enums mirror psCfa* by construction
@@ -3302,8 +3361,8 @@ static void addImage(std::unique_ptr<ImageDoc> im) {
     if (im->batchId == 0) {
         if (app.loadBatchId) im->batchId = app.loadBatchId;
         else {
-            size_t sl = im->path.find_last_of("/\\");
-            std::string dir = sl == std::string::npos ? std::string() : im->path.substr(0, sl);
+            size_t sl = im->src->path.find_last_of("/\\");
+            std::string dir = sl == std::string::npos ? std::string() : im->src->path.substr(0, sl);
             size_t s2 = dir.find_last_of("/\\");
             std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
             im->batchId = batchReuse(leaf.empty() ? "generated" : leaf, dir);
@@ -3369,17 +3428,18 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
     const int ow = horizontal ? rw * n : rw;
     const int oh = horizontal ? rh : rh * n;
     auto out = std::make_unique<ImageDoc>();
-    out->w = ow; out->h = oh; out->ch = ch;
-    out->dtype = im->dtype;
-    out->data.assign((size_t)ow * oh * ch, 0.0f);
+    FrameSource& S = *out->src;          // composed NEW pixels: a copy by design (§2.2)
+    S.w = ow; S.h = oh; S.ch = ch;
+    S.dtype = im->dtype;
+    S.data.assign((size_t)ow * oh * ch, 0.0f);
     for (int k = 0; k < n; k++) {
         const ImageDoc& src = *app.images[fr[k]];
         if (src.w != im->w || src.h != im->h || src.ch != ch) continue;   // ragged stack
         const int ox = horizontal ? rw * k : 0;
         const int oy = horizontal ? 0 : rh * k;
         for (int y = 0; y < rh; y++) {
-            const float* sp = &src.data[((size_t)(ry + y) * src.w + rx) * ch];
-            float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+            const float* sp = &src.px()[((size_t)(ry + y) * src.w + rx) * ch];
+            float* dp = &S.data[((size_t)(oy + y) * ow + ox) * ch];
             memcpy(dp, sp, (size_t)rw * ch * sizeof(float));
         }
         if (perFrameAuto) {
@@ -3387,13 +3447,13 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
             // per-plane normalisation would silently rebalance the CFA mosaic
             float lo = FLT_MAX, hi = -FLT_MAX;
             for (int y = 0; y < rh; y++) {
-                const float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+                const float* dp = &S.data[((size_t)(oy + y) * ow + ox) * ch];
                 for (int x = 0; x < rw * ch; x++)
                     if (std::isfinite(dp[x])) { lo = std::min(lo, dp[x]); hi = std::max(hi, dp[x]); }
             }
             const float span = hi - lo;
             for (int y = 0; y < rh; y++) {
-                float* dp = &out->data[((size_t)(oy + y) * ow + ox) * ch];
+                float* dp = &S.data[((size_t)(oy + y) * ow + ox) * ch];
                 for (int x = 0; x < rw * ch; x++) {
                     if (!std::isfinite(dp[x])) continue;
                     dp[x] = span > 0 ? (dp[x] - lo) / span : 0.5f;
@@ -3405,13 +3465,14 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
     // the even-snap above guarantees; the pattern itself is unchanged
     out->cfa = im->cfa; out->cfaPattern = im->cfaPattern;
     if (perFrameAuto) {
-        out->dtype = "f32";              // whatever the source was, this is not it
+        S.dtype = "f32";                 // whatever the source was, this is not it
         out->black = 0.0f; out->white = 1.0f;
-        out->vmin = 0.0f;  out->vmax = 1.0f;
+        S.vmin = 0.0f;  S.vmax = 1.0f;
     } else {
         out->black = im->black; out->white = im->white;
-        out->vmin = im->vmin; out->vmax = im->vmax;
+        S.vmin = im->vmin; S.vmax = im->vmax;
     }
+    out->syncMirrors();
     out->batchId = im->batchId;
     const App::SeqInfo* si = seqInfo(im->seqId);
     int expected = si && si->expectedFrames > 0 ? si->expectedFrames : n;
@@ -3597,8 +3658,13 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
         size_t before = app.images.size();
         std::string lErr = loadNpyBuffer(member, path, label);
         if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
-        for (size_t k = before; k < app.images.size(); k++)
-            app.images[k]->npzMember = arrayName;    // identity for session restore
+        for (size_t k = before; k < app.images.size(); k++) {
+            app.images[k]->src->npzMember = arrayName;   // identity for session restore
+            // Watch baseline (§2.1): the npz FILE is the local file these pixels
+            // came from - src->path already names it; npzMember keeps members
+            // distinct in the future registry tuple (§6.2)
+            statSourceFile(*app.images[k]->src);
+        }
         loaded++;
         (e.method == 0 ? stored : deflated)++;
     }
@@ -3669,15 +3735,17 @@ static void runProcessor(int idx) {
     }
     auto doc = std::make_unique<ImageDoc>();
     doc->name = im->name + " [" + p.name + "]";
-    doc->w = (int)out.w; doc->h = (int)out.h; doc->ch = (int)out.ch;
-    doc->dtype = "f32";
+    FrameSource& S = *doc->src;            // the plugin's result: new pixels, no file
+    S.w = (int)out.w; S.h = (int)out.h; S.ch = (int)out.ch;
+    S.dtype = "f32";
     doc->note = "processed by " + p.name;
     doc->cfa = out.cfa_type; doc->cfaPattern = out.cfa_pattern & 3;
-    doc->data.resize((size_t)out.w * out.h * out.ch);
+    S.data.resize((size_t)out.w * out.h * out.ch);
     size_t rowFloats = (size_t)out.w * out.ch;
     for (uint32_t y = 0; y < out.h; y++)   // pitch-aware copy into the ImageDoc
-        memcpy(doc->data.data() + (size_t)y * rowFloats,
+        memcpy(S.data.data() + (size_t)y * rowFloats,
                (const char*)out.data + (size_t)y * out.pitch_bytes, rowFloats * sizeof(float));
+    doc->syncMirrors();
     plugin_host::frameFree(out.data);      // host frees, always
     float bk = out.black, wt = out.white;
     // processed results have no file path: sessions skip them (v2: re-run recipe)
@@ -3844,15 +3912,18 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
 
     auto im = std::make_unique<ImageDoc>();
     im->name = displayName.empty() ? baseName(path) : displayName;
-    im->path = path;
-    im->w = (int)W; im->h = (int)H; im->ch = (int)C;
-    im->dtype = dtypeName; im->note = note;
-    im->data.resize((size_t)W * H * C);
+    FrameSource& S = *im->src;
+    S.path = path;
+    S.w = (int)W; S.h = (int)H; S.ch = (int)C;
+    S.dtype = dtypeName;
+    im->note = note;
+    S.data.resize((size_t)W * H * C);
     size_t di = 0;
     for (int64_t y = 0; y < H; y++)
         for (int64_t x = 0; x < W; x++)
             for (int64_t c = 0; c < C; c++)
-                im->data[di++] = getVal((size_t)(frameIdx * sf + y * sh + x * sw + c * sc));
+                S.data[di++] = getVal((size_t)(frameIdx * sf + y * sh + x * sw + c * sc));
+    im->syncMirrors();
     return im;
 }
 
@@ -3861,7 +3932,9 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
                                                 int64_t& frameStrideOut) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
-    return decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
+    auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
+    if (im) statSourceFile(*im->src);      // a local file: record the Watch baseline
+    return im;
 }
 static std::unique_ptr<ImageDoc> decodeNpy(const std::string& path, std::string& errOut) {
     int frames = 1; int64_t fstride = 0;
@@ -3985,11 +4058,13 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
     }
 
     auto im = std::make_unique<ImageDoc>();
-    im->name = baseName(d.path); im->path = d.path;
-    im->w = outW; im->h = outH; im->ch = ch;
-    im->dtype = RAW_DTYPE_NAMES[d.dtype];
-    im->data.resize((size_t)outW * outH * ch);
-    float* out = im->data.data();
+    im->name = baseName(d.path);
+    FrameSource& S = *im->src;
+    S.path = d.path;
+    S.w = outW; S.h = outH; S.ch = ch;
+    S.dtype = RAW_DTYPE_NAMES[d.dtype];
+    S.data.resize((size_t)outW * outH * ch);
+    float* out = S.data.data();
     bool sw = d.interp == RI_BGR || d.interp == RI_BGRA;   // channel 0/2 swap
     for (int y = 0; y < outH; y++)
         for (int x = 0; x < outW; x++) {
@@ -4000,8 +4075,8 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
                 out[dst + oc] = rd(src + c);
             }
         }
-    im->srcW = d.w; im->srcH = d.h;
-    im->cropX = cx; im->cropY = cy;
+    S.srcW = d.w; S.srcH = d.h;
+    S.cropX = cx; S.cropY = cy;
     im->note = std::string(RAW_INTERP_NAMES[d.interp]) + " " + RAW_DTYPE_NAMES[d.dtype];
     if (d.interp == RI_BAYER || d.interp == RI_QUAD) {
         im->cfa = d.interp == RI_QUAD ? 2 : 1;
@@ -4009,10 +4084,12 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
         im->note = std::string(d.interp == RI_QUAD ? "Quad Bayer " : "Bayer ")
                  + CFA_PATTERNS[im->cfaPattern] + " " + RAW_DTYPE_NAMES[d.dtype];
     }
-    im->rawDtype = d.dtype;           // remember raw params: sessions + reinterpret
-    im->rawInterp = d.interp;
-    im->rawOffset = d.offset;
-    im->rawLE = d.littleEndian;
+    S.rawDtype = d.dtype;             // remember raw params: sessions + reinterpret
+    S.rawInterp = d.interp;
+    S.rawOffset = d.offset;
+    S.rawLE = d.littleEndian;
+    statSourceFile(S);                // a local file: record the Watch baseline
+    im->syncMirrors();
     return im;
 }
 
@@ -4044,7 +4121,13 @@ static std::string loadRaw(const RawDialog& d) {
 // pattern stays valid. appliedX/Y report the snapped origin.
 static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
                         int* appliedX = nullptr, int* appliedY = nullptr) {
-    if (im.srcW == 0) { im.srcW = im.w; im.srcH = im.h; }
+    // CoW (§2.2): a crop re-scopes THIS stack's measurement subject, so pixels
+    // shared with another stack must not change under it. Cannot fire in stage 1
+    // (nothing shares a source yet) - the discipline ships with the field split.
+    if (im.src.use_count() > 1)
+        im.src = cloneSource(*im.src);
+    FrameSource& S = *im.src;
+    if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
     x = std::clamp(x, 0, im.w - 1);
     y = std::clamp(y, 0, im.h - 1);
     if (im.cfa == 1) { x &= ~1; y &= ~1; }
@@ -4054,11 +4137,12 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     std::vector<float> nd((size_t)w * h * im.ch);
     for (int yy = 0; yy < h; yy++)
         memcpy(&nd[(size_t)yy * w * im.ch],
-               &im.data[((size_t)(y + yy) * im.w + x) * im.ch],
+               &S.data[((size_t)(y + yy) * im.w + x) * im.ch],
                (size_t)w * im.ch * sizeof(float));
-    im.data = std::move(nd);
-    im.w = w; im.h = h;
-    im.cropX += x; im.cropY += y;
+    S.data = std::move(nd);
+    S.w = w; S.h = h;
+    S.cropX += x; S.cropY += y;
+    im.syncMirrors();
     im.dataRev++;
     computeMinMax(im);
     im.texDirty = true;
@@ -4073,7 +4157,8 @@ static void shiftAnnotations(int dx, int dy) {
 }
 
 static bool isCropped(const ImageDoc& im) {
-    return im.srcW > 0 && (im.w != im.srcW || im.h != im.srcH || im.cropX != 0 || im.cropY != 0);
+    return im.src->srcW > 0 && (im.w != im.src->srcW || im.h != im.src->srcH ||
+                                im.src->cropX != 0 || im.src->cropY != 0);
 }
 
 static void cropCurrentToSelectedRoi() {
@@ -4091,25 +4176,25 @@ static void cropCurrentToSelectedRoi() {
 static void restoreFull() {
     ImageDoc* im = cur();
     if (!im || !isCropped(*im)) return;
-    int sx = im->cropX, sy = im->cropY;
+    int sx = im->src->cropX, sy = im->src->cropY;
     int idx = app.current;
     float ob = im->black, ow = im->white;
-    if (im->rawDtype >= 0) {
+    if (im->src->rawDtype >= 0) {
         RawDialog d;
-        d.path = im->path;
-        d.dtype = im->rawDtype;
-        d.interp = im->rawInterp;
+        d.path = im->src->path;
+        d.dtype = im->src->rawDtype;
+        d.interp = im->src->rawInterp;
         if (RAW_INTERP_CH[d.interp] == 1)
             d.interp = im->cfa == 2 ? RI_QUAD : im->cfa == 1 ? RI_BAYER : RI_GRAY;
-        d.w = im->srcW; d.h = im->srcH;
-        d.offset = im->rawOffset; d.littleEndian = im->rawLE;
+        d.w = im->src->srcW; d.h = im->src->srcH;
+        d.offset = im->src->rawOffset; d.littleEndian = im->src->rawLE;
         d.cfaPattern = im->cfaPattern & 3;
         d.replaceIdx = idx;
         std::string err = loadRaw(d);
         if (!err.empty()) { toast("restore failed: " + err, true); return; }
-    } else if (!im->path.empty()) {
+    } else if (!im->src->path.empty()) {
         int before = (int)app.images.size();
-        std::string err = loadNpy(im->path);
+        std::string err = loadNpy(im->src->path);
         if (!err.empty() || (int)app.images.size() == before) {
             toast("restore failed: " + (err.empty() ? std::string("reload error") : err), true);
             return;
@@ -4166,7 +4251,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // ordinal of the line that carries the current image instead.
     // A stack contributes exactly one line: the frame it was left on.
     auto isSavedLine = [&](const ImageDoc* d) {
-        if (d->path.empty()) return false;
+        if (d->src->path.empty()) return false;
         if (d->seqId == 0) return true;
         int rep = -1;
         if (App::SeqInfo* si = seqInfo(d->seqId))
@@ -4202,7 +4287,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     for (uint64_t u : app.cmpExtra)
         for (const auto& d : app.images)
             if (d->uid == u)
-                f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->path << "\n";
+                f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->src->path << "\n";
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projstatlayout " << app.projStatLayout << " " << app.projDecimals << " "
@@ -4256,7 +4341,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // silence is the one thing this format does not do: say how many.
     int derived = 0;
     for (auto& d : app.images)
-        if (d->path.empty()) derived++;
+        if (d->src->path.empty()) derived++;
     if (derived)
         fprintf(stderr, "session: %d derived image(s) not saved "
                         "(no file to reload them from)\n", derived);
@@ -4264,23 +4349,23 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
-        if (!d->npzMember.empty()) f << "member " << d->npzMember << "\n";
+        if (!d->src->npzMember.empty()) f << "member " << d->src->npzMember << "\n";
         f << "lut " << d->displayLut << "\n";
         f << "image " << d->black << " " << d->white << " ";
-        if (d->rawDtype >= 0) {
-            int interp = d->rawInterp;
+        if (d->src->rawDtype >= 0) {
+            int interp = d->src->rawInterp;
             if (RAW_INTERP_CH[interp] == 1)   // 1ch family: honor the CURRENT interpretation
                 interp = d->cfa == 2 ? RI_QUAD : d->cfa == 1 ? RI_BAYER : RI_GRAY;
-            f << "raw3 " << d->rawDtype << " " << interp << " "
-              << (d->srcW > 0 ? d->srcW : d->w) << " " << (d->srcH > 0 ? d->srcH : d->h) << " "
-              << d->rawOffset << " " << (d->rawLE ? 1 : 0) << " " << d->cfaPattern << " "
+            f << "raw3 " << d->src->rawDtype << " " << interp << " "
+              << (d->src->srcW > 0 ? d->src->srcW : d->w) << " " << (d->src->srcH > 0 ? d->src->srcH : d->h) << " "
+              << d->src->rawOffset << " " << (d->src->rawLE ? 1 : 0) << " " << d->cfaPattern << " "
               << (d->cfaColorize ? 1 : 0) << " "
-              << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
+              << d->src->cropX << " " << d->src->cropY << " " << d->w << " " << d->h << " ";
         } else {
             f << "npy3 " << d->cfa << " " << d->cfaPattern << " " << (d->cfaColorize ? 1 : 0) << " "
-              << d->cropX << " " << d->cropY << " " << d->w << " " << d->h << " ";
+              << d->src->cropX << " " << d->src->cropY << " " << d->w << " " << d->h << " ";
         }
-        f << d->path << "\n";           // path last: may contain spaces
+        f << d->src->path << "\n";      // path last: may contain spaces
         // the batch travels BY NAME: ids do not survive sessions, and equal
         // names merging on restore is the least surprising failure mode
         for (const auto& b : app.batches)
@@ -4292,7 +4377,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // sibling scan there would split the stack in two.
             bool inFile = true;
             for (const auto& o : app.images)
-                if (o->seqId == d->seqId && o->path != d->path) { inFile = false; break; }
+                if (o->seqId == d->seqId && o->src->path != d->src->path) { inFile = false; break; }
             // ...but the head frame of the CURRENT rescan is also the only
             // image with its seqId until pumpSequence integrates the siblings
             // (4 per UI frame - the worker finishing first is the norm, so
@@ -4365,7 +4450,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             if (std::isfinite(m.value)) f << fmtExact(m.value);
             else f << "-";                             // "-" = unset, NOT zero
             f << " " << (m.include ? 1 : 0) << " "
-              << app.images[fr.front()]->path << "\n";   // path last: spaces
+              << app.images[fr.front()]->src->path << "\n";   // path last: spaces
         }
         f << "seriesend\n";
     }
@@ -4742,7 +4827,7 @@ static std::vector<std::string> newWindowArgv(const ImageDoc* d) {
         for (const auto& o : app.images)
             if (o && o->seqId == d->seqId && o->seqIndex < head->seqIndex)
                 head = o.get();
-    std::string target = !head->remoteUrl.empty() ? head->remoteUrl : head->path;
+    std::string target = !head->src->remoteUrl.empty() ? head->src->remoteUrl : head->src->path;
     if (target.empty()) return {};     // nothing on disk behind this row
     std::vector<std::string> av{ selfExePath(), "--secondary",
                                  "--window-offset", "40,40" };
@@ -5109,8 +5194,8 @@ static std::string loadSession(const std::string& path) {
             // a batch of them migrates to nothing, which is what the canon says
             // (値は「読めなければ未設定」... 0 ではない).
             double lv = parseSeriesValue(restOfLine(ls).c_str());
-            if (lastImageOk && cur() && !cur()->path.empty() && std::isfinite(lv))
-                app.seqLevelLegacy.push_back({ cur()->path, lv });
+            if (lastImageOk && cur() && !cur()->src->path.empty() && std::isfinite(lv))
+                app.seqLevelLegacy.push_back({ cur()->src->path, lv });
         }
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
@@ -5171,9 +5256,9 @@ static std::string loadSession(const std::string& path) {
             int on = 0; ls >> on;
             // only if that image actually loaded, and not when it is already a
             // stack (an in-file frame axis) - that would split it in two
-            if (on && lastImageOk && cur() && !cur()->path.empty() && cur()->seqId == 0) {
+            if (on && lastImageOk && cur() && !cur()->src->path.empty() && cur()->seqId == 0) {
                 std::string pat;
-                std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
+                std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
                 // queued, not started: see App::seqRestore
                 if (files.size() >= 2)
                     app.seqRestore.push_back({ cur()->uid, std::move(files), pat, {}, {}, {}, {} });
@@ -5336,8 +5421,14 @@ static size_t seqMemBudget() {
 // frames already resident, so the budget covers everything open and not just the
 // stack being loaded right now
 static size_t residentImageBytes() {
+    // the sum over unique SOURCES: two docs sharing one source (stage 2+) hold
+    // one copy of the pixels. While nothing is shared this equals the old
+    // per-doc sum exactly.
     size_t n = 0;
-    for (const auto& d : app.images) n += d->data.size() * sizeof(float);
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(app.images.size());
+    for (const auto& d : app.images)
+        if (seen.insert(d->src->srcId).second) n += d->px().size() * sizeof(float);
     return n;
 }
 // What the budget has to reckon with: what has landed PLUS what has been
@@ -5537,7 +5628,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     // position of the already-open frame inside the file list
     int selfIdx = 0;
     for (int i = 0; i < (int)files.size(); i++)
-        if (files[i] == ref->path) { selfIdx = i; break; }
+        if (files[i] == ref->src->path) { selfIdx = i; break; }
     ref->seqIndex = selfIdx;
 
     // capture everything the worker needs BY VALUE
@@ -5545,25 +5636,25 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     std::vector<Job> jobs;
     for (int i = 0; i < (int)files.size(); i++)
         if (i != selfIdx) jobs.push_back({ files[i], i });
-    bool isRaw = ref->rawDtype >= 0;
+    bool isRaw = ref->src->rawDtype >= 0;
     RawDialog recipe;
     if (isRaw) {
-        recipe.dtype = ref->rawDtype;
-        recipe.interp = ref->rawInterp;
+        recipe.dtype = ref->src->rawDtype;
+        recipe.interp = ref->src->rawInterp;
         if (RAW_INTERP_CH[recipe.interp] == 1)
             recipe.interp = ref->cfa == 2 ? RI_QUAD : ref->cfa == 1 ? RI_BAYER : RI_GRAY;
-        recipe.w = ref->srcW > 0 ? ref->srcW : ref->w;
-        recipe.h = ref->srcH > 0 ? ref->srcH : ref->h;
-        recipe.offset = ref->rawOffset;
-        recipe.littleEndian = ref->rawLE;
+        recipe.w = ref->src->srcW > 0 ? ref->src->srcW : ref->w;
+        recipe.h = ref->src->srcH > 0 ? ref->src->srcH : ref->h;
+        recipe.offset = ref->src->rawOffset;
+        recipe.littleEndian = ref->src->rawLE;
         recipe.cfaPattern = ref->cfaPattern & 3;
         recipe.cropOn = isCropped(*ref);
-        recipe.cropX = ref->cropX; recipe.cropY = ref->cropY;
+        recipe.cropX = ref->src->cropX; recipe.cropY = ref->src->cropY;
         recipe.cropW = ref->w; recipe.cropH = ref->h;
         recipe.replaceIdx = -1;
     }
     app.seqLoadingId = info.id;
-    app.seqBytes = ref->data.size() * sizeof(float);
+    app.seqBytes = ref->px().size() * sizeof(float);
     app.seqDone = 0;
     app.seqTotal = (int)jobs.size();
     app.seqCancel = false;
@@ -5601,7 +5692,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 continue;
             }
             computeMinMax(*doc);      // pure: keep this off the UI thread
-            bytes += doc->data.size() * sizeof(float);
+            bytes += doc->px().size() * sizeof(float);
             {
                 std::lock_guard<std::mutex> lk(app.seqMtx);
                 app.seqReady.emplace_back(j.index, std::move(doc));
@@ -5739,7 +5830,7 @@ static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
     };
     int any = 0;
     for (const auto& d : app.images) {
-        if (d->seqId == 0 || d->path != path || claimed(d->seqId)) continue;
+        if (d->seqId == 0 || d->src->path != path || claimed(d->seqId)) continue;
         if (preferBatch && d->batchId == preferBatch) return d->seqId;
         if (!any) any = d->seqId;
     }
@@ -6991,9 +7082,9 @@ static void maybeOfferSequence(int imageIdx) {
     if (app.seqLoadMode == 2) return;                 // never
     if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
     ImageDoc* im = app.images[imageIdx].get();
-    if (im->seqId != 0 || im->path.empty()) return;
+    if (im->seqId != 0 || im->src->path.empty()) return;
     std::string pattern;
-    std::vector<std::string> files = findSequenceSiblings(im->path, pattern);
+    std::vector<std::string> files = findSequenceSiblings(im->src->path, pattern);
     if ((int)files.size() < 2) return;
     if (app.seqLoadMode == 1) {                       // always
         startSequenceLoad(imageIdx, files, pattern);
@@ -7085,7 +7176,7 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         double s = 0, s2 = 0;
         size_t n = 0;
         for (size_t k = 0; k < offs.size(); k++) {
-            float v = fr.data[offs[k]];
+            float v = fr.px()[offs[k]];
             if (!std::isfinite(v)) { nonFinite++; continue; }
             sum[k] += v; sum2[k] += (double)v * v; cnt[k]++;
             s += v; s2 += (double)v * v; n++;
@@ -8155,7 +8246,7 @@ static void stepPreviewFrame(int delta) {
         if (want == app.previewIndex) return;
         for (const auto& d : app.images)
             if (d->uid == app.previewUid && d->preview) {
-                std::string url = d->remoteUrl;   // openRemote frees the doc
+                std::string url = d->src->remoteUrl;   // openRemote frees the doc
                 openRemote(url, true, want);
                 return;
             }
@@ -8202,16 +8293,18 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     auto doc = std::make_unique<ImageDoc>();
     doc->name = baseName(rpath) + (frame > 0 ? " #" + std::to_string(frame) : "") +
                 (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
-    doc->path = url;
-    doc->dtype = dt;
-    doc->w = tw; doc->h = th; doc->ch = tch;
-    doc->data = std::move(px);
+    FrameSource& S = *doc->src;              // remote: no local file to stat
+    S.path = url;
+    S.dtype = dt;
+    S.w = tw; S.h = th; S.ch = tch;
+    S.data = std::move(px);
     doc->note = "remote " + host + "  -  " + std::to_string(m.w) + "x" + std::to_string(m.h) +
                 (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
     doc->uid = app.nextUid++;
-    doc->remoteUrl = url;
-    doc->remoteFrame = frame;
-    doc->remoteStep = step;
+    S.remoteUrl = url;
+    S.remoteFrame = frame;
+    S.remoteStep = step;
+    doc->syncMirrors();
     doc->remoteFrames = (int)m.frames;
     doc->preview = asPreview;
     // --cfa applies to a remote 1ch frame exactly as it does to a local one:
@@ -8355,8 +8448,8 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     noteGroupStack(token, si.id);
     maybeRequestServerTemporal(si.id);
     size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
-    if (first->remoteStep > 1)                    // preview dims: scale the estimate
-        perFrame *= (size_t)first->remoteStep * first->remoteStep;
+    if (first->src->remoteStep > 1)               // preview dims: scale the estimate
+        perFrame *= (size_t)first->src->remoteStep * first->src->remoteStep;
     size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
     int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
     for (int i = 1; i <= fit; i++) {
@@ -8395,7 +8488,7 @@ static void promotePreview(ImageDoc* d) {
     }
     std::string host, rpath;
     int port = 0;
-    remote::parseUrl(d->remoteUrl, host, rpath, &port);
+    remote::parseUrl(d->src->remoteUrl, host, rpath, &port);
     {   // out of the "preview" pseudo-batch, into a folder-named one
         size_t sl = rpath.find_last_of('/');
         std::string dir = sl == std::string::npos ? std::string() : rpath.substr(0, sl);
@@ -8410,24 +8503,24 @@ static void promotePreview(ImageDoc* d) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
         si.name = baseName(rpath) + " [remote]";
-        si.remoteUrl = d->remoteUrl;
+        si.remoteUrl = d->src->remoteUrl;
         si.remoteHost = host;
         si.remotePort = port;
         si.expectedFrames = d->remoteFrames;
         si.cfaType = d->cfa; si.cfaPattern = d->cfaPattern;       // planes travel too
         app.seqs.push_back(si);
         d->seqId = si.id;
-        d->seqIndex = d->remoteFrame;    // the scrub may have parked it mid-stack
+        d->seqIndex = d->src->remoteFrame;   // the scrub may have parked it mid-stack
         maybeRequestServerTemporal(si.id);
         size_t perFrame = (size_t)d->w * d->h * d->ch * sizeof(float) *
-                          (d->remoteStep > 1 ? (size_t)d->remoteStep * d->remoteStep : 1);
+                          (d->src->remoteStep > 1 ? (size_t)d->src->remoteStep * d->src->remoteStep : 1);
         size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
         int fit = (int)std::min<size_t>((size_t)d->remoteFrames - 1,
                                         perFrame ? room / perFrame : 0);
         for (int i = 0, q = 0; i < d->remoteFrames && q < fit; i++) {
-            if (i == d->remoteFrame) continue;   // that frame is already resident
+            if (i == d->src->remoteFrame) continue;   // that frame is already resident
             App::RFetchJob j;
-            j.url = d->remoteUrl;
+            j.url = d->src->remoteUrl;
             j.name = baseName(rpath) + " #" + std::to_string(i);
             j.seqId = si.id;
             j.seqIndex = i;
@@ -9654,18 +9747,18 @@ static void drawCanvas(ImVec2 avail) {
         }
         // Remote preview: say so ON the image. Measuring a 1/3-sampled preview
         // without knowing it is how a wrong number gets written down.
-        if (im->remoteStep > 1) {
+        if (im->src->remoteStep > 1) {
             char msg[160];
-            if (im->remoteErr.empty())
+            if (im->src->remoteErr.empty())
                 snprintf(msg, sizeof msg, "PREVIEW 1/%d - fetching full resolution...",
-                         im->remoteStep);
+                         im->src->remoteStep);
             else
                 snprintf(msg, sizeof msg, "PREVIEW 1/%d - fetch failed: %s",
-                         im->remoteStep, im->remoteErr.c_str());
+                         im->src->remoteStep, im->src->remoteErr.c_str());
             ImVec2 ts = ImGui::CalcTextSize(msg);
             float bx = std::max(canvasP0.x + 6 * s, (canvasP0.x + canvasP1.x - ts.x) * 0.5f);
             float by = canvasP0.y + 8 * s;
-            ImU32 bg = im->remoteErr.empty() ? IM_COL32(120, 80, 20, 225) : IM_COL32(120, 30, 30, 225);
+            ImU32 bg = im->src->remoteErr.empty() ? IM_COL32(120, 80, 20, 225) : IM_COL32(120, 30, 30, 225);
             dl->AddRectFilled(ImVec2(bx - 8 * s, by - 4 * s),
                               ImVec2(bx + ts.x + 8 * s, by + ts.y + 4 * s), bg, 4.0f * s);
             dl->AddText(ImVec2(bx, by), IM_COL32(255, 215, 140, 255), msg);
@@ -9878,7 +9971,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     for (int y0 = 0; y0 < rh; y0 += (int)step)
         for (int y = y0; y < y0 + cell && y < rh; y++)
             for (int x = 0; x < rw; x++) {
-                const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
+                const float* src = &im->px()[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
                 if (cfa) {
                     float v = src[0];
                     if (std::isfinite(v)) {
@@ -10570,20 +10663,20 @@ static void drawInspector() {
         if (im->cfa) {
             if (ImGui::Checkbox("Colorize CFA pattern", &im->cfaColorize)) im->texDirty = true;
         }
-        if (im->rawDtype >= 0 && ImGui::Button("Reinterpret raw...")) {
-            openRawDialogFor(im->path);                 // prefill size guesses from the file
+        if (im->src->rawDtype >= 0 && ImGui::Button("Reinterpret raw...")) {
+            openRawDialogFor(im->src->path);            // prefill size guesses from the file
             if (rawDlg.open) {                          // only if the file was readable
-            rawDlg.dtype = im->rawDtype;
-            rawDlg.interp = im->rawInterp;
+            rawDlg.dtype = im->src->rawDtype;
+            rawDlg.interp = im->src->rawInterp;
             if (RAW_INTERP_CH[rawDlg.interp] == 1)      // 1ch family: honor current interpretation
                 rawDlg.interp = im->cfa == 2 ? RI_QUAD : im->cfa == 1 ? RI_BAYER : RI_GRAY;
-            rawDlg.w = im->srcW > 0 ? im->srcW : im->w;
-            rawDlg.h = im->srcH > 0 ? im->srcH : im->h;
-            rawDlg.offset = im->rawOffset;
-            rawDlg.littleEndian = im->rawLE;
+            rawDlg.w = im->src->srcW > 0 ? im->src->srcW : im->w;
+            rawDlg.h = im->src->srcH > 0 ? im->src->srcH : im->h;
+            rawDlg.offset = im->src->rawOffset;
+            rawDlg.littleEndian = im->src->rawLE;
             rawDlg.cfaPattern = im->cfaPattern & 3;
             rawDlg.cropOn = isCropped(*im);
-            rawDlg.cropX = im->cropX; rawDlg.cropY = im->cropY;
+            rawDlg.cropX = im->src->cropX; rawDlg.cropY = im->src->cropY;
             rawDlg.cropW = im->w; rawDlg.cropH = im->h;
             rawDlg.replaceIdx = app.current;
             rawGuessDims(rawDlg);
@@ -10594,7 +10687,8 @@ static void drawInspector() {
             bool roiSel = selAnn && selAnn->type == 0;
             if (isCropped(*im))
                 ImGui::TextDisabled("crop %dx%d @ (%d,%d) of %dx%d",
-                                    im->w, im->h, im->cropX, im->cropY, im->srcW, im->srcH);
+                                    im->w, im->h, im->src->cropX, im->src->cropY,
+                                    im->src->srcW, im->src->srcH);
             if (roiSel && ImGui::Button("Crop to selected ROI")) cropCurrentToSelectedRoi();
             if (isCropped(*im)) {
                 if (roiSel) ImGui::SameLine();
@@ -11089,7 +11183,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     int step = (int)std::max<size_t>(1, ((size_t)rw * rh * cell) / PROJ_MAX_SAMPLES);
     if (cell > 1) step = ((step + cell - 1) / cell) * cell;   // whole cells only
     auto accumulate = [&](int x, int y, bool toH) {
-        const float* src = &im->data[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
+        const float* src = &im->px()[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
         int lo = 0, hi = P.nSeries;
         if (cfa) { lo = cfaChannelAt(*im, rx + x, ry + y); hi = lo + 1; }
         // every value goes into its own plane's row, and - when asked for -
@@ -11873,7 +11967,7 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
     std::vector<const ImageDoc*> use;
     for (int idx : fr) {
         const ImageDoc* d = app.images[idx].get();
-        if (d->remoteStep > 1 || d->data.empty()) continue;   // previews lie
+        if (d->src->remoteStep > 1 || d->px().empty()) continue;   // previews lie
         if (!first) first = d;
         if (d->w != first->w || d->h != first->h || d->ch != first->ch) continue;
         use.push_back(d);
@@ -11896,7 +11990,7 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
     std::vector<uint32_t> cnt(samples, 0);
     for (const ImageDoc* d : use)
         for (int y = 0; y < rh; y++) {
-            const float* row = &d->data[((size_t)(ry + y) * W + rx) * C];
+            const float* row = &d->px()[((size_t)(ry + y) * W + rx) * C];
             double* s1 = &sum[(size_t)y * rw * C];
             double* s2 = &sum2[(size_t)y * rw * C];
             uint32_t* cn = &cnt[(size_t)y * rw * C];
@@ -13282,7 +13376,7 @@ static FrameLinData frameLinCollect(int seqId, const FrameAxis& ax) {
     std::vector<int> fr = framesOfSeq(seqId);
     for (int idx : fr) {
         const ImageDoc* d = app.images[idx].get();
-        if (d->data.empty() || d->remoteStep > 1) { D.skipped++; continue; }
+        if (d->px().empty() || d->src->remoteStep > 1) { D.skipped++; continue; }
         int W = d->w, H = d->h, C = d->ch;
         int x0 = std::clamp(rx, 0, W - 1), y0 = std::clamp(ry, 0, H - 1);
         int ww = rw <= 0 ? W - x0 : std::min(rw, W - x0);
@@ -13295,7 +13389,7 @@ static FrameLinData frameLinCollect(int seqId, const FrameAxis& ax) {
         double sum[4] = {};
         size_t cnt[4] = {};
         for (int y = 0; y < hh; y++) {
-            const float* row = &d->data[((size_t)(y0 + y) * W + x0) * C];
+            const float* row = &d->px()[((size_t)(y0 + y) * W + x0) * C];
             for (int x = 0; x < ww; x++)
                 for (int c = 0; c < C; c++) {
                     int p = D.cfa ? cfaChannelAt(*d, x0 + x, y0 + y)
@@ -13523,7 +13617,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
     bool cfa = false;
     for (int idx : fr) {
         const ImageDoc* d = app.images[idx].get();
-        if (d->data.empty() || d->remoteStep > 1) { res.skipped++; continue; }   // previews lie
+        if (d->px().empty() || d->src->remoteStep > 1) { res.skipped++; continue; }   // previews lie
         int W = d->w, H = d->h, C = d->ch;
         int x0 = std::clamp(rx, 0, W - 1), y0 = std::clamp(ry, 0, H - 1);
         int ww = rw <= 0 ? W - x0 : std::min(rw, W - x0);
@@ -13551,7 +13645,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
         std::vector<double> colS((size_t)ww * nPl, 0.0), rowS((size_t)hh * nPl, 0.0);
         std::vector<uint32_t> colN((size_t)ww * nPl, 0), rowN((size_t)hh * nPl, 0);
         for (int y = 0; y < hh; y++) {
-            const float* row = &d->data[((size_t)(y0 + y) * W + x0) * C];
+            const float* row = &d->px()[((size_t)(y0 + y) * W + x0) * C];
             for (int x = 0; x < ww; x++)
                 for (int c = 0; c < C; c++) {
                     int p = cfa ? cfaChannelAt(*d, x0 + x, y0 + y) : std::min(c, nPl - 1);
@@ -13883,7 +13977,7 @@ static std::string buildTemporalExport(char delim) {
         const ImageDoc* d = s.doc;
         char b[512];
         snprintf(b, sizeof b, "%s: %s  |  path: %s", s.letter.c_str(),
-                 abDocLabel(d).c_str(), d->path.empty() ? "-" : d->path.c_str());
+                 abDocLabel(d).c_str(), d->src->path.empty() ? "-" : d->src->path.c_str());
         doc.comment(b);
         std::string cfa = d->cfa
             ? std::string(CFA_PATTERNS[d->cfaPattern & 3]) + (d->cfa == 2 ? " quad" : "") + " (4 planes)"
@@ -15263,7 +15357,7 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
         for (int y = y0; y < y0 + cell && y < rh; y++)
             for (int x = 0; x < rw; x++) {
                 const int ax = rx + x, ay = ry + y;
-                const float* src = &im.data[((size_t)ay * im.w + ax) * im.ch];
+                const float* src = &im.px()[((size_t)ay * im.w + ax) * im.ch];
                 if (cfa) {
                     if (chSel >= 0 && cfaChannelAt(im, ax, ay) != chSel) continue;
                     float v = src[0];
@@ -16508,7 +16602,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (di->uid == app.previewUid && di->preview) pv = di.get();
         std::string u = makeRemoteUrl(B.host, target, B.port);
         bool live = true;
-        if (pv && pv->remoteUrl == u) selectImage(app.current);
+        if (pv && pv->src->remoteUrl == u) selectImage(app.current);
         else live = openRemote(u, true);
         // only when there IS a preview: a scrub bar over nothing re-runs the
         // failing open on every press of its buttons and of , / .
@@ -16552,9 +16646,9 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImageDoc* pv = nullptr;
         for (const auto& di : app.images)
             if (di->uid == app.previewUid && di->preview) pv = di.get();
-        if (pv && pv->remoteUrl == u) { promotePreview(pv); return; }
+        if (pv && pv->src->remoteUrl == u) { promotePreview(pv); return; }
         for (int i = 0; i < (int)app.images.size(); i++)
-            if (app.images[i]->remoteUrl == u && !app.images[i]->preview) {
+            if (app.images[i]->src->remoteUrl == u && !app.images[i]->preview) {
                 selectImage(i);              // already registered: show it
                 return;
             }
@@ -17632,15 +17726,15 @@ static std::vector<DeriveEntry> stackMembers(int seqId) {
             out.push_back({ baseName(si->remoteFiles[i]), i, -1 });
         for (int k = 0; k < (int)app.images.size(); k++) {
             const ImageDoc* d = app.images[k].get();
-            if (d->seqId != seqId || d->remoteStep > 1) continue;
+            if (d->seqId != seqId || d->src->remoteStep > 1) continue;
             for (auto& e : out)
                 if (e.seqIndex == d->seqIndex && e.imageIdx < 0) { e.imageIdx = k; break; }
         }
     } else {
         for (int k = 0; k < (int)app.images.size(); k++) {
             const ImageDoc* d = app.images[k].get();
-            if (d->seqId != seqId || d->remoteStep > 1) continue;
-            out.push_back({ baseName(d->path.empty() ? d->name : d->path),
+            if (d->seqId != seqId || d->src->remoteStep > 1) continue;
+            out.push_back({ baseName(d->src->path.empty() ? d->name : d->src->path),
                             d->seqIndex, k });
         }
         std::sort(out.begin(), out.end(),
@@ -17755,18 +17849,24 @@ static std::string deriveRuleText(const DerivePlan& P) {
 static ImageDoc* materializeDerivedFrame(const ImageDoc& s, int seqId, int seqIndex,
                                          int batchId, const std::string& note) {
     auto d = std::make_unique<ImageDoc>();
-    d->name = s.name; d->path = s.path; d->dtype = s.dtype;
-    d->w = s.w; d->h = s.h; d->ch = s.ch;
-    d->data = s.data;                     // the pixels, copied from RAM
-    d->vmin = s.vmin; d->vmax = s.vmax;
+    d->name = s.name;
+    // its OWN source (fresh srcId), holding a copy of s's pixels and provenance:
+    // stage 3 replaces this whole block with d->src = s.src (mtime/fsize stay 0
+    // until then - a copy is not the file on disk)
+    FrameSource& D = *d->src;
+    D.path = s.src->path; D.dtype = s.dtype;
+    D.w = s.w; D.h = s.h; D.ch = s.ch;
+    D.data = s.px();                      // the pixels, copied from RAM
+    D.vmin = s.vmin; D.vmax = s.vmax;
+    d->syncMirrors();
     d->black = s.black; d->white = s.white;   // frames stay directly comparable
     d->cfa = s.cfa; d->cfaPattern = s.cfaPattern; d->cfaColorize = s.cfaColorize;
-    d->rawDtype = s.rawDtype; d->rawInterp = s.rawInterp;
-    d->rawOffset = s.rawOffset; d->rawLE = s.rawLE;
-    d->srcW = s.srcW; d->srcH = s.srcH; d->cropX = s.cropX; d->cropY = s.cropY;
+    D.rawDtype = s.src->rawDtype; D.rawInterp = s.src->rawInterp;
+    D.rawOffset = s.src->rawOffset; D.rawLE = s.src->rawLE;
+    D.srcW = s.src->srcW; D.srcH = s.src->srcH; D.cropX = s.src->cropX; D.cropY = s.src->cropY;
     d->displayLut = s.displayLut;
-    d->npzMember = s.npzMember;
-    d->remoteUrl = s.remoteUrl; d->remoteFrame = s.remoteFrame;  // provenance only
+    D.npzMember = s.src->npzMember;
+    D.remoteUrl = s.src->remoteUrl; D.remoteFrame = s.src->remoteFrame;  // provenance only
     d->note = note;    // the SAME note on every frame: a stack-constant row, so
                        // the Inspector never gains or loses a line mid-stack
     d->seqId = seqId; d->seqIndex = seqIndex; d->batchId = batchId;
@@ -18072,7 +18172,7 @@ static std::vector<FileGroup> buildFileGroups(const std::vector<std::vector<int>
         FileGroup* g = nullptr;
         for (auto& q : groups) if (q.batch == head.batchId) { g = &q; break; }
         if (!g) {
-            const std::string& p = head.path;
+            const std::string& p = head.src->path;
             size_t slash = p.find_last_of("/\\");
             std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
             std::string label = "opened";
@@ -18351,7 +18451,7 @@ static void drawFileList() {
                                                        ImGui::GetTextLineHeight()) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
             }
-            if (hov) ImGui::SetTooltip("%s\n%s", dispPath(d.path).c_str(), meta);
+            if (hov) ImGui::SetTooltip("%s\n%s", dispPath(d.src->path).c_str(), meta);
             return clicked;
         };
         // One row. mem != nullptr means the row is being drawn INSIDE a series
@@ -18788,7 +18888,7 @@ static bool viewingRemote() {
     const ImageDoc* im = cur();
     for (const auto& p : app.browsePanels)
         if (p->b.connected) return true;
-    return im && !im->remoteUrl.empty();
+    return im && !im->src->remoteUrl.empty();
 }
 
 // The host behind that, or "" for the local peer. The peer protocol is the same
@@ -18802,9 +18902,9 @@ static std::string viewingHost() {
     for (const auto& p : app.browsePanels)
         if (p->b.connected && !p->b.host.empty()) return p->b.host;
     const ImageDoc* im = cur();
-    if (im && !im->remoteUrl.empty()) {
+    if (im && !im->src->remoteUrl.empty()) {
         std::string h, p;
-        remote::parseUrl(im->remoteUrl, h, p);
+        remote::parseUrl(im->src->remoteUrl, h, p);
         return h;
     }
     return {};
@@ -19009,9 +19109,9 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::Separator();
             }
             if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
-                                cur() && cur()->seqId == 0 && !cur()->path.empty())) {
+                                cur() && cur()->seqId == 0 && !cur()->src->path.empty())) {
                 std::string pat;
-                std::vector<std::string> files = findSequenceSiblings(cur()->path, pat);
+                std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
                 if (files.size() >= 2) startSequenceLoad(app.current, files, pat);
                 else toast("no numbered siblings found next to this file", true);
             }
@@ -20398,6 +20498,10 @@ static int remoteSelfTest(const char* exe, const char* path) {
         // local one of the same pixels disagree.
         if (ref.ch == 1) {
             ImageDoc mosaic = ref;                  // same pixels, declared Bayer
+            // the implicit copy ALIASES ref's source (one shared_ptr, two docs)
+            // - stage 1's invariant is one owner per source, and makeFrame's
+            // const-cast pointer must aim at a throwaway, not the live doc
+            mosaic.src = cloneSource(*mosaic.src);
             mosaic.cfa = 1;
             mosaic.cfaPattern = 0;                  // RGGB
             std::vector<std::pair<std::string, std::string>> local2;
@@ -20907,7 +21011,7 @@ int main(int argc, char** argv) {
         };
         auto stackFiles = [&](int seqId) {
             std::vector<std::string> out;
-            for (int idx : framesOfSeq(seqId)) out.push_back(app.images[idx]->path);
+            for (int idx : framesOfSeq(seqId)) out.push_back(app.images[idx]->src->path);
             return out;
         };
         auto joinBase = [&](const std::vector<std::string>& v) {
@@ -21617,16 +21721,16 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (!samples) {
-                    samples = d->data.size();
+                    samples = d->px().size();
                     sum.assign(samples, 0.0);
                     sum2.assign(samples, 0.0);
                 }
-                if (d->data.size() != samples) {
+                if (d->px().size() != samples) {
                     fprintf(stderr, "rtemporalselftest: shape mismatch in fixture\n");
                     return 1;
                 }
                 for (size_t i = 0; i < samples; i++) {
-                    double v = d->data[i];
+                    double v = d->px()[i];
                     sum[i] += v; sum2[i] += v * v;
                 }
                 N++;
@@ -21964,8 +22068,8 @@ int main(int argc, char** argv) {
                 bool same = true;
                 for (int y = 0; y < erh && same; y++)
                     for (int x = 0; x < erw; x++)
-                        if (m->data[((size_t)y * m->w + x) * m->ch] !=
-                            f0.data[((size_t)(ry + y) * f0.w + (rx + x)) * f0.ch]) { same = false; break; }
+                        if (m->px()[((size_t)y * m->w + x) * m->ch] !=
+                            f0.px()[((size_t)(ry + y) * f0.w + (rx + x)) * f0.ch]) { same = false; break; }
                 check(same, "E9 tile 0 is frame 0's ROI, pixel for pixel");
             }
             int mid = (int)app.images.size();
@@ -22000,7 +22104,7 @@ int main(int argc, char** argv) {
                         float lo = FLT_MAX, hi = -FLT_MAX;
                         for (int y = 0; y < erh2; y++)
                             for (int x = 0; x < erw2; x++) {
-                                float vpx = mN->data[((size_t)y * mN->w + (k * erw2 + x)) * mN->ch];
+                                float vpx = mN->px()[((size_t)y * mN->w + (k * erw2 + x)) * mN->ch];
                                 if (!std::isfinite(vpx)) continue;
                                 lo = std::min(lo, vpx); hi = std::max(hi, vpx);
                             }
@@ -22109,7 +22213,7 @@ int main(int argc, char** argv) {
             for (const auto& m : S->members) {
                 std::vector<int> fr = framesOfSeq(m.seqId);
                 if (fr.empty() || !std::isfinite(m.value)) continue;
-                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << app.images[fr.front()]->path << "\n";
+                lf << "image 0 1 npy3 0 0 0 0 0 0 0 " << app.images[fr.front()]->src->path << "\n";
                 lf << "imgbatch legacyset\n";
                 lf << "seqload 1\n";
                 lf << "seqlevel " << m.value << "\n";
@@ -22130,7 +22234,7 @@ int main(int argc, char** argv) {
             std::vector<Want> want;
             for (const auto& m : S->members) {
                 std::vector<int> fr = framesOfSeq(m.seqId);
-                want.push_back({ fr.empty() ? std::string() : app.images[fr.front()]->path,
+                want.push_back({ fr.empty() ? std::string() : app.images[fr.front()]->src->path,
                                  m.value, m.include });
             }
             std::string wantName = S->name, wantParam = S->paramName, wantUnit = S->unit;
@@ -22162,7 +22266,7 @@ int main(int argc, char** argv) {
             if (memOk)
                 for (size_t i = 0; i < want.size(); i++) {
                     std::vector<int> fr = framesOfSeq(R->members[i].seqId);
-                    std::string p = fr.empty() ? std::string() : app.images[fr.front()]->path;
+                    std::string p = fr.empty() ? std::string() : app.images[fr.front()]->src->path;
                     double a = want[i].value, b = R->members[i].value;
                     bool vOk = std::isfinite(a) == std::isfinite(b) &&
                                (!std::isfinite(a) ||
@@ -22338,7 +22442,7 @@ int main(int argc, char** argv) {
             if (M)
                 for (const auto& m : M->members) {
                     std::vector<int> fr = framesOfSeq(m.seqId);
-                    if (!fr.empty()) lpaths.push_back(app.images[fr.front()]->path);
+                    if (!fr.empty()) lpaths.push_back(app.images[fr.front()]->src->path);
                 }
             std::string onePath = lpaths.empty() ? std::string() : lpaths.front();
             {
@@ -22577,7 +22681,7 @@ int main(int argc, char** argv) {
             std::vector<std::string> paths;
             for (const auto& si : app.seqs) {
                 std::vector<int> fr = framesOfSeq(si.id);
-                if (!fr.empty()) paths.push_back(app.images[fr.front()]->path);
+                if (!fr.empty()) paths.push_back(app.images[fr.front()]->src->path);
             }
             std::string bn = batchNameOf(app.images.empty() ? 0 : app.images[0]->batchId);
             std::string hostile = (std::filesystem::temp_directory_path(tec) /
@@ -22679,7 +22783,7 @@ int main(int argc, char** argv) {
             std::string keepPath;
             {
                 std::vector<int> fr = framesOfSeq(keep);
-                if (!fr.empty()) keepPath = app.images[fr.front()]->path;
+                if (!fr.empty()) keepPath = app.images[fr.front()]->src->path;
             }
             openFolder(g_seriesSelftest);
             loadAll();
@@ -22687,7 +22791,7 @@ int main(int argc, char** argv) {
             for (const auto& si : app.seqs) {
                 if (si.id == keep || batchOfStack(si.id) == bm) continue;
                 std::vector<int> fr = framesOfSeq(si.id);
-                if (!fr.empty() && app.images[fr.front()]->path == keepPath) mv = si.id;
+                if (!fr.empty() && app.images[fr.front()]->src->path == keepPath) mv = si.id;
             }
             if (mv) moveStackToBatch(mv, bm);
             int sm = newSeries(bm, "merged");
@@ -22742,7 +22846,7 @@ int main(int argc, char** argv) {
             std::vector<std::string> tpaths;
             for (const auto& si : app.seqs) {
                 std::vector<int> fr = framesOfSeq(si.id);
-                if (!fr.empty()) tpaths.push_back(app.images[fr.front()]->path);
+                if (!fr.empty()) tpaths.push_back(app.images[fr.front()]->src->path);
             }
             std::string tbn = batchNameOf(app.images.empty() ? 0 : app.images[0]->batchId);
             std::string cut = (std::filesystem::temp_directory_path(tec) /
@@ -23710,9 +23814,9 @@ int main(int argc, char** argv) {
             auto mk = [&](const char* path, int seq, int seqIdx, int cfa, int pat,
                           const char* url) {
                 auto d = std::make_unique<ImageDoc>();
-                d->path = path; d->seqId = seq; d->seqIndex = seqIdx;
+                d->src->path = path; d->seqId = seq; d->seqIndex = seqIdx;
                 d->cfa = cfa; d->cfaPattern = pat;
-                if (url) d->remoteUrl = url;
+                if (url) d->src->remoteUrl = url;
                 app.images.push_back(std::move(d));
                 return app.images.back().get();
             };
@@ -23881,7 +23985,7 @@ int main(int argc, char** argv) {
                             "resolveB #1 -> %s, resolveB #2 -> %s\n",
                     bname.c_str(), leftName.c_str(),
                     b1 ? b1->name.c_str() : "(null)",
-                    b2 ? (b2->path + " seq " + std::to_string(b2->seqId)).c_str() : "(null)");
+                    b2 ? (b2->src->path + " seq " + std::to_string(b2->seqId)).c_str() : "(null)");
             check(leftName.empty(), "V4b frameOnly close clears the compare-B name");
             check(b2 == nullptr, "V4b closed B does not re-latch onto a same-named frame");
         }
@@ -24063,8 +24167,9 @@ int main(int argc, char** argv) {
             auto mkPreview = [] {                  // a preview at index 0
                 auto d = std::make_unique<ImageDoc>();
                 d->name = "preview.npy";
-                d->w = d->h = 2; d->ch = 1;
-                d->data.assign(4, 0.f);
+                d->src->w = d->src->h = 2; d->src->ch = 1;
+                d->src->data.assign(4, 0.f);
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 d->preview = true;
                 app.previewUid = d->uid;
@@ -24111,14 +24216,15 @@ int main(int argc, char** argv) {
             for (int f = 0; f < NF; f++) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = "cfa_" + std::to_string(f) + ".npy";
-                d->w = W; d->h = H; d->ch = 1;
+                d->src->w = W; d->src->h = H; d->src->ch = 1;
                 d->cfa = 1; d->cfaPattern = 0;              // RGGB
-                d->dtype = "f32";
-                d->data.resize((size_t)W * H);
+                d->src->dtype = "f32";
+                d->src->data.resize((size_t)W * H);
                 for (int y = 0; y < H; y++)
                     for (int x = 0; x < W; x++)
-                        d->data[(size_t)y * W + x] =
+                        d->px()[(size_t)y * W + x] =
                             (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] + (f % 2 ? 10 : -10));
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 d->seqId = si.id;
                 d->seqIndex = f;
@@ -24284,10 +24390,11 @@ int main(int argc, char** argv) {
             for (int f = 0; f < NF; f++) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = "nan_" + std::to_string(f) + ".npy";
-                d->w = W; d->h = H; d->ch = 1;
-                d->dtype = "f32";
-                d->data.assign((size_t)W * H, 100.0f);
-                if (f < 2) d->data[0] = std::numeric_limits<float>::quiet_NaN();
+                d->src->w = W; d->src->h = H; d->src->ch = 1;
+                d->src->dtype = "f32";
+                d->src->data.assign((size_t)W * H, 100.0f);
+                if (f < 2) d->px()[0] = std::numeric_limits<float>::quiet_NaN();
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 d->seqId = si.id;
                 d->seqIndex = f;
@@ -24514,7 +24621,7 @@ int main(int argc, char** argv) {
             bool askedB = rawDlg.open && rawDlg.forQueue;
             bool noGarbage = true;              // nothing decoded with A's geometry
             for (const auto& d : app.images)
-                if (d->path.find("b_") != std::string::npos) noGarbage = false;
+                if (d->src->path.find("b_") != std::string::npos) noGarbage = false;
             fprintf(stderr, "verifyselftest: V16 raw recipe: asked for A=%d, kept over the "
                             "second Open=%d, A's 2nd stack %dx%d, asked again for B=%d, "
                             "queue %d\n", askedA ? 1 : 0, keptA ? 1 : 0,
@@ -24571,16 +24678,17 @@ int main(int argc, char** argv) {
             };
             auto mkCfa = [](int W2, int H2, int mode) {   // mode: 1=Bayer 2=Quad
                 auto d = std::make_unique<ImageDoc>();
-                d->name = "v18"; d->w = W2; d->h = H2; d->ch = 1;
-                d->cfa = mode; d->cfaPattern = 0; d->dtype = "f32";
+                d->name = "v18"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+                d->cfa = mode; d->cfaPattern = 0; d->src->dtype = "f32";
                 static const float LVL[4] = { 100, 300, 500, 900 };
-                d->data.resize((size_t)W2 * H2);
+                d->src->data.resize((size_t)W2 * H2);
                 for (int y = 0; y < H2; y++)
                     for (int x = 0; x < W2; x++) {
                         int cx = mode == 2 ? (x >> 1) & 1 : x & 1;
                         int cy = mode == 2 ? (y >> 1) & 1 : y & 1;
-                        d->data[(size_t)y * W2 + x] = LVL[CFA_MAP[0][cy * 2 + cx]];
+                        d->px()[(size_t)y * W2 + x] = LVL[CFA_MAP[0][cy * 2 + cx]];
                     }
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 return d;
             };
@@ -24790,9 +24898,9 @@ int main(int argc, char** argv) {
             selectImage(framesOfSeq(seqA)[3]);          // f_003
             ImageDoc* b3 = resolveB();
             bool mispair = b3 && !g_abFollowDiverged &&
-                           baseName(b3->path) == "f_004.npy";
+                           baseName(b3->src->path) == "f_004.npy";
             fprintf(stderr, "deriveselftest: D3 A#3 (f_003) follows to %s, diverged=%d\n",
-                    b3 ? baseName(b3->path).c_str() : "(null)",
+                    b3 ? baseName(b3->src->path).c_str() : "(null)",
                     g_abFollowDiverged ? 1 : 0);
             check(mispair, "D3 today: same-number follow pairs the WRONG file, silently");
             selectImage(framesOfSeq(seqA)[7]);          // f_007: B has no #7
@@ -24822,8 +24930,8 @@ int main(int argc, char** argv) {
             for (int idx : fd) {
                 const ImageDoc& d = *app.images[idx];
                 if (d.seqIndex == 3)
-                    pixels = baseName(d.path) == "f_004.npy" &&
-                             fabsf(d.data[0] - 4.0f) < 1e-6f;
+                    pixels = baseName(d.src->path) == "f_004.npy" &&
+                             fabsf(d.px()[0] - 4.0f) < 1e-6f;
                 if (d.note != note0 || d.note.empty()) noteSame = false;
             }
             check(pixels, "D4 pixels copied from the SOURCE, files already deleted");
@@ -24848,8 +24956,8 @@ int main(int argc, char** argv) {
                 selectImage(idx);
                 ImageDoc* b = resolveB();
                 if (!b || g_abFollowDiverged) { follows = false; continue; }
-                if (baseName(b->path) != baseName(cur()->path)) sameFile = false;
-                if (fabsf(b->data[0] - (cur()->data[0] + 100.0f)) > 1e-4f) paired = false;
+                if (baseName(b->src->path) != baseName(cur()->src->path)) sameFile = false;
+                if (fabsf(b->px()[0] - (cur()->px()[0] + 100.0f)) > 1e-4f) paired = false;
             }
             check(follows, "D6 follow-frame never diverges across the derived stack");
             check(sameFile, "D6 A/B now show the SAME file on both sides");
@@ -24904,8 +25012,8 @@ int main(int argc, char** argv) {
             int nid = applyDerivePlan(Pp, true);
             std::vector<int> fd = framesOfSeq(nid);
             bool picked = fd.size() == 2 &&
-                          baseName(app.images[fd[0]]->path) == "f_000.npy" &&
-                          baseName(app.images[fd[1]]->path) == "f_009.npy";
+                          baseName(app.images[fd[0]]->src->path) == "f_000.npy" &&
+                          baseName(app.images[fd[1]]->src->path) == "f_009.npy";
             check(picked, "D8 hand-picked rule copies exactly the ticked frames");
             check(!fd.empty() && app.images[fd[0]]->batchId != bBatch,
                   "D8 'into a new batch' really is a new batch");
@@ -24990,7 +25098,7 @@ int main(int argc, char** argv) {
                 for (int x = 0; x < rw; x++) {
                     size_t p = (size_t)y * rw + x;
                     if (p % step) continue;
-                    const float* src = &im.data[((size_t)y * im.w + x) * im.ch];
+                    const float* src = &im.px()[((size_t)y * im.w + x) * im.ch];
                     if (cfa) {
                         float v = src[0];
                         if (std::isfinite(v)) {
@@ -25039,7 +25147,7 @@ int main(int argc, char** argv) {
                 if (fr.w != im.w || fr.h != im.h || fr.ch != im.ch) continue;
                 bool any = false;
                 for (size_t k = 0; k < offs.size(); k++) {
-                    float v = fr.data[offs[k]];
+                    float v = fr.px()[offs[k]];
                     if (!std::isfinite(v)) continue;
                     s1[k] += v; s2[k] += (double)v * v; any = true;
                 }
@@ -26367,9 +26475,10 @@ int main(int argc, char** argv) {
             auto mkDoc = [&](const char* nm, int w, int h) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = nm;
-                d->w = w; d->h = h; d->ch = 1;
-                d->dtype = "f32";
-                d->data.assign((size_t)w * h, 0.f);
+                d->src->w = w; d->src->h = h; d->src->ch = 1;
+                d->src->dtype = "f32";
+                d->src->data.assign((size_t)w * h, 0.f);
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 app.images.push_back(std::move(d));
                 return app.images.back().get();
@@ -26444,6 +26553,8 @@ int main(int argc, char** argv) {
                 ta->vmin = 10;  ta->vmax = 100;  ta->black = 12;  ta->white = 90;
                 tb->vmin = 0;   tb->vmax = 50;   tb->black = 1;   tb->white = 40;
                 tc->vmin = -5;  tc->vmax = 200;  tc->black = 0;   tc->white = 1;
+                for (ImageDoc* t : { ta, tb, tc })   // forced range = mirror write: set both sides
+                    { t->src->vmin = t->vmin; t->src->vmax = t->vmax; }
                 app.compareRangeMode = 2;               // union auto
                 fprintf(stderr, "tileselftest: T11 union: A %.6g..%.6g  B %.6g..%.6g  "
                                 "C %.6g..%.6g  (want -5..200 on all three)\n",
@@ -27107,15 +27218,16 @@ int main(int argc, char** argv) {
             for (int f = 0; f < NF; f++) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = std::string(name) + "_" + std::to_string(f) + ".npy";
-                d->w = W; d->h = H; d->ch = 1;
-                d->dtype = "f32";
+                d->src->w = W; d->src->h = H; d->src->ch = 1;
+                d->src->dtype = "f32";
                 if (cfa) { d->cfa = 1; d->cfaPattern = 0; }          // RGGB
-                d->data.resize((size_t)W * H);
+                d->src->data.resize((size_t)W * H);
                 for (int y = 0; y < H; y++)
                     for (int x = 0; x < W; x++) {
                         int pl = cfa ? CFA_MAP[0][(y & 1) * 2 + (x & 1)] : 0;
-                        d->data[(size_t)y * W + x] = px(f, x, y, pl);
+                        d->px()[(size_t)y * W + x] = px(f, x, y, pl);
                     }
+                d->syncMirrors();
                 d->uid = app.nextUid++;
                 d->seqId = si.id;
                 d->seqIndex = f;
@@ -27190,7 +27302,7 @@ int main(int argc, char** argv) {
         // line MEANS, and the numbers say so exactly.
         for (auto& d : app.images)
             if (d->seqId == sid && d->seqIndex == 5)
-                for (auto& v : d->data) v *= 1.02f;
+                for (auto& v : d->px()) v *= 1.02f;
         double le5 = 0, mean5 = 0;
         {
             FrameLinData D = frameLinCollect(sid, axOf(sid));
@@ -27314,7 +27426,7 @@ int main(int argc, char** argv) {
             if (d->seqId == sid && d->seqIndex == 2)
                 for (int y = 0; y < H; y++)
                     for (int x = 0; x < W / 2; x++)         // half of frame 2
-                        d->data[(size_t)y * W + x] = std::numeric_limits<float>::quiet_NaN();
+                        d->px()[(size_t)y * W + x] = std::numeric_limits<float>::quiet_NaN();
         {
             FrameLinData D = frameLinCollect(sid, axOf(sid));
             FrameLinFit F0 = frameLinFitPlane(D, 0, 0, false, 0, 0);
@@ -28444,7 +28556,8 @@ int main(int argc, char** argv) {
                     // pins compareFollowFrame (it only steps B across stacks).
                     bool other = a0->seqId != 0
                                ? d->seqId != a0->seqId
-                               : (d->path != a0->path || d->npzMember != a0->npzMember);
+                               : (d->src->path != a0->src->path ||
+                                  d->src->npzMember != a0->src->npzMember);
                     if (other) { setCompareB(d.get()); break; }
                 }
                 if (!resolveB()) setCompareB(app.images[1].get());   // same file twice
@@ -28834,11 +28947,11 @@ int main(int argc, char** argv) {
                         bool at = pv && app.previewIndex == arg && arg < scrubLen();
                         // ...and the slot really holds frame K, not just the label
                         if (at && app.previewFiles.size() >= 2)
-                            at = pv->remoteUrl ==
+                            at = pv->src->remoteUrl ==
                                  makeRemoteUrl(app.previewHost,
                                                app.previewFiles[arg], app.previewPort);
-                        else if (at) at = pv->remoteFrame == arg;   // frame axis
-                        chk(at, pv ? pv->remoteUrl : "-");
+                        else if (at) at = pv->src->remoteFrame == arg;   // frame axis
+                        chk(at, pv ? pv->src->remoteUrl : "-");
                     } else if (op == "chkopen") {            // registered, nothing else
                         bool okc = !pvDoc() && app.previewUid == 0 &&
                                    (int)app.seqs.size() == arg && app.previewFiles.empty();
