@@ -1872,12 +1872,15 @@ static std::string abStatusChipText() {
         if (a->src == b->src) {
             share = "  -  A and B share the same pixels";
         } else {
-            for (size_t k = 0; k < app.cmpExtra.size() && share.empty(); k++)
-                for (const auto& d : app.images)
-                    if (d->uid == app.cmpExtra[k] && d->src == a->src) {
-                        share = "  -  A and " + slotName(k) + " share the same pixels";
-                        break;
-                    }
+            // The slots the panes actually SHOW: follow-frame-resolved, exactly
+            // as B above (resolveSlots IS that resolution, and it skips a
+            // dormant slot A stands on). Testing the pinned uid instead claimed
+            // or withheld the share against a frame nobody was comparing.
+            for (const ResolvedSlot& rs : resolveSlots())
+                if (rs.doc->src == a->src) {
+                    share = "  -  A and " + slotName(rs.idx) + " share the same pixels";
+                    break;
+                }
         }
     }
     if (app.compareMode == App::CmpDiff) {
@@ -2957,11 +2960,80 @@ static void closeImages(std::vector<int> idxs) {
 // close freed everything it held (and said nothing, as before sharing).
 static std::string g_lastCloseNote;
 
+// The survival scan behind that notice, over the WHOLE closing set of ONE
+// user action: closeBatch/closeSeries hand every doc they are about to close
+// here at once, so the sentence can never name a "survivor" the same action
+// then frees (a per-member scan did exactly that for a batch holding a source
+// stack and its derived stack). Counts are UNIQUE PIXELS, not memberships -
+// source+derived closing together is N frames, not 2N. Sources adopted by an
+// in-flight load but still queued in app.seqReady count as ALIVE (the loader
+// holds the shared_ptr and lands them moments later), named by the stack they
+// are loading into - unless that stack is itself being closed, in which case
+// closeStack sweeps the queue. Speaks (stderr + toast + g_lastCloseNote) only
+// when pixels survive; a close that frees everything stays silent, as before
+// sharing.
+static void sayCloseNotice(const std::vector<int>& closing,
+                           const std::vector<int>& closingSeqIds,
+                           const std::string& what) {
+    g_lastCloseNote.clear();
+    if (closing.empty()) return;
+    std::vector<char> inSet(app.images.size(), 0);
+    for (int idx : closing)
+        if (idx >= 0 && idx < (int)app.images.size()) inSet[idx] = 1;
+    std::unordered_map<uint64_t, const ImageDoc*> outside;
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (!inSet[i]) outside.emplace(app.images[i]->src->srcId, app.images[i].get());
+    std::unordered_set<uint64_t> queued;   // decoded and adopted, not landed yet
+    const int loadingSeq = app.seqLoadingId;
+    if (loadingSeq != 0 &&
+        std::find(closingSeqIds.begin(), closingSeqIds.end(), loadingSeq) ==
+            closingSeqIds.end()) {
+        std::lock_guard<std::mutex> lk(app.seqMtx);
+        for (const auto& r : app.seqReady)
+            if (r.second && r.second->src) queued.insert(r.second->src->srcId);
+    }
+    std::unordered_set<uint64_t> seen;
+    int total = 0, kept = 0;
+    std::vector<std::string> keepers;      // distinct counterpart names
+    auto keeper = [&](const std::string& nm) {
+        if (std::find(keepers.begin(), keepers.end(), nm) == keepers.end())
+            keepers.push_back(nm);
+    };
+    for (int idx : closing) {
+        if (idx < 0 || idx >= (int)app.images.size()) continue;
+        const ImageDoc& d = *app.images[idx];
+        if (!seen.insert(d.src->srcId).second) continue;
+        total++;
+        auto it = outside.find(d.src->srcId);
+        if (it != outside.end()) {
+            kept++;
+            const ImageDoc* o = it->second;
+            const App::SeqInfo* osi = o->seqId ? seqInfo(o->seqId) : nullptr;
+            keeper(osi ? osi->name : o->name);
+        } else if (queued.count(d.src->srcId)) {
+            kept++;
+            const App::SeqInfo* lsi = seqInfo(loadingSeq);
+            keeper((lsi ? lsi->name : std::string("a stack")) + " (loading)");
+        }
+    }
+    if (kept == 0) return;                 // freed everything: silence, as ever
+    std::string who = "\"" + keepers[0] + "\"";
+    if (keepers.size() > 1)
+        who += " (+" + std::to_string(keepers.size() - 1) + " more)";
+    char m[512];
+    snprintf(m, sizeof m, "closed %s - %d frame(s) freed, %d still referenced by %s",
+             what.c_str(), total - kept, kept, who.c_str());
+    fprintf(stderr, "%s\n", m);
+    toast(m);
+    g_lastCloseNote = m;
+}
+
 // Close every frame of a stack plus its SeqInfo, and stop everything that
 // would quietly regrow it: the sequence loader (pumpSequence stamps
 // seqLoadingId on frames as they land), the remote prefetch queue, the
-// linearity row, the server temporal result.
-static void closeStack(int seqId) {
+// linearity row, the server temporal result. announce=false is for
+// closeBatch/closeSeries, which speak ONCE for their whole set instead.
+static void closeStack(int seqId, bool announce = true) {
     if (seqId == 0) return;
     if (app.seqLoadingId == seqId) { stopSequenceLoader(); app.seqLoadingId = 0; }
     {   // queued remote prefetches. The ONE job the worker may be running right
@@ -2979,42 +3051,17 @@ static void closeStack(int seqId) {
             app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0; app.rfBytesInFlight = 0;
         }
     }
-    // §4: when another stack still references some of these pixels, the close
+    // §4: when another doc still references some of these pixels, the close
     // says so BEFORE the memberships go - counted in both directions (how many
     // die, how many live on), the same shape as derive's count promise. A
-    // silent close would read as "freed" while a sharer keeps the pixels alive.
-    {
-        g_lastCloseNote.clear();             // this close said nothing (yet)
-        std::vector<int> members = framesOfSeq(seqId);
-        std::unordered_map<uint64_t, const ImageDoc*> outside;
-        for (const auto& d : app.images)
-            if (d->seqId != seqId) outside.emplace(d->src->srcId, d.get());
-        int kept = 0;
-        std::vector<std::string> keepers;    // distinct counterpart names
-        for (int idx : members) {
-            auto it = outside.find(app.images[idx]->src->srcId);
-            if (it == outside.end()) continue;
-            kept++;
-            const ImageDoc* o = it->second;
-            const App::SeqInfo* osi = o->seqId ? seqInfo(o->seqId) : nullptr;
-            std::string nm = osi ? osi->name : o->name;
-            if (std::find(keepers.begin(), keepers.end(), nm) == keepers.end())
-                keepers.push_back(nm);
-        }
-        if (kept > 0) {
-            const App::SeqInfo* si = seqInfo(seqId);
-            std::string who = "\"" + (keepers.empty() ? std::string("?") : keepers[0]) + "\"";
-            if (keepers.size() > 1)
-                who += " (+" + std::to_string(keepers.size() - 1) + " more)";
-            char m[512];
-            snprintf(m, sizeof m,
-                     "closed \"%s\" - %d frame(s) freed, %d still referenced by %s",
-                     si ? si->name.c_str() : "stack",
-                     (int)members.size() - kept, kept, who.c_str());
-            fprintf(stderr, "%s\n", m);
-            toast(m);
-            g_lastCloseNote = m;
-        }
+    // silent close would read as "freed" while a sharer keeps the pixels
+    // alive. When this close is ONE MEMBER of a larger action, the caller has
+    // already scanned and spoken over its whole set (announce=false):
+    // announcing per member here named survivors the same action then freed.
+    if (announce) {
+        const App::SeqInfo* si = seqInfo(seqId);
+        sayCloseNotice(framesOfSeq(seqId), { seqId },
+                       "\"" + (si ? si->name : std::string("stack")) + "\"");
     }
     // rbOpenQueue entries carry no seqId yet, so a stack whose FOLDER is still
     // queued may open later regardless - accepted; closeBatch removes those by
@@ -3056,7 +3103,17 @@ static void closeBatch(int batchId) {
         if (d->batchId == batchId && d->seqId != 0 &&
             std::find(seqIds.begin(), seqIds.end(), d->seqId) == seqIds.end())
             seqIds.push_back(d->seqId);
-    for (int s : seqIds) closeStack(s);
+    // §4, scoped to THIS user action: ONE survival scan over everything the
+    // batch close takes - member stacks AND loose frames - so the notice can
+    // never name a survivor this same close then frees, and a loose member's
+    // survivors are said too (closeImages itself carries no notice).
+    {
+        std::vector<int> closing;
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->batchId == batchId) closing.push_back(i);
+        sayCloseNotice(closing, seqIds, "batch \"" + batchNameOf(batchId) + "\"");
+    }
+    for (int s : seqIds) closeStack(s, false);
     std::vector<int> loose;
     for (int i = 0; i < (int)app.images.size(); i++)
         if (app.images[i]->batchId == batchId) loose.push_back(i);
@@ -3090,6 +3147,10 @@ static void closeCurrent(bool frameOnly = false) {
     if (!im) return;
     if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
     int seqId = im->seqId;
+    // §4 for the two one-frame closes (Ctrl+W on a loose frame, Ctrl+Alt+W):
+    // one membership goes here without passing closeStack, and pixels that
+    // live on elsewhere must still be said to - a silent close reads as freed.
+    sayCloseNotice({ app.current }, {}, "\"" + im->name + "\"");
     forgetImage(im);
     if (im->tex) glDeleteTextures(1, &im->tex);
     app.images.erase(app.images.begin() + app.current);
@@ -3211,7 +3272,14 @@ static void closeSeries(int seriesId) {
     std::string n = S->name;
     std::vector<int> ids;
     for (const auto& m : S->members) ids.push_back(m.seqId);
-    for (int s : ids) closeStack(s);
+    {   // §4, scoped to THIS user action: one scan across every member stack,
+        // so no member is called a survivor of a close that takes it too
+        std::vector<int> closing;
+        for (int s : ids)
+            for (int idx : framesOfSeq(s)) closing.push_back(idx);
+        sayCloseNotice(closing, ids, "series \"" + n + "\"");
+    }
+    for (int s : ids) closeStack(s, false);
     for (auto it = app.series.begin(); it != app.series.end(); ++it)
         if (it->id == seriesId) {
             if (app.curSeriesId == seriesId) app.curSeriesId = 0;
@@ -18576,22 +18644,59 @@ static const char* shareGlyph() {
     return have ? "\xE2\xA7\x89" : "";
 }
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
-// n = how many of the row's frames are also referenced elsewhere, co = one
-// counterpart membership to point at. The row itself only carries the mark;
+// `shared` = the row's frames whose source has another holder. Counterparts
+// are counted PER STACK - `4 frame(s) shared - 2 with "D1", 2 with "D2"` -
+// never the row-wide total pinned on whichever holder happens to sit first
+// in app.images; a single frame names ALL its other holders. At most 3 are
+// named, the rest are "(+N more)". The row itself only carries the mark;
 // WHO ELSE has the pixels is said here, in reading order.
-static std::string filesShareSentence(int n, const ImageDoc* co) {
-    std::string s = *shareGlyph() ? std::string(shareGlyph()) + " shared" : "shared";
-    if (!co) return s;
-    const App::SeqInfo* osi = co->seqId ? seqInfo(co->seqId) : nullptr;
-    const std::string where = osi ? osi->name : co->name;
+static std::string filesShareSentence(const std::vector<const ImageDoc*>& shared) {
+    if (shared.empty()) return "";
+    struct CP { const ImageDoc* rep; int frames; };
+    std::vector<uint64_t> keys;            // stack seqId / loose uid, first-seen
+    std::vector<CP> cps;
+    for (const ImageDoc* f : shared) {
+        std::vector<uint64_t> seenHere;    // one count per counterpart per frame
+        for (const auto& e : app.images) {
+            if (e.get() == f || e->src->srcId != f->src->srcId) continue;
+            if (f->seqId && e->seqId == f->seqId) continue;   // the row itself
+            uint64_t key = e->seqId ? ((uint64_t)1 << 63) | (uint64_t)e->seqId
+                                    : e->uid;
+            if (std::find(seenHere.begin(), seenHere.end(), key) != seenHere.end())
+                continue;
+            seenHere.push_back(key);
+            size_t k = std::find(keys.begin(), keys.end(), key) - keys.begin();
+            if (k == keys.size()) { keys.push_back(key); cps.push_back({ e.get(), 0 }); }
+            cps[k].frames++;
+        }
+    }
+    if (cps.empty()) return "";
+    const int n = (int)shared.size();
+    std::string s = *shareGlyph() ? std::string(shareGlyph()) + " " : "";
     char b[320];
-    if (n == 1 && co->seqId)
-        snprintf(b, sizeof b, " - also frame %d of \"%s\"", co->seqIndex, where.c_str());
-    else if (n == 1)
-        snprintf(b, sizeof b, " - also open as \"%s\"", where.c_str());
-    else
-        snprintf(b, sizeof b, " - %d frame(s) also in \"%s\"", n, where.c_str());
-    return s + b;
+    if (n == 1) {
+        s += "shared - also ";
+    } else {
+        snprintf(b, sizeof b, "%d frame(s) shared - ", n);
+        s += b;
+    }
+    const int named = std::min((int)cps.size(), 3);
+    for (int k = 0; k < named; k++) {
+        const ImageDoc* rep = cps[k].rep;
+        const App::SeqInfo* osi = rep->seqId ? seqInfo(rep->seqId) : nullptr;
+        const std::string where = osi ? osi->name : rep->name;
+        if (k) s += ", ";
+        if (n == 1 && rep->seqId)
+            snprintf(b, sizeof b, "frame %d of \"%s\"", rep->seqIndex, where.c_str());
+        else if (n == 1)
+            snprintf(b, sizeof b, "open as \"%s\"", where.c_str());
+        else
+            snprintf(b, sizeof b, "%d with \"%s\"", cps[k].frames, where.c_str());
+        s += b;
+    }
+    if ((int)cps.size() > named)
+        s += " (+" + std::to_string((int)cps.size() - named) + " more)";
+    return s;
 }
 
 static void drawFileList() {
@@ -18902,14 +19007,8 @@ static void drawFileList() {
             std::string share;                 // §4: this frame's pixels, elsewhere
             {
                 auto sh = srcOwners.find(head.src->srcId);
-                if (sh != srcOwners.end() && sh->second > 1) {
-                    const ImageDoc* co = nullptr;
-                    for (const auto& e : app.images)
-                        if (e.get() != &head && e->src->srcId == head.src->srcId) {
-                            co = e.get(); break;
-                        }
-                    share = filesShareSentence(1, co);
-                }
+                if (sh != srcOwners.end() && sh->second > 1)
+                    share = filesShareSentence({ &head });
             }
             if (head.preview) ImGui::PushStyleColor(ImGuiCol_Text,
                                                     ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -19020,20 +19119,14 @@ static void drawFileList() {
           }
           std::string share;                   // §4: any member's pixels, elsewhere
           {
-              int sharedN = 0;
-              const ImageDoc* co = nullptr;    // one counterpart, for the tooltip
+              std::vector<const ImageDoc*> sharedFrames;
               for (int fidx : stack) {
                   const ImageDoc& f = *app.images[fidx];
                   auto sh = srcOwners.find(f.src->srcId);
-                  if (sh == srcOwners.end() || sh->second < 2) continue;
-                  sharedN++;
-                  if (!co)
-                      for (const auto& e : app.images)
-                          if (e.get() != &f && e->src->srcId == f.src->srcId) {
-                              co = e.get(); break;
-                          }
+                  if (sh != srcOwners.end() && sh->second > 1)
+                      sharedFrames.push_back(&f);
               }
-              if (sharedN) share = filesShareSentence(sharedN, co);
+              if (!sharedFrames.empty()) share = filesShareSentence(sharedFrames);
           }
           if (rowWithMeta(head, lb, active, frames, badge, !cmpOn, share)) {
               selectImage(stack[pos]);
@@ -25448,6 +25541,180 @@ int main(int argc, char** argv) {
                 closeAll();
                 std::filesystem::remove_all(pathFromUtf8(fxroot), ec);
             }
+        }
+
+        // ---- V20: the close notice is scoped to the USER ACTION and the share
+        // text names every counterpart (review findings 3/4/5/6/17/18/19/20/26).
+        // (a) one batch holding a source stack AND its derived stack (the
+        //     derive default): the batch close frees everything, so the close
+        //     must read as freed - no toast may name the derived stack as a
+        //     survivor the same action then frees.
+        reload();
+        {
+            int s0 = app.seqs[0].id;
+            const int n0 = (int)framesOfSeq(s0).size();
+            DerivePlan P = buildDerivePlan(s0, DR_RANGE, 0, 0, n0 - 1, nullptr);
+            int did = applyDerivePlan(P, false);           // same batch as the source
+            check(did != 0 && seqInfo(did) != nullptr, "V20a derived stack lands");
+            const int batch = app.images[framesOfSeq(s0).front()]->batchId;
+            const size_t logBefore = app.msgLog.size();
+            closeBatch(batch);
+            std::string lied;                              // any survivor claim spoken
+            for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                if (app.msgLog[i].text.find("still referenced") != std::string::npos)
+                    lied = app.msgLog[i].text;
+            fprintf(stderr, "verifyselftest: V20a batch(source+derived) closed: docs %d, "
+                            "note '%s', survivor-toast '%s'\n",
+                    (int)app.images.size(), g_lastCloseNote.c_str(), lied.c_str());
+            check(g_lastCloseNote.empty() && lied.empty(),
+                  "V20a source+derived batch close reads as freed");
+        }
+        // (b) a LOOSE frame (seqId==0) whose pixels survive in a stack: its
+        //     close says the survival sentence too (finding 18) - and while
+        //     TWO other holders exist, the single-frame tooltip names both
+        //     (finding 17), not just the first one found.
+        reload();
+        {
+            int s0 = app.seqs[0].id;
+            const std::string s0name = seqInfo(s0)->name;
+            const FrameSource* msrc = app.images[framesOfSeq(s0).front()]->src.get();
+            const std::string mpath = msrc->path;
+            std::string e1 = loadNpy(mpath);               // loose holder #1
+            ImageDoc* l1 = app.images.back().get();
+            std::string e2 = loadNpy(mpath);               // loose holder #2
+            check(e1.empty() && e2.empty() && l1->seqId == 0 &&
+                  l1->src.get() == msrc,
+                  "V20b loose re-open adopts the stack's source");
+            std::string sent = filesShareSentence({ l1 });
+            std::string wantStack = "frame 0 of \"" + s0name + "\"";
+            std::string wantLoose = "open as \"" + std::string(l1->name) + "\"";
+            fprintf(stderr, "verifyselftest: V20b single-frame sentence: '%s' "
+                            "(want both '%s' and '%s')\n",
+                    sent.c_str(), wantStack.c_str(), wantLoose.c_str());
+            check(sent.find(wantStack) != std::string::npos &&
+                  sent.find(wantLoose) != std::string::npos,
+                  "V20b single-frame tooltip names ALL other holders");
+            // close loose holder #2 first (silently sharing on), then #1: both
+            // closes leave survivors, so both must say so
+            selectImage((int)app.images.size() - 1);       // l2
+            closeCurrent();
+            g_lastCloseNote = "unwritten";
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i].get() == l1) { selectImage(i); break; }
+            closeCurrent();                                // Ctrl+W on the loose frame
+            fprintf(stderr, "verifyselftest: V20b loose close note: '%s'\n",
+                    g_lastCloseNote.c_str());
+            check(g_lastCloseNote.find("still referenced by") != std::string::npos,
+                  "V20b loose-frame close says its sharer survives");
+        }
+        // (c) the stack row's tooltip with the sharing SPLIT over two derived
+        //     stacks: per-counterpart counts, never the row-wide total pinned
+        //     on whichever counterpart sits first in app.images (findings 3/17).
+        reload();
+        {
+            int s0 = app.seqs[0].id;
+            DerivePlan P1 = buildDerivePlan(s0, DR_RANGE, 0, 0, 1, nullptr);
+            int d1 = applyDerivePlan(P1, false);
+            DerivePlan P2 = buildDerivePlan(s0, DR_RANGE, 0, 2, 3, nullptr);
+            int d2 = applyDerivePlan(P2, false);
+            check(d1 != 0 && d2 != 0, "V20c two partial derived stacks land");
+            const std::string n1 = seqInfo(d1)->name, n2 = seqInfo(d2)->name;
+            // the row's sentence, built exactly as drawFileList builds it
+            std::unordered_map<uint64_t, int> owners;
+            for (const auto& d : app.images) owners[d->src->srcId]++;
+            std::vector<const ImageDoc*> sharedFrames;
+            for (int fidx : framesOfSeq(s0)) {
+                const ImageDoc& f = *app.images[fidx];
+                auto sh = owners.find(f.src->srcId);
+                if (sh != owners.end() && sh->second > 1)
+                    sharedFrames.push_back(&f);
+            }
+            std::string sent = filesShareSentence(sharedFrames);
+            const std::string w1 = "2 with \"" + n1 + "\"";
+            const std::string w2 = "2 with \"" + n2 + "\"";
+            fprintf(stderr, "verifyselftest: V20c stack-row sentence: '%s' "
+                            "(want '4 frame(s) shared', '%s', '%s')\n",
+                    sent.c_str(), w1.c_str(), w2.c_str());
+            check(sent.find("4 frame(s) shared") != std::string::npos &&
+                  sent.find(w1) != std::string::npos &&
+                  sent.find(w2) != std::string::npos,
+                  "V20c tooltip counts per counterpart stack");
+        }
+        // (d) the compare chip resolves slots THROUGH follow-frame, exactly as
+        //     the panes do (findings 5/19): a dormant slot (A standing on the
+        //     pin - resolveSlots compares nothing) says nothing, and a pin
+        //     that follow-resolves onto A's twin frame says the share even
+        //     though the PINNED frame's pixels differ from A's.
+        reload();
+        {
+            openFolder(g_verifySelftest);                  // twins: same folder again
+            if (app.folderPickOpen) pickerAccept();
+            loadAll();
+            int s0 = app.seqs[0].id;
+            std::vector<int> f0 = framesOfSeq(s0);
+            int twinSeq = 0;                               // second open of stack 0
+            for (const auto& d : app.images)
+                if (d->seqId != s0 && d->seqId != 0 &&
+                    d->src.get() == app.images[f0[0]]->src.get())
+                    twinSeq = d->seqId;
+            int s1 = 0;                                    // an UNRELATED stack for B
+            for (const auto& s : app.seqs)
+                if (s.id != s0 && s.id != twinSeq) { s1 = s.id; break; }
+            check(twinSeq != 0 && s1 != 0, "V20d twin stack and a B stack exist");
+            app.compareFollowFrame = true;
+            for (int idx : f0)
+                if (app.images[idx]->seqIndex == 1) { selectImage(idx); break; }
+            ImageDoc* bpick = nullptr;
+            for (int idx : framesOfSeq(s1))
+                if (app.images[idx]->seqIndex == 1) bpick = app.images[idx].get();
+            setCompareB(bpick);
+            app.compareMode = App::CmpWipe;
+            app.cmpExtra.clear();
+            app.cmpExtra.push_back(cur()->uid);            // pin C = A itself: dormant
+            std::string chipDormant = abStatusChipText();
+            app.cmpExtra.clear();
+            for (int idx : framesOfSeq(twinSeq))           // pin C = twin frame 3...
+                if (app.images[idx]->seqIndex == 3)
+                    app.cmpExtra.push_back(app.images[idx]->uid);
+            std::string chipFollow = abStatusChipText();   // ...pane shows twin frame 1
+            fprintf(stderr, "verifyselftest: V20d chip dormant '%s' | followed '%s'\n",
+                    chipDormant.c_str(), chipFollow.c_str());
+            check(chipDormant.find("share the same pixels") == std::string::npos,
+                  "V20d dormant slot says nothing");
+            check(chipFollow.find("A and C share the same pixels") != std::string::npos,
+                  "V20d chip speaks for the RESOLVED slot frame");
+            app.cmpExtra.clear();
+            app.compareMode = App::CmpOff;
+            app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+        }
+        // (e) sources held only by an in-flight load's decoded-but-not-landed
+        //     queue count as ALIVE (finding 26): "N frame(s) freed" must not
+        //     overstate while the loader still holds the shared_ptr.
+        reload();
+        {
+            int s0 = app.seqs[0].id, s1 = app.seqs[1].id;
+            std::vector<int> f0 = framesOfSeq(s0);
+            {   // white-box: what the seq worker queues after ADOPTING s0's
+                // first source for a second open of the same folder
+                auto qd = std::make_unique<ImageDoc>();
+                qd->src = app.images[f0[0]]->src;
+                qd->syncMirrors();
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.emplace_back(0, std::move(qd));
+            }
+            app.seqLoadingId = s1;                         // loading ANOTHER stack
+            closeStack(s0);
+            std::string note = g_lastCloseNote;
+            app.seqLoadingId = 0;
+            {   // only what this test queued
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.clear();
+            }
+            fprintf(stderr, "verifyselftest: V20e close under in-flight adoption: "
+                            "note '%s'\n", note.c_str());
+            check(note.find("4 frame(s) freed") != std::string::npos &&
+                  note.find("1 still referenced by") != std::string::npos,
+                  "V20e queued-but-not-landed holder counts as alive");
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
