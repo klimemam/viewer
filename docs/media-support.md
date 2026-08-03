@@ -66,6 +66,12 @@ TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../core/remote_pr
 
 ## 2. 動画再生(再生だけ)
 
+> **この節は [docs/video-support.md](video-support.md) に引き継がれ、推奨は覆った。**
+> 本節は「画素が測定値かどうか」を問わないまま依存だけを比較していた。実測すると
+> 8-bit lossy 動画は既知の σ_t 40 DN16 を **0.00** にする(消滅させる)。
+> 結論は **(d) ffmpeg-pipe → 却下 / v1 は y4m 直読 + 非可逆コンテナは名指しで拒否**。
+> 変更点の一覧は video-support.md 末尾の表。以下は経緯として残す。
+
 IQ エンジニアが動画にすること = scrub / frame step / A/B 比較 / per-frame stats。
 これは**既存の stack モデルそのもの**(動画 = 遅延デコードされる stack)。
 リアルタイム再生・音声は要件ではない。
