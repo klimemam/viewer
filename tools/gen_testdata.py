@@ -1,10 +1,22 @@
-"""Generate test data for the native viewer (npy / raw)."""
+"""Generate test data for the native viewer (npy / raw).
+
+    python tools/gen_testdata.py [outdir] [--bench]
+
+Every fixture the selftests need is written here, deterministically (fixed
+rng seeds), so CI can regenerate the lot from a clean checkout - nothing under
+tools/testdata is in git. `--bench` adds the two large arrays the frame-time
+gate uses; they are ~90 MB and no selftest needs them, so they are opt-in.
+"""
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 
-out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "testdata"
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+WANT_BENCH = "--bench" in sys.argv[1:]
+
+out = Path(_args[0]) if _args else Path(__file__).parent / "testdata"
 out.mkdir(exist_ok=True)
 
 H, W = 480, 640
@@ -142,6 +154,111 @@ for sub in ("00", "01", "02"):
         np.save(d / f"frame_{k:03d}.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
     np.save(d / "average.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
 
+# ---------------------------------------------------------------------------
+# Fixtures the selftests take as their <dir> argument. These were hand-made in
+# a scratch directory until CI needed them; they are generated here now so
+# `tools/run_selftests.sh` works on a clean checkout on any machine.
+# ---------------------------------------------------------------------------
+
+def fresh(p):
+    """Rebuild a fixture tree from scratch.
+
+    These four are counted, not just read: --lin asserts exactly 7 levels,
+    --sweepfile exactly 7 folders, --close exactly 3 stacks, --picker exactly
+    3 batches. A leftover directory from an older layout is a false FAIL that
+    costs an hour to find, so the tree is removed before it is rewritten.
+    """
+    shutil.rmtree(p, ignore_errors=True)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# multi/ - three stacks of five identically-named frames, at three levels.
+# The workhorse fixture: --range (2 stacks, 2+ frames each, same frame names),
+# --abstats (2 stacks), --close and --verify (3 stacks), --batch (the picker
+# must open on it), --export (a stack with 2+ frames), --tile (4+ images in one
+# named batch) and --export-tsv (2+ stacks) all run against it.
+# NOTE --close-selftest also browses <multi>/../rb/scanroot and --verify-selftest
+# loads <multi>/../cfa_big_rggb_2064x1032_u16.npy, so multi must stay a direct
+# child of the testdata root, next to those two.
+multi = fresh(out / "multi")
+rng5 = np.random.default_rng(31)
+MH, MW = 64, 80
+fixed_m = rng5.normal(0, 13.5, (MH, MW))       # fixed pattern, same every frame
+for i, level in enumerate((1000.0, 1200.0, 1400.0)):
+    d = multi / f"{i:02d}"
+    d.mkdir(parents=True, exist_ok=True)
+    for k in range(5):
+        frame = level + fixed_m + rng5.normal(0, 28.0, (MH, MW))
+        np.save(d / f"frame_{k:03d}.npy", frame.astype(np.float32))
+
+# linset/ - a linearity sweep, root/<level>lx/frame_XXX.npy, with ground truth
+# the fit must recover. --lin-selftest hard-codes this signature (7 levels
+# including a 0 lx dark, 24 frames each, 4 CFA planes, unit "lx") and checks
+# the recovered SNR curve against the injected model to 2% / 3%; --series and
+# --scan run over the same tree, --framestats over linset/80lx alone.
+#   per RGGB plane p:  mean = SENS[p]*level + OFFSET
+#                      sigma_t^2 = K*(mean - OFFSET) + READ^2   (photon transfer)
+LIN_LEVELS = [0, 10, 20, 40, 80, 160, 320]     # lx; the 0 is the measured dark
+LIN_SENS = [8.0, 10.0, 10.0, 6.0]              # DN/lx per plane, RGGB
+LIN_OFFSET, LIN_K, LIN_READ, LIN_NFR = 64.0, 2.0, 3.0, 24
+LH = LW = 64
+linset = fresh(out / "linset")
+rng6 = np.random.default_rng(7)
+lyy, lxx = np.mgrid[0:LH, 0:LW]
+sens_map = np.array(LIN_SENS)[(lyy % 2) * 2 + (lxx % 2)]   # RGGB -> R Gr Gb B
+for lv in LIN_LEVELS:
+    d = linset / f"{lv}lx"
+    d.mkdir(parents=True, exist_ok=True)
+    signal = sens_map * lv                                  # DN above offset
+    sigma = np.sqrt(LIN_K * signal + LIN_READ ** 2)         # DN, temporal
+    for i in range(LIN_NFR):
+        f = LIN_OFFSET + signal + rng6.normal(0.0, 1.0, (LH, LW)) * sigma
+        np.save(d / f"frame_{i:03d}.npy", f.astype(np.float32))
+
+# abset/ - A/B variants of the same numbering in ONE directory, for
+# --picker-selftest: UC3 filters "_A" (must cut the file list), UC6 filters
+# "00_A" (must cut exactly one group down to a single 2-D frame, which cannot
+# join a sweep) and UC2 merges everything into one stack. Flat constant values
+# make "which files actually loaded" readable in the failure output.
+abset = fresh(out / "abset")
+for k in range(3):
+    np.save(abset / f"{k:02d}_A.npy", np.full((8, 8), float(k), np.float32))
+    np.save(abset / f"{k:02d}_B.npy", np.full((8, 8), 100.0 + k, np.float32))
+
+# levelfiles/ - the same sweep as linset laid out as ONE multi-frame .npy per
+# level, which is the layout --sweepfile-selftest exists to cover. It asserts
+# the folder names literally (lv000..lv320, lowercase) and re-derives the
+# injected physics: sens 8 DN/lx, offset 64 DN, K 2 DN/e-, read 3 DN. Single
+# plane here - no CFA, one axis at a time.
+SWEEP_LEVELS = [0, 10, 20, 40, 80, 160, 320]
+SW_SENS, SW_OFFSET, SW_K, SW_READ, SW_NFR = 8.0, 64.0, 2.0, 3.0, 8
+SH = SW = 32
+levelfiles = fresh(out / "levelfiles")
+rng7 = np.random.default_rng(4242)
+for lv in SWEEP_LEVELS:
+    d = levelfiles / f"lv{lv:03d}"
+    d.mkdir(parents=True, exist_ok=True)
+    signal = SW_SENS * lv
+    var = SW_K * signal + SW_READ ** 2
+    frames = SW_OFFSET + signal + rng7.normal(0.0, np.sqrt(var), (SW_NFR, SH, SW))
+    np.save(d / "capture.npy", frames.astype(np.float32))   # frames on axis 0
+
+# bench_stack.npy - a real multi-frame stack over the wire for
+# --remote-selftest (it asks the local peer for META/LIST and compares against
+# the local decoder), and the second image of the --bench A/B pass.
+np.save(out / "bench_stack.npy",
+        (np.random.default_rng(1).random((120, 256, 320)) * 4095).astype(np.float32))
+
+if WANT_BENCH:
+    # only the frame-time gate needs this one, and it is 48 MB
+    np.save(out / "bench_big.npy",
+            (np.random.default_rng(0).random((3000, 4000)) * 4095).astype(np.float32))
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
-    print(" ", p.name, p.stat().st_size, "bytes")
+    if p.is_dir():
+        n = sum(1 for _ in p.rglob("*") if _.is_file())
+        print(" ", p.name + "/", n, "files")
+    else:
+        print(" ", p.name, p.stat().st_size, "bytes")

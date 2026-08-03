@@ -208,3 +208,110 @@ viewer_add_plugin(analyzer_prnu       plugins/analyzer_prnu.c)
 viewer_add_plugin(analyzer_sharpness  plugins/analyzer_sharpness.c)
 viewer_add_plugin(analyzer_esfr       plugins/analyzer_esfr.c)
 viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
+
+# ---- selftests as ctest tests ---------------------------------------------
+# The binary carries 22 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# tools/run_selftests.sh, that script runs ctest, and a developer runs the same
+# script to get exactly what CI got. There is no second copy of the argument
+# lists anywhere - adding a test here adds it to CI.
+#
+# Fixtures come from tools/gen_testdata.py and are deterministic (fixed rng
+# seeds). tools/testdata/ is gitignored: nothing binary is committed, and CI
+# regenerates the whole tree on every run.
+enable_testing()
+
+# Only --remote-selftest returns before glfwCreateWindow(). The other 21 build
+# a real GLFW window and an OpenGL context - most of them VISIBLE, since
+# GLFW_VISIBLE is only cleared for --bench and --browse-keys-selftest - so on a
+# headless Linux box they need a display. Each test gets its own server via
+# `xvfb-run -a` rather than sharing one, so a server that dies takes one test
+# with it instead of the rest of the run.
+set(VIEWER_TEST_LAUNCHER "")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_program(XVFB_RUN xvfb-run)
+  if(XVFB_RUN)
+    set(VIEWER_TEST_LAUNCHER ${XVFB_RUN} -a "--server-args=-screen 0 1920x1200x24")
+  else()
+    message(STATUS "selftests: xvfb-run not found - the GUI selftests will need "
+                   "a real DISPLAY on this machine")
+  endif()
+endif()
+
+# Hermetic config dir. docs/verify-functional.md E-5: a scripted selftest that
+# does not blank io.IniFilename writes the OPERATOR'S real
+# %APPDATA%/viewer/layout.ini, and claimAutosaveSlot() drops a lock file there
+# for every run. Pointing the config dir into the build tree keeps `ctest` from
+# editing the developer's saved layout, and keeps a stale layout from deciding
+# where a scripted click lands.
+set(VIEWER_TEST_HOME ${CMAKE_BINARY_DIR}/selftest-home)
+file(MAKE_DIRECTORY ${VIEWER_TEST_HOME})
+
+# Relative fixture paths + WORKING_DIRECTORY at the source root, because
+# --picker-selftest falls back to the literal "tools/testdata/batchset" when
+# batchset is not a sibling of its own argument.
+function(viewer_selftest name)
+  add_test(NAME selftest.${name}
+           COMMAND ${VIEWER_TEST_LAUNCHER} $<TARGET_FILE:viewer> ${ARGN})
+  set_tests_properties(selftest.${name} PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
+    LABELS selftest
+    TIMEOUT 900)                 # the loaders' own budgets are 120-600 s
+endfunction()
+
+viewer_selftest(series      --series-selftest tools/testdata/linset)
+viewer_selftest(lin         --lin-selftest --sequence always
+                            --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
+viewer_selftest(browse      --browse-selftest tools/testdata/rb)
+viewer_selftest(browse-keys --browse-keys-selftest tools/testdata/rb)
+viewer_selftest(abstats     --abstats-selftest tools/testdata/multi)
+viewer_selftest(range       --range-selftest tools/testdata/multi)
+viewer_selftest(close       --close-selftest tools/testdata/multi)
+viewer_selftest(batch       --batch-selftest tools/testdata/multi)
+viewer_selftest(picker      --picker-selftest tools/testdata/abset)
+viewer_selftest(verify      --verify-selftest tools/testdata/multi)
+viewer_selftest(scan        --scan-selftest tools/testdata/linset)
+viewer_selftest(localbrowse --localbrowse-selftest tools/testdata/rb)
+viewer_selftest(rtemporal   --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
+viewer_selftest(framestats  --sequence always
+                            --framestats-selftest tools/testdata/linset/80lx)
+viewer_selftest(export      --export-selftest tools/testdata/multi --sequence always)
+viewer_selftest(tile        --tile-selftest tools/testdata/multi)
+viewer_selftest(derive      --derive-selftest tools/testdata)
+viewer_selftest(export-tsv  --export-tsv-selftest tools/testdata/multi --sequence always
+                            --cfa bayer --bayer-pattern RGGB)
+viewer_selftest(frame-lin   --frame-lin-selftest tools/testdata)
+viewer_selftest(newwin      --newwin-selftest tools/testdata)
+# The 22nd flag, which the scratchpad orchestrator never ran: its fixture
+# (levelfiles/) was hand-made and lived outside the repo. gen_testdata.py
+# writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
+viewer_selftest(sweepfile   --sweepfile-selftest tools/testdata/levelfiles)
+
+# --remote-selftest is the one flag that returns before glfwInit(), so it needs
+# no display - and it must be told where the standalone peer is, or it silently
+# tests this binary against itself instead of viewer-serve.
+add_test(NAME selftest.remote
+         COMMAND $<TARGET_FILE:viewer> --remote-selftest tools/testdata/bench_stack.npy
+                 --remote-exe $<TARGET_FILE:viewer-serve>)
+set_tests_properties(selftest.remote PROPERTIES
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
+  LABELS selftest
+  TIMEOUT 900)
+
+# ---- QUARANTINE -----------------------------------------------------------
+# Named, reasoned, and reported - never deleted and never loosened.
+#
+# docs/tasks.csv:73  "abstats A2既知失敗 / --cfa bayer併用時のB σ_t 1e-6不一致
+# (スイート外) / 原因未調査".  The A2 assert compares the B slot's cached
+# sigma_t against an independent recompute at 1e-6 relative; with --cfa bayer
+# it was recorded as mismatching. It is NOT reproducible on this build: 10 runs
+# out of 10 pass on MinGW against merged main, with both the generated and the
+# original hand-made multi/ fixture. So it is either already fixed by another
+# change or it is intermittent, and nobody has established which. Until someone
+# does, it stays out of the gate rather than being allowed to redden the matrix
+# at random. tools/run_selftests.sh prints this quarantine on every run.
+viewer_selftest(abstats-cfa-bayer --abstats-selftest --cfa bayer tools/testdata/multi)
+set_tests_properties(selftest.abstats-cfa-bayer PROPERTIES
+  DISABLED TRUE
+  LABELS "selftest;quarantine")
