@@ -69,7 +69,7 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
-                      core/window_frame.cpp core/version.cpp
+                      core/window_frame.cpp core/version.cpp core/adapter.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
 # configure-time hash goes stale the moment you commit, and this string is

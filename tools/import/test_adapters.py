@@ -581,8 +581,15 @@ def load(path):
 
 
 @case
-def harness_drops_unitless_values():
-    """4.3.2: an axis with no unit is not applied -- the same rule a pasted column obeys."""
+def harness_carries_unitless_values():
+    """4.3.2: an axis with no unit is not applied -- but its values are NOT discarded.
+
+    "not applied" and "not carried" are different things, and 4.3.2 is explicit
+    about which one this is: the axis does not label anything until a unit
+    exists, and the numbers travel anyway so the user can supply the unit in the
+    UI instead of retyping measurements.  The empty unit is what says "not
+    applied"; the summary still counts it as skipped.
+    """
     need_numpy(); need_runner()
     path, _ = sample_npz((6, 4, 5))
     src = """
@@ -593,7 +600,11 @@ def load(path):
 """
     proc, out = run_adapter(src, "load", path)
     m = members(out)
-    assert "__timestamps_values_0" not in m, "an axis with no unit must not be applied"
+    assert np.array_equal(m["__timestamps_values_0"], np.arange(6.0)), \
+        "4.3.2: the values must survive a missing unit"
+    assert scalar(m, "__timestamps_unit_0") == "", \
+        "an empty unit is what records that the axis is not applied"
+    assert scalar(m, "__timestamps_name_0") == "time"
     assert "no unit" in scalar(m, "__note_0"), scalar(m, "__note_0")
     assert "skipped" in proc.stderr
 
