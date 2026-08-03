@@ -4586,6 +4586,155 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn);
 
+// ---- the framed stream ------------------------------------------------------
+// What the harness writes with --stream: a line-based header, then the pixel
+// blobs raw and in the order their `pixels` lines named them. An npz cannot be
+// streamed - its directory is at the END, so reading one means holding all of
+// it, which is the buffer this exists to remove.
+//
+// Header rules are the session file's: one key per line, the value is the rest
+// of the line, and a key this build does not know is skipped rather than
+// refused, so an older viewer still reads what it does understand.
+static const int VIEWER_STREAM_VERSION = 1;
+
+// A .npy header for a blob the stream described, written into space reserved at
+// the front of the SAME buffer the bytes are read into. That is what lets the
+// existing decoder be used unchanged and without a second copy of the pixels:
+// the read lands directly where the decoder will look for it.
+static size_t writeNpyHeaderFor(std::vector<uint8_t>& buf, const std::string& dtype,
+                                const std::vector<int64_t>& shape) {
+    std::string d = "{'descr': '<" + dtype + "', 'fortran_order': False, 'shape': (";
+    for (size_t i = 0; i < shape.size(); i++) {
+        d += std::to_string(shape[i]);
+        if (i + 1 < shape.size() || shape.size() == 1) d += ",";
+        if (i + 1 < shape.size()) d += " ";
+    }
+    d += "), }";
+    size_t pre = 10;                       // magic(6) + version(2) + len(2)
+    while ((pre + d.size() + 1) % 64) d += ' ';
+    d += '\n';
+    buf.resize(pre + d.size());
+    const char magic[] = "\x93NUMPY";
+    memcpy(buf.data(), magic, 6);
+    buf[6] = 1; buf[7] = 0;
+    uint16_t hlen = (uint16_t)d.size();
+    buf[8] = (uint8_t)(hlen & 0xff);
+    buf[9] = (uint8_t)(hlen >> 8);
+    memcpy(buf.data() + pre, d.data(), d.size());
+    return buf.size();
+}
+
+struct VnzBlob { int node = 0; std::string dtype; std::vector<int64_t> shape; uint64_t nbytes = 0; };
+
+static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
+                                    const std::string& origin) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote: " + path;
+    std::string line;
+    if (!std::getline(f, line)) return "the reader produced nothing";
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    int ver = 0;
+    if (sscanf(line.c_str(), "VIEWERSTREAM %d", &ver) != 1)
+        return "not a viewer stream: first line is \"" + line.substr(0, 60) + "\"";
+    if (ver > VIEWER_STREAM_VERSION)
+        return "this stream is version " + std::to_string(ver) + " and this viewer reads " +
+               std::to_string(VIEWER_STREAM_VERSION);
+
+    std::vector<VnzNode> nodes;
+    std::vector<VnzBlob> blobs;
+    std::vector<std::pair<std::string, std::string>> meta;
+    int n = -1;
+    auto need = [&](int i) -> VnzNode* {
+        if (i < 0 || i >= n) return nullptr;
+        return &nodes[(size_t)i];
+    };
+    bool sawEnd = false;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "end") { sawEnd = true; break; }
+        size_t sp = line.find(' ');
+        std::string key = sp == std::string::npos ? line : line.substr(0, sp);
+        std::string rest = sp == std::string::npos ? std::string() : line.substr(sp + 1);
+        if (key == "n") {
+            n = atoi(rest.c_str());
+            if (n <= 0 || n > 100000) return "n is " + rest + ": not a node count";
+            nodes.assign((size_t)n, VnzNode{});
+            continue;
+        }
+        if (n < 0) return "the stream declares its nodes before it describes them (n is missing)";
+        size_t sp2 = rest.find(' ');
+        int idx = atoi(rest.c_str());
+        std::string val = sp2 == std::string::npos ? std::string() : rest.substr(sp2 + 1);
+        VnzNode* v = need(idx);
+        if (!v) continue;                       // a node this build does not have
+        auto nums = [&](const std::string& s, std::vector<double>& out) {
+            std::istringstream is(s);
+            size_t cnt = 0;
+            is >> cnt;
+            out.clear();
+            double d;
+            while (out.size() < cnt && is >> d) out.push_back(d);
+        };
+        if      (key == "layer")  v->layer = val;
+        else if (key == "parent") v->parent = atoi(val.c_str());
+        else if (key == "name")   v->name = val;
+        else if (key == "note")   v->note = val;
+        else if (key == "cfa")    v->cfa = val;
+        else if (key == "range")  nums(val, v->range);
+        else if (key == "timestamps") { nums(val, v->tsVals);   v->hasTs = true; }
+        else if (key == "conditions") { nums(val, v->condVals); v->hasCond = true; }
+        else if (key == "timestamps_name") v->tsName = val;
+        else if (key == "timestamps_unit") v->tsUnit = val;
+        else if (key == "conditions_name") v->condName = val;
+        else if (key == "conditions_unit") v->condUnit = val;
+        else if (key == "meta") {
+            size_t s3 = val.find(' ');
+            if (s3 != std::string::npos)
+                meta.emplace_back(val.substr(0, s3), val.substr(s3 + 1));
+        }
+        else if (key == "pixels") {
+            VnzBlob b;
+            b.node = idx;
+            std::istringstream is(val);
+            int ndim = 0;
+            is >> b.dtype >> ndim;
+            for (int k = 0; k < ndim; k++) { int64_t d = 0; is >> d; b.shape.push_back(d); }
+            is >> b.nbytes;
+            v->hasPixels = true;
+            v->pixelEntry = blobs.size();
+            blobs.push_back(b);
+        }
+        // any other key: skipped on purpose, see the header comment
+    }
+    if (!sawEnd) return "the stream stopped before its header ended - the reader was cut short";
+    if (n < 0) return "the stream never said how many nodes it has";
+
+    // The blobs follow, in order. Read one, hand it to the same decoder a loose
+    // .npy goes through, move on: only one blob is in memory at a time.
+    size_t next = 0;
+    return vnzBuild(nodes, n, origin, readerSpec,
+                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
+                        std::string& e) -> bool {
+                        if (v.pixelEntry != next) {
+                            e = "the stream's blobs are out of order";
+                            return false;
+                        }
+                        const VnzBlob& b = blobs[v.pixelEntry];
+                        size_t pre = writeNpyHeaderFor(out, b.dtype, b.shape);
+                        out.resize(pre + (size_t)b.nbytes);
+                        f.read((char*)out.data() + pre, (std::streamsize)b.nbytes);
+                        if ((uint64_t)f.gcount() != b.nbytes) {
+                            e = "the stream ended " +
+                                std::to_string(b.nbytes - (uint64_t)f.gcount()) +
+                                " byte(s) short of what it declared";
+                            return false;
+                        }
+                        next++;
+                        return true;
+                    },
+                    meta);
+}
+
 static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
                                  const std::vector<NpzEntry>& entries, int version,
                                  const std::string& readerSpec, const std::string& origin) {
@@ -6328,12 +6477,15 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     std::string cacheDir = adapterCacheDir();
     std::string cached;
     if (!cacheDir.empty())
-        cached = (pathFromUtf8(cacheDir) / (adapterCacheKey(src, spec) + ".npz")).u8string();
+        // .vstream, not .npz: the cache now holds the framed stream, and an npz
+        // left by an older build must not be handed to the stream reader. A
+        // stale one is simply not found, so the reader runs again.
+        cached = (pathFromUtf8(cacheDir) / (adapterCacheKey(src, spec) + ".vstream")).u8string();
     std::error_code ec;
     if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
         // §7 stage 5: the second open does not start Python. The key already
         // covers the adapter's mtime, so "cached" cannot mean "stale".
-        std::string lerr = loadNpz(cached, "", 0, spec, src);
+        std::string lerr = loadViewerStream(cached, spec, src);
         if (lerr.empty()) {
             rememberReader(src, spec);
             app.readerLastOk = true;
@@ -6348,14 +6500,17 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (out.empty()) {
         std::filesystem::path t = std::filesystem::temp_directory_path(ec);
         char nm[64];
-        snprintf(nm, sizeof nm, "viewer_adapter_%llx.npz",
+        snprintf(nm, sizeof nm, "viewer_adapter_%llx.vstream",
                  (unsigned long long)adapterHash(src + spec));
         out = (t / nm).u8string();
     }
     // -u: unbuffered. Without it Python holds print() in a buffer until it
     // exits, so a reader that reports its progress reports all of it at the end,
     // which is the one moment the progress is worthless.
-    std::vector<std::string> argv = { py, "-u", script, spec, src, "-o", out };
+    // --stream: the result comes back on stdout, framed, and the run captures
+    // stdout straight to `out`. No npz is written and none is read: the zip
+    // container cost 1.45 ms per MB of pixels for nothing.
+    std::vector<std::string> argv = { py, "-u", script, spec, src, "--stream" };
     // §4.13: the exact command, before it runs - every time, not only the first.
     // The picker shows it in front of the user for a reader they have not used
     // before; this is the durable record, so "what did it actually start?" is
@@ -6366,7 +6521,12 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     std::filesystem::path td = std::filesystem::temp_directory_path(tec);
     char sn[64];
     snprintf(sn, sizeof sn, "viewer_reader_%llx", (unsigned long long)adapterHash(src + spec));
-    std::string outFile = (td / (std::string(sn) + ".out")).u8string();
+    // stdout IS the payload now, so it goes straight to `out` -- the cache
+    // path when there is one, a temp otherwise. Nothing reads it back as text:
+    // that would be the 755 MB std::string captureStdout=false exists to avoid.
+    // stderr still lands in a file, because that is the summary and the
+    // reader's own prints, which the panel shows and tails while it runs.
+    const std::string& outFile = out;
     std::string errFile = (td / (std::string(sn) + ".err")).u8string();
     if (job) {
         // Asynchronous: the window keeps drawing and pollReader() picks this up.
@@ -6377,14 +6537,13 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
         App::ReaderJob* j = job;
         j->th = std::thread([j]() {
-            j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile);
+            j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile, false);
             j->done.store(true);
         });
         return {};
     }
-    adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile);
+    adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile, false);
     std::string fin = readerFinish(src, spec, out, argv, r);
-    std::filesystem::remove(pathFromUtf8(outFile), tec);
     std::filesystem::remove(pathFromUtf8(errFile), tec);
     return fin;
 }
@@ -6426,7 +6585,7 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
         app.readerLastOut = msg;
         return msg;
     }
-    std::string lerr = loadNpz(out, "", 0, spec, src);
+    std::string lerr = loadViewerStream(out, spec, src);
     if (!lerr.empty()) {
         // The one failure that used to leave the panel EMPTY. The reader ran and
         // exited 0, so it is not the reader's traceback that is wrong - what it
@@ -6495,7 +6654,9 @@ static void pollReader() {
     if (!app.rdJob) return;
     App::ReaderJob* j = app.rdJob.get();
     if (!j->done.load()) {
-        std::string live = readerTail(j->errFile) + readerTail(j->outFile);
+        // errFile only: outFile is the payload, and tailing binary into a
+        // text panel would show the pixels as mojibake.
+        std::string live = readerTail(j->errFile);
         if (live.size() != j->shown) {
             j->shown = live.size();
             app.readerLastOut = live.empty()
@@ -6506,7 +6667,6 @@ static void pollReader() {
     j->th.join();
     std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r);
     std::error_code ec;
-    std::filesystem::remove(pathFromUtf8(j->outFile), ec);
     std::filesystem::remove(pathFromUtf8(j->errFile), ec);
     app.rdJob.reset();
     if (!e.empty()) toast(e, true);
