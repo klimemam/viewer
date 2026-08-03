@@ -121,7 +121,7 @@ option(VIEWER_WITH_EXR "..." ON)     # 既定 ON
 グループ化して **1 layer = 1 doc**。dtype は `f16`/`f32` を記録し Inspector に出る。
 表示レンジはデータ自身の min/max から。**トーンマップ・γ・クランプは一切しない。**
 
-断るもの(すべて**名指し＋理由**、`docs/import-adapters.md` §3.2 の作法):
+断るもの(すべて**名指し＋理由**、`docs/input-adapters.md` §3.2 の作法):
 
 | 対象 | 文言 |
 |---|---|

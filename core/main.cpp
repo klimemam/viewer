@@ -4560,7 +4560,7 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
 // way in. This is a measurement tool: the numbers in the file are the point,
 // and a viewer that display-encodes them on load has destroyed the
 // measurement. Whatever cannot be read is refused BY NAME with a reason
-// (docs/import-adapters.md §3.2), never a bare "cannot open".
+// (docs/input-adapters.md §3.2), never a bare "cannot open".
 #ifdef VIEWER_WITH_EXR
 
 // One group of channels that becomes one ImageDoc. EXR names channels
@@ -27959,7 +27959,7 @@ int main(int argc, char** argv) {
                   "V23e the session restores the same .exr layer");
 
             // ---- V23f: what is NOT read is refused BY NAME ------------------
-            // Never a bare "cannot open" (docs/import-adapters.md §3.2).
+            // Never a bare "cannot open" (docs/input-adapters.md §3.2).
             closeAll();
             // (1) chroma subsampled Y/RY/BY
             std::string pSub = (xdir / "chroma.exr").u8string();
