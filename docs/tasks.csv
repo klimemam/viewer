@@ -1,4 +1,5 @@
 ﻿分類,項目,内容,参照,備考
+残課題,selftest を GL 非依存にする(ウィンドウ不要経路),22本中フレームを描くのは6本(browse-keys/tile/verify のROI/abstats/frame-lin/framestats)。残り15本は起動時に必ずウィンドウが作られるから巻き込まれているだけ。ウィンドウを作らない起動経路を1本足せば16/22が3OSでGL無しに走る。macOSのカバレッジが0→16本になる,".github/workflows/build.yml, core/main.cpp 起動部",決定(2026-08-03): ソフトウェアGLをランナーに入れる案は却下 — 価値のあるmacOSにはllvmpipe相当が無く、効く先(Windows)は開発機と重複。CI修正(能力検知)が土台なのでその後に着手
 残課題,ImageView フッタのツールチップが嘘をついている,"「frame %d / %d (drag; . and , step)」と出るが、,/. は Browse パネルでしか効かない(ImageView は左右矢印=gotoFrame)。ツールチップかキー割当のどちらかを合わせる",main.cpp:11072 vs 19023-19024,シーケンスバー作業の調査で発覚
 残課題,ImageView フッタが常駐数を総数として表示,footer は framesOfSeq().size() だけを見て expectedFrames を見ない。部分ロードの stack で「n/N」が言えていない(正典違反)。stackMembers()+expectedFrames が既存の正しい組,"main.cpp:11047-11073, 19486-19493",シーケンスバーで同時に直る見込み
 残課題,preview スロットの後始末2件,(1) closeAllImages が previewHost/previewPort を消し残す(dropPreview だけが消す) (2) stepPreviewFrame の frame-axis 分岐が openRemote の戻り値を捨てるので、失敗時に previewIndex は据え置きのまま preview doc だけ壊れる(file-stack 分岐には対策コメントつきのガードがある),"main.cpp:3326-3329, 9406-9414",小粒だが実害あり
