@@ -79,3 +79,4 @@
 "レビュー必要項目","参照+Watch設計文書","執筆中→完成後に最重要レビュー","ref-design予定",""
 "レビュー必要項目","実機確認","見た目全般/別窓実操作/シェブロン/複数Browse/実ssh再接続/フレームリニアリティ表示","—","GLキャプチャ不可のため全て未目視"
 "残課題","TemporalStateキー欠陥","キャッシュキーにdata revisionが無い(main.cpp:7027) + forgetImageがtemporalExtraを見逃す(2183)","reference-design.md発見","参照化stage 5で同時修正予定だが独立して実バグ"
+"対応済み",".npz の key 対応","メンバを形で分類してから開く。1次元(N,)が「高さ1pxの絵」になる捏造を停止。npz=batch/メンバ=stack、picker(画像1つ+軸候補無しなら出さない)、frame数と一致する1次元keyをTemporalと同じ軸機構へ(単位はユーザー確定)、スカラー/文字列はInspectorへ、4次元超は拒否","npz-design.md §4, V19/V19b/V19c","リモートは未着手(プロトコル無変更)"
