@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(pixelscope_native C CXX)   # C: bundled plugins are pure C
+project(viewer C CXX)              # C: bundled plugins are pure C
 if(WIN32)
   enable_language(RC)              # core/viewer.rc.in: exe icon + version block
 endif()
