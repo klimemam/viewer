@@ -9445,6 +9445,278 @@ static void promotePreview(ImageDoc* d) {
     toast(d->name + ": opened");
 }
 
+// ------------------------------------------------------------- video --------
+// docs/video-support.md is the argument; this is the enforcement of it.
+//
+// A video file is a STACK: frames of one capture, in order (terminology.md).
+// The question that decides whether we may load one is not "can it be decoded"
+// but "are the numbers still the numbers". Measured (video-support.md §1): an
+// 8-bit lossy round trip turns a known sigma_t of 40 DN16 into 0.00 - not
+// degraded, gone - and noise that IS representable at 8 bit comes back 11% low
+// with a GOP-periodic bias, I-frames retaining 3.9% more than P-frames. So a
+// per-frame noise plot over a lossy stack measures the encoder. Refusing is not
+// conservatism here; loading would be the silent lie the canon forbids.
+//
+// y4m (YUV4MPEG2) is the one container this build reads: a one-line text header
+// plus raw planes. No compression and no inter-frame prediction, so the samples
+// are the samples that were written and index -> frame is arithmetic rather
+// than a seek that can land on the wrong picture.
+static std::string videoRefusal(const std::string& path, const std::string& low) {
+    struct Known { const char* ext; const char* name; bool mayBeLossless; };
+    static const Known K[] = {
+        { ".mp4",  "MP4 (H.264/HEVC)",                  false },
+        { ".m4v",  "M4V (H.264)",                       false },
+        { ".mov",  "QuickTime MOV (H.264/HEVC/ProRes)",  true  },
+        { ".mkv",  "Matroska MKV",                       true  },
+        { ".webm", "WebM (VP8/VP9)",                    false },
+        { ".avi",  "AVI",                                true  },
+        { ".wmv",  "WMV (VC-1)",                        false },
+        { ".flv",  "FLV",                               false },
+        { ".mpg",  "MPEG program stream",               false },
+        { ".mpeg", "MPEG program stream",               false },
+        { ".m2v",  "MPEG-2 elementary stream",          false },
+        { ".ts",   "MPEG transport stream",             false },
+        { ".m2ts", "MPEG transport stream",             false },
+        { ".mts",  "MPEG transport stream",             false },
+        { ".3gp",  "3GP (H.263/H.264)",                 false },
+        { ".ogv",  "Ogg Theora",                        false },
+        { ".264",  "raw H.264 elementary stream",       false },
+        { ".h264", "raw H.264 elementary stream",       false },
+        { ".avc",  "raw H.264 elementary stream",       false },
+        { ".265",  "raw HEVC elementary stream",        false },
+        { ".hevc", "raw HEVC elementary stream",        false },
+    };
+    const Known* k = nullptr;
+    for (const auto& e : K) {
+        size_t n = strlen(e.ext);
+        if (low.size() >= n && low.compare(low.size() - n, n, e.ext) == 0) { k = &e; break; }
+    }
+    if (!k) return {};
+    std::string m = baseName(path) + ": " + k->name +
+        " needs a video codec this build does not link. Decoded 8-bit video is "
+        "display-referred, not DN - a known sigma_t of 40 DN16 comes back as 0.00, "
+        "and representable noise is attenuated 11% with a GOP-periodic bias "
+        "(docs/video-support.md 1).";
+    if (k->mayBeLossless)
+        m += " This container can also hold a LOSSLESS codec (FFV1, v210), whose "
+             "values would be DN - reading that still needs libavcodec, which this "
+             "build weighs at 95.6 MB against a 7.6 MB viewer (docs/video-support.md 6).";
+    m += " Convert the frames you want to measure and open the .y4m:\n"
+         "    ffmpeg -i \"" + baseName(path) + "\" -pix_fmt gray16le -strict -1 out.y4m";
+    return m;
+}
+
+struct Y4mInfo {
+    int w = 0, h = 0, bits = 8, bps = 1;
+    size_t lumaBytes = 0, frameBytes = 0, headerLen = 0;
+    char ilace = '?';
+    bool hasChroma = false;
+    std::string cspace = "420", range, hdr;
+};
+
+// Plane sizes from the C tag. Returns "" on success, else a reason that NAMES
+// what it did not know - "unsupported" tells the operator nothing.
+static std::string y4mGeometry(Y4mInfo& I) {
+    const std::string s = I.cspace;
+    int hs = 0, vs = 0;                       // 0 = no chroma planes at all
+    bool alpha = false;
+    if (s.compare(0, 4, "mono") == 0) {
+        if (s.size() > 4) I.bits = atoi(s.c_str() + 4);
+    } else if (s.size() >= 3 && isdigit((unsigned char)s[0])) {
+        const std::string t = s.substr(0, 3), rest = s.substr(3);
+        if      (t == "444") { hs = 1; vs = 1; }
+        else if (t == "422") { hs = 2; vs = 1; }
+        else if (t == "420") { hs = 2; vs = 2; }
+        else if (t == "411") { hs = 4; vs = 1; }
+        else return "colour space C" + s + " is not one this reader knows";
+        // jpeg / paldv / mpeg2 differ only in chroma SITING - luma is unaffected.
+        // The bit-depth suffix is pNN, so the digit test is load-bearing:
+        // "C420paldv" also begins with p, and reading its depth as atoi("aldv")
+        // would reject a perfectly ordinary 8-bit PAL-DV file.
+        if (rest == "alpha") alpha = true;
+        else if (rest.size() > 1 && rest[0] == 'p' && isdigit((unsigned char)rest[1]))
+            I.bits = atoi(rest.c_str() + 1);
+    } else {
+        return "colour space C" + s + " is not one this reader knows";
+    }
+    if (I.bits < 8 || I.bits > 16)
+        return "a luma bit depth of " + std::to_string(I.bits) + " is not one this reader knows";
+    I.bps = I.bits > 8 ? 2 : 1;
+    I.hasChroma = hs != 0;
+    I.lumaBytes = (size_t)I.w * I.h * I.bps;
+    size_t rest = 0;
+    if (hs) rest = 2 * (size_t)((I.w + hs - 1) / hs) * ((I.h + vs - 1) / vs) * I.bps;
+    if (alpha) rest += I.lumaBytes;
+    I.frameBytes = I.lumaBytes + rest;
+    return {};
+}
+
+// One file = one stack. Returns an error string, empty = ok.
+static std::string loadY4m(const std::string& path) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return "cannot be read";
+    f.seekg(0, std::ios::end);
+    const uint64_t fsz = (uint64_t)f.tellg();
+    f.seekg(0);
+
+    char raw[1024];
+    f.read(raw, sizeof raw);
+    const std::string head(raw, (size_t)f.gcount());
+    const size_t nl = head.find('\n');
+    if (nl == std::string::npos) return "no y4m header line in the first 1024 bytes";
+    Y4mInfo I;
+    I.hdr = head.substr(0, nl);
+    I.headerLen = nl + 1;
+    if (I.hdr.compare(0, 9, "YUV4MPEG2") != 0)
+        return "not a y4m file (the YUV4MPEG2 signature is missing)";
+    {
+        std::istringstream ss(I.hdr);
+        std::string tok;
+        ss >> tok;                                   // YUV4MPEG2
+        while (ss >> tok) {
+            if (tok.size() < 2) continue;
+            const std::string v = tok.substr(1);
+            switch (tok[0]) {
+                case 'W': I.w = atoi(v.c_str()); break;
+                case 'H': I.h = atoi(v.c_str()); break;
+                case 'I': I.ilace = v[0]; break;
+                case 'C': I.cspace = v; break;
+                case 'X': if (v.compare(0, 11, "COLORRANGE=") == 0) I.range = v.substr(11); break;
+                default: break;                      // F (rate), A (aspect): not pixels
+            }
+        }
+    }
+    if (I.w <= 0 || I.h <= 0) return "the header does not give a usable W and H";
+    // A header is untrusted input: W/H feed an allocation below, so bound them
+    // before anything is sized from them.
+    if (I.w > 65536 || I.h > 65536)
+        return "the header claims " + std::to_string(I.w) + "x" + std::to_string(I.h) +
+               ", which is past this reader's 65536 limit";
+    // A frame that is two fields is two instants, and a stack's sigma_t assumes
+    // one instant per frame (terminology.md). Refuse rather than average them.
+    if (I.ilace != 'p' && I.ilace != '?')
+        return std::string("interlaced (I") + I.ilace + "): one frame is two fields, "
+               "so it is two instants - sigma_t over such a stack is not a temporal "
+               "noise. Deinterlace to progressive frames first";
+    std::string ge = y4mGeometry(I);
+    if (!ge.empty()) return ge;
+    // The header was read by grabbing a 1024-byte block, which (a) leaves the
+    // get pointer past the first frames and (b) sets failbit on any file
+    // SHORTER than the block. Both have to be undone before the frame loop, or
+    // the reads below start in the middle of frame 3 - or never run at all.
+    f.clear();
+    f.seekg((std::streamoff)I.headerLen);
+
+    // Frames are fixed-size, so N is ARITHMETIC from the byte count: this is the
+    // one format where the tool knows exactly what it is missing, and
+    // terminology.md forbids not saying so.
+    const size_t stride = 6 + I.frameBytes;          // "FRAME\n" + planes
+    const uint64_t body = fsz > I.headerLen ? fsz - I.headerLen : 0;
+    // Size the frame buffer only once the file is known to be able to hold a
+    // frame: a header claiming a geometry the bytes cannot back would otherwise
+    // reserve that much memory on the strength of the claim alone.
+    if (I.frameBytes == 0 || (uint64_t)I.frameBytes > body)
+        return "the header claims " + std::to_string(I.w) + "x" + std::to_string(I.h) +
+               " " + std::to_string(I.bits) + "-bit C" + I.cspace + " (" +
+               std::to_string(I.frameBytes) + " bytes a frame) but only " +
+               std::to_string(body) + " bytes follow it";
+    int declared = (int)(body / stride);
+    if (body % stride) declared++;                   // a partial frame was intended
+    if (declared <= 0) return "the header is there but no complete frame follows it";
+
+    const uint64_t budget = seqMemBudget();
+    const uint64_t perFrame = (uint64_t)I.w * I.h * sizeof(float);
+    int want = declared;
+    if (budget && perFrame) {
+        int fit = (int)(budget / perFrame);
+        if (fit < 1) fit = 1;
+        if (fit < want) want = fit;
+    }
+
+    // The note carries the two claims apart: bit-exactness earns [DN], and the
+    // transfer is a SEPARATE claim this container almost never makes. Saying
+    // "not assumed linear" out loud is what keeps a linearity fit honest.
+    std::string note = "y4m C" + I.cspace + " " + std::to_string(I.bits) + "-bit luma" +
+        (I.hasChroma ? " (chroma subsampled: present, NOT read - an interpolated "
+                       "colour is not a measurement)" : "") +
+        "; uncompressed, bit-exact - values are DN as stored. Range: " +
+        (I.range.empty() ? "not declared" : I.range) +
+        ". Transfer/primaries: not declared by the file, not assumed linear.";
+
+    std::vector<uint8_t> plane(I.frameBytes);
+    auto readOne = [&](int idx) -> std::unique_ptr<ImageDoc> {
+        char m[6] = { 0 };
+        f.read(m, 5);
+        if (f.gcount() != 5 || memcmp(m, "FRAME", 5) != 0) return nullptr;
+        char c;                                      // optional per-frame params
+        do { if (!f.get(c)) return nullptr; } while (c != '\n');
+        f.read((char*)plane.data(), (std::streamsize)I.frameBytes);
+        if ((size_t)f.gcount() != I.frameBytes) return nullptr;
+        auto d = std::make_unique<ImageDoc>();
+        FrameSource& S = *d->src;
+        S.w = I.w; S.h = I.h; S.ch = 1;
+        S.dtype = I.bps == 2 ? "u16" : "u8";         // how it is STORED
+        S.path = path;
+        S.data.resize((size_t)I.w * I.h);
+        const uint8_t* p = plane.data();             // luma plane leads the frame
+        if (I.bps == 1)
+            for (size_t i = 0; i < S.data.size(); i++) S.data[i] = (float)p[i];
+        else
+            for (size_t i = 0; i < S.data.size(); i++)
+                S.data[i] = (float)(p[2 * i] | (p[2 * i + 1] << 8));   // y4m is LE
+        d->name = baseName(path) + "  #" + std::to_string(idx);
+        d->note = note;
+        d->syncMirrors();
+        return d;
+    };
+
+    auto first = readOne(0);
+    if (!first) return "the file ends inside its first frame: no complete frame to open";
+    computeMinMax(*first);
+    if (declared == 1) { addImage(std::move(first)); return {}; }
+
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = baseName(path) + "  (" + std::to_string(declared) + " frames)";
+    info.expectedFrames = declared;
+    app.seqs.push_back(info);
+    first->seqId = info.id;
+    first->seqIndex = 0;
+    const int firstIdx = (int)app.images.size();
+    addImage(std::move(first));
+    const ImageDoc* ref = app.images[firstIdx].get();
+    for (int fr = 1; fr < want; fr++) {
+        auto doc = readOne(fr);
+        if (!doc) break;                             // short read: n of N says so
+        doc->seqId = info.id;
+        doc->seqIndex = fr;
+        computeMinMax(*doc);
+        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        doc->batchId = ref->batchId;                        // a stack is in ONE batch
+        doc->texDirty = true;
+        doc->uid = app.nextUid++;
+        app.imagesRev++;
+        app.images.push_back(std::move(doc));
+    }
+    for (auto& s : app.seqs)
+        if (s.id == info.id) s.lastImageIdx = firstIdx;
+    int got = 0;
+    for (const auto& d : app.images) if (d->seqId == info.id) got++;
+    if (got < declared) {
+        for (auto& s : app.seqs)
+            if (s.id == info.id)
+                s.name = baseName(path) + "  (" + std::to_string(got) + " of " +
+                         std::to_string(declared) + " frames)";
+        toast(baseName(path) + ": " + std::to_string(got) + " of " +
+              std::to_string(declared) + " frames - the file ends inside frame " +
+              std::to_string(got) + (want < declared ? " or the memory budget stopped it" : ""),
+              true);
+    }
+    fprintf(stderr, "y4m stack: %s - %d of %d frames (%dx%d %d-bit luma, C%s)\n",
+            baseName(path).c_str(), got, declared, I.w, I.h, I.bits, I.cspace.c_str());
+    return {};
+}
+
 static void openPath(const std::string& path) {
     if (path.compare(0, 6, "ssh://") == 0 || path.compare(0, 8, "local://") == 0) {
         // A url naming a file opens that file. A url naming a host or a
@@ -9473,6 +9745,16 @@ static void openPath(const std::string& path) {
         // both what happened and when
         std::string err = loadNpz(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
+    } else if (ends(".y4m")) {
+        std::string err = loadY4m(path);
+        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        else toast("loaded " + baseName(path));
+    } else if (!videoRefusal(path, low).empty()) {
+        // A codec-bearing container, refused BY NAME with the measured reason
+        // and the conversion that would be honest - never a bare "cannot open",
+        // and never the raw-geometry dialog, which would invite the operator to
+        // interpret an H.264 bitstream as pixels.
+        toast(videoRefusal(path, low), true);
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -9491,7 +9773,7 @@ static void openFileDialog() {
     }
     if (app.openDlg) return;             // one dialog at a time
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (*.npy *.npz *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.bin *.raw *.yuv *.dat",
+        std::vector<std::string>{ "Images (*.npy *.npz *.y4m *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.y4m *.bin *.raw *.yuv *.dat",
           "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
@@ -26730,6 +27012,189 @@ int main(int argc, char** argv) {
 
             std::filesystem::remove_all(ndir, nec);
             app.npyAxis = npyAxisWas;
+            closeAll();
+        }
+
+        // ---- V24: a video is a stack, and only where its numbers survived ---
+        // docs/video-support.md: an 8-bit lossy round trip turns a known
+        // sigma_t of 40 DN16 into 0.00 - not degraded, gone - so this tool
+        // loads video ONLY where the samples are bit-exact (y4m: a text header
+        // plus raw planes, no compression and no inter-frame prediction) and
+        // refuses the rest BY NAME. What has to hold: one file is one stack in
+        // presentation order, the values are the values that were written, the
+        // note records the transfer as NOT assumed linear, a lossy container is
+        // refused naming its format and the conversion that would be honest,
+        // subsampled chroma yields luma only rather than an invented colour,
+        // and a file cut in half says n of N.
+        //
+        // The fixture is written HERE, in C++: tools/testdata is gitignored and
+        // CI has no ffmpeg, so a checked-in y4m or a shelled-out one would make
+        // this test non-hermetic. That y4m can be written in twenty lines is
+        // the same property that makes it the format whose numbers survive.
+        {
+            closeAll();
+            std::error_code vec;
+            std::filesystem::path vdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-y4m-scratch";
+            std::filesystem::create_directories(vdir, vec);   // ours: ours to remove
+
+            const int VW = 16, VH = 8, VN = 5;
+            // frame f, pixel (x,y) = 1000 + 100f + 3x + y: the value names its
+            // own frame AND its own position, so "in order" and "bit-exact" are
+            // one check instead of two.
+            auto vpix = [&](int f, int x, int y) { return 1000 + 100 * f + 3 * x + y; };
+            auto luma = [&](int f, int bps) {
+                std::string s;
+                for (int y = 0; y < VH; y++)
+                    for (int x = 0; x < VW; x++) {
+                        int v = vpix(f, x, y);
+                        s += (char)(uint8_t)(v & 0xff);
+                        if (bps == 2) s += (char)(uint8_t)((v >> 8) & 0xff);
+                    }
+                return s;
+            };
+            auto writeFile = [&](const std::string& p, const std::string& blob, double frac) {
+                std::ofstream o(pathFromUtf8(p), std::ios::binary);
+                o.write(blob.data(), (std::streamsize)(blob.size() * frac));
+            };
+            auto seqFrames = [&]() {
+                return app.seqs.empty() ? 0 : (int)framesOfSeq(app.seqs.front().id).size();
+            };
+            auto frameAt = [&](int idx) -> ImageDoc* {
+                for (auto& d : app.images)
+                    if (d->seqId && d->seqIndex == idx) return d.get();
+                return nullptr;
+            };
+
+            // -- V24a/b/c: 16-bit mono, the honest case -----------------------
+            std::string mono16;
+            mono16 = "YUV4MPEG2 W16 H8 F30:1 Ip A1:1 Cmono16 XCOLORRANGE=FULL\n";
+            for (int f = 0; f < VN; f++) mono16 += "FRAME\n" + luma(f, 2);
+            std::string pMono = (vdir / "mono16.y4m").u8string();
+            writeFile(pMono, mono16, 1.0);
+
+            closeAll();
+            openPath(pMono);
+            int n24 = seqFrames();
+            fprintf(stderr, "verifyselftest: V24 mono16.y4m: seqs=%zu frames=%d images=%zu \"%s\"\n",
+                    app.seqs.size(), n24, app.images.size(),
+                    app.msgLog.empty() ? "" : app.msgLog.back().text.c_str());
+            check(app.seqs.size() == 1 && n24 == VN, "V24 one y4m file is ONE stack of 5");
+
+            // COUNT the comparisons: "no sample mismatched" is vacuously true
+            // when no sample was reached, and a test that passes by not running
+            // is worse than no test.
+            bool order = true, exact = true;
+            long cmp = 0;
+            for (int f = 0; f < VN; f++) {
+                ImageDoc* d = frameAt(f);
+                if (!d || d->w != VW || d->h != VH || d->ch != 1) { order = false; break; }
+                for (int y = 0; y < VH; y++)
+                    for (int x = 0; x < VW; x++) {
+                        if (d->sample(x, y, 0) != (float)vpix(f, x, y)) exact = false;
+                        cmp++;
+                    }
+            }
+            fprintf(stderr, "verifyselftest: V24 order=%d bitexact=%d compared=%ld/%d "
+                            "f0(0,0)=%.10g f4(0,0)=%.10g\n",
+                    (int)order, (int)exact, cmp, VN * VW * VH,
+                    frameAt(0) ? frameAt(0)->sample(0, 0, 0) : -1.0,
+                    frameAt(4) ? frameAt(4)->sample(0, 0, 0) : -1.0);
+            check(order, "V24 frames are in presentation order");
+            check(exact && cmp == (long)VN * VW * VH,
+                  "V24 the samples are the samples written");
+
+            std::string vnote = frameAt(0) ? frameAt(0)->note : std::string();
+            fprintf(stderr, "verifyselftest: V24 note: \"%s\"\n", vnote.c_str());
+            // "bit-exact" earns the [DN] label; the transfer is a SEPARATE claim
+            // this file does not make, and the note must not make it either.
+            bool honest = vnote.find("bit-exact") != std::string::npos &&
+                          vnote.find("not assumed linear") != std::string::npos;
+            check(honest, "V24 the note says exact, and linear NOT assumed");
+
+            // -- V24d: a lossy container is refused BY NAME -------------------
+            closeAll();
+            std::string pMp4 = (vdir / "capture.mp4").u8string();
+            writeFile(pMp4, std::string(4096, '\0'), 1.0);
+            openPath(pMp4);
+            std::string rmsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "verifyselftest: V24 refusal: \"%s\"\n", rmsg.c_str());
+            bool refused = app.images.empty() &&
+                           rmsg.find("H.264") != std::string::npos &&
+                           rmsg.find("not DN") != std::string::npos &&
+                           rmsg.find(".y4m") != std::string::npos;
+            check(refused, "V24 mp4 refused by name, reason, remedy");
+
+            // -- V24e: subsampled chroma gives luma, never an invented colour --
+            closeAll();
+            std::string p420 = "YUV4MPEG2 W16 H8 F30:1 Ip A1:1 C420jpeg\n";
+            for (int f = 0; f < VN; f++)
+                p420 += "FRAME\n" + luma(f, 1) + std::string((VW / 2) * (VH / 2) * 2, (char)128);
+            std::string p420p = (vdir / "sub420.y4m").u8string();
+            writeFile(p420p, p420, 1.0);
+            openPath(p420p);
+            ImageDoc* d420 = frameAt(0);
+            fprintf(stderr, "verifyselftest: V24 C420: frames=%d ch=%d note=\"%s\"\n",
+                    seqFrames(), d420 ? d420->ch : -1, d420 ? d420->note.c_str() : "");
+            check(d420 && d420->ch == 1 && seqFrames() == VN,
+                  "V24 subsampled chroma opens as luma only");
+
+            // C420paldv is an ordinary 8-bit file whose suffix begins with the
+            // same letter as the pNN bit-depth marker. Reading its depth as
+            // atoi("aldv") = 0 refused it as "a luma bit depth of 0", so the
+            // digit test in y4mGeometry is pinned here rather than by eye.
+            closeAll();
+            std::string pal = "YUV4MPEG2 W16 H8 F30:1 Ip A1:1 C420paldv\n";
+            for (int f = 0; f < VN; f++)
+                pal += "FRAME\n" + luma(f, 1) + std::string((VW / 2) * (VH / 2) * 2, (char)128);
+            std::string pPal = (vdir / "paldv.y4m").u8string();
+            writeFile(pPal, pal, 1.0);
+            openPath(pPal);
+            ImageDoc* dPal = frameAt(0);
+            fprintf(stderr, "verifyselftest: V24 C420paldv: frames=%d ch=%d f0(1,0)=%.10g \"%s\"\n",
+                    seqFrames(), dPal ? dPal->ch : -1,
+                    dPal ? dPal->sample(1, 0, 0) : -1.0,
+                    app.msgLog.empty() ? "" : app.msgLog.back().text.c_str());
+            // an 8-bit plane holds the LOW byte of the fixture value: 1003 -> 235
+            check(dPal && dPal->ch == 1 && seqFrames() == VN &&
+                      dPal->sample(1, 0, 0) == (float)(vpix(0, 1, 0) & 0xff),
+                  "V24 C420paldv reads as 8-bit, not depth 0");
+
+            // -- V24f: interlaced is refused (a frame is not one instant) -----
+            closeAll();
+            std::string ilace = "YUV4MPEG2 W16 H8 F30:1 It A1:1 Cmono\n";
+            for (int f = 0; f < VN; f++) ilace += "FRAME\n" + luma(f, 1);
+            std::string pIl = (vdir / "fields.y4m").u8string();
+            writeFile(pIl, ilace, 1.0);
+            openPath(pIl);
+            std::string imsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "verifyselftest: V24 interlaced: images=%zu \"%s\"\n",
+                    app.images.size(), imsg.c_str());
+            check(app.images.empty() && imsg.find("interlaced") != std::string::npos,
+                  "V24 interlaced y4m refused, saying which");
+
+            // -- V24g: a file cut in half says n of N -------------------------
+            // Frames are fixed-size, so N is ARITHMETIC from the byte count -
+            // and that is the whole of what a y4m can tell you, because the
+            // format declares no frame count anywhere. So N here is "what the
+            // surviving bytes imply", NOT the length of the original capture:
+            // cutting the 5-frame fixture in half leaves 2 whole frames plus a
+            // piece of a third, and the honest report is "2 of 3", not "2 of 5".
+            // Claiming 5 would be inventing a number the file does not contain.
+            // (56-byte header + 5 x 262-byte frames = 1366; half = 683;
+            //  627 body bytes = 2 x 262 + 103 -> 2 whole, 1 started.)
+            closeAll();
+            std::string pCut = (vdir / "cut.y4m").u8string();
+            writeFile(pCut, mono16, 0.5);
+            openPath(pCut);
+            std::string cutName = app.seqs.empty() ? std::string() : app.seqs.front().name;
+            int cutGot = seqFrames();
+            fprintf(stderr, "verifyselftest: V24 truncated: got=%d name=\"%s\"\n",
+                    cutGot, cutName.c_str());
+            check(cutGot == 2 && cutName.find("2 of 3 frames") != std::string::npos,
+                  "V24 a truncated y4m says n of N");
+
+            std::filesystem::remove_all(vdir, vec);
             closeAll();
         }
 
