@@ -9,3 +9,4 @@ build-mingw/
 *.ini
 build-verify/
 build-dbg/
+*.egg-info/
