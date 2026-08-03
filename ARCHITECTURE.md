@@ -328,7 +328,7 @@ Uniformity / Flat field、Statistics / Sanity)。知らないカテゴリは自�
 行志向のテキスト。1行目が `viewer-prefs 1`、以降は `key value`。
 テーマ、compact、dragpans、wheelzoom、fitonswitch、seqload、showfps、
 lowbandwidth、membudget、procpolicy、linunit、gamma、grid、frame、
-Browse の表示形 (`rbflat`/`rbadv`/`rbtree`)、`remoteexe`、`remoteurl`、
+Browse の表示形 (`rbflat`/`rbtree`)、`remoteexe`、`remoteurl`、
 そして繰り返しの `rbookmark` / `rbrecent` (履歴は10件まで)。
 パスを含む値は行の残り全部を値として読みます。
 
