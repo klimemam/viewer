@@ -4576,6 +4576,16 @@ static int vnzCfaPattern(const std::string& cfa, int& kind) {
 // reader memory and Watch are looked up under - names `origin`. Getting this
 // wrong labelled every frame with a hash and left the Inspector's own reader row
 // unable to find the reader that had just run.
+// How the build phase gets one node's pixels. The tree, the names, the axes and
+// the layer rules are the same whether the container arrived as an npz or down a
+// pipe; only the fetch differs, and it differs in exactly one line. Passing it in
+// is what keeps there from being two copies of the layer rules to drift apart.
+using VnzFetch = std::function<bool(int i, const VnzNode& v,
+                                    std::vector<uint8_t>& out, std::string& err)>;
+static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
+                            const std::string& readerSpec, const VnzFetch& fetch,
+                            const std::vector<std::pair<std::string, std::string>>& metaIn);
+
 static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
                                  const std::vector<NpzEntry>& entries, int version,
                                  const std::string& readerSpec, const std::string& origin) {
@@ -4682,7 +4692,26 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         }
     }
 
-    // ---- build ---------------------------------------------------------------
+    // __meta_* lives in the zip, so it is read here where the zip is.
+    std::vector<std::pair<std::string, std::string>> meta;
+    for (const auto& kv : byName) {
+        if (kv.first.compare(0, 7, "__meta_") != 0) continue;
+        std::vector<uint8_t> b; NpyHead H; std::string e;
+        if (!vnzRead(zip, entries, byName, kv.first, b, H, e)) continue;
+        meta.emplace_back(kv.first.substr(7), npzTextValue(b, H));
+    }
+    return vnzBuild(nodes, n, origin, readerSpec,
+                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
+                        std::string& e) { return npzExtract(zip, entries[v.pixelEntry], out, e); },
+                    meta);
+}
+
+// ---- build ---------------------------------------------------------------
+// Shared by both carriers (see VnzFetch). Everything here reads `nodes`; the one
+// thing that knew where the bytes live is now the callback.
+static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
+                            const std::string& readerSpec, const VnzFetch& fetch,
+                            const std::vector<std::pair<std::string, std::string>>& metaIn) {
     int prevBatch = app.loadBatchId;
     std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
                                 ? nodes[0].name : baseName(origin);
@@ -4714,7 +4743,7 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         // uses, so a container and a loose .npy of the same array cannot drift.
         std::vector<uint8_t> member;
         std::string mErr;
-        if (!npzExtract(zip, entries[v.pixelEntry], member, mErr)) {
+        if (!fetch(i, v, member, mErr)) {
             firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
             break;
         }
@@ -4826,14 +4855,10 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
 
     // metadata: __meta_<k> at the root, __meta_<i>_<k> below it. The viewer
     // CARRIES meta and never rewrites it (§4.3.1), so it lands beside the frame
-    // as provenance rather than becoming a panel of its own.
-    std::vector<std::pair<std::string, std::string>> meta;
-    for (const auto& kv : byName) {
-        if (kv.first.compare(0, 7, "__meta_") != 0) continue;
-        std::vector<uint8_t> b; NpyHead H; std::string e;
-        if (!vnzRead(zip, entries, byName, kv.first, b, H, e)) continue;
-        meta.emplace_back(kv.first.substr(7), npzTextValue(b, H));
-    }
+    // as provenance rather than becoming a panel of its own. Collected by
+    // whoever parsed the container, because that is the half that knows how the
+    // members are stored.
+    std::vector<std::pair<std::string, std::string>> meta = metaIn;
     if (!readerSpec.empty()) meta.emplace_back("reader", readerSpec);
     if (!meta.empty()) {
         bool replaced = false;
