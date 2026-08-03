@@ -23,6 +23,7 @@
 #include "plugin_host.h"
 #include "miniz.h"                   // deflate for compressed .npz members
 #include "ui_theme.h"
+#include "version.h"                 // the commit this binary was built from
 #include "remote.h"
 #include "remote_proto.h"
 #include "app_icon.h"
@@ -13978,7 +13979,7 @@ static std::string buildTemporalExport(char delim) {
         char ts[32] = "";
         time_t now = time(nullptr);
         if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
-        doc.comment(std::string("app: viewer 0.1  |  generated: ") + ts);
+        doc.comment(std::string("app: viewer ") + viewerVersion() + "  |  generated: " + ts);
     }
     {
         std::string s = "sides: ";
@@ -16715,83 +16716,40 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (on) ImGui::PopStyleColor();
             return clicked;
         };
-        ImGui::BeginDisabled(I.histBack.empty());
-        if (ImGui::SmallButton("<##rbback")) rbDefer([&I] { rbHistGo(I, true); });
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("back (Alt+Left, mouse button 4)");
-        rbFlow(rbBtnW(">"));
-        ImGui::BeginDisabled(I.histFwd.empty());
-        if (ImGui::SmallButton(">##rbfwd")) rbDefer([&I] { rbHistGo(I, false); });
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("forward (Alt+Right, mouse button 5)");
-        rbFlow(rbBtnW("up"));
-        ImGui::BeginDisabled(atRoot);
-        if (ImGui::SmallButton("up")) rbGoParent();
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("parent folder (Backspace)");
-        rbFlow(rbBtnW("~"));
-        if (ImGui::SmallButton("~##rbhome")) rbGoTo(I, "~");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
-        rbFlow(rbBtnW("refresh"));
-        if (ImGui::SmallButton("refresh")) {
+        // Navigation has no buttons: back / forward are mouse 4 / 5 and
+        // Alt+Left / Alt+Right, the parent is the ".." row and Backspace, home
+        // is a place in the places popup. Five buttons that answered no
+        // question were charging every glance (docs/browse-topbar-design.md
+        // 10.2). Refresh and the two view modes moved into the menu below, and
+        // a mode that is NOT the default says so with a chip instead - a
+        // setting that changes what you see must name itself when it is on.
+        auto rbModeChip = [&](const char* text, const char* why) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            ImGui::SmallButton(text);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", why);
+        };
+        auto rbRefresh = [&I, &B] {
             rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
             rbGoTo(I, B.dir);
+        };
+        if (I.flat) {
+            rbModeChip("flat##rbchip", "every frame is its own row - the default is "
+                                       "grouped (one row per numbered sequence).\n"
+                                       "change it in the panel menu");
+            rbFlow(rbBtnW("tree##rbchip"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
-        // Grouped <-> flat. No round trip: the peer already sent every member.
-        rbFlow(rbBtnW("grp") + rbBtnW("flat") + 1);
-        if (rbSegBtn("grp##rbview", !I.flat) && I.flat) {
-            I.flat = app.rbFlat = false;   // this panel now; the pref = the default
-            app.prefsDirty = true;
-            savePrefs();
+        if (I.tree) {
+            rbModeChip("tree##rbchip", "folders open in place - the default is a "
+                                       "list, one folder at a time.\n"
+                                       "change it in the panel menu");
+            rbFlow(rbBtnW("filter"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("grouped: a numbered sequence is ONE row");
-        ImGui::SameLine(0, 1);
-        if (rbSegBtn("flat##rbview", I.flat) && !I.flat) {
-            I.flat = app.rbFlat = true;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("flat: every frame is its own row\n(per-frame size and "
-                              "date are not in the listing reply - those cells stay blank)");
-        // List <-> tree. Expanding a node costs ONE list, once.
-        rbFlow(rbBtnW("list") + rbBtnW("tree") + 1);
-        if (rbSegBtn("list##rblist", !I.tree) && I.tree) {
-            // Leaving the tree with something under the cursor: the listing
-            // opens on THAT folder. Walking down a tree is how you got to a
-            // folder five levels deep; dropping back to the root on the way out
-            // throws away the only thing the trip was for. A file under the
-            // cursor means the folder holding it.
-            if (I.cursor >= 0 && I.cursor < (int)view.size()) {
-                const RbRow& r = view[I.cursor];
-                std::string want = r.ph || r.up ? std::string()
-                                 : r.isDir()    ? r.full() : *r.dir;
-                if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
-            }
-            I.tree = app.rbTree = false;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("list: one folder at a time\n(a double-click or Enter "
-                              "enters a folder; a click selects it)");
-        ImGui::SameLine(0, 1);
-        if (rbSegBtn("tree##rbtree", I.tree) && !I.tree) {
-            I.tree = app.rbTree = true;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("tree: a folder opens IN PLACE (click it; Right/Left "
-                              "also do).\ndouble-click or Enter goes INTO it.\neach "
-                              "node is listed once and kept - collapsing costs "
-                              "nothing to undo.");
+        // F5 is the refresh that lost its button; the panel must be the one
+        // holding focus, or a second browser would reload on the first one's key
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_F5, false))
+            rbRefresh();
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
@@ -16817,6 +16775,52 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SetTooltip("filters the listing below without asking the server\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
+        // The panel's own menu: the verbs that are real but rare. They used to
+        // be buttons charging every glance; here they cost nothing until asked
+        // for, and each one still names its key.
+        rbFlow(rbBtnW("..##rbmenu"));
+        if (ImGui::SmallButton("...##rbmenu")) ImGui::OpenPopup("rbpanelmenu");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("this panel: refresh, how it lists");
+        if (ImGui::BeginPopup("rbpanelmenu")) {
+            if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
+            ImGui::Separator();
+            // Radio pairs, not toggles: the state is visible without clicking.
+            if (ImGui::MenuItem("Grouped (a numbered sequence is one row)", nullptr, !I.flat)
+                && I.flat) {
+                I.flat = app.rbFlat = false;   // this panel now; the pref = the default
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            if (ImGui::MenuItem("Flat (every frame is its own row)", nullptr, I.flat)
+                && !I.flat) {
+                I.flat = app.rbFlat = true;
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("List (one folder at a time)", nullptr, !I.tree) && I.tree) {
+                // Leaving the tree with something under the cursor: the listing
+                // opens on THAT folder. Walking down a tree is how you got to a
+                // folder five levels deep; dropping back to the root on the way
+                // out throws away the only thing the trip was for. A file under
+                // the cursor means the folder holding it.
+                if (I.cursor >= 0 && I.cursor < (int)view.size()) {
+                    const RbRow& r = view[I.cursor];
+                    std::string want = r.ph || r.up ? std::string()
+                                     : r.isDir()    ? r.full() : *r.dir;
+                    if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
+                }
+                I.tree = app.rbTree = false;
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            if (ImGui::MenuItem("Tree (folders open in place)", nullptr, I.tree) && !I.tree) {
+                I.tree = app.rbTree = true;
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            ImGui::EndPopup();
+        }
     }
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
@@ -18931,7 +18935,7 @@ static std::string viewingHost() {
 // button, and the integrated title bar this app draws for itself.
 static std::string windowTitleText() {
     const ImageDoc* im = cur();
-    std::string t = im ? im->name + " - viewer" : "viewer v0.1";
+    std::string t = im ? im->name + " - viewer" : std::string("viewer  ") + viewerVersion();
     // The bracket answers "which machine are these pixels on?". A local browse
     // goes through the peer protocol but the file is on this disk, so there is
     // no other machine to name - and "[local peer]" named one, which is how a
@@ -19614,7 +19618,7 @@ static void drawHelpAbout() {
     if (app.showAbout) {
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         if (ImGui::Begin("About viewer", &app.showAbout, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("viewer v0.1");
+            ImGui::Text("viewer  %s", viewerVersion());
             ImGui::TextDisabled("cross-platform image viewer for engineering data");
             ImGui::Separator();
             ImGui::TextDisabled("Dear ImGui %s  |  GLFW %s", IMGUI_VERSION, glfwGetVersionString());
@@ -20882,7 +20886,9 @@ int main(int argc, char** argv) {
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
     glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
-    GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1600, 1000,
+                                       (std::string("viewer  ") + viewerVersion()).c_str(),
+                                       nullptr, nullptr);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
     applyWindowIcon(win, false);
     // The frame comes up before the first frame is drawn, so the window never
