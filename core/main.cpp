@@ -15406,9 +15406,12 @@ static void drawPanelTemporal() {
 
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
 // live in the Analysis window; this is the "at a glance" layer.
-struct RoiStat { double mean, sd, mn, mx; size_t n; bool valid; };
+// step: the row stride the sampler used (1 = every row). It rides along in the
+// result because a sigma whose sample count nobody can see is not a measurement
+// - the panel has to be able to say what n it rests on, and why n < the rect.
+struct RoiStat { double mean, sd, mn, mx; size_t n, step; bool valid; };
 static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
-    RoiStat s{ 0, 0, 0, 0, 0, false };
+    RoiStat s{ 0, 0, 0, 0, 0, 0, false };
     rx = std::clamp(rx, 0, im.w); ry = std::clamp(ry, 0, im.h);
     rw = std::clamp(rw, 0, im.w - rx); rh = std::clamp(rh, 0, im.h - ry);
     if (rw < 1 || rh < 1) return s;
@@ -15451,8 +15454,23 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
     s.mean = sum / n;
     double var = sum2 / n - s.mean * s.mean;
     s.sd = sqrt(var > 0 ? var : 0);
-    s.mn = mn; s.mx = mx; s.n = n; s.valid = true;
+    s.mn = mn; s.mx = mx; s.n = n; s.step = step; s.valid = true;
     return s;
+}
+
+// What the table cannot show in six characters. Full precision lives here; the
+// columns format at the edge. n both directions: past ~200k samples the sampler
+// reads whole rows at a stride, and n = 1 (a 1x1 ROI) makes sd exactly 0 - the
+// single most confusing number this panel can print, so it says why.
+static void roiStatTooltip(const RoiStat& s) {
+    if (!s.valid || !ImGui::IsItemHovered()) return;
+    ImGui::BeginTooltip();
+    ImGui::Text("mean %.10g    sd %.10g   [DN]", s.mean, s.sd);
+    ImGui::Text("min  %.10g    max %.10g   [DN]", s.mn, s.mx);
+    if (s.step > 1) ImGui::Text("n = %zu (sampled 1 row in %zu)", s.n, s.step);
+    else            ImGui::Text("n = %zu (every row)", s.n);
+    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition");
+    ImGui::EndTooltip();
 }
 
 // The ROI table is drawn every frame; recomputing hundreds of thousands of
@@ -15488,7 +15506,17 @@ static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh,
     return s;
 }
 
+// Selftest probe: the numbers this table actually printed, and where each row's
+// delete button landed on screen. The panel's own call path - roiBasicStats
+// through the cache, inside the clipper, with the button under a span-all-columns
+// Selectable - had no coverage; asserts that call the stats function directly
+// cannot see any of it. id 0 = the "All (whole image)" row (no delete button).
+struct RoiRowProbe { int id; RoiStat s; ImVec2 del, lbl; };
+static std::vector<RoiRowProbe> g_roiRowProbe;
+static bool g_roiRowProbeOn = false;
+
 static void drawPanelRois() {
+    if (g_roiRowProbeOn) g_roiRowProbe.clear();
     ImageDoc* im = cur();
     if (!im) { ImGui::TextDisabled("no image"); return; }
 
@@ -15497,7 +15525,11 @@ static void drawPanelRois() {
     static const char* CFA_SEL[5] = { "all", "R", "Gr", "Gb", "B" };
     static const char* CH_SEL[5] = { "all", "ch0", "ch1", "ch2", "ch3" };
     int maxSel = cfa ? 4 : std::min(im->ch, 4);
-    app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - (cfa ? 0 : 1));
+    // maxSel - 1 on BOTH sides: the CFA arm used to clamp to maxSel, so a
+    // restored roichannel of 4 stuck at 4 - one past the last plane. That reads
+    // CFA_SEL[5] off the end of the array and matches no plane, so every row in
+    // the table would print "-" with nothing saying why.
+    app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - 1);
     const char* curSel = app.roiChannel < 0 ? "all"
                                             : (cfa ? CFA_SEL[app.roiChannel + 1] : CH_SEL[app.roiChannel + 1]);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
@@ -15546,12 +15578,14 @@ static void drawPanelRois() {
             if (ImGui::Selectable("All (whole image)", app.selectedAnn <= 0,
                                   ImGuiSelectableFlags_SpanAllColumns))
                 app.selectedAnn = 0;
+            roiStatTooltip(s);
             ImGui::TableNextColumn(); ImGui::Text("%dx%d", im->w, im->h);
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
+            if (g_roiRowProbeOn) g_roiRowProbe.push_back({ 0, s, ImVec2(-1, -1), ImVec2(-1, -1) });
         }
         int removeId = -1;
         // Only the rows you can see. Submitting all of them cost 1.35 ms/frame at
@@ -15563,22 +15597,34 @@ static void drawPanelRois() {
         for (int ai = clipper.DisplayStart; ai < clipper.DisplayEnd; ai++) {
             App::Ann& a = app.anns[ai];
             ImGui::PushID(a.id);
+            // measured before the row is drawn, so the row label can carry the
+            // tooltip that says what n these numbers rest on
+            RoiStat s{ 0, 0, 0, 0, 0, 0, false };
+            if (a.type == 0) s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
             ImGui::TableNextColumn();
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ANN_COLORS[a.color & 7]));
             bool sel = app.selectedAnn == a.id;
-            if (ImGui::Selectable(a.label.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns))
+            // AllowOverlap: this Selectable is submitted first and its rect covers
+            // the whole row, the delete button in the last column included. Without
+            // it ImGui hands the row's hover to the Selectable and every later item
+            // in the row is unreachable - the x button never saw a click.
+            if (ImGui::Selectable(a.label.c_str(), sel,
+                                  ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowOverlap))
                 app.selectedAnn = a.id;
+            ImVec2 lblC((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                        (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
             ImGui::PopStyleColor();
+            roiStatTooltip(s);
             ImGui::TableNextColumn();
             if (a.type == 0) ImGui::Text("%dx%d @%d,%d", a.w, a.h, a.x, a.y);
             else if (im->cfa && a.x < im->w && a.y < im->h)
                 ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
             else ImGui::Text("%d,%d", a.x, a.y);
             if (a.type == 0) {                          // ROI: area statistics
-                RoiStat s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
@@ -15595,6 +15641,11 @@ static void drawPanelRois() {
             }
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("x")) removeId = a.id;
+            if (g_roiRowProbeOn)
+                g_roiRowProbe.push_back({ a.id, s,
+                    ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                           (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f),
+                    lblC });
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -24893,6 +24944,245 @@ int main(int argc, char** argv) {
                 check(rOk, "V18 fixture ROI stats see all four planes");
                 check(rmOk, "V18 fixture ROI means hit the plane levels");
             }
+        }
+
+        {   // ---- V19: the ROI TABLE's numbers, and its delete button ---------
+            // V18 and every other ROI assert call roiBasicStats* directly. The
+            // panel reaches those numbers through a hash cache, prints them from
+            // inside a clipper, and puts its delete button in the last column of
+            // a row whose label Selectable spans ALL columns. None of those three
+            // layers had a test. So drive the real panel in real frames and read
+            // back what it actually printed, and where the button actually is.
+            //
+            // Fixtures are analytic, never a second implementation of the stats:
+            // every row is identical, so whatever rows the stride lands on give
+            // exactly mean=base(+off), sd=amp, min/max=base(+off)-+amp.
+            auto mkMono = [](int W2, int H2, double base, double amp, double rightOff) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "v19mono"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+                d->src->dtype = "u16";
+                d->src->data.resize((size_t)W2 * H2);
+                for (int y = 0; y < H2; y++)
+                    for (int x = 0; x < W2; x++)
+                        d->px()[(size_t)y * W2 + x] =
+                            (float)(base + ((x & 1) ? amp : -amp) + (x >= W2 / 2 ? rightOff : 0));
+                d->syncMirrors();
+                d->uid = app.nextUid++;
+                return d;
+            };
+            // per-plane level plus a within-plane dither, so a plane's sd is NOT
+            // zero: a flat plane would let a broken sd read 0 and look right
+            auto mkCfaD = [](int W2, int H2, double amp) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "v19cfa"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+                d->cfa = 1; d->cfaPattern = 0; d->src->dtype = "u16";
+                static const double LVL[4] = { 1000, 2000, 3000, 4000 };
+                d->src->data.resize((size_t)W2 * H2);
+                for (int y = 0; y < H2; y++)
+                    for (int x = 0; x < W2; x++)
+                        d->px()[(size_t)y * W2 + x] =
+                            (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] +
+                                    (((x >> 1) & 1) ? amp : -amp));
+                d->syncMirrors();
+                d->uid = app.nextUid++;
+                return d;
+            };
+
+            ImGuiIO& pio = ImGui::GetIO();
+            int held = -1;
+            auto roiFrame = [&](ImVec2 mouse, int btn) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                // after the backend, before NewFrame: the GLFW backend rewrites
+                // MousePos from the OS cursor every frame (see g_injMouse)
+                if (mouse.x >= 0) pio.AddMousePosEvent(mouse.x, mouse.y);
+                if (held != btn) {
+                    if (held >= 0) pio.AddMouseButtonEvent(held, false);
+                    if (btn >= 0) pio.AddMouseButtonEvent(btn, true);
+                    held = btn;
+                }
+                ImGui::NewFrame();
+                ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_Always);
+                ImGui::Begin("RoiProbe", nullptr,
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+                g_roiRowProbeOn = true;
+                drawPanelRois();
+                ImGui::End();
+                ImGui::EndFrame();
+            };
+            auto settle = [&] { for (int f = 0; f < 4; f++) roiFrame(ImVec2(-1, -1), -1); };
+            auto row = [&](int id) -> const RoiRowProbe* {
+                for (const auto& r : g_roiRowProbe) if (r.id == id) return &r;
+                return nullptr;
+            };
+            auto dump = [&](const char* what) {
+                for (const auto& r : g_roiRowProbe)
+                    fprintf(stderr, "verifyselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
+                                    "min=%.10g max=%.10g n=%zu valid=%d del=%.0f,%.0f\n",
+                            what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
+                            r.s.n, (int)r.s.valid, r.del.x, r.del.y);
+            };
+            auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
+
+            closeAll();
+            app.images.push_back(mkMono(1024, 1024, 30000.0, 2.0, 1000.0));
+            app.current = 0;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 100, 100, 256, 256);          // wholly in the left half
+            const int roiId = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            dump("mono left");
+            const RoiRowProbe* ra = row(0);
+            const RoiRowProbe* rr = row(roiId);
+            check(ra && ra->s.valid, "V19 panel prints the All row");
+            check(rr && rr->s.valid, "V19 panel prints a placed ROI row");
+            // sd is the whole point of this panel: assert it is the real sigma,
+            // never 0. All row: values 29998/30002/30998/31002 in equal quarters
+            // -> mean 30500, var = 500^2 + 2^2.
+            if (ra) {
+                check(nearEq(ra->s.mean, 30500.0), "V19 All row mean is the true mean");
+                check(nearEq(ra->s.sd, sqrt(250004.0)), "V19 All row sd is the true sigma");
+                check(nearEq(ra->s.mn, 29998.0) && nearEq(ra->s.mx, 31002.0),
+                      "V19 All row min/max are the true extremes");
+                check(ra->s.n > 0 && ra->s.n < (size_t)1024 * 1024,
+                      "V19 All row decimates and can say n");
+            }
+            if (rr) {
+                check(nearEq(rr->s.mean, 30000.0), "V19 ROI row mean is the true mean");
+                check(nearEq(rr->s.sd, 2.0), "V19 ROI row sd is the true sigma");
+                check(nearEq(rr->s.mn, 29998.0) && nearEq(rr->s.mx, 30002.0),
+                      "V19 ROI row min/max are the true extremes");
+            }
+            // ...and the cached panel path must FOLLOW the ROI when it moves
+            findAnn(roiId)->x = 600;                 // wholly in the right half
+            app.annRev++;
+            settle();
+            dump("mono right");
+            rr = row(roiId);
+            check(rr && nearEq(rr->s.mean, 31000.0) && nearEq(rr->s.sd, 2.0),
+                  "V19 moving the ROI updates the printed numbers");
+
+            // sigma at the noise floor, on a large pedestal: the regime this
+            // panel exists for. sum2/n - mean^2 cancels ~10 of double's 16
+            // digits here (3.6e9 against a variance of 0.25), so if the two-pass
+            // form is fragile for real 16-bit data this is where it shows.
+            closeAll();
+            app.images.push_back(mkMono(1024, 1024, 60000.0, 0.5, 0.0));
+            app.current = 0;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 512, 512);
+            const int floorRoi = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            dump("60000+/-0.5");
+            if (const RoiRowProbe* rf = row(floorRoi)) {
+                fprintf(stderr, "verifyselftest: V19 noise floor sd err = %.3e (want 0.5)\n",
+                        rf->s.sd - 0.5);
+                check(nearEq(rf->s.mean, 60000.0), "V19 noise-floor mean survives the pedestal");
+                check(fabs(rf->s.sd - 0.5) < 1e-9, "V19 sigma 0.5 DN on a 60000 DN pedestal");
+            }
+
+            // channel switching, through the panel, on a Bayer frame: each plane
+            // is its own population and must never be mixed with its neighbours
+            closeAll();
+            app.images.push_back(mkCfaD(1024, 1024, 3.0));
+            app.current = 0;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 512, 512);
+            const int cfaRoi = app.anns.back().id;
+            static const double PLV[4] = { 1000, 2000, 3000, 4000 };
+            bool chOk = true, chSd = true;
+            app.roiChannel = -1;
+            settle();
+            dump("cfa all");
+            if (const RoiRowProbe* r0 = row(cfaRoi))
+                chOk = chOk && nearEq(r0->s.mean, 2500.0) && nearEq(r0->s.sd, sqrt(1250009.0));
+            for (int c = 0; c < 4; c++) {
+                app.roiChannel = c;
+                settle();
+                dump(CFA_CH_NAMES[c]);
+                const RoiRowProbe* rc = row(cfaRoi);
+                if (!rc || !rc->s.valid || !nearEq(rc->s.mean, PLV[c])) chOk = false;
+                if (!rc || !nearEq(rc->s.sd, 3.0)) chSd = false;
+            }
+            check(chOk, "V19 channel switch repoints the panel's numbers");
+            check(chSd, "V19 per-plane sd is the plane's own sigma");
+            app.roiChannel = -1;
+
+            // ---- the delete button ------------------------------------------
+            // Its click has to survive the row label's SpanAllColumns Selectable,
+            // which is submitted first and covers the button's rect.
+            // A 1x1 ROI is reachable from the editor's x/y/w/h fields and from a
+            // restored session. n = 1 makes sd exactly 0 and mean = min = max,
+            // which reads exactly like a broken panel - so the panel has to be
+            // able to say n. Pin both the number and the disclosure.
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 4, 4, 1, 1);
+            const int oneRoi = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            dump("1x1");
+            if (const RoiRowProbe* r1 = row(oneRoi)) {
+                check(r1->s.valid && r1->s.n == 1, "V19 a 1x1 ROI measures exactly one pixel");
+                check(r1->s.sd == 0.0 && r1->s.mn == r1->s.mx,
+                      "V19 n=1 gives sd 0 - the panel's n is what explains it");
+                check(r1->s.step >= 1, "V19 the stat carries the stride it sampled at");
+            }
+            // ...and a decimated ROI must report the stride that produced its n
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 1024, 1024);
+            const int bigRoi = app.anns.back().id;
+            settle();
+            dump("full 1024^2");
+            if (const RoiRowProbe* rb = row(bigRoi))
+                check(rb->s.step > 1 && rb->s.n < (size_t)1024 * 1024,
+                      "V19 a decimated ROI says both n and its stride");
+
+            // the channel selector's clamp: one past the last plane is not a
+            // plane, and CFA_SEL has no fifth entry
+            app.roiChannel = 99;
+            settle();
+            check(app.roiChannel == 3, "V19 roiChannel clamps to the last CFA plane");
+            app.roiChannel = -1;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 512, 512);
+            const int cfaRoi2 = app.anns.back().id;
+
+            // ...but the row label must STILL select: the button is only reachable
+            // because the Selectable now allows overlap, and that must not cost
+            // the click the Selectable is there for.
+            app.selectedAnn = 0;
+            settle();
+            if (const RoiRowProbe* rl = row(cfaRoi2)) {
+                roiFrame(rl->lbl, -1);
+                roiFrame(rl->lbl, 0);
+                roiFrame(rl->lbl, -1);
+                roiFrame(rl->lbl, -1);
+                fprintf(stderr, "verifyselftest: V19 label click at %.0f,%.0f: sel=%d\n",
+                        rl->lbl.x, rl->lbl.y, app.selectedAnn);
+                check(app.selectedAnn == cfaRoi2, "V19 clicking the row still selects it");
+            }
+
+            settle();
+            const RoiRowProbe* rd = row(cfaRoi2);
+            check(rd && rd->del.x > 0, "V19 the row's delete button is on screen");
+            if (rd) {
+                ImVec2 at = rd->del;
+                size_t before = app.anns.size();
+                roiFrame(at, -1);                    // hover
+                roiFrame(at, 0);                     // press
+                roiFrame(at, -1);                    // release
+                roiFrame(at, -1);
+                fprintf(stderr, "verifyselftest: V19 delete click at %.0f,%.0f: "
+                                "anns %zu -> %zu\n", at.x, at.y, before, app.anns.size());
+                check(app.anns.size() == before - 1, "V19 the x button deletes its ROI");
+            }
+            g_roiRowProbeOn = false;
+            held = -1;
+            pio.AddMouseButtonEvent(0, false);
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
