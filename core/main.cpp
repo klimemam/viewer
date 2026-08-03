@@ -27157,13 +27157,13 @@ int main(int argc, char** argv) {
             // the slice type must equal the channel type (InputFile is the one
             // that converts, which is why the loader can ask for FLOAT and get
             // half widened for free). So a HALF file is fed half memory.
-            auto writeExr = [&](const std::string& p,
-                                const std::vector<std::pair<std::string, std::vector<float>>>& chans,
-                                Imf::PixelType pt) {
+            auto writeExrC = [&](const std::string& p,
+                                 const std::vector<std::pair<std::string, std::vector<float>>>& chans,
+                                 Imf::PixelType pt, Imf::Compression comp) {
                 Imf::Header hdr(XW, XH);
                 for (const auto& c : chans)
                     hdr.channels().insert(c.first, Imf::Channel(pt));
-                hdr.compression() = Imf::NO_COMPRESSION;
+                hdr.compression() = comp;
                 Imf::OutputFile out(p.c_str(), hdr);
                 Imf::FrameBuffer fb;
                 std::vector<std::vector<Imath::half>> hbuf;
@@ -27183,6 +27183,11 @@ int main(int argc, char** argv) {
                 }
                 out.setFrameBuffer(fb);
                 out.writePixels(XH);
+            };
+            auto writeExr = [&](const std::string& p,
+                                const std::vector<std::pair<std::string, std::vector<float>>>& chans,
+                                Imf::PixelType pt) {
+                writeExrC(p, chans, pt, Imf::NO_COMPRESSION);
             };
             std::vector<float> cR = mkchan(0.0f), cG = mkchan(1.0f), cB = mkchan(2.0f),
                                cA = mkchan(3.0f);
@@ -27397,6 +27402,53 @@ int main(int argc, char** argv) {
                         grp.empty() ? -1 : (int)grp[0].isRaw);
                 check(grp.size() == 1 && grp[0].files.size() == 3 && !grp[0].isRaw,
                       "V23g three .exr files scan as ONE non-raw group");
+            }
+
+            // ---- V23h: the COMPRESSED cases, which is the whole argument ----
+            // docs/media-support.md §1 rejected a hand-rolled reader because
+            // real EXRs are PIZ/DWA and "NONE+ZIP only" would produce a stream
+            // of files that will not open. That reasoning is worth nothing
+            // unless the compressed paths are actually exercised, and every
+            // fixture above is NO_COMPRESSION. ZIP and PIZ are lossless, so the
+            // values must come back byte-for-byte identical to the plain file;
+            // DWAB is LOSSY, so it is checked for opening and for rough
+            // agreement, never for equality.
+            for (auto cc : { std::make_pair(Imf::ZIP_COMPRESSION,  "ZIP"),
+                             std::make_pair(Imf::PIZ_COMPRESSION,  "PIZ"),
+                             std::make_pair(Imf::RLE_COMPRESSION,  "RLE"),
+                             std::make_pair(Imf::ZIPS_COMPRESSION, "ZIPS") }) {
+                closeAll();
+                std::string pc = (xdir / (std::string("comp_") + cc.second + ".exr")).u8string();
+                writeExrC(pc, { { "R", cR }, { "G", cG }, { "B", cB } }, Imf::HALF, cc.first);
+                std::string ec = loadExr(pc);
+                bool okc = ec.empty() && app.images.size() == 1 &&
+                           app.images[0]->ch == 3 &&
+                           app.images[0]->sample(0, 0, 0) == 12.5f &&
+                           app.images[0]->sample(3, 0, 0) == -3.25f &&
+                           app.images[0]->sample(2, 0, 0) == 256.0f;
+                fprintf(stderr, "verifyselftest: V23h %-4s -> %zu image(s) px(0,0)=%.9g%s\n",
+                        cc.second, app.images.size(),
+                        app.images.empty() ? 0.0 : (double)app.images[0]->sample(0, 0, 0),
+                        ec.empty() ? "" : (" err: " + ec).c_str());
+                check(okc, (std::string("V23h ") + cc.second +
+                            " decompresses to the same values").c_str());
+            }
+            {   // DWAB is lossy: it must OPEN and be close, and must NOT be
+                // asserted equal - claiming exactness for a lossy codec would
+                // be the same kind of lie this loader exists to avoid.
+                closeAll();
+                std::string pd = (xdir / "comp_DWAB.exr").u8string();
+                writeExrC(pd, { { "R", cR }, { "G", cG }, { "B", cB } }, Imf::HALF,
+                          Imf::DWAB_COMPRESSION);
+                std::string ed = loadExr(pd);
+                float got = app.images.empty() ? 0.0f : app.images[0]->sample(0, 0, 0);
+                fprintf(stderr, "verifyselftest: V23h DWAB -> %zu image(s) px(0,0)=%.9g "
+                                "(lossy: 12.5 +/- 0.5)%s\n",
+                        app.images.size(), (double)got,
+                        ed.empty() ? "" : (" err: " + ed).c_str());
+                check(ed.empty() && app.images.size() == 1 && app.images[0]->ch == 3 &&
+                      std::fabs(got - 12.5f) < 0.5f,
+                      "V23h DWAB (lossy) opens and is close, not asserted exact");
             }
             } catch (const std::exception& ex) {
                 fprintf(stderr, "verifyselftest: V23 threw: %s\n", ex.what());
