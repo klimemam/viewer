@@ -4697,7 +4697,18 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
             break;
         }
         size_t before = app.images.size();
-        std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(i) : v.name;
+        // The fallback name counts POSITION AMONG SIBLINGS, from zero - so the
+        // first stack of a series is ":0" and lines up with stacks[0] in the
+        // Python that produced it. It used to be the container's flat node
+        // index, which counts the batch and the series nodes too: the first
+        // stack of a plain sweep came out ":2" and matched nothing the author
+        // could point at.
+        int ord = 0;
+        for (int k = 0; k < i; k++)
+            if (nodes[(size_t)k].parent == v.parent &&
+                nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series")
+                ord++;
+        std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(ord) : v.name;
         std::string lErr = loadNpyBuffer(member, origin, label);
         if (!lErr.empty()) {
             firstErr = "__pixels_" + std::to_string(i) + ": " + lErr;
@@ -20941,6 +20952,45 @@ static std::vector<FileGroup> buildFileGroups(const std::vector<std::vector<int>
 // letters are asserted as state (--abstats-selftest S4), like g_tilePanesDrawn.
 static std::string g_filesBadgeProbe;
 
+// The ink for one layer of the canon, in whichever theme is on. Wrapped so the
+// Files rows read as "this row is a series" rather than as a colour lookup.
+static ImVec4 inkOf(int layer) { return ui_theme::layerInk(app.themeVariant, layer); }
+
+// One condition, printed to the format the WHOLE series shares, so the values
+// read as a column. Formatting each on its own with %g gives 1, 2, 5, 10, 20
+// four different widths and nothing lines up. The digits of the UI font are
+// tabular, so a shared width and a shared number of decimals really do align -
+// padding with spaces would not, the font being proportional.
+//
+// The decimals are the fewest that still say every member exactly: a sweep of
+// whole milliseconds stays whole, and one member of 2.5 gives the column one
+// decimal rather than giving 2.5 six.
+static std::string conditionText(const App::Series& S, double v) {
+    if (!std::isfinite(v)) return "value unset";
+    int dec = 0;
+    for (const auto& m : S.members) {
+        if (!std::isfinite(m.value)) continue;
+        int d = 0;
+        for (; d < 6; d++) {
+            char t[64];
+            snprintf(t, sizeof t, "%.*f", d, m.value);
+            double back = atof(t);
+            if (std::fabs(back - m.value) <= 1e-9 * std::max(1.0, std::fabs(m.value))) break;
+        }
+        dec = std::max(dec, d);
+    }
+    int w = 0;
+    for (const auto& m : S.members) {
+        if (!std::isfinite(m.value)) continue;
+        char t[64];
+        snprintf(t, sizeof t, "%.*f", dec, m.value);
+        w = std::max(w, (int)strlen(t));
+    }
+    char b[96];
+    snprintf(b, sizeof b, "%*.*f", w, dec, v);
+    return b;
+}
+
 static void drawFileList() {
     g_filesBadgeProbe.clear();
     if (ImGui::Button("Open (O)")) openFileDialog();
@@ -21093,8 +21143,11 @@ static void drawFileList() {
       bool open = true;
       if (showHeaders) {
           bool isPreview = group.label == "preview";
-          if (isPreview) ImGui::PushStyleColor(ImGuiCol_Text,
-                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+          // The batch ink, unless this is the preview batch - "transient" is
+          // what that row has to say first, and dim already says it.
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                isPreview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
+                                          : inkOf(ui_theme::LayerBatch));
           open = isPreview
               ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
                                            ImGuiTreeNodeFlags_SpanAvailWidth,
@@ -21102,7 +21155,7 @@ static void drawFileList() {
               : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
                                            ImGuiTreeNodeFlags_SpanAvailWidth,
                                   "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
-          if (isPreview) ImGui::PopStyleColor();
+          ImGui::PopStyleColor();
           if (ImGui::IsItemHovered() && !group.dir.empty())
               ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
                                 dispPath(group.dir).c_str());
@@ -21223,10 +21276,13 @@ static void drawFileList() {
             // and at least the two the rows have always had
             snprintf(lb, 512, "%*s%s%s##%d", (int)std::max<size_t>(badge.size() * 2, 2),
                      "", head.name.c_str(), head.preview ? "   [preview]" : "", i);
-            if (head.preview) ImGui::PushStyleColor(ImGuiCol_Text,
-                                                    ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            // A loose image is a frame. Preview keeps the dim ink: "transient"
+            // outranks "which layer" on that one row.
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  head.preview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
+                                               : inkOf(ui_theme::LayerFrame));
             bool rowHit = rowWithMeta(head, lb, i == app.current, nullptr, badge, !cmpOn);
-            if (head.preview) ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
             if (head.preview && ImGui::IsItemHovered())
                 ImGui::SetTooltip("a throwaway preview - the one slot the Browse panel\n"
                                   "reuses; the next click there replaces it. Double-click /\n"
@@ -21293,11 +21349,12 @@ static void drawFileList() {
               // the text: ImGui cuts a label at the FIRST "##", so a stack the
               // user renames to "a##b" renders as "a" in either shape of row.
               char vb[64];
-              if (std::isfinite(mem->value)) {
-                  if (ser->unit[0]) snprintf(vb, sizeof vb, "%.6g %s", mem->value, ser->unit);
-                  else snprintf(vb, sizeof vb, "%.6g", mem->value);
-              } else {
-                  snprintf(vb, sizeof vb, "value unset");
+              {
+                  std::string vs = conditionText(*ser, mem->value);
+                  if (std::isfinite(mem->value) && ser->unit[0])
+                      snprintf(vb, sizeof vb, "%s %s", vs.c_str(), ser->unit);
+                  else
+                      snprintf(vb, sizeof vb, "%s", vs.c_str());
               }
               snprintf(lb, sizeof lb, "%*s%s · %s##m%d", (int)(badge.size() * 2), "",
                        vb, sname, head.seqId);
@@ -21315,7 +21372,10 @@ static void drawFileList() {
               else
                   snprintf(frames, sizeof frames, "  %df", (int)stack.size());
           }
-          if (rowWithMeta(head, lb, active, frames, badge, !cmpOn)) {
+          ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
+          bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn);
+          ImGui::PopStyleColor();
+          if (stackHit) {
               selectImage(stack[pos]);
               if (app.fitOnSwitch) app.fitRequested = true;
           }
@@ -21463,9 +21523,11 @@ static void drawFileList() {
             // made a context menu unreachable on the name once already.
             if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
                                                      p0.y + ImGui::GetFrameHeight()), true);
+            ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerSeries));
             bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
                                                     ImGuiTreeNodeFlags_SpanAvailWidth,
                                            "%s", S.name.c_str());
+            ImGui::PopStyleColor();
             if (room) ImGui::PopClipRect();
             if (room) {
                 ImVec2 m = ImGui::GetItemRectMin();
