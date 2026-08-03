@@ -12283,25 +12283,73 @@ static void drawCanvas(ImVec2 avail) {
                 ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, lh));
                 bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
                 int alpha = sh || sa ? 235 : 150;
+                // The bar spans the stack's TRUE length, not the part of it
+                // that happens to be resident: a 24-frame stack with 8 loaded
+                // used to draw a full bar, so the missing 16 were invisible and
+                // the handle sat at the end of a stack that had barely started.
+                // Three states, and the middle one is the point of the design:
+                //   resident  - the frame is here and can be shown
+                //   loading   - this stack is being read right now
+                //   absent    - not here, and nothing is fetching it
+                int total = std::max((int)fr.size(), si->expectedFrames);
+                bool loadingThis = app.seqRunning && app.seqLoadingId == si->id;
                 dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
-                float fx = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
-                dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha), barH * 0.5f);
+                if (total > (int)fr.size()) {
+                    // Where the resident frames actually ARE, one mark per
+                    // ordinal. Drawn from seqIndex, so a stack that arrived out
+                    // of order says so instead of pretending to be a prefix.
+                    float w = (b1.x - b0.x) / (float)total;
+                    for (int k = 0; k < (int)fr.size(); k++) {
+                        int ord = app.images[fr[k]]->seqIndex;
+                        if (ord < 0 || ord >= total) continue;
+                        float x0 = b0.x + w * (float)ord;
+                        dl->AddRectFilled(ImVec2(x0, b0.y), ImVec2(x0 + std::max(w, 1.0f), b1.y),
+                                          IM_COL32(110, 160, 210, alpha));
+                    }
+                    if (loadingThis) {   // the tail still coming, dimmer than resident
+                        float x0 = b0.x + w * (float)fr.size();
+                        dl->AddRectFilled(ImVec2(x0, b0.y), ImVec2(b1.x, b1.y),
+                                          IM_COL32(110, 160, 210, 70));
+                    }
+                } else {
+                    float fx0 = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
+                    dl->AddRectFilled(b0, ImVec2(fx0, b1.y), IM_COL32(110, 160, 210, alpha),
+                                      barH * 0.5f);
+                }
+                int curOrd = total > (int)fr.size() ? app.images[fr[pos]]->seqIndex : pos;
+                float fx = b0.x + (b1.x - b0.x) *
+                           (total > 1 ? (float)curOrd / (float)(total - 1) : 0.0f);
                 dl->AddCircleFilled(ImVec2(fx, botY + lh * 0.5f), barH * (sh || sa ? 1.4f : 1.0f),
                                     IM_COL32(160, 200, 240, alpha));
                 if (sa) {
                     float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
-                    int want = (int)(t * (float)(fr.size() - 1) + 0.5f);
-                    if (want != pos) selectImage(fr[want]);
+                    // Land on the nearest frame that is HERE. Dragging over a
+                    // gap leaves the picture and the number where they are:
+                    // there is no image to show for an ordinal we do not have,
+                    // and a number that moves without the picture moving is the
+                    // one thing this bar must not do.
+                    int wantOrd = (int)(t * (float)(total - 1) + 0.5f);
+                    int best = pos, bestD = INT_MAX;
+                    for (int k = 0; k < (int)fr.size(); k++) {
+                        int ord = total > (int)fr.size() ? app.images[fr[k]]->seqIndex : k;
+                        int d = std::abs(ord - wantOrd);
+                        if (d < bestD) { bestD = d; best = k; }
+                    }
+                    if (best != pos) selectImage(fr[best]);
                 }
                 // The keys named here are the ones that work HERE. It used to
                 // say ". and ," - those step the Browse panel's preview, and
                 // have never done anything in this view. Left/Right is what
                 // gotoFrame is bound to.
                 if (sh) {
-                    if (si->expectedFrames > (int)fr.size())
-                        ImGui::SetTooltip("frame %d of the %d loaded (%d expected)\n"
-                                          "drag, or Left / Right",
-                                          pos + 1, (int)fr.size(), si->expectedFrames);
+                    if (total > (int)fr.size())
+                        ImGui::SetTooltip("frame %d of %d\n"
+                                          "%d loaded - the bar spans all %d, and the gaps "
+                                          "are frames that are not here%s\n"
+                                          "dragging lands on the nearest loaded frame; "
+                                          "Left / Right step",
+                                          curOrd + 1, total, (int)fr.size(), total,
+                                          loadingThis ? " yet (still loading)" : "");
                     else
                         ImGui::SetTooltip("frame %d / %d  (drag, or Left / Right)",
                                           pos + 1, (int)fr.size());
