@@ -163,34 +163,30 @@ return Series(stacks, sweep=...)        # 条件を振ったもの
 return Batch([dark, flat])              # 一緒に開くもの
 ```
 
-dict で書きたいときも同じ — **キーが層を名乗る**:
-
-```python
-return {"stack": arr, "axis": {"values": t, "name": "time", "unit": "s"}}
-return {"frame": img}
-return {"series": [...], "sweep": {...}}
-```
-
-**素の配列も返せる。** その場合は §3.1 の native と同じ規則で読む —
-覚えることを増やさないため。曖昧さを自分で潰したいときに層を名乗る。
+**返し方は2通りだけ。** 素の配列か、上の型か。dict は用意しない —
+同じことを言う道が3つあれば3通りに食い違い、どれが正なのかを
+harness が調停する羽目になる。
 
 ```python
 def load(path):
-    return np.load(path)["data"]        # native と同じ読み方。1行のまま
+    return np.load(path)["data"]        # 1. 素の配列: native と同じ読み方。1行のまま
 ```
 
-### 4.3 層ごとのキー
+素の配列は §3.1 の native と同じ規則で読む (覚えることを増やさない)。
+**曖昧さを自分で潰したくなった時点で型を名乗る** — それが2つ目の道。
 
-| 層 | 位置引数 | 追加のキー |
+### 4.3 層ごとのフィールド
+
+| 層 | 位置引数 | 追加のフィールド |
 |---|---|---|
 | `Frame` | 画素 | `cfa` `name` `note` `meta` `range` |
 | `Stack` | 画素 | `axis` `cfa` `name` `note` `meta` `range` |
 | `Series` | `Stack` の列 (または画素) | **`sweep` (必須)** `name` `note` `meta` |
 | `Batch` | 上記の列 | `name` |
 
-| キー | 型 | 意味 |
+| フィールド | 型 | 意味 |
 |---|---|---|
-| `axis` | dict | 繰り返しの**並び順の座標** (時刻・番号)。条件は同じまま |
+| `axis` | `Axis` | 繰り返しの**並び順の座標** (時刻・番号)。条件は同じまま |
 | `sweep` | dict | stack 間で**変わった条件** (露光・照度)。series の存在理由 |
 | `cfa` | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
 | `name` | str | 表示名。省略時はファイル名 |
@@ -198,10 +194,11 @@ def load(path):
 | `meta` | dict | **撮影条件の事実**。key-value。provenance に載る。§4.3.1 |
 | `range` | (lo,hi) または配列 | 表示レンジ。**その層の形に合わせられる**。§4.3.2 |
 
-`axis` / `sweep` の中身はどちらも `{"values": 1次元配列, "name": str, "unit": str}`。
+`Axis` / `Sweep` はどちらも `(values, name, unit)` の3つ組。
 **値は全桁保持。単位は推測しない** — 書かれていなければ空欄のまま。
 
-未知のキーは**黙って捨てない** — 「adapter が知らないキー `foo` を返した」と言う。
+綴りを間違えたフィールドは**その場で TypeError になる** — 型を名乗る利点そのもの
+(dict なら「知らないキー `foo`」を実行後に報告するしかなかった)。
 
 #### 4.3.1 `note` と `meta` の違い
 
@@ -370,26 +367,12 @@ raise ValueError("header says 12 planes but the file holds 9")
 
 **黙って空を返さない。**「開けませんでした」だけの表示にはしない — 理由が要る。
 
-### 4.10 型に嵌めたい場合 — 3段階、下ほど早く間違いが分かる
+### 4.10 なぜ2通りなのか
 
-dict のゆるい形は残したまま、上に2段を用意する。どれで書いても harness の
-受け取りは同じ (duck typing)。
+**素の配列** — 学ぶことがゼロ。native と同じ読み方なので、既に知っている規則しか
+使わない。1行で書ける。
 
-**段1: 素の配列 / dict** — §4.2 のとおり。
-
-**段2: TypedDict** — 実行時コストゼロ。既存の書き方を1文字も変えずに、
-キー名の綴り間違いが**エディタ上で赤くなる**。
-
-```python
-from viewer_import import SeriesDict         # typing.TypedDict
-
-def load(path) -> SeriesDict:
-    z = np.load(path)
-    return {"series": z["data"],
-            "sweep": {"values": z["exposure_ms"], "name": "exposure", "unit": "ms"}}
-```
-
-**段3: dataclass** — 型名が層モデルそのもの (`Frame` / `Stack` / `Series` / `Batch`)
+**dataclass** — 型名が層モデルそのもの (`Frame` / `Stack` / `Series` / `Batch`)
 なので、書きながら語彙が身につく。そして**構築した行で落ちる**:
 
 ```python
@@ -402,26 +385,16 @@ def load(path):
 ```
 
 構築時に検査するもの: 名乗った層に対して shape が合っているか (§4.4) /
-`Series` の `sweep` 長 == stack 数 / `Axis` 長 == frame 数 / `cfa` が既知の
-パターンか / 非数値 dtype の拒否。
+`Series` の `sweep` 長 == stack 数 / `Axis` 長 == frame 数 / `range` の形 (§4.3.2) /
+`cfa` が既知のパターンか / 非数値 dtype の拒否。
 
-**これが型に嵌める最大の利得**: 間違いが *harness が走ったあと* ではなく
+**これが型の最大の利得**: 間違いが *harness が走ったあと* ではなく
 **間違えた行**で、その行の文脈つきで報告される。
 
 ```
 File "adapters/acme.py", line 12, in load
-    sweep=Sweep(values=z["exp"], name="exposure", unit="ms"))
+    sweep=Sweep(z["exp"], "exposure", "ms"))
 ValueError: Series: sweep has 8 value(s) but there are 16 stack(s)
-```
-
-便利コンストラクタ:
-
-```python
-Series(arr, sweep=Sweep(exposures, "exposure", "ms"))
-#   (S,R,H,W) → S 条件 × R 繰り返し / (S,H,W) → S 条件 × 1 枚
-Stack(arr, axis=Axis(t, "time", "s"))
-Frame(img, cfa="RGGB")
-Batch([dark, flat], name="20260803_dark_sweep")
 ```
 
 `viewer_import.py` の約束:
@@ -430,8 +403,8 @@ Batch([dark, flat], name="20260803_dark_sweep")
   (配列は触らず持ち回るだけ)。**コピーして持っていける**こと
 - torch も import しない。`__array__` / `.numpy()` を duck typing で見るだけ
 - dataclass は `frozen=True`。返したあとに誰も書き換えない
-- **dict / TypedDict / dataclass のどれで返しても同じ npz が出る**ことを
-  harness の検査項目にする (段が食い違うくらいなら段は無い方がマシ)
+- **import できない環境でも素の配列は返せる** — これが2通りにしておく実利。
+  型は表現力のために足すのであって、依存を増やすためではない
 
 ### 4.11 harness が引き受けること (ユーザーが書かなくてよいこと)
 
