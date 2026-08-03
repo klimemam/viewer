@@ -7,8 +7,9 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 
 > **§1 (どのライブラリで画像形式を読むか) は
 > [docs/media-formats.md](media-formats.md) に移った。**
-> あちらは調査メモではなく**測定つきの判断**で、EXR だけでなく PNG やその他の
-> 形式、そして「その画素は測定値か」という問題まで扱う。
+> あちらは調査メモではなく**測定つきの判断**で、EXR / PNG / JPEG / TIFF /
+> **主要カメラベンダとスマホの RAW** / **EXIF**、そして
+> 「その画素は測定値か」という問題まで扱う。
 > この文書に残っているのは **動画 (§2)** と **click-to-open UX (§3)** である。
 
 ---
@@ -34,13 +35,25 @@ Imath は OpenEXR が自分で取り、libdeflate は vendored 済みだった�
 あちらが決めていること (ここでは繰り返さない):
 
 - 3つの戦略 (OIIO 全部 / 形式ごとの公式 lib / 狭く + アダプタ) の測定つき比較
-- **OIIO は FetchContent だけでは建たなかった**という実測と、その意味
+- **OIIO は FetchContent だけでは建たなかった**という実測と、その意味。
+  そして **OIIO は EXR を OpenEXR で、RAW を LibRaw で読んでいる**ので
+  「OIIO にすれば全部タダで付く」は成立しないこと
 - **画素が [DN] かどうかを名乗る `values` フィールド**と、analyzer の門番
   — PNG/TIFF/JPEG のような「自分が何かを言わないファイル」を
   黙って測定値として扱わないための仕組み
+- **ベンダ RAW は EXR より安く (+11.8 s / +0.95 MiB)、しかも
+  `values=dn` を名乗れる**という実測 (実機5社で CFA・ブラック・ビット深度を確認)。
+  **PNG より RAW のほうが native の資格がある**という、直感に反する結論
+- **LibRaw には CMakeLists.txt が無い** (上流が 2014 年に公式サポート終了)。
+  imgui と同じ「ソースを直に並べる」流儀でしか入らないこと
+- **ライセンス**: LibRaw は LGPL-2.1 か **CDDL-1.0** の二択で、CDDL を推す。
+  exiv2 は GPL なので採らない。そして**この repo には LICENSE が無いのに
+  CI がバイナリを自動公開している**
+- **EXIF は `conditions` の材料**になるが、series は自動生成しない
 - **`Imf::setGlobalThreadCount()` を呼ばないと 3.6〜5.0 倍遅い**という実測
   (「OIIO の方が読み出しが速い」という印象のおそらくの正体)
-- native reader とアダプタの境界を**どこに引くか**
+- native reader とアダプタの境界を**どこに引くか** —
+  「ファイルが自分の数値の意味を言えるか」
 
 なお、この節にあった **loadExr の挿入点** (`loadNpy` / `loadRaw` の並び)、
 **channel → ImageDoc のマッピング** (`R,G,B(,A)`→ch=3/4、単独 AOV→ch=1、
@@ -115,15 +128,19 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
 
 | Phase | 内容 | 規模感 |
 |---|---|---|
-| **A0** | **`values` フィールド + analyzer の門 + selftest 1本** ([media-formats.md](media-formats.md) §5) | S |
+| **A0** | **`values` フィールド + analyzer の門 + selftest 1本** ([media-formats.md](media-formats.md) §6) | S |
+| **A0.5** | **LICENSE + THIRD-PARTY-NOTICES を置く**(同 §10)。**RAW より前** | S |
 | A | **公式 OpenEXR** で loadExr(ローカルのみ、scanline RGB/Y/layer→member)。**`setGlobalThreadCount()` を必ず呼ぶ** | S(数日) |
+| **A2** | **LibRaw でベンダ RAW**(ローカルのみ、`unpack()` の生値 + CFA/black/深度、**ブラックは引かない**)。同 §4 | S〜M |
 | B | preview slot UX(Space preview → click 設定 → 既定反転の 3 段階) | M(1〜2 週) |
 | C | 動画 Phase 1: ffmpeg-pipe → N フレーム stack(budget 適用) | M(1〜2 週) |
 | D | loader 共有 TU 化 + serve 側 EXR(f32 TILE、プロトコル不変) | S〜M |
 | E | 動画の窓デコード / remote 動画 | L(必要が立証されてから) |
 
-A0→A→B→C の順を推す: **A0 は A より先** — 表示参照の画素が入ってくる前に
-門を作るのが一番安い([media-formats.md](media-formats.md) §5)。
+A0→A0.5→A→A2→B→C の順を推す: **A0 は A より先** — 表示参照の画素が
+入ってくる前に門を作るのが一番安い。**A0.5 は A2 より先** — LibRaw は
+LGPL/CDDL で、いま LICENSE が1つも無いまま CI がバイナリを公開している
+([media-formats.md](media-formats.md) §10)。
 A は独立で安い。B は C の前提(動画こそ preview が要る)。
 
 **D には CI の代償がある**: serve 側に EXR を入れると、Linux ジョブが
