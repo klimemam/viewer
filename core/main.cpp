@@ -1250,8 +1250,18 @@ struct App {
     bool readerRan = false;
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+    // The reader panel's own dialogs. These went in as pfd::open_file(...).
+    // result() - blocking, inside the frame - which broke the rule the openDlg
+    // comment states, skipped the one-at-a-time guard every other dialog has,
+    // and left anyFileDialog() saying "no dialog" while one was on screen.
+    std::unique_ptr<pfd::open_file>     rdOpenDlg;
+    int rdOpenMode = 0;               // 0 = pick a reader .py, 1 = open a file with one
+    std::unique_ptr<pfd::select_folder> rdFolderDlg;
+    int rdFolderMode = 0;             // 0 = the folder of readers, 1 = open a folder with one
+    std::unique_ptr<pfd::save_file>     rdNewDlg;   // where to write the template
     bool anyFileDialog() const {      // see the note on csvDlg
-        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg;
+        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg ||
+               rdOpenDlg || rdFolderDlg || rdNewDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
@@ -8800,6 +8810,38 @@ static std::vector<std::string> shippedReaders() {
     return out;
 }
 
+// Write the starting template to `dest` and open it. Every failure here used to
+// come out as "could not write the template to <dest>", which names the
+// destination even when the destination is fine and the SOURCE is what is
+// missing - the case that actually happens, because a packaged build ships no
+// tools/import at all. Say which of the three things went wrong.
+static void newReaderFrom(const std::string& dest) {
+    if (dest.empty()) return;
+    std::string script = runAdapterScript();
+    if (script.empty()) {
+        toast("no reader harness found: this build has no tools/import/run_adapter.py "
+              "beside it, so readers cannot run at all", true);
+        return;
+    }
+    std::filesystem::path tmpl = pathFromUtf8(script).parent_path() / "adapters" / "template.py";
+    std::error_code ec;
+    if (!std::filesystem::exists(tmpl, ec)) {
+        toast("the template is missing: " + tmpl.u8string(), true);
+        return;
+    }
+    if (!std::filesystem::copy_file(tmpl, pathFromUtf8(dest),
+                                    std::filesystem::copy_options::overwrite_existing, ec)) {
+        toast("could not write " + dest + ": " +
+              (ec ? ec.message() : std::string("copy refused without saying why")), true);
+        return;
+    }
+    snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", dest.c_str());
+    snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "load");
+    std::string how;
+    if (adapter::openInEditor(dest, how)) toast("opened in " + how + ": " + baseName(dest));
+    else toast(how, true);
+}
+
 static void drawReaderPanel() {
     if (!app.readerPanelOpen) return;
     if (app.readerPanelRaise) {                 // an entrance asked for it
@@ -8843,12 +8885,9 @@ static void drawReaderPanel() {
     // prefs, because the second reader someone writes lives beside the first.
     if (ImGui::TreeNodeEx("##local", ImGuiTreeNodeFlags_SpanAvailWidth, "your readers%s",
                           app.readerLocalDir[0] ? "" : " (no folder chosen)")) {
-        if (ImGui::SmallButton("Choose folder...")) {
-            std::string d = pfd::select_folder("Folder of readers", ".").result();
-            if (!d.empty()) {
-                snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", d.c_str());
-                savePrefs();
-            }
+        if (ImGui::SmallButton("Choose folder...") && !app.rdFolderDlg) {
+            app.rdFolderMode = 0;
+            app.rdFolderDlg = std::make_unique<pfd::select_folder>("Folder of readers", ".");
         }
         if (app.readerLocalDir[0]) {
             ImGui::SameLine();
@@ -8891,10 +8930,10 @@ static void drawReaderPanel() {
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26);
     ImGui::InputText("file", app.readerPickFile, sizeof app.readerPickFile);
     ImGui::SameLine();
-    if (ImGui::Button("Browse...")) {
-        auto sel = pfd::open_file("Reader (.py)", ".", { "Python", "*.py" }).result();
-        if (!sel.empty())
-            snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", sel[0].c_str());
+    if (ImGui::Button("Browse...") && !app.rdOpenDlg) {
+        app.rdOpenMode = 0;
+        app.rdOpenDlg = std::make_unique<pfd::open_file>(
+            "Reader (.py)", ".", std::vector<std::string>{ "Python", "*.py" });
     }
     // The functions the file actually defines. Read out of the text, so the list
     // is what is there rather than what someone hoped was there.
@@ -8914,27 +8953,9 @@ static void drawReaderPanel() {
 
     // §4.13: no built-in editor. New writes the template out and opens it; Edit
     // opens the one named above. $EDITOR, then `code -g`, then the OS.
-    if (ImGui::Button("New reader...")) {
-        auto dest = pfd::save_file("New reader", "reader.py", { "Python", "*.py" }).result();
-        if (!dest.empty()) {
-            std::string tmpl;
-            std::string script = runAdapterScript();
-            if (!script.empty())
-                tmpl = (pathFromUtf8(script).parent_path() / "adapters" / "template.py").u8string();
-            std::error_code ec;
-            bool copied = !tmpl.empty() &&
-                          std::filesystem::copy_file(pathFromUtf8(tmpl), pathFromUtf8(dest),
-                                                     std::filesystem::copy_options::overwrite_existing, ec);
-            if (copied) {
-                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", dest.c_str());
-                snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "load");
-                std::string how;
-                if (adapter::openInEditor(dest, how)) toast("opened in " + how + ": " + baseName(dest));
-                else toast(how, true);
-            } else {
-                toast("could not write the template to " + dest, true);
-            }
-        }
+    if (ImGui::Button("New reader...") && !app.rdNewDlg) {
+        app.rdNewDlg = std::make_unique<pfd::save_file>(
+            "New reader", "reader.py", std::vector<std::string>{ "Python", "*.py" });
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(app.readerPickFile[0] == '\0');
@@ -10815,6 +10836,30 @@ static void pollFileDialog() {           // called once per frame from the main 
             if (app.folderDlgMode == 1) browseLocalFolder(p);   // Browse panel
             else openFolder(p);                                 // load stacks
         }
+    }
+    if (app.rdOpenDlg && app.rdOpenDlg->ready(0)) {
+        std::vector<std::string> sel = app.rdOpenDlg->result();
+        int mode = app.rdOpenMode;
+        app.rdOpenDlg.reset();
+        if (!sel.empty()) {
+            if (mode == 1) openReaderPicker(sel[0], "");
+            else snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", sel[0].c_str());
+        }
+    }
+    if (app.rdFolderDlg && app.rdFolderDlg->ready(0)) {
+        std::string d = app.rdFolderDlg->result();
+        int mode = app.rdFolderMode;
+        app.rdFolderDlg.reset();
+        if (!d.empty()) {
+            if (mode == 1) openReaderPicker(d, "");
+            else { snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", d.c_str());
+                   savePrefs(); }
+        }
+    }
+    if (app.rdNewDlg && app.rdNewDlg->ready(0)) {
+        std::string dest = app.rdNewDlg->result();
+        app.rdNewDlg.reset();
+        newReaderFrom(dest);
     }
 }
 
@@ -21564,14 +21609,14 @@ static void drawMenuBar(GLFWwindow* win) {
         // §4.13: a reader must be reachable for a FOLDER as well as a file -
         // "one condition per folder" is a common way to store a sweep, so the
         // folder is often the thing that needs reading, not any file in it.
-        if (ImGui::MenuItem("Open With a Reader...")) {
-            auto sel = pfd::open_file("Open with a reader", ".",
-                                      { "All files", "*" }).result();
-            if (!sel.empty()) openReaderPicker(sel[0], "");
+        if (ImGui::MenuItem("Open With a Reader...") && !app.rdOpenDlg) {
+            app.rdOpenMode = 1;
+            app.rdOpenDlg = std::make_unique<pfd::open_file>(
+                "Open with a reader", ".", std::vector<std::string>{ "All files", "*" });
         }
-        if (ImGui::MenuItem("Open Folder With a Reader...")) {
-            std::string d = pfd::select_folder("Open folder with a reader", ".").result();
-            if (!d.empty()) openReaderPicker(d, "");
+        if (ImGui::MenuItem("Open Folder With a Reader...") && !app.rdFolderDlg) {
+            app.rdFolderMode = 1;
+            app.rdFolderDlg = std::make_unique<pfd::select_folder>("Open folder with a reader", ".");
         }
         // The local mirror of browsing a server: look around, preview, use the
         // server-side stats - without loading anything. Same Browse panel, the
