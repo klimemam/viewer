@@ -150,14 +150,64 @@ Inspector の **Interpret** で切り替えます。オプションの全体は 
 
 | 形式 | 備考 |
 |---|---|
-| `.npy` | `u1 i1 b1 u2 i2 u4 i4 f4 f8`、ビッグエンディアン、fortran order に対応。先頭軸がフレーム軸なら 1 stack |
-| `.npz` | zip 内の各 `.npy` メンバを1枚ずつ (stored / deflate) |
+| `.npy` | `u1 i1 b1 u2 i2 u4 i4 f4 f8`、ビッグエンディアン、fortran order に対応。形の読み方は下表 |
+| `.npz` | zip 内の各 `.npy` メンバを読む (stored / deflate)。名前は `file.npz:key` |
 | `.bin` `.raw` `.yuv` `.dat` `.rggb` | ヘッダ無し raw。dtype (u8/u16/f32/f64)、解釈 (gray/rgb/bgr/rgba/bgra/bayer/quad-bayer)、寸法、オフセット、クロップを指定 |
 | `.vsession` | 保存したセッション |
 
 **書ける**: PNG (表示のとおり)、CSV / TSV (測定結果)、`.vsession`。
 
 PNG は書き出し専用で、PNG/JPEG/TIFF の**読み込みはありません**。
+
+### `.npy` / `.npz` の形をどう読むか
+
+配列の次元数から決めます。**3次元だけは曖昧**なので、そこに旗があります。
+
+| shape | 読み方 |
+|---|---|
+| `(H, W)` | 1枚・1ch |
+| `(H, W, C)` / `(C, H, W)` | 1枚・C ch (C ≤ 4 のとき。`(C,H,W)` は note に `CHW->HWC` と残る) |
+| `(F, H, W)` | **F 枚の stack** (先頭が 5 以上のとき) |
+| `(F, H, W, C)` | F 枚 × C ch |
+| `(N,)` | 1×N の1枚として開かれる — **軸データを入れている場合は意図しない絵になります** |
+| 5次元以上 | 先頭要素 `[0]` だけを読みます |
+
+**3次元の曖昧さ**: `(3, H, W)` は「3ch のカラー1枚」とも「3枚の stack」とも読めます。
+既定は**先頭が 4 以下ならチャンネル**。連番だと分かっているときは
+`--npy-axis frames` を付けると先頭軸をフレーム軸として読みます
+(`--npy-axis auto` が既定)。CFA の指定は `--cfa bayer --bayer-pattern RGGB`
+の順で書いてください (`--bayer-pattern` は `--cfa` より前だと無視されます)。
+
+`.npz` は今のところ**メンバを全部開きます**。露光時間の列のような1次元配列を
+一緒に入れてあると、それも「高さ1の画像」として並びます。
+この扱いは [docs/npz-design.md](docs/npz-design.md) で見直し中です
+(1次元は画像にせず、フレーム数と長さが一致すれば**フレームごとの X 軸**として使う)。
+
+### 入力アダプタ (設計中・未実装)
+
+上の表のとおり、この読み方は**推測**を含みます。推測が外れたときに黙って
+別の絵を出すのは測定器として最悪の失敗で、しかも形式を足すたびに推測が増えます。
+
+そこで「読み方を書いた人が宣言する」仕組みを設計しています —
+**ユーザーが Python の関数を1つ書き、それを viewer に指定する**方式です。
+
+```python
+def load(path):
+    z = np.load(path)
+    return {"frames": z["data"],                       # (F, H, W)
+            "axis": {"values": z["exposure_ms"],
+                     "name": "exposure", "unit": "ms"},
+            "cfa": "RGGB"}
+```
+
+- 配列をそのまま返せば stack。言いたいことがあるときだけ dict
+- **アダプタの世界では 3 次元は frames** — 推測が消え、`--npy-axis` が要らなくなる
+- 指定は Inspector から。一度指定した対応は「このフォルダの `*.npz`」のような
+  **規則**として憶える (prefs に保存され、一覧で見えて消せる)
+- 明示的に選んだものだけが走る (自動探索はしない)
+
+仕様と段階は [docs/import-adapters.md](docs/import-adapters.md)。
+**まだ動きません** — 決定待ちの項目が同ドキュメント末尾にあります。
 
 ---
 
