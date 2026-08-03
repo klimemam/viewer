@@ -69,8 +69,21 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
-                      core/window_frame.cpp
+                      core/window_frame.cpp core/version.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
+# The commit this binary was built from, refreshed on every build (a
+# configure-time hash goes stale the moment you commit, and this string is
+# written into exported data as provenance). version.cpp is its own tiny
+# translation unit so a new commit relinks instead of recompiling main.cpp.
+set(VIEWER_VERSION_HEADER ${CMAKE_BINARY_DIR}/generated/viewer_version_generated.h)
+add_custom_target(viewer_version ALL
+    COMMAND ${CMAKE_COMMAND} -DOUT=${VIEWER_VERSION_HEADER}
+                             -DSRCDIR=${CMAKE_SOURCE_DIR}
+                             -P ${CMAKE_SOURCE_DIR}/cmake/gitversion.cmake
+    BYPRODUCTS ${VIEWER_VERSION_HEADER}
+    COMMENT "resolving the build's commit")
+add_dependencies(viewer viewer_version)
+target_include_directories(viewer PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # third-party: do not police its warnings. MINIZ_NO_STDIO drops the archive
 # file-I/O layer we never use (only the in-memory codec is called), which also
 # silences its large-file #pragma message on MinGW.
