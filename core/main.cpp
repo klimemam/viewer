@@ -5609,6 +5609,8 @@ static void crashHandler(int sig) {
     raise(sig);
 }
 
+static std::string loadY4m(const std::string& path);   // defined with the video loaders
+
 static std::string loadSession(const std::string& path) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read session file";
@@ -5957,6 +5959,10 @@ static std::string loadSession(const std::string& path) {
                 std::transform(lowp.begin(), lowp.end(), lowp.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
+                // ...and a y4m must go back through the y4m reader for the same
+                // reason: it is a stack inside ONE file, so handing it to
+                // loadNpy loses the whole stack, not one frame of it.
+                bool isY4m = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".y4m") == 0;
                 bool isRemote = p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
                 if (isRemote) {
                     // a remote image has no local file to decode: reconnect instead
@@ -5964,7 +5970,9 @@ static std::string loadSession(const std::string& path) {
                     openRemote(p);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
-                    err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
+                    err = isNpz ? loadNpz(p, pendingMember)
+                        : isY4m ? loadY4m(p)
+                                : loadNpy(p);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -27112,7 +27120,26 @@ int main(int argc, char** argv) {
                           vnote.find("not assumed linear") != std::string::npos;
             check(honest, "V24 the note says exact, and linear NOT assumed");
 
-            // -- V24d: a lossy container is refused BY NAME -------------------
+            // -- V24d: the stack survives a session round trip ----------------
+            // A session records a doc by PATH and reopens it by extension. The
+            // .npz branch exists there because loadNpy would fail the magic
+            // check and the array would silently vanish; a y4m is a whole STACK
+            // inside one file, so the same omission loses all N frames rather
+            // than one - which is why this is asserted and not assumed.
+            {
+                std::string sess = (vdir / "v24.vsession").u8string();
+                saveSession(sess, true);
+                loadSession(sess);
+                loadAll();
+                ImageDoc* r0 = frameAt(0);
+                fprintf(stderr, "verifyselftest: V24 session: frames=%d f0(0,0)=%.10g\n",
+                        seqFrames(), r0 ? r0->sample(0, 0, 0) : -1.0);
+                check(seqFrames() == VN && r0 &&
+                          r0->sample(0, 0, 0) == (float)vpix(0, 0, 0),
+                      "V24 a y4m stack survives a session");
+            }
+
+            // -- V24e: a lossy container is refused BY NAME -------------------
             closeAll();
             std::string pMp4 = (vdir / "capture.mp4").u8string();
             writeFile(pMp4, std::string(4096, '\0'), 1.0);

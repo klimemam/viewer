@@ -318,6 +318,17 @@ y4m 内部でも、正直に読めないものは拒否する:
 | n of N | バイト数から `declared` を導出、短い読み取りで停止、stack 名を `(n of N frames)` に書き換え + toast |
 | メモリ予算 | `seqMemBudget()` を frame バイト数で割って `want` を決める |
 | 正直さの記録 | `ImageDoc::note` に「bit-exact / values are DN as stored / **not assumed linear**」 |
+| セッション復元 | `loadSession` の拡張子分岐に `.y4m` を追加。npz と同じ理由(`loadNpy` に渡すと magic check で落ちて**黙って消える**)だが、y4m は 1 ファイル = 1 stack なので**失うのは N 枚全部**。V24 が固定 |
+
+### v1 の既知の制限(意図的)
+
+**Browse パネルには y4m は出ない。** 一覧・リモート stack 化・サーバ側走査は
+すべて `isNpyName()`(`.npy` のみ真)で門番されており、ここを広げると
+**リモートの y4m 対応があるかのように見えてしまう** — remote は npy しか
+配信しない(`core/serve.cpp`)。開く経路は File > Open / drag & drop /
+コマンドライン(いずれも `openPath` を通る)。
+「見えるのに開けない」より「経路が限られている」方が嘘が少ないので、
+v1 はこちらを採る。リモート動画は video-support.md §6 の再評価対象。
 
 **`abValueUnit()` は変更していない。** 読み込むのはビット完全な値だけなので、
 **[DN] は正しい**。ラベルを剥がす必要が出るのは非可逆を読むようになったときで、

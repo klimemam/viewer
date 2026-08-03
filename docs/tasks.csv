@@ -83,3 +83,4 @@
 "レビュー必要項目","実機確認","見た目全般/別窓実操作/シェブロン/複数Browse/実ssh再接続/フレームリニアリティ表示","—","GLキャプチャ不可のため全て未目視"
 "残課題","TemporalStateキー欠陥","キャッシュキーにdata revisionが無い(main.cpp:7027) + forgetImageがtemporalExtraを見逃す(2183)","reference-design.md発見","参照化stage 5で同時修正予定だが独立して実バグ"
 "対応済み",".npz の key 対応","メンバを形で分類してから開く。1次元(N,)が「高さ1pxの絵」になる捏造を停止。npz=batch/メンバ=stack、picker(画像1つ+軸候補無しなら出さない)、frame数と一致する1次元keyをTemporalと同じ軸機構へ(単位はユーザー確定)、スカラー/文字列はInspectorへ、4次元超は拒否","npz-design.md §4, V19/V19b/V19c","リモートは未着手(プロトコル無変更)"
+"レビュー必要項目","動画対応(y4m)","動画=stackだが「画素が測定値か」で可否が決まる。実測: 8bit lossy往復で既知σ_t 40 DN16→0.00(消滅)、8bitで表現可能なノイズも-11%かつGOP周期バイアス(Iフレーム+3.9%)、FFV1 16bitはビット完全。→v1はy4mの輝度のみ読む(依存追加ゼロ、1ファイル=1stack、n of N)、codec必須コンテナは名指し+理由+変換コマンドで拒否。abValueUnitは不変(ビット完全な値しか入れないのでDNが真)","video-support.md, V24","media-video ブランチ。FFmpegは実測95.6MB対7.6MBで見送り、採用条件は§6。独立レビュー待ち・未マージ"
