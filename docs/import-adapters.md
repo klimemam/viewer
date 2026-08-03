@@ -125,6 +125,121 @@ viewer はそれを読む。**npz は既に読める形式**なので、転送�
 - 起動前に**実際のコマンドを表示**する
 - Python が無ければ、その事実を言う (推測して黙って失敗しない)
 
+### 3.8 関数の形式 (仕様)
+
+#### シグネチャ
+
+```python
+def load(path):            # path: str。この1引数だけが必須
+    ...
+```
+
+- 関数名は自由。viewer には `adapters/acme.py:load` の形で指定する
+  (1ファイルに複数の reader を置ける)
+- モジュールは**自分のディレクトリを sys.path に載せて**実行される。
+  隣に置いたヘルパを import できる
+- **元ファイルを書き換えてはならない。** 読むだけ
+
+**将来のための1つの約束 (今書いておけば破壊的変更にならない)**:
+関数が `frames` というキーワード引数を受けるなら、viewer は
+「この範囲だけ欲しい」と渡すことがある。受けない関数はこれまでどおり全部返す。
+
+```python
+def load(path, frames=None):   # frames: range | list[int] | None(全部)
+```
+
+#### 返り値 — 3つの形
+
+| 返り値 | 意味 |
+|---|---|
+| `ndarray` | frames そのもの。stack (または1枚) |
+| `dict` | 1つの stack + 言いたいこと |
+| `list[dict \| ndarray]` | 複数の stack。まとめて1つの batch になる |
+
+#### dict のキー
+
+| キー | 必須 | 型 | 規則 |
+|---|---|---|---|
+| `frames` | ✔ | ndarray / torch tensor | 下の「形の規則」参照 |
+| `layout` | | str | `"HW"` `"HWC"` `"FHW"` `"FHWC"` `"CHW"` `"FCHW"`。省略時は形の規則 |
+| `axis` | | dict | `{"values": 1次元配列 (長さ = F), "name": str, "unit": str}` |
+| `cfa` | | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
+| `name` | | str | stack の表示名。省略時はファイル名 |
+| `note` | | str | 素性の一文。doc の note に入る |
+| `meta` | | dict | スカラー/文字列。**provenance に載る** (エクスポートの出所行) |
+| `range` | | (lo, hi) | 表示レンジの初期値。**表示だけ**で、測定値には触らない |
+
+未知のキーは**黙って捨てない** — 「adapter が知らないキー `foo` を返した」と言う
+(綴り間違いを黙殺しない)。
+
+#### 形の規則 — ここが本題
+
+**3次元は frames。** `(3,H,W)` は3枚の stack として読む。
+
+これが今の loader との決定的な違い。native の `decodeNpyBuffer` は
+「先頭が4以下ならチャンネル」という**推測**をしていて、それが外れると黙って
+間違った絵になる (`--npy-axis` はその推測を人が上書きするための旗)。
+adapter の世界では**書いた人が知っている**ので、推測を置かない:
+
+- 2次元 `(H,W)` → 1枚、1ch
+- 3次元 `(F,H,W)` → **F 枚の stack**
+- 4次元 `(F,H,W,C)` → F 枚 × C ch
+- それ以外の意味にしたいときだけ `layout` を書く
+  (`(H,W,3)` を1枚のカラーにしたいなら `layout="HWC"`)
+- 5次元以上は**拒否**する。黙って `[0]` を取らない
+
+#### dtype
+
+- 配列の dtype がそのまま「このデータの型」として表示される (`u8/u16/i32/f32/f64`)
+- viewer 内部は f32。**整数は値を保ったまま f32 に載る** (画素値は [DN])
+- `bfloat16` など numpy に無いものは f32 に変換し、**変換したと note に残す**
+- 非数値 (文字列・object・complex) は拒否。理由を言う
+
+#### 失敗のしかた
+
+例外を投げる。メッセージがそのままユーザーに出る。
+
+```python
+raise ValueError("header says 12 planes but the file holds 9")
+```
+
+**黙って空を返さない。**「開けませんでした」だけの表示にはしない — 理由が要る。
+
+#### harness が引き受けること (ユーザーが書かなくてよいこと)
+
+- torch → numpy (`.detach().cpu().numpy()` 相当、`__array__` / `.numpy()` を duck typing)
+- 非連続配列の連続化、endianness の正規化
+- 返り値の検査 (形・dtype・軸の長さが F と一致するか)
+- **.npz への書き出し** (予約メンバ: `__frames_<i>` / `__axis_values_<i>` /
+  `__axis_name_<i>` / `__axis_unit_<i>` / `__cfa_<i>` / `__name_<i>` /
+  `__note_<i>` / `__meta_<k>`)
+- 1行の要約を stderr に出す (viewer がそのまま中継する)
+
+#### キャッシュの鍵
+
+`(元ファイルの path, mtime, size, adapter ファイルの path, その mtime, 関数名,
+ モジュールの VERSION 属性があればその値)`
+
+adapter を編集したら**次に開いたときに効く**。ユーザーが明示的に版を上げたい
+ときのために `VERSION = "1.2.0"` を見る。
+
+#### 例 — これで全部
+
+```python
+import numpy as np
+VERSION = "1.0.0"
+
+def load(path):
+    z = np.load(path)
+    return {
+        "frames": z["data"],                       # (24, 480, 640) u16
+        "axis": {"values": z["exposure_ms"],
+                 "name": "exposure", "unit": "ms"},
+        "cfa": "RGGB",
+        "meta": {"gain_db": float(z["gain"]), "sensor": "IMX999"},
+    }
+```
+
 ## 4. 何が良くなるか
 
 - **推測が減る。** `--npy-axis` のような「人が形を教える」旗は、adapter が宣言する世界では要らない
@@ -176,3 +291,9 @@ docs/npz-design.md の修正 (1次元を画像にしない・picker・軸候補)
    既定は**このフォルダの同拡張子**)
 5. **内蔵エディタは要るか** (推奨: v1 では作らず、外部エディタ起動のみ)
 6. **v1 はローカル先行でよいか** (推奨: よい)
+7. **画素値の単位を adapter が変えられるようにするか** — 正典は「画素値は [DN]」。
+   電子数 [e-] を返す adapter を許すと、軸ラベル・統計・エクスポートの全部に
+   波及する。(推奨: **v1 では許さない**。[DN] 固定。必要になったら、
+   「単位付きの画素値」を層モデルの語彙として正面から議論する)
+8. **部分読み込み (`frames=` キーワード) を v1 で使うか**
+   (推奨: **契約だけ先に決めて実装は後**。関数側の書き方が後で変わらないことが大事)
