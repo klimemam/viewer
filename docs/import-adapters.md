@@ -30,52 +30,100 @@ series ⊂ batch)・軸・単位はドメインの知識であって、バイト
 
 アダプタはこの形をもう一度使うだけでよい。新しい機構ではない。
 
-## 3. 提案 — importer は「層を宣言する」プロセス
+## 3. 提案 — ユーザーが書くのは「関数」。書式ではない
 
-### 3.1 契約 (viewer が知るべきこと)
+初版は manifest(JSON)を契約にしていた。**却下** (2026-08-03):
+「json だと学習コストがある。numpy か torch で、ある形で出力する関数をユーザーが書く。
+inspector でその関数を指定する。一旦指定されたものはパス名と関数のペアを記憶しておいて
+それを適用する。関数はレポジトリにあるやつとローカルにあるやつ」。
 
-    viewer-import <path> [--opt k=v ...]
-      → stdout に manifest (JSON) + payload (npy バイト列)
+JSON は viewer の都合の書式で、書く人にとっては外国語。この分野の人が毎日書いている
+のは numpy であって、書式ではない。**契約を「関数の返り値」にする。**
 
-manifest が**推測ではなく宣言**を運ぶ:
+### 3.1 いちばん簡単な形が、いちばん短いこと
 
-```json
-{ "adapter": "acme_raw", "adapter_version": "1.2.0",
-  "batch": "20260803_dark_sweep",
-  "stacks": [
-    { "name": "dark", "frames": 24, "w": 640, "h": 480, "ch": 1,
-      "dtype": "u16", "cfa": "bayer", "cfa_pattern": "RGGB",
-      "axis": { "name": "exposure", "unit": "ms",
-                "values": [1.0, 2.0, 5.0, 10.0] },
-      "payload": "stack0" }
-  ],
-  "metadata": { "gain_db": 6.0, "sensor": "IMX999", "temp_C": 25.3 } }
+```python
+def load(path):
+    return np.load(path)["data"]          # (F,H,W) の ndarray。これだけで動く
 ```
 
-- **層は宣言される**。「これは 24 枚の stack だ」と adapter が言う。viewer は推測しない
-- **軸も単位も宣言される**。npz に x 軸が入っている件はここで自然に解ける
-- **CFA も宣言される**。今は doc の属性として後から人が設定している
-- **metadata はそのまま provenance に乗る**
+これが1行目の体験。返り値が配列なら、それが stack (または frame)。
+**学習するものが無い。**
 
-### 3.2 どこで動かすか — ローカルもリモートも同じ
+### 3.2 言いたいことがあるときだけ、dict にする
 
-peer は既に**向こう側のマシンで動くプロセス**。adapter も同じ場所で動かせる:
+```python
+def load(path):
+    z = np.load(path)
+    return {
+        "frames": z["data"],              # (F,H,W) / (F,H,W,C) / (H,W)
+        "axis":   {"values": z["exposure_ms"], "name": "exposure", "unit": "ms"},
+        "cfa":    "RGGB",                 # 省略可
+        "name":   "dark sweep",           # 省略可
+        "meta":   {"gain_db": 6.0},       # 省略可。provenance に載る
+    }
+```
 
-- ローカル: viewer が adapter を起動
-- リモート: peer が adapter を起動し、結果だけが回線を流れる
-  (生の巨大ファイルを転送しない — 今の設計思想と一致)
+複数 stack を返したいときは dict の list。**manifest は消えたのではなく、
+Python の返り値になった** — 学習コストだけが消えた。
 
-### 3.3 Python 参照実装を同梱する
+- **torch も可**: `.detach().cpu().numpy()` 相当を harness 側で行う
+  (`__array__` / `.numpy()` を duck typing)。bfloat16 のように numpy に無い
+  dtype は f32 に変換し、**変換したことを note に残す** (黙って変えない)
+- **軸は宣言**: 値は全桁保持。**単位は推測しない** — 書かれていなければ空欄
 
-`tools/import/` に:
+### 3.3 データの渡し方 — 新しい転送形式を作らない
 
-- `viewer_import.py` — manifest を書くための薄いライブラリ
-  (`emit_stack(array, name=..., axis=..., unit=...)` だけ)
-- 例: `adapter_npz_keys.py` (key 付き npz)、`adapter_hdf5.py`、`adapter_tiff_stack.py`
-- ユーザーは自分のドメイン用に**30行くらい**書けば済む
+harness (同梱スクリプト) がユーザー関数を呼び、返り値を **.npz** に書く。
+viewer はそれを読む。**npz は既に読める形式**なので、転送のために新しい
+パーサを増やさない。軸や metadata は予約名のメンバとして同じ npz に入る
+(`__axis_values` / `__axis_name` / `__axis_unit` / `__meta_*`)。
 
-viewer 側の設定は「この拡張子はこの adapter」という表 (prefs)。
-**自動探索はしない** — 任意のスクリプトが勝手に走るのは許さない。明示設定のみ。
+> これは今まさに実装中の「key 付き npz」対応と同じ土台に乗る (docs/npz-design.md)。
+> 二つの作業は競合ではなく、後者が前者の運び屋になる。
+
+### 3.4 パスと関数の対応を憶える
+
+一度指定したら憶える。ただし**1ファイル1エントリでは増える一方**なので、
+記憶するのは「規則」:
+
+| 記憶する形 | 例 |
+|---|---|
+| ディレクトリ + 拡張子 | `//nas/share/2026/** : *.npz` → `adapters/acme.py:load` |
+| glob | `*_raw.bin` → `adapters/acme.py:load_raw` |
+| 単一ファイル (最後の手段) | `.../odd_one.dat` → … |
+
+- **より具体的な規則が勝つ**
+- **有限に抑える**: 単一ファイル規則だけ LRU (既定 64 件)。規則は残る
+- **prefs に保存し、一覧で見えて消せる**。見えない魔法にしない
+  (後から「なぜこのファイルだけ違う読まれ方をするのか」が説明できること)
+
+### 3.5 どこで指定するか
+
+- **Inspector** に「reader」欄 (ユーザー提案どおり)。今このファイルが何で読まれたかを
+  表示し、その場で差し替えられる
+- **開けなかったときのエラーからも直接**指定できる。読めない理由を告げた同じ場所に
+  「reader を選ぶ…」を置く (探しに行かせない)
+- 選択肢は **repo 同梱の adapter** (`tools/import/adapters/*.py`) と
+  **ローカルの adapter** (ユーザーのフォルダ) の両方から
+
+### 3.6 関数を書く場所
+
+- **新規作成**: テンプレートを書き出して**ユーザーのエディタで開く**
+  (`$EDITOR` / OS 関連付け)。ImGui のテキスト編集は貧弱で、
+  この道具が担うべき仕事ではない
+- **編集**: 同上。保存すれば次回から反映 (§5 のキャッシュは adapter ファイルの
+  mtime も鍵に含めるので、編集が即座に効く)
+- 内蔵エディタは v1 では作らない。必要と分かってから
+
+### 3.7 信頼
+
+外部の Python を起動する。したがって:
+
+- **明示的に選んだものだけが走る**。自動探索も自動適用もしない
+  (記憶された規則は「ユーザーが一度選んだ」ことの記録であって、発見ではない)
+- 起動前に**実際のコマンドを表示**する
+- Python が無ければ、その事実を言う (推測して黙って失敗しない)
 
 ## 4. 何が良くなるか
 
@@ -108,18 +156,23 @@ docs/npz-design.md の修正 (1次元を画像にしない・picker・軸候補)
 
 | # | 内容 | 検証 |
 |---|---|---|
-| 1 | manifest の形を確定 (この文書 §3.1 を仕様化) | 例 JSON を2つ書いて層モデルに矛盾がないこと |
-| 2 | `tools/import/viewer_import.py` + adapter 1本 (key 付き npz) | Python 側だけで完結、手で叩ける |
-| 3 | viewer 側: 拡張子→adapter の表 (prefs) と起動・manifest 解釈 | 新 selftest: 偽 adapter (echo するだけの実行ファイル) を起動し、宣言どおり層ができること |
-| 4 | payload 検証 (宣言 shape と実バイト数) + 失敗時の言い方 | 嘘 manifest を食わせて拒否されること |
-| 5 | キャッシュ (mtime/size で無効化) | 2回目が adapter を起動しないこと |
-| 6 | peer 側での実行 (リモート) | 既存の remote selftest に1本足す |
+| 1 | 返り値の契約を確定 (§3.1-3.2) + harness `tools/import/run_adapter.py` | Python 側だけで完結。ndarray も dict も list も受けること |
+| 2 | 同梱 adapter 1本 (key 付き npz) + テンプレート | 手で叩いて npz が出ること |
+| 3 | viewer 側: 起動・npz 受け取り・Inspector の reader 欄 | 新 selftest: 偽 adapter (固定 npz を書くだけ) を起動し、層と軸ができること |
+| 4 | パス→関数の規則 (prefs 保存・一覧・LRU) | 規則の具体性順に勝つこと、LRU が上限を守ること |
+| 5 | キャッシュ (元ファイルの mtime/size + adapter の mtime で無効化) | 2回目は起動しない / adapter を編集したら起動する |
+| 6 | 返り値の検査と断り方 (shape 不整合・非数値・空) | 嘘の返り値が拒否され、理由が言われること |
+| 7 | peer 側での実行 (リモート) | 既存の remote selftest に1本足す |
 
 ## 8. 決めてほしいこと
 
-1. **この方向で進めるか** (推奨: 進める。§6 のとおり npz 修正は独立で先行)
-2. **manifest は JSON でよいか**、それとも既存 remote_proto の枠に載せるか
-   (推奨: JSON。人が手で書けることが adapter を書く敷居を決める)
-3. **adapter の起動は明示設定のみでよいか** (推奨: よい。自動探索はしない)
-4. **v1 の適用範囲**: ローカルのみか、最初からリモートもか
-   (推奨: ローカル先行。peer 側は §7-6 で追う)
+1. **この方向で進めるか** (推奨: 進める。npz native 修正は独立で先行)
+2. **返り値は ndarray / dict / list of dict の3形でよいか**
+   (推奨: よい。1行で書けることと、言いたいことが言えることの両立)
+3. **torch の bfloat16 など numpy に無い dtype は f32 に変換してよいか**
+   (推奨: 変換し、note に残す。黙って変えないことが条件)
+4. **記憶する規則の既定はどれか** — ディレクトリ+拡張子 / glob / 単一ファイル
+   (推奨: 指定時に「この1ファイル」「このフォルダの *.npz」「この glob」から選ばせ、
+   既定は**このフォルダの同拡張子**)
+5. **内蔵エディタは要るか** (推奨: v1 では作らず、外部エディタ起動のみ)
+6. **v1 はローカル先行でよいか** (推奨: よい)
