@@ -5,7 +5,7 @@
     python tools/import/test_adapters.py --messages # + every validation message produced
 
 No test framework: plain asserts and a main().  numpy is required (the harness
-needs it anyway); nothing else.  Every case is written against docs/import-adapters.md
+needs it anyway); nothing else.  Every case is written against docs/input-adapters.md
 section 4 and is annotated with the paragraph it comes from.
 """
 

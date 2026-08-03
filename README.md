@@ -142,15 +142,20 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 
 **配列の形の読み方**:
 
+判定は**次元数と、最後の軸だけ**です。先頭の軸の大きさは見ません。
+
 | shape | 読み方 |
 |---|---|
 | `(H,W)` | 1枚・1ch |
-| `(H,W,C)` / `(C,H,W)` | 1枚・C ch (C ≤ 4) |
-| `(F,H,W)` | **F 枚の stack** |
-| `(F,H,W,C)` | F 枚 × C ch |
+| `(H,W,C)` C ≤ 4 | **1枚**・C ch (`(H,W,1)` はモノクロ1枚、`(H,W,3)` はカラー) |
+| `(F,H,W)` | **F 枚の stack** (`(3,H,W)` も3枚) |
+| `(F,H,W,C)` C ≤ 4 | F 枚 × C ch |
+| 上記以外 | **読みません。**形と読める形を名指しして断ります |
 
-3次元は「C ch のカラー1枚」とも「F 枚の stack」とも読めます。既定は**先頭が 4 以下
-ならチャンネル**。連番と分かっているときは `--npy-axis frames` を付けます。
+**取り違えたときは Inspector で言い直せます** — 「read as / re-read as」に、
+その配列の形から計算できる読み方だけが並びます。選んだ読み方は**そのファイルに
+覚えられ**、セッションにも残ります。
+
 CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 (`--bayer-pattern` を後ろに置くと無視されます)。
 
@@ -169,7 +174,14 @@ def load(path):
 ```
 
 返り値の**型が層を名乗る**ので、形の推測が要りません (配列をそのまま返すこともできます)。
-仕様と段階は [docs/import-adapters.md](docs/import-adapters.md)。**まだ動きません。**
+
+いま動くのは**手で叩くところまで**です。viewer からの呼び出しは配線中:
+
+```
+python tools/import/run_adapter.py adapters/npz_keys.py:load sweep.npz out.npz
+```
+
+仕様と段階は [docs/input-adapters.md](docs/input-adapters.md)。
 
 ---
 
@@ -241,7 +253,7 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 | [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
 | [docs/manual.md](docs/manual.md) | 操作の手引き |
 | [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
-| [docs/import-adapters.md](docs/import-adapters.md) | 入力アダプタの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/input-adapters.md](docs/input-adapters.md) | 入力アダプタの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
 | [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
 | [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
 | [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |

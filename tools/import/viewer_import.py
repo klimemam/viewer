@@ -19,7 +19,7 @@ Returning a bare array is also allowed and is read exactly as the viewer reads a
 .npy natively -- (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C).  Naming a type is what
 you do when you want to kill an ambiguity yourself.
 
-Promises this file keeps (docs/import-adapters.md 4.10):
+Promises this file keeps (docs/input-adapters.md 4.10):
 
   * single file, standard library only.  It does NOT import numpy or torch.
     Arrays are carried, never inspected element by element: only `.shape` and

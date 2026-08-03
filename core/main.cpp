@@ -205,7 +205,7 @@ struct FrameSource {
     float vmin = 0, vmax = 1;         // data min/max
     std::string path;
     std::string npzMember;            // array name when this came from a .npz
-    // How this array was READ (docs/import-adapters.md §3.1/§3.3). npyShape is
+    // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
     // the shape the FILE declared, kept so the Inspector can compute which
     // other readings that shape permits instead of offering a fixed list; empty
     // = these pixels did not come from a .npy. npyRead is NR_NATIVE until a
@@ -1300,7 +1300,7 @@ struct App {
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
     // (npyAxis lived here: one global override for every 3-D .npy in a run.
-    //  docs/import-adapters.md §3.4 replaced it with FrameSource::npyRead, which
+    //  docs/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
     //  is per file, visible in the Inspector, and saved with that image.)
     // shared display range: every open image (and every newly loaded one) uses it
     bool linkRange = false;
@@ -3770,7 +3770,7 @@ static std::string npyShapeText(const std::vector<int64_t>& shape) {
 }
 
 // ---- which axis is what -----------------------------------------------------
-// docs/import-adapters.md §3: native reads FOUR shapes and refuses the rest by
+// docs/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
 // name. The decision is RANK and the LAST AXIS, and never the first axis's
 // size. "A leading axis of 4 or less must be channels" is the guess that read
 // (3,H,W) - three frames, an ordinary thing to save - as one 3-channel picture,
@@ -11817,7 +11817,7 @@ static void drawInspector() {
             }
         }
         // ---- how this array was read, and how else this SHAPE could be read --
-        // docs/import-adapters.md §3.3. The successor to --npy-axis: what the
+        // docs/input-adapters.md §3.3. The successor to --npy-axis: what the
         // viewer decided is on screen, and the ways out are computed from the
         // actual shape, so a reading this array cannot support is never offered.
         if (!im->src->npyShape.empty()) {
@@ -21482,7 +21482,7 @@ static void parseCli(int argc, char** argv) {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
         } else if (a == "--npy-axis") {
-            // docs/import-adapters.md §3.4. One global flag decided the meaning
+            // docs/input-adapters.md §3.4. One global flag decided the meaning
             // of every 3-D array in a run, so a session holding one file to read
             // as a stack and another to read as colour could not be expressed at
             // all. Say so and carry on - silence would leave the user believing
@@ -27043,7 +27043,7 @@ int main(int argc, char** argv) {
         }
 
         // ---- V22: native reads FOUR shapes, and SAYS SO when it will not -----
-        // docs/import-adapters.md §3.1: the decision is RANK and the LAST AXIS,
+        // docs/input-adapters.md §3.1: the decision is RANK and the LAST AXIS,
         // and nothing else. The LEADING axis is never consulted - "a small
         // leading axis must be channels" is the guess that turned three frames
         // into one 3-channel picture, and a 1-D exposure vector into a
