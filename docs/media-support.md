@@ -5,62 +5,49 @@
 1〜4ch([core/main.cpp](../core/main.cpp) `struct ImageDoc`)、stack = 時間解析の単位、
 remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 
+> **§1 (どのライブラリで画像形式を読むか) は
+> [docs/media-formats.md](media-formats.md) に移った。**
+> あちらは調査メモではなく**測定つきの判断**で、EXR だけでなく PNG やその他の
+> 形式、そして「その画素は測定値か」という問題まで扱う。
+> この文書に残っているのは **動画 (§2)** と **click-to-open UX (§3)** である。
+
 ---
 
-## 1. OpenEXR 対応
+## 1. OpenEXR 対応 → [docs/media-formats.md](media-formats.md) に移動
 
-必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
-読むことだけ。deep / tiled / multipart は当面対象外。
+**この節の結論 (tinyexr 推奨) は破棄された。ここには記録だけ残す。**
 
-### 候補比較
+初版のこの節は候補を3つ (公式 OpenEXR / tinyexr / 自前最小リーダ) 比較して
+**tinyexr を推した** — 単一ヘッダで、`TINYEXR_USE_MINIZ` により既に
+FetchContent 済みの miniz を再利用でき、公式 lib は「Imath ごと fetch して
+4 ライブラリを建てるのは repo の流儀に対して重い」と考えたからである。
 
-| | 公式 OpenEXR 3.x | tinyexr | 自前最小リーダ |
-|---|---|---|---|
-| 形態 | CMake ライブラリ群 (OpenEXRCore/OpenEXR/Iex/IlmThread) | 単一ヘッダ C++ | 数百行 |
-| 依存 | **Imath**(無ければ自動 fetch)+ libdeflate(3.4 で vendored) | miniz か zlib を選択 | miniz のみ |
-| ライセンス | BSD-3-Clause | BSD-3-Clause | — |
-| half→f32 | Imath::half(基準実装) | 内蔵ビット展開 | 自前 ~20 行 |
-| 圧縮 | 全方式 (ZIP/PIZ/DWA/…) | ZIP/ZIPS/RLE/PIZ/ZFP 等 | NONE+ZIP が現実的な上限 |
-| fuzzing | OSS-Fuzz 常時(CVE 多数→修正済の歴史) | 0.9.5 期に CVE 複数(heap overflow 等)、v1.0.7 で fuzz 済・既知クラッシュなしと明言 | 自分で fuzz する羽目になる |
-| 保守 | ASWF、活発 | syoyo、活発(C11 書き直し `exr.h` が次期主線) | 自分 |
+**ユーザーがこれを覆し、公式 OpenEXR を選んだ。**
+その記録が [docs/tasks.csv](tasks.csv) の「フォーマット」行
+(`OpenEXR(公式lib)/動画(ffmpeg)/ベタRAWリモート/params_schema`) である。
 
-要点:
+そして「重い」という当時の判断は**推測であって測定ではなかった**。
+実際に測ると configure +17.8 s / build +20.3 s / バイナリ +2.98 MiB で、
+Imath は OpenEXR が自分で取り、libdeflate は vendored 済みだった。
 
-- **half→float32 は情報無損失**(全 half 値が f32 で表現可能)。「変換の正しさ」は丸めでなく
-  denormal / Inf / NaN の展開バグの有無の問題で、tinyexr の実装で足りる。測定値の正確さは
-  どの候補でも損なわれない。
-- 自前リーダは魅力的に見えるが、実務の EXR は PIZ / DWA 圧縮が普通に混ざる。
-  「NONE+ZIP だけ読める」は開けないファイルへの不満を量産する。**却下**。
-- 公式 lib は品質最高だが、Imath ごと fetch して 4 ライブラリをビルドするのは
-  この repo の流儀(miniz を 1 ファイル直コンパイル)に対して重い。scanline 読みだけに
-  払う代価ではない。
-- **推奨: tinyexr**。単一ヘッダ、BSD-3、そして `TINYEXR_USE_MINIZ` で
-  **既に FetchContent 済みの miniz をそのまま再利用できる**(include パスを
-  `${miniz_SOURCE_DIR}` に向けるだけ。miniz.c の二重コンパイル・シンボル衝突に注意)。
-  CVE 歴は「単独ヘッダの画像パーサの通例」レベルで、入力は自分のラボのファイルが主。
+**現在の判断は [docs/media-formats.md](media-formats.md) にある。**
+あちらが決めていること (ここでは繰り返さない):
 
-### loadExr の挿入点と channel マッピング
+- 3つの戦略 (OIIO 全部 / 形式ごとの公式 lib / 狭く + アダプタ) の測定つき比較
+- **OIIO は FetchContent だけでは建たなかった**という実測と、その意味
+- **画素が [DN] かどうかを名乗る `values` フィールド**と、analyzer の門番
+  — PNG/TIFF/JPEG のような「自分が何かを言わないファイル」を
+  黙って測定値として扱わないための仕組み
+- **`Imf::setGlobalThreadCount()` を呼ばないと 3.6〜5.0 倍遅い**という実測
+  (「OIIO の方が読み出しが速い」という印象のおそらくの正体)
+- native reader とアダプタの境界を**どこに引くか**
 
-- `loadNpy` / `loadRaw` の並び(main.cpp ~1653 行付近)に `loadExr(path)` を置く。
-  `readFileBytes` → `ParseEXRHeaderFromMemory` + `DecodeEXRImage`(高レベル `LoadEXR` は
-  常に RGBA 詰め替えをするので使わない — channel 名を保ちたい)。
-- channel → ImageDoc(1〜4ch):
-  - `R,G,B(,A)` → ch=3/4、`Y` 単独 → ch=1、`Z` 等の単独 AOV → ch=1。
-  - 任意 AOV / multi-layer(`diffuse.R` 等)は **npz member と同じ扱い**:
-    prefix でグループ化し、1 グループ = 1 doc、`npzMember` 相当のフィールドで
-    session 復元。UI 前例(npz の複数 array)がそのまま使える。
-  - `Y/RY/BY`(chroma subsampled)は初期は「未対応」でエラー文言を出す。
-- 表示: データは scene-linear のまま `data` に入れ、black/white 初期値は
-  データ min/max(既存の表示レンジ + gamma で見る。ロード時トーンマップは**しない**)。
-  `dtype` は "f16"/"f32" を記録し、Inspector で由来が分かるようにする。
-
-### remote への波及
-
-TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../core/remote_proto.h))なので、
-サーバ側で EXR→f32 に落として `DT_F32` を返せば**プロトコル変更ゼロ**(案 b)。
-ただし loader が main.cpp 内にある現状では serve.cpp から呼べない。
-**推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` 的な
-共有 TU へ切り出す整理(toFloatSamples と同じ共有パターン)ができた時点で (b) を足す。
+なお、この節にあった **loadExr の挿入点** (`loadNpy` / `loadRaw` の並び)、
+**channel → ImageDoc のマッピング** (`R,G,B(,A)`→ch=3/4、単独 AOV→ch=1、
+multi-layer は npz member と同じ扱い、chroma subsampled は当面未対応)、
+**ロード時トーンマップはしない**、**remote は f32 TILE でプロトコル変更ゼロ**
+(ただし loader が main.cpp にある間は serve から呼べないので**まずローカル専用**)
+という設計は**そのまま生きている**。media-formats.md はそれを前提にしている。
 
 ---
 
@@ -128,16 +115,23 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
 
 | Phase | 内容 | 規模感 |
 |---|---|---|
-| A | tinyexr で loadExr(ローカルのみ、scanline RGB/Y/layer→member) | S(数日) |
+| **A0** | **`values` フィールド + analyzer の門 + selftest 1本** ([media-formats.md](media-formats.md) §5) | S |
+| A | **公式 OpenEXR** で loadExr(ローカルのみ、scanline RGB/Y/layer→member)。**`setGlobalThreadCount()` を必ず呼ぶ** | S(数日) |
 | B | preview slot UX(Space preview → click 設定 → 既定反転の 3 段階) | M(1〜2 週) |
 | C | 動画 Phase 1: ffmpeg-pipe → N フレーム stack(budget 適用) | M(1〜2 週) |
 | D | loader 共有 TU 化 + serve 側 EXR(f32 TILE、プロトコル不変) | S〜M |
 | E | 動画の窓デコード / remote 動画 | L(必要が立証されてから) |
 
-A→B→C の順を推す: A は独立で安い。B は C の前提(動画こそ preview が要る)。
+A0→A→B→C の順を推す: **A0 は A より先** — 表示参照の画素が入ってくる前に
+門を作るのが一番安い([media-formats.md](media-formats.md) §5)。
+A は独立で安い。B は C の前提(動画こそ preview が要る)。
 
-参考: [tinyexr](https://github.com/syoyo/tinyexr) /
-[tinyexr CVE 一覧](https://www.cvedetails.com/product/46936/Tinyexr-Project-Tinyexr.html?vendor_id=18510) /
-[OpenEXR install(Imath/libdeflate)](https://openexr.com/en/latest/install.html) /
+**D には CI の代償がある**: serve 側に EXR を入れると、Linux ジョブが
+`viewer-serve` を Ubuntu 20.04 コンテナで**手書きの g++ 1行**で建て直している
+箇所(`.github/workflows/build.yml`:90-108、cmake は入っていない)が破綻する。
+[media-formats.md](media-formats.md) §1.3 / §3.6 を読んでから着手すること。
+
+参考: [OpenEXR install(Imath/libdeflate)](https://openexr.com/en/latest/install.html) /
 [OpenEXR license](https://openexr.com/en/latest/license.html) /
-[pl_mpeg](https://github.com/phoboslab/pl_mpeg)
+[pl_mpeg](https://github.com/phoboslab/pl_mpeg) /
+~~[tinyexr](https://github.com/syoyo/tinyexr)~~(§1 のとおり不採用)
