@@ -1,7 +1,9 @@
+現行ドキュメント: [browse-topbar-design.md](../browse-topbar-design.md) の背景 — 判定前に集めた素材表。
+
 # Browse に「表示しうるもの」全候補 — 判定なしの素材表
 
 一個ずつ載せる/載せないを一緒に決めるための材料。**判定列は置かない**
-(私の推奨は docs/browse-inventory.md にあるが、ここでは持ち込まない)。
+(私の推奨は [browse-inventory.md](browse-inventory.md) にあるが、ここでは持ち込まない)。
 
 各行の見方:
 - **答える問い** — 使う人がその瞬間に持っている問い。これが無い項目は、

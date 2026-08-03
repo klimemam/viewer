@@ -1,9 +1,11 @@
+現行ドキュメント: [import-adapters.md](../import-adapters.md)（読める形式の範囲）の背景 — 未実装形式の調査と候補比較。
+
 # メディア対応の設計検討 — OpenEXR / 動画再生 / click-to-open UX
 
 将来判断のための調査メモ(LOW PRIORITY、実装なし)。前提: C++17 / FetchContent /
-重い依存を嫌う([CMakeLists.txt](../CMakeLists.txt))、ImageDoc は float32 plane
-1〜4ch([core/main.cpp](../core/main.cpp) `struct ImageDoc`)、stack = 時間解析の単位、
-remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
+重い依存を嫌う([CMakeLists.txt](../../CMakeLists.txt))、ImageDoc は float32 plane
+1〜4ch([core/main.cpp](../../core/main.cpp) `struct ImageDoc`)、stack = 時間解析の単位、
+remote は npy のみ配信([core/serve.cpp](../../core/serve.cpp))。
 
 ---
 
@@ -56,7 +58,7 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 
 ### remote への波及
 
-TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../core/remote_proto.h))なので、
+TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../../core/remote_proto.h))なので、
 サーバ側で EXR→f32 に落として `DT_F32` を返せば**プロトコル変更ゼロ**(案 b)。
 ただし loader が main.cpp 内にある現状では serve.cpp から呼べない。
 **推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` 的な

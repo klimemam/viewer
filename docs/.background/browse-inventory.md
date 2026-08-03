@@ -1,8 +1,10 @@
+現行ドキュメント: [browse-topbar-design.md](../browse-topbar-design.md) の背景 — 上部領域を作り直す前の棚卸しと判定。
+
 # Browse パネル 全機能の棚卸しと要否判定
 
 「まずボタンと機能を列挙して本当に必要か、どういう表示が正しいか」(2026-08-03)。
 コード(core/main.cpp 16318-17700)から**実在するもの全部**を数えた。
-判定の物差しは docs/browse-topbar-design.md §2.2 の収斂文法:
+判定の物差しは [browse-topbar-design.md](../browse-topbar-design.md) §2.2 の収斂文法:
 
 1. 定常クロームは1行、唯一の可読テキストはパス
 2. パスは編集できる1本の行(箱の列ではない)

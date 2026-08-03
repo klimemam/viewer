@@ -1,10 +1,6 @@
 # Temporal export 設計 — テンポラルデータ + H/V profile statistics を1回で持ち出す
 
-「Temporal で出力するときに、テンポラルのデータと H/V Profile の Statistic を
-両方出すようにして。今のやつは一回ないものとしてあるべき姿を考えて出す」への回答。
-本書が仕様で、実装はここに書いた形と理由に従う。現行の
-`copyPerFrameStats`(per-frame TSV)は**前提にしない** — 生き残る部分は §7 で
-明示的に選び直す。
+本書が仕様で、実装はここに書いた形と理由に従う。
 
 ## 0. この出力は何のためにあるか
 
@@ -15,16 +11,7 @@ Temporal パネルが答える質問は「この stack のノイズはいくつ�
 2. **時間方向の変化**(frame 毎の mean/σ — ドリフト・フリッカの素材)— frame 軸の表
 3. **空間方向の構造**(H/V profile statistics — 行/列 FPN、シェーディング)— plane 毎のスカラ表
 
-今は 1 が画面写し(スクリーンショット)でしか出せず、2 が per-frame TSV、3 が
-Projection パネルの別ボタンで、**3回の操作と3つの断片**になる。同じ画像・同じ
-ROI の測定なのだから、1回の Export が3つとも運ぶべきである。これが「両方出す」の
-正体で、measure-ux.md の原則(出力はそれ単体で証拠になる)をここにも適用する。
-
 ## 1. 誰が読むか — 主読者は Excel 貼り付け、副読者は pandas
-
-この codebase の既存動線は「TSV をクリップボードへ → Excel(資料)に貼る」
-(Analysis の Copy table、Projection の Copy table)と「CSV をファイルへ」
-(Export curves)。ユーザーの実際の行き先は**資料**である。よって:
 
 - **主**: クリップボード TSV。Excel に貼って列が揃い、ラベル行が読めること。
 - **副**: CSV ファイル(pfd の save dialog、Export curves と同じ導線)。
@@ -33,20 +20,9 @@ ROI の測定なのだから、1回の Export が3つとも運ぶべきである
 
 ## 2. 中心決定 — 「ラベル付き矩形の積み重ね」(sectioned rectangles)
 
-§0 の3つの表は**軸が違う**: 1 と 3 は行 = side×plane、2 は行 = side×frame。
-1つの矩形に畳む方法は2つしかなく、どちらも捨てる:
-
-- frame 行に σ_t を持たせる → **カテゴリエラー**(σ_t は stack の属性。
-  stats-taxonomy.md §3 と terminology.md の操作マトリクスが明文で禁止)。
-- 全列の直積 + 空セル埋め → Excel でも pandas でも「何が何の値か」が列名から
-  読めなくなる。空欄の海は矩形ではなくただの穴。
-
 よって出力は **`#` 行で見出しを付けたセクションの列**とし、**各セクションは
 それ自体が完全な矩形**(ヘッダ行1 + データ行 N、行によって列数が変わらない)
-とする。Excel は矩形を欲しがる — 各セクションが矩形である。人間はラベルを
-欲しがる — `#` 見出しがそれである。pandas はどちらでも読める —
-`comment='#'` で1セクション、または `#` 見出しで split。3読者全員が
-既存の家風(`#` provenance 行つき TSV/CSV)のまま満足する。これが中心決定。
+とする。
 
 セクションの順序は **summary → profile statistics → per-frame**。スカラ表
 2枚を先頭に置き、行数が伸びる per-frame を末尾に置く(貼った先で bulk が
@@ -211,3 +187,5 @@ temporal/profile の region 食い違いが NOTE になること、CSV の quoti
 per-frame x 軸: 3種の区切りのパース、位置つきエラー、個数不一致の拒否文言
 (両方の数字)、単位必須、`frameAxisOf` が適用値を返すこと、export 列、
 セッション往復。壊した時に落ちることも証明する(region ラベル偽装、plane 欠落)。
+
+経緯と検討: [.background/export-design.md](.background/export-design.md)

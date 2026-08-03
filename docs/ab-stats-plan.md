@@ -1,7 +1,6 @@
-# A/B 統計パネル計画 — compare 中に B の統計も出す
+# A/B 統計パネル — compare 中に B の統計も出す
 
-現状、5 つの統計パネルは `cur()` だけを見てキャッシュも 1 枚分しか持たない。本書は「重ねる」と
-「画像と同じ並びで横に並べる」の**両方**を入れるための仕様。
+「重ねる」と「画像と同じ並びで横に並べる」の**両方**を持つ、統計パネルの A/B 仕様。
 
 ## 1. キャッシュ — 2 スロット化
 - `App::HistState hist[2]` / `ProjState proj[2]` / `TemporalState temporal[2]`。0=A、1=B。**struct
@@ -92,18 +91,4 @@ Projection 重ね = 破線が A の実線に沿い min-max バーは A のみ。
 **再測定**: (a) follow-frame ステップの draw 時間(bench にフレーム送りが必要)、(b) ROI 表の
 `1.35 ms/frame @ 400 ROI` は行数 2 倍で測り直し、(c) CFA 4 系列 × 2 side の描画。
 
-## 7. フェーズ
-- **P0 基盤** — キャッシュ `[2]` 化、recompute の引数化、`forgetImage`/`closeAll` の両スロット、
-  `app.abStatsLayout`、`drawABLegend`、`addDashedPolyline`。UI 無変化、bench 不変を確認。
-- **P1 Histogram** — 重ね、正規化 y、plane セレクタ、横並び。一番安く一番見られるので最初。
-- **P2 Projection** — 重ねの判読性、y レンジ共有、長さ不一致の退避、横並び。
-- **P3 Temporal** — `A|B|Δ|Δ%` 表、B が stack でない場合、server temporal は手動。
-- **P4 ROI 表** — 1 ROI = 2 行、clamp 表示、Δ 行トグル。描画コスト再測定。
-- **P5 Analysis** — `Run on B` のみ(自動実行なし)、B 専用 provenance。
-  各フェーズ末で `--abstats-selftest` に該当 check を追加する。
-
-**リスク**: (1) follow-frame の二重再計算 —— P0 の測定次第で throttle 追加。
-(2) CFA 4 系列 × 2 = 8 系列は重ねでは読めず、plane セレクタ(新 UI)が事実上の前提。
-(3) 幅の狭いドックでは横並びが成立しない(重ねへ自動退避)。(4) projection の長さ不一致は
-**安くは解けない**(正しくやるなら物理座標での位置合わせが要る)。今回は「重ねない + 理由表示」
-までとし、揃ったふりはしない。
+経緯と検討: [.background/ab-stats-plan.md](.background/ab-stats-plan.md)

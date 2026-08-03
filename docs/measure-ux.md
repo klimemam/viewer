@@ -1,6 +1,5 @@
 # Measure UX — 測定体験の理想形
 
-「Measure メニュー以下の項目や使い勝手、結果の提示が若干寂しい」への回答。
 このファイルが理想の定義で、実装はここに書いた順序と理由に従う。
 対象は Measure メニュー / Analysis パネル / 結果グリッド / カーブプロット。
 Linearity 機能・remote/ssh 系・README は対象外(別導線で構築中)。
@@ -93,3 +92,5 @@ Linearity 機能・remote/ssh 系・README は対象外(別導線で構築中)�
 - **params_schema**(測定パラメータの宣言 UI)は ABI v2 の未実装項目の
   まま。今回の装飾はパラメータを持たないので依存しない。
 - **Linearity / remote 系 / README.md** には触れない。
+
+経緯と検討: [.background/measure-ux.md](.background/measure-ux.md)

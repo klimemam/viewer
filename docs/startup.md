@@ -144,10 +144,8 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 ローカルのフォルダも**同じパネル**で見られます: **File > Browse Folder (Local)...**。
 peer がこのマシンで動くだけで、操作も見え方も一切変わりません(接続表示は `local peer`)。
 
-> **`File > Open File (Remote)...` と `Open Folder (Remote)...` は廃止されました。**
-> ファイルを開くのもフォルダを丸ごと開くのも Browse パネルの中でやります ——
-> 「先に繋いで、見てから選ぶ」以外の入口を残さないためです。File メニューに残るリモート項目は
-> **Start Remote (ssh)...**(接続 = パネルを出す)と **Update remote peer**(peer の更新)の 2 つだけ。
+File メニューに残るリモート項目は
+**Start Remote (ssh)...**(接続 = パネルを出す)と **Update remote peer**(peer の更新)の 2 つだけ。
 
 #### パネルの並び
 
@@ -159,7 +157,6 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | 一覧 | name / shape / size / modified。ヘッダクリックでソート(フォルダは常に先頭) |
 | 下端 | プレビュー中の連番のスクラブバー。**プレビューが無い間も高さを確保**してあるので、行が動きません |
 
-ヘッダは 5 段から **2 段**(+ 畳んである `more` の 1 段)に減っています。
 `grouped`/`flat`、`list`/`tree`、`more` の開閉は次回起動にも引き継がれます。
 
 | したいこと | 操作 |
@@ -172,7 +169,7 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | 1 枚ずつ見たい | **`flat`** に切り替えると連番が 1 フレーム 1 行に展開されます(サーバへの問い合わせは発生しません。ただし size / modified 列は空になります —— 一覧の応答が持っていない値だからです) |
 | 正式に開く | **ダブルクリック**か `Enter`(連番行なら塊ごと)。測定・比較に使った瞬間にも自動で昇格します |
 | 任意の組み合わせ | `Ctrl` / `Shift` + クリックで選んで「**Open N selected as stack**」。形が揃わない選択はボタンが押せず、理由が出ます(転送する前に分かります) |
-| **いま居るフォルダ**を丸ごと | 2 段目の **`open folder`**。行を選ぶのではなく、**いま中に居るフォルダ**を走査します(以前はフォルダ行の右クリックしか無く、ホームやルートに居ると自分の名前を探しに 1 階層戻る必要がありました) |
+| **いま居るフォルダ**を丸ごと | 2 段目の **`open folder`**。行を選ぶのではなく、**いま中に居るフォルダ**を走査します |
 | 別のフォルダを丸ごと | フォルダ行の右クリック「Open folder (all stacks below)」(パンくずの右クリックでも同じ) |
 | 開かずに時間統計 | 連番行の右クリック「Temporal stats (server)」、複数選択中なら同名のボタン |
 
@@ -384,3 +381,5 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 計算し、`[server <ホスト>, N frames]` タグ付きで表示します
 (`File > Sequence loading > Remote processing` で auto / server / local fetch を切替)。
 開いていない連番も、Browse パネルの「Temporal stats (server)」でそのまま測れます。
+
+経緯と検討: [.background/startup.md](.background/startup.md)

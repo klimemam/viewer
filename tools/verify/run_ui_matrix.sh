@@ -9,7 +9,7 @@
 # (core/main.cpp:20910) with no selftest guard, and the periodic autosave in
 # the frame loop (core/main.cpp:28609) is guarded only by !benchFrames. A
 # --browse-keys-selftest run therefore WRITES the user's real layout.ini and
-# a real autosave.vsession - see docs/verify-ui.md defect D-1. Every run below
+# a real autosave.vsession - see docs/.background/verify-ui.md defect D-1. Every run below
 # is pointed at a throwaway config dir so the suite can never touch the
 # operator's own panel layout or session.
 set -u

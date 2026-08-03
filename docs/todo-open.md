@@ -665,7 +665,7 @@ numpy shape + dtype に**寄せる**のが素直 (元データがそう名乗っ
 ユーザー判断 (2026-07-30): 「上記の議論は良くまとまってますが，設計に落とす前に
 再度議論させてもらいたいです．」
 
-`docs/flat-field-stats.md` は**整理と検算までが済んだ叩き台**。
+`docs/.background/flat-field-stats.md` は**整理と検算までが済んだ叩き台**。
 **この文書を根拠に実装を始めてはいけない。** まず下の論点を人間と詰める。
 
 ### 決めるべき論点
@@ -685,7 +685,7 @@ numpy shape + dtype に**寄せる**のが素直 (元データがそう名乗っ
    軽く決めてよい話ではない。
 5. **EMVA 準拠を名乗るか。** 名乗ると動作点・L枚平均・スペクトログラムまで
    要求が伸びる。名乗らず独自名で出す選択肢も含めて決める。
-   (現状 `docs/flat-field-stats.md` の EMVA 式は**未検証**と明記済み。
+   (現状 `docs/.background/flat-field-stats.md` の EMVA 式は**未検証**と明記済み。
    名乗るなら標準の原文確認が前提条件。)
 6. **画面のどこに出すか。** 新パネルか、Projection / Temporal の拡張か。
    項目8 (zoom%) や項目13 (Files と Browse の UI 不一致) と同じで、
@@ -696,7 +696,7 @@ numpy shape + dtype に**寄せる**のが素直 (元データがそう名乗っ
 
 ### 議論のときに手元にあるとよいもの
 
-- `docs/flat-field-stats.md` — 3層の表、数式、検算で見つかった7つの罠
+- `docs/.background/flat-field-stats.md` — 3層の表、数式、検算で見つかった7つの罠
 - `docs/stats-taxonomy.md` — 既存の分類 (入力の数による軸)
 - `TODO_one_implementation.md` / `TODO_measure_unit_tests.md` — カーネルと単体テスト
 

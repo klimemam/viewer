@@ -1,3 +1,5 @@
+現行ドキュメント: [terminology.md](../terminology.md) の背景 — 正典にコードを合わせたときの実装計画（実施済み）。
+
 # 実装計画: 正典 (terminology.md) にコードを合わせる
 
 順序は「痛み × 実装リスク」。正典を満たす*最小の変更*のみ。検証は headless selftest + GUI 撮影の 2 本立て。

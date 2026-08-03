@@ -165,28 +165,11 @@ PID 生存判定 — 4464 / 20726 — で分離済み。Watch が足すものは
 これは仕様であり欠陥ではない: 測定中の窓の画素を、隣の窓の操作が
 動かさないことの方が正しい。
 
-## 9. 自動更新 — 判断record (2026-08-02 確定)
-
-- **グローバル1スイッチで開始** (File > Watch > Auto-reload、既定 OFF)。
-  per-stack トグルは運用を見てから。
-- **ポーリング間隔は提案初期値で開始** (stack 5s/非表示15s、Browse 3s/10s)。
-  prefs 化は後。
-- **watch 対象は初版範囲で開始**: 自動オープンは連番グループのみ、監視は
-  stack + Browse dir のみ (単発は手動 Reload)。
-
-## (原文) 自動更新 (オプトイン) と決めずに残していたもの
+## 9. 自動更新 (オプトイン)
 
 - **自動 Reload はグローバルのオプトイン1つ** (File > Watch > Auto-reload、
   既定 OFF、prefs 保存)。ON でも§4 の2回一致は踏む。自動 Reload の実行は
   「通知行を出してから次のフレームで実行」— 何が起きたかは同じ場所に残る。
-- 決めずに残す (ユーザー判断待ち):
-  1. per-stack の自動更新 (「この stack だけ自動」) — グローバルで足りるか
-     運用を見てから。
-  2. ポーリング間隔の prefs 化と値そのもの (§2 の表は初期値)。
-  3. watch folder の自動オープン対象 (グループのみか、単発ファイルもか) —
-     初版はグループ (連番) のみ。
-  4. リモート単発 frame (stack でない開き方) の監視 — 初版は stack と
-     Browse dir のみ。単発は手動 Reload (ステージ5) で拾える。
 
 ## 10. 検証 — `--watch-selftest <dir>`
 
@@ -205,3 +188,5 @@ PID 生存判定 — 4464 / 20726 — で分離済み。Watch が足すものは
   「open new stacks」ON で新グループが1回だけ開くこと。
 - リモート経路はローカル peer (`--localbrowse-selftest` の流儀) で
   同じ script を回す — 判定式が origin で違わないことの証明。
+
+経緯と検討: [.background/watch-design.md](.background/watch-design.md)

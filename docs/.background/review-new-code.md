@@ -1,3 +1,5 @@
+現行ドキュメント: [terminology.md](../terminology.md)（series 層の正典）の背景 — 実装直後のレビュー記録。
+
 # Review: code landed after e38de8b
 
 Scope: `e38de8b..HEAD` (series layer phases 1-5 + picker sweep, Browse deferred actions,

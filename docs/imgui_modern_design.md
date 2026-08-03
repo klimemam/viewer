@@ -8,10 +8,6 @@ Dear ImGui を「開発のテンションが上がる & 情報が分かりやす
    実行中に切り替えられます。
 2. このドキュメント(設計値と根拠)。
 
-> テーマの出自は Python のデザイン実験場 (`imgui_theme.py` / `imgui_demo.py`) で、
-> 値が C++ に移った時点でそちらは役目を終えたため 2026-08-03 に削除しました。
-> 以下の Python 版に関する記述は、設計値の由来としてそのまま残しています。
-
 ## スクリーンショット(C++ 本体)
 
 **ダーク(既定)**
@@ -24,30 +20,6 @@ Dear ImGui を「開発のテンションが上がる & 情報が分かりやす
 
 画像キャンバスとルーラーはどちらのテーマでも暗色のまま——計測対象の画像が
 常に主役で、周辺 UI だけが着替える設計です。
-
-## Python デモ(デザイン実験場)
-
-```
-pip install -r requirements-imgui.txt
-python imgui_demo.py
-```
-
-ギャラリー | ビューア | 統計というレイアウトのモックで、Design Lab パネルから
-ダーク/ライト・アクセント色・角丸を**その場で**動かせます。C++ に反映する前の
-色検討はここでやるのが最速です。画像・サムネイル・ヒストグラムは
-すべて手続き生成なので、アセットなしでどこでも起動します。
-
-**ダーク**
-
-![dark](img/imgui_dark.png)
-
-**ライト**
-
-![light](img/imgui_light.png)
-
-**A/B 比較モード**
-
-![compare](img/imgui_compare.png)
 
 ## デザインコンセプト
 
@@ -163,26 +135,7 @@ ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの
 
 ## 実装メモ
 
-- テーマは**素の ImGui スタイル値を設定するだけ**です。C++ 版は
-  [core/ui_theme.cpp](../core/ui_theme.cpp)、Python 版は `imgui_theme.py` で、
-  両者は同じ数値を共有しています(片方を変えたらもう片方へ同期)。
-- デモは [imgui-bundle](https://github.com/pthom/imgui_bundle) の
-  hello_imgui(docking レイアウト)+ immvision(numpy 画像表示)+
-  implot(ヒストグラム)を使用。
-- hello_imgui は ini に保存したテーマを起動後に再適用するため、
-  デモでは `remember_theme = False` にした上で毎フレーム
-  `pre_new_frame` からテーマを適用しています(スタイル値の代入のみで軽量)。
-- Design Lab パネルで ダーク/ライト・アクセント色・角丸を**実行中に変更**
-  できます。デザイン調整の試行錯誤はここで行うのが速いです。
-- スクリーンショットは headless で再生成できます:
-  `xvfb-run python imgui_demo.py --screenshot docs/img/imgui_dark.png [--light|--compare]`
-
-## フォントについて
-
-デモは同梱の **Roboto Regular 16px** + FontAwesome(アイコン)を使用しています。
-ImGui 1.92 以降はグリフを動的に読み込むため、グリフ範囲の指定は不要です。
-日本語 UI にする場合は **Noto Sans JP** / **IBM Plex Sans JP** の ttf を
-リポジトリに追加し、`_load_fonts()` の1行を差し替えるだけで済みます。
+- テーマは**素の ImGui スタイル値を設定するだけ**です。
 
 ## C++ 本体への適用状況
 
@@ -200,3 +153,5 @@ C++ 側は vanilla ImGui 1.91 の範囲だけで実装しています(docking �
 1.92 の新色は不使用)。Python デモにある `no_tab_bar` やカード UI は
 docking/hello_imgui 前提のテクニックなので、固定3ペイン構成の本体には
 そのまま該当しません——本体は元からタブバーレスなので既に達成済みです。
+
+経緯と検討: [.background/imgui_modern_design.md](.background/imgui_modern_design.md)
