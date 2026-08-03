@@ -30,6 +30,42 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto t1 = std::chrono::steady_clock::now();
+
+        // WHICH CODEC, asked BEFORE decoding. load_raw is bound during
+        // open_file(), so this is answerable without unpacking a single pixel.
+        // This is the hinge for values=dn: a lossy codec decodes cleanly and
+        // looks perfect, and its numbers are not the sensor's counts.
+        if (r == 0) {
+            libraw_decoder_info_t di;
+            int drc = p.get_decoder_info(&di);
+            std::fprintf(stderr, "\n--- WHICH CODEC (pre-decode) ---\n");
+            std::fprintf(stderr, "get_decoder_info rc : %d\n", drc);
+            std::fprintf(stderr, "decoder_name        : %s\n",
+                         di.decoder_name ? di.decoder_name : "(none)");
+            std::fprintf(stderr, "decoder_flags       : 0x%08x%s%s\n", di.decoder_flags,
+                         (di.decoder_flags & LIBRAW_DECODER_UNSUPPORTED_FORMAT)
+                             ? "  <- UNSUPPORTED_FORMAT" : "",
+                         (di.decoder_flags & LIBRAW_DECODER_SONYARW2)
+                             ? "  <- SONYARW2 (lossy 11-bit delta)" : "");
+            // NOTE: is_raw is NOT public in 0.22.2 (dcraw-internal only);
+            // raw_count is what the public iparams exposes.
+            std::fprintf(stderr, "raw_count           : %u\n",
+                         p.imgdata.idata.raw_count);
+            std::fprintf(stderr, "NEFCompression      : %u  (1,4=lossy 3=lossless "
+                                 "13=HE 14=HE*; 0 = not a NEF)\n",
+                         (unsigned)p.imgdata.makernotes.nikon.NEFCompression);
+            // Canon's lossy C-RAW is NOT visible in decoder_name (lossless CR3
+            // and C-RAW both go through crxLoadRaw). It is visible here:
+            // 4 = RAW (lossless), 7 = CRAW (lossy). CanonLog != 0 means a log
+            // curve was baked in -- also not linear DN.
+            std::fprintf(stderr, "Canon Quality       : %d  (4=RAW lossless, "
+                                 "7=CRAW LOSSY; 0/-1 = not a Canon)\n",
+                         (int)p.imgdata.makernotes.canon.Quality);
+            std::fprintf(stderr, "Canon CanonLog      : %d  (0=off; !=0 means a "
+                                 "log curve is baked in)\n",
+                         (int)p.imgdata.makernotes.canon.CanonLog);
+        }
+
         rc = p.unpack();                       // sensor values, no processing
         if (rc != LIBRAW_SUCCESS) {
             std::fprintf(stderr, "unpack failed: %s\n", libraw_strerror(rc));

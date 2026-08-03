@@ -15,7 +15,7 @@
 | `gen_exr.cpp` | 4K float RGB の EXR を NONE / ZIP / PIZ / ZIPS で書く。**内容はグラデーション + 固定パターン + 画素ごとのノイズ (決定的 LCG)** — 平坦な画像は圧縮が効きすぎてデコード時間の嘘になるため |
 | `bench_exr.cpp` | 公式 OpenEXR で全画素を float に展開する時間。`FrameBuffer` で **R/G/B を別平面に**読む (= `loadExr` がやることと同じ。RGBA 詰め替えはしない) |
 | `bench_oiio.cpp` | 同じことを OpenImageIO の `read_image(..., TypeDesc::FLOAT, ...)` で。**OIIO はインタリーブで返す**ので、両者は厳密には同じ仕事をしていない — docs/media-formats.md §3.2 の但し書きを読むこと |
-| `raw/bench_raw.cpp` | LibRaw で `unpack()` の時間を測り、**同時に「これは測定値か」を印字する** — CFA パターン / ブラックレベル / ビット深度 / 生値の先頭、そして EXIF (露光・ISO・絞り・焦点距離・時刻)。`dcraw_process()` は**呼ばない** (デモザイクとトーンマップをする側なので) |
+| `raw/bench_raw.cpp` | LibRaw で `unpack()` の時間を測り、**同時に「これは測定値か」を印字する** — CFA パターン / ブラックレベル / ビット深度 / 生値の先頭、そして EXIF (露光・ISO・絞り・焦点距離・時刻)。`dcraw_process()` は**呼ばない** (デモザイクとトーンマップをする側なので)。さらに **`get_decoder_info()` を `unpack()` の前に呼び、コーデック名と `UNSUPPORTED_FORMAT` 旗、`NEFCompression`、`canon.Quality` を出す** — 非可逆かどうかを**1画素も復号せずに**判定できるため (docs/media-formats.md §4.8) |
 
 どれも 1 行 1 回で `ms=` を出す。**中央値と幅で読むこと** — このプロジェクトの
 規律として、1 回の数字は報告しない (`tools/bench_media/stats.sh` がそれをやる)。
