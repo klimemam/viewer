@@ -21402,6 +21402,8 @@ static void printUsage() {
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
+        "  --gl-probe                  can this machine make the GL context the viewer\n"
+        "                              needs? name it and exit (0 yes, 3 no + why)\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
@@ -22346,6 +22348,90 @@ static void dropOwnConsole() {
 }
 #endif
 
+// ---- the GL context this binary asks for, and whether the machine has one ---
+//
+// The hints live in one function because the probe below and the real window
+// must ask for exactly the SAME context. A machine that will hand out a context
+// but not a 3.0 (3.2 core on macOS) one is precisely the case the probe exists
+// to catch, and it would miss it the moment the two lists drifted apart.
+// glslVersion travels with them: it is one decision, not two.
+static const char* applyGlContextHints() {
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    return "#version 150";
+#else
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    return "#version 130";
+#endif
+}
+
+// GLFW's own account of the last thing that went wrong. It is only STORED here,
+// never printed on arrival: the failure sites decide what is worth saying, and
+// say it once. Until this existed GLFW's reason was simply discarded, so every
+// failure to make a window said "window creation failed" and nothing more -
+// which is exactly what the Windows and macOS runners printed, once per test,
+// with no way to tell a dead runner from a broken viewer.
+static std::string g_glfwLastError;
+static void glfwErrorSink(int code, const char* desc) {
+    g_glfwLastError = "GLFW error " + std::to_string(code) + ": " +
+                      (desc && *desc ? desc : "(no description)");
+}
+static std::string glfwReasonOr(const char* fallback) {
+    return g_glfwLastError.empty() ? std::string(fallback) : g_glfwLastError;
+}
+
+// --gl-probe: "this machine cannot make a GL context" and "an assert failed"
+// are different events, and until this existed nothing could tell them apart.
+// Startup opens a real 1600x1000 window unconditionally, so every selftest but
+// one dies inside glfwCreateWindow on a runner that has no context, and each of
+// them reads as a broken test - which is how CI stayed red for hours with
+// nothing in the output that said why. Answering it once, out loud, is the fix.
+//
+// The probe does what those tests do in their first moments - glfwInit, the
+// same hints, one window - and when it cannot, it says WHY in GLFW's own words,
+// taken from the error callback rather than guessed at from the failure site.
+// Exit 0: there is a context, run everything. Exit 3: there is not, and
+// tools/run_selftests.sh turns that into a named skip instead of a red matrix.
+// It answers for the harness today; the app can ask it the same question later.
+static int glProbe() {
+    // The no-GL branch of run_selftests.sh has to be provable on a machine that
+    // HAS GL, or nobody watches it work until CI does - and CI is unreadable.
+    if (const char* f = getenv("VIEWER_FORCE_NO_GL"); f && *f && strcmp(f, "0")) {
+        printf("no OpenGL context on this machine: forced by VIEWER_FORCE_NO_GL=%s\n", f);
+        return 3;
+    }
+    glfwSetErrorCallback(glfwErrorSink);
+    if (!glfwInit()) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("glfwInit failed, no GLFW error reported").c_str());
+        return 3;
+    }
+    applyGlContextHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // a probe must never flash a window
+    // This is the call the runners die in - 0.08-0.20 s per test, 21 times a run.
+    GLFWwindow* w = glfwCreateWindow(64, 64, "viewer gl probe", nullptr, nullptr);
+    if (!w) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("window creation failed, no GLFW error reported").c_str());
+        glfwTerminate();
+        return 3;
+    }
+    glfwMakeContextCurrent(w);
+    // Named, because "which GL did that machine actually get" is the next
+    // question every time a render result differs between a runner and a desk.
+    const char* rend = (const char*)glGetString(GL_RENDERER);
+    const char* ver  = (const char*)glGetString(GL_VERSION);
+    printf("OpenGL context OK: %s / %s\n", rend ? rend : "(no renderer)",
+                                           ver  ? ver  : "(no version)");
+    glfwDestroyWindow(w);
+    glfwTerminate();
+    return 0;
+}
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -22372,6 +22458,10 @@ int main(int argc, char** argv) {
             if (!strcmp(argv[i], "--remote-selftest"))
                 return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
     }
+    // Asked before prefs are read and before an autosave slot is claimed: a
+    // question ABOUT the machine must not alter the machine it is asking about.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--gl-probe")) return glProbe();
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
@@ -22423,18 +22513,15 @@ int main(int argc, char** argv) {
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
-    if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
-#if defined(__APPLE__)
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    const char* glslVersion = "#version 150";
-#else
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    const char* glslVersion = "#version 130";
-#endif
+    // Installed before anything can fail, so the two messages below can quote
+    // GLFW instead of shrugging. Storing only - it prints nothing by itself.
+    glfwSetErrorCallback(glfwErrorSink);
+    if (!glfwInit()) {
+        fprintf(stderr, "glfwInit failed: %s\n",
+                glfwReasonOr("no GLFW error reported").c_str());
+        return 1;
+    }
+    const char* glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
     if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     // How a Linux desktop matches a window to its launcher: without these the
     // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
@@ -22446,7 +22533,16 @@ int main(int argc, char** argv) {
     GLFWwindow* win = glfwCreateWindow(1600, 1000,
                                        (std::string("viewer  ") + viewerVersion()).c_str(),
                                        nullptr, nullptr);
-    if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
+    if (!win) {
+        // THE line the Windows and macOS CI runners printed once per selftest,
+        // with no reason attached - which is what made a machine with no GL
+        // indistinguishable from 21 broken tests. GLFW knew why the whole time.
+        fprintf(stderr, "window creation failed: %s\n",
+                glfwReasonOr("no GLFW error reported").c_str());
+        fprintf(stderr, "  is it this machine or is it this test? "
+                        "`viewer --gl-probe` answers that alone.\n");
+        return 1;
+    }
     applyWindowIcon(win, false);
     // The frame comes up before the first frame is drawn, so the window never
     // flashes a system title bar it is about to lose. --frame on the command
