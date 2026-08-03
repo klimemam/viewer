@@ -70,7 +70,7 @@ series ⊂ batch)・軸・単位・CFA はドメインの知識であって、�
 | 上記以外 (1次元・5次元以上・最後の軸が 2 や 5 の3次元) | **読まない。** adapter を促す |
 
 **例外は1つだけ、明文化されている**: 3次元で最後の軸が 3 か 4 ならカラー。
-それ以外の3次元は frames。これで実用上のカラー画像は読めたまま、
+それ以外の3次元は stack。これで実用上のカラー画像は読めたまま、
 **`(3,H,W)` は3枚の stack** になる (以前は3chカラーと誤読されていた)。
 
 残る取り違えは `(5,8,3)` のような「幅3ピクセルの5枚 stack」だけ。
@@ -110,7 +110,7 @@ read as   1 frame x 3 ch   (H,W,C)         [ re-read as... ]
 ### 3.4 これで消えるもの
 
 - **`--npy-axis`** — 3次元の意味を人が上書きするための**グローバルな旗**。
-  同じ実行の中に「frames として読みたいファイル」と「カラーとして読みたい
+  同じ実行の中に「stack として読みたいファイル」と「カラーとして読みたい
   ファイル」が混在していても、旗は1つしかなかった。
   §3.3 の言い直しは**ファイルごと**で、しかも画面に見えている
 - `decodeNpyBuffer` の `firstIsChannels` 分岐と、暗黙の `CHW->HWC` 変換
@@ -142,125 +142,176 @@ def load(path):            # path: str。この1引数だけが必須
 - モジュールは**自分のディレクトリを sys.path に載せて**実行される
 - **元ファイルを書き換えてはならない。** 読むだけ
 - **将来のための予約** (今決めておけば後で破壊的変更にならない):
-  関数が `frames` キーワード引数を受けるなら、viewer は「この範囲だけ欲しい」と
+  関数が `only` キーワード引数を受けるなら、viewer は「この範囲だけ欲しい」と
   渡すことがある。受けない関数はこれまでどおり全部返す。
 
   ```python
-  def load(path, frames=None):   # frames: range | list[int] | None (全部)
+  def load(path, only=None):   # only: range | list[int] | None (全部)
   ```
 
-### 4.2 返り値は3つの形
+### 4.2 返り値が層を名乗る
 
-| 返り値 | 意味 |
-|---|---|
-| `ndarray` (または torch tensor) | それが画素。§4.4 の形の規則で読む |
-| `dict` | 1つの stack (または series) + 言いたいこと |
-| `list[dict \| ndarray]` | 複数。まとめて1つの batch になる |
+**返り値の型が、frame / stack / series / batch のどれかを名乗る。**
+層モデルの4語以外の語を持ち込まない (`frames` のような新語を作らない)。
 
-いちばん簡単な形が、いちばん短いこと:
+```python
+from viewer_import import Frame, Stack, Series, Batch
+
+return Frame(img)                       # 1枚
+return Stack(arr)                       # 複数フレーム、同一条件
+return Series(stacks, sweep=...)        # 条件を振ったもの
+return Batch([dark, flat])              # 一緒に開くもの
+```
+
+dict で書きたいときも同じ — **キーが層を名乗る**:
+
+```python
+return {"stack": arr, "axis": {"values": t, "name": "time", "unit": "s"}}
+return {"frame": img}
+return {"series": [...], "sweep": {...}}
+```
+
+**素の配列も返せる。** その場合は §3.1 の native と同じ規則で読む —
+覚えることを増やさないため。曖昧さを自分で潰したいときに層を名乗る。
 
 ```python
 def load(path):
-    return np.load(path)["data"]          # (F,H,W) → F 枚の stack。これだけで動く
+    return np.load(path)["data"]        # native と同じ読み方。1行のまま
 ```
 
-### 4.3 dict のキー
+### 4.3 層ごとのキー
 
-| キー | 必須 | 型 | 意味 |
-|---|---|---|---|
-| `frames` | ✔ | ndarray / tensor | 画素。形の規則は §4.4 |
-| `layout` | | str | `"HW"` `"HWC"` `"CHW"` `"FHW"` `"FHWC"` `"FCHW"` `"SRHW"` `"SRHWC"` |
-| `sweep` | | dict | **フレーム/stack 間で変わった条件**。書くと series になる。§4.5 |
-| `axis` | | dict | **繰り返しの並び順の座標** (時刻・番号)。条件は同じまま。§4.5 |
-| `cfa` | | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
-| `name` | | str | 表示名。省略時はファイル名 |
-| `note` | | str | 素性の一文。doc の note に入る |
-| `meta` | | dict | スカラー/文字列。**provenance に載る** (エクスポートの出所行) |
-| `range` | | (lo, hi) | 表示レンジの初期値。**表示だけ**で測定値には触らない |
+| 層 | 位置引数 | 追加のキー |
+|---|---|---|
+| `Frame` | 画素 | `cfa` `name` `note` `meta` `range` |
+| `Stack` | 画素 | `axis` `cfa` `name` `note` `meta` `range` |
+| `Series` | `Stack` の列 (または画素) | **`sweep` (必須)** `name` `note` `meta` |
+| `Batch` | 上記の列 | `name` |
 
-`sweep` と `axis` の中身はどちらも `{"values": 1次元配列, "name": str, "unit": str}`。
+| キー | 型 | 意味 |
+|---|---|---|
+| `axis` | dict | 繰り返しの**並び順の座標** (時刻・番号)。条件は同じまま |
+| `sweep` | dict | stack 間で**変わった条件** (露光・照度)。series の存在理由 |
+| `cfa` | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
+| `name` | str | 表示名。省略時はファイル名 |
+| `note` | str | 素性の一文 |
+| `meta` | dict | スカラー/文字列。**provenance に載る** |
+| `range` | (lo, hi) | 表示レンジの初期値。**表示だけ**で測定値には触らない |
+
+`axis` / `sweep` の中身はどちらも `{"values": 1次元配列, "name": str, "unit": str}`。
 **値は全桁保持。単位は推測しない** — 書かれていなければ空欄のまま。
 
 未知のキーは**黙って捨てない** — 「adapter が知らないキー `foo` を返した」と言う。
 
-### 4.4 形の規則 — native と同じ、プラス `layout`
+### 4.4 形の判定は、名乗った層の下で行う
 
-| shape | 読み方 |
-|---|---|
-| `(H,W)` | 1枚・1ch |
-| `(H,W,3)` / `(H,W,4)` | 1枚のカラー (native と同じ例外) |
-| `(F,H,W)` | **F 枚の stack** |
-| `(F,H,W,C)` | F 枚 × C ch |
-| `(S,R,H,W)` | `sweep` の長さが S のとき **S 条件 × R 繰り返し** (§4.5) |
-| 5次元以上 | **拒否**。黙って `[0]` を取らない |
+**`layout` を書かなくてよくする**のがこの設計の要点。層が分かっていれば、
+同じ shape でも意味が一意に決まる:
 
-**native (§3.1) と同じ規則**であることが大事 — 覚えることを増やさない。
-違うのは、**曖昧さを `layout` で先に潰せる**点だけ。native では Inspector で
-後から言い直すところを、adapter は書いた時点で宣言できる
-(`(5,8,3)` を「幅3ピクセルの5枚」にしたいなら `layout="FHW"`)。
+| 層 | 受ける shape | 意味 |
+|---|---|---|
+| `Frame` | `(H,W)` | 1ch |
+| `Frame` | `(H,W,C)` | C ch。**C の値は問わない** (frame に frame 軸は無いので曖昧さが無い) |
+| `Stack` | `(F,H,W)` | F 枚・1ch。`(3,H,W)` は3枚 |
+| `Stack` | `(F,H,W,C)` | F 枚 × C ch |
+| `Series` | `Stack` の列 | そのまま。`sweep` の長さ == 列の長さ |
+| `Series` | `(S,H,W[,C])` | S 条件 × 各1枚 |
+| `Series` | `(S,R,H,W[,C])` | S 条件 × R 繰り返し |
+| どれでも | 合わない shape | **拒否**。層と shape を両方名指しして言う |
 
-### 4.5 層の宣言 — 書く人が意識するのは1点だけ
+つまり **`(3,H,W)` を3枚にしたいなら `Stack(arr)`、3ch のカラーにしたいなら
+`Frame(arr)`** と書く。`layout` も `--npy-axis` も要らない。
+
+`layout` は残すが**転置された並びのためだけ**の逃げ道 (`"CHW"` `"FCHW"`)。
+普段は書かない。
+
+### 4.5 `axis` と `sweep` の違い — 「経っただけ」か「設定を変えた」か
+
+一文で言うと:
+
+> **オペレータが設定を変えたなら `sweep`。ただ時間が経った・順番が進んだだけなら `axis`。**
+
+| | `axis` (Stack につく) | `sweep` (Series につく) |
+|---|---|---|
+| 何を表すか | 繰り返しの**並び順の座標** | stack 間で**変えた条件** |
+| 例 | 時刻 [s]、フレーム番号、経過時間 | 露光 [ms]、照度 [lx]、ゲイン [dB] |
+| 撮影条件は | **同じ** | **各点で違う** |
+| σ_t | **意味を持つ** (繰り返しなので) | **条件をまたぐ計算は拒否** |
+| 何が描けるか | ドリフト (時間に対する平均値の変化) | リニアリティ・PTC |
+| 層 | stack の中の座標 | series を series たらしめるもの |
+
+**なぜ分けるか**: 露光を振った8枚を「1つの stack」として渡されると、
+viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノイズ」として報告する**。
+数字は出るが意味は無い — 測定器として最悪の失敗。
+`Stack` と `Series` という型がその2つを分け、`axis` / `sweep` はそれぞれの
+層に属するので、**構造的に取り違えられない**。
+
+判断に迷う例:
+
+- **温度が勝手に上がった連続撮影** → `axis` (時刻)。設定は変えていない。
+  温度は観測された共変量であって、振った条件ではない
+- **温度を段階的に設定した測定** → `sweep`。各点が別の条件
+- **撮影時刻を記録した露光掃引** → `Series` + `sweep`(露光)。時刻も残したければ
+  各 `Stack` の `axis` に入れる (両方持てる)
+
+### 4.6 層の宣言が、そのまま σ_t の可否になる
 
 **同じ `(F,H,W)` が2つの違うものを表しうる**:
 
-- **同一条件の F 回の繰り返し** → **stack**。σ_t (時間ノイズ) が意味を持つ
-- **条件を振った F 枚** (露光 1,2,5,10 ms) → **series**。ここで σ_t を計算すると
+- **同一条件の F 回の繰り返し** → `Stack`。σ_t (時間ノイズ) が意味を持つ
+- **条件を振った F 枚** (露光 1,2,5,10 ms) → `Series`。ここで σ_t を計算すると
   **露光の掃引を「時間ノイズ」として報告する**ことになる
 
 正典が「σ_t は stack の性質」と言っているのはこのため。形からは決まらない。
-そこで**層の名前を書かせるのではなく、キーの名前で意味を分ける**:
+**型がその答えそのもの**なので、書く人が意識するのは「繰り返しか、振ったか」の1点:
 
-| 書くもの | 意味 | できる測定 |
-|---|---|---|
-| どちらも書かない | F 枚は**同一条件の繰り返し** | σ_t、σ_s、欠陥画素 |
-| `axis` | 繰り返しの**並び順の座標** (時刻・番号)。条件は同じ | 上 + ドリフトの図 |
-| `sweep` | フレーム/stack 間で**変わった条件** | リニアリティ・PTC。**条件をまたぐ σ_t は拒否** |
+| 書くもの | できる測定 |
+|---|---|
+| `Stack(arr)` | σ_t、σ_s、欠陥画素 |
+| `Stack(arr, axis=...)` | 上 + 並び順に対するドリフトの図 (条件は同じまま) |
+| `Series(..., sweep=...)` | リニアリティ・PTC。**条件をまたぐ σ_t は拒否** |
 
-- 両方書ける。各条件に繰り返しがあるとき (EMVA 的な撮り方) がまさにそれ
-- `sweep` を書いた時点で viewer は **series** として組む。series メンバシップは
-  正典どおり明示的に作られ、**後から自動で継がれることはない**
-- **`sweep` の長さが形を決める**。`(8,16,H,W)` で `sweep` が 8 なら
-  「8条件 × 16繰り返し」。長さが合わなければ**拒否** (黙って辻褄を合わせない)
-- **frame と stack の区別は書かなくてよい**。2次元は1枚、それだけ
+- `Series` の各 `Stack` が繰り返しを持てる (EMVA 的な撮り方はこれ)
+- series メンバシップは正典どおり明示的に作られ、**後から自動で継がれない**
+- `sweep` の長さが合わなければ**拒否** (黙って辻褄を合わせない)
 
-書かなかったときは「繰り返し」として扱われる。それが違えば σ_t は嘘になるので、
-`axis` があって `sweep` が無い F>1 のときは note に
-`repeats (no sweep declared)` を残す — 数値の出所が後から辿れること。
+素の配列を返したときは `Stack` (繰り返し) として扱われる。それが違えば σ_t は
+嘘になるので、note に `repeats (returned as a bare array)` を残す —
+数値の出所が後から辿れること。
 
-### 4.6 よくある保存形の書き方
+### 4.7 よくある保存形の書き方
 
 ```python
-# 1. 同一条件で 24 枚 → stack
-return arr                                    # (24, H, W)
+# 1. 同一条件で 24 枚
+return Stack(arr)                                  # (24, H, W)
 
-# 2. 露光 8 通り × 各 16 枚 → series (8 stack × 16 frames)
-return {"frames": arr,                        # (8, 16, H, W)
-        "sweep": {"values": exposures, "name": "exposure", "unit": "ms"}}
+# 2. 露光 8 通り x 各 16 枚
+return Series(arr, sweep=Sweep(exposures, "exposure", "ms"))   # (8, 16, H, W)
 
-# 3. 露光 8 通り × 各 1 枚 → series (8 stack × 1 frame)
-return {"frames": arr,                        # (8, H, W)
-        "sweep": {"values": exposures, "name": "exposure", "unit": "ms"}}
+# 3. 露光 8 通り x 各 1 枚
+return Series(arr, sweep=Sweep(exposures, "exposure", "ms"))   # (8, H, W)
 
-# 4. 同一条件の 24 枚 + 撮影時刻 → stack (σ_t は有効なまま)
-return {"frames": arr,                        # (24, H, W)
-        "axis": {"values": t, "name": "time", "unit": "s"}}
+# 4. 同一条件の 24 枚 + 撮影時刻 (σ_t は有効なまま)
+return Stack(arr, axis=Axis(t, "time", "s"))       # (24, H, W)
 
-# 5. 曖昧な形を先に潰す (native なら Inspector で言い直すところ)
-return {"frames": arr, "layout": "FHW"}       # (5, 8, 3) = 幅3の5枚
+# 5. カラー1枚
+return Frame(img)                                  # (H, W, 3)
 
-# 6. 別々に撮った dark と flat → 1 batch に 2 stack
-return [{"name": "dark", "frames": d},
-        {"name": "flat", "frames": f}]
+# 6. 3枚の stack (以前は 3ch と誤読された形)
+return Stack(arr)                                  # (3, H, W)
+
+# 7. 別々に撮った dark と flat
+return Batch([Stack(d, name="dark"), Stack(f, name="flat")])
 ```
 
-### 4.7 dtype
+### 4.8 dtype
 
 - 配列の dtype がそのまま「このデータの型」として表示される (`u8/u16/i32/f32/f64`)
 - viewer 内部は f32。**整数は値を保ったまま f32 に載る** (画素値は [DN])
 - `bfloat16` など numpy に無いものは f32 に変換し、**変換したと note に残す**
 - 非数値 (文字列・object・complex) は拒否。理由を言う
 
-### 4.8 失敗のしかた
+### 4.9 失敗のしかた
 
 例外を投げる。メッセージがそのままユーザーに出る。
 
@@ -270,7 +321,7 @@ raise ValueError("header says 12 planes but the file holds 9")
 
 **黙って空を返さない。**「開けませんでした」だけの表示にはしない — 理由が要る。
 
-### 4.9 型に嵌めたい場合 — 3段階、下ほど早く間違いが分かる
+### 4.10 型に嵌めたい場合 — 3段階、下ほど早く間違いが分かる
 
 dict のゆるい形は残したまま、上に2段を用意する。どれで書いても harness の
 受け取りは同じ (duck typing)。
@@ -281,11 +332,11 @@ dict のゆるい形は残したまま、上に2段を用意する。どれで�
 キー名の綴り間違いが**エディタ上で赤くなる**。
 
 ```python
-from viewer_import import StackDict          # typing.TypedDict
+from viewer_import import SeriesDict         # typing.TypedDict
 
-def load(path) -> StackDict:
+def load(path) -> SeriesDict:
     z = np.load(path)
-    return {"frames": z["data"],
+    return {"series": z["data"],
             "sweep": {"values": z["exposure_ms"], "name": "exposure", "unit": "ms"}}
 ```
 
@@ -297,12 +348,11 @@ from viewer_import import Stack, Series, Frame, Batch, Axis, Sweep
 
 def load(path):
     z = np.load(path)
-    return Series(
-        stacks=[Stack(frames=z["data"][i], name=f"{e:g}ms") for i, e in enumerate(z["exp"])],
-        sweep=Sweep(values=z["exp"], name="exposure", unit="ms"))
+    return Series([Stack(z["data"][i], name=f"{e:g}ms") for i, e in enumerate(z["exp"])],
+                  sweep=Sweep(z["exp"], "exposure", "ms"))
 ```
 
-構築時に検査するもの: `frames` の次元と `layout` の整合 / 5次元以上の拒否 /
+構築時に検査するもの: 名乗った層に対して shape が合っているか (§4.4) /
 `Series` の `sweep` 長 == stack 数 / `Axis` 長 == frame 数 / `cfa` が既知の
 パターンか / 非数値 dtype の拒否。
 
@@ -318,10 +368,10 @@ ValueError: Series: sweep has 8 value(s) but there are 16 stack(s)
 便利コンストラクタ:
 
 ```python
-Series.from_array(arr, sweep=Sweep(exposures, "exposure", "ms"))
+Series(arr, sweep=Sweep(exposures, "exposure", "ms"))
 #   (S,R,H,W) → S 条件 × R 繰り返し / (S,H,W) → S 条件 × 1 枚
-Stack.from_array(arr, axis=Axis(t, "time", "s"))
-Frame(pixels=img, cfa="RGGB")
+Stack(arr, axis=Axis(t, "time", "s"))
+Frame(img, cfa="RGGB")
 Batch([dark, flat], name="20260803_dark_sweep")
 ```
 
@@ -334,13 +384,13 @@ Batch([dark, flat], name="20260803_dark_sweep")
 - **dict / TypedDict / dataclass のどれで返しても同じ npz が出る**ことを
   harness の検査項目にする (段が食い違うくらいなら段は無い方がマシ)
 
-### 4.10 harness が引き受けること (ユーザーが書かなくてよいこと)
+### 4.11 harness が引き受けること (ユーザーが書かなくてよいこと)
 
 - torch → numpy (`.detach().cpu().numpy()` 相当、duck typing)
 - 非連続配列の連続化、endianness の正規化
 - 返り値の検査 (形・dtype・`sweep`/`axis` の長さの整合)
 - **.npz への書き出し**。予約メンバ:
-  `__frames_<i>` / `__sweep_values_<i>` / `__sweep_name_<i>` / `__sweep_unit_<i>` /
+  `__pixels_<i>` / `__sweep_values_<i>` / `__sweep_name_<i>` / `__sweep_unit_<i>` /
   `__axis_values_<i>` / `__axis_name_<i>` / `__axis_unit_<i>` /
   `__cfa_<i>` / `__name_<i>` / `__note_<i>` / `__layout_<i>` / `__meta_<k>`
 - 1行の要約を stderr に出す (viewer がそのまま中継する)
@@ -349,7 +399,7 @@ Batch([dark, flat], name="20260803_dark_sweep")
 新しいパーサを増やさない。これは実装中の「key 付き npz」対応
 (docs/npz-design.md) と同じ土台に乗る。二つは競合ではなく、後者が前者を運ぶ。
 
-### 4.11 パスと関数の対応を憶える
+### 4.12 パスと関数の対応を憶える
 
 一度指定したら憶える。ただし**1ファイル1エントリでは増える一方**なので、
 記憶するのは「規則」:
@@ -369,7 +419,7 @@ Batch([dark, flat], name="20260803_dark_sweep")
 その mtime, 関数名, モジュールの VERSION 属性があればその値)`。
 adapter を編集したら次に開いたときに効く。
 
-### 4.12 どこで指定するか / どこで書くか / 信頼
+### 4.13 どこで指定するか / どこで書くか / 信頼
 
 - **Inspector に「reader」欄**。今このファイルが何で読まれたかを表示し、
   その場で差し替えられる
@@ -425,8 +475,9 @@ adapter を編集したら次に開いたときに効く。
 3. ~~HWC の猶予~~ **決定**: 猶予ではなく**恒久的に native**。deprecated にしない
 4. ~~`--npy-axis` を廃止してよいか~~ **決定**: 廃止。後継は §3.3 の
    Inspector での言い直し (ファイルごと・可視・セッションに残る)
-5. **層の宣言は `axis` / `sweep` の2語でよいか** — 層の名前 (`kind: "series"`) を
-   書かせる案との比較 (推奨: 2語。σ_t が意味を持つかと1対1に対応する)
+5. ~~層の宣言は axis / sweep の2語でよいか~~ **決定**: 型が層を名乗るので
+   `Stack` に `axis`、`Series` に `sweep` が付く形に落ちた。
+   `layout` は転置 (`CHW` / `FCHW`) 専用の逃げ道に降格
 6. **torch の bfloat16 など numpy に無い dtype は f32 変換でよいか**
    (推奨: 変換し note に残す。黙って変えないことが条件)
 7. **記憶する規則の既定** (推奨: 「この1ファイル」「このフォルダの同拡張子」
@@ -435,6 +486,6 @@ adapter を編集したら次に開いたときに効く。
 9. **画素値の単位を adapter が変えられるようにするか** — 正典は「画素値は [DN]」。
    [e-] を許すと軸ラベル・統計・エクスポート全部に波及する
    (推奨: v1 では許さない)
-10. **部分読み込み (`frames=`) を v1 で実装するか**
+10. **部分読み込み (`only=`) を v1 で実装するか**
     (推奨: 契約だけ決めて実装は後)
 11. **v1 はローカル先行でよいか** (推奨: よい)
