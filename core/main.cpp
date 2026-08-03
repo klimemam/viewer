@@ -18769,6 +18769,22 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             snprintf(cnt, sizeof cnt, "%d of %d selected", rbNSel, total);
             line += DOT;
             line += cnt;
+            // ...and what those rows STAND FOR. A grouped row is one row and
+            // four hundred frames, and "2 selected" just before pressing "Open
+            // selected as stack" is the row count answering a question nobody
+            // asked. Said only when the two numbers differ - otherwise it would
+            // print "3 selected, 3 frames" on every ordinary file selection.
+            int frames = 0;
+            for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                if (!rbSel[i]) continue;
+                frames += view[i].isGroup() && !view[i].e->members.empty()
+                        ? (int)view[i].e->members.size() : 1;
+            }
+            if (frames != rbNSel) {
+                snprintf(cnt, sizeof cnt, "%d frames", frames);
+                line += DOT;
+                line += cnt;
+            }
         }
         // ---- and now the things that are usually not true. Connection OK is
         // SILENT: the host's name above is the whole report. Only work in
@@ -21027,11 +21043,19 @@ static std::string g_browseKeysActs =
     // (the filter from the instance segment is still on here, so the first
     // chkstat reads the narrowed form "N of M items"; clearing it reads the
     // plain "M items" - the count in both directions)
-    "w400,chktitle,chkstat:0,filt:,marklist,chkstat:0,"
+    "w400,chktitle,chkstat:0,"
+    // ...a GROUPED row: one row, twenty-four frames, and the line says both
+    // (the filter from the instance segment leaves exactly that row showing)
+    "home,down,chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    "ctrlclick,chkstat:1,chkframes:24,ctrlclick,chkstat:0,"
+    "filt:,marklist,chkstat:0,"
     "starmark,starclick,chkstar:1,starclick,chkstar:0,"
     "seterr,chkerr:1,clrerr,chkerr:0,"
     "setpv:2,chkproto:1,setpv:99,chkproto:1,pvback,chkproto:0,"
-    "down,ctrlclick,chkstat:1,w0,"
+    // ...and a plain row: one row, one thing, no second count. Placed from
+    // "home" because clearing the filter above rebuilt the shown set and reset
+    // the cursor - a bare "down" would land on ".." , which selects nothing.
+    "home,down,chkatrow:digitset,ctrlclick,chkstat:1,chkframes:0,w0,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -31065,6 +31089,21 @@ int main(int argc, char** argv) {
                                   g.statusFull.find(peerTag(rbKeysT().b.host)) == 0 &&
                                   g.statusText.find('\n') == std::string::npos;
                         chk(ok, "\"" + g.statusFull + "\"");
+                    }
+                    else if (op == "chkframes") {
+                        // What the selected ROWS stand for. One grouped row is
+                        // one row and N frames, and the row count alone is the
+                        // wrong answer to "am I about to open 24 files or 480".
+                        // Both directions: the clause is absent when the two
+                        // numbers are equal, or every ordinary selection would
+                        // carry a redundant second count.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        char want[48];
+                        snprintf(want, sizeof want, "%d frames", arg);
+                        bool says = g.statusFull.find(" frames") != std::string::npos;
+                        chk(arg == 0 ? !says
+                                     : (says && g.statusFull.find(want) != std::string::npos),
+                            "\"" + g.statusFull + "\"");
                     }
                     else if (a == "starmark") g_rbStar0 = rbKeysT().toolbar.starLit;
                     else if (op == "chkstar") {
