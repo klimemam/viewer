@@ -233,6 +233,17 @@ struct FrameSource {
     // second copy of all of that. (Kept the .npz-flavoured name to keep the
     // diff small; it is read on ~12 lines.)
     std::string npzMember;
+    // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
+    // the shape the FILE declared, kept so the Inspector can compute which
+    // other readings that shape permits instead of offering a fixed list; empty
+    // = these pixels did not come from a .npy. npyRead is NR_NATIVE until a
+    // user says otherwise, and then it is a DECLARATION, not a guess: it
+    // survives reload and session, and it is what --npy-axis stopped being.
+    // NB: an .exr never sets these. Its channel layout comes from the file's
+    // own channel names, so there is no shape to re-declare and the Inspector's
+    // "read as" control stays out of its way (it keys off npyShape).
+    std::vector<int64_t> npyShape;
+    int npyRead = 0;                  // NpyRead; 0 = NR_NATIVE
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -1319,7 +1330,9 @@ struct App {
     float projYLo = 0, projYHi = 1;   // used by mode 2
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
-    int npyAxis = 0;                  // ambiguous 3D npy: 0 = auto, 1 = leading axis is frames
+    // (npyAxis lived here: one global override for every 3-D .npy in a run.
+    //  docs/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
+    //  is per file, visible in the Inspector, and saved with that image.)
     // shared display range: every open image (and every newly loaded one) uses it
     bool linkRange = false;
     float linkBlack = 0, linkWhite = 1;
@@ -3691,7 +3704,8 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  const std::string& path,
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
-                                                 int& framesOut, int64_t& frameStrideOut);
+                                                 int& framesOut, int64_t& frameStrideOut,
+                                                 int npyRead = 0 /*NR_NATIVE*/);
 struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
 
 // ---- the .npy header, parsed ONCE -------------------------------------------
@@ -3787,60 +3801,157 @@ static std::string npyShapeText(const std::vector<int64_t>& shape) {
 }
 
 // ---- which axis is what -----------------------------------------------------
-// The layout decision, lifted out of the decoder so the .npz picker can promise
-// exactly what will happen. shape and strides are consumed in lockstep; on
-// success F/H/W/C and their strides describe the frame to read.
+// docs/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
+// name. The decision is RANK and the LAST AXIS, and never the first axis's
+// size. "A leading axis of 4 or less must be channels" is the guess that read
+// (3,H,W) - three frames, an ordinary thing to save - as one 3-channel picture,
+// and it could not be right in both of the two cases that actually occur. On
+// the last axis the collision does not arise: an image three pixels wide is not
+// a thing. THE EXCEPTION IS THE ONE WRITTEN DOWN, and there is only one.
 //
-// Deeper than (F,H,W,C) is REFUSED, naming the shape. It used to erase leading
-// axes until four were left and take [0] of each in silence: a (2,3,480,640,3)
-// array became one picture out of six with nothing on screen saying so, which
-// is the same fabrication as a 1-D array becoming a one-pixel-tall image.
-static bool npyLayout(std::vector<int64_t>& shape, std::vector<int64_t>& strides,
-                      int npyAxis, int64_t& F, int64_t& sf,
+// What a user cannot get from the shape, they SAY (§3.3, NpyRead below). That
+// is a declaration, per file and visible on screen - which is what --npy-axis,
+// one global flag for a whole run, could never be.
+
+// A reading of an array. Never inferred beyond NR_NATIVE; the others exist only
+// because someone chose them in the Inspector. VALUES ARE WRITTEN TO SESSIONS:
+// append, never renumber.
+enum NpyRead {
+    NR_NATIVE = 0,   // no choice recorded: §3.1 decides from rank + last axis
+    NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
+    NR_HWC    = 2,   // 3-D as ONE colour frame, channels last: (H,W,C)
+    NR_CHW    = 3,   // 3-D as ONE colour frame, planes first:  (C,H,W)
+};
+
+// The four forms, spelled the way §3.2 spells them to a user.
+static const char* NPY_NATIVE_FORMS = "(H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)";
+
+// Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
+// -1 = "this reading has no such axis". False = r does not apply to this rank,
+// which is how impossible readings are kept off the menu (§3.3).
+static bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) {
+    iF = iH = iW = iC = -1;
+    switch (r) {
+    case NR_STACK:
+        if (rank == 3) { iF = 0; iH = 1; iW = 2;           return true; }
+        if (rank == 4) { iF = 0; iH = 1; iW = 2; iC = 3;   return true; }
+        return false;
+    case NR_HWC: if (rank == 3) { iH = 0; iW = 1; iC = 2; return true; } return false;
+    case NR_CHW: if (rank == 3) { iC = 0; iH = 1; iW = 2; return true; } return false;
+    }
+    return false;
+}
+
+// §3.1, entire: rank, then the last axis, then stop. NR_NATIVE for a rank that
+// has no reading at all (1-D, 5-D and up) - the caller refuses those by name.
+static int npyNativeRead(const std::vector<int64_t>& shape) {
+    if (shape.size() == 3) return (shape[2] == 3 || shape[2] == 4) ? NR_HWC : NR_STACK;
+    if (shape.size() == 4) return NR_STACK;
+    return NR_NATIVE;
+}
+
+// §3.2: name the shape that arrived, and name what native DOES read. A refusal
+// that says only "cannot open" sends the reader nowhere, which is how a 1-D
+// exposure vector stayed a one-pixel-tall image for as long as it did.
+//
+// TODO(§4.13): the third line of §3.2 is "[ choose a reader... ]", and THIS is
+// the single place it attaches - the same message that said no. There is no
+// adapter mechanism yet (§4 / stage 1-3), so the affordance has no destination
+// and is deliberately absent rather than half-built: a picker that picks
+// nothing is worse than a sentence that is honest about the state of things.
+static std::string npyNotNative(const std::vector<int64_t>& shape) {
+    // npyShapeText says "scalar" for a 0-D array, and "shape scalar" is not a
+    // sentence; everything else is a shape and is named as one.
+    return (shape.empty() ? std::string("a scalar")
+                          : "shape " + npyShapeText(shape)) +
+           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS);
+}
+
+// The layout decision, lifted out of the decoder so the .npz picker can promise
+// exactly what will happen. On success F/H/W/C and their strides describe the
+// frame to read. npyRead is the user's declaration or NR_NATIVE.
+static bool npyLayout(const std::vector<int64_t>& shape, const std::vector<int64_t>& strides,
+                      int npyRead, int64_t& F, int64_t& sf,
                       int64_t& H, int64_t& W, int64_t& C,
                       int64_t& sh, int64_t& sw, int64_t& sc,
                       std::string& note, std::string& err) {
-    F = 1; sf = 0;
-    const std::vector<int64_t> shape0 = shape;   // shape is consumed below; errors name it
-    if (shape.size() > 4) {
-        err = std::to_string(shape.size()) + "-D array " + npyShapeText(shape) +
-              " - this viewer opens up to 4 axes (frames, height, width, channels); "
-              "say which axis is frames, or slice it before saving";
-        return false;
-    }
-    if (shape.size() == 4) {            // (F,H,W,C) or (F,C,H,W)
-        F = shape[0]; sf = strides[0];
-        shape.erase(shape.begin());
-        strides.erase(strides.begin());
-    } else if (shape.size() == 3) {
-        bool lastIsChannels = shape[2] <= 4;
-        bool firstIsChannels = shape[0] <= 4;
-        bool asFrames = !lastIsChannels &&
-                        (!firstIsChannels || npyAxis == 1);   // 1 = force frames
-        if (asFrames || (firstIsChannels && npyAxis == 1)) {
-            F = shape[0]; sf = strides[0];
-            shape.erase(shape.begin());
-            strides.erase(strides.begin());
+    F = 1; sf = 0; H = W = C = 1; sh = sw = sc = 0;
+    const size_t rank = shape.size();
+    auto addNote = [&](const std::string& s) { note = note.empty() ? s : note + ", " + s; };
+    if (rank == 2) {                    // (H,W): one frame, one channel, no choice
+        H = shape[0]; sh = strides[0];
+        W = shape[1]; sw = strides[1];
+    } else if (rank == 3 || rank == 4) {
+        int iF, iH, iW, iC;
+        int r = npyRead;
+        // A remembered choice that no longer fits (the file was rewritten with a
+        // different rank) falls back to native and SAYS it did - restoring a
+        // session must not quietly apply a reading to an array it cannot mean.
+        if (r != NR_NATIVE && !npyReadAxes(rank, r, iF, iH, iW, iC)) {
+            addNote("re-read choice does not fit " + npyShapeText(shape) + "; read natively");
+            r = NR_NATIVE;
         }
-    }
-    if (shape.size() == 1) { H = 1; W = shape[0]; C = 1; sh = 0; sw = strides[0]; sc = 0; }
-    else if (shape.size() == 2) { H = shape[0]; W = shape[1]; C = 1; sh = strides[0]; sw = strides[1]; sc = 0; }
-    else {
-        if (shape[2] <= 4)      { H = shape[0]; W = shape[1]; C = shape[2]; sh = strides[0]; sw = strides[1]; sc = strides[2]; }
-        else if (shape[0] <= 4) { C = shape[0]; H = shape[1]; W = shape[2]; sc = strides[0]; sh = strides[1]; sw = strides[2];
-                                  note = note.empty() ? "CHW->HWC" : note + ", CHW->HWC"; }
-        else { err = "shape not interpretable as image"; return false; }
+        if (r == NR_NATIVE) r = npyNativeRead(shape);
+        npyReadAxes(rank, r, iF, iH, iW, iC);
+        if (iF >= 0) { F = shape[iF]; sf = strides[iF]; }
+        H = shape[iH]; sh = strides[iH];
+        W = shape[iW]; sw = strides[iW];
+        if (iC >= 0) { C = shape[iC]; sc = strides[iC]; }
+        // The transposed reading is never native (§3.4 deleted the implicit
+        // CHW->HWC), so when it happens it happened because someone asked.
+        if (r == NR_CHW) addNote("planes first (C,H,W), as asked");
+    } else {                            // 0-D, 1-D, 5-D and up: not a picture
+        err = npyNotNative(shape);
+        return false;
     }
     // EVERY axis has to be a real extent. W and H were bounded and F and C were
     // not, so (8,8,0) built an ImageDoc with ch=0 and (0,8,8,3) read H*W*C
     // values out of a payload holding none. A zero-length axis is not an image.
     if (F < 1 || H < 1 || W < 1 || C < 1) {
-        err = "a zero-length axis in " + npyShapeText(shape0) + ": no pixels in it";
+        err = "a zero-length axis in " + npyShapeText(shape) + ": no pixels in it";
         return false;
     }
-    if (W > 32768 || H > 32768 || C > 4) { err = "unsupported image size"; return false; }
-    if (F > 1) note = note.empty() ? "frame axis" : note + ", frame axis";
+    if (W > 32768 || H > 32768) { err = "unsupported image size"; return false; }
+    // (F,H,W,C) is a native FORM; C > 4 is this viewer's own ceiling, so it is
+    // said as a ceiling and not as "not a native form" - a different sentence
+    // because it is a different refusal.
+    if (C > 4) {
+        err = npyShapeText(shape) + " would be " + std::to_string(C) +
+              " channels: this viewer shows up to 4";
+        return false;
+    }
+    if (F > 1) addNote("frame axis");
     return true;
+}
+
+// "3 frames x 1 ch  (F,H,W)" - what a reading MAKES of this shape, in the
+// wording §3.3 uses. Computed, so the menu can never offer a reading that this
+// array cannot support.
+static std::string npyReadLabel(const std::vector<int64_t>& shape, int r) {
+    std::vector<int64_t> st(shape.size(), 1);       // strides are irrelevant here
+    int64_t F, sf, H, W, C, sh, sw, sc;
+    std::string note, err;
+    if (!npyLayout(shape, st, r, F, sf, H, W, C, sh, sw, sc, note, err)) return {};
+    const char* form = r == NR_HWC ? "(H,W,C)" : r == NR_CHW ? "(C,H,W)"
+                     : shape.size() == 4 ? "(F,H,W,C)" : shape.size() == 3 ? "(F,H,W)" : "(H,W)";
+    return std::to_string((int)F) + (F == 1 ? " frame x " : " frames x ") +
+           std::to_string((int)C) + " ch  " + form;
+}
+
+// Every reading this shape permits, native first. One entry means there is
+// nothing to choose and the Inspector shows no control (§3.3: impossible
+// readings are not offered, and neither is a menu of one).
+static std::vector<int> npyReadOptions(const std::vector<int64_t>& shape) {
+    std::vector<int> out;
+    int nat = npyNativeRead(shape);
+    if (nat == NR_NATIVE) return out;               // a refused shape reads no way
+    for (int r : { nat, (int)NR_STACK, (int)NR_HWC, (int)NR_CHW }) {
+        bool dup = false;
+        for (int o : out) if (o == r) dup = true;
+        if (dup || npyReadLabel(shape, r).empty()) continue;
+        out.push_back(r);
+    }
+    return out;
 }
 
 static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
@@ -3965,16 +4076,18 @@ static bool npzExtractPrefix(const std::vector<uint8_t>& zip, const NpzEntry& e,
 // the temporal analysis operates on.
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
-                                                int64_t& frameStrideOut);   // defined below
+                                                int64_t& frameStrideOut,
+                                                int npyRead = 0 /*NR_NATIVE*/);   // defined below
 
 // Shared by .npy files and .npz members: build a stack when the array has a
-// frame axis, otherwise a single image.
+// frame axis, otherwise a single image. npyRead is the user's declaration
+// (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
 static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
-                                 const std::string& displayName) {
+                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/) {
     std::string err;
     int frames = 1;
     int64_t fstride = 0;
-    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride);
+    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
     if (!first) return err.empty() ? "decode failed" : err;
     std::string label = first->name;
     if (frames <= 1) { addImage(std::move(first)); return {}; }
@@ -3991,7 +4104,7 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     for (int f = 1; f < frames; f++) {
         std::string e2;
         int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs);
+        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
         if (!doc) { toast(label + ": frame " + std::to_string(f) + ": " + e2, true); break; }
         doc->seqId = info.id;
         doc->seqIndex = f;
@@ -4205,13 +4318,16 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
         else           { int64_t s = 1; for (int k = (int)shape.size() - 1; k >= 0; k--) { strides[k] = s; s *= shape[k]; } }
         std::string note, lerr;
         int64_t F, sf, Hh, Ww, Cc, sh, sw, sc;
-        if (!npyLayout(shape, strides, app.npyAxis, F, sf, Hh, Ww, Cc, sh, sw, sc, note, lerr)) {
+        // NR_NATIVE: the picker predicts what an Open will do, and an Open of a
+        // member has no re-read declaration behind it yet (§3.3 restates a doc
+        // that is already open, from the Inspector).
+        if (!npyLayout(shape, strides, NR_NATIVE, F, sf, Hh, Ww, Cc, sh, sw, sc, note, lerr)) {
             // Named in one line, not merely counted: "not opened" tells a reader
             // nothing, and this member is the one that used to become a picture
             // by having its leading axes quietly thrown away.
             m.role = H.shape.size() > 4 ? NpzMember::RAmbig : NpzMember::RBad;
             m.becomes = H.shape.size() > 4
-                            ? std::to_string(H.shape.size()) + "-D: say which axis is frames"
+                            ? "not a native form: native reads " + std::string(NPY_NATIVE_FORMS)
                             : "not an image: " + lerr;
             m.why = lerr;
             out.push_back(std::move(m));
@@ -4230,12 +4346,13 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
 // Open ONE image-shaped member: the stack (or the frame) it makes, tagged with
 // the array name so a session can come back to exactly this member.
 static std::string npzOpenMember(const std::string& path, const std::vector<uint8_t>& zip,
-                                 const NpzEntry& e, const std::string& arrayName) {
+                                 const NpzEntry& e, const std::string& arrayName,
+                                 int npyRead = 0 /*NR_NATIVE*/) {
     std::vector<uint8_t> member;
     std::string mErr;
     if (!npzExtract(zip, e, member, mErr)) return mErr;
     size_t before = app.images.size();
-    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName);
+    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead);
     if (!lErr.empty()) return lErr;
     for (size_t k = before; k < app.images.size(); k++) {
         app.images[k]->src->npzMember = arrayName;   // identity for session restore
@@ -4309,7 +4426,8 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
 //
 // onlyMember != "" restores a single array (sessions record which one): no
 // picker and no batch of its own, because the session owns both.
-static std::string loadNpz(const std::string& path, const std::string& onlyMember = "") {
+static std::string loadNpz(const std::string& path, const std::string& onlyMember = "",
+                           int npyRead = 0 /*NR_NATIVE*/) {
     std::vector<uint8_t> zip;
     if (!readFileBytes(path, zip)) return "cannot read file";
     std::vector<NpzEntry> entries;
@@ -4324,7 +4442,10 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
                 return "member " + onlyMember + " " + m.shapeText + " is not an image (" +
                        m.why + ")";
             npzRememberMeta(path, mem);
-            return npzOpenMember(path, zip, entries[m.entry], m.name);
+            // npyRead rides along: a session restoring a member, and a §3.3
+            // re-read of one, both come through here and both must land on the
+            // reading the user declared rather than on the native one.
+            return npzOpenMember(path, zip, entries[m.entry], m.name, npyRead);
         }
         return "no member named " + onlyMember + " in this npz";
     }
@@ -4387,11 +4508,11 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
     return {};
 }
 
-static std::string loadNpy(const std::string& path) {
+static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/) {
     std::string err;
     int frames = 1;
     int64_t fstride = 0;
-    auto first = decodeNpyFrame(path, err, 0, frames, fstride);
+    auto first = decodeNpyFrame(path, err, 0, frames, fstride, npyRead);
     if (!first) return err.empty() ? "decode failed" : err;
     if (frames <= 1) { addImage(std::move(first)); return {}; }
 
@@ -4408,7 +4529,7 @@ static std::string loadNpy(const std::string& path) {
     for (int f = 1; f < frames; f++) {
         std::string e2;
         int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyFrame(path, e2, f, fr, fs);
+        auto doc = decodeNpyFrame(path, e2, f, fr, fs, npyRead);
         if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
         doc->seqId = info.id;
         doc->seqIndex = f;
@@ -4732,6 +4853,111 @@ static std::string loadExr(const std::string& path, const std::string& onlyLayer
 #endif
 }
 
+// ---- §3.3: say it again, and mean it ----------------------------------------
+// The successor to --npy-axis. Not one guess corrected by another: the reading
+// is a DECLARATION, so it is remembered on the source, saved with the session,
+// and applied to every frame of the stack it rebuilds.
+
+// What re-reading COSTS, named before it happens (§3.3 requires this said in
+// advance). Re-reading builds a new document with a new identity, so anything
+// that pointed at the old one by identity - a compare slot pinned to it, a
+// frame number that other state refers to - points at nothing afterwards.
+// Empty = nothing is riding on this document and the re-read costs nothing.
+static std::string npyReReadLoss(const ImageDoc* d) {
+    if (!d) return {};
+    std::vector<std::string> lost;
+    std::string slots;
+    for (const auto& q : app.images) {
+        if (q->seqId != 0 ? q->seqId != d->seqId : q.get() != d) continue;
+        if (app.compareBUid == q->uid) slots += slots.empty() ? "B" : ", B";
+        for (size_t i = 0; i < app.cmpExtra.size(); i++)
+            if (app.cmpExtra[i] == q->uid)
+                slots += (slots.empty() ? "" : ", ") + slotName(i);
+    }
+    if (!slots.empty()) lost.push_back("compare slot " + slots + " unpins");
+    // A crop is a rectangle in a grid the new reading may not even have, so it
+    // is dropped rather than carried onto pixels it no longer describes.
+    if (d->src->srcW > 0 && (d->w != d->src->srcW || d->h != d->src->srcH))
+        lost.push_back("the crop is dropped (the new reading is a different grid)");
+    int frames = d->seqId != 0 ? (int)framesOfSeq(d->seqId).size() : 1;
+    if (frames > 1)
+        lost.push_back("the stack's " + std::to_string(frames) +
+                       " frames are rebuilt, so anything keyed to a frame NUMBER "
+                       "(follow-frame pairing, a pinned frame) is re-established");
+    if (lost.empty()) return {};
+    std::string s = "re-reading rebuilds this document: ";
+    for (size_t i = 0; i < lost.size(); i++) s += (i ? "; " : "") + lost[i];
+    return s;
+}
+
+// Read the SAME file again under reading r. The old document is dropped only
+// after the new one exists, so a re-read that cannot happen leaves what was on
+// screen exactly where it was.
+static std::string npyReReadAs(ImageDoc* d, int r) {
+    if (!d || !d->src) return "no image";
+    const std::string path = d->src->path, member = d->src->npzMember;
+    if (path.empty()) return "these pixels have no file to read again";
+    if (d->src->npyShape.empty()) return "not a .npy: there is no other reading of it";
+    if (npyReadLabel(d->src->npyShape, r).empty())
+        return npyShapeText(d->src->npyShape) + " cannot be read that way";
+    // What belongs to the FILE and not to the reading travels across; the range
+    // does not, because a different reading is a different set of pixels.
+    const int cfa = d->cfa, pat = d->cfaPattern, lut = d->displayLut, batch = d->batchId;
+    const bool col = d->cfaColorize;
+    const int oldSeq = d->seqId;
+    const uint64_t oldUid = d->uid;
+
+    const size_t before = app.images.size();
+    const int prevBatch = app.loadBatchId;
+    app.loadBatchId = batch;              // a re-read stays in the batch it was in
+    const bool quietWas = g_quietLoad;
+    g_quietLoad = true;                   // selection is set below, once
+    std::string err = member.empty() ? loadNpy(path, r) : loadNpz(path, member, r);
+    g_quietLoad = quietWas;
+    app.loadBatchId = prevBatch;
+    if (err.empty() && app.images.size() == before) err = "nothing opened";
+    if (!err.empty()) return err;         // nothing was closed: the old doc stands
+
+    std::vector<ImageDoc*> made;
+    for (size_t k = before; k < app.images.size(); k++) made.push_back(app.images[k].get());
+    // now, and only now, the reading it replaces goes
+    if (oldSeq != 0) closeStack(oldSeq);
+    else {
+        for (size_t k = 0; k < app.images.size(); k++)
+            if (app.images[k]->uid == oldUid) { closeImages({ (int)k }); break; }
+    }
+    for (ImageDoc* m : made) {
+        m->cfa = cfa; m->cfaPattern = pat; m->cfaColorize = col;
+        m->displayLut = lut;
+        m->texDirty = true;
+    }
+    for (size_t k = 0; k < app.images.size(); k++)
+        if (app.images[k].get() == made[0]) { app.current = (int)k; break; }
+    app.imagesRev++;
+    return {};
+}
+
+// The Inspector ASKS; the work happens here, between frames. Re-reading
+// destroys the very document whose panel requested it, so running it inside the
+// draw would pull the ground out from under the rest of that panel.
+static uint64_t g_reReadAsk  = 0;            // uid whose confirm popup is up
+static int      g_reReadWant = NR_NATIVE;    // the reading it is asking about
+static uint64_t g_reReadGo   = 0;            // uid confirmed; runs next frame
+static void pumpReRead() {
+    if (!g_reReadGo) return;
+    const uint64_t uid = g_reReadGo;
+    const int want = g_reReadWant;
+    g_reReadGo = 0; g_reReadAsk = 0; g_reReadWant = NR_NATIVE;
+    ImageDoc* d = nullptr;
+    for (const auto& q : app.images) if (q->uid == uid) { d = q.get(); break; }
+    if (!d) return;                          // closed while the popup was up
+    const std::string label = npyReadLabel(d->src->npyShape, want);
+    const std::string name = baseName(d->src->path);
+    std::string e = npyReReadAs(d, want);
+    if (!e.empty()) toast(name + ": " + e, true);
+    else            toast(name + ": read as " + label);
+}
+
 static void runProcessor(int idx) {
     ImageDoc* im = cur();
     if (!im || idx < 0 || idx >= (int)plugin_host::processors().size()) return;
@@ -4779,7 +5005,8 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  const std::string& path,
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
-                                                 int& framesOut, int64_t& frameStrideOut) {
+                                                 int& framesOut, int64_t& frameStrideOut,
+                                                 int npyRead) {
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     framesOut = 1;
     frameStrideOut = 0;
@@ -4797,8 +5024,10 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     const bool fortran = Hd.fortran, be = Hd.be;
     const int esize = Hd.esize;
     if (esize == 0) { errOut = "unsupported dtype: " + descr; return {}; }
-    std::vector<int64_t> shape = Hd.shape;
-    if (shape.empty()) shape.push_back(1);
+    // The shape the FILE declared, unedited. A 0-D scalar used to be padded to
+    // (1,) here and then read as a 1x1 picture; §3.1 refuses it, like every
+    // other rank that is not 2, 3 or 4, and npyLayout is the one place that says so.
+    const std::vector<int64_t> shape = Hd.shape;
 
     size_t count = 1;
     for (int64_t d : shape) count *= (size_t)d;
@@ -4842,13 +5071,14 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
 
     // Layout decision, in npyLayout so the .npz picker predicts with the same
-    // rule. A leading axis that is not a plausible channel count is a FRAME
-    // axis: (F,H,W) / (F,H,W,1) / (F,H,W,C) load as a stack, not as one image.
-    // app.npyAxis can force the ambiguous small-leading-axis case. Deeper than
-    // 4 axes is refused BY NAME instead of silently showing [0].
+    // rule (§3.1): rank and the LAST axis decide, the leading axis is never
+    // consulted, and every other rank is refused by name. npyRead carries the
+    // user's re-read declaration when there is one (§3.3) - it is threaded in
+    // rather than read from app state so the sequence loader thread and the
+    // Inspector reach the same answer for the same file.
     std::string note, lerr;
     int64_t F = 1, sf = 0, H, W, C, sh, sw, sc;
-    if (!npyLayout(shape, strides, app.npyAxis, F, sf, H, W, C, sh, sw, sc, note, lerr)) {
+    if (!npyLayout(shape, strides, npyRead, F, sf, H, W, C, sh, sw, sc, note, lerr)) {
         errOut = lerr;
         return {};
     }
@@ -4863,6 +5093,8 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     S.path = path;
     S.w = (int)W; S.h = (int)H; S.ch = (int)C;
     S.dtype = dtypeName;
+    S.npyShape = shape;                 // what the file said, for §3.3's menu
+    S.npyRead = npyRead;                // and how it was read, for the session
     im->note = note;
     S.data.resize((size_t)W * H * C);
     size_t di = 0;
@@ -4876,10 +5108,10 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
 
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
-                                                int64_t& frameStrideOut) {
+                                                int64_t& frameStrideOut, int npyRead) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
-    auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
+    auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut, npyRead);
     if (im) statSourceFile(*im->src);      // a local file: record the Watch baseline
     return im;
 }
@@ -5141,7 +5373,10 @@ static void restoreFull() {
         if (!err.empty()) { toast("restore failed: " + err, true); return; }
     } else if (!im->src->path.empty()) {
         int before = (int)app.images.size();
-        std::string err = loadNpy(im->src->path);
+        // the reading is part of what "the same file" means: restoring the full
+        // frame must not quietly hand back the native reading of a file the user
+        // has already said is read some other way (§3.3)
+        std::string err = loadNpy(im->src->path, im->src->npyRead);
         if (!err.empty() || (int)app.images.size() == before) {
             toast("restore failed: " + (err.empty() ? std::string("reload error") : err), true);
             return;
@@ -5249,8 +5484,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
       << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
-    // must precede the image lines: it decides whether (F,H,W) reloads as a stack
-    f << "npyaxis " << app.npyAxis << "\n";
+    // "npyaxis" used to sit here: one global reading for a whole session
+    // (§3.4). Its successor is the per-image "npyread" line below, so nothing
+    // global is written any more. An OLD session's npyaxis is skipped like any
+    // unknown key - and lands on the same pixels, because the reading it used
+    // to force for (F,H,W) is now what native does anyway.
     f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << " "
       << app.diffGain << " " << (app.diffAbs ? 1 : 0) << " "
       << (app.flipAuto ? 1 : 0) << " " << app.flipPeriod << "\n";
@@ -5302,6 +5540,12 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
         if (!d->src->npzMember.empty()) f << "member " << d->src->npzMember << "\n";
+        // §3.3: the reading is the user's declaration and it sticks across
+        // sessions. ADDITIVE, and written only when there IS a declaration - an
+        // older viewer skips the unknown key and reloads natively, which is
+        // exactly what it would have done with no key at all. It precedes the
+        // image line because it decides how that line's file is decoded.
+        if (d->src->npyRead != NR_NATIVE) f << "npyread " << d->src->npyRead << "\n";
         f << "lut " << d->displayLut << "\n";
         f << "image " << d->black << " " << d->white << " ";
         if (d->src->rawDtype >= 0) {
@@ -5487,7 +5731,7 @@ static void saveSession(std::string path, bool quiet = false) {
     toast(msg, lostSeries > 0 || lostMembers > 0);
 }
 
-static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
+static std::string loadNpy(const std::string& path, int npyRead);   // fwd (defined above)
 
 // ---- instance identity (Open in new window, todo-open item 28 / A7) ---------
 // Two viewers used to share ONE autosave file: whichever exited last overwrote
@@ -5955,6 +6199,7 @@ static std::string loadSession(const std::string& path) {
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     int pendingLut = -1;
     std::string pendingMember;         // .npz array name for the next image line
+    int pendingRead = NR_NATIVE;       // §3.3 reading for the next image line
     bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
     // "current" is an ordinal over saved image lines; a line can expand into a
@@ -6015,7 +6260,9 @@ static std::string loadSession(const std::string& path) {
             if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
         }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
-        else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
+        // "npyaxis" is deliberately NOT parsed any more (§3.4): the flag it
+        // restored no longer exists, and an old session's value falls through
+        // the chain like any unknown key rather than being half-honoured.
         else if (key == "compare") { int ab = 0, fa = 0;
                                      ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
                                      if (ls >> app.diffGain >> ab) app.diffAbs = ab != 0;  // v2
@@ -6070,6 +6317,11 @@ static std::string loadSession(const std::string& path) {
         }
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
+        else if (key == "npyread") {              // §3.3, applies to the next image line
+            int r = NR_NATIVE;
+            ls >> r;
+            pendingRead = (r >= NR_NATIVE && r <= NR_CHW) ? r : NR_NATIVE;
+        }
         else if (key == "selann") ls >> selAnnIndex;
         else if (key == "imgbatch") {   // batch of the image above, by name
             std::string nm = restOfLine(ls);
@@ -6295,9 +6547,13 @@ static std::string loadSession(const std::string& path) {
                     openRemote(p);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
-                    err = isNpz ? loadNpz(p, pendingMember)
+                    // loadExr takes no pendingRead: the "read as" declaration
+                    // (§3.3) re-interprets a .npy SHAPE, and an .exr has none -
+                    // its layout comes from the file's own channel names. There
+                    // is nothing for a user to re-declare, so nothing to restore.
+                    err = isNpz ? loadNpz(p, pendingMember, pendingRead)
                         : isExr ? loadExr(p, pendingMember)
-                                : loadNpy(p);
+                                : loadNpy(p, pendingRead);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -6311,6 +6567,7 @@ static std::string loadSession(const std::string& path) {
                 err = loadNpy(p);
             }
             pendingMember.clear();
+            pendingRead = NR_NATIVE;      // must not leak onto the next image
             if (!err.empty()) {
                 failures.push_back(err);
                 lastImageOk = false;
@@ -11930,6 +12187,58 @@ static void drawInspector() {
                     ImGui::TreePop();
                 }
                 break;
+            }
+        }
+        // ---- how this array was read, and how else this SHAPE could be read --
+        // docs/input-adapters.md §3.3. The successor to --npy-axis: what the
+        // viewer decided is on screen, and the ways out are computed from the
+        // actual shape, so a reading this array cannot support is never offered.
+        if (!im->src->npyShape.empty()) {
+            const std::vector<int64_t>& shp = im->src->npyShape;
+            const int nowRead = im->src->npyRead != NR_NATIVE ? im->src->npyRead
+                                                             : npyNativeRead(shp);
+            ImGui::TextDisabled("read as   %s", npyReadLabel(shp, nowRead).c_str());
+            std::vector<int> opts = npyReadOptions(shp);
+            if (opts.size() > 1) {
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.75f);
+                if (ImGui::BeginCombo("##reread", "re-read as...",
+                                      ImGuiComboFlags_NoArrowButton)) {
+                    for (int r : opts) {
+                        if (r == nowRead) continue;
+                        if (ImGui::Selectable(npyReadLabel(shp, r).c_str())) {
+                            g_reReadAsk = im->uid;      // confirm first: §3.3 says
+                            g_reReadWant = r;           // what is lost, BEFORE
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (g_reReadAsk == im->uid && !ImGui::IsPopupOpen("Re-read"))
+                    ImGui::OpenPopup("Re-read");
+                if (ImGui::BeginPopupModal("Re-read", nullptr,
+                                           ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::Text("%s  %s", baseName(im->src->path).c_str(),
+                                npyShapeText(shp).c_str());
+                    ImGui::Text("read as   %s", npyReadLabel(shp, nowRead).c_str());
+                    ImGui::Text("re-read as   %s", npyReadLabel(shp, g_reReadWant).c_str());
+                    std::string loss = npyReReadLoss(im);
+                    if (!loss.empty()) {
+                        ImGui::Separator();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+                        ImGui::TextWrapped("%s", loss.c_str());
+                        ImGui::PopTextWrapPos();
+                    }
+                    ImGui::Separator();
+                    if (ImGui::Button("Re-read")) {
+                        g_reReadGo = im->uid;           // pumpReRead runs it next frame
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) {
+                        g_reReadAsk = 0; g_reReadWant = NR_NATIVE;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
             }
         }
         if (im->ch == 1) {
@@ -21449,7 +21758,9 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
-        "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
+        "  .npy shapes read natively:  (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)\n"
+        "                              any other shape is refused by name; to read one\n"
+        "                              differently, use \"re-read as...\" in the Inspector\n"
         "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
         "                              here, only the visible region is fetched\n"
         "  ssh://user@host/~/dir       connect and browse there instead (a host on\n"
@@ -21464,6 +21775,8 @@ static void printUsage() {
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
+        "  --gl-probe                  can this machine make the GL context the viewer\n"
+        "                              needs? name it and exit (0 yes, 3 no + why)\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
@@ -21544,10 +21857,16 @@ static void parseCli(int argc, char** argv) {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
         } else if (a == "--npy-axis") {
-            std::string v = next();
-            if (v == "frames") app.npyAxis = 1;
-            else if (v == "auto" || v == "channels") app.npyAxis = 0;
-            else fprintf(stderr, "--npy-axis expects auto|frames\n");
+            // docs/input-adapters.md §3.4. One global flag decided the meaning
+            // of every 3-D array in a run, so a session holding one file to read
+            // as a stack and another to read as colour could not be expressed at
+            // all. Say so and carry on - silence would leave the user believing
+            // the old meaning still applied.
+            next();                                // swallow its value, not a path
+            fprintf(stderr, "--npy-axis is gone: (F,H,W) is F frames and (H,W,3|4) is one "
+                            "colour frame, always. To read one file differently, open it and "
+                            "use \"re-read as...\" in the Inspector - it is per file and it "
+                            "is remembered.\n");
         } else if (a == "--sequence") {            // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
@@ -22403,6 +22722,90 @@ static void dropOwnConsole() {
 }
 #endif
 
+// ---- the GL context this binary asks for, and whether the machine has one ---
+//
+// The hints live in one function because the probe below and the real window
+// must ask for exactly the SAME context. A machine that will hand out a context
+// but not a 3.0 (3.2 core on macOS) one is precisely the case the probe exists
+// to catch, and it would miss it the moment the two lists drifted apart.
+// glslVersion travels with them: it is one decision, not two.
+static const char* applyGlContextHints() {
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    return "#version 150";
+#else
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    return "#version 130";
+#endif
+}
+
+// GLFW's own account of the last thing that went wrong. It is only STORED here,
+// never printed on arrival: the failure sites decide what is worth saying, and
+// say it once. Until this existed GLFW's reason was simply discarded, so every
+// failure to make a window said "window creation failed" and nothing more -
+// which is exactly what the Windows and macOS runners printed, once per test,
+// with no way to tell a dead runner from a broken viewer.
+static std::string g_glfwLastError;
+static void glfwErrorSink(int code, const char* desc) {
+    g_glfwLastError = "GLFW error " + std::to_string(code) + ": " +
+                      (desc && *desc ? desc : "(no description)");
+}
+static std::string glfwReasonOr(const char* fallback) {
+    return g_glfwLastError.empty() ? std::string(fallback) : g_glfwLastError;
+}
+
+// --gl-probe: "this machine cannot make a GL context" and "an assert failed"
+// are different events, and until this existed nothing could tell them apart.
+// Startup opens a real 1600x1000 window unconditionally, so every selftest but
+// one dies inside glfwCreateWindow on a runner that has no context, and each of
+// them reads as a broken test - which is how CI stayed red for hours with
+// nothing in the output that said why. Answering it once, out loud, is the fix.
+//
+// The probe does what those tests do in their first moments - glfwInit, the
+// same hints, one window - and when it cannot, it says WHY in GLFW's own words,
+// taken from the error callback rather than guessed at from the failure site.
+// Exit 0: there is a context, run everything. Exit 3: there is not, and
+// tools/run_selftests.sh turns that into a named skip instead of a red matrix.
+// It answers for the harness today; the app can ask it the same question later.
+static int glProbe() {
+    // The no-GL branch of run_selftests.sh has to be provable on a machine that
+    // HAS GL, or nobody watches it work until CI does - and CI is unreadable.
+    if (const char* f = getenv("VIEWER_FORCE_NO_GL"); f && *f && strcmp(f, "0")) {
+        printf("no OpenGL context on this machine: forced by VIEWER_FORCE_NO_GL=%s\n", f);
+        return 3;
+    }
+    glfwSetErrorCallback(glfwErrorSink);
+    if (!glfwInit()) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("glfwInit failed, no GLFW error reported").c_str());
+        return 3;
+    }
+    applyGlContextHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // a probe must never flash a window
+    // This is the call the runners die in - 0.08-0.20 s per test, 21 times a run.
+    GLFWwindow* w = glfwCreateWindow(64, 64, "viewer gl probe", nullptr, nullptr);
+    if (!w) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("window creation failed, no GLFW error reported").c_str());
+        glfwTerminate();
+        return 3;
+    }
+    glfwMakeContextCurrent(w);
+    // Named, because "which GL did that machine actually get" is the next
+    // question every time a render result differs between a runner and a desk.
+    const char* rend = (const char*)glGetString(GL_RENDERER);
+    const char* ver  = (const char*)glGetString(GL_VERSION);
+    printf("OpenGL context OK: %s / %s\n", rend ? rend : "(no renderer)",
+                                           ver  ? ver  : "(no version)");
+    glfwDestroyWindow(w);
+    glfwTerminate();
+    return 0;
+}
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -22429,6 +22832,10 @@ int main(int argc, char** argv) {
             if (!strcmp(argv[i], "--remote-selftest"))
                 return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
     }
+    // Asked before prefs are read and before an autosave slot is claimed: a
+    // question ABOUT the machine must not alter the machine it is asking about.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--gl-probe")) return glProbe();
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
@@ -22480,18 +22887,15 @@ int main(int argc, char** argv) {
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
-    if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
-#if defined(__APPLE__)
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    const char* glslVersion = "#version 150";
-#else
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    const char* glslVersion = "#version 130";
-#endif
+    // Installed before anything can fail, so the two messages below can quote
+    // GLFW instead of shrugging. Storing only - it prints nothing by itself.
+    glfwSetErrorCallback(glfwErrorSink);
+    if (!glfwInit()) {
+        fprintf(stderr, "glfwInit failed: %s\n",
+                glfwReasonOr("no GLFW error reported").c_str());
+        return 1;
+    }
+    const char* glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
     if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     // How a Linux desktop matches a window to its launcher: without these the
     // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
@@ -22503,7 +22907,16 @@ int main(int argc, char** argv) {
     GLFWwindow* win = glfwCreateWindow(1600, 1000,
                                        (std::string("viewer  ") + viewerVersion()).c_str(),
                                        nullptr, nullptr);
-    if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
+    if (!win) {
+        // THE line the Windows and macOS CI runners printed once per selftest,
+        // with no reason attached - which is what made a machine with no GL
+        // indistinguishable from 21 broken tests. GLFW knew why the whole time.
+        fprintf(stderr, "window creation failed: %s\n",
+                glfwReasonOr("no GLFW error reported").c_str());
+        fprintf(stderr, "  is it this machine or is it this test? "
+                        "`viewer --gl-probe` answers that alone.\n");
+        return 1;
+    }
     applyWindowIcon(win, false);
     // The frame comes up before the first frame is drawn, so the window never
     // flashes a system title bar it is about to lose. --frame on the command
@@ -26727,13 +27140,12 @@ int main(int argc, char** argv) {
         // the same member with its axis.
         {
             closeAll();
-            // (4,8,8) is the OTHER ambiguity, and an old one: a leading 4 is as
-            // plausible a channel count as a frame count, and the existing
-            // heuristic reads it as CHW. --npy-axis frames is the control that
-            // exists for exactly this; V21 is about members, not about that
-            // heuristic, so it says which one it means and puts it back.
-            int npyAxisWas = app.npyAxis;
-            app.npyAxis = 1;
+            // (4,8,8) used to be the OTHER ambiguity: a leading 4 is as
+            // plausible a channel count as a frame count, and the old heuristic
+            // read it as CHW - so V21 had to set --npy-axis frames to get the
+            // four frames it is about. There is nothing to set now. §3.1 reads
+            // the LAST axis, (4,8,8) ends in 8, and eight is not a channel
+            // count, so it is four frames because that is what native means.
             std::error_code nec;
             std::filesystem::path ndir =
                 std::filesystem::path(g_verifySelftest) / "vfy-npz-scratch";
@@ -27097,7 +27509,245 @@ int main(int argc, char** argv) {
             app.npzPickQueue.clear();
 
             std::filesystem::remove_all(ndir, nec);
-            app.npyAxis = npyAxisWas;
+            closeAll();
+        }
+
+        // ---- V22: native reads FOUR shapes, and SAYS SO when it will not -----
+        // docs/input-adapters.md §3.1: the decision is RANK and the LAST AXIS,
+        // and nothing else. The LEADING axis is never consulted - "a small
+        // leading axis must be channels" is the guess that turned three frames
+        // into one 3-channel picture, and a 1-D exposure vector into a
+        // one-pixel-tall image. Both are fabrication, and both flip here.
+        //
+        //   (H,W)        1 frame, 1 ch
+        //   (H,W,3|4)    1 colour frame        <- the ONE size-based exception,
+        //                                        and it is on the LAST axis
+        //   (F,H,W)      F frames, 1 ch each   <- so (3,H,W) is THREE FRAMES
+        //   (F,H,W,C)    F frames of C channels
+        //
+        // Anything else is refused BY NAME and the refusal names what native
+        // does read (§3.2), because "cannot open" sends nobody anywhere.
+        {
+            closeAll();
+            std::error_code vec;
+            std::filesystem::path vdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-native-scratch";
+            std::filesystem::create_directories(vdir, vec);   // ours: ours to remove
+            // one .npy FILE on disk from a shape and its bytes. V21 builds .npy
+            // members inside a zip; these have to be loose files because the
+            // rule under test is the FILE loader's, and loadNpy is its door.
+            auto writeNpy = [&](const std::string& name, const char* descr,
+                                const std::vector<int64_t>& shape,
+                                const void* data, size_t nbytes) {
+                std::string sh;
+                if (shape.empty()) sh = "()";
+                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+                else {
+                    sh = "(";
+                    for (size_t i = 0; i < shape.size(); i++)
+                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+                    sh += ")";
+                }
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+                out.insert(out.end(), magic, magic + 8);
+                out.push_back((uint8_t)(hdr.size() & 0xff));
+                out.push_back((uint8_t)(hdr.size() >> 8));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                std::string path = (vdir / name).u8string();
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)out.data(), (std::streamsize)out.size());
+                return path;
+            };
+            // every fixture is a slice of ONE ramp, so a re-reading of the same
+            // file is comparable to the reading it replaced pixel for pixel
+            std::vector<uint16_t> pix(4096);
+            for (size_t i = 0; i < pix.size(); i++) pix[i] = (uint16_t)(i * 7 + 3);
+            auto npyOf = [&](const std::string& name, const std::vector<int64_t>& shape) {
+                size_t n = 1;
+                for (int64_t d : shape) n *= (size_t)d;
+                return writeNpy(name, "<u2", shape, pix.data(), n * 2);
+            };
+            struct Opened { std::string err; size_t docs; int w, h, ch; };
+            auto openOne = [&](const std::string& path) {
+                closeAll();
+                Opened o{};
+                o.err = loadNpy(path);
+                o.docs = app.images.size();
+                if (!app.images.empty()) {
+                    o.w = app.images[0]->w; o.h = app.images[0]->h; o.ch = app.images[0]->ch;
+                }
+                return o;
+            };
+
+            // ---- V22a: the four native forms open, and open as themselves ----
+            struct Want { const char* file; std::vector<int64_t> shape;
+                          size_t docs; int w, h, ch; };
+            const Want ACCEPT[] = {
+                { "a_hw.npy",   { 8, 8 },       1, 8, 8, 1 },   // (H,W)
+                { "a_hw3.npy",  { 8, 8, 3 },    1, 8, 8, 3 },   // (H,W,3)  colour
+                { "a_hw4.npy",  { 8, 8, 4 },    1, 8, 8, 4 },   // (H,W,4)  RGBA
+                { "a_fhw.npy",  { 3, 8, 8 },    3, 8, 8, 1 },   // (3,H,W) = 3 FRAMES
+                { "a_fhwc.npy", { 2, 8, 8, 3 }, 2, 8, 8, 3 },   // (F,H,W,C)
+            };
+            for (const auto& t : ACCEPT) {
+                Opened o = openOne(npyOf(t.file, t.shape));
+                bool good = o.err.empty() && o.docs == t.docs &&
+                            o.w == t.w && o.h == t.h && o.ch == t.ch;
+                fprintf(stderr, "verifyselftest: V22a %-14s -> %zu doc(s) %dx%d %dch"
+                                " (want %zu doc(s) %dx%d %dch)%s%s\n",
+                        npyShapeText(t.shape).c_str(), o.docs, o.w, o.h, o.ch,
+                        t.docs, t.w, t.h, t.ch, o.err.empty() ? "" : "  err=", o.err.c_str());
+                check(good, ("V22a native reads " + npyShapeText(t.shape)).c_str());
+            }
+
+            // ---- V22b: everything else is REFUSED, and nothing is built ------
+            struct Bad { const char* file; std::vector<int64_t> shape; const char* why; };
+            const Bad REFUSE[] = {
+                { "b_1d.npy",   { 6 },             "1-D is an axis, not a picture" },
+                { "b_0d.npy",   {},                "a scalar is a number" },
+                { "b_5d.npy",   { 2, 2, 4, 4, 3 }, "deeper than four axes" },
+                { "b_fchw.npy", { 2, 3, 8, 8 },    "(F,C,H,W): the last axis is not channels" },
+                { "b_zero.npy", { 0, 8, 8 },       "a zero-length axis" },
+            };
+            for (const auto& t : REFUSE) {
+                Opened o = openOne(npyOf(t.file, t.shape));
+                bool good = !o.err.empty() && o.docs == 0;
+                fprintf(stderr, "verifyselftest: V22b %-16s %-28s -> %zu doc(s) err=\"%s\"\n",
+                        npyShapeText(t.shape).c_str(), t.why, o.docs, o.err.c_str());
+                check(good, ("V22b native refuses " + npyShapeText(t.shape)).c_str());
+            }
+
+            // ---- V22c: the refusal names the shape AND the accepted forms ----
+            // §3.2. A refusal that does not say what WOULD have worked leaves
+            // the reader to guess, which is the habit this whole change ends.
+            {
+                Opened o = openOne(npyOf("c_odd.npy", { 4, 8, 8, 8, 2 }));
+                bool namesShape = o.err.find("(4, 8, 8, 8, 2)") != std::string::npos;
+                bool namesForms = o.err.find("(H,W)") != std::string::npos &&
+                                  o.err.find("(H,W,3|4)") != std::string::npos &&
+                                  o.err.find("(F,H,W)") != std::string::npos &&
+                                  o.err.find("(F,H,W,C)") != std::string::npos;
+                fprintf(stderr, "verifyselftest: V22c refusal = \"%s\"\n", o.err.c_str());
+                check(namesShape, "V22c the refusal names the shape that arrived");
+                check(namesForms, "V22c the refusal names every form native reads");
+            }
+
+            // ---- V22d: the way out - say it again, per file (§3.3) -----------
+            // (3,8,8) is the shape the old heuristic got wrong, so it is the one
+            // that has to be sayable in BOTH directions. The pixels must be the
+            // same bytes read a different way round: frame c of the stack is
+            // plane c of the colour frame, or one of the two readings is lying.
+            {
+                std::string p = npyOf("d_fhw.npy", { 3, 8, 8 });
+                closeAll();
+                std::string e = loadNpy(p);
+                bool asStack = e.empty() && app.images.size() == 3 &&
+                               app.images[0]->ch == 1 && app.images[0]->w == 8 &&
+                               app.images[0]->h == 8;
+                // the menu offers only what this shape permits: (3,8,8) can be a
+                // 3-frame stack or a plane-first colour frame, but NOT (H,W,C) -
+                // that would be 8 channels, and it must not be on the menu
+                std::vector<int64_t> shp = { 3, 8, 8 };
+                std::vector<int> opts = npyReadOptions(shp);
+                bool hasStack = false, hasChw = false, hasHwc = false;
+                for (int r : opts) {
+                    if (r == NR_STACK) hasStack = true;
+                    if (r == NR_CHW)   hasChw = true;
+                    if (r == NR_HWC)   hasHwc = true;
+                }
+                fprintf(stderr, "verifyselftest: V22d (3, 8, 8) read as \"%s\", %zu option(s):",
+                        npyReadLabel(shp, NR_STACK).c_str(), opts.size());
+                for (int r : opts) fprintf(stderr, " [%s]", npyReadLabel(shp, r).c_str());
+                fprintf(stderr, "\n");
+                check(asStack, "V22d (3,H,W) opens as three frames, not one 3ch image");
+                check(hasStack && hasChw && !hasHwc && opts.size() == 2,
+                      "V22d the menu is computed: (C,H,W) yes, (H,W,C) impossible");
+                // what the three frames hold, to compare against the re-reading
+                std::vector<float> plane[3];
+                for (int f = 0; f < 3 && f < (int)app.images.size(); f++)
+                    plane[f] = app.images[f]->src->data;
+                // ...and what it costs, said BEFORE it happens
+                std::string loss = npyReReadLoss(app.images[0].get());
+                fprintf(stderr, "verifyselftest: V22d loss = \"%s\"\n", loss.c_str());
+                check(loss.find("rebuilds") != std::string::npos &&
+                      loss.find("3 frames") != std::string::npos,
+                      "V22d the cost of re-reading is stated before it runs");
+
+                std::string re = npyReReadAs(app.images[0].get(), NR_CHW);
+                bool oneColour = re.empty() && app.images.size() == 1 &&
+                                 app.images[0]->ch == 3 && app.images[0]->w == 8 &&
+                                 app.images[0]->h == 8;
+                bool samePixels = oneColour;
+                if (oneColour) {
+                    const FrameSource& S = *app.images[0]->src;
+                    for (int c = 0; c < 3 && samePixels; c++)
+                        for (int i = 0; i < 64 && samePixels; i++)
+                            if (S.data[(size_t)i * 3 + c] != plane[c][i]) samePixels = false;
+                }
+                fprintf(stderr, "verifyselftest: V22d re-read as (C,H,W): %zu doc(s) %dch"
+                                " err=\"%s\" samePixels=%d npyRead=%d\n",
+                        app.images.size(), app.images.empty() ? 0 : app.images[0]->ch,
+                        re.c_str(), (int)samePixels,
+                        app.images.empty() ? -1 : app.images[0]->src->npyRead);
+                check(oneColour, "V22d re-read as (C,H,W) gives ONE 3ch frame");
+                check(samePixels, "V22d the re-reading is the same bytes, read round");
+                check(!app.images.empty() && app.images[0]->src->npyRead == NR_CHW,
+                      "V22d the declaration is remembered on the source");
+
+                // ...and back. The reverse must return the stack it came from,
+                // frame for frame - a one-way door is not a way out.
+                std::string back = npyReReadAs(app.images[0].get(), NR_STACK);
+                bool backOk = back.empty() && app.images.size() == 3 &&
+                              app.images[0]->ch == 1;
+                for (int f = 0; f < 3 && backOk; f++)
+                    if (app.images[f]->src->data != plane[f]) backOk = false;
+                fprintf(stderr, "verifyselftest: V22d back to (F,H,W): %zu doc(s) err=\"%s\"\n",
+                        app.images.size(), back.c_str());
+                check(backOk, "V22d re-reading back gives the same three frames");
+            }
+
+            // ---- V22e: the declaration survives a session round trip ---------
+            // §3.3: "saved in the session, and it opens the same way next time".
+            // An ADDITIVE key: a viewer that predates it skips the line and gets
+            // the native reading, which is what it would have done anyway.
+            {
+                std::string p = npyOf("e_fhw.npy", { 3, 8, 8 });
+                closeAll();
+                loadNpy(p);
+                std::string re = npyReReadAs(app.images[0].get(), NR_CHW);
+                std::string sess = (vdir / "reread.vsession").u8string();
+                saveSession(sess, true);
+                std::string body;
+                {
+                    std::ifstream sf(pathFromUtf8(sess));
+                    std::stringstream ss2; ss2 << sf.rdbuf(); body = ss2.str();
+                }
+                bool wrote = body.find("npyread " + std::to_string((int)NR_CHW)) !=
+                             std::string::npos;
+                bool noGlobal = body.find("npyaxis") == std::string::npos;
+                closeAll();
+                std::string lerr2 = loadSession(sess);
+                bool restored = lerr2.empty() && app.images.size() == 1 &&
+                                app.images[0]->ch == 3 &&
+                                app.images[0]->src->npyRead == NR_CHW;
+                fprintf(stderr, "verifyselftest: V22e session: wrote npyread=%d, npyaxis gone=%d,"
+                                " restored %zu doc(s) %dch read=%d err=\"%s\"\n",
+                        (int)wrote, (int)noGlobal, app.images.size(),
+                        app.images.empty() ? 0 : app.images[0]->ch,
+                        app.images.empty() ? -1 : app.images[0]->src->npyRead, lerr2.c_str());
+                check(re.empty() && wrote, "V22e the session records the reading, per image");
+                check(noGlobal, "V22e the global npyaxis line is gone from sessions");
+                check(restored, "V22e reopening reads it the way it was declared");
+            }
+
+            std::filesystem::remove_all(vdir, vec);
             closeAll();
         }
 
@@ -27123,6 +27773,13 @@ int main(int argc, char** argv) {
             std::error_code xec;
             std::filesystem::path xdir =
                 std::filesystem::path(g_verifySelftest) / "vfy-exr-scratch";
+            // Removed BEFORE as well as after. These fixtures sit inside the
+            // fixture tree the folder-scanning selftests walk, and .exr is in
+            // SEQ_EXTS now - so a scratch file this block failed to clean up
+            // (a crashed run, a held handle) would no longer be invisible to
+            // them: it would become a stack in somebody else's scan. Cleaning
+            // on the way IN means one bad run cannot poison every later one.
+            std::filesystem::remove_all(xdir, xec);
             std::filesystem::create_directories(xdir, xec);
 #ifndef VIEWER_WITH_EXR
             // A LOUD skip, not a failure. -DVIEWER_WITH_EXR=OFF is a supported
@@ -30667,6 +31324,8 @@ int main(int argc, char** argv) {
         drawMenuBar(win);
         // before any panel draws: the B cache slots exist only while compare does
         abStatsFrame();
+        // ...and before any panel draws, because it closes documents (§3.3)
+        pumpReRead();
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
