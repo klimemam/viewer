@@ -970,7 +970,11 @@ struct App {
         std::vector<Row> rows;
     } seriesEdit;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
-    bool showRemote = false;          // the server browser, its own panel
+    // Open by default (2026-08-03, user): Browse is how a file is found, and a
+    // tool you have to summon through the OS dialog it replaces is the wrong
+    // way round. The saved layout wins after the first run - close it and it
+    // stays closed, because layout.ini remembers.
+    bool showRemote = true;           // the server browser, its own panel
     // Browse listing view: false = the collapsed group rows the peer sends,
     // true = every frame of every sequence as its own row. Expansion is a pure
     // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
@@ -32825,6 +32829,38 @@ int main(int argc, char** argv) {
             g_lastInputAt = 0;
         }
     };
+
+    // Browse is open when the app comes up, standing where it stood last time
+    // (2026-08-03, user). Until now the ONLY way to get a Browse panel was
+    // File > Browse Folder (Local)..., which opens the OS folder dialog first -
+    // so reaching the tool that replaces the OS dialog required going through
+    // it. The place comes from rbRecents, which prefs.txt already carries: the
+    // session's rbplace cannot serve here, because the autosave is offered by
+    // a menu item and never restored on its own at startup.
+    //
+    // Not for scripted runs: --bench and the keys selftests drive their own
+    // panels, and starting a local peer under them would change what they
+    // measure. A CLI path was an explicit request to look at THAT, so the
+    // panel stays where it is rather than jumping somewhere else.
+    if (!benchFrames && g_browseKeys.empty() && !g_secondary && app.showRemote) {
+        App::BrowseInstance& I = rbMain();
+        if (!I.b.connected && I.b.host.empty() && I.b.dir == "~") {
+            std::string place = app.rbRecents.empty() ? std::string() : app.rbRecents.front();
+            if (place.empty()) {
+#if defined(_WIN32)
+                const char* h = getenv("USERPROFILE");
+#else
+                const char* h = getenv("HOME");
+#endif
+                if (h && *h) {
+                    std::string hp = h;
+                    std::replace(hp.begin(), hp.end(), '\\', '/');
+                    place = "local://" + hp;
+                }
+            }
+            if (!place.empty()) goToPlace(I, place);
+        }
+    }
 
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = glfwGetTime();
