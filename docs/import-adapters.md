@@ -170,7 +170,7 @@ from viewer_import import Frame, Stack, Series, Batch
 
 return Frame(img)                       # 1枚
 return Stack(arr)                       # 複数フレーム、同一条件
-return Series(stacks, sweep=...)        # 条件を振ったもの
+return Series(stacks, conditions=...)   # 条件を振ったもの
 return Batch([dark, flat])              # 一緒に開くもの
 ```
 
@@ -191,21 +191,21 @@ def load(path):
 | 層 | 位置引数 | 追加のフィールド |
 |---|---|---|
 | `Frame` | 画素 | `cfa` `name` `note` `meta` `range` |
-| `Stack` | 画素 | `axis` `cfa` `name` `note` `meta` `range` |
-| `Series` | `Stack` の列 (または画素) | **`sweep` (必須)** `name` `note` `meta` |
+| `Stack` | 画素 | `timestamps` `cfa` `name` `note` `meta` `range` |
+| `Series` | `Stack` の列 (または画素) | **`conditions` (必須)** `name` `note` `meta` `range` |
 | `Batch` | 上記の列 | `name` |
 
 | フィールド | 型 | 意味 |
 |---|---|---|
-| `axis` | `Axis` | 繰り返しの**並び順の座標** (時刻・番号)。条件は同じまま |
-| `sweep` | dict | stack 間で**変わった条件** (露光・照度)。series の存在理由 |
+| `timestamps` | `Values` | 各フレームを**いつ撮ったか**。条件は同じまま。§4.3.3 |
+| `conditions` | `Values` | stack 間で**変えた条件** (露光・照度)。series の存在理由。§4.3.3 |
 | `cfa` | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
 | `name` | str | 表示名。省略時はファイル名 |
 | `note` | str | **素性の一文**。画面に出る散文。§4.3.1 |
 | `meta` | dict | **撮影条件の事実**。key-value。provenance に載る。§4.3.1 |
-| `range` | (lo,hi) または配列 | 表示レンジ。**その層の形に合わせられる**。§4.3.2 |
+| `range` | (lo,hi) または配列 | 表示レンジ。**その層の形に合わせられる**。§4.3.3 |
 
-`Axis` / `Sweep` はどちらも `(values, name, unit)` の3つ組。
+どちらも値の型は `Values` 1つ (§4.3.2)。
 **値は全桁保持。単位は推測しない** — 書かれていなければ空欄のまま。
 
 綴りを間違えたフィールドは**その場で TypeError になる** — 型を名乗る利点そのもの
@@ -237,7 +237,42 @@ meta ではない。meta は後で機械が読む (provenance・将来の series
 単位を埋めない** — キー名は誰かが選んだ名前であって単位の証明ではない
 (単位を key 名から推測しないのと同じ理由)。
 
-#### 4.3.2 `range` は、それが属する層の形に合わせられる
+#### 4.3.2 `timestamps` と `conditions` — 値の型は1つ
+
+```python
+from viewer_import import Stack, Series, Values
+
+Stack(arr,  timestamps=Values(t, unit="s"))                    # 名前は "time" が既定
+Series(sts, conditions=Values(exposures, "exposure", "ms"))    # 名前は必須
+```
+
+| フィールド | 付く層 | 長さ | `name` | `unit` |
+|---|---|---|---|---|
+| `timestamps` | `Stack` | **フレーム数** | **省略可** (既定 `"time"`)。`"elapsed"` 等で上書き可 | **必須** |
+| `conditions` | `Series` | **stack 数** | **必須** — 何を振ったかは viewer には分からない | **必須** |
+| `covariates` (将来) | `Stack` | フレーム数 | **キーが名前** | **必須** |
+
+- **型は `Values(values, name="", unit="")` の1つだけ。** 専用型 (`Times` / `Sweep`) は
+  作らない — `covariates` を足すときも同じ型で足りる
+- **`name` の冗長は、フィールド側が既定を持つことで消す。** `timestamps` に
+  `"time"` と書き足す必要はない (書きたければ書ける)
+- **`unit` は常に必須。** 時刻ですら `"s"` か `"ms"` かは推測しない。
+  空なら**その軸は適用されない** — 貼り付けの規則と同じで、ファイル由来だからと
+  緩めない
+- **複数形は「メンバ1つにつき1つ」を語形が言う。** 長さの規則が名前から読める
+
+将来 `covariates` を足すときの形 (v1 では受けない、名前だけ予約):
+
+```python
+Stack(arr, timestamps=Values(t, unit="s"),
+           covariates={"temperature": Values(temp, unit="C")})
+```
+
+**なぜ `timestamps` を汎用化しないか**: 温度ドリフトを時刻欄に入れさせると、
+「いつ」と「何が観測されたか」が同じ場所に混ざる。狭く始めて、必要になったら
+別のフィールドで足すほうが、後から意味を分離するより安い。
+
+#### 4.3.3 `range` は、それが属する層の形に合わせられる
 
 ユーザー提案 (2026-08-03):「stack でフレーム毎に変えたい場合、series で
 series 毎に変えたい場合は、画像側の shape と合わせて作ったらどうだろう?」
@@ -249,7 +284,7 @@ series 毎に変えたい場合は、画像側の shape と合わせて作った
 | `Series` に `range=arr` | `(S,2)` | **stack ごと** |
 | `Series` に `range=arr` | `(S,R,2)` | stack ごと × フレームごと |
 
-長さが合わなければ**拒否** (`sweep` と同じ規則)。
+長さが合わなければ**拒否** (`conditions` と同じ規則)。
 
 **ただし警告を1つ**: フレームごとに違うレンジを与えると、**並べても目で比較
 できなくなる**。同じ明るさに見える2枚が、実は違う伸ばし方をされている。
@@ -271,7 +306,7 @@ range は「values are NOT DN, view only」と明記している)、それと同
 | `Frame` | `(H,W,C)` | C ch。**C の値は問わない** (frame に frame 軸は無いので曖昧さが無い) |
 | `Stack` | `(F,H,W)` | F 枚・1ch。`(3,H,W)` は3枚 |
 | `Stack` | `(F,H,W,C)` | F 枚 × C ch |
-| `Series` | `Stack` の列 | そのまま。`sweep` の長さ == 列の長さ |
+| `Series` | `Stack` の列 | そのまま。`conditions` の長さ == 列の長さ |
 | `Series` | `(S,H,W[,C])` | S 条件 × 各1枚 |
 | `Series` | `(S,R,H,W[,C])` | S 条件 × R 繰り返し |
 | どれでも | 合わない shape | **拒否**。層と shape を両方名指しして言う |
@@ -282,16 +317,16 @@ range は「values are NOT DN, view only」と明記している)、それと同
 `layout` は残すが**転置された並びのためだけ**の逃げ道 (`"CHW"` `"FCHW"`)。
 普段は書かない。
 
-### 4.5 `axis` と `sweep` の違い — 「経っただけ」か「設定を変えた」か
+### 4.5 `timestamps` と `conditions` の違い — 「経っただけ」か「設定を変えた」か
 
 一文で言うと:
 
-> **オペレータが設定を変えたなら `sweep`。ただ時間が経った・順番が進んだだけなら `axis`。**
+> **オペレータが設定を変えたなら `conditions`。ただ時間が経っただけなら `timestamps`。**
 
-| | `axis` (Stack につく) | `sweep` (Series につく) |
+| | `timestamps` (Stack につく) | `conditions` (Series につく) |
 |---|---|---|
-| 何を表すか | 繰り返しの**並び順の座標** | stack 間で**変えた条件** |
-| 例 | 時刻 [s]、フレーム番号、経過時間 | 露光 [ms]、照度 [lx]、ゲイン [dB] |
+| 何を表すか | 各フレームを**いつ撮ったか** | stack 間で**変えた条件** |
+| 例 | 時刻 [s]、開始からの経過 [s] | 露光 [ms]、照度 [lx]、ゲイン [dB] |
 | 撮影条件は | **同じ** | **各点で違う** |
 | σ_t | **意味を持つ** (繰り返しなので) | **条件をまたぐ計算は拒否** |
 | 何が描けるか | ドリフト (時間に対する平均値の変化) | リニアリティ・PTC |
@@ -300,16 +335,16 @@ range は「values are NOT DN, view only」と明記している)、それと同
 **なぜ分けるか**: 露光を振った8枚を「1つの stack」として渡されると、
 viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノイズ」として報告する**。
 数字は出るが意味は無い — 測定器として最悪の失敗。
-`Stack` と `Series` という型がその2つを分け、`axis` / `sweep` はそれぞれの
+`Stack` と `Series` という型がその2つを分け、`timestamps` / `conditions` はそれぞれの
 層に属するので、**構造的に取り違えられない**。
 
 判断に迷う例:
 
-- **温度が勝手に上がった連続撮影** → `axis` (時刻)。設定は変えていない。
-  温度は観測された共変量であって、振った条件ではない
-- **温度を段階的に設定した測定** → `sweep`。各点が別の条件
-- **撮影時刻を記録した露光掃引** → `Series` + `sweep`(露光)。時刻も残したければ
-  各 `Stack` の `axis` に入れる (両方持てる)
+- **温度が勝手に上がった連続撮影** → `timestamps` (時刻)。設定は変えていない。
+  温度そのものは観測された共変量で、v1 では受けない (将来 `covariates`)
+- **温度を段階的に設定した測定** → `conditions`。各点が別の条件
+- **撮影時刻を記録した露光掃引** → `Series` + `conditions`(露光)。時刻も残したければ
+  各 `Stack` の `timestamps` に入れる (両方持てる)
 
 ### 4.6 層の宣言が、そのまま σ_t の可否になる
 
@@ -325,12 +360,12 @@ viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノ�
 | 書くもの | できる測定 |
 |---|---|
 | `Stack(arr)` | σ_t、σ_s、欠陥画素 |
-| `Stack(arr, axis=...)` | 上 + 並び順に対するドリフトの図 (条件は同じまま) |
-| `Series(..., sweep=...)` | リニアリティ・PTC。**条件をまたぐ σ_t は拒否** |
+| `Stack(arr, timestamps=...)` | 上 + 時間に対するドリフトの図 (条件は同じまま) |
+| `Series(..., conditions=...)` | リニアリティ・PTC。**条件をまたぐ σ_t は拒否** |
 
 - `Series` の各 `Stack` が繰り返しを持てる (EMVA 的な撮り方はこれ)
 - series メンバシップは正典どおり明示的に作られ、**後から自動で継がれない**
-- `sweep` の長さが合わなければ**拒否** (黙って辻褄を合わせない)
+- `conditions` の長さが合わなければ**拒否** (黙って辻褄を合わせない)
 
 素の配列を返したときは `Stack` (繰り返し) として扱われる。それが違えば σ_t は
 嘘になるので、note に `repeats (returned as a bare array)` を残す —
@@ -343,13 +378,13 @@ viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノ�
 return Stack(arr)                                  # (24, H, W)
 
 # 2. 露光 8 通り x 各 16 枚
-return Series(arr, sweep=Sweep(exposures, "exposure", "ms"))   # (8, 16, H, W)
+return Series(arr, conditions=Values(exposures, "exposure", "ms"))   # (8, 16, H, W)
 
 # 3. 露光 8 通り x 各 1 枚
-return Series(arr, sweep=Sweep(exposures, "exposure", "ms"))   # (8, H, W)
+return Series(arr, conditions=Values(exposures, "exposure", "ms"))   # (8, H, W)
 
 # 4. 同一条件の 24 枚 + 撮影時刻 (σ_t は有効なまま)
-return Stack(arr, axis=Axis(t, "time", "s"))       # (24, H, W)
+return Stack(arr, timestamps=Values(t, unit="s"))  # (24, H, W)
 
 # 5. カラー1枚
 return Frame(img)                                  # (H, W, 3)
@@ -387,16 +422,16 @@ raise ValueError("header says 12 planes but the file holds 9")
 なので、書きながら語彙が身につく。そして**構築した行で落ちる**:
 
 ```python
-from viewer_import import Stack, Series, Frame, Batch, Axis, Sweep
+from viewer_import import Stack, Series, Frame, Batch, Values
 
 def load(path):
     z = np.load(path)
     return Series([Stack(z["data"][i], name=f"{e:g}ms") for i, e in enumerate(z["exp"])],
-                  sweep=Sweep(z["exp"], "exposure", "ms"))
+                  conditions=Values(z["exp"], "exposure", "ms"))
 ```
 
 構築時に検査するもの: 名乗った層に対して shape が合っているか (§4.4) /
-`Series` の `sweep` 長 == stack 数 / `Axis` 長 == frame 数 / `range` の形 (§4.3.2) /
+`conditions` 長 == stack 数 / `timestamps` 長 == frame 数 / `range` の形 (§4.3.3) /
 `cfa` が既知のパターンか / 非数値 dtype の拒否。
 
 **これが型の最大の利得**: 間違いが *harness が走ったあと* ではなく
@@ -404,8 +439,8 @@ def load(path):
 
 ```
 File "adapters/acme.py", line 12, in load
-    sweep=Sweep(z["exp"], "exposure", "ms"))
-ValueError: Series: sweep has 8 value(s) but there are 16 stack(s)
+    conditions=Values(z["exp"], "exposure", "ms"))
+ValueError: Series: conditions has 8 value(s) but there are 16 stack(s)
 ```
 
 `viewer_import.py` の約束:
@@ -421,10 +456,11 @@ ValueError: Series: sweep has 8 value(s) but there are 16 stack(s)
 
 - torch → numpy (`.detach().cpu().numpy()` 相当、duck typing)
 - 非連続配列の連続化、endianness の正規化
-- 返り値の検査 (形・dtype・`sweep`/`axis` の長さの整合)
+- 返り値の検査 (形・dtype・`conditions`/`timestamps` の長さの整合)
 - **.npz への書き出し**。予約メンバ:
-  `__pixels_<i>` / `__sweep_values_<i>` / `__sweep_name_<i>` / `__sweep_unit_<i>` /
-  `__axis_values_<i>` / `__axis_name_<i>` / `__axis_unit_<i>` /
+  `__pixels_<i>` / `__conditions_values_<i>` / `__conditions_name_<i>` /
+  `__conditions_unit_<i>` / `__timestamps_values_<i>` / `__timestamps_name_<i>` /
+  `__timestamps_unit_<i>` /
   `__cfa_<i>` / `__name_<i>` / `__note_<i>` / `__layout_<i>` / `__meta_<k>`
 - 1行の要約を stderr に出す (viewer がそのまま中継する)
 
@@ -522,8 +558,10 @@ adapter を編集したら次に開いたときに効く。
 3. ~~HWC の猶予~~ **決定**: 猶予ではなく**恒久的に native**。deprecated にしない
 4. ~~`--npy-axis` を廃止してよいか~~ **決定**: 廃止。後継は §3.3 の
    Inspector での言い直し (ファイルごと・可視・セッションに残る)
-5. ~~層の宣言は axis / sweep の2語でよいか~~ **決定**: 型が層を名乗るので
-   `Stack` に `axis`、`Series` に `sweep` が付く形に落ちた。
+5. ~~層の宣言の語~~ **決定 (2026-08-03)**: `Stack` に **`timestamps`**、
+   `Series` に **`conditions`** (複数形 = メンバ1つにつき1つ = 長さの規則)。
+   値の型は **`Values(values, name, unit)` の1つ**で、`timestamps` の名前は
+   `"time"` が既定。共変量は v1 では受けず、将来 `covariates` を別に足す。
    `layout` は転置 (`CHW` / `FCHW`) 専用の逃げ道に降格
 6. ~~bfloat16~~ **決定**: f32 に変換し、変換したことを note に残す
 7. ~~記憶する規則~~ **決定 (暫定)**: v1 は**1ファイルごとのキャッシュ**だけ。
