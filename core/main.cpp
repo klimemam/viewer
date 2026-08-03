@@ -3382,6 +3382,12 @@ static void closeAll() {
     app.previewFiles.clear();
     app.previewFrames = 0;
     app.previewLabel.clear();
+    // ...and the three this used to leave standing. dropPreview() clears all
+    // seven; Close All cleared four, so the machine and port of a preview that
+    // no longer exists survived a Close All and were handed to the next step.
+    app.previewIndex = 0;
+    app.previewHost.clear();
+    app.previewPort = 0;
     app.current = -1;
     // compare state refers to docs that no longer exist; leaving it would let a
     // later file with the same name silently become B again
@@ -10553,7 +10559,15 @@ static void stepPreviewFrame(int delta) {
         for (const auto& d : app.images)
             if (d->uid == app.previewUid && d->preview) {
                 std::string url = d->src->remoteUrl;   // openRemote frees the doc
-                openRemote(url, true, want);
+                // Same guard the file-stack branch above carries. openRemote
+                // calls dropPreview() before it can fail, so a discarded return
+                // leaves previewIndex and previewFrames describing a preview
+                // that is no longer there - and the scrub bar keeps re-running
+                // the failing open, one toast per press.
+                if (!openRemote(url, true, want)) {
+                    app.previewIndex = 0;
+                    app.previewFrames = 0;
+                }
                 return;
             }
     }
@@ -12232,8 +12246,17 @@ static void drawCanvas(ImVec2 avail) {
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
-            char cnt[32];
-            snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
+            // n/N, not n/n. fr.size() is what is RESIDENT; a stack still
+            // loading has fewer frames here than it will have, and printing the
+            // resident count as the total states a stack size that is not true
+            // (docs/terminology.md - a partial load says n/N). The Files rows
+            // already say "8/24f"; this said "3/8" and looked complete.
+            char cnt[48];
+            int expF = si->expectedFrames;
+            if (expF > (int)fr.size())
+                snprintf(cnt, sizeof cnt, "%d/%d of %d", pos + 1, (int)fr.size(), expF);
+            else
+                snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
             ImVec2 cs = ImGui::CalcTextSize(cnt);
             dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
             float barH = 5.0f * s;
@@ -12254,7 +12277,19 @@ static void drawCanvas(ImVec2 avail) {
                     int want = (int)(t * (float)(fr.size() - 1) + 0.5f);
                     if (want != pos) selectImage(fr[want]);
                 }
-                if (sh) ImGui::SetTooltip("frame %d / %d  (drag; . and , step)", pos + 1, (int)fr.size());
+                // The keys named here are the ones that work HERE. It used to
+                // say ". and ," - those step the Browse panel's preview, and
+                // have never done anything in this view. Left/Right is what
+                // gotoFrame is bound to.
+                if (sh) {
+                    if (si->expectedFrames > (int)fr.size())
+                        ImGui::SetTooltip("frame %d of the %d loaded (%d expected)\n"
+                                          "drag, or Left / Right",
+                                          pos + 1, (int)fr.size(), si->expectedFrames);
+                    else
+                        ImGui::SetTooltip("frame %d / %d  (drag, or Left / Right)",
+                                          pos + 1, (int)fr.size());
+                }
             }
         }
     }
@@ -20993,9 +21028,12 @@ static std::string conditionText(const App::Series& S, double v) {
 
 static void drawFileList() {
     g_filesBadgeProbe.clear();
-    if (ImGui::Button("Open (O)")) openFileDialog();
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) closeCurrent();
+    // No Open / Close buttons here (2026-08-03). Browse is how a file is found
+    // and opened, and it reaches remote machines as well, which the OS dialog
+    // never did. Close was the worse of the two: it silently escalated from the
+    // frame to the whole stack, and it was the ONLY Close that did not name the
+    // layer it closes -- the row menus say Close batch / Close stack / Close
+    // series, and the File menu says Close Frame / Close Batch / Close All.
     if (app.seqRunning || !app.seqQueue.empty()) {
         int done = app.seqDone, total = app.seqTotal;
         if (app.seqRunning) ImGui::TextDisabled("loading %d/%d", done, total);
@@ -21814,7 +21852,7 @@ static void drawTitleBarExtras() {
 static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
+        if (ImGui::MenuItem("Open...")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
         // §4.13: a reader must be reachable for a FOLDER as well as a file -
         // "one condition per folder" is a common way to store a sweep, so the
@@ -22379,7 +22417,7 @@ static void drawHelpAbout() {
                 row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
                 row("Ctrl+N / Ctrl+P", "next / previous stack");
                 row("Ctrl+A / Ctrl+E", "first / last frame");
-                row(SC_MOD "+O / O", "open files");
+                row(SC_MOD "+Shift+O", "open a folder (files: use Browse)");
                 row(SC_MOD "+S",     "save session (view state + images)");
                 row(SC_MOD "+W",     "close current image");
                 row("F / double-click", "fit to window");
@@ -32205,8 +32243,12 @@ int main(int argc, char** argv) {
         bool remoteFocused = nav && nav->RootWindow &&
                              rbIsBrowseWindowName(nav->RootWindow->Name);
         if (!io.WantTextInput && !popupOpen) {
+            // Cmd/Ctrl+O is NOT bound (2026-08-03). On macOS that chord means
+            // "open what is selected", which is Enter or a double-click in
+            // Browse - not "show me a file dialog". Binding it to the dialog
+            // taught the wrong thing on the platform where it already means
+            // something. Open Folder keeps its chord: nothing else claims it.
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
-            else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             // the layer variants (docs/terminology.md): frame-only escape hatch
             // and whole-batch close
@@ -32260,7 +32302,7 @@ int main(int argc, char** argv) {
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) fr = std::clamp(fr - 0.01f, 0.03f, 0.97f);
                 if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) fr = std::clamp(fr + 0.01f, 0.03f, 0.97f);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
+            // bare O is not bound either - same reasoning as the chord above
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
             // M = measure again: rerun the selected analyzer on the current
             // image and ROI set, and bring the Analysis panel forward. This is

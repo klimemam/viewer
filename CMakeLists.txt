@@ -176,7 +176,12 @@ else()
 endif()
 if(MINGW)   # self-contained exes: no libstdc++/libgcc/libwinpthread DLLs alongside
   foreach(tgt viewer viewer-serve)
+    # --no-insert-timestamp: mingw stamps the PE header with the link time, so
+    # building the same tree twice produced two different binaries. The export
+    # provenance line names the commit this build came from; without this, that
+    # commit does not name one binary, which is the whole point of writing it.
     target_link_options(${tgt} PRIVATE -static-libgcc -static-libstdc++
+                                       -Wl,--no-insert-timestamp
                                        -Wl,-Bstatic,--whole-archive -lwinpthread
                                        -Wl,--no-whole-archive)
   endforeach()

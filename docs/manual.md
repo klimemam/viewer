@@ -533,7 +533,7 @@ viewer [options] [files...]
 
 | キー | 動作 |
 |---|---|
-| `Ctrl/Cmd+O`(`O` 単体でも)/ `Ctrl/Cmd+S` | 開く / セッション保存 |
+| `Ctrl/Cmd+Shift+O` / `Ctrl/Cmd+S` | フォルダを開く / セッション保存 |
 | `Ctrl/Cmd+W` / `Ctrl/Cmd+Alt+W` / `Ctrl/Cmd+Shift+W` | **stack を閉じる**(単発 frame ならその1枚)/ **frame を1枚だけ**閉じる / **batch を閉じる** |
 | `P` | カーソル位置にピン(POI)を打つ |
 | `\`(または `C`)/ `Shift+\`(`Shift+C`) | A/B 比較 オフ→ワイプ→並べて→差分→ブリンク / A と B を入れ替え |
