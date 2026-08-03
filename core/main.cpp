@@ -6308,7 +6308,20 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         return msg;
     }
     std::string lerr = loadNpz(out, "", 0, spec, src);
-    if (!lerr.empty()) return lerr;
+    if (!lerr.empty()) {
+        // The one failure that used to leave the panel EMPTY. The reader ran and
+        // exited 0, so it is not the reader's traceback that is wrong - what it
+        // returned is something this viewer cannot read. Every other failure
+        // above fills readerLastOut; this one returned without doing it, so the
+        // panel said "refused it" over a blank box and Copy copied nothing.
+        // That is also the path a first reader most often takes.
+        app.readerLastOut = "the reader ran and returned, but the viewer could not read "
+                            "what it produced:\n\n" + lerr +
+                            "\n\nthe reader itself did not fail - check what load() returns "
+                            "(the layer type, the shape, the dtype).\n" +
+                            adapter::showCommand(argv);
+        return lerr;
+    }
     rememberReader(src, spec);
     app.readerLastOk = true;
     // §4.11: the harness writes one line to stderr counting what it read and
@@ -9010,7 +9023,15 @@ static void drawReaderPanel() {
             ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s refused it",
                                app.readerLastSpec.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Copy")) ImGui::SetClipboardText(app.readerLastOut.c_str());
+        // Say it copied. Without this a Copy that worked and a Copy that had
+        // nothing to copy look identical, and the user reports the button as
+        // broken - which is how the empty-panel defect above was found.
+        ImGui::BeginDisabled(app.readerLastOut.empty());
+        if (ImGui::SmallButton("Copy")) {
+            ImGui::SetClipboardText(app.readerLastOut.c_str());
+            toast("copied");
+        }
+        ImGui::EndDisabled();
         ImGui::BeginChild("##readerout", ImVec2(0, 0), true,
                           ImGuiWindowFlags_HorizontalScrollbar);
         // Unwrapped and monospaced-ish: a traceback's indentation is how you

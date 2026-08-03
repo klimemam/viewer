@@ -113,9 +113,47 @@ def to_numpy(where, what, obj, notes):
         raise AdapterError("%s: dtype %s is not numeric -- %s must be integer or "
                            "float (strings, objects and complex are refused)"
                            % (where, arr.dtype.name, what))
+    arr = to_viewer_dtype(where, what, arr, notes)
     if not arr.dtype.isnative:
         arr = arr.astype(arr.dtype.newbyteorder("="))
     return np.ascontiguousarray(arr)
+
+
+# The nine the viewer decodes.  numpy's DEFAULT integer is int64, so the very
+# first thing a new reader writes -- np.array([[1, 2], [3, 4]]) -- is not one of
+# them.  Until this check existed the container was written successfully and the
+# viewer refused it at the far end, where the author cannot see the dtype and
+# cannot act on it.  Convert here, where the reader is, or refuse here.
+VIEWER_DTYPES = ("uint8", "int8", "bool", "uint16", "int16",
+                 "uint32", "int32", "float32", "float64")
+
+
+def to_viewer_dtype(where, what, arr, notes):
+    if arr.dtype.name in VIEWER_DTYPES:
+        return arr
+    if arr.dtype.kind == "f":
+        if arr.dtype.itemsize < 4:                  # float16 -> float32 is exact
+            notes.append("%s -> float32" % arr.dtype.name)
+            return arr.astype("float32")
+        raise AdapterError(
+            "%s: %s is %s, and the viewer reads float32 and float64. Narrowing a "
+            "wider float here would change the numbers, so say which you want: "
+            ".astype(np.float64)" % (where, what, arr.dtype.name))
+    # Integer.  One step down to the widest type of the same signedness -- NOT
+    # the smallest that fits, because the smallest changes the apparent depth of
+    # the data.  If the values do not fit, that is the author's decision to make,
+    # not ours to make silently.
+    target = "uint32" if arr.dtype.kind == "u" else "int32"
+    info = np.iinfo(target)
+    lo = int(arr.min()) if arr.size else 0
+    hi = int(arr.max()) if arr.size else 0
+    if lo < info.min or hi > info.max:
+        raise AdapterError(
+            "%s: %s is %s holding %d..%d, which does not fit %s -- the viewer reads "
+            "u1 i1 u2 i2 u4 i4 f4 f8. Scale or offset the values, or return them as "
+            "float64." % (where, what, arr.dtype.name, lo, hi, target))
+    notes.append("%s -> %s (values %d..%d fit)" % (arr.dtype.name, target, lo, hi))
+    return arr.astype(target)
 
 
 # ------------------------------------------------------------------ node tree
