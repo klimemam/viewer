@@ -474,7 +474,7 @@ x 軸ラベルにも、丸めた実効レンジと bin 幅 (DN/bin) を出すこ
 **0 行**。ホスト・ポート・現在のディレクトリはどこにも保存されていない。
 
 保存されているのは **prefs のほう** (`savePrefs`, ~3731):
-`rbflat` / `rbadv` / `rbtree` (表示の形)、`remoteexe`、
+`rbflat` / `rbtree` (表示の形)、`remoteexe`、
 `remoteurl` (= `app.lastRemoteUrl`、ただし **Start Remote ダイアログの
 入力欄の初期値としてしか使われていない** — ~14522)、`rbookmark` / `rbrecent`。
 

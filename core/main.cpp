@@ -311,10 +311,27 @@ struct ViewState {
 // (Defined up here because every Browse INSTANCE carries one - see
 // App::BrowseInstance below.)
 struct RbToolbarGeom {
-    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
+    // menuR was moreR until the drawer went away: the row's LAST permanent item
+    // is the "..." panel menu now, and the contract it stands for is unchanged -
+    // whatever ends the toolbar row must still be inside the panel at any width.
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, menuR = 0;
     float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
     int   emptyLocalBtn = 0;               // the not-connected state's local entry
     float rowX = 0, rowY = 0;              // centre of the first row submitted
+    // ---- the bottom status line, and the star that ends the path line -------
+    // The line is built as one string and then elided to fit, so the selftest
+    // reads the LITERAL text the user sees rather than re-deriving it.
+    std::string statusText;                // after elision: what is on screen
+    std::string statusFull;                // before elision: the whole sentence
+    int   statusShown = 0, statusTotal = 0, statusSel = 0;
+    // what the drawn line MEASURES against the room it had. The line elides
+    // middle-out and must never wrap into a second row, so textW <= availW is
+    // the whole contract, checked at every width the geometry sweep uses.
+    float statusTextW = 0, statusAvailW = 0;
+    float listTopY = 0;                    // where the listing starts: a band
+                                           // above it would push this down
+    ImVec2 starCentre = ImVec2(-1, -1);    // the path line's bookmark star
+    int   starLit = 0;                     // 1 = this place is bookmarked
 };
 
 // One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
@@ -800,9 +817,10 @@ struct App {
         std::string histKey;          // host:port the history belongs to
         bool histNav = false;         // set while back/forward itself navigates
         // ---- the shape of the listing. Per instance; app.rbFlat / rbTree /
-        // rbAdvanced remain the persisted DEFAULTS a new instance starts from,
-        // and a toggle writes through to them (last toggle wins next start).
-        bool flat = false, tree = false, advanced = false;
+        // remain the persisted DEFAULTS a new instance starts from, and a
+        // toggle writes through to them (last toggle wins next start).
+        // (`advanced` - was the "more" drawer open - went with the drawer.)
+        bool flat = false, tree = false;
         // ---- panel state, formerly function-local statics of drawPanelRemote.
         // keyboard cursor (row index into the built view, -1 = none)
         int cursor = -1;
@@ -821,6 +839,7 @@ struct App {
         char filter[256] = "";
         char searchBuf[256] = "";
         bool searchFocus = false;
+        bool searchOpen = false;      // ask for the server-search popup next frame
         char pathEdit[1024] = "";
         bool pathEditing = false, pathFocus = false;
         // Properties popup: a snapshot, because the row may scroll out of the
@@ -948,10 +967,9 @@ struct App {
     // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
     // so the toggle costs no round trip. Persisted: it is a way of working.
     bool rbFlat = false;
-    // Browse header: false = just the path bar and the toolbar (the common
-    // case), true = also the connection row and the server-side search. Also
-    // persisted - "I always search" and "I never do" are both ways of working.
-    bool rbAdvanced = false;
+    // (rbAdvanced - whether the Browse header's "more" drawer started open -
+    // is gone with the drawer. Its contents each moved to the place they are
+    // about: docs/browse-topbar-design.md 10.3.)
     // Tree mode: a directory expands IN PLACE instead of replacing the listing,
     // so a folder of folders can be compared without losing your place. LAZY -
     // expanding a node costs exactly one LIST, issued on the browse worker and
@@ -1341,16 +1359,36 @@ static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
 
 // ---- Browse instances (docs/todo-open.md item 17: instance-able views) -----
+// What a Browse panel is CALLED. The host is the most important fact about a
+// panel and it used to live inside the "more" drawer, which meant that with two
+// panels open the two were pixel-identical until you unfolded one
+// (docs/browse-topbar-design.md 10.3). It belongs in the title: a title is read
+// once, changes rarely, and costs no row.
+//
+//   Browse                    - this machine (local:// is LOCAL, not a remote:
+//                               the panel never says "ssh" about a pipe)
+//   Browse [ssh: trc2]        - a machine reached over ssh
+//   Browse 2 [ssh: trc2]      - ...and which panel it is
+//
+// The ### id is NOT touched by any of this: layouts, the dock builder and the
+// session file key off "###Remote" / "###BrowseN", so a panel that renames
+// itself on connect still docks where the user left it.
+static std::string rbPanelTitle(int num, const std::string& host) {
+    std::string t = "Browse";
+    if (num > 1) t += " " + std::to_string(num);
+    if (!host.empty()) t += " [ssh: " + host + "]";   // cf. ICON_SSH on the status line
+    t += num > 1 ? "###Browse" + std::to_string(num) : std::string("###Remote");
+    return t;
+}
 // The primordial instance. Lazy so it exists whenever anything asks - the
 // selftests, the menus and the first frame all funnel through here.
 static App::BrowseInstance& rbMain() {
     if (app.browsePanels.empty()) {
         auto p = std::make_unique<App::BrowseInstance>();
         p->num = 1;
-        p->wtitle = "Browse###Remote";      // the singleton's id: layouts survive
+        p->wtitle = rbPanelTitle(1, "");    // the singleton's id: layouts survive
         p->flat = app.rbFlat;
         p->tree = app.rbTree;
-        p->advanced = app.rbAdvanced;
         app.browsePanels.push_back(std::move(p));
     }
     return *app.browsePanels[0];
@@ -1375,10 +1413,9 @@ static App::BrowseInstance& rbNewInstance(int wantNum = 0) {
     while (rbFindNum(num)) num++;
     auto p = std::make_unique<App::BrowseInstance>();
     p->num = num;
-    p->wtitle = "Browse " + std::to_string(num) + "###Browse" + std::to_string(num);
+    p->wtitle = rbPanelTitle(num, "");
     p->flat = app.rbFlat;                   // a new view starts from the prefs
     p->tree = app.rbTree;
-    p->advanced = app.rbAdvanced;
     p->open = true;
     p->focusReq = true;
     app.browsePanels.push_back(std::move(p));
@@ -5320,7 +5357,8 @@ static void savePrefs() {
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "frame " << app.frameMode << "\n";
     f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
-    f << "rbadv " << (app.rbAdvanced ? 1 : 0) << "\n";
+    // ("rbadv" - the Browse drawer's open/closed state - is no longer written.
+    //  A prefs file that still carries one is read and ignored, below.)
     f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
@@ -5361,7 +5399,7 @@ static void loadPrefs() {
         else if (key == "frame")       { ls >> app.frameMode;
                                          app.frameMode = std::clamp(app.frameMode, 0, 1); }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
-        else if (key == "rbadv")       { ls >> v; app.rbAdvanced = v != 0; }
+        else if (key == "rbadv")       { ls >> v; }   // the drawer is gone: read, drop
         else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent") {
@@ -17229,6 +17267,14 @@ static void drawRemotePlacesCombo(App::BrowseInstance& I) {
 
 // (RbToolbarGeom is defined next to ViewState now - each instance carries one.)
 static float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
+// "marklist" / "starmark": the baselines the drawer-removal checks compare
+// against. The list's top y proves an error does not open a band above the rows
+// (it changes the status line and nothing else), and the star's baseline makes
+// the bookmark check a FLIP rather than an absolute - a scripted run inherits
+// the user's real bookmark list and must not care what is already in it.
+static float g_rbListTopY0 = 0;
+static int   g_rbStar0 = -1;
+static int   g_rbPeerV0 = -1;     // "setpv" saves the real one; "pvback" restores
 // --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
 // frame, after the GLFW backend has had its say: the backend overwrites the
 // mouse position from the OS cursor whenever the window counts as focused, and
@@ -17253,6 +17299,61 @@ static void rbPlusButton() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("new Browse panel - another view onto another place\n"
                           "(View > New Browse Panel)");
+}
+
+// The protocol-mismatch sentence, in BOTH directions, for the bottom status
+// line. It used to be a conditional orange row above the listing; the fact is
+// worth keeping and the row was not (a warning that shoves every file down one
+// line the moment an old peer answers). Empty = the versions agree, and
+// agreement is silent.
+static std::string rbProtocolNote(int pv) {
+    char t[192];
+    if (pv > 0 && pv < 3)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "shape and date need an update (File > Update remote peer)",
+                 pv, (int)rp::VERSION);
+    else if (pv > 0 && pv < (int)rp::VERSION)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "File > Update remote peer", pv, (int)rp::VERSION);
+    else if (pv > (int)rp::VERSION)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "listings may group differently from a local open; "
+                              "update the viewer", pv, (int)rp::VERSION);
+    else return std::string();
+    return t;
+}
+
+// Middle-out elision to a PIXEL width, for the status line. Middle-out and not
+// front or back because both ends of that line carry a fact: the machine is at
+// the head and the counts are at the tail, and dropping either answers a
+// question the reader did not ask. Binary search on how many bytes survive -
+// width is monotone in that - so a long failure message costs a dozen
+// CalcTextSize calls, not one per character.
+static std::string rbElideMiddle(const std::string& s, float maxW) {
+    if (s.empty()) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    // Not even the marker fits: print NOTHING. Returning "..." here would draw
+    // wider than the room it was given, which is the one thing this function
+    // exists to prevent - and three dots that overflow say less than nothing.
+    if (ImGui::CalcTextSize("...").x > maxW) return std::string();
+    auto onBoundary = [&s](size_t i) {         // never cut a UTF-8 sequence
+        return i == 0 || i >= s.size() || (s[i] & 0xC0) != 0x80;
+    };
+    auto build = [&](size_t keep) {
+        size_t head = (keep + 1) / 2;
+        while (head > 0 && !onBoundary(head)) head--;
+        size_t tstart = s.size() - (keep - (keep + 1) / 2);
+        while (tstart < s.size() && !onBoundary(tstart)) tstart++;
+        if (tstart < head) tstart = head;
+        return s.substr(0, head) + "..." + s.substr(tstart);
+    };
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (ImGui::CalcTextSize(build(mid).c_str()).x <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    return build(lo);
 }
 
 static void drawPanelRemote(App::BrowseInstance& I) {
@@ -17314,11 +17415,13 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     }
     // The panel used to stack FIVE things above the listing: a host row with
     // three buttons, the breadcrumb bar, the filter, the server-search row, and
-    // (when a preview was alive) the scrub bar. Four of them were there for the
-    // rare case. What is left permanently on screen is what browsing actually
-    // needs - where am I (breadcrumbs) and narrow it down (toolbar + filter) -
-    // and everything else is one click away under "more", with nothing removed.
-    bool& rbAdvanced = I.advanced;
+    // (when a preview was alive) the scrub bar - plus an error band and a
+    // protocol warning that appeared and vanished, moving every file row under
+    // the cursor. What is above the listing now is TWO rows that never change
+    // count: where am I (the path, with the bookmark star at its end) and
+    // narrow it down (the filter, the count, the "..." menu). Everything that
+    // is state rather than navigation reports on the bottom status line, and
+    // the "more" drawer is gone - see docs/browse-topbar-design.md 10.2/10.3.
     // Server-side search: a different thing from the filter (which only narrows
     // what is already listed). Referenced up here because the path bar's context
     // menu can aim it at a folder. (These were function-local statics - one
@@ -17340,6 +17443,26 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         // "C:" (a different place on Windows), and a UNC share has no parent
         if (up.size() < rbRoot.size()) up = rbRoot;
         rbGoTo(I, up);
+    };
+    // Leaving the place. One verb, two entrances - the bottom status line (next
+    // to the host it acts on) and the root crumb's menu (the crumb that NAMES
+    // the host). It was in the "more" drawer, where nobody could see the thing
+    // it disconnects from either. Deferred: it replaces the state every row on
+    // screen is pointing into, so it runs after the panel is done drawing.
+    // There is nothing to disconnect FROM when the peer runs on this machine,
+    // so the local wording is "close browse" - the panel never claims a network
+    // connection it does not have.
+    const bool rbLocalPeer = B.host.empty();
+    const char* rbEndLbl = rbLocalPeer ? "close browse" : "disconnect";
+    auto rbDisconnect = [&I] {
+        rbDefer([&I] {                   // another machine, other children
+            app.uiSession.stop();        // ours to stop; the worker's is a job
+            App::RbJob j;
+            j.kind = App::RbDisconnect;
+            rbEnqueue(I, std::move(j));
+            I.b = App::RemoteBrowse{};
+            rbTreeForget(I);
+        });
     };
     // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     char* rbPathEdit = I.pathEdit;
@@ -17391,7 +17514,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
                     rbSearchFocus = true;
-                    rbAdvanced = true;          // the search row lives under "more"
+                    I.searchOpen = true;        // the search box is a popup now
                 }
                 if (ImGui::MenuItem("Bookmark")) {
                     std::string u = placeUrl(B.host, B.port, target);
@@ -17402,6 +17525,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         savePrefs();
                     }
                     toast("bookmarked " + u);
+                }
+                // The ROOT crumb is the one that stands for the machine, so it
+                // is the one that can leave it. Deeper crumbs are folders and
+                // have no opinion about the connection.
+                if (k == 0) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(rbLocalPeer ? "Close this browse"
+                                                    : "Disconnect")) rbDisconnect();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(rbLocalPeer
+                            ? "stop listing this machine and empty the panel"
+                            : "drop the ssh session to %s and empty the panel",
+                            peerLabel(B.host).c_str());
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Copy path")) {
@@ -17421,11 +17557,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         // itself is the affordance, not another button in the row
         if (!segs.empty()) ImGui::SameLine(0, 4);
         {
-            // the "+" (one more Browse) holds the bar's right edge - the
-            // click-to-edit run pays for it
-            const float plusW = ImGui::CalcTextSize("+").x +
-                                ImGui::GetStyle().FramePadding.x * 2 + 6;
-            float editW = std::max(ImGui::GetContentRegionAvail().x - plusW -
+            // the star and the "+" (one more Browse) hold the bar's right edge -
+            // the click-to-edit run pays for both
+            const float oneBtnW = ImGui::CalcTextSize("+").x +
+                                  ImGui::GetStyle().FramePadding.x * 2 + 6;
+            float editW = std::max(ImGui::GetContentRegionAvail().x - oneBtnW * 2 -
                                    (I.busy ? ImGui::CalcTextSize("(listing...)").x + 8 : 0),
                                    ImGui::GetFontSize() * 1.5f);
             if (ImGui::InvisibleButton("##pathedit", ImVec2(editW, ImGui::GetTextLineHeight())))
@@ -17437,6 +17573,39 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
         }
         if (I.busy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+        // The star ends the PATH line because it is about the path: lit means
+        // this place is bookmarked, so it reads as a state before it is used as
+        // a verb. In the drawer it could be neither - a bookmark indicator that
+        // is only visible after you open a fold indicates nothing.
+        ImGui::SameLine(0, 4);
+        {
+            std::string curUrl = placeUrl(B.host, B.port, B.dir);
+            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                     curUrl) != app.rbBookmarks.end();
+            I.toolbar.starLit = starred ? 1 : 0;
+            // lit = gold, unlit = the dimmed text colour. The star is always
+            // THERE (an affordance that appears only once used cannot be found
+            // the first time); what changes is whether it is on.
+            ImGui::PushStyleColor(ImGuiCol_Text, starred
+                ? ImVec4(0.98f, 0.83f, 0.35f, 1)
+                : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::SmallButton("*##rbstar")) {
+                if (starred)
+                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                      app.rbBookmarks.end(), curUrl),
+                                          app.rbBookmarks.end());
+                else
+                    app.rbBookmarks.push_back(curUrl);
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            ImGui::PopStyleColor();
+            I.toolbar.starCentre = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                                          (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(starred ? "bookmarked - click to forget:\n%s"
+                                          : "bookmark this place:\n%s", curUrl.c_str());
+        }
         ImGui::SameLine(0, 4);
         rbPlusButton();
         if (editReq) {
@@ -17462,18 +17631,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SameLine();
         if (ImGui::SmallButton("cancel##path")) rbPathEditing = false;
     }
-    if (!B.err.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextUnformatted(B.err.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("copy##rberr")) {
-            ImGui::SetClipboardText(B.err.c_str());
-            toast("copied");
-        }
-    }
+    // (The full-width orange error band used to be here. A wrapped band above
+    // the listing took one to three ROWS and shoved every file down by them -
+    // the appearing-and-vanishing rows this redesign is against - and it said
+    // the failure in the one place the failure did not happen. The text lives
+    // on the bottom status line now, at the end of this function.)
     // The listing as ROWS: grouped (one row per sequence) or flat (one row per
     // frame), listing or tree. Rebuilt every frame - see rbBuildView.
     std::vector<RbRow> view = rbBuildView(I, &B.dir, B.entries, I.flat, I.tree);
@@ -17604,8 +17766,9 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         dropPreview();                       // a stale preview is not this row's
         openRemote(u, false);
     };
-    // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
-    // narrow it down. Everything else is behind "more".
+    // ---- row 2: the toolbar. Narrow the listing down, and say so when the
+    // listing's shape is not the default. Everything else is in the "..." menu
+    // at the end of the row - there is no drawer any more.
     //
     // The row FLOWS. It used to be one fixed SameLine chain, and at the panel's
     // own default docked width (0.17 of the window - 271 px on a 1600 px screen)
@@ -17625,28 +17788,25 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
     };
     // Measured, not guessed: what has to survive to the right of the filter.
-    // The WIDER of the two labels the fold button wears, so clicking it cannot
-    // reflow the row it sits in ("more" is 12 px wider than "less").
-    const float rbAdvW = std::max(rbBtnW("more##rbadv"), rbBtnW("less##rbadv"));
+    // That used to be the fold button, measured at the WIDER of its two labels
+    // so a click could not reflow its own row; the fold is gone and the fixed
+    // label "..." cannot change width at all.
+    const float rbMenuW = rbBtnW("...##rbmenu");
     auto rbFilterTailW = [&](bool counted) {
-        float w = rbAdvW + rbStyle.ItemSpacing.x;
+        float w = rbMenuW + rbStyle.ItemSpacing.x;
         if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
         return w;
     };
     char* rbFilter = I.filter;
+    // Refresh lost its button to F5 and the "..." menu; both call this, so it
+    // is declared before either of them.
+    auto rbRefresh = [&I, &B] {
+        rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
+        rbGoTo(I, B.dir);
+    };
     {
-        // One toolbar row: navigation first (back / forward / up / home /
-        // refresh, compact), then the two view toggles, then the filter. The
-        // half of a two-state toggle that is ON wears the active fill, so the
-        // pair never changes width when clicked (a swapping label reflowed the
-        // row it sat in - same defect family as the more/less fold button).
-        auto rbSegBtn = [&](const char* lb, bool on) {
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button,
-                                          ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
-            bool clicked = ImGui::SmallButton(lb);
-            if (on) ImGui::PopStyleColor();
-            return clicked;
-        };
+        // One toolbar row: the chips that name a non-default listing shape,
+        // then the filter, then the count, then the "..." menu.
         // Navigation has no buttons: back / forward are mouse 4 / 5 and
         // Alt+Left / Alt+Right, the parent is the ".." row and Backspace, home
         // is a place in the places popup. Five buttons that answered no
@@ -17659,10 +17819,6 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SmallButton(text);
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", why);
-        };
-        auto rbRefresh = [&I, &B] {
-            rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
-            rbGoTo(I, B.dir);
         };
         if (I.flat) {
             rbModeChip("flat##rbchip", "every frame is its own row - the default is "
@@ -17706,52 +17862,6 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SetTooltip("filters the listing below without asking the server\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
                               "comma separates alternatives");
-        // The panel's own menu: the verbs that are real but rare. They used to
-        // be buttons charging every glance; here they cost nothing until asked
-        // for, and each one still names its key.
-        rbFlow(rbBtnW("..##rbmenu"));
-        if (ImGui::SmallButton("...##rbmenu")) ImGui::OpenPopup("rbpanelmenu");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("this panel: refresh, how it lists");
-        if (ImGui::BeginPopup("rbpanelmenu")) {
-            if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
-            ImGui::Separator();
-            // Radio pairs, not toggles: the state is visible without clicking.
-            if (ImGui::MenuItem("Grouped (a numbered sequence is one row)", nullptr, !I.flat)
-                && I.flat) {
-                I.flat = app.rbFlat = false;   // this panel now; the pref = the default
-                app.prefsDirty = true;
-                savePrefs();
-            }
-            if (ImGui::MenuItem("Flat (every frame is its own row)", nullptr, I.flat)
-                && !I.flat) {
-                I.flat = app.rbFlat = true;
-                app.prefsDirty = true;
-                savePrefs();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("List (one folder at a time)", nullptr, !I.tree) && I.tree) {
-                // Leaving the tree with something under the cursor: the listing
-                // opens on THAT folder. Walking down a tree is how you got to a
-                // folder five levels deep; dropping back to the root on the way
-                // out throws away the only thing the trip was for. A file under
-                // the cursor means the folder holding it.
-                if (I.cursor >= 0 && I.cursor < (int)view.size()) {
-                    const RbRow& r = view[I.cursor];
-                    std::string want = r.ph || r.up ? std::string()
-                                     : r.isDir()    ? r.full() : *r.dir;
-                    if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
-                }
-                I.tree = app.rbTree = false;
-                app.prefsDirty = true;
-                savePrefs();
-            }
-            if (ImGui::MenuItem("Tree (folders open in place)", nullptr, I.tree) && !I.tree) {
-                I.tree = app.rbTree = true;
-                app.prefsDirty = true;
-                savePrefs();
-            }
-            ImGui::EndPopup();
-        }
     }
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
@@ -17810,79 +17920,94 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
-    rbFlow(rbAdvW);
-    if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
-        rbAdvanced = !rbAdvanced;
-        app.rbAdvanced = rbAdvanced;   // the pref is the next panel's default
-        app.prefsDirty = true;
-        savePrefs();
-    }
-    I.toolbar.moreR = ImGui::GetItemRectMax().x;
+    // The panel's own menu ENDS the toolbar row: the verbs that are real but
+    // rare. They used to be buttons charging every glance - and behind them sat
+    // the "more" drawer, whose contents have all gone to the place each one
+    // belongs (docs/browse-topbar-design.md 10.3): the host to the title,
+    // disconnect to the status line and the root crumb, the star to the path
+    // line, open folder to File, and the server search to the popup below.
+    rbFlow(rbMenuW);
+    if (ImGui::SmallButton("...##rbmenu")) ImGui::OpenPopup("rbpanelmenu");
+    I.toolbar.menuR = ImGui::GetItemRectMax().x;
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("the connection, the places list and the server-side\n"
-                          "recursive search - the things a browse does not need\n"
-                          "every minute");
-    // ---- row 3, on request: the connection and the server-side search ----
-    if (rbAdvanced) {
-        ImGui::TextUnformatted(peerLabel(B.host).c_str());
-        // there is nothing to disconnect FROM when the peer runs here
-        const char* rbEndLbl = B.host.empty() ? "close browse##rbdisc" : "disconnect##rbdisc";
-        rbFlow(rbBtnW(rbEndLbl));        // same flow rule as row 2: never clipped
-        if (ImGui::SmallButton(rbEndLbl)) {
-            rbDefer([&I] {               // another machine, other children
-                app.uiSession.stop();    // ours to stop; the worker's is a job
-                App::RbJob j;
-                j.kind = App::RbDisconnect;
-                rbEnqueue(I, std::move(j));
-                I.b = App::RemoteBrowse{};
-                rbTreeForget(I);
-            });
-            ImGui::PopID();
-            return;
+        ImGui::SetTooltip("this panel: refresh, how it lists, search the server");
+    if (ImGui::BeginPopup("rbpanelmenu")) {
+        if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
+        ImGui::Separator();
+        // Radio pairs, not toggles: the state is visible without clicking.
+        if (ImGui::MenuItem("Grouped (a numbered sequence is one row)", nullptr, !I.flat)
+            && I.flat) {
+            I.flat = app.rbFlat = false;   // this panel now; the pref = the default
+            app.prefsDirty = true;
+            savePrefs();
         }
-        rbFlow(rbBtnW("*"));
-        {   // star = bookmark the place being looked at; the combo recalls them
-            std::string curUrl = placeUrl(B.host, B.port, B.dir);
-            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
-                                     curUrl) != app.rbBookmarks.end();
-            if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
-            if (ImGui::SmallButton("*")) {
-                if (starred)
-                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
-                                                      app.rbBookmarks.end(), curUrl),
-                                          app.rbBookmarks.end());
-                else
-                    app.rbBookmarks.push_back(curUrl);
-                app.prefsDirty = true;
-                savePrefs();
+        if (ImGui::MenuItem("Flat (every frame is its own row)", nullptr, I.flat)
+            && !I.flat) {
+            I.flat = app.rbFlat = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("List (one folder at a time)", nullptr, !I.tree) && I.tree) {
+            // Leaving the tree with something under the cursor: the listing
+            // opens on THAT folder. Walking down a tree is how you got to a
+            // folder five levels deep; dropping back to the root on the way
+            // out throws away the only thing the trip was for. A file under
+            // the cursor means the folder holding it.
+            if (I.cursor >= 0 && I.cursor < (int)view.size()) {
+                const RbRow& r = view[I.cursor];
+                std::string want = r.ph || r.up ? std::string()
+                                 : r.isDir()    ? r.full() : *r.dir;
+                if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
             }
-            if (starred) ImGui::PopStyleColor();
+            I.tree = app.rbTree = false;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::MenuItem("Tree (folders open in place)", nullptr, I.tree) && !I.tree) {
+            I.tree = app.rbTree = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        ImGui::Separator();
+        // TEMPORARY HOME. The filter (this listing, instantly) and the server
+        // search (a new set, a round trip) are still two doors onto the same
+        // question - one on the toolbar, one in here. The summoned chip that
+        // replaces BOTH is the next step; until it lands, the second door at
+        // least stops charging a permanent row for a rare, expensive verb.
+        if (ImGui::MenuItem("Search on the server...")) I.searchOpen = true;
+        if (ImGui::MenuItem("Open folder (all stacks below)")) remoteScanFolder(I, B.dir);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
+                              "which stacks to open:\n%s", B.dir.c_str());
+        ImGui::EndPopup();
+    }
+    // ---- the server-side search, summoned: from the menu above or from the
+    // crumb's "Search under here". It is recursive and it costs a round trip,
+    // so it is asked for rather than parked on screen; what it is DOING is
+    // reported on the bottom status line, where the rest of the panel's state
+    // already lives.
+    if (I.searchOpen) { ImGui::OpenPopup("rbsearchpop"); I.searchOpen = false; }
+    if (ImGui::BeginPopup("rbsearchpop")) {
+        ImGui::TextDisabled("search under: %s",
+                            rbSearchRoot.empty() ? B.dir.c_str() : rbSearchRoot.c_str());
+        if (!rbSearchRoot.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
-                                  curUrl.c_str());
-            // Open Folder for the folder you are IN. Neither navigation nor
-            // narrowing, so it lives here with the other on-request tools.
-            // (It used to exist only on a folder ROW, so opening the directory
-            // being browsed meant going up a level to find its own name.)
-            rbFlow(rbBtnW("open folder"));
-            if (ImGui::SmallButton("open folder")) remoteScanFolder(I, B.dir);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
-                                  "which stacks to open:\n%s", B.dir.c_str());
+                ImGui::SetTooltip("search from the folder being browsed instead");
         }
         if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        const float srchTailW = rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
-        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - srchTailW,
-                                         ImGui::GetFontSize() * 4));
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20);
         bool go = ImGui::InputTextWithHint("##rbsearch",
-                                           "search server (recursive): frame_* or **/dark.npy",
+                                           "frame_* or **/dark.npy",
                                            rbSearchBuf, sizeof I.searchBuf,
                                            ImGuiInputTextFlags_EnterReturnsTrue);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
                               "bare text matches anywhere in the relative path;\n"
                               "* and ? glob across '/'");
-        rbFlow(rbBtnW("Stop##rbsearch"));
+        ImGui::SameLine();
         if (I.search.running) {
             if (ImGui::SmallButton("Stop##rbsearch")) {
                 I.search.gen++;               // in-flight result becomes stale
@@ -17890,18 +18015,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
         } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
             remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
+            ImGui::CloseCurrentPopup();       // the answer arrives in the listing
         }
-        if (!rbSearchRoot.empty()) {
-            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
-            rbFlow(rbBtnW("x##sroot"));
-            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
-        }
-    } else if (!rbSearchRoot.empty() || I.search.running) {
-        // a search aimed or running is state the user set: never silently
-        // hidden by a fold, even though the row that made it is folded away
-        if (I.search.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
-        else ImGui::TextDisabled("search aimed at: %s  (\"more\")", rbSearchRoot.c_str());
+        ImGui::EndPopup();
     }
+    // How many rows are selected: counted once, here, because two places need
+    // it - the action row below and the bottom status line at the end.
+    int rbNSel = 0;
+    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) if (rbSel[i]) rbNSel++;
     {   // "Open N selected as stack" - enabled only when the v3 metadata proves
         // the frames can actually stack, BEFORE any pixel is transferred
         int nSel = 0;
@@ -18016,30 +18137,17 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         }
     }
     
-    // The metadata columns exist from protocol 3 on. Say so once, up here - a
-    // "-" in every row of every column explains nothing.
-    {
-        int pv = B.peerVersion;              // published by the worker; no lock
-        // Both directions. Downward the update can fix it, so name the fix;
-        // upward it cannot, and the honest statement is that the listing may
-        // not match what a local open produces (the peer gates the v5 pattern
-        // text on the client version now, but v4 grouping cannot be un-applied
-        // without keeping dead code).
-        if (pv > 0 && pv < 3)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer is protocol %d - File > Update remote peer "
-                               "enables shape / date columns", pv);
-        else if (pv > 0 && pv < (int)rp::VERSION)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer is protocol %d, this viewer speaks %d - "
-                               "File > Update remote peer", pv, (int)rp::VERSION);
-        else if (pv > (int)rp::VERSION)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer speaks protocol %d, this viewer speaks %d - "
-                               "listings may group differently from a local open; "
-                               "update the viewer", pv, (int)rp::VERSION);
-    }
+    // (The protocol-mismatch warning was a conditional full-width orange row
+    // here. It is a FACT about the connection that is rarely true and never
+    // urgent - exactly the kind of thing the bottom status line was added to
+    // carry - and as a row it moved the whole listing the moment a peer of the
+    // wrong version answered. rbProtocolNote() below builds the same sentence,
+    // in both directions, for the status line.)
     ImGui::Separator();
+    // Where the listing begins. A selftest reads this to prove that a failure
+    // does NOT open a band above the rows: the error changes the status line's
+    // text and leaves this number alone.
+    I.toolbar.listTopY = ImGui::GetCursorScreenPos().y;
     if (I.search.active) {         // search results stand in for the listing
         App::RemoteSearch& S = I.search;
         auto joinS = [&S](const std::string& rel) {
@@ -18235,6 +18343,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // alive, so starting one never shifts the rows under the cursor (a bar
     // that appeared above the list moved every row mid-double-click)
     float rbFootH = ImGui::GetFrameHeightWithSpacing();
+    // ...plus the bottom status line, which is permanent: its separator and its
+    // one text row are taken out of the table's height so the listing stops
+    // above it instead of scrolling underneath it.
+    rbFootH += ImGui::GetTextLineHeightWithSpacing() +
+               ImGui::GetStyle().ItemSpacing.y * 2 + 1;
     // Column widths, measured from the widest thing each column actually
     // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
     // SCROLLING table auto-fits over its first frames, which for this table are
@@ -18608,6 +18721,153 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
         }
         ImGui::PopID();
+    }
+    // ---- the bottom status line (docs/browse-topbar-design.md 10.3) --------
+    // One permanent thin row under the listing, carrying the facts that are
+    // rarely true and had no home: which machine this panel stands on, how much
+    // is in front of you, how much of it you have picked - and, only when they
+    // are true, what the connection is doing, what a scan or a search is doing,
+    // which protocol the peer speaks, and what failed.
+    //
+    // PERMANENT, not conditional (10.7). Every one of the rows this replaces
+    // appeared and vanished, and each time it did it moved every file row under
+    // the reader's eye. A line that is always there costs one line and moves
+    // nothing.
+    //
+    // It is NOT an action bar. The single verb on it is disconnect, and it is
+    // allowed because it acts on the host named at the other end of the same
+    // line. Everything else the drawer used to hold is a menu item now.
+    {
+        ImGui::Separator();
+        // counted over REAL rows: ".." is the way out, not an item in the
+        // folder, and a tree's placeholder rows are not files either
+        int total = 0, shownN = 0;
+        for (const RbRow& r : view) if (!r.up && !r.ph) total++;
+        for (int i : shown) if (!view[i].up && !view[i].ph) shownN++;
+        I.toolbar.statusTotal = total;
+        I.toolbar.statusShown = shownN;
+        I.toolbar.statusSel   = rbNSel;
+
+        std::string line = std::string(peerTag(B.host)) + " " + peerLabel(B.host);
+        const char* DOT = " \xC2\xB7 ";              // U+00B7, in the font's Latin-1
+        char cnt[96];
+        // Counts BOTH directions. While a filter is narrowing, "34 items" alone
+        // would be a false statement about the folder, so the line says what is
+        // in front of you and what it was narrowed from. (This absorbs the
+        // toolbar's old shown/total, which stays on the toolbar next to the
+        // filter that causes it - the two agree by construction, both being
+        // this same pair of numbers.)
+        if (shownN != total)
+            snprintf(cnt, sizeof cnt, "%d of %d items", shownN, total);
+        else
+            snprintf(cnt, sizeof cnt, "%d item%s", total, total == 1 ? "" : "s");
+        line += DOT;
+        line += cnt;
+        // Selection, and only when there IS one: "0 selected" is noise on every
+        // glance to report a state whose absence is already obvious.
+        if (rbNSel > 0) {
+            snprintf(cnt, sizeof cnt, "%d of %d selected", rbNSel, total);
+            line += DOT;
+            line += cnt;
+            // ...and what those rows STAND FOR. A grouped row is one row and
+            // four hundred frames, and "2 selected" just before pressing "Open
+            // selected as stack" is the row count answering a question nobody
+            // asked. Said only when the two numbers differ - otherwise it would
+            // print "3 selected, 3 frames" on every ordinary file selection.
+            int frames = 0;
+            for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                if (!rbSel[i]) continue;
+                frames += view[i].isGroup() && !view[i].e->members.empty()
+                        ? (int)view[i].e->members.size() : 1;
+            }
+            if (frames != rbNSel) {
+                snprintf(cnt, sizeof cnt, "%d frames", frames);
+                line += DOT;
+                line += cnt;
+            }
+        }
+        // ---- and now the things that are usually not true. Connection OK is
+        // SILENT: the host's name above is the whole report. Only work in
+        // progress, a version disagreement and a failure get words.
+        bool warn = false;
+        if (I.busy) {
+            // I.phase belongs to the worker thread (BrowseInstance::mtx guards
+            // queue / done / phase): copy it, never read it in place.
+            std::string phase;
+            { std::lock_guard<std::mutex> lk(I.mtx); phase = I.phase; }
+            line += DOT;
+            line += phase.empty() ? std::string("listing...") : phase;
+        }
+        if (I.search.running) {
+            line += DOT;
+            line += "searching " + std::string(I.search.pattern) + " under " + I.search.root;
+        } else if (!B.searchRoot.empty()) {
+            line += DOT;
+            line += "search aimed at " + B.searchRoot;
+        }
+        if (std::string pn = rbProtocolNote(B.peerVersion); !pn.empty()) {
+            line += DOT;
+            line += pn;
+            warn = true;
+        }
+        // The error band's content, in the line rather than in a band. First
+        // line only: the rest is in the details dialog, one click away, which
+        // is where a stack trace belonged all along.
+        if (!B.err.empty()) {
+            std::string first = B.err.substr(0, B.err.find('\n'));
+            line += DOT;
+            line += "failed: " + first;
+            warn = true;
+        }
+        I.toolbar.statusFull = line;
+        // The verb sits at the right end and is measured FIRST: the text gets
+        // what is left, never the other way round. One row, always - the line
+        // elides, it does not wrap (300 px is a width this panel has to work
+        // at, and a status line that becomes two lines is another moving row).
+        const float endW = ImGui::CalcTextSize(rbEndLbl).x +
+                           ImGui::GetStyle().FramePadding.x * 2 +
+                           ImGui::GetStyle().ItemSpacing.x;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        // Too narrow for both: the FACT stays and the VERB goes. Disconnect has
+        // a second home - the root crumb's right-click menu - and the sentence
+        // has none, so the sentence wins the pixels. (The row count is the same
+        // either way: what changes with the panel's width is what is ON the row,
+        // never how many rows there are.)
+        const bool showEnd = avail - endW >= ImGui::GetFontSize() * 6;
+        float textW = showEnd ? avail - endW : avail;
+        std::string shownLine = rbElideMiddle(line, textW);
+        I.toolbar.statusText  = shownLine;
+        I.toolbar.statusAvailW = textW;
+        I.toolbar.statusTextW  = ImGui::CalcTextSize(shownLine.c_str()).x;
+        if (warn) ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+        else      ImGui::PushStyleColor(ImGuiCol_Text,
+                                        ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextUnformatted(shownLine.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            // the untruncated sentence, plus the way to the full failure text -
+            // the old band carried a "copy" button, and a second verb is
+            // exactly what this line must not grow
+            ImGui::SetTooltip("%s%s%s", line.c_str(),
+                              B.err.empty() ? "" : "\n\nclick for the full failure text",
+                              showEnd ? "" : "\n\ntoo narrow for the disconnect button - "
+                                             "it is on the first crumb's right-click menu");
+            if (!B.err.empty() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                app.showRemoteError = true;
+        }
+        if (showEnd) {
+            ImGui::SameLine();
+            const float endX = ImGui::GetWindowContentRegionMax().x -
+                               (endW - ImGui::GetStyle().ItemSpacing.x);
+            if (ImGui::GetCursorPosX() < endX) ImGui::SetCursorPosX(endX);
+            if (ImGui::SmallButton(rbEndLbl)) rbDisconnect();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(rbLocalPeer
+                    ? "stop listing this machine and empty the panel\n"
+                      "(nothing is connected: the peer runs here, over a pipe)"
+                    : "drop the ssh session to %s and empty the panel",
+                    peerLabel(B.host).c_str());
+        }
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
     if (ImGui::BeginPopup("Remote properties")) {
@@ -19980,6 +20240,23 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("open a folder in the Browse panel: list, preview\n"
                               "and measure without loading anything");
+        // "open folder" was a button in the Browse panel's "more" drawer. It is
+        // a verb about a WHOLE folder, not about the panel's chrome, so it
+        // belongs on the menu bar with the other openers (10.3). The crumb's
+        // right-click keeps its own copy: there the subject is the folder the
+        // crumb names, which is the more precise aim of the two.
+        {
+            App::BrowseInstance& I = rbActive();
+            if (ImGui::MenuItem("Open Folder (all stacks below)...", nullptr, false,
+                                I.b.connected))
+                remoteScanFolder(I, I.b.dir);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(I.b.connected
+                    ? "scan the folder the Browse panel is in and everything\n"
+                      "below it, then pick which stacks to open:\n%s"
+                    : "the Browse panel is not standing anywhere yet%s",
+                    I.b.connected ? I.b.dir.c_str() : "");
+        }
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
@@ -20589,12 +20866,14 @@ static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slo
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx,
+// left, right, enter, home, end, back, flat, tree, disc, fmenu, rctx,
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
 // img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
 // the cursor's row - a double-click only exists as clicks); chevclick (a click
 // on the cursor row's tree chevron, asserting the toggle landed at once);
-// mback / mfwd
+// starclick (a click on the bookmark star at the end of the path line);
+// marklist / starmark / seterr / clrerr (baselines and a fake failure for the
+// drawer-removal checks below); mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
 // viewreset (absolute grouped+list+folded state - the toggles are relative);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
@@ -20604,6 +20883,16 @@ static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slo
 // chkfwd:N, chkexp:N, exparm / chkexpn:0 (a per-frame watch: the armed path
 // was never expanded on ANY frame in between), chkfocus:0|1 - any FAIL fails
 // the run.
+//
+// The "more" drawer's removal (docs/browse-topbar-design.md 10.2/10.3) is
+// asserted by chktitle (the panel is named after its machine, both directions,
+// with the ### id untouched), chkstat:N (the bottom status line's item and
+// selected counts, both directions, and one line only), chkstar:0|1 (the star
+// flipped from starmark and agrees with the bookmark list), chkerr:0|1 (a
+// failure is IN the status line and the listing did not move - marklist is the
+// baseline) and setpv:N / pvback / chkproto:0|1 (the same two claims for the
+// protocol-mismatch notice, the other orange row that is gone). "more" is gone
+// as an action along with the drawer it folded.
 //
 // INSTANCES (item 17): every stateful action and check drives the TARGET
 // instance (target:N switches it; 1 = the primordial panel). newpanel creates
@@ -20615,10 +20904,12 @@ static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slo
 // (windows visible), chksel:N (rows selected in the target).
 //
 // w<px> floats the panel at an exact width and then asserts what a human would
-// otherwise have to read off a screenshot: that the filter box and the "more"
-// button are still INSIDE the panel, and that the filter is wide enough to type
-// a glob into. 271 is the panel's own default docked width on a 1600 px screen,
-// which is where the fixed SameLine chain used to push both of them off-screen.
+// otherwise have to read off a screenshot: that the filter box and the item
+// that ENDS the toolbar row are still INSIDE the panel, and that the filter is
+// wide enough to type a glob into. 271 is the panel's own default docked width
+// on a 1600 px screen, which is where the fixed SameLine chain used to push
+// both of them off-screen. (That last item was the "more" fold button and is
+// the "..." panel menu now - same contract, different button.)
 static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
 // Key-routing evidence for --browse-keys-selftest: how many times the MAIN
@@ -20646,7 +20937,7 @@ static int g_chevPreExp = -1;           // "chevclick": expanded count pre-press
 static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
-    "left,end,home,up,down,more,down,back,"
+    "left,end,home,up,down,down,back,"
     // ---- what PREVIEW means for a stack row (docs/todo-open.md items 1/26).
     // Floated first (w400): the click actions aim real mouse events at the
     // cursor row's rectangle, and the user's saved layout must not decide
@@ -20710,7 +21001,7 @@ static std::string g_browseKeysActs =
     "blur,down,up,end,home,"
     // ...then the panel geometry sweep: the toolbar must stay inside the panel
     // at every docked width, and Escape must close a menu and a context popup.
-    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
+    "w271,w200,w180,w420,w700,w1150,w271,w700,w180,w0,"
     "rctx,esc,fmenu,esc,disc,"
     // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
     // singleton). Reconnect the primordial panel, then open a SECOND Browse
@@ -20741,6 +21032,30 @@ static std::string g_browseKeysActs =
     // ...and the LAST one closing only hides: View > Panels > Browse reopens
     // it with its place, listing and cursor intact
     "hidep,chkshown:0,showp,chkshown:1,chkdir:rb,focus,up,chkatrow:..,"
+    // ---- THE DRAWER IS GONE (docs/browse-topbar-design.md 10.2/10.3). Each
+    // of these asserts one of its contents in the place it moved to, which is
+    // the only way to tell "rehomed" from "deleted". Floated first so the path
+    // line has room for the star and the click can be aimed at it.
+    // The title names the machine; the status line counts what is in front of
+    // you in both directions; the star is lit iff the place is bookmarked and
+    // survives a real click at the end of the path line; and a failure speaks
+    // ON the status line without opening a band that moves the listing.
+    // (the filter from the instance segment is still on here, so the first
+    // chkstat reads the narrowed form "N of M items"; clearing it reads the
+    // plain "M items" - the count in both directions)
+    "w400,chktitle,chkstat:0,"
+    // ...a GROUPED row: one row, twenty-four frames, and the line says both
+    // (the filter from the instance segment leaves exactly that row showing)
+    "home,down,chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    "ctrlclick,chkstat:1,chkframes:24,ctrlclick,chkstat:0,"
+    "filt:,marklist,chkstat:0,"
+    "starmark,starclick,chkstar:1,starclick,chkstar:0,"
+    "seterr,chkerr:1,clrerr,chkerr:0,"
+    "setpv:2,chkproto:1,setpv:99,chkproto:1,pvback,chkproto:0,"
+    // ...and a plain row: one row, one thing, no second count. Placed from
+    // "home" because clearing the filter above rebuilt the shown set and reset
+    // the cursor - a bare "down" would land on ".." , which selects nothing.
+    "home,down,chkatrow:digitset,ctrlclick,chkstat:1,chkframes:0,w0,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -29411,13 +29726,12 @@ int main(int argc, char** argv) {
         startRemote(rbMain(), "local://" + d);
         app.showRemote = true;
         // Scripted row indices assume the DEFAULT view: the user's real prefs
-        // must not leak a flat/tree/advanced state into what "down,down,down"
-        // lands on. With rbtree left on, a click+double-click pair on a folder
-        // row expanded it in place and its children took over the row indices
+        // must not leak a flat/tree state into what "down,down,down" lands on.
+        // With rbtree left on, a click+double-click pair on a folder row
+        // expanded it in place and its children took over the row indices
         // every later action was aimed at - reproduced, two hours of forensics.
         rbMain().flat = app.rbFlat = false;
         rbMain().tree = app.rbTree = false;
-        rbMain().advanced = app.rbAdvanced = false;
         // Key REPEAT is a human affordance; for injected keys it is a race.
         // Each scripted press is held for ~one frame, but a trickle-delayed
         // release across a slow frame (texture uploads after a stack lands)
@@ -29712,6 +30026,12 @@ int main(int argc, char** argv) {
                 if (!primordial)
                     ImGui::SetNextWindowSize(ImVec2(420 * uiScale, 520 * uiScale),
                                              ImGuiCond_FirstUseEver);
+                // The title names the machine (10.3). Recomputed here, every
+                // frame, because connecting and disconnecting change it - and
+                // only the part BEFORE ### changes, so ImGui's identity (and
+                // with it the docking, the layout file and the session) is
+                // exactly what it was when the title was a fixed string.
+                I.wtitle = rbPanelTitle(I.num, I.b.connected ? I.b.host : std::string());
                 if (ImGui::Begin(I.wtitle.c_str(), &show)) drawPanelRemote(I);
                 ImGui::End();
                 if (!show && !primordial) destroyNum = I.num;
@@ -30392,7 +30712,8 @@ int main(int argc, char** argv) {
                     fflush(stderr);
                 }
                 if (op == "dbl" || op == "click" || op == "ctrlclick" ||
-                    op == "chevclick" || op == "mback" || op == "mfwd") {
+                    op == "chevclick" || op == "starclick" ||
+                    op == "mback" || op == "mfwd") {
                     // A real gesture into the real queue, aimed at the row the
                     // keyboard cursor is on - a double-click only exists as real
                     // clicks. "click" lands 40 px right of "dbl" (same row: rows
@@ -30408,8 +30729,14 @@ int main(int argc, char** argv) {
                     if (keyPhase == 0) {
                         if (op == "chevclick" && rbKeysT().cursorChev.x < 0)
                             chk(false, "cursor row has no chevron");
-                        g_injMouse = op == "chevclick"
-                            ? rbKeysT().cursorChev
+                        // "starclick" is aimed at the bookmark star at the right
+                        // end of the PATH line - not at a row. It is a real
+                        // click because the point of the move is that the star
+                        // is reachable there, which only a real click can show.
+                        if (op == "starclick" && rbKeysT().toolbar.starCentre.x < 0)
+                            chk(false, "no bookmark star on the path line");
+                        g_injMouse = op == "chevclick" ? rbKeysT().cursorChev
+                                   : op == "starclick" ? rbKeysT().toolbar.starCentre
                             : ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
                                      (op == "click" ? 40.0f : 0.0f),
                                      (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
@@ -30438,8 +30765,8 @@ int main(int argc, char** argv) {
                     else if (keyPhase == 1) { rio.AddKeyEvent(k2, false);
                                               rio.AddKeyEvent(ImGuiMod_Alt, false); }
                 } else if (keyPhase == 0) {
-                    if (a == "more")       rbKeysT().advanced = !rbKeysT().advanced;
-                    else if (a == "flat")  rbKeysT().flat = !rbKeysT().flat;
+                    // ("more" - fold the drawer open - is gone with the drawer.)
+                    if (a == "flat")       rbKeysT().flat = !rbKeysT().flat;
                     else if (a == "tree")  rbKeysT().tree = !rbKeysT().tree;
                     else if (a == "viewreset") {
                         // an ABSOLUTE state pin: the toggles above are relative,
@@ -30447,7 +30774,6 @@ int main(int argc, char** argv) {
                         // depend on the parity of every toggle before it
                         rbKeysT().flat = false;
                         rbKeysT().tree = false;
-                        rbKeysT().advanced = false;
                         rbTreeForget(rbKeysT());
                     }
                     else if (a == "focus") rbShowInstance(rbKeysT());
@@ -30709,6 +31035,149 @@ int main(int argc, char** argv) {
                             std::to_string(g_expNeverFrames) + " watched frame(s)");
                         g_expNeverPath.clear();
                     }
+                    // ---- the "more" drawer is gone, and each thing it held is
+                    // asserted in its NEW home (docs/browse-topbar-design.md
+                    // 10.3). These are the only checks that can tell "moved"
+                    // from "deleted".
+                    else if (a == "chktitle") {
+                        // The panel is named after the machine it stands on -
+                        // the fact that used to be invisible until you unfolded
+                        // the drawer, so that two panels were pixel-identical.
+                        // BOTH directions, because the wrong one is a lie: a
+                        // local panel must not claim ssh, and a remote one must
+                        // not keep the plain name. And the ### id is untouched
+                        // either way, or saved layouts stop docking the panel.
+                        const App::BrowseInstance& T = rbKeysT();
+                        bool ok = rbPanelTitle(1, "") == "Browse###Remote" &&
+                                  rbPanelTitle(1, "trc2") == "Browse [ssh: trc2]###Remote" &&
+                                  rbPanelTitle(2, "") == "Browse 2###Browse2" &&
+                                  rbPanelTitle(2, "trc2") == "Browse 2 [ssh: trc2]###Browse2" &&
+                                  // ...and the LIVE title of a local panel says
+                                  // nothing about ssh (local:// is not remote)
+                                  T.b.connected && T.b.host.empty() &&
+                                  T.wtitle == rbPanelTitle(T.num, "") &&
+                                  T.wtitle.find("[ssh:") == std::string::npos;
+                        chk(ok, "live=\"" + T.wtitle + "\" ssh form=\"" +
+                                rbPanelTitle(1, "trc2") + "\"");
+                    }
+                    else if (op == "chkstat") {
+                        // The bottom status line, which is where every fact the
+                        // drawer and the two orange bands used to carry now
+                        // lives. Counts BOTH directions: the numbers it prints
+                        // are the numbers the panel holds, and the "selected"
+                        // clause is present exactly when a selection exists.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        int realSel = 0;
+                        for (char c : rbKeysT().sel) if (c) realSel++;
+                        char want[64], wantSel[64];
+                        if (g.statusShown != g.statusTotal)
+                            snprintf(want, sizeof want, "%d of %d items",
+                                     g.statusShown, g.statusTotal);
+                        else
+                            snprintf(want, sizeof want, "%d item%s", g.statusTotal,
+                                     g.statusTotal == 1 ? "" : "s");
+                        snprintf(wantSel, sizeof wantSel, "%d of %d selected",
+                                 g.statusSel, g.statusTotal);
+                        bool says = g.statusFull.find(" selected") != std::string::npos;
+                        bool ok = g.statusSel == arg && realSel == arg &&
+                                  g.statusTotal > 0 &&
+                                  g.statusFull.find(want) != std::string::npos &&
+                                  says == (arg > 0) &&
+                                  (arg == 0 ||
+                                   g.statusFull.find(wantSel) != std::string::npos) &&
+                                  // it names the machine, and it is one line
+                                  g.statusFull.find(peerTag(rbKeysT().b.host)) == 0 &&
+                                  g.statusText.find('\n') == std::string::npos;
+                        chk(ok, "\"" + g.statusFull + "\"");
+                    }
+                    else if (op == "chkframes") {
+                        // What the selected ROWS stand for. One grouped row is
+                        // one row and N frames, and the row count alone is the
+                        // wrong answer to "am I about to open 24 files or 480".
+                        // Both directions: the clause is absent when the two
+                        // numbers are equal, or every ordinary selection would
+                        // carry a redundant second count.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        char want[48];
+                        snprintf(want, sizeof want, "%d frames", arg);
+                        bool says = g.statusFull.find(" frames") != std::string::npos;
+                        chk(arg == 0 ? !says
+                                     : (says && g.statusFull.find(want) != std::string::npos),
+                            "\"" + g.statusFull + "\"");
+                    }
+                    else if (a == "starmark") g_rbStar0 = rbKeysT().toolbar.starLit;
+                    else if (op == "chkstar") {
+                        // The star is a STATE before it is a verb: lit means
+                        // this place is in the bookmark list. Asserted as a flip
+                        // from the mark, because a scripted run inherits the
+                        // user's real bookmarks and must not assume the test
+                        // folder is absent from them.
+                        const App::BrowseInstance& T = rbKeysT();
+                        std::string u = placeUrl(T.b.host, T.b.port, T.b.dir);
+                        bool listed = std::find(app.rbBookmarks.begin(),
+                                                app.rbBookmarks.end(), u) !=
+                                      app.rbBookmarks.end();
+                        int wantLit = arg ? !g_rbStar0 : g_rbStar0;
+                        bool ok = g_rbStar0 >= 0 &&
+                                  T.toolbar.starLit == wantLit &&
+                                  (T.toolbar.starLit != 0) == listed &&
+                                  T.toolbar.starCentre.x > 0;   // and it is ON the path line
+                        chk(ok, "star lit=" + std::to_string(T.toolbar.starLit) +
+                                " bookmarked=" + std::to_string(listed ? 1 : 0) +
+                                " " + u);
+                    }
+                    else if (a == "marklist") g_rbListTopY0 = rbKeysT().toolbar.listTopY;
+                    else if (a == "seterr")
+                        rbKeysT().b.err = "listing failed: no such file or directory";
+                    else if (a == "clrerr") rbKeysT().b.err.clear();
+                    else if (op == "chkerr") {
+                        // A failure speaks on the status line and NOWHERE else.
+                        // The old shape was a wrapped orange band above the
+                        // listing: it said the failure in the one place the
+                        // failure did not happen, and it pushed every file row
+                        // down by one to three lines on its way in and out.
+                        // listTopY is the proof - the listing does not move.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        bool inLine = g.statusFull.find("failed: ") != std::string::npos;
+                        float moved = g.listTopY - g_rbListTopY0;
+                        if (moved < 0) moved = -moved;
+                        chk(inLine == (arg != 0) && moved <= 1.0f,
+                            "list top " + std::to_string((int)g_rbListTopY0) + " -> " +
+                            std::to_string((int)g.listTopY) + "  line=\"" +
+                            g.statusFull + "\"");
+                    }
+                    else if (op == "setpv") {
+                        if (g_rbPeerV0 < 0) g_rbPeerV0 = rbKeysT().b.peerVersion;
+                        rbKeysT().b.peerVersion = arg;
+                    }
+                    else if (a == "pvback") {
+                        if (g_rbPeerV0 >= 0) rbKeysT().b.peerVersion = g_rbPeerV0;
+                        g_rbPeerV0 = -1;
+                    }
+                    else if (op == "chkproto") {
+                        // The protocol-mismatch notice was the OTHER orange row
+                        // above the listing. Same two claims as chkerr: it is on
+                        // the status line, and it does not take a row from the
+                        // files. The sentence names BOTH versions - a warning
+                        // that says only the peer's leaves the reader guessing
+                        // what it is being compared against.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        char peer[32], mine[32];
+                        snprintf(peer, sizeof peer, "protocol %d", rbKeysT().b.peerVersion);
+                        snprintf(mine, sizeof mine, "speaks %d", (int)rp::VERSION);
+                        bool said = g.statusFull.find("protocol") != std::string::npos;
+                        bool both = g.statusFull.find(peer) != std::string::npos &&
+                                    g.statusFull.find(mine) != std::string::npos;
+                        float moved = g.listTopY - g_rbListTopY0;
+                        if (moved < 0) moved = -moved;
+                        chk(said == (arg != 0) && (arg == 0 || both) && moved <= 1.0f &&
+                            // ...and the agreeing case is SILENT, which is the
+                            // rule the whole redesign rests on
+                            rbProtocolNote((int)rp::VERSION).empty(),
+                            "peer v" + std::to_string(rbKeysT().b.peerVersion) +
+                            " list top " + std::to_string((int)g.listTopY) +
+                            "  line=\"" + g.statusFull + "\"");
+                    }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
@@ -30746,25 +31215,39 @@ int main(int argc, char** argv) {
                     fflush(stderr);
                 } else if (keyPhase == 7 && g_rbForceW > 0) {
                     // The toolbar's contract at ANY width: the filter box and
-                    // the "more" button are inside the panel, and the filter is
-                    // wide enough to hold a glob. Both used to be submitted past
-                    // the right edge at the panel's default docked width.
+                    // the item that ENDS the row are inside the panel, and the
+                    // filter is wide enough to hold a glob. Both used to be
+                    // submitted past the right edge at the default docked width.
+                    //
+                    // SPEC CHANGE (drawer removal): the row's last item was the
+                    // "more" fold button (g.moreR); it is the "..." panel menu
+                    // now (g.menuR). The button being asserted changed because
+                    // the button changed - the contract, "whatever ends the
+                    // toolbar row is reachable at every width", did not, and it
+                    // is still checked at the same seven widths below.
                     const RbToolbarGeom& g = rbKeysT().toolbar;
                     float slack = 1.0f;             // one pixel of rounding
                     bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
-                                  g.moreR <= g.x1 + slack;
+                                  g.menuR <= g.x1 + slack;
                     bool usable = g.filterR - g.filterL >= ImGui::GetFontSize() * 3.5f;
+                    // ...and the bottom status line, at the same widths: it
+                    // elides middle-out into the room left beside the one verb
+                    // it carries, and it NEVER takes a second row (a status line
+                    // that wraps is one more thing moving the listing).
+                    bool statusOk = g.statusTextW <= g.statusAvailW + slack &&
+                                    g.statusAvailW > 0;
                     // ...and the "modified" column: shown means it FITS. It is
                     // allowed to be absent (a panel too narrow to afford it) and
                     // it is allowed to be short - it is not allowed to print
                     // three characters of a sixteen-character stamp.
                     bool dateOk = g.dateTextW <= 0 || g.dateTextW <= g.dateCellW + slack;
-                    if (!inside || !usable || !dateOk) keysCheckBad++;
+                    if (!inside || !usable || !dateOk || !statusOk) keysCheckBad++;
                     fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
-                                    "filter=[%.0f,%.0f] more_r=%.0f date=%.0f/%.0f: %s\n",
-                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
-                            g.dateTextW, g.dateCellW,
-                            (inside && usable && dateOk) ? "ok" : "FAIL");
+                                    "filter=[%.0f,%.0f] menu_r=%.0f date=%.0f/%.0f "
+                                    "status=%.0f/%.0f: %s\n",
+                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.menuR,
+                            g.dateTextW, g.dateCellW, g.statusTextW, g.statusAvailW,
+                            (inside && usable && dateOk && statusOk) ? "ok" : "FAIL");
                     fflush(stderr);
                 }
                 if (!hold && ++keyPhase >= 8) { keyPhase = 0; keyAct++; }
