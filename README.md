@@ -162,7 +162,7 @@ CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 **書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
 PNG / JPEG / TIFF の**読み込みはありません**。
 
-### 読めない形式を読ませる — 入力アダプタ (設計確定・実装中)
+### 読めない形式を読ませる — 入力アダプタ (実装中)
 
 Python の関数を1つ書いて、viewer に指定します。
 
@@ -258,13 +258,11 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 | [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
 | [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
 | [docs/tasks.csv](docs/tasks.csv) | 課題表 (対応済み / 進行中 / 残課題 / 暫定 / 要レビュー) |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 中を触る人向け |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | データモデル・フレームループ・不変条件 |
 
 ---
 
 ## ソースからビルド
-
-普段は上の「インストール」で足ります。ここから先は中を触る人向けです。
 
 **MSVC (Visual Studio 2022)**
 
