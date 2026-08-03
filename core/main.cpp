@@ -2161,6 +2161,23 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
+// The Range panel's one mode control (0 auto per frame / 1 per stack /
+// 2 linked). It lives here, not inside the combo, because choosing a mode has
+// to act on the frame ALREADY on screen: the per-frame policy is otherwise
+// applied only by selectImage, on a frame change, and the mode read as dead
+// until the first step (report 2026-08-03).
+static void applyRangeMode(int mode, ImageDoc* on) {
+    bool wasLinked = app.linkRange;
+    app.linkRange = mode == 2;
+    app.rangeScope = mode == 0 ? 0 : 1;
+    if (on) {
+        if (app.linkRange && !wasLinked) {     // seed from what is on screen
+            app.linkBlack = on->black; app.linkWhite = on->white;
+        }
+        if (mode == 0 && !app.linkRange) { defaultRange(*on); on->texDirty = true; }
+    }
+    if (app.linkRange != wasLinked) markAllTexDirty();
+}
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
 static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
@@ -4251,6 +4268,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // ordinal of the line that carries the current image instead.
     // A stack contributes exactly one line: the frame it was left on.
     auto isSavedLine = [&](const ImageDoc* d) {
+        // A preview is a look, not an open: it is not in the session, and
+        // writing one must not turn it into an open. The autosave runs a few
+        // seconds after any change and used to promote the preview first, so a
+        // frame the user had merely clicked appeared under the batch by itself.
+        if (d->preview) return false;
         if (d->src->path.empty()) return false;
         if (d->seqId == 0) return true;
         int rep = -1;
@@ -4518,8 +4540,9 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
 }
 
 static void saveSession(std::string path, bool quiet = false) {
-    for (auto& d : app.images)                  // a saved session has no transients
-        if (d->preview) promotePreview(d.get());
+    // A saved session has no transients - but the way to honour that is to
+    // leave the preview OUT of the file (isSavedLine), not to promote it into
+    // a real open behind the user's back.
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
@@ -10726,13 +10749,7 @@ static void drawInspector() {
             ImGui::SetNextItemWidth(-1);
             if (ImGui::Combo("##rangemode", &mode,
                              "Auto per frame\0Per stack (default)\0Linked across all images\0")) {
-                bool wasLinked = app.linkRange;
-                app.linkRange = mode == 2;
-                app.rangeScope = mode == 0 ? 0 : 1;
-                if (app.linkRange && !wasLinked) {      // seed from what is on screen
-                    app.linkBlack = im->black; app.linkWhite = im->white;
-                }
-                if (app.linkRange != wasLinked) markAllTexDirty();
+                applyRangeMode(mode, im);
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
@@ -24198,6 +24215,41 @@ int main(int argc, char** argv) {
             check(app.previewUid == 0 && app.current >= 0 &&
                   app.current < (int)app.images.size(),
                   "V9 dropping the current preview re-points A in range");
+
+            // ...and SAVING a session must not turn the look into an open.
+            // The autosave fires a few seconds after any change and went
+            // through saveSession, which promoted every preview first - so a
+            // frame the user had merely clicked appeared under the batch on
+            // its own, and a double-click then opened the stack NEXT TO it
+            // ("stack と一枚がそれぞれ登録される").
+            mkPreview();
+            for (auto& d : app.images)
+                if (d->uid == app.previewUid) d->src->path = "pv-scratch/preview.npy";
+            uint64_t pvUid = app.previewUid;
+            size_t nBefore = app.images.size();
+            std::error_code sec;
+            std::filesystem::path sdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-session-scratch";
+            std::filesystem::create_directories(sdir, sec);   // ours: ours to remove
+            std::string spath = (sdir / "s.vsession").u8string();
+            saveSession(spath, true);
+            bool stillPreview = false;
+            for (const auto& d : app.images)
+                if (d->uid == pvUid) stillPreview = d->preview;
+            bool named = false;
+            {
+                std::ifstream in(pathFromUtf8(spath), std::ios::binary);
+                for (std::string ln; std::getline(in, ln); )
+                    if (ln.find("preview.npy") != std::string::npos) named = true;
+            }
+            fprintf(stderr, "verifyselftest: V9b autosave with a live preview: "
+                            "still a preview=%d, images %zu->%zu, named in file=%d\n",
+                    (int)stillPreview, nBefore, app.images.size(), (int)named);
+            check(stillPreview, "V9b saving a session leaves the preview a preview");
+            check(app.images.size() == nBefore, "V9b saving a session opens nothing");
+            check(!named, "V9b the preview is not written into the session file");
+            std::filesystem::remove_all(sdir, sec);
+            dropPreview();
         }
 
         // ---- V10: CFA planes are never mixed in a temporal statistic --------
@@ -26846,6 +26898,26 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        }
+        // Switching TO "auto per frame" must re-fit the frame on screen. The
+        // policy is applied in selectImage, which only runs on a frame change,
+        // so the mode used to look dead until the first step ("選んだ直後は
+        // 画像がかわらず、コマ送りすると反映される").
+        {
+            app.linkRange = false;
+            app.rangeScope = 1;                       // per stack
+            selectImage(fa[1]);                       // a frame that inherited
+            ImageDoc* d = cur();
+            d->black = d->vmin - 1000; d->white = d->vmax + 1000;   // clearly not its own fit
+            float wasB = d->black, wasW = d->white;
+            applyRangeMode(0, d);              // exactly what the combo calls
+            bool refit = d->black != wasB || d->white != wasW;
+            fprintf(stderr, "rangeselftest: auto-per-frame applied on the spot: "
+                            "%.6g..%.6g -> %.6g..%.6g (frame data %.6g..%.6g) %s\n",
+                    wasB, wasW, d->black, d->white, d->vmin, d->vmax,
+                    refit ? "ok" : "WRONG");
+            if (!refit) bad++;
+            app.rangeScope = 1;
         }
         fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
         if (app.seqThread.joinable()) app.seqThread.join();
