@@ -1,0 +1,29 @@
+loaded 5 analyzer(s)
+frame 4000x3000x1 f32 = 48.0 MB, reps=15
+
+analyzer                 roi            median       min       max     per-s
+stats/moments            256x256          5.44      5.37      5.99     183.7
+stats/moments            512x512         24.45     23.98     25.55      40.9
+stats/moments            1024x1024       96.75     95.95    104.00      10.3
+stats/moments            2048x2048      351.68    350.47    356.05       2.8
+stats/moments            whole         1015.16   1006.21   1070.09       1.0
+noise/floor              256x256          0.11      0.11      0.11    9433.9
+noise/floor              512x512          0.45      0.44      0.69    2213.9
+noise/floor              1024x1024        1.89      1.86      2.06     530.2
+noise/floor              2048x2048        7.85      7.65      9.12     127.4
+noise/floor              whole           23.17     22.92     23.81      43.2
+uniformity/prnu-fpn      256x256          0.46      0.45      0.46    2188.7
+uniformity/prnu-fpn      512x512          2.23      2.18      2.91     447.8
+uniformity/prnu-fpn      1024x1024       10.40     10.16     10.71      96.1
+uniformity/prnu-fpn      2048x2048       48.81     43.62     63.82      20.5
+uniformity/prnu-fpn      whole          143.73    140.73    151.15       7.0
+sharpness/gradient       256x256          0.18      0.18      0.19    5491.5
+sharpness/gradient       512x512          0.88      0.87      1.43    1135.5
+sharpness/gradient       1024x1024        3.48      3.43      3.61     287.1
+sharpness/gradient       2048x2048       14.31     13.95     14.91      69.9
+sharpness/gradient       whole           40.15     39.42     42.25      24.9
+iso12233/e-sfr           256x256          1.32      1.31      1.37     757.9
+iso12233/e-sfr           512x512          4.06      3.95      4.75     246.1
+iso12233/e-sfr           1024x1024       13.52     13.10     14.65      73.9
+iso12233/e-sfr           2048x2048       25.75     25.48     27.38      38.8
+iso12233/e-sfr           whole               -   (rc!=0: e-sfr: ROI too large (keep it around the edge))
