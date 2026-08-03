@@ -1259,6 +1259,22 @@ struct App {
     std::unique_ptr<pfd::select_folder> rdFolderDlg;
     int rdFolderMode = 0;             // 0 = the folder of readers, 1 = open a folder with one
     std::unique_ptr<pfd::save_file>     rdNewDlg;   // where to write the template
+    // A reader runs for as long as the user's data takes. Waiting for it on the
+    // UI thread made the whole window stop answering - up to the five-minute
+    // timeout - with nothing on screen to say why or to stop it. Only the wait
+    // moves off-thread: reading what it produced touches images and GL.
+    struct ReaderJob {
+        std::string src, spec, out;        // what it is reading, with what, to where
+        std::vector<std::string> argv;
+        std::string outFile, errFile;      // the child's streams, readable AS it writes
+        std::thread th;
+        std::atomic<bool> done{ false };
+        std::atomic<bool> cancel{ false };
+        adapter::Run r;
+        double startedAt = 0;
+        size_t shown = 0;                  // how much of the live output is on screen
+    };
+    std::unique_ptr<ReaderJob> rdJob;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg ||
                rdOpenDlg || rdFolderDlg || rdNewDlg;
@@ -6229,8 +6245,13 @@ static std::string adapterCacheDir() {
 // Run `spec` over `src` and open what it wrote. Returns "" on success; on
 // failure the string is the adapter's OWN message wherever there is one (§4.9),
 // because a message we invent in its place is a message the author cannot fix.
+static std::string readerFinish(const std::string& src, const std::string& spec,
+                                const std::string& out,
+                                const std::vector<std::string>& argv,
+                                const adapter::Run& r);   // fwd: the tail, shared
 static std::string openWithReader(const std::string& src, const std::string& spec,
-                                  bool allowCache = true) {
+                                  bool allowCache = true,
+                                  App::ReaderJob* job = nullptr) {
     // Whatever happens, the panel gets the whole of it (§4.13.0).
     app.readerRan = true;
     app.readerLastOk = false;
@@ -6273,14 +6294,54 @@ static std::string openWithReader(const std::string& src, const std::string& spe
                  (unsigned long long)adapterHash(src + spec));
         out = (t / nm).u8string();
     }
-    std::vector<std::string> argv = { py, script, spec, src, "-o", out };
+    // -u: unbuffered. Without it Python holds print() in a buffer until it
+    // exits, so a reader that reports its progress reports all of it at the end,
+    // which is the one moment the progress is worthless.
+    std::vector<std::string> argv = { py, "-u", script, spec, src, "-o", out };
     // §4.13: the exact command, before it runs - every time, not only the first.
     // The picker shows it in front of the user for a reader they have not used
     // before; this is the durable record, so "what did it actually start?" is
     // answerable after the fact as well as before it.
     app.msgLog.push_back({ "reader: " + adapter::showCommand(argv), false });
     g_adapterRuns++;
-    adapter::Run r = adapter::run(argv);
+    std::error_code tec;
+    std::filesystem::path td = std::filesystem::temp_directory_path(tec);
+    char sn[64];
+    snprintf(sn, sizeof sn, "viewer_reader_%llx", (unsigned long long)adapterHash(src + spec));
+    std::string outFile = (td / (std::string(sn) + ".out")).u8string();
+    std::string errFile = (td / (std::string(sn) + ".err")).u8string();
+    if (job) {
+        // Asynchronous: the window keeps drawing and pollReader() picks this up.
+        // Only the wait is off-thread - readerFinish touches images and GL.
+        job->src = src; job->spec = spec; job->out = out; job->argv = argv;
+        job->outFile = outFile; job->errFile = errFile;
+        job->startedAt = glfwGetTime();
+        app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
+        App::ReaderJob* j = job;
+        j->th = std::thread([j]() {
+            j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile);
+            j->done.store(true);
+        });
+        return {};
+    }
+    adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile);
+    std::string fin = readerFinish(src, spec, out, argv, r);
+    std::filesystem::remove(pathFromUtf8(outFile), tec);
+    std::filesystem::remove(pathFromUtf8(errFile), tec);
+    return fin;
+}
+
+// Everything after the process has run. Shared by the synchronous path
+// (selftests, session restore) and the asynchronous one the UI uses, so the two
+// cannot drift into reporting the same failure differently.
+static std::string readerFinish(const std::string& src, const std::string& spec,
+                                const std::string& out,
+                                const std::vector<std::string>& argv,
+                                const adapter::Run& r) {
+    if (r.cancelled) {
+        app.readerLastOut += "\nstopped.\n";
+        return "the reader was stopped";
+    }
     if (!r.started) {
         app.readerLastOut = "could not start the reader: " + r.fail + "\n" +
                             adapter::showCommand(argv);
@@ -6329,7 +6390,15 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     // directions, so paraphrasing it is how a skipped axis becomes invisible.
     std::string sum = r.err;
     while (!sum.empty() && (sum.back() == '\n' || sum.back() == '\r')) sum.pop_back();
+    // What the reader PRINTED, kept on a success as well as on a failure. print()
+    // goes to stdout, which used to be read and then dropped whenever the run
+    // worked - so the one thing an author adds to see what their reader is doing
+    // was visible only when it crashed.
+    std::string said = r.out;
+    while (!said.empty() && (said.back() == '\n' || said.back() == '\r')) said.pop_back();
     app.readerLastOut = sum.empty() ? std::string("the reader wrote no summary") : sum;
+    if (!said.empty())
+        app.readerLastOut += "\n\n--- the reader printed ---\n" + said;
     size_t lastLine = sum.find_last_of('\n');
     if (lastLine != std::string::npos) sum = sum.substr(lastLine + 1);
     if (!sum.empty()) {
@@ -6337,6 +6406,52 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         toast(sum);
     }
     return {};
+}
+
+// Whatever is in the file now. The child is still writing it, so a short read
+// is normal and not an error - this is a tail, not a load.
+static std::string readerTail(const std::string& path) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return {};
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return s;
+}
+
+// Start a reader without waiting for it. The panel shows how long it has been
+// running, what it has printed so far, and a Stop.
+static void startReader(const std::string& src, const std::string& spec) {
+    if (app.rdJob) { toast("a reader is already running", true); return; }
+    app.rdJob.reset(new App::ReaderJob());
+    std::string e = openWithReader(src, spec, true, app.rdJob.get());
+    // A cache hit, or a failure before Python was reached, finishes with no
+    // thread: there is nothing to wait for and nothing to stop.
+    if (!app.rdJob->th.joinable()) {
+        app.rdJob.reset();
+        if (!e.empty()) toast(e, true);
+    }
+}
+
+// Called once per frame. Until the child exits this only refreshes what it has
+// printed; the loading itself happens here, on the UI thread, when it is done.
+static void pollReader() {
+    if (!app.rdJob) return;
+    App::ReaderJob* j = app.rdJob.get();
+    if (!j->done.load()) {
+        std::string live = readerTail(j->errFile) + readerTail(j->outFile);
+        if (live.size() != j->shown) {
+            j->shown = live.size();
+            app.readerLastOut = live.empty()
+                ? ("running " + baseName(readerFileOf(j->spec)) + " ...\n") : live;
+        }
+        return;
+    }
+    j->th.join();
+    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r);
+    std::error_code ec;
+    std::filesystem::remove(pathFromUtf8(j->outFile), ec);
+    std::filesystem::remove(pathFromUtf8(j->errFile), ec);
+    app.rdJob.reset();
+    if (!e.empty()) toast(e, true);
 }
 
 // §4.13: only an explicitly chosen adapter runs, and the first time a given one
@@ -8991,22 +9106,34 @@ static void drawReaderPanel() {
         ImGui::TextWrapped("%s", readerCommandLine(app.readerPickPath, spec).c_str());
         ImGui::PopTextWrapPos();
     }
-    ImGui::BeginDisabled(!haveFile);
+    ImGui::BeginDisabled(!haveFile || app.rdJob != nullptr);
     // §4.13.0: pressable as many times as you like. The cache key carries the
     // adapter's mtime, so editing the file and pressing this again ALWAYS
     // re-runs it - a cache that defeated the edit loop would kill the feature.
     if (ImGui::Button("Load", ImVec2(ImGui::GetFontSize() * 8, 0))) {
         readerConfirmed(spec);
-        std::string src = app.readerPickPath;
-        // The panel stays open: applying a reader to several files in a row is
-        // the common case, and this is also where the traceback lands.
-        std::string err = openWithReader(src, spec);
-        if (!err.empty())
-            app.msgLog.push_back({ baseName(src) + " via " + spec + ": " + err, true });
+        // Started, not waited for. The panel stays open - applying a reader to
+        // several files in a row is the common case, and this is also where the
+        // traceback lands - and the window keeps answering while Python runs.
+        startReader(app.readerPickPath, spec);
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("re-runs whenever the reader file has changed");
+    if (app.rdJob) {
+        // Something turning, how long it has been turning, and a way out. A
+        // reader takes as long as the user's data takes, and a window that only
+        // stops answering does not say whether it is working or wedged.
+        double el = glfwGetTime() - app.rdJob->startedAt;
+        const char* spin = "|/-\\";
+        ImGui::Text("%c  running  %.1f s", spin[(int)(glfwGetTime() * 8) & 3], el);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop")) {
+            app.rdJob->cancel.store(true);
+            toast("stopping the reader...");
+        }
+    } else {
+        ImGui::TextDisabled("re-runs whenever the reader file has changed");
+    }
 
     // ---- what the last run said, WHOLE -------------------------------------
     // The only debugging surface an adapter author has. A traceback folded into
@@ -31998,6 +32125,7 @@ int main(int argc, char** argv) {
 
         // shortcuts
         pollFileDialog();
+        pollReader();          // a running reader, and what it has printed so far
 #if defined(__APPLE__)
         const ImGuiKeyChord MODK = ImGuiMod_Super;    // Cmd on macOS
 #else
@@ -32603,6 +32731,7 @@ int main(int argc, char** argv) {
         // "not responding", which is exactly what a spinner is supposed to deny.
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
                     rbAnyBusy() || app.mPending > 0 ||
+                    app.rdJob != nullptr ||          // a reader is running
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
@@ -32703,6 +32832,7 @@ int main(int argc, char** argv) {
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= app.anyFileDialog();   // pollFileDialog lives in the frame
+                working |= app.rdJob != nullptr;  // and so does pollReader
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();

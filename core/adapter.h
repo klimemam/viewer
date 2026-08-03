@@ -3,6 +3,7 @@
 // docs/input-adapters.md §4.13. Everything here is free of the viewer's state so
 // that the parts that touch the process table stay testable on their own.
 #pragma once
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@ namespace adapter {
 struct Run {
     bool started = false;
     bool timedOut = false;
+    bool cancelled = false;   // the caller asked for it to stop; not a failure
     int exit = -1;
     std::string out;          // stdout
     std::string err;          // stderr: where the harness writes its summary
@@ -22,7 +24,20 @@ struct Run {
 
 // argv[0] is the executable. No shell is involved, so nothing is word-split and
 // no quoting rule of the user's applies to their own paths.
-Run run(const std::vector<std::string>& argv, int timeoutMs = 300000);
+//
+// `cancel`, when given, is polled while waiting: set it and the child is killed.
+// The wait is therefore done in slices rather than in one uninterruptible call,
+// which is also what lets the caller run this on a worker thread and still stop
+// it - a reader takes as long as the user's data takes.
+//
+// `outFile` / `errFile`, when given, are where the child's stdout and stderr go.
+// Supplying them is what lets the caller READ THEM WHILE THE CHILD IS STILL
+// RUNNING - a reader that prints its progress is only useful if the progress
+// arrives before the end. Left empty, run() picks temporaries of its own.
+Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
+        std::atomic<bool>* cancel = nullptr,
+        const std::string& outFile = std::string(),
+        const std::string& errFile = std::string());
 
 // The interpreter to use, or "" with `why` naming what was tried. `configured`
 // wins when it is set. Probed by RUNNING it: on Windows the bare python3 on PATH

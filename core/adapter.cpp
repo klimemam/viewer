@@ -105,10 +105,15 @@ std::string showCommand(const std::vector<std::string>& argv) {
 // alongside the wait or a child writing more than the pipe buffer deadlocks
 // forever; a traceback plus a numpy warning gets close enough to that to matter.
 // Files cost one temp write and cannot deadlock at all.
-Run run(const std::vector<std::string>& argv, int timeoutMs) {
+Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* cancel,
+        const std::string& outFile, const std::string& errFile) {
     Run r;
     if (argv.empty()) { r.fail = "no command"; return r; }
-    std::filesystem::path outPath = scratch("out"), errPath = scratch("err");
+    std::filesystem::path outPath = outFile.empty() ? scratch("out")
+                                                    : std::filesystem::u8path(outFile);
+    std::filesystem::path errPath = errFile.empty() ? scratch("err")
+                                                    : std::filesystem::u8path(errFile);
+    bool ownPaths = outFile.empty() && errFile.empty();
     std::error_code ec;
 
 #if defined(_WIN32)
@@ -155,11 +160,29 @@ Run run(const std::vector<std::string>& argv, int timeoutMs) {
         return r;
     }
     r.started = true;
-    DWORD w = WaitForSingleObject(pi.hProcess, timeoutMs < 0 ? INFINITE : (DWORD)timeoutMs);
-    if (w == WAIT_TIMEOUT) {
-        r.timedOut = true;
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 5000);
+    if (!cancel && timeoutMs < 0) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    } else {
+        // Sliced, not one uninterruptible wait: a Stop has to be able to reach
+        // the child, and the caller has to be able to say how long it has been
+        // running. 25 ms is below anything a person perceives and costs nothing.
+        int waited = 0;
+        for (;;) {
+            if (WaitForSingleObject(pi.hProcess, 25) != WAIT_TIMEOUT) break;
+            if (cancel && cancel->load()) {
+                r.cancelled = true;
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 5000);
+                break;
+            }
+            waited += 25;
+            if (timeoutMs >= 0 && waited >= timeoutMs) {
+                r.timedOut = true;
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 5000);
+                break;
+            }
+        }
     }
     DWORD code = (DWORD)-1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -184,14 +207,20 @@ Run run(const std::vector<std::string>& argv, int timeoutMs) {
     }
     r.started = true;
     int status = 0;
-    if (timeoutMs < 0) {
+    if (timeoutMs < 0 && !cancel) {
         waitpid(pid, &status, 0);
     } else {
         int waited = 0;
         for (;;) {
             pid_t got = waitpid(pid, &status, WNOHANG);
             if (got == pid) break;
-            if (waited >= timeoutMs) {
+            if (cancel && cancel->load()) {
+                r.cancelled = true;
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                break;
+            }
+            if (timeoutMs >= 0 && waited >= timeoutMs) {
                 r.timedOut = true;
                 kill(pid, SIGKILL);
                 waitpid(pid, &status, 0);
@@ -214,8 +243,12 @@ Run run(const std::vector<std::string>& argv, int timeoutMs) {
 
     r.out = readWhole(outPath);
     r.err = readWhole(errPath);
-    std::filesystem::remove(outPath, ec);
-    std::filesystem::remove(errPath, ec);
+    // Only clean up what we chose ourselves. Caller-supplied paths belong to the
+    // caller, which is still holding them open to show what the reader printed.
+    if (ownPaths) {
+        std::filesystem::remove(outPath, ec);
+        std::filesystem::remove(errPath, ec);
+    }
     return r;
 }
 
