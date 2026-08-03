@@ -12,7 +12,7 @@ Windows / Linux / macOS ・ C++17 + Dear ImGui + GLFW ・ GPU 不要 ・ 単体�
 足せる場所が3つあります:
 
 - **プラグイン** — 測定を C の共有ライブラリで足す (同梱7本)
-- **入力アダプタ** — 読めない形式を Python の関数1つで読ませる (設計確定・実装中)
+- **リーダ** — 読めない形式を Python の関数1つで読ませる
 - **リモート** — 計算機側に peer を置き、ssh 越しに開く。回線を流れるのは
   見えている領域と測定結果だけ
 
@@ -162,9 +162,10 @@ CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 **書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
 PNG / JPEG / TIFF の**読み込みはありません**。
 
-### 読めない形式を読ませる — 入力アダプタ (実装中)
+### 読めない形式を読ませる — リーダ
 
-Python の関数を1つ書いて、viewer に指定します。
+**リーダは、あなたが書く Python の関数1つ**です。viewer はそれにパスを渡し、
+返ってきたものを開きます。
 
 ```python
 def load(path):
@@ -175,13 +176,20 @@ def load(path):
 
 返り値の**型が層を名乗る**ので、形の推測が要りません (配列をそのまま返すこともできます)。
 
-いま動くのは**手で叩くところまで**です。viewer からの呼び出しは配線中:
-
 ```
-python tools/import/run_adapter.py adapters/npz_keys.py:load sweep.npz out.npz
+File > Open With a Reader...        (Browse で読めないファイルをダブルクリックしても同じ)
+[New reader...]                     テンプレートを書き出して、あなたのエディタで開く
+[Load]                              走らせる。失敗すれば traceback がそのままパネルに出る
 ```
 
-仕様と段階は [docs/input-adapters.md](docs/input-adapters.md)。
+- 一度読めた **パスと関数の対応は憶えます**。次からは黙って同じリーダで開きます
+- リーダのファイルを編集すると、**次に開くとき自動で走り直します**
+- 結果はキャッシュするので、2回目は Python を起動しません
+- Inspector がそのファイルを「native で読んだか、どのリーダで読んだか」を言い、
+  `[change...]` `[edit]` `[native]` でいつでも変えられます
+
+Python は `numpy` があるものを探して使います。無ければ**どれを試して何が足りなかったか**を
+名指しで言います。仕様は [docs/input-adapters.md](docs/input-adapters.md)。
 
 ---
 
@@ -253,7 +261,7 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 | [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
 | [docs/manual.md](docs/manual.md) | 操作の手引き |
 | [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
-| [docs/input-adapters.md](docs/input-adapters.md) | 入力アダプタの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/input-adapters.md](docs/input-adapters.md) | リーダの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
 | [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
 | [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
 | [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
