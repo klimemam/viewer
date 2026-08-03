@@ -1,4 +1,7 @@
 ﻿分類,項目,内容,参照,備考
+残課題,ImageView フッタのツールチップが嘘をついている,"「frame %d / %d (drag; . and , step)」と出るが、,/. は Browse パネルでしか効かない(ImageView は左右矢印=gotoFrame)。ツールチップかキー割当のどちらかを合わせる",main.cpp:11072 vs 19023-19024,シーケンスバー作業の調査で発覚
+残課題,ImageView フッタが常駐数を総数として表示,footer は framesOfSeq().size() だけを見て expectedFrames を見ない。部分ロードの stack で「n/N」が言えていない(正典違反)。stackMembers()+expectedFrames が既存の正しい組,"main.cpp:11047-11073, 19486-19493",シーケンスバーで同時に直る見込み
+残課題,preview スロットの後始末2件,(1) closeAllImages が previewHost/previewPort を消し残す(dropPreview だけが消す) (2) stepPreviewFrame の frame-axis 分岐が openRemote の戻り値を捨てるので、失敗時に previewIndex は据え置きのまま preview doc だけ壊れる(file-stack 分岐には対策コメントつきのガードがある),"main.cpp:3326-3329, 9406-9414",小粒だが実害あり
 Claudeで対応進行中,CI 全落ちの修復(GL 無しランナー),c26f8da以降 windows/macos の Selftests が全失敗。原因は環境: 22本中21本がGLコンテキストを要求するが両ランナーに無い(既存のbench gateがLinux限定なのが傍証)。能力検知して『動かせない』と『落ちた』を区別し、GL無しでは名指しでskip・走ったものが落ちれば非ゼロ,".github/workflows/build.yml, tools/run_selftests.sh",Opus実装中。ログは管理者権限が要り読めないので次回実行が自己診断する形にさせる
 対応済み,項目0 stack派生,別stackと同名抽出などの規則でstackからstackを作る(コピー方式),c72fcdb,参照化で置換予定→暫定欄も参照
 対応済み,項目1+26 Preview/ダブルクリック,2回目リリースの誤発火が根。重複登録・幻の開き・Frame化を一掃,ce02f12,非0開始仮説は誤りと実証
