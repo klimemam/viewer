@@ -315,6 +315,83 @@ return [{"name": "dark", "frames": d},
 - 掃引データを stack として読ませてしまった場合の救済として、
   **後から series に組み替える**操作は既存の series 機能で可能
 
+### 3.10 型に嵌めたい場合 — 3段階、下ほど早く間違いが分かる
+
+「型に嵌めたい場合のベターな書き方は?」(2026-08-03)。
+**dict のゆるい形は残したまま**、上に2段を用意する。どれで書いても harness の
+受け取りは同じ (duck typing)。
+
+#### 段1: 素の配列 / dict (これまでどおり)
+
+```python
+def load(path): return np.load(path)["data"]
+```
+
+#### 段2: TypedDict — 実行時コストゼロ、エディタと mypy だけが賢くなる
+
+`viewer_import` は型定義も配る。**import しても実行時には何も起きない**ので、
+既存の dict の書き方を1文字も変えずに補完と型検査が効く。
+
+```python
+from viewer_import import StackDict          # typing.TypedDict
+
+def load(path) -> StackDict:
+    z = np.load(path)
+    return {"frames": z["data"],
+            "sweep": {"values": z["exposure_ms"], "name": "exposure", "unit": "ms"}}
+```
+
+キー名の綴り間違いがエディタ上で赤くなる。**動かす前に**分かる。
+
+#### 段3: dataclass — 構築した行で落ちる
+
+```python
+from viewer_import import Stack, Series, Frame, Batch, Axis, Sweep
+
+def load(path):
+    z = np.load(path)
+    return Series(
+        stacks=[Stack(frames=z["data"][i], name=f"{e:g}ms") for i, e in enumerate(z["exp"])],
+        sweep=Sweep(values=z["exp"], name="exposure", unit="ms"))
+```
+
+型名が層モデルそのもの (`Frame` / `Stack` / `Series` / `Batch`) なので、
+**書きながら語彙が身につく**。そして構築時に検査する:
+
+- `frames` の次元と `layout` の整合、5次元以上の拒否
+- `Series` の `sweep` の長さ == stack 数、`Axis` の長さ == frame 数
+- `cfa` が既知のパターン文字列か
+- 非数値 dtype の拒否
+
+**これが型に嵌める最大の利得**: 間違いが *harness が走ったあと* ではなく
+**間違えた行**で、その行の文脈つきで報告される。
+
+```
+Traceback (most recent call last):
+  File "adapters/acme.py", line 12, in load
+    sweep=Sweep(values=z["exp"], name="exposure", unit="ms"))
+ValueError: Series: sweep has 8 value(s) but there are 16 stack(s)
+```
+
+#### 便利コンストラクタ (よくある保存形の直書き)
+
+```python
+Series.from_array(arr, sweep=Sweep(exposures, "exposure", "ms"))
+#   (S,R,H,W) -> S 条件 x R 繰り返し / (S,H,W) -> S 条件 x 1 枚
+Stack.from_array(arr, axis=Axis(t, "time", "s"))
+Frame(pixels=img, cfa="RGGB")
+Batch([dark, flat], name="20260803_dark_sweep")
+```
+
+#### 実装上の約束
+
+- `viewer_import.py` は**単一ファイル・標準ライブラリのみ**。numpy すら import しない
+  (配列は触らず持ち回るだけ)。**コピーして持っていける**ことを保つ
+- torch は import しない。`__array__` / `.numpy()` を duck typing で見るだけ
+- dataclass は `frozen=True`。adapter が返したあとに誰も書き換えない
+- dict / TypedDict / dataclass の**どれで返しても同じ結果**になること自体を
+  harness の検査項目にする (3通りで同じ npz が出ることを assert)
+
 ## 4. 何が良くなるか
 
 - **推測が減る。** `--npy-axis` のような「人が形を教える」旗は、adapter が宣言する世界では要らない
