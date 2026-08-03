@@ -1,89 +1,101 @@
 ﻿分類,項目,内容,参照,備考
-"対応済み","項目0 stack派生","別stackと同名抽出などの規則でstackからstackを作る(コピー方式)","c72fcdb","参照化で置換予定→暫定欄も参照"
-"対応済み","項目1+26 Preview/ダブルクリック","2回目リリースの誤発火が根。重複登録・幻の開き・Frame化を一掃","ce02f12","非0開始仮説は誤りと実証"
-"対応済み","項目3 サイズ違いFit","大きい方に合わせてunionを収める","ecbe706","A3回答反映"
-"対応済み","項目4 `..`行","list/tree両方、常に行0、フィルタでも消えない","d359073, 3df373d",""
-"対応済み","項目10+A5 remote自動再接続","rbplace保存・インスタンス毎ワーカーで非同期接続","6683352","実ssh未検証"
-"対応済み","項目17 Browseインスタンス化","複数パネル、状態35個引越し、1インスタンス1ワーカー","6683352","6件のゲート解除"
-"対応済み","項目19欠陥 比較スロット","FilesにC,D表示/follow-frame/OFF=A単独/A=B paused","ecbe706",""
-"対応済み","項目21+A4 stale表示","淡色+TSVに(stale)語","35d31d8","throttle再計測は暫定欄"
-"対応済み","項目27 CFAサンプリング","Histogram/ROIでGr/Bが無サンプルだった","c12b623","閾値実測済み"
-"対応済み","項目28 別ウィンドウ","インスタンス別autosave(ロック+PID)/prefs副窓RO/カスケード","dc426c8","実2窓操作は未検証"
-"対応済み","Projectionサンプリング","ストライド偶数化でBプレーン全滅→セル単位歩行","47eec0c",""
-"対応済み","SNRカーブ","Linearityパネル内、解析検証付き","ecbe706",""
-"対応済み","Temporal書出再設計","3セクション矩形+provenance、A/B/スロット同居","7286f67","export-design.md"
-"対応済み","カスタムX軸","名前+単位+値貼付(改行/CSV可)、貸与、セッション保存","7286f67, 024c1a4",""
-"対応済み","チャートズーム","矩形ドラッグ拡大/ダブルクリック復帰/zoomed明示","024c1a4",""
-"対応済み","フレームリニアリティ","窓付きフィット+LE%チャート+書出。OLS/rev4-style選択","79488d3","暫定欄も参照"
-"対応済み","モンタージュper-frameレンジ","タイル毎0..1正規化、NOT DN明記","7bd0d9a",""
-"対応済み","シェブロン展開","tree展開を▶専用領域に。ダブルクリックのフラッシュ根絶","c5dbcad","1/24フレーム→0を実測"
-"対応済み","compare-ux 4件","値域が全スロットunion/メニュー簡素化+Aバッジ/ペイン2行/ESC離脱+席淡色","560ed2e",""
-"対応済み","C2 [remote xN]廃止","名前は正典のフォルダ/パターンのみ。旧セッション互換あり","cd41efe",""
-"対応済み","C3 zoom%移設","ステータスバー→Image Viewフッター右上","cd41efe",""
-"対応済み","画像書出","dot-by-dotコピー/PNG保存/ROIモンタージュ","1641cea",""
-"対応済み","Temporalチャート復活","ScrollXテーブルが高さを食い潰していた","f57c6f0",""
-"対応済み","参照化 stage1: FrameSource敷設","画素+出自を共有可能なFrameSourceへ分離(共有はまだ無し)。suite21本無変更で緑。敵対レビュー7体で潜在欠陥2件(npz基線/mosaicエイリアス)を検出し修正済み","880d2ae, docs/reference-design.md §2","挙動不変。cloneSource()がcrop CoWと共通"
-"対応済み","機能検証マトリクス + A/B数値不変性証明","50項目作成・26実行・24PASS/0FAIL。stage1前後の25コマンドA/B比較で数値ドリフト0(24/25バイト同一、残1はビルド自身のノイズ床以下を三重比較で証明)。較正=偽差注入で検出確認","docs/verify-functional.md","stage2/3/4/5の受入行17件はマージ後に再実行"
-"残課題","--srcmap-selftest probe","srcId/use_count/revをCLIから出す観測手段が無く「2つのdocが1つのsourceを共有」が外から検証不能。1本のprobeでstage2/3/5の受入行が全部解錠される","docs/verify-functional.md D節","検証エージェント提案"
-"残課題","browse-keys action相の時間上限","listing相には60s脱出があるがaction相は無制限。異常時にスイートが無限に待つ","main.cpp:28658 付近","E-6。小粒"
-"対応済み","UI検証マトリクス + selftest衛生修正","UI検証54項目(実行31/PASS31/FAIL0、較正証明つき)。検出したD-1=selftestが実layout.ini/autosaveを書く、を修正: スクリプト実行はlayoutを読みも書きもしない","docs/verify-ui.md","実機確認のみ7項目はD節に集約"
-"残課題","UI状態probe 2件(zoom%表示・ESCテキスト段)","状態がどこにも出ておらず自動検証不能。g_footerProbe/g_escProbe を足すと常時検証可能になる","docs/verify-ui.md E節","小粒。次のUI変更のついでに"
-"対応済み","Preview が勝手に開かれる不具合","autosave の saveSession が全previewを昇格させていた(変更3秒後に発火)。昇格をやめ、セッションに書かないだけにした。stack+一枚の二重登録も同時に解消。fail-first: still a preview=0/named in file=1","main.cpp writeSessionTo/saveSession, V9b","3e950e7"
-"対応済み","Auto Per Frame が選択直後に効かない","per-frame再フィットが selectImage にしか無く、モード選択時に走っていなかった。applyRangeMode() に括り出し、コンボもテストも同一関数を通す。fail-first: -999..1002 -> -999..1002 WRONG","main.cpp applyRangeMode, rangeselftest","3e950e7"
-"残課題","group の ImageView シーケンスバー","Browse内のプレビュー送り(< > スライダ , .)をImageView側へ。未取得コマの表現が要設計: 目盛りを常駐/取得中/未取得で塗り分け、未取得へ飛んだら取得するまで前のコマを出したままコマ番号は動かさない(嘘の絵を出さない)","報告 2026-08-03","設計→実装"
-"残課題","command palette (Ctrl+P / Ctrl+Shift+P) とメニュー整理","peer updateは自動化してメニューから削除。Ctrl+P=どこへ行くか / Ctrl+Shift+P=何をするか。前提: メニューを1テーブルから生成し palette も同じテーブルを引く(二重登録は必ず腐る)","docs/browse-topbar-design.md 10.8","順序: テーブル化→メニュー生成→palette"
-"レビュー必要項目","Browse全機能の棚卸しと要否判定","上部21ウィジェット+リスト/列/キー/右クリック10項目を全数列挙し、残す/降格/統合/廃止を判定。重複3件(bookmark・open folder・copy paths)を発見。常設21→6個。判断6点は推奨つき","docs/browse-inventory.md","案A/B/Cの選択と同時に回答いただきたい"
-"Claudeで対応進行中","参照化 修正34件+再レビュー(クレジット切れで中断)","ref-integrate @ 28ef105 は全緑(3 selftest+tripwire+suite21)。再レビュー10体中4体完了・6体がクレジット切れで失敗。確認2件(UNCロック下IO・promotePreview無効化欠落)+未反証3件が残るためmain統合は保留","ref-integrate, review journal wf_19459efb-b82","クレジット回復後に残レンズ(lifecycle)と反証4件を再実行"
-"対応済み","README/ARCHITECTURE 全面書き直し + pixelscope.html 削除","現在のViewerのみを記述(過去・将来を排除)。検証できない主張は載せない方針で、旧スクショ・未マージのstage2/3/5・EMVA準拠表現を除外。ARCHITECTUREはselftest22個と不変条件を明記","README.md, ARCHITECTURE.md","docs-refresh + repo-cleanup をmerge"
-"対応済み","バージョン表示をコミットハッシュに","v0.1が形骸化。ビルド時解決・未コミットは+local・エクスポート出所行にも反映。version.cppを別TUにしmain.cpp再コンパイルを回避","cmake/gitversion.cmake, core/version.*","e86fd27"
-"対応済み","Browse ツールバーの5ボタン撤去","< > up ~ refresh を削除(マウス4/5・..行・Backspace・places・F5で代替)。refresh/grp-flat/list-treeは…メニューへ、非既定モードはチップで自己申告","main.cpp Browse toolbar, docs/browse-topbar-design.md 10.2","6ecf98e"
-"対応済み","Browse more/less 引き出しの廃止と下端ステータス行","引き出しを削除し中身を各々の住家へ: ホスト名→タイトル Browse [ssh: host]、disconnect→下端行＋ルートクラム右クリック、★→パス行右端(点灯=登録済)、open folder→Fileメニュー、サーバ検索→…メニューのポップアップ(召喚チップへの統合は別ステップ)。上部のエラー帯とプロトコル警告行を削除し下端行へ集約。上部は2行固定で出没しない","main.cpp drawPanelRemote, docs/browse-topbar-design.md 10.2/10.3","browse-drawer。more_r→menu_rにパネル検査を変更(行末尾のボタンが変わったため)。chktitle/chkstat/chkstar/chkerr/chkproto を追加"
-"残課題","ROI統計の不具合調査(std=0, mean/min/max更新されず, x削除効かず)","実機報告2026-08-03。今日の変更は無関係(最終変更はf35a79e、V18は緑)。V18は関数直叩きでパネル/キャッシュ層は未検査 → パネル経由のprobeが必要","報告 2026-08-03","切り分け質問を送付済み"
-"対応済み","CI で selftest 22本を3OS matrixで実行","build.yml に Selftests ステップを追加。CMakeLists の enable_testing()+add_test が唯一のリスト、tools/run_selftests.sh が CI と手元の共通入口(build→fixture生成→ctest)。Linux は xvfb-run を各testごとに起動(21本が実GLFWウィンドウを作るため)。fixture は tools/gen_testdata.py が全部決定論的に生成(multi/linset/abset/levelfiles/bench_stack を追加)。bench 120フレームと viewer-serve --help の既存ゲートは維持",".github/workflows/build.yml, CMakeLists.txt, tools/run_selftests.sh","ローカルMinGWで22/22 PASS。ubuntu/macos/MSVC は未実行(CI初回で確認)"
-"残課題","--help と実装の食い違い3件","(1)--help が22あるselftestを8しか列挙せず(--verify-selftest等が未記載) (2)--remote-exe の既定は viewer ではなく ~/.viewer/viewer-serve (3)--bayer-pattern は --cfa より前に置かないと無視される","ARCHITECTURE.md 調査","docs-refreshエージェント発見"
-"残課題","ps_plugin.h の版表記ずれ / docs remote.md の陳腐化","ps_plugin.h 1行目が ABI v1 と書きつつ PS_ABI_VERSION=2。remote.md §8 は Fortran order 拒否・32bitサイズ・ssh:// CLI未配線と書くが全て現状と異なる(VERSION=5)","include/ps/ps_plugin.h, docs/remote.md","小粒だが誤情報"
-"レビュー必要項目","変換アダプタ(importer)構想【方向性の判断待ち】","形式の動物園をC++に飼うのは負け戦。外部プロセスが読んで層・軸・単位・CFAを宣言するmanifestを返す。remote peerと同じstdio機構の再利用で新機構ではない。Python参照実装を同梱。npz native修正とは独立","docs/import-adapters.md","決定4点。段階6つ"
-"Claudeで対応進行中","npz の key 対応(1次元を画像にしない/picker/軸候補)","1次元配列が高さ1の偽画像として開かれる欠陥を修正。npz=batch メンバ=stack/frame。frame数と長さ一致の1次元keyをper-frame軸として提案","docs/npz-design.md","Opusエージェント実装中"
-"Claudeで対応進行中","ROI統計の不具合(std=0/更新されず/x効かず)","パネル経由・キャッシュ層を通る検査が無いギャップを埋めつつ再現→根本原因修正。3症状のどれが再現するかも報告させる","報告2026-08-03","Opusエージェント調査中"
-"対応済み","NASのパスクリックでエラー(UNC)","//nas/share を / で分解し /nas を作っていた。UNC共有を1つの根として扱う。裸のC:も根ではない点を同時修正。V9cで検査","main.cpp pathSegments/pathRootOf","262a50b"
-"Claudeで対応進行中","docs の分割: Opusが原案 → Fableがレビュー","直下=今それを理解・変更するのに要るもの(現在形)、.background=なぜ他の形でないか。削除ではなく移動。原案はブランチ docs-split-draft に置きmainには入れない。main.cppの引用35箇所は触らず修正リストのみ出させる(C++側エージェントと衝突回避)","docs/ 全体, branch docs-split-draft","レビューはFable。分割線の判断根拠を全件報告させる"
-"残課題【Fable】","native 形の決め打ち + Inspector で読み方を言い直す","決定済: native=(H,W)/(H,W,3|4)/(F,H,W)/(F,H,W,C)。判定は次元数と最後の軸のみ、先頭の軸は見ない。--npy-axis 廃止し、後継はInspectorの「read as / re-read as」(ファイルごと・可視・セッションに残る)。失うもの(比較ピン等)は実行前に明示","docs/import-adapters.md §3","入力アダプタ stage 0"
-"レビュー必要項目","docs 分割の原案(Fableレビュー待ち)","28文書を文単位で分割し docs/.background/ へ。ブランチ docs-split-draft に置きmain未統合。判断根拠を全件報告済み。コード引用は35でなく97箇所(+tools/CI 13)と判明、main.cppは未修正で修正リストのみ","branch docs-split-draft","分割線の妥当性をFableがレビュー"
-"残課題","docs の内容矛盾7件(分割で発覚、未修正)","(1)remote.md §8が陳腐化(Fortran拒否/32bit/ssh未配線は全て現状と異なる) (2)startup.mdとremote.mdがFortran orderで矛盾 (3)remote.md §8内で実装済みと次にやることが矛盾 (4)imgui_modern_design.mdに空table (5)同 FrameRounding 5 vs 4・16px vs 17px の食い違い (6)同 削除済みPythonの記号を参照 (7)manual.md §9に--remote-policyが無い","docs-split-draft の報告","移動ではなく修正が要る"
-"残課題","main.cpp等のdoc引用97箇所の貼り直し","分割後、規則を引く箇所は直下・理由を引く箇所は.backgroundへ。C++側エージェントとの衝突回避のため原案では未実施","docs-split-draft の報告","分割をmergeする時に同時実施"
-"レビュー必要項目","Browse上部の再設計案(サーベイ済)","4系統20パターンのサーベイから収斂文法を抽出し3案提示。推奨=案A(定常1行+打鍵召喚チップ、入口統一でfilter/search二重入口が構成的に消滅)。未決6点は推奨既定値つき","docs/browse-topbar-design.md, browse-topbar-mockup.html","案の選択と未決6点の回答待ち。実装は選択後。比較モックアップは絵で確認可"
-"Claudeで対応進行中","参照化 stage2+3+5: 統合+レビュー修正","実装は3段とも完了しref-integrateへmerge済(suite21緑)。merge前敵対レビュー(49体)で36所見確認→2エージェントで修正中: 核心25件(registry再キー/crop占拠/preview登録/測定前公開/stat順序/mutex規律/local:拒否/npyAxis出自/FAT粒度) + 通知9件(closeBatch偽生存/tooltip誤帰属/chip解決不一致)","docs/reference-design.md, scratchpad review235","mainは検証済stage1のまま。全修正+再確認後に統合"
-"レビュー必要項目","部分reload後の混合世代stackの永続マーカー","stack reloadが部分失敗すると新旧世代が混ざるが、toast以外に痕跡が残らずσ_tが黙って2世代を混合する。source状態(remoteStep類似)として持つか、Watchの再poll任せか設計判断が必要","レビュー所見[24]","reload/Watch仕様の一部として要議論"
-"Claudeで対応進行中","参照化 stage5: reload walk + 手動Reload","reloadSourceの一箇所walk/temporal鍵にstackRev/temporalExtra forget修正/Files右クリックReload from disk。既知欠陥2件(7027鍵・2179forget)もここで塞ぐ","docs/reference-design.md §3.2","stage1のみ依存で並走。Watchの土台","docs/reference-design.md §8-9, watch-design.md","6段階、各段で suite 緑のまま出荷可"
-"残課題","項目20 Watch実装","設計完了後。仕様確定済(通知→手動Reload/stack再構築/mtime+size)","todo-open #20","参照実装とセット"
-"残課題","項目6 検索の複数選択","検索結果にrbSel参加+Stack/Frame開き","todo-open #6","stack化順序はレビュー欄C4"
-"残課題","項目7 検索進捗","件数/現在地のインクリメンタル表示。peerのGLOB変更要","todo-open #7",""
-"残課題","項目9 Histogram bin","整数/2べき乗スナップ。クリップ数の罠を文書化済み","todo-open #9","設計済・未実装"
-"残課題","項目11 Inspector remote行","rfWorkerがnoteを書かず行が出入りする。原因特定済","todo-open #11",""
-"残課題","項目13 スクラブ2重","BrowseとImage Viewでフレーム送りUIが2つ","todo-open #13",""
-"残課題","項目14 filter/search入口","統合の議論アイテム","todo-open #14",""
-"残課題","項目18 表示どおりコピー","glReadPixels方式。倍率の焼き込み判断含む","todo-open #18",""
-"残課題","項目22 パネル追加ボタン","右上からタブ追加。ImGui docking APIの制約調査済","todo-open #22",""
-"残課題","項目23 数値書式の一般解","11種の書式が散在。方針決めから","todo-open #23",""
-"残課題","共有測定カーネル+parity","σ_t CFA/NaNの二重実装解消。単体テスト必須化","TODO_one_implementation",""
-"残課題","未着手測定","DSNU/PRNU/欠陥画素/blink・RTS/DR/暗電流/時間平均出力","stats-taxonomy.md","平坦統計レビュー後"
-"残課題","フォーマット","OpenEXR(公式lib)/動画(ffmpeg)/ベタRAWリモート/params_schema","todo-open ほか",""
-"暫定対応したが後で直す","derive-stackのコピー方式","参照化で置換(選択と実体化は分離済みで差替は1関数)","c72fcdb→ref-design","今回の設計の主対象"
-"暫定対応したが後で直す","比較スロットcmpExtra","A/Bに載せた暫定。compare-n.mdのスロット列一本化へ","ecbe706, compare-n.md","レビュー後に本実装"
-"暫定対応したが後で直す","フレームリニアリティ残","設定のセッション未保存/単一stackローカルのみ/rev4原文未照合","79488d3","A/B側は案内ヘッダのみ"
-"暫定対応したが後で直す","Projection小数桁UI","1表専用の暫定。一般解は項目23","6047aab",""
-"暫定対応したが後で直す","B遅延throttle","stale表示で可視化済。300msの根拠再計測が残","35d31d8","A4回答の後半"
-"暫定対応したが後で直す","prefs副窓読み取り専用","最小対処。完全なマージ戦略は後","dc426c8",""
-"暫定対応したが後で直す","uiSession共有","複数Browseで異ホスト交互openは接続張り直し(最後勝ち)","6683352記録","参照/多窓設計と関連"
-"暫定対応したが後で直す","線形ストライド残渣","ensureDiffTexture表示用percentile/refHistogramミラー","f35a79e記録","影響軽微と判定済み"
-"暫定対応したが後で直す","abstats A2既知失敗","--cfa bayer併用時のB σ_t 1e-6不一致(スイート外)","temporal agent記録, CMakeLists.txt selftest.abstats-cfa-bayer","原因未調査。CIでは DISABLED で隔離(名前つき・run_selftests.sh が毎回出力)。assertは一切緩めていない。MinGW+merged main では10/10 PASSするため、修正済みか間欠かの切り分け待ち"
-"レビュー必要項目","平坦統計仕様(項目16+B2/B4/B5)","解析項目の分類を整えてから落ち着いてレビュー(ユーザー指示7/31)","flat-field-stats.md","実装凍結中"
-"レビュー必要項目","用語 stack/sequence(C1)","分類概念の再議論をユーザーが希望","todo-open #5",""
-"レビュー必要項目","検索結果のstack化仕様(C4)","並び順=時間軸の扱いを仕様議論","todo-open #6",""
-"レビュー必要項目","compare-n.md","N比較のあるべき姿(スロット列・A=カーソル・上限A+6)","docs/compare-n.md",""
-"レビュー必要項目","export-design.md","書出の形(セクション矩形)の追認","docs/export-design.md",""
-"レビュー必要項目","参照+Watch設計文書","執筆中→完成後に最重要レビュー","ref-design予定",""
-"レビュー必要項目","実機確認","見た目全般/別窓実操作/シェブロン/複数Browse/実ssh再接続/フレームリニアリティ表示","—","GLキャプチャ不可のため全て未目視"
-"残課題","TemporalStateキー欠陥","キャッシュキーにdata revisionが無い(main.cpp:7027) + forgetImageがtemporalExtraを見逃す(2183)","reference-design.md発見","参照化stage 5で同時修正予定だが独立して実バグ"
-"対応済み",".npz の key 対応","メンバを形で分類してから開く。1次元(N,)が「高さ1pxの絵」になる捏造を停止。npz=batch/メンバ=stack、picker(画像1つ+軸候補無しなら出さない)、frame数と一致する1次元keyをTemporalと同じ軸機構へ(単位はユーザー確定)、スカラー/文字列はInspectorへ、4次元超は拒否","npz-design.md §4, V19/V19b/V19c","リモートは未着手(プロトコル無変更)"
-"レビュー必要項目","plugin を Python(numpy/torch)で書く【方向性の判断待ち】","検討のみ・製品コード無し。推奨=常駐Python worker+共有メモリ。実測(12Mpx f32): 共有メモリの呼出往復0.04ms / ホストのフレーム書込2.5-3.0ms(フレーム変化時のみ) / 毎回プロセス起動は120-190ms・torchは1.2-1.4s。import-adapters §4の機構(起動・信頼・エディタ・パス記憶・Values・peer実行)は全部再利用し、運び屋だけnpz→共有メモリ。副産物でC側の穴2件を発見(出所行にplugin名/版が無い、単位規則がanalyzers.mdとimport-adapters.mdで逆)","docs/python-plugins.md","未決3点(A採否/単位は宣言優先/peer実装時期)。CUDA不在のためGPUは未測定。ベンチはtools/pyplugin-bench、出荷物に非混入をbyte比較で確認済"
+レビュー必要項目,Python プラグインの検討(常駐ワーカ+共有メモリを推奨),実測: 常駐ワーカ+共有メモリで1呼び出し0.04ms(最も安いCアナライザより速い)。毎回起動は120-190ms、torch は import だけで1.2-1.4秒なので常駐必須。numpyはC同等(noise: C 23.3ms vs py 29.7ms でCが勝つ)。入力アダプタの機構を丸ごと再利用し、運び屋だけ npz→共有メモリ に差し替える案,branch plugin-python-study @ 2b39edd,反論2点: peerの配備問題は実測不能(パリティが『2つのnumpyが最終ULPまで一致』に劣化) / ハングの始末機構が無い
+残課題,analyzer_stats の percentile が 12M 要素を qsort している,3つのパーセンタイルのために全体をソート。numpyはpartitionで済ませており、これが『Pythonの方が6.5-9倍速い』の正体(言語差ではなくアルゴリズム差)。nth_element相当に変えれば桁で縮む,plugins/analyzer_stats.c:101,Pythonプラグイン検討の副産物
+残課題,単位の規則が文書間で矛盾 / Analysis の provenance にプラグイン名が無い,"(1) analyzers.md は『キー名から host が単位を推測する』(unitForAnalysisKey, main.cpp:16594)、input-adapters.md §4.3.1 は『キー名から単位を推測しない』。Pythonアナライザはその間に落ちる。推奨: 宣言が勝つ (2) Analysisの出所行にプラグイン名・版・ファイルが記録されていない(main.cpp:16772-16794)","docs/analyzers.md, docs/input-adapters.md §4.3.1",どちらもPythonプラグインの前提条件
+残課題,ビルドが再現可能でない(PE TimeDateStamp),"同じツリーを2回ビルドすると全成果物が異なる。mingwがPEにタイムスタンプを打つため。-Wl,--no-insert-timestamp で同一になることは確認済み。エクスポートの出所行がコミットハッシュを名乗るのに、そのハッシュが唯一のバイナリを意味しない","CMakeLists.txt, docs/python-plugins.md §10.3",本日のハッシュ表示作業と関係
+残課題,LICENSE と THIRD-PARTY-NOTICES が無い【配布している以上、先に要る】,CIがmainへのmergeごとにbinariesブランチへforce-pushしており、これは配布。にもかかわらずLICENSEファイルが1つも無い。同梱するGLFW/ImGui/miniz/pfdの表示義務も未整理。LibRawを入れるならCDDL(LGPLの再リンク義務は自動公開の単一静的exeに合わない)を選ぶ判断も要る,"docs/media-formats.md §5, .github/workflows/build.yml",形式戦略の調査で発覚。RAW着手より前に置く
+レビュー必要項目,形式戦略の改訂版 C′(native = EXR + ベンダRAW、PNG/JPEG/TIFF はアダプタ),実測: LibRaw は EXR より安い(+11.8s/+0.95MiB vs +20.3s/+2.98MiB)。OIIO は raw を LibRaw 経由で読むので『タダで付いてくる』は嘘。実ファイル5社で raw_image が CFA/黒/白/ビット深度つきで取れ values=dn を正直に名乗れる。ただし Nikon は黒レベル0を申告しつつ画素は80-306 — 表示はするが黙って引かない。EXIF は meta へ、series の自動生成はしない(Olympus が絞り0/焦点0を返す=未設定が0で来る),branch media-format-strategy @ 5c507a8,反論2点も記載: LibRawのピン留めは陳腐化する / ユーザーが名指ししたPNG-JPEG-TIFFを『開けもしない』ままにする
+レビュー必要項目,OpenEXR 公式ライブラリ対応(実装済・main未統合),実測: +27s コールドビルド(+37%)、バイナリ +3.12MiB(+40.9%)。使わないとリンカが丸ごと落とすので増分は全部実コード。find_package優先→FetchContent(Imathを先に宣言してgit依存を回避)、VIEWER_WITH_EXR=ON既定、viewer-serveには載せない(peerはnpyのみ)。V23が23本、22/22緑。要判断: (1)EXRのlayer名にnpzMemberを流用 (2)fixtureがOpenEXRのwriterを使うため書き出しコードが製品バイナリに乗る (3)tiledは仕様に従い拒否だがInputFileは透過的に読める (4)Browseに.exrが出ない(isNpyName=リモートpeerと結合),branch media-openexr @ 319f0ea,形式戦略(RAW/EXIF込み)の判断材料。単独mergeせず一緒に決める
+レビュー必要項目,動画対応の判断(FFmpegは見送り、y4mを実装),実測: 8bit H.264 で σ_t=40 DN16 が 0.00 に消滅、表現可能なノイズも -11%、I frameがP frameより3.9%多く残す(GOP周期のバイアス)。FFmpeg一式95.6MB vs viewer.exe 7.6MB(12.6倍)、LGPL動的リンクで自己完結バイナリが終わる。代わりに依存ゼロのy4mリーダ(luma只、bit-exact、n/N)を実装し21形式を理由つきで拒否,"branch media-video @ c186187, docs/video-support.md",mainには入れていない。Fableレビュー待ち
+残課題,selftest を GL 非依存にする(ウィンドウ不要経路),22本中フレームを描くのは6本(browse-keys/tile/verify のROI/abstats/frame-lin/framestats)。残り15本は起動時に必ずウィンドウが作られるから巻き込まれているだけ。ウィンドウを作らない起動経路を1本足せば16/22が3OSでGL無しに走る。macOSのカバレッジが0→16本になる,".github/workflows/build.yml, core/main.cpp 起動部",決定(2026-08-03): ソフトウェアGLをランナーに入れる案は却下 — 価値のあるmacOSにはllvmpipe相当が無く、効く先(Windows)は開発機と重複。CI修正(能力検知)が土台なのでその後に着手
+残課題,ImageView フッタのツールチップが嘘をついている,"「frame %d / %d (drag; . and , step)」と出るが、,/. は Browse パネルでしか効かない(ImageView は左右矢印=gotoFrame)。ツールチップかキー割当のどちらかを合わせる",main.cpp:11072 vs 19023-19024,シーケンスバー作業の調査で発覚
+残課題,ImageView フッタが常駐数を総数として表示,footer は framesOfSeq().size() だけを見て expectedFrames を見ない。部分ロードの stack で「n/N」が言えていない(正典違反)。stackMembers()+expectedFrames が既存の正しい組,"main.cpp:11047-11073, 19486-19493",シーケンスバーで同時に直る見込み
+残課題,preview スロットの後始末2件,(1) closeAllImages が previewHost/previewPort を消し残す(dropPreview だけが消す) (2) stepPreviewFrame の frame-axis 分岐が openRemote の戻り値を捨てるので、失敗時に previewIndex は据え置きのまま preview doc だけ壊れる(file-stack 分岐には対策コメントつきのガードがある),"main.cpp:3326-3329, 9406-9414",小粒だが実害あり
+Claudeで対応進行中,CI 全落ちの修復(GL 無しランナー),c26f8da以降 windows/macos の Selftests が全失敗。原因は環境: 22本中21本がGLコンテキストを要求するが両ランナーに無い(既存のbench gateがLinux限定なのが傍証)。能力検知して『動かせない』と『落ちた』を区別し、GL無しでは名指しでskip・走ったものが落ちれば非ゼロ,".github/workflows/build.yml, tools/run_selftests.sh",Opus実装中。ログは管理者権限が要り読めないので次回実行が自己診断する形にさせる
+対応済み,項目0 stack派生,別stackと同名抽出などの規則でstackからstackを作る(コピー方式),c72fcdb,参照化で置換予定→暫定欄も参照
+対応済み,項目1+26 Preview/ダブルクリック,2回目リリースの誤発火が根。重複登録・幻の開き・Frame化を一掃,ce02f12,非0開始仮説は誤りと実証
+対応済み,項目3 サイズ違いFit,大きい方に合わせてunionを収める,ecbe706,A3回答反映
+対応済み,項目4 `..`行,list/tree両方、常に行0、フィルタでも消えない,"d359073, 3df373d",
+対応済み,項目10+A5 remote自動再接続,rbplace保存・インスタンス毎ワーカーで非同期接続,6683352,実ssh未検証
+対応済み,項目17 Browseインスタンス化,複数パネル、状態35個引越し、1インスタンス1ワーカー,6683352,6件のゲート解除
+対応済み,項目19欠陥 比較スロット,"FilesにC,D表示/follow-frame/OFF=A単独/A=B paused",ecbe706,
+対応済み,項目21+A4 stale表示,淡色+TSVに(stale)語,35d31d8,throttle再計測は暫定欄
+対応済み,項目27 CFAサンプリング,Histogram/ROIでGr/Bが無サンプルだった,c12b623,閾値実測済み
+対応済み,項目28 別ウィンドウ,インスタンス別autosave(ロック+PID)/prefs副窓RO/カスケード,dc426c8,実2窓操作は未検証
+対応済み,Projectionサンプリング,ストライド偶数化でBプレーン全滅→セル単位歩行,47eec0c,
+対応済み,SNRカーブ,Linearityパネル内、解析検証付き,ecbe706,
+対応済み,Temporal書出再設計,3セクション矩形+provenance、A/B/スロット同居,7286f67,export-design.md
+対応済み,カスタムX軸,名前+単位+値貼付(改行/CSV可)、貸与、セッション保存,"7286f67, 024c1a4",
+対応済み,チャートズーム,矩形ドラッグ拡大/ダブルクリック復帰/zoomed明示,024c1a4,
+対応済み,フレームリニアリティ,窓付きフィット+LE%チャート+書出。OLS/rev4-style選択,79488d3,暫定欄も参照
+対応済み,モンタージュper-frameレンジ,タイル毎0..1正規化、NOT DN明記,7bd0d9a,
+対応済み,シェブロン展開,tree展開を▶専用領域に。ダブルクリックのフラッシュ根絶,c5dbcad,1/24フレーム→0を実測
+対応済み,compare-ux 4件,値域が全スロットunion/メニュー簡素化+Aバッジ/ペイン2行/ESC離脱+席淡色,560ed2e,
+対応済み,C2 [remote xN]廃止,名前は正典のフォルダ/パターンのみ。旧セッション互換あり,cd41efe,
+対応済み,C3 zoom%移設,ステータスバー→Image Viewフッター右上,cd41efe,
+対応済み,画像書出,dot-by-dotコピー/PNG保存/ROIモンタージュ,1641cea,
+対応済み,Temporalチャート復活,ScrollXテーブルが高さを食い潰していた,f57c6f0,
+対応済み,参照化 stage1: FrameSource敷設,画素+出自を共有可能なFrameSourceへ分離(共有はまだ無し)。suite21本無変更で緑。敵対レビュー7体で潜在欠陥2件(npz基線/mosaicエイリアス)を検出し修正済み,"880d2ae, docs/reference-design.md §2",挙動不変。cloneSource()がcrop CoWと共通
+対応済み,機能検証マトリクス + A/B数値不変性証明,50項目作成・26実行・24PASS/0FAIL。stage1前後の25コマンドA/B比較で数値ドリフト0(24/25バイト同一、残1はビルド自身のノイズ床以下を三重比較で証明)。較正=偽差注入で検出確認,docs/verify-functional.md,stage2/3/4/5の受入行17件はマージ後に再実行
+残課題,--srcmap-selftest probe,srcId/use_count/revをCLIから出す観測手段が無く「2つのdocが1つのsourceを共有」が外から検証不能。1本のprobeでstage2/3/5の受入行が全部解錠される,docs/verify-functional.md D節,検証エージェント提案
+残課題,browse-keys action相の時間上限,listing相には60s脱出があるがaction相は無制限。異常時にスイートが無限に待つ,main.cpp:28658 付近,E-6。小粒
+対応済み,UI検証マトリクス + selftest衛生修正,UI検証54項目(実行31/PASS31/FAIL0、較正証明つき)。検出したD-1=selftestが実layout.ini/autosaveを書く、を修正: スクリプト実行はlayoutを読みも書きもしない,docs/verify-ui.md,実機確認のみ7項目はD節に集約
+残課題,UI状態probe 2件(zoom%表示・ESCテキスト段),状態がどこにも出ておらず自動検証不能。g_footerProbe/g_escProbe を足すと常時検証可能になる,docs/verify-ui.md E節,小粒。次のUI変更のついでに
+対応済み,Preview が勝手に開かれる不具合,autosave の saveSession が全previewを昇格させていた(変更3秒後に発火)。昇格をやめ、セッションに書かないだけにした。stack+一枚の二重登録も同時に解消。fail-first: still a preview=0/named in file=1,"main.cpp writeSessionTo/saveSession, V9b",3e950e7
+対応済み,Auto Per Frame が選択直後に効かない,per-frame再フィットが selectImage にしか無く、モード選択時に走っていなかった。applyRangeMode() に括り出し、コンボもテストも同一関数を通す。fail-first: -999..1002 -> -999..1002 WRONG,"main.cpp applyRangeMode, rangeselftest",3e950e7
+残課題,group の ImageView シーケンスバー,"Browse内のプレビュー送り(< > スライダ , .)をImageView側へ。未取得コマの表現が要設計: 目盛りを常駐/取得中/未取得で塗り分け、未取得へ飛んだら取得するまで前のコマを出したままコマ番号は動かさない(嘘の絵を出さない)",報告 2026-08-03,設計→実装
+残課題,command palette (Ctrl+P / Ctrl+Shift+P) とメニュー整理,peer updateは自動化してメニューから削除。Ctrl+P=どこへ行くか / Ctrl+Shift+P=何をするか。前提: メニューを1テーブルから生成し palette も同じテーブルを引く(二重登録は必ず腐る),docs/browse-topbar-design.md 10.8,順序: テーブル化→メニュー生成→palette
+レビュー必要項目,Browse全機能の棚卸しと要否判定,上部21ウィジェット+リスト/列/キー/右クリック10項目を全数列挙し、残す/降格/統合/廃止を判定。重複3件(bookmark・open folder・copy paths)を発見。常設21→6個。判断6点は推奨つき,docs/browse-inventory.md,案A/B/Cの選択と同時に回答いただきたい
+Claudeで対応進行中,参照化 修正34件+再レビュー(クレジット切れで中断),ref-integrate @ 28ef105 は全緑(3 selftest+tripwire+suite21)。再レビュー10体中4体完了・6体がクレジット切れで失敗。確認2件(UNCロック下IO・promotePreview無効化欠落)+未反証3件が残るためmain統合は保留,"ref-integrate, review journal wf_19459efb-b82",クレジット回復後に残レンズ(lifecycle)と反証4件を再実行
+対応済み,README/ARCHITECTURE 全面書き直し + pixelscope.html 削除,現在のViewerのみを記述(過去・将来を排除)。検証できない主張は載せない方針で、旧スクショ・未マージのstage2/3/5・EMVA準拠表現を除外。ARCHITECTUREはselftest22個と不変条件を明記,"README.md, ARCHITECTURE.md",docs-refresh + repo-cleanup をmerge
+対応済み,バージョン表示をコミットハッシュに,v0.1が形骸化。ビルド時解決・未コミットは+local・エクスポート出所行にも反映。version.cppを別TUにしmain.cpp再コンパイルを回避,"cmake/gitversion.cmake, core/version.*",e86fd27
+対応済み,Browse ツールバーの5ボタン撤去,< > up ~ refresh を削除(マウス4/5・..行・Backspace・places・F5で代替)。refresh/grp-flat/list-treeは…メニューへ、非既定モードはチップで自己申告,"main.cpp Browse toolbar, docs/browse-topbar-design.md 10.2",6ecf98e
+対応済み,Browse more/less 引き出しの廃止と下端ステータス行,引き出しを削除し中身を各々の住家へ: ホスト名→タイトル Browse [ssh: host]、disconnect→下端行＋ルートクラム右クリック、★→パス行右端(点灯=登録済)、open folder→Fileメニュー、サーバ検索→…メニューのポップアップ(召喚チップへの統合は別ステップ)。上部のエラー帯とプロトコル警告行を削除し下端行へ集約。上部は2行固定で出没しない,"main.cpp drawPanelRemote, docs/browse-topbar-design.md 10.2/10.3",browse-drawer。more_r→menu_rにパネル検査を変更(行末尾のボタンが変わったため)。chktitle/chkstat/chkstar/chkerr/chkproto を追加
+残課題,"ROI統計の不具合調査(std=0, mean/min/max更新されず, x削除効かず)",実機報告2026-08-03。今日の変更は無関係(最終変更はf35a79e、V18は緑)。V18は関数直叩きでパネル/キャッシュ層は未検査 → パネル経由のprobeが必要,報告 2026-08-03,切り分け質問を送付済み
+対応済み,CI で selftest 22本を3OS matrixで実行,build.yml に Selftests ステップを追加。CMakeLists の enable_testing()+add_test が唯一のリスト、tools/run_selftests.sh が CI と手元の共通入口(build→fixture生成→ctest)。Linux は xvfb-run を各testごとに起動(21本が実GLFWウィンドウを作るため)。fixture は tools/gen_testdata.py が全部決定論的に生成(multi/linset/abset/levelfiles/bench_stack を追加)。bench 120フレームと viewer-serve --help の既存ゲートは維持,".github/workflows/build.yml, CMakeLists.txt, tools/run_selftests.sh",ローカルMinGWで22/22 PASS。ubuntu/macos/MSVC は未実行(CI初回で確認)
+残課題,--help と実装の食い違い3件,(1)--help が22あるselftestを8しか列挙せず(--verify-selftest等が未記載) (2)--remote-exe の既定は viewer ではなく ~/.viewer/viewer-serve (3)--bayer-pattern は --cfa より前に置かないと無視される,ARCHITECTURE.md 調査,docs-refreshエージェント発見
+残課題,ps_plugin.h の版表記ずれ / docs remote.md の陳腐化,ps_plugin.h 1行目が ABI v1 と書きつつ PS_ABI_VERSION=2。remote.md §8 は Fortran order 拒否・32bitサイズ・ssh:// CLI未配線と書くが全て現状と異なる(VERSION=5),"include/ps/ps_plugin.h, docs/remote.md",小粒だが誤情報
+レビュー必要項目,変換アダプタ(importer)構想【方向性の判断待ち】,形式の動物園をC++に飼うのは負け戦。外部プロセスが読んで層・軸・単位・CFAを宣言するmanifestを返す。remote peerと同じstdio機構の再利用で新機構ではない。Python参照実装を同梱。npz native修正とは独立,docs/input-adapters.md,決定4点。段階6つ
+対応済み,npz の key 対応(1次元を画像にしない/picker/軸候補),1次元配列が高さ1の偽画像として開かれる欠陥を修正。npz=batch メンバ=stack/frame。frame数と長さ一致の1次元keyをper-frame軸として提案,docs/npz-design.md,Opusエージェント実装中 / 8045b6a
+対応済み,ROI統計の不具合(std=0/更新されず/x効かず),パネル経由・キャッシュ層を通る検査が無いギャップを埋めつつ再現→根本原因修正。3症状のどれが再現するかも報告させる,報告2026-08-03,Opusエージェント調査中 / d4a744e
+対応済み,NASのパスクリックでエラー(UNC),//nas/share を / で分解し /nas を作っていた。UNC共有を1つの根として扱う。裸のC:も根ではない点を同時修正。V9cで検査,main.cpp pathSegments/pathRootOf,262a50b
+レビュー必要項目,docs の分割: Opusが原案 → Fableがレビュー,直下=今それを理解・変更するのに要るもの(現在形)、.background=なぜ他の形でないか。削除ではなく移動。原案はブランチ docs-split-draft に置きmainには入れない。main.cppの引用35箇所は触らず修正リストのみ出させる(C++側エージェントと衝突回避),"docs/ 全体, branch docs-split-draft",レビューはFable。分割線の判断根拠を全件報告させる
+対応済み,native 形の決め打ち + Inspector で読み方を言い直す,"決定済: native=(H,W)/(H,W,3|4)/(F,H,W)/(F,H,W,C)。判定は次元数と最後の軸のみ、先頭の軸は見ない。--npy-axis 廃止し、後継はInspectorの「read as / re-read as」(ファイルごと・可視・セッションに残る)。失うもの(比較ピン等)は実行前に明示",docs/input-adapters.md §3,入力アダプタ stage 0 / adapter-native merged
+レビュー必要項目,docs 分割の原案(Fableレビュー待ち),28文書を文単位で分割し docs/.background/ へ。ブランチ docs-split-draft に置きmain未統合。判断根拠を全件報告済み。コード引用は35でなく97箇所(+tools/CI 13)と判明、main.cppは未修正で修正リストのみ,branch docs-split-draft,分割線の妥当性をFableがレビュー
+残課題,docs の内容矛盾7件(分割で発覚、未修正),(1)remote.md §8が陳腐化(Fortran拒否/32bit/ssh未配線は全て現状と異なる) (2)startup.mdとremote.mdがFortran orderで矛盾 (3)remote.md §8内で実装済みと次にやることが矛盾 (4)imgui_modern_design.mdに空table (5)同 FrameRounding 5 vs 4・16px vs 17px の食い違い (6)同 削除済みPythonの記号を参照 (7)manual.md §9に--remote-policyが無い,docs-split-draft の報告,移動ではなく修正が要る
+残課題,main.cpp等のdoc引用97箇所の貼り直し,分割後、規則を引く箇所は直下・理由を引く箇所は.backgroundへ。C++側エージェントとの衝突回避のため原案では未実施,docs-split-draft の報告,分割をmergeする時に同時実施
+レビュー必要項目,Browse上部の再設計案(サーベイ済),4系統20パターンのサーベイから収斂文法を抽出し3案提示。推奨=案A(定常1行+打鍵召喚チップ、入口統一でfilter/search二重入口が構成的に消滅)。未決6点は推奨既定値つき,"docs/browse-topbar-design.md, browse-topbar-mockup.html",案の選択と未決6点の回答待ち。実装は選択後。比較モックアップは絵で確認可
+Claudeで対応進行中,参照化 stage2+3+5: 統合+レビュー修正,実装は3段とも完了しref-integrateへmerge済(suite21緑)。merge前敵対レビュー(49体)で36所見確認→2エージェントで修正中: 核心25件(registry再キー/crop占拠/preview登録/測定前公開/stat順序/mutex規律/local:拒否/npyAxis出自/FAT粒度) + 通知9件(closeBatch偽生存/tooltip誤帰属/chip解決不一致),"docs/reference-design.md, scratchpad review235",mainは検証済stage1のまま。全修正+再確認後に統合
+レビュー必要項目,部分reload後の混合世代stackの永続マーカー,stack reloadが部分失敗すると新旧世代が混ざるが、toast以外に痕跡が残らずσ_tが黙って2世代を混合する。source状態(remoteStep類似)として持つか、Watchの再poll任せか設計判断が必要,レビュー所見[24],reload/Watch仕様の一部として要議論
+Claudeで対応進行中,参照化 stage5: reload walk + 手動Reload,reloadSourceの一箇所walk/temporal鍵にstackRev/temporalExtra forget修正/Files右クリックReload from disk。既知欠陥2件(7027鍵・2179forget)もここで塞ぐ,docs/reference-design.md §3.2,stage1のみ依存で並走。Watchの土台,"docs/reference-design.md §8-9, watch-design.md",6段階、各段で suite 緑のまま出荷可
+残課題,項目20 Watch実装,設計完了後。仕様確定済(通知→手動Reload/stack再構築/mtime+size),todo-open #20,参照実装とセット
+残課題,項目6 検索の複数選択,検索結果にrbSel参加+Stack/Frame開き,todo-open #6,stack化順序はレビュー欄C4
+残課題,項目7 検索進捗,件数/現在地のインクリメンタル表示。peerのGLOB変更要,todo-open #7,
+残課題,項目9 Histogram bin,整数/2べき乗スナップ。クリップ数の罠を文書化済み,todo-open #9,設計済・未実装
+残課題,項目11 Inspector remote行,rfWorkerがnoteを書かず行が出入りする。原因特定済,todo-open #11,
+残課題,項目13 スクラブ2重,BrowseとImage Viewでフレーム送りUIが2つ,todo-open #13,
+残課題,項目14 filter/search入口,統合の議論アイテム,todo-open #14,
+残課題,項目18 表示どおりコピー,glReadPixels方式。倍率の焼き込み判断含む,todo-open #18,
+残課題,項目22 パネル追加ボタン,右上からタブ追加。ImGui docking APIの制約調査済,todo-open #22,
+残課題,項目23 数値書式の一般解,11種の書式が散在。方針決めから,todo-open #23,
+残課題,共有測定カーネル+parity,σ_t CFA/NaNの二重実装解消。単体テスト必須化,TODO_one_implementation,
+残課題,未着手測定,DSNU/PRNU/欠陥画素/blink・RTS/DR/暗電流/時間平均出力,stats-taxonomy.md,平坦統計レビュー後
+残課題,フォーマット,OpenEXR(公式lib)/動画(ffmpeg)/ベタRAWリモート/params_schema,todo-open ほか,
+暫定対応したが後で直す,derive-stackのコピー方式,参照化で置換(選択と実体化は分離済みで差替は1関数),c72fcdb→ref-design,今回の設計の主対象
+暫定対応したが後で直す,比較スロットcmpExtra,A/Bに載せた暫定。compare-n.mdのスロット列一本化へ,"ecbe706, compare-n.md",レビュー後に本実装
+暫定対応したが後で直す,フレームリニアリティ残,設定のセッション未保存/単一stackローカルのみ/rev4原文未照合,79488d3,A/B側は案内ヘッダのみ
+暫定対応したが後で直す,Projection小数桁UI,1表専用の暫定。一般解は項目23,6047aab,
+暫定対応したが後で直す,B遅延throttle,stale表示で可視化済。300msの根拠再計測が残,35d31d8,A4回答の後半
+暫定対応したが後で直す,prefs副窓読み取り専用,最小対処。完全なマージ戦略は後,dc426c8,
+暫定対応したが後で直す,uiSession共有,複数Browseで異ホスト交互openは接続張り直し(最後勝ち),6683352記録,参照/多窓設計と関連
+暫定対応したが後で直す,線形ストライド残渣,ensureDiffTexture表示用percentile/refHistogramミラー,f35a79e記録,影響軽微と判定済み
+暫定対応したが後で直す,abstats A2既知失敗,--cfa bayer併用時のB σ_t 1e-6不一致(スイート外),"temporal agent記録, CMakeLists.txt selftest.abstats-cfa-bayer",原因未調査。CIでは DISABLED で隔離(名前つき・run_selftests.sh が毎回出力)。assertは一切緩めていない。MinGW+merged main では10/10 PASSするため、修正済みか間欠かの切り分け待ち
+レビュー必要項目,平坦統計仕様(項目16+B2/B4/B5),解析項目の分類を整えてから落ち着いてレビュー(ユーザー指示7/31),flat-field-stats.md,実装凍結中
+レビュー必要項目,用語 stack/sequence(C1),分類概念の再議論をユーザーが希望,todo-open #5,
+レビュー必要項目,検索結果のstack化仕様(C4),並び順=時間軸の扱いを仕様議論,todo-open #6,
+レビュー必要項目,compare-n.md,N比較のあるべき姿(スロット列・A=カーソル・上限A+6),docs/compare-n.md,
+レビュー必要項目,export-design.md,書出の形(セクション矩形)の追認,docs/export-design.md,
+レビュー必要項目,参照+Watch設計文書,執筆中→完成後に最重要レビュー,ref-design予定,
+レビュー必要項目,実機確認,見た目全般/別窓実操作/シェブロン/複数Browse/実ssh再接続/フレームリニアリティ表示,—,GLキャプチャ不可のため全て未目視
+残課題,TemporalStateキー欠陥,キャッシュキーにdata revisionが無い(main.cpp:7027) + forgetImageがtemporalExtraを見逃す(2183),reference-design.md発見,参照化stage 5で同時修正予定だが独立して実バグ
+対応済み,.npz の key 対応,"メンバを形で分類してから開く。1次元(N,)が「高さ1pxの絵」になる捏造を停止。npz=batch/メンバ=stack、picker(画像1つ+軸候補無しなら出さない)、frame数と一致する1次元keyをTemporalと同じ軸機構へ(単位はユーザー確定)、スカラー/文字列はInspectorへ、4次元超は拒否","npz-design.md §4, V19/V19b/V19c",リモートは未着手(プロトコル無変更)

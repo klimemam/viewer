@@ -142,22 +142,27 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 
 **配列の形の読み方**:
 
+判定は**次元数と、最後の軸だけ**です。先頭の軸の大きさは見ません。
+
 | shape | 読み方 |
 |---|---|
 | `(H,W)` | 1枚・1ch |
-| `(H,W,C)` / `(C,H,W)` | 1枚・C ch (C ≤ 4) |
-| `(F,H,W)` | **F 枚の stack** |
-| `(F,H,W,C)` | F 枚 × C ch |
+| `(H,W,C)` C ≤ 4 | **1枚**・C ch (`(H,W,1)` はモノクロ1枚、`(H,W,3)` はカラー) |
+| `(F,H,W)` | **F 枚の stack** (`(3,H,W)` も3枚) |
+| `(F,H,W,C)` C ≤ 4 | F 枚 × C ch |
+| 上記以外 | **読みません。**形と読める形を名指しして断ります |
 
-3次元は「C ch のカラー1枚」とも「F 枚の stack」とも読めます。既定は**先頭が 4 以下
-ならチャンネル**。連番と分かっているときは `--npy-axis frames` を付けます。
+**取り違えたときは Inspector で言い直せます** — 「read as / re-read as」に、
+その配列の形から計算できる読み方だけが並びます。選んだ読み方は**そのファイルに
+覚えられ**、セッションにも残ります。
+
 CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 (`--bayer-pattern` を後ろに置くと無視されます)。
 
 **書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
 PNG / JPEG / TIFF の**読み込みはありません**。
 
-### 読めない形式を読ませる — 入力アダプタ (設計確定・実装中)
+### 読めない形式を読ませる — 入力アダプタ (実装中)
 
 Python の関数を1つ書いて、viewer に指定します。
 
@@ -169,7 +174,14 @@ def load(path):
 ```
 
 返り値の**型が層を名乗る**ので、形の推測が要りません (配列をそのまま返すこともできます)。
-仕様と段階は [docs/import-adapters.md](docs/import-adapters.md)。**まだ動きません。**
+
+いま動くのは**手で叩くところまで**です。viewer からの呼び出しは配線中:
+
+```
+python tools/import/run_adapter.py adapters/npz_keys.py:load sweep.npz out.npz
+```
+
+仕様と段階は [docs/input-adapters.md](docs/input-adapters.md)。
 
 ---
 
@@ -241,18 +253,16 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 | [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
 | [docs/manual.md](docs/manual.md) | 操作の手引き |
 | [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
-| [docs/import-adapters.md](docs/import-adapters.md) | 入力アダプタの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/input-adapters.md](docs/input-adapters.md) | 入力アダプタの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
 | [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
 | [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
 | [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
 | [docs/tasks.csv](docs/tasks.csv) | 課題表 (対応済み / 進行中 / 残課題 / 暫定 / 要レビュー) |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 中を触る人向け |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | データモデル・フレームループ・不変条件 |
 
 ---
 
 ## ソースからビルド
-
-普段は上の「インストール」で足ります。ここから先は中を触る人向けです。
 
 **MSVC (Visual Studio 2022)**
 

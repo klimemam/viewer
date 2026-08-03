@@ -3,7 +3,7 @@
 > **2つの npz がある。** この文書は**人が `np.savez` で書いた npz** を viewer が
 > どう読むか。もう1つ、**viewer 自身が書く容器**があり (予約メンバ `__viewer` /
 > `__layer_<i>` / `__parent_<i>`)、そちらは
-> [import-adapters.md §4.11](import-adapters.md) にある。
+> [input-adapters.md §4.11](input-adapters.md) にある。
 > **区別は `__viewer` メンバの有無ひとつ**で、無ければこの文書の規則が働く。
 
 ユーザー提起 (2026-08-03):「npz で array 直ではなく、key が入った場合ってどういう対応しましょうかね」。
@@ -143,7 +143,7 @@ np.savez("sweep.npz",
 
 ### 2.5.4 2つの形の役割分担
 
-| | 人が書く形 (この文書) | viewer が書く容器 (import-adapters §4.11) |
+| | 人が書く形 (この文書) | viewer が書く容器 (input-adapters §4.11) |
 |---|---|---|
 | 誰が書く | 人 (`np.savez` 一行) | harness / viewer |
 | 曖昧さ | **ある**。picker で1回確定する | **無い**。層も軸も明示 |
