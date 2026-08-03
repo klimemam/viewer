@@ -195,6 +195,20 @@ ctest --test-dir "$build_dir" -C "$config" -L "$run_label" \
       --output-on-failure --no-tests=error
 rc=$?
 
+# Keep the evidence of a failing run. ctest writes every test's output to
+# Testing/Temporary/LastTest.log and the NEXT run overwrites it, so an
+# intermittent failure is routinely diagnosed by re-running -- which destroys
+# the only record of what it printed. Three separate investigations of
+# selftest.browse-keys have now lost the failure this way. Copy it aside
+# before anyone can re-run.
+if [ "$rc" -ne 0 ]; then
+    last="$build_dir/Testing/Temporary/LastTest.log"
+    if [ -f "$last" ]; then
+        kept="$build_dir/Testing/failed-$(date +%Y%m%d-%H%M%S).log"
+        cp "$last" "$kept" && echo "  kept the failing run's output: $kept"
+    fi
+fi
+
 echo
 echo "== skipped: no GL context (NOT a gate - these did NOT run) =="
 if [ "$n_skip" -eq 0 ]; then
