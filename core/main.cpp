@@ -131,6 +131,60 @@ static std::string dispPath(std::string p) {
     std::replace(p.begin(), p.end(), '\\', '/');
     return p;
 }
+
+// The shortest path that still names a volume - where "up" stops and what the
+// first breadcrumb points at. A UNC share is ONE root: \\nas\share names the
+// volume, and neither \\nas nor a bare \\ can be listed, so it must not be cut
+// into clickable "nas" / "share" pieces. A bare "C:" is not the drive's root
+// either - on Windows it means the process's current directory ON that drive.
+static std::string pathRootOf(const std::string& d) {
+    if (d.size() > 1 && d[0] == '/' && d[1] == '/') {          // //server/share
+        size_t srv = d.find('/', 2);
+        size_t shr = srv == std::string::npos ? std::string::npos : d.find('/', srv + 1);
+        return shr == std::string::npos ? d : d.substr(0, shr);
+    }
+    if (!d.empty() && d[0] == '~') return "~";
+    if (d.size() >= 2 && d[1] == ':') return d.substr(0, 2) + "/";
+    return "/";
+}
+
+// The path as clickable pieces: {what it reads as, where it goes}. Splitting a
+// path is not splitting on '/' - the root can be "/", "~", "C:/" or a whole
+// UNC share, and rebuilding a prefix from the pieces has to give back a path
+// that exists (a NAS reported 2026-08-03: clicking the path errored, while ".."
+// kept working, because "//nas/share/x" was being rebuilt as "/nas").
+struct PathSeg { std::string label, path; };
+static std::vector<PathSeg> pathSegments(const std::string& d) {
+    std::vector<PathSeg> segs;
+    size_t i = 0;
+    std::string root = pathRootOf(d);
+    if (d.size() > 1 && d[0] == '/' && d[1] == '/') {
+        segs.push_back({ root, root });
+        i = root.size() < d.size() ? root.size() + 1 : d.size();
+    } else if (!d.empty() && d[0] == '/') {
+        segs.push_back({ "/", "/" });
+        i = 1;
+    } else if (!d.empty() && d[0] == '~') {
+        segs.push_back({ "~", "~" });
+        i = d.size() > 1 && d[1] == '/' ? 2 : 1;
+    } else if (d.size() >= 2 && d[1] == ':') {
+        segs.push_back({ d.substr(0, 2), root });               // "C:" -> "C:/"
+        i = d.size() > 2 && d[2] == '/' ? 3 : 2;
+    }
+    while (i < d.size()) {
+        size_t s = d.find('/', i);
+        std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
+        if (!part.empty()) {
+            const std::string base = segs.empty() ? std::string() : segs.back().path;
+            segs.push_back({ part, base.empty()            ? part
+                                 : base.back() == '/'      ? base + part
+                                                           : base + "/" + part });
+        }
+        if (s == std::string::npos) break;
+        i = s + 1;
+    }
+    return segs;
+}
 static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
     float mag = powf(10.0f, floorf(log10f(std::max(raw, 1e-9f))));
     for (float m : {1.0f, 2.0f, 5.0f, 10.0f})
@@ -16384,38 +16438,24 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // it dies with the connection - see the field.
     std::string& rbSearchRoot = B.searchRoot;
     // where we are, and how to leave
-    bool atRoot = B.dir == "~" || B.dir == "/";
+    const std::string rbRoot = pathRootOf(B.dir);
+    bool atRoot = B.dir == rbRoot || B.dir == "~" || B.dir == "/";
     auto rbGoParent = [&]() {
         if (atRoot) return;
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
-        rbGoTo(I, s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                   : d.substr(0, s));
+        std::string up = s == std::string::npos || s == 0 ? rbRoot : d.substr(0, s);
+        // never step above the volume: the parent of "C:/data" is "C:/", not
+        // "C:" (a different place on Windows), and a UNC share has no parent
+        if (up.size() < rbRoot.size()) up = rbRoot;
+        rbGoTo(I, up);
     };
     // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     char* rbPathEdit = I.pathEdit;
     bool& rbPathEditing = I.pathEditing;
     bool& rbPathFocus = I.pathFocus;
     if (!rbPathEditing) {
-        struct Seg { std::string label, path; };
-        std::vector<Seg> segs;
-        const std::string& d = B.dir;
-        size_t i = 0;
-        if (!d.empty() && d[0] == '/')      { segs.push_back({ "/", "/" }); i = 1; }
-        else if (!d.empty() && d[0] == '~') { segs.push_back({ "~", "~" });
-                                              i = d.size() > 1 && d[1] == '/' ? 2 : 1; }
-        while (i < d.size()) {
-            size_t s = d.find('/', i);
-            std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
-            if (!part.empty()) {
-                std::string prefix = segs.empty() ? part
-                                   : segs.back().path == "/" ? "/" + part
-                                   : segs.back().path + "/" + part;
-                segs.push_back({ part, prefix });
-            }
-            if (s == std::string::npos) break;
-            i = s + 1;
-        }
+        std::vector<PathSeg> segs = pathSegments(B.dir);
         bool editReq = false;
         // The places dropdown sits at the LEFT EDGE of the path bar - a file
         // manager's address-bar chevron - instead of being a band of its own.
@@ -16509,7 +16549,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SameLine(0, 4);
         rbPlusButton();
         if (editReq) {
-            snprintf(rbPathEdit, sizeof I.pathEdit, "%s", d.c_str());
+            snprintf(rbPathEdit, sizeof I.pathEdit, "%s", B.dir.c_str());
             rbPathEditing = true;
             rbPathFocus = true;
         }
@@ -24221,6 +24261,30 @@ int main(int argc, char** argv) {
             check(app.previewUid == 0 && app.current >= 0 &&
                   app.current < (int)app.images.size(),
                   "V9 dropping the current preview re-points A in range");
+
+            // ---- V9c: a clicked path segment must rebuild a path that EXISTS.
+            // A NAS reported it: clicking the path errored while ".." kept
+            // working, because "//nas/share/x" was split on '/' and rebuilt as
+            // "/nas" - a UNC prefix does not survive being read as two folders.
+            {
+                struct { const char* dir; size_t n; const char* first; const char* last; } CASES[] = {
+                    { "//nas/share/2026/dark", 3, "//nas/share", "//nas/share/2026/dark" },
+                    { "//nas/share",           1, "//nas/share", "//nas/share" },
+                    { "C:/capt/run42",         3, "C:/",         "C:/capt/run42" },
+                    { "/data/run42",           3, "/",           "/data/run42" },
+                    { "~/capt",                2, "~",           "~/capt" },
+                };
+                bool segOk = true;
+                for (const auto& c : CASES) {
+                    std::vector<PathSeg> v = pathSegments(c.dir);
+                    std::string f = v.empty() ? "<none>" : v.front().path;
+                    std::string l = v.empty() ? "<none>" : v.back().path;
+                    fprintf(stderr, "verifyselftest: V9c \"%s\" -> %zu seg(s), first \"%s\", "
+                                    "last \"%s\"\n", c.dir, v.size(), f.c_str(), l.c_str());
+                    if (v.size() != c.n || f != c.first || l != c.last) segOk = false;
+                }
+                check(segOk, "V9c every path segment rebuilds a path that exists");
+            }
 
             // ...and SAVING a session must not turn the look into an open.
             // The autosave fires a few seconds after any change and went
