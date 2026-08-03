@@ -55,8 +55,21 @@ jobs:
       # ctest, printing one line per selftest and the full output of any that
       # fail. Same command a developer runs locally - that is the point of it.
       # It comes BEFORE packaging so a failed assert cannot ship a binary.
+      #
+      # The script probes for an OpenGL context first and reports what it found.
+      # Only the Linux runner has one (xvfb + libgl1-mesa-dri, installed above);
+      # on Windows and macOS the hosted runners have no GL, so the tests that
+      # need a window are skipped BY NAME with GLFW's own reason printed, and
+      # the rest still run and still gate. Read the "ran N, skipped M" line.
       - name: Selftests
         shell: bash
+        env:
+          # Linux is KNOWN to have a context here, so its absence would be a
+          # regression in THIS job rather than a fact about the machine: fail,
+          # do not skip. This is a statement about the runner we provisioned -
+          # what actually RUNS is still decided by the probe, on every OS, so
+          # Windows and macOS begin gating fully the day they gain a context.
+          VIEWER_SELFTEST_REQUIRE_GL: ${{ runner.os == 'Linux' && '1' || '' }}
         run: tools/run_selftests.sh build
       - name: Headless render + frame-time check
         if: runner.os == 'Linux'

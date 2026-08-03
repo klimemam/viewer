@@ -220,12 +220,13 @@ viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 # regenerates the whole tree on every run.
 enable_testing()
 
-# Only --remote-selftest returns before glfwCreateWindow(). The other 21 build
-# a real GLFW window and an OpenGL context - most of them VISIBLE, since
-# GLFW_VISIBLE is only cleared for --bench and --browse-keys-selftest - so on a
-# headless Linux box they need a display. Each test gets its own server via
-# `xvfb-run -a` rather than sharing one, so a server that dies takes one test
-# with it instead of the rest of the run.
+# Every selftest NOT marked NOGL below builds a real GLFW window and an OpenGL
+# context - most of them VISIBLE, since GLFW_VISIBLE is only cleared for --bench
+# and --browse-keys-selftest - so on a headless Linux box they need a display.
+# Each test gets its own server via `xvfb-run -a` rather than sharing one, so a
+# server that dies takes one test with it instead of the rest of the run.
+# (Only --remote-selftest returns before glfwCreateWindow() today. That is a
+# fact about startup, not about the tests: most of them never draw anything.)
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_program(XVFB_RUN xvfb-run)
@@ -249,15 +250,60 @@ file(MAKE_DIRECTORY ${VIEWER_TEST_HOME})
 # Relative fixture paths + WORKING_DIRECTORY at the source root, because
 # --picker-selftest falls back to the literal "tools/testdata/batchset" when
 # batchset is not a sibling of its own argument.
+#
+# Write NOGL as the first word to declare that a test needs no OpenGL context:
+#
+#     viewer_selftest(something NOGL --something-selftest tools/testdata/x)
+#
+# "Does this test need a GL context" is a PROPERTY OF THE TEST, carried here
+# beside the test itself, and deliberately NOT a list kept somewhere else.
+# Startup creates a window unconditionally today, so all but one of these need a
+# context even though only about six of them actually draw frames or inject
+# clicks. When a windowless startup path lands and a test stops needing one, the
+# entire edit is this one word - and that test starts running on all three OSes
+# with nothing in tools/run_selftests.sh to update. A list living in the harness
+# would have to be edited fifteen more times, and would go stale in silence the
+# first time it was not.
 function(viewer_selftest name)
+  set(args ${ARGN})
+  set(labels selftest)
+  set(launcher ${VIEWER_TEST_LAUNCHER})
+  if(args)
+    list(GET args 0 first)
+    if(first STREQUAL "NOGL")
+      list(REMOVE_AT args 0)
+      list(APPEND labels nogl)
+      set(launcher "")           # needs no display, so it needs no xvfb either
+    endif()
+  endif()
   add_test(NAME selftest.${name}
-           COMMAND ${VIEWER_TEST_LAUNCHER} $<TARGET_FILE:viewer> ${ARGN})
+           COMMAND ${launcher} $<TARGET_FILE:viewer> ${args})
   set_tests_properties(selftest.${name} PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
-    LABELS selftest
+    LABELS "${labels}"
     TIMEOUT 900)                 # the loaders' own budgets are 120-600 s
 endfunction()
+
+# ---- the capability gate ----------------------------------------------------
+# Which of the tests below can run here is a question about the MACHINE, not
+# about its OS name. `viewer --gl-probe` asks GLFW for exactly the context the
+# real window asks for and prints either the renderer it got or, from GLFW's own
+# error callback, why it got none. tools/run_selftests.sh runs this first: with
+# a context every selftest runs (Linux under xvfb today, and Windows or macOS
+# the day a runner gains one, with no change here); without one the `nogl` tests
+# still run and the rest are skipped BY NAME, with the reason printed.
+#
+# It carries its own label rather than `selftest`, so it never counts as one of
+# them - and it runs under the same ${VIEWER_TEST_LAUNCHER} they do, or it would
+# be answering for a different environment than the one they are given.
+add_test(NAME glprobe
+         COMMAND ${VIEWER_TEST_LAUNCHER} $<TARGET_FILE:viewer> --gl-probe)
+set_tests_properties(glprobe PROPERTIES
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
+  LABELS glprobe
+  TIMEOUT 300)
 
 viewer_selftest(series      --series-selftest tools/testdata/linset)
 viewer_selftest(lin         --lin-selftest --sequence always
@@ -287,17 +333,14 @@ viewer_selftest(newwin      --newwin-selftest tools/testdata)
 # writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
 viewer_selftest(sweepfile   --sweepfile-selftest tools/testdata/levelfiles)
 
-# --remote-selftest is the one flag that returns before glfwInit(), so it needs
-# no display - and it must be told where the standalone peer is, or it silently
-# tests this binary against itself instead of viewer-serve.
-add_test(NAME selftest.remote
-         COMMAND $<TARGET_FILE:viewer> --remote-selftest tools/testdata/bench_stack.npy
-                 --remote-exe $<TARGET_FILE:viewer-serve>)
-set_tests_properties(selftest.remote PROPERTIES
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
-  LABELS selftest
-  TIMEOUT 900)
+# --remote-selftest is the one flag that returns before glfwInit(), so it is the
+# one test that carries NOGL today - and it must be told where the standalone
+# peer is, or it silently tests this binary against itself instead of
+# viewer-serve. Being the only NOGL test makes it the only thing standing
+# between "we skipped the GL tests" and "we ran nothing and called it a pass",
+# which is why the summary counts what ran rather than trusting an exit code.
+viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
+                            --remote-exe $<TARGET_FILE:viewer-serve>)
 
 # ---- QUARANTINE -----------------------------------------------------------
 # Named, reasoned, and reported - never deleted and never loosened.
