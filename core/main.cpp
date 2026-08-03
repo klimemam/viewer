@@ -198,6 +198,18 @@ static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
 // §2.1). Held by ImageDoc through a shared_ptr so one frame can belong to
 // several stacks from stage 2 on; in stage 1 every source has exactly one
 // owner (use_count == 1) and behaviour is identical to the pre-split code.
+// The platform's shortcut modifier, spelled two ways: SC_MOD for the label a
+// menu shows, MODK for the chord a key test compares. They are declared
+// together because a build where they disagree advertises one key and answers
+// to another, and Browse needs MODK long before the menu bar is written.
+#if defined(__APPLE__)
+  #define SC_MOD "Cmd"
+  static const ImGuiKeyChord MODK = ImGuiMod_Super;
+#else
+  #define SC_MOD "Ctrl"
+  static const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
+#endif
+
 static std::atomic<uint64_t> g_nextSrcId{ 1 };
 struct FrameSource {
     std::vector<float> data;          // raw values, size w*h*ch
@@ -19821,8 +19833,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // folders would then dive into the first one and never come back
             if (!view[rbCursor].isDir()) rbActivateRow(view[rbCursor]);
         }
+        // Cmd/Ctrl+O rides with Enter (2026-08-03, user): on macOS that chord
+        // means "open what is selected", which is this, and never "show me a
+        // file dialog". Same code path, so the two cannot come to differ.
         if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+            ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) {
             int nSel = 0;
             for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
                 if (rbSel[i]) nSel++;
@@ -21711,11 +21727,6 @@ static void drawSequenceModal() {
 }
 
 // ---------------------------------------------------------------- menu bar / dialogs
-#if defined(__APPLE__)
-  #define SC_MOD "Cmd"
-#else
-  #define SC_MOD "Ctrl"
-#endif
 
 // Is what we are looking at somewhere else? A session being up counts (any
 // Browse instance), and so does an image that came from one: a dropped
@@ -22421,7 +22432,8 @@ static void drawHelpAbout() {
                 row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
                 row("Ctrl+N / Ctrl+P", "next / previous stack");
                 row("Ctrl+A / Ctrl+E", "first / last frame");
-                row(SC_MOD "+Shift+O", "open a folder (files: use Browse)");
+                row(SC_MOD "+O",       "open what is selected in Browse (or go there)");
+                row(SC_MOD "+Shift+O", "open a folder");
                 row(SC_MOD "+S",     "save session (view state + images)");
                 row(SC_MOD "+W",     "close current image");
                 row("F / double-click", "fit to window");
@@ -32230,11 +32242,6 @@ int main(int argc, char** argv) {
         // shortcuts
         pollFileDialog();
         pollReader();          // a running reader, and what it has printed so far
-#if defined(__APPLE__)
-        const ImGuiKeyChord MODK = ImGuiMod_Super;    // Cmd on macOS
-#else
-        const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
-#endif
         // modals (RAW dialog etc.) own the keyboard: no global shortcuts underneath —
         // Ctrl+W during reinterpret would shift the replaceIdx target image
         bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
@@ -32247,11 +32254,14 @@ int main(int argc, char** argv) {
         bool remoteFocused = nav && nav->RootWindow &&
                              rbIsBrowseWindowName(nav->RootWindow->Name);
         if (!io.WantTextInput && !popupOpen) {
-            // Cmd/Ctrl+O is NOT bound (2026-08-03). On macOS that chord means
-            // "open what is selected", which is Enter or a double-click in
-            // Browse - not "show me a file dialog". Binding it to the dialog
-            // taught the wrong thing on the platform where it already means
-            // something. Open Folder keeps its chord: nothing else claims it.
+            // Cmd/Ctrl+O means "open what is selected" (2026-08-03, user), the
+            // way it does on macOS - not "show me a file dialog". Inside Browse
+            // it rides with Enter, where the selection is. Outside it, there is
+            // no selection to open, so it goes to the place where there would
+            // be one rather than doing nothing at all.
+            if (!remoteFocused && ImGui::IsKeyChordPressed(MODK | ImGuiKey_O))
+                rbShowInstance(rbActive());
+            // Open Folder keeps its chord: nothing else claims it.
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             // the layer variants (docs/terminology.md): frame-only escape hatch

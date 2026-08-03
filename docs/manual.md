@@ -533,6 +533,7 @@ viewer [options] [files...]
 
 | キー | 動作 |
 |---|---|
+| `Ctrl/Cmd+O` | **Browse で選択しているものを開く**(Enter・ダブルクリックと同じ)。Browse にいないときは Browse を前に出す |
 | `Ctrl/Cmd+Shift+O` / `Ctrl/Cmd+S` | フォルダを開く / セッション保存 |
 | `Ctrl/Cmd+W` / `Ctrl/Cmd+Alt+W` / `Ctrl/Cmd+Shift+W` | **stack を閉じる**(単発 frame ならその1枚)/ **frame を1枚だけ**閉じる / **batch を閉じる** |
 | `P` | カーソル位置にピン(POI)を打つ |

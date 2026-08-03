@@ -157,21 +157,30 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                 sink->emit_number(sink->ctx, key, H);
             }
         }
-        {   /* The three the array is actually needed for. Selected in order and
-             * each search bounded below by the previous one: once p1 sits at its
-             * index nothing before it is larger, so p50 can only be above it.
-             * Same indices a sorted array would give, without sorting it. */
+        {   /* The three the array is actually needed for. Each search is bounded
+             * below by the previous one: once p1 sits at its index nothing
+             * before it is larger, so p50 can only be above it.
+             *
+             * Each value is READ AS SOON AS IT IS SELECTED, before the next call
+             * runs. A later selection rearranges a range that still contains the
+             * earlier index, so reading all three at the end depends on the
+             * partition happening to leave that index alone. This one does --
+             * Lomuto keeps a range's minimum at lo -- but that is a property of
+             * this implementation and not of the operation: std::nth_element,
+             * chained the same way, returns the wrong p1 and p50 (measured). A
+             * future change of pivot or partition would break it silently. */
             size_t k1  = (size_t)((double)(n - 1) * 0.01);
             size_t k50 = (size_t)((double)(n - 1) * 0.50);
             size_t k99 = (size_t)((double)(n - 1) * 0.99);
-            selectNth(scratch, 0,   n - 1, k1);
-            selectNth(scratch, k1,  n - 1, k50);
-            selectNth(scratch, k50, n - 1, k99);
+            float p1, p50, p99;
+            selectNth(scratch, 0,   n - 1, k1);   p1  = scratch[k1];
+            selectNth(scratch, k1,  n - 1, k50);  p50 = scratch[k50];
+            selectNth(scratch, k50, n - 1, k99);  p99 = scratch[k99];
             snprintf(key, sizeof key, "%s.min", names[c]); sink->emit_number(sink->ctx, key, vmin);
             snprintf(key, sizeof key, "%s.max", names[c]); sink->emit_number(sink->ctx, key, vmax);
-            snprintf(key, sizeof key, "%s.p1", names[c]);  sink->emit_number(sink->ctx, key, scratch[k1]);
-            snprintf(key, sizeof key, "%s.p50", names[c]); sink->emit_number(sink->ctx, key, scratch[k50]);
-            snprintf(key, sizeof key, "%s.p99", names[c]); sink->emit_number(sink->ctx, key, scratch[k99]);
+            snprintf(key, sizeof key, "%s.p1", names[c]);  sink->emit_number(sink->ctx, key, p1);
+            snprintf(key, sizeof key, "%s.p50", names[c]); sink->emit_number(sink->ctx, key, p50);
+            snprintf(key, sizeof key, "%s.p99", names[c]); sink->emit_number(sink->ctx, key, p99);
         }
     }
     if (npx * in->ch > 0)
