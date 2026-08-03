@@ -317,6 +317,33 @@ struct RbToolbarGeom {
     float rowX = 0, rowY = 0;              // centre of the first row submitted
 };
 
+// One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
+// (docs/npz-design.md §2.1). An .npz is a container: the file is a batch, a
+// member is a stack or a frame - and a member that is not pixels must never
+// become pixels. (Defined up here because App carries the member picker; the
+// scanner that fills these lives with the zip reader.)
+struct NpzMember {
+    enum Role {
+        RImage,    // 2-D+ and interpretable: opens as a stack or a frame
+        RAxis,     // 1-D numeric: the per-frame x axis, or metadata. NOT pixels
+        RMeta,     // scalar / string / object dtype: provenance, never opened
+        RAmbig,    // deeper than (F,H,W,C): which axis is frames? we do not guess
+        RBad       // this viewer cannot read it, and says why
+    };
+    std::string name;         // array name, without the ".npy" the zip member has
+    std::string shapeText;    // "(24, 480, 640)" / "scalar" - as WRITTEN
+    std::string dtype;        // "u16" ... or the raw descr when unreadable
+    std::string becomes;      // what it will become, in the picker's own words
+    std::string why;          // why it is not an image (RAxis/RMeta/RAmbig/RBad)
+    int role = RMeta;
+    int frames = 1;           // RImage: frames of the stack it makes (1 = a frame)
+    int w = 0, h = 0, ch = 1;
+    std::vector<double> vals; // RAxis: every value, at FULL precision (never float)
+    std::string text;         // RMeta: the value as text (fmtExact / the string)
+    bool selected = false;
+    size_t entry = 0;         // index into the zip listing
+};
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;
@@ -1143,6 +1170,25 @@ struct App {
     char pickSweepParam[64] = "";
     char pickSweepUnit[16] = "";
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
+    // ---- .npz member picker (docs/npz-design.md §2.3) ----------------------
+    // The SAME dialog as the folder picker, one layer down: an .npz is a batch
+    // and its members are the stacks and frames inside it, so the vocabulary,
+    // the All/None/Invert row and the accept path are the folder picker's.
+    // Raised only when there is a choice to make - a file holding one image and
+    // nothing else opens with no dialog at all, exactly as it does today.
+    std::vector<NpzMember> npzPick;
+    bool npzPickOpen = false;
+    std::string npzPickPath;          // the .npz these members came from
+    // The axis' NAME and UNIT are the user's to confirm. The key name is offered
+    // as the default label because it is the only honest starting point; the
+    // unit starts EMPTY and is never read out of the key name ("exposure_ms"
+    // does not prove milliseconds - docs/terminology.md: 単位を仮定しない).
+    char npzAxisName[64] = "";
+    char npzAxisUnit[16] = "";
+    // Members that are NOT pixels, kept per .npz file so the Inspector can show
+    // the file's provenance next to the frame it opened (docs/npz-design.md §2.5).
+    struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
+    std::vector<NpzMeta> npzMeta;
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
     bool anyFileDialog() const {      // see the note on csvDlg
@@ -3579,6 +3625,147 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  int& framesOut, int64_t& frameStrideOut);
 struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
 
+// ---- the .npy header, parsed ONCE -------------------------------------------
+// shape is the shape AS WRITTEN: a scalar is 0-D and stays 0-D here, because
+// "() versus (1,) versus (1,1)" is the whole question the .npz classifier asks.
+// esize 0 = a dtype this viewer cannot read as pixels (strings, object arrays);
+// that is a fact about the member, not an error, so the peek still succeeds and
+// the caller decides. The decoder and the classifier share this function so
+// what the picker promises and what actually opens cannot drift apart.
+struct NpyHead {
+    std::vector<int64_t> shape;
+    std::string descr;                // raw, e.g. "<u2" / "<U8" / "|O"
+    std::string code;                 // descr without the byte-order character
+    std::string dtypeName;            // "u16" ... empty when esize == 0
+    int esize = 0;
+    bool fortran = false, be = false;
+    size_t dataOff = 0;
+};
+static bool npyPeekHeader(const std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
+    auto fail = [&](const char* m) { err = m; return false; };
+    if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
+        return fail("not a .npy file (bad magic)");
+    int major = buf[6];
+    size_t hlen, hoff;
+    if (major >= 2) {
+        if (buf.size() < 12) return fail("corrupt npy header");
+        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
+    } else {
+        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
+    }
+    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
+    std::string hdr((char*)&buf[hoff], hlen);
+    auto findQuoted = [&](const char* key) -> std::string {
+        size_t k = hdr.find(key);
+        if (k == std::string::npos) return {};
+        size_t q1 = hdr.find('\'', hdr.find(':', k));
+        if (q1 == std::string::npos) return {};
+        size_t q2 = hdr.find('\'', q1 + 1);
+        return hdr.substr(q1 + 1, q2 - q1 - 1);
+    };
+    H.descr = findQuoted("'descr'");
+    if (H.descr.empty()) return fail("cannot parse descr");
+    H.fortran = hdr.find("'fortran_order': True") != std::string::npos;
+    size_t sp = hdr.find("'shape'");
+    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
+    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
+    H.shape.clear();
+    {
+        std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t c = s.find(',', pos);
+            std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+            if (tok.find_first_of("0123456789") != std::string::npos)
+                H.shape.push_back(std::stoll(tok));
+            if (c == std::string::npos) break;
+            pos = c + 1;
+        }
+    }
+    char bo = '<';
+    H.code = H.descr;
+    if (!H.code.empty() && (H.code[0] == '<' || H.code[0] == '>' ||
+                            H.code[0] == '|' || H.code[0] == '=')) {
+        bo = H.code[0]; H.code = H.code.substr(1);
+    }
+    H.be = (bo == '>');
+    H.esize = 0;
+    H.dtypeName.clear();
+    if      (H.code == "u1") { H.esize = 1; H.dtypeName = "u8"; }
+    else if (H.code == "i1") { H.esize = 1; H.dtypeName = "i8"; }
+    else if (H.code == "b1") { H.esize = 1; H.dtypeName = "bool"; }
+    else if (H.code == "u2") { H.esize = 2; H.dtypeName = "u16"; }
+    else if (H.code == "i2") { H.esize = 2; H.dtypeName = "i16"; }
+    else if (H.code == "u4") { H.esize = 4; H.dtypeName = "u32"; }
+    else if (H.code == "i4") { H.esize = 4; H.dtypeName = "i32"; }
+    else if (H.code == "f4") { H.esize = 4; H.dtypeName = "f32"; }
+    else if (H.code == "f8") { H.esize = 8; H.dtypeName = "f64"; }
+    H.dataOff = hoff + hlen;
+    return true;
+}
+
+// "(24, 480, 640)" / "scalar" - the shape a human recognises from the script
+// that wrote it, printed from the header and never from what we made of it.
+static std::string npyShapeText(const std::vector<int64_t>& shape) {
+    if (shape.empty()) return "scalar";
+    std::string s = "(";
+    for (size_t i = 0; i < shape.size(); i++) {
+        s += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s += ", ";
+        else if (shape.size() == 1) s += ",";
+    }
+    return s + ")";
+}
+
+// ---- which axis is what -----------------------------------------------------
+// The layout decision, lifted out of the decoder so the .npz picker can promise
+// exactly what will happen. shape and strides are consumed in lockstep; on
+// success F/H/W/C and their strides describe the frame to read.
+//
+// Deeper than (F,H,W,C) is REFUSED, naming the shape. It used to erase leading
+// axes until four were left and take [0] of each in silence: a (2,3,480,640,3)
+// array became one picture out of six with nothing on screen saying so, which
+// is the same fabrication as a 1-D array becoming a one-pixel-tall image.
+static bool npyLayout(std::vector<int64_t>& shape, std::vector<int64_t>& strides,
+                      int npyAxis, int64_t& F, int64_t& sf,
+                      int64_t& H, int64_t& W, int64_t& C,
+                      int64_t& sh, int64_t& sw, int64_t& sc,
+                      std::string& note, std::string& err) {
+    F = 1; sf = 0;
+    if (shape.size() > 4) {
+        err = std::to_string(shape.size()) + "-D array " + npyShapeText(shape) +
+              " - this viewer opens up to 4 axes (frames, height, width, channels); "
+              "say which axis is frames, or slice it before saving";
+        return false;
+    }
+    if (shape.size() == 4) {            // (F,H,W,C) or (F,C,H,W)
+        F = shape[0]; sf = strides[0];
+        shape.erase(shape.begin());
+        strides.erase(strides.begin());
+    } else if (shape.size() == 3) {
+        bool lastIsChannels = shape[2] <= 4;
+        bool firstIsChannels = shape[0] <= 4;
+        bool asFrames = !lastIsChannels &&
+                        (!firstIsChannels || npyAxis == 1);   // 1 = force frames
+        if (asFrames || (firstIsChannels && npyAxis == 1)) {
+            F = shape[0]; sf = strides[0];
+            shape.erase(shape.begin());
+            strides.erase(strides.begin());
+        }
+    }
+    if (shape.size() == 1) { H = 1; W = shape[0]; C = 1; sh = 0; sw = strides[0]; sc = 0; }
+    else if (shape.size() == 2) { H = shape[0]; W = shape[1]; C = 1; sh = strides[0]; sw = strides[1]; sc = 0; }
+    else {
+        if (shape[2] <= 4)      { H = shape[0]; W = shape[1]; C = shape[2]; sh = strides[0]; sw = strides[1]; sc = strides[2]; }
+        else if (shape[0] <= 4) { C = shape[0]; H = shape[1]; W = shape[2]; sc = strides[0]; sh = strides[1]; sw = strides[2];
+                                  note = note.empty() ? "CHW->HWC" : note + ", CHW->HWC"; }
+        else { err = "shape not interpretable as image"; return false; }
+    }
+    if (W < 1 || H < 1 || W > 32768 || H > 32768) { err = "unsupported image size"; return false; }
+    if (F > 1) note = note.empty() ? "frame axis" : note + ", frame axis";
+    return true;
+}
+
 static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
     auto rd16 = [&](size_t o) { return (uint16_t)(buf[o] | buf[o + 1] << 8); };
     auto rd32 = [&](size_t o) {
@@ -3697,6 +3884,11 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
         doc->seqIndex = f;
         computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        // ...and the batch, which addImage assigns to the HEAD frame only: these
+        // go straight into app.images, so a stack built inside one file used to
+        // have frame 0 in a batch and frames 1..N-1 in none (the folder path
+        // already does this, in pumpSequence). A stack is in ONE batch.
+        doc->batchId = ref->batchId;
         doc->texDirty = true;
         doc->uid = app.nextUid++;
         app.imagesRev++;
@@ -3711,38 +3903,293 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     return {};
 }
 
-// onlyMember != "" restores a single array (sessions record which one).
+// ---- classifying an .npz's members (docs/npz-design.md §2.1) ----------------
+// One element as a DOUBLE. An axis is the quantity data is plotted against, so
+// it never passes through float on the way in: the pixel path's getVal returns
+// float and that is right for pixels, but it is not right for 12345.678901234567.
+static double npyElem(const std::vector<uint8_t>& buf, const NpyHead& H, size_t i) {
+    const uint8_t* p = buf.data() + H.dataOff + i * (size_t)H.esize;
+    auto bswap = [](uint64_t v, int n) {
+        uint64_t r = 0;
+        for (int k = 0; k < n; k++) r = (r << 8) | ((v >> (8 * k)) & 0xff);
+        return r;
+    };
+    switch (H.esize) {
+    case 1: return H.code == "i1" ? (double)*(const int8_t*)p : (double)*p;
+    case 2: { uint16_t u; memcpy(&u, p, 2); if (H.be) u = (uint16_t)bswap(u, 2);
+              return H.code == "i2" ? (double)(int16_t)u : (double)u; }
+    case 4: { uint32_t u; memcpy(&u, p, 4); if (H.be) u = (uint32_t)bswap(u, 4);
+              if (H.code == "f4") { float f; memcpy(&f, &u, 4); return (double)f; }
+              return H.code == "i4" ? (double)(int32_t)u : (double)u; }
+    case 8: { uint64_t u; memcpy(&u, p, 8); if (H.be) u = bswap(u, 8);
+              double d; memcpy(&d, &u, 8); return d; }
+    }
+    return 0;
+}
+
+// A string member's value, so a "note" key can be SHOWN and not merely counted.
+// numpy writes <U as UCS-4 and |S as bytes. Anything else is left empty, which
+// reads as "not shown" - never as a guess at what the bytes meant.
+static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& H) {
+    if (H.code.empty() || H.dataOff >= buf.size()) return {};
+    size_t avail = buf.size() - H.dataOff;
+    const uint8_t* p = buf.data() + H.dataOff;
+    std::string s;
+    if (H.code[0] == 'S') {
+        for (size_t i = 0; i < avail && p[i]; i++) s += (char)p[i];
+    } else if (H.code[0] == 'U') {
+        for (size_t i = 0; i + 4 <= avail; i += 4) {
+            uint32_t c; memcpy(&c, p + i, 4);
+            if (H.be) c = ((c & 0xffu) << 24) | ((c & 0xff00u) << 8) |
+                          ((c >> 8) & 0xff00u) | (c >> 24);
+            if (!c) break;
+            if (c < 0x80) s += (char)c;                       // UTF-8, so a
+            else if (c < 0x800) { s += (char)(0xc0 | (c >> 6));       // non-ASCII
+                                  s += (char)(0x80 | (c & 0x3f)); }   // note is
+            else if (c < 0x10000) { s += (char)(0xe0 | (c >> 12));    // readable
+                                    s += (char)(0x80 | ((c >> 6) & 0x3f));
+                                    s += (char)(0x80 | (c & 0x3f)); }
+            else { s += (char)(0xf0 | (c >> 18));
+                   s += (char)(0x80 | ((c >> 12) & 0x3f));
+                   s += (char)(0x80 | ((c >> 6) & 0x3f));
+                   s += (char)(0x80 | (c & 0x3f)); }
+        }
+    }
+    if (s.size() > 120) s = s.substr(0, 117) + "...";
+    return s;
+}
+
+// Every member, classified BY SHAPE, before anything is opened. This is the
+// whole fix: the decision "is this pixels?" is made from the header, once, and
+// a member that is not pixels can no longer become pixels by falling through
+// into the image path.
+static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
+                                      const std::vector<NpzEntry>& entries) {
+    std::vector<NpzMember> out;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const NpzEntry& e = entries[i];
+        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
+        NpzMember m;
+        m.entry = i;
+        m.name = e.name.substr(0, e.name.size() - 4);
+        m.shapeText = "?";
+        m.dtype = "?";
+        std::vector<uint8_t> buf;
+        std::string err;
+        NpyHead H;
+        if (!npzExtract(zip, e, buf, err) || !npyPeekHeader(buf, H, err)) {
+            m.role = NpzMember::RBad;
+            m.becomes = "not opened";
+            m.why = err;
+            out.push_back(std::move(m));
+            continue;
+        }
+        m.shapeText = npyShapeText(H.shape);
+        m.dtype = H.dtypeName.empty() ? H.descr : H.dtypeName;
+        size_t n = 1;
+        for (int64_t d : H.shape) n *= (size_t)d;
+        if (H.esize == 0) {                       // strings, object arrays, ...
+            m.role = NpzMember::RMeta;
+            m.becomes = "metadata";
+            m.why = "dtype " + H.descr + " is not pixels";
+            m.text = npzTextValue(buf, H);
+            out.push_back(std::move(m));
+            continue;
+        }
+        if (H.shape.empty()) {                    // a 0-D scalar is a number, not a picture
+            m.role = NpzMember::RMeta;
+            m.becomes = "metadata";
+            m.why = "a scalar is not pixels";
+            if (H.dataOff + (size_t)H.esize <= buf.size()) m.text = fmtExact(npyElem(buf, H, 0));
+            out.push_back(std::move(m));
+            continue;
+        }
+        if (H.shape.size() == 1) {                // THE defect: (N,) used to be H=1,W=N
+            m.role = NpzMember::RAxis;
+            m.becomes = "metadata";               // upgraded to "x axis" when a
+            m.why = "a 1-D array is not pixels";  // stack of the same length opens
+            if (H.dataOff + n * (size_t)H.esize <= buf.size()) {
+                m.vals.reserve(n);
+                for (size_t k = 0; k < n; k++) m.vals.push_back(npyElem(buf, H, k));
+            }
+            out.push_back(std::move(m));
+            continue;
+        }
+        std::vector<int64_t> shape = H.shape, strides(shape.size());
+        if (H.fortran) { int64_t s = 1; for (size_t k = 0; k < shape.size(); k++) { strides[k] = s; s *= shape[k]; } }
+        else           { int64_t s = 1; for (int k = (int)shape.size() - 1; k >= 0; k--) { strides[k] = s; s *= shape[k]; } }
+        std::string note, lerr;
+        int64_t F, sf, Hh, Ww, Cc, sh, sw, sc;
+        if (!npyLayout(shape, strides, app.npyAxis, F, sf, Hh, Ww, Cc, sh, sw, sc, note, lerr)) {
+            // Named in one line, not merely counted: "not opened" tells a reader
+            // nothing, and this member is the one that used to become a picture
+            // by having its leading axes quietly thrown away.
+            m.role = H.shape.size() > 4 ? NpzMember::RAmbig : NpzMember::RBad;
+            m.becomes = H.shape.size() > 4
+                            ? std::to_string(H.shape.size()) + "-D: say which axis is frames"
+                            : "not an image: " + lerr;
+            m.why = lerr;
+            out.push_back(std::move(m));
+            continue;
+        }
+        m.role = NpzMember::RImage;
+        m.frames = (int)F;
+        m.w = (int)Ww; m.h = (int)Hh; m.ch = (int)Cc;
+        m.selected = true;                       // pixels are what an Open is for
+        m.becomes = F > 1 ? "stack of " + std::to_string((int)F) + " frames" : "frame";
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+// Open ONE image-shaped member: the stack (or the frame) it makes, tagged with
+// the array name so a session can come back to exactly this member.
+static std::string npzOpenMember(const std::string& path, const std::vector<uint8_t>& zip,
+                                 const NpzEntry& e, const std::string& arrayName) {
+    std::vector<uint8_t> member;
+    std::string mErr;
+    if (!npzExtract(zip, e, member, mErr)) return mErr;
+    size_t before = app.images.size();
+    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName);
+    if (!lErr.empty()) return lErr;
+    for (size_t k = before; k < app.images.size(); k++) {
+        app.images[k]->src->npzMember = arrayName;   // identity for session restore
+        // Watch baseline (§2.1): the npz FILE is the local file these pixels
+        // came from - src->path already names it; npzMember keeps members
+        // distinct in the future registry tuple (§6.2)
+        statSourceFile(*app.images[k]->src);
+    }
+    return {};
+}
+
+// Members that are not pixels, kept against the FILE so the Inspector can show
+// them beside the frame that did open (docs/npz-design.md §2.5 - provenance,
+// not a new panel).
+static void npzRememberMeta(const std::string& path, const std::vector<NpzMember>& mem) {
+    std::vector<std::pair<std::string, std::string>> items;
+    for (const auto& m : mem) {
+        if (m.role == NpzMember::RImage) continue;
+        std::string v = m.text;
+        if (v.empty() && m.role == NpzMember::RAxis)
+            v = std::to_string(m.vals.size()) + " value(s)";
+        items.emplace_back(m.name, m.shapeText + "  " + m.dtype + (v.empty() ? "" : "  = " + v));
+    }
+    for (auto& e : app.npzMeta)
+        if (e.path == path) { e.items = std::move(items); return; }
+    if (!items.empty()) app.npzMeta.push_back({ path, std::move(items) });
+}
+
+// What opened and what did not, BY NAME, in one line. Never silent in either
+// direction: "3 member(s) skipped" without their names is how the one-pixel-tall
+// exposure vector went unnoticed for as long as it did.
+static std::string npzSummary(const std::string& path, const std::vector<NpzMember>& mem,
+                              const std::vector<std::string>& openedNames,
+                              int stacks, int stackFrames, int loneFrames,
+                              const std::string& axisNote) {
+    std::string s = baseName(path) + ": ";
+    if (stacks || loneFrames) {
+        s += "opened ";
+        if (stacks) s += std::to_string(stacks) + " stack" + (stacks > 1 ? "s" : "") +
+                         " (" + std::to_string(stackFrames) + " frames)";
+        if (stacks && loneFrames) s += " + ";
+        if (loneFrames) s += std::to_string(loneFrames) + " frame" + (loneFrames > 1 ? "s" : "");
+    } else s += "opened nothing";
+    if (!axisNote.empty()) s += ", " + axisNote;
+    std::string notImg, notSel;
+    int nNotImg = 0, nNotSel = 0;
+    for (const auto& m : mem) {
+        bool wasOpened = false;
+        for (const auto& o : openedNames) if (o == m.name) { wasOpened = true; break; }
+        if (wasOpened) continue;
+        if (m.role == NpzMember::RImage) {
+            nNotSel++;
+            if (!notSel.empty()) notSel += ", ";
+            notSel += m.name + " " + m.shapeText;
+        } else {
+            nNotImg++;
+            if (!notImg.empty()) notImg += ", ";
+            notImg += m.name + " " + m.shapeText + " -> " + m.becomes;
+        }
+    }
+    if (nNotImg) s += ", " + std::to_string(nNotImg) + " member(s) not images: " + notImg;
+    if (nNotSel) s += ", " + std::to_string(nNotSel) + " image member(s) not opened: " + notSel;
+    return s;
+}
+
+// An .npz is a CONTAINER, not a picture (docs/npz-design.md §2): the FILE is a
+// batch and each member is a stack or a frame. Members are classified by shape
+// first, and nothing that is not an image is opened as one - the (N,) exposure
+// vector that used to arrive as a one-pixel-tall picture is offered as the
+// stack's x axis instead, and scalars / strings stay metadata.
+//
+// onlyMember != "" restores a single array (sessions record which one): no
+// picker and no batch of its own, because the session owns both.
 static std::string loadNpz(const std::string& path, const std::string& onlyMember = "") {
     std::vector<uint8_t> zip;
     if (!readFileBytes(path, zip)) return "cannot read file";
     std::vector<NpzEntry> entries;
     std::string err;
     if (!npzList(zip, entries, err)) return err;
-    int loaded = 0, stored = 0, deflated = 0;
-    for (const auto& e : entries) {
-        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
-        std::string arrayName = e.name.substr(0, e.name.size() - 4);
-        if (!onlyMember.empty() && arrayName != onlyMember) continue;
-        std::vector<uint8_t> member;
-        std::string mErr;
-        if (!npzExtract(zip, e, member, mErr)) { toast(e.name + ": " + mErr, true); continue; }
-        std::string label = baseName(path) + ":" + arrayName;
-        size_t before = app.images.size();
-        std::string lErr = loadNpyBuffer(member, path, label);
-        if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
-        for (size_t k = before; k < app.images.size(); k++) {
-            app.images[k]->src->npzMember = arrayName;   // identity for session restore
-            // Watch baseline (§2.1): the npz FILE is the local file these pixels
-            // came from - src->path already names it; npzMember keeps members
-            // distinct in the future registry tuple (§6.2)
-            statSourceFile(*app.images[k]->src);
+    std::vector<NpzMember> mem = npzScan(zip, entries);
+    if (mem.empty()) return "no arrays in npz";
+    if (!onlyMember.empty()) {
+        for (const auto& m : mem) {
+            if (m.name != onlyMember) continue;
+            if (m.role != NpzMember::RImage)
+                return "member " + onlyMember + " " + m.shapeText + " is not an image (" +
+                       m.why + ")";
+            npzRememberMeta(path, mem);
+            return npzOpenMember(path, zip, entries[m.entry], m.name);
         }
-        loaded++;
-        (e.method == 0 ? stored : deflated)++;
+        return "no member named " + onlyMember + " in this npz";
     }
-    if (!loaded) return "no readable arrays in npz";
-    fprintf(stderr, "npz: %s - %d array(s) (%d stored, %d deflate)\n",
-            baseName(path).c_str(), loaded, stored, deflated);
+    int images = 0, axes = 0;
+    for (const auto& m : mem) if (m.role == NpzMember::RImage) images++;
+    // An axis CANDIDATE is a 1-D numeric member exactly as long as some image
+    // member's frame count. Anything else 1-D stays metadata - and either way
+    // it is never pixels.
+    for (const auto& m : mem) {
+        if (m.role != NpzMember::RAxis || m.vals.empty()) continue;
+        for (const auto& im : mem)
+            if (im.role == NpzMember::RImage && im.frames > 1 &&
+                (size_t)im.frames == m.vals.size()) { axes++; break; }
+    }
+    // Nothing in here is pixels. Say what IS in here - a dialog whose only live
+    // button is Cancel answers a question nobody can act on.
+    if (images == 0) {
+        std::string what;
+        for (const auto& m : mem)
+            what += (what.empty() ? "" : ", ") + m.name + " " + m.shapeText + " " + m.dtype;
+        npzRememberMeta(path, mem);
+        return "no image-shaped arrays in this npz (" + what + ")";
+    }
+    // ONE image and nothing to decide: open it, no dialog. That is what an .npz
+    // holding a single array has always done and it must keep doing it.
+    if (images == 1 && axes == 0) {
+        npzRememberMeta(path, mem);
+        for (const auto& m : mem) {
+            if (m.role != NpzMember::RImage) continue;
+            // the file is the batch here too, so the two ways in agree
+            int prevBatch = app.loadBatchId;
+            app.loadBatchId = newBatch(uniqueBatchName(baseName(path)));
+            std::string oErr = npzOpenMember(path, zip, entries[m.entry], m.name);
+            app.loadBatchId = prevBatch;
+            if (!oErr.empty()) return baseName(path) + ":" + m.name + ": " + oErr;
+            std::string say = npzSummary(path, mem, { m.name }, m.frames > 1 ? 1 : 0,
+                                         m.frames > 1 ? m.frames : 0, m.frames > 1 ? 0 : 1,
+                                         "");
+            fprintf(stderr, "npz: %s\n", say.c_str());
+            toast(say);
+            return {};
+        }
+    }
+    // More than one picture, or a 1-D key that could be this stack's axis:
+    // ask, in the folder picker's words.
+    app.npzPick = std::move(mem);
+    app.npzPickPath = path;
+    app.npzAxisName[0] = '\0';        // the key name is offered when one is
+    app.npzAxisUnit[0] = '\0';        // ticked; the unit is NEVER pre-filled
+    app.npzPickOpen = true;
     return {};
 }
 
@@ -3773,6 +4220,11 @@ static std::string loadNpy(const std::string& path) {
         doc->seqIndex = f;
         computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        // ...and the batch, which addImage assigns to the HEAD frame only: these
+        // go straight into app.images, so a stack built inside one file used to
+        // have frame 0 in a batch and frames 1..N-1 in none (the folder path
+        // already does this, in pumpSequence). A stack is in ONE batch.
+        doc->batchId = ref->batchId;
         doc->texDirty = true;
         doc->uid = app.nextUid++;
         app.imagesRev++;
@@ -3838,72 +4290,24 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     framesOut = 1;
     frameStrideOut = 0;
-    if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
-        return fail("not a .npy file (bad magic)");
-    int major = buf[6];
-    size_t hlen, hoff;
-    if (major >= 2) {
-        if (buf.size() < 12) return fail("corrupt npy header");
-        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
-    } else {
-        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
-    }
-    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
-    std::string hdr((char*)&buf[hoff], hlen);
-
-    auto findQuoted = [&](const char* key) -> std::string {
-        size_t k = hdr.find(key);
-        if (k == std::string::npos) return {};
-        size_t q1 = hdr.find('\'', hdr.find(':', k));
-        if (q1 == std::string::npos) return {};
-        size_t q2 = hdr.find('\'', q1 + 1);
-        return hdr.substr(q1 + 1, q2 - q1 - 1);
-    };
-    std::string descr = findQuoted("'descr'");
-    if (descr.empty()) return fail("cannot parse descr");
-    bool fortran = hdr.find("'fortran_order': True") != std::string::npos;
-
-    size_t sp = hdr.find("'shape'");
-    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
-    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
-    std::vector<int64_t> shape;
-    {
-        std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
-        size_t pos = 0;
-        while (pos < s.size()) {
-            size_t c = s.find(',', pos);
-            std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
-            if (tok.find_first_of("0123456789") != std::string::npos)
-                shape.push_back(std::stoll(tok));
-            if (c == std::string::npos) break;
-            pos = c + 1;
-        }
-    }
+    // Header parsing lives in npyPeekHeader, which the .npz classifier also
+    // calls: one reading of the shape, so the picker cannot promise a stack the
+    // decoder then declines to build.
+    NpyHead Hd;
+    if (!npyPeekHeader(buf, Hd, errOut)) return {};
+    const std::string& descr = Hd.descr;
+    const std::string& code = Hd.code;
+    const std::string& dtypeName = Hd.dtypeName;
+    const bool fortran = Hd.fortran, be = Hd.be;
+    const int esize = Hd.esize;
+    if (esize == 0) { errOut = "unsupported dtype: " + descr; return {}; }
+    std::vector<int64_t> shape = Hd.shape;
     if (shape.empty()) shape.push_back(1);
-
-    char bo = '<';
-    std::string code = descr;
-    if (!code.empty() && (code[0] == '<' || code[0] == '>' || code[0] == '|' || code[0] == '=')) {
-        bo = code[0]; code = code.substr(1);
-    }
-    bool be = (bo == '>');
-    int esize = 0;
-    std::string dtypeName;
-    if      (code == "u1") { esize = 1; dtypeName = "u8"; }
-    else if (code == "i1") { esize = 1; dtypeName = "i8"; }
-    else if (code == "b1") { esize = 1; dtypeName = "bool"; }
-    else if (code == "u2") { esize = 2; dtypeName = "u16"; }
-    else if (code == "i2") { esize = 2; dtypeName = "i16"; }
-    else if (code == "u4") { esize = 4; dtypeName = "u32"; }
-    else if (code == "i4") { esize = 4; dtypeName = "i32"; }
-    else if (code == "f4") { esize = 4; dtypeName = "f32"; }
-    else if (code == "f8") { esize = 8; dtypeName = "f64"; }
-    else { errOut = "unsupported dtype: " + descr; return {}; }
 
     size_t count = 1;
     for (int64_t d : shape) count *= (size_t)d;
-    if (hoff + hlen + count * esize > buf.size()) return fail("file too small for shape");
-    const uint8_t* raw = &buf[hoff + hlen];
+    if (Hd.dataOff + count * esize > buf.size()) return fail("file too small for shape");
+    const uint8_t* raw = &buf[Hd.dataOff];
 
     auto bswap = [&](uint64_t v, int n) -> uint64_t {
         uint64_t r = 0;
@@ -3941,45 +4345,20 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     if (fortran) { int64_t s = 1; for (size_t i = 0; i < shape.size(); i++) { strides[i] = s; s *= shape[i]; } }
     else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
 
-    // Layout decision. A leading axis that is not a plausible channel count is a
-    // FRAME axis: (F,H,W) / (F,H,W,1) / (F,H,W,C) load as a stack, not as one
-    // image. app.npyAxis can force the ambiguous small-leading-axis case.
-    std::string note;
-    int64_t F = 1, sf = 0;
-    while (shape.size() > 4) {          // deeper than (F,H,W,C): take [0]
-        if (shape[0] != 1) note = "showing [0] of leading axis";
-        shape.erase(shape.begin());
-        strides.erase(strides.begin());
+    // Layout decision, in npyLayout so the .npz picker predicts with the same
+    // rule. A leading axis that is not a plausible channel count is a FRAME
+    // axis: (F,H,W) / (F,H,W,1) / (F,H,W,C) load as a stack, not as one image.
+    // app.npyAxis can force the ambiguous small-leading-axis case. Deeper than
+    // 4 axes is refused BY NAME instead of silently showing [0].
+    std::string note, lerr;
+    int64_t F = 1, sf = 0, H, W, C, sh, sw, sc;
+    if (!npyLayout(shape, strides, app.npyAxis, F, sf, H, W, C, sh, sw, sc, note, lerr)) {
+        errOut = lerr;
+        return {};
     }
-    if (shape.size() == 4) {            // (F,H,W,C) or (F,C,H,W)
-        F = shape[0]; sf = strides[0];
-        shape.erase(shape.begin());
-        strides.erase(strides.begin());
-    } else if (shape.size() == 3) {
-        bool lastIsChannels = shape[2] <= 4;
-        bool firstIsChannels = shape[0] <= 4;
-        bool asFrames = !lastIsChannels &&
-                        (!firstIsChannels || app.npyAxis == 1);   // 1 = force frames
-        if (asFrames || (firstIsChannels && app.npyAxis == 1)) {
-            F = shape[0]; sf = strides[0];
-            shape.erase(shape.begin());
-            strides.erase(strides.begin());
-        }
-    }
-    int64_t H, W, C, sh, sw, sc;
-    if (shape.size() == 1) { H = 1; W = shape[0]; C = 1; sh = 0; sw = strides[0]; sc = 0; }
-    else if (shape.size() == 2) { H = shape[0]; W = shape[1]; C = 1; sh = strides[0]; sw = strides[1]; sc = 0; }
-    else {
-        if (shape[2] <= 4)      { H = shape[0]; W = shape[1]; C = shape[2]; sh = strides[0]; sw = strides[1]; sc = strides[2]; }
-        else if (shape[0] <= 4) { C = shape[0]; H = shape[1]; W = shape[2]; sc = strides[0]; sh = strides[1]; sw = strides[2];
-                                  note = note.empty() ? "CHW->HWC" : note + ", CHW->HWC"; }
-        else return fail("shape not interpretable as image");
-    }
-    if (W < 1 || H < 1 || W > 32768 || H > 32768) return fail("unsupported image size");
     if (F > 1) {                        // multi-frame: caller turns this into a stack
         framesOut = (int)F;
         frameStrideOut = sf;
-        note = note.empty() ? "frame axis" : note + ", frame axis";
     }
 
     auto im = std::make_unique<ImageDoc>();
@@ -6821,6 +7200,95 @@ static void pickerAccept() {
     }
 }
 
+// ---- the .npz member picker's answer (docs/npz-design.md §2.3) --------------
+// The same shape as pickerAccept above, one layer down: no ImGui, so the
+// headless selftests and every auto-accept go through this exact function.
+//
+// The file is the BATCH (frame ⊂ stack ⊂ series ⊂ batch: an .npz is "what was
+// opened together", which is precisely a batch and nothing more). Members of
+// different shapes coexist inside it as separate stacks - that is the whole
+// point of a container.
+static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
+                               std::vector<double> vals, std::string& err);   // fwd
+static void npzPickAccept() {
+    std::vector<NpzMember> mem = std::move(app.npzPick);
+    std::string path = app.npzPickPath;
+    std::string axName = app.npzAxisName, axUnit = app.npzAxisUnit;
+    app.npzPick.clear();
+    app.npzPickOpen = false;
+    app.npzPickPath.clear();
+    if (path.empty() || mem.empty()) return;
+    std::vector<uint8_t> zip;
+    std::vector<NpzEntry> entries;
+    std::string err;
+    if (!readFileBytes(path, zip) || !npzList(zip, entries, err)) {
+        toast(baseName(path) + ": " + (err.empty() ? std::string("cannot read file") : err), true);
+        return;
+    }
+    npzRememberMeta(path, mem);
+    int prevBatch = app.loadBatchId;
+    app.loadBatchId = newBatch(uniqueBatchName(baseName(path)));
+    std::vector<std::string> openedNames;
+    std::vector<int> openedSeqs;
+    int stacks = 0, stackFrames = 0, loneFrames = 0;
+    for (const auto& m : mem) {
+        if (!m.selected || m.role != NpzMember::RImage) continue;
+        // by NAME, not by the index the scan recorded: the file could have been
+        // rewritten while the dialog stood open, and opening whatever now sits
+        // at that index under the old member's name is the quiet lie again
+        size_t at = entries.size();
+        for (size_t k = 0; k < entries.size(); k++)
+            if (entries[k].name == m.name + ".npy") { at = k; break; }
+        if (at == entries.size()) {
+            toast(baseName(path) + ": " + m.name + " is no longer in this file", true);
+            continue;
+        }
+        size_t before = app.images.size();
+        std::string oErr = npzOpenMember(path, zip, entries[at], m.name);
+        if (!oErr.empty()) { toast(baseName(path) + ":" + m.name + ": " + oErr, true); continue; }
+        openedNames.push_back(m.name);
+        int sid = 0;
+        for (size_t k = before; k < app.images.size(); k++)
+            if (app.images[k]->seqId) sid = app.images[k]->seqId;
+        if (sid) { stacks++; stackFrames += (int)framesOfSeq(sid).size(); openedSeqs.push_back(sid); }
+        else loneFrames += (int)(app.images.size() - before);
+    }
+    app.loadBatchId = prevBatch;
+    // ...and the axis, through the SAME call the Temporal panel's pasted axis
+    // makes. The values came out of the file at full precision; the NAME and the
+    // UNIT came from the human, which is the only way either of them is allowed
+    // to be set (a key called "exposure_ms" does not prove milliseconds).
+    std::string axisNote;
+    for (auto& m : mem) {
+        if (!m.selected || m.role != NpzMember::RAxis) continue;
+        int applied = 0;
+        std::string lastErr;
+        for (int sid : openedSeqs) {
+            if (framesOfSeq(sid).size() != m.vals.size()) continue;
+            std::string aerr;
+            if (applyFrameAxisVals(sid, axName.empty() ? m.name : axName, axUnit,
+                                   m.vals, aerr)) applied++;
+            else lastErr = aerr;
+        }
+        if (applied) {
+            axisNote = "x axis " + (axName.empty() ? m.name : axName) + " [" + axUnit +
+                       "] from " + m.name + " on " + std::to_string(applied) + " stack(s)";
+            // it is still not an image, and the summary still names it - but it
+            // says what the member BECAME rather than what it was declined for
+            m.becomes = "x axis [" + axUnit + "]";
+        } else {
+            axisNote = "x axis " + m.name + " NOT applied: " +
+                       (lastErr.empty() ? "no opened stack has " +
+                                          std::to_string(m.vals.size()) + " frames" : lastErr);
+        }
+        break;                     // one axis per Open: one name, one unit
+    }
+    std::string say = npzSummary(path, mem, openedNames, stacks, stackFrames,
+                                 loneFrames, axisNote);
+    fprintf(stderr, "npz: %s\n", say.c_str());
+    toast(say, stacks == 0 && loneFrames == 0);
+}
+
 // Tree of what the scan found. One live filter narrows FILES as you type;
 // checkboxes choose groups; the footer picks between "one stack per sequence"
 // and "everything as ONE stack". Group count is capped at 256 by the scans, so
@@ -7151,6 +7619,181 @@ static void drawFolderPickModal() {
     if (load) {
         ImGui::CloseCurrentPopup();
         pickerAccept();                // same call the headless selftests make
+    }
+    ImGui::EndPopup();
+}
+
+// What is inside this .npz, and what each member will BECOME. The folder
+// picker's dialog one layer down: same wording, same All/None/Invert row, same
+// "N selected" footer, same Cancel-decides-nothing rule - a container's members
+// are not a new concept and do not get a second vocabulary.
+//
+// The one thing this picker has that the folder picker does not is the x AXIS:
+// a 1-D key as long as the stack is the quantity its frames were captured
+// against, and it goes into the same SeqInfo the Temporal panel's pasted column
+// fills. Its name and unit are typed here by the person opening the file -
+// nothing is read out of the key name.
+static void drawNpzPickModal() {
+    if (app.npzPickOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        fprintf(stderr, "npz picker: OpenPopup (%s, %d members)\n",
+                baseName(app.npzPickPath).c_str(), (int)app.npzPick.size());
+        ImGui::OpenPopup("Select arrays");
+    }
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 420 * app.uiScale), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 14),
+                                        ImVec2(FLT_MAX, FLT_MAX));
+    if (!ImGui::BeginPopupModal("Select arrays", nullptr)) return;
+
+    ImGui::TextDisabled("%s", dispPath(app.npzPickPath).c_str());
+    int selImages = 0, nImages = 0, selFrames = 0, axisRow = -1;
+    for (size_t i = 0; i < app.npzPick.size(); i++) {
+        const NpzMember& m = app.npzPick[i];
+        if (m.role == NpzMember::RImage) {
+            nImages++;
+            if (m.selected) { selImages++; selFrames += m.frames; }
+        } else if (m.role == NpzMember::RAxis && m.selected) axisRow = (int)i;
+    }
+    // does the ticked axis have a ticked stack of its length to belong to?
+    bool axisFits = false;
+    if (axisRow >= 0)
+        for (const auto& m : app.npzPick)
+            if (m.role == NpzMember::RImage && m.selected && m.frames > 1 &&
+                (size_t)m.frames == app.npzPick[axisRow].vals.size()) axisFits = true;
+    ImGui::TextDisabled("%d member(s), %d of them image-shaped",
+                        (int)app.npzPick.size(), nImages);
+    if (ImGui::SmallButton("All")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Invert")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = !m.selected;
+    }
+    ImGui::Separator();
+
+    float footer = ImGui::GetFrameHeightWithSpacing() * (axisRow >= 0 ? 3 : 2) +
+                   ImGui::GetTextLineHeightWithSpacing() * 2;
+    ImGui::BeginChild("npztree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
+    if (ImGui::BeginTable("npzmembers", 4,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("array", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+        ImGui::TableSetupColumn("shape", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+        ImGui::TableSetupColumn("dtype", ImGuiTableColumnFlags_WidthStretch, 0.12f);
+        ImGui::TableSetupColumn("becomes", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < app.npzPick.size(); i++) {
+            NpzMember& m = app.npzPick[i];
+            ImGui::TableNextRow();
+            ImGui::PushID((int)i);
+            ImGui::TableSetColumnIndex(0);
+            bool pickable = m.role == NpzMember::RImage || m.role == NpzMember::RAxis;
+            ImGui::BeginDisabled(!pickable);
+            bool wasSel = m.selected;
+            if (ImGui::Checkbox("##sel", &m.selected) && m.role == NpzMember::RAxis) {
+                // ONE axis per Open: one name, one unit. Ticking a second one
+                // would silently relabel the first with the second's name.
+                if (!wasSel) {
+                    for (size_t k = 0; k < app.npzPick.size(); k++)
+                        if (k != i && app.npzPick[k].role == NpzMember::RAxis)
+                            app.npzPick[k].selected = false;
+                    snprintf(app.npzAxisName, sizeof app.npzAxisName, "%s", m.name.c_str());
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextUnformatted(m.name.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(m.shapeText.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextDisabled("%s", m.dtype.c_str());
+            ImGui::TableSetColumnIndex(3);
+            if (m.role == NpzMember::RImage) {
+                ImGui::TextUnformatted(m.becomes.c_str());
+            } else if (m.role == NpzMember::RAxis) {
+                bool fits = false;
+                for (const auto& o : app.npzPick)
+                    if (o.role == NpzMember::RImage && o.selected && o.frames > 1 &&
+                        (size_t)o.frames == m.vals.size()) fits = true;
+                if (!fits)
+                    ImGui::TextDisabled("metadata (no %d-frame stack ticked)", (int)m.vals.size());
+                else if (m.selected && !app.npzAxisUnit[0])
+                    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "x axis - needs a unit");
+                else if (m.selected)
+                    ImGui::Text("x axis in %s", app.npzAxisUnit);
+                else
+                    ImGui::TextDisabled("could be the x axis");
+            } else {
+                ImGui::TextDisabled("%s", m.becomes.c_str());
+            }
+            if (!m.why.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", m.why.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    if (axisRow >= 0) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("x axis:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+        ImGui::InputTextWithHint("##npzaxname", "name", app.npzAxisName, sizeof app.npzAxisName);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("what frame i physically IS: exposure, illuminance,\n"
+                              "elapsed time ... the key's name is only the default");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        ImGui::InputTextWithHint("##npzaxunit", "unit", app.npzAxisUnit, sizeof app.npzAxisUnit);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ms, lx, C ... NOT read from the key name: \"exposure_ms\"\n"
+                              "is a name somebody chose, not a proof of milliseconds.\n"
+                              "No unit, no axis - which is the honest answer.");
+    }
+    // one honesty line, always drawn so the footer height does not jump
+    if (axisRow >= 0 && !axisFits)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                           "no ticked stack has %d frames - the axis will not be applied",
+                           (int)app.npzPick[axisRow].vals.size());
+    else if (axisRow >= 0 && !app.npzAxisUnit[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                           "the axis needs a unit - without one it is not applied "
+                           "(a unit is never assumed)");
+    else if (axisRow >= 0)
+        ImGui::TextDisabled("%d value(s) become the x axis of a %d-frame stack, exactly "
+                            "as pasted values do",
+                            (int)app.npzPick[axisRow].vals.size(),
+                            (int)app.npzPick[axisRow].vals.size());
+    else
+        ImGui::NewLine();
+    ImGui::Text("selected: %d array(s), %d frame(s)", selImages, selFrames);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("batch:");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(baseName(app.npzPickPath).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the file is the batch: everything opened from it lands\n"
+                          "under ONE heading in Files, named after the file");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(selImages == 0);
+    bool open = ImGui::Button("Load selected", ImVec2(150 * app.uiScale, 0));
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
+        app.npzPick.clear();
+        app.npzPickOpen = false;
+        app.npzPickPath.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    if (open) {
+        ImGui::CloseCurrentPopup();
+        npzPickAccept();               // same call the headless selftests make
     }
     ImGui::EndPopup();
 }
@@ -8635,9 +9278,11 @@ static void openPath(const std::string& path) {
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
     } else if (ends(".npz")) {
+        // loadNpz says what it did (or raises the member picker, which says it
+        // after): a blanket "loaded x.npz" over a dialog would be a lie about
+        // both what happened and when
         std::string err = loadNpz(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
-        else toast("loaded " + baseName(path));
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -10711,6 +11356,25 @@ static void drawInspector() {
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
+        // Where these pixels came from inside their container, and what else the
+        // container held. An .npz member's provenance is the file PLUS the array
+        // name, and the members that are not pixels (exposure, gain, a note) are
+        // the reason the file was written that way - so they belong beside it
+        // rather than in a panel of their own (docs/npz-design.md §2.5).
+        if (!im->src->npzMember.empty()) {
+            ImGui::TextDisabled("npz member  %s", im->src->npzMember.c_str());
+            for (const auto& e : app.npzMeta) {
+                if (e.path != im->src->path) continue;
+                if (e.items.empty()) break;
+                if (ImGui::TreeNodeEx("##npzmeta", ImGuiTreeNodeFlags_SpanAvailWidth,
+                                      "other members (%d)", (int)e.items.size())) {
+                    for (const auto& kv : e.items)
+                        ImGui::TextDisabled("%s   %s", kv.first.c_str(), kv.second.c_str());
+                    ImGui::TreePop();
+                }
+                break;
+            }
+        }
         if (im->ch == 1) {
             // interpretation axis: change what the 1ch data means AFTER opening
             const char* modes[3] = { "Gray", "Bayer", "Quad Bayer" };
@@ -13366,24 +14030,18 @@ static bool parseAxisValues(const std::string& text, std::vector<double>& out,
 // must equal the stack's frame count - against the EXPECTED total for a
 // partially loaded stack. A mismatch refuses with both numbers: a partial
 // mapping silently truncating either side is the classic quiet lie.
-static bool applyFrameAxis(int seqId, const char* name, const char* unit,
-                           const std::string& text, std::string& err) {
+// The axis itself, once the values exist. Both ways of giving them - pasting a
+// column into the Temporal panel and ticking a 1-D key in the .npz picker -
+// land HERE, so the two cannot drift into two different ideas of what an axis
+// is (and a key read out of a file gets no relaxation of the rules a pasted
+// column obeys: the unit is required of both).
+static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
+                               std::vector<double> vals, std::string& err) {
     App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "not a stack"; return false; }
-    auto trim = [](std::string s) {
-        size_t a = s.find_first_not_of(" \t\r\n");
-        size_t b = s.find_last_not_of(" \t\r\n");
-        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-    };
-    std::string nm = trim(name ? name : ""), un = trim(unit ? unit : "");
-    if (nm.empty() || un.empty()) {
+    if (name.empty() || unit.empty()) {
         err = "the axis needs a NAME and a UNIT - a bare list of numbers "
               "cannot label an axis (the unit is never assumed)";
-        return false;
-    }
-    std::vector<double> vals;
-    if (!parseAxisValues(text, vals, err)) {
-        if (err.empty()) err = "no values";
         return false;
     }
     int n = (int)framesOfSeq(seqId).size();
@@ -13397,10 +14055,35 @@ static bool applyFrameAxis(int seqId, const char* name, const char* unit,
         err = b;
         return false;
     }
-    si->axisName = nm;
-    si->axisUnit = un;
+    si->axisName = name;
+    si->axisUnit = unit;
     si->axisVals = std::move(vals);
     return true;
+}
+
+static bool applyFrameAxis(int seqId, const char* name, const char* unit,
+                           const std::string& text, std::string& err) {
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!si) { err = "not a stack"; return false; }
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string nm = trim(name ? name : ""), un = trim(unit ? unit : "");
+    // name and unit are checked BEFORE the values are parsed: an unlabelled
+    // paste is refused for what it is, not for the first bad token in it
+    if (nm.empty() || un.empty()) {
+        err = "the axis needs a NAME and a UNIT - a bare list of numbers "
+              "cannot label an axis (the unit is never assumed)";
+        return false;
+    }
+    std::vector<double> vals;
+    if (!parseAxisValues(text, vals, err)) {
+        if (err.empty()) err = "no values";
+        return false;
+    }
+    return applyFrameAxisVals(seqId, nm, un, std::move(vals), err);
 }
 
 // ---- frame-wise linearity (interim) -----------------------------------------
@@ -24895,6 +25578,262 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- V19: an .npz is a BATCH of members; a 1-D key is not a picture --
+        // docs/npz-design.md §1: loadNpz opened EVERY *.npy member in silence and
+        // decodeNpyBuffer maps a 1-D (N,) array to H=1,W=N - so a per-frame
+        // exposure vector arrived as a one-pixel-tall PICTURE and a scalar as a
+        // 1x1 one. That is fabrication, which this project forbids.
+        //
+        // The fixture is what a capture script actually writes, built HERE so the
+        // test needs no Python (miniz is linked; npzList/npzExtract are the format):
+        //     data        (4,8,8) uint16   -> the stack
+        //     dark        (8,8)   uint16   -> a frame
+        //     exposure_ms (4,)    float64  -> the per-frame x AXIS, not pixels
+        //     gain        scalar  float64  -> metadata
+        // What has to hold: nothing that is not an image becomes an ImageDoc, the
+        // frame-axis member opens as ONE stack of 4, the 1-D member whose length
+        // matches can BECOME that stack's axis at full precision, the counts are
+        // said in both directions by name, and a session round-trip brings back
+        // the same member with its axis.
+        {
+            closeAll();
+            // (4,8,8) is the OTHER ambiguity, and an old one: a leading 4 is as
+            // plausible a channel count as a frame count, and the existing
+            // heuristic reads it as CHW. --npy-axis frames is the control that
+            // exists for exactly this; V19 is about members, not about that
+            // heuristic, so it says which one it means and puts it back.
+            int npyAxisWas = app.npyAxis;
+            app.npyAxis = 1;
+            std::error_code nec;
+            std::filesystem::path ndir =
+                std::filesystem::path(g_verifySelftest) / "vfy-npz-scratch";
+            std::filesystem::create_directories(ndir, nec);   // ours: ours to remove
+            // one .npy member as bytes
+            auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
+                               const void* data, size_t nbytes) {
+                std::string sh;
+                if (shape.empty()) sh = "()";
+                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+                else {
+                    sh = "(";
+                    for (size_t i = 0; i < shape.size(); i++)
+                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+                    sh += ")";
+                }
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+                out.insert(out.end(), magic, magic + 8);
+                out.push_back((uint8_t)(hdr.size() & 0xff));
+                out.push_back((uint8_t)(hdr.size() >> 8));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                return out;
+            };
+            // a stored (method 0) zip: local headers, central directory, EOCD
+            auto writeNpz = [](const std::string& path,
+                               const std::vector<std::pair<std::string,
+                                                           std::vector<uint8_t>>>& mem) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff)); z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                std::vector<uint32_t> offs, crcs;
+                for (const auto& m : mem) {
+                    offs.push_back((uint32_t)z.size());
+                    crcs.push_back((uint32_t)mz_crc32(MZ_CRC32_INIT, m.second.data(),
+                                                      m.second.size()));
+                    p32(0x04034b50); p16(20); p16(0); p16(0); p16(0); p16(0);
+                    p32(crcs.back()); p32((uint32_t)m.second.size());
+                    p32((uint32_t)m.second.size());
+                    p16((uint32_t)m.first.size()); p16(0);
+                    z.insert(z.end(), m.first.begin(), m.first.end());
+                    z.insert(z.end(), m.second.begin(), m.second.end());
+                }
+                uint32_t cdOff = (uint32_t)z.size();
+                for (size_t i = 0; i < mem.size(); i++) {
+                    p32(0x02014b50); p16(20); p16(20); p16(0); p16(0); p16(0); p16(0);
+                    p32(crcs[i]); p32((uint32_t)mem[i].second.size());
+                    p32((uint32_t)mem[i].second.size());
+                    p16((uint32_t)mem[i].first.size()); p16(0); p16(0);
+                    p16(0); p16(0); p32(0); p32(offs[i]);
+                    z.insert(z.end(), mem[i].first.begin(), mem[i].first.end());
+                }
+                uint32_t cdSize = (uint32_t)z.size() - cdOff;   // before the EOCD
+                p32(0x06054b50); p16(0); p16(0);
+                p16((uint32_t)mem.size()); p16((uint32_t)mem.size());
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            std::vector<uint16_t> data((size_t)4 * 8 * 8);
+            for (int f = 0; f < 4; f++)
+                for (int i = 0; i < 64; i++) data[(size_t)f * 64 + i] = (uint16_t)(1000 + f * 100 + i);
+            std::vector<uint16_t> dark(64, 7);
+            // values a float32 round trip would destroy: an axis is DATA
+            const double EXP[4] = { 0.5, 2.5, 12.75, 12345.678901234567 };
+            const double GAIN = 1.5;
+            std::string npzPath = (ndir / "sweep.npz").u8string();
+            writeNpz(npzPath, {
+                { "data.npy",        npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                { "dark.npy",        npyBytes("<u2", { 8, 8 },    dark.data(), dark.size() * 2) },
+                { "exposure_ms.npy", npyBytes("<f8", { 4 },       EXP, sizeof EXP) },
+                { "gain.npy",        npyBytes("<f8", { },         &GAIN, sizeof GAIN) },
+            });
+
+            // Two image-shaped members and a 1-D key as long as one of them:
+            // there is something to decide, so the picker comes up - and it is
+            // driven here through the same call the button makes.
+            std::string oerr = loadNpz(npzPath);
+            check(app.npzPickOpen && app.npzPick.size() == 4,
+                  "V19 a multi-member npz raises the member picker");
+            {
+                std::string roles;
+                for (const auto& m : app.npzPick)
+                    roles += (roles.empty() ? "" : ", ") + m.name + " " + m.shapeText +
+                             " " + m.dtype + " -> " + m.becomes;
+                fprintf(stderr, "verifyselftest: V19 picker: %s\n", roles.c_str());
+            }
+            bool sawImage = false, sawAxis = false, sawScalar = false;
+            for (auto& m : app.npzPick) {
+                if (m.name == "data")        sawImage = m.role == NpzMember::RImage && m.frames == 4;
+                if (m.name == "dark")        sawImage = sawImage && m.role == NpzMember::RImage;
+                if (m.name == "exposure_ms") sawAxis  = m.role == NpzMember::RAxis && m.vals.size() == 4;
+                if (m.name == "gain")        sawScalar = m.role == NpzMember::RMeta;
+            }
+            check(sawImage && sawAxis && sawScalar,
+                  "V19 the picker classifies every member by shape");
+            // tick the axis, name and unit typed by the "user" - never inferred
+            for (auto& m : app.npzPick) if (m.role == NpzMember::RAxis) m.selected = true;
+            snprintf(app.npzAxisName, sizeof app.npzAxisName, "exposure_ms");
+            snprintf(app.npzAxisUnit, sizeof app.npzAxisUnit, "ms");
+            npzPickAccept();
+            // (a) NOTHING that is not an image may become one
+            int fabricated = 0;
+            std::string fabNames;
+            for (const auto& d : app.images)
+                if (d->src->npzMember == "exposure_ms" || d->src->npzMember == "gain") {
+                    fabricated++;
+                    if (fabNames.size() < 90)
+                        fabNames += (fabNames.empty() ? "" : ", ") + d->name +
+                                    " " + std::to_string(d->w) + "x" + std::to_string(d->h);
+                }
+            fprintf(stderr, "verifyselftest: V19 opened %zu image(s), %zu stack(s)%s%s\n",
+                    app.images.size(), app.seqs.size(),
+                    fabricated ? "; FABRICATED: " : "", fabNames.c_str());
+            check(fabricated == 0, "V19 a 1-D / scalar member never becomes an image");
+            // (b) the frame-axis member is ONE stack of 4; dark is the lone frame
+            int v19frames = app.seqs.empty() ? 0 : (int)framesOfSeq(app.seqs.front().id).size();
+            check(app.seqs.size() == 1 && v19frames == 4,
+                  "V19 the frame-axis member opens as ONE stack of 4");
+            check(app.images.size() == 5, "V19 only the image-shaped members opened");
+            // the FILE is the batch: two members of different shapes are two
+            // stacks under one heading, not two unrelated opens
+            {
+                int b0 = app.images.empty() ? 0 : app.images.front()->batchId;
+                bool oneBatch = b0 != 0;
+                for (const auto& d : app.images) if (d->batchId != b0) oneBatch = false;
+                std::string bname;
+                for (const auto& b : app.batches) if (b.id == b0) bname = b.name;
+                fprintf(stderr, "verifyselftest: V19 batch: one=%d name='%s'\n",
+                        (int)oneBatch, bname.c_str());
+                check(oneBatch && bname == "sweep.npz",
+                      "V19 the npz FILE is one batch, named after the file");
+            }
+            // (c) the matching 1-D member becomes the axis, EXACTLY
+            App::SeqInfo* v19si = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
+            bool axOk = v19si && v19si->axisVals.size() == 4 &&
+                        v19si->axisVals[3] == 12345.678901234567 &&
+                        v19si->axisName == "exposure_ms" && v19si->axisUnit == "ms";
+            fprintf(stderr, "verifyselftest: V19 axis: %d value(s) '%s' [%s], last=%s\n",
+                    v19si ? (int)v19si->axisVals.size() : -1,
+                    v19si ? v19si->axisName.c_str() : "-",
+                    v19si ? v19si->axisUnit.c_str() : "-",
+                    v19si && !v19si->axisVals.empty() ? fmtExact(v19si->axisVals.back()).c_str()
+                                                      : "-");
+            check(axOk, "V19 the matching 1-D member lands in axisVals exactly");
+            // (d) counts BOTH directions, by name, never silent
+            std::string v19msg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            bool said = v19msg.find("exposure_ms") != std::string::npos &&
+                        v19msg.find("gain") != std::string::npos &&
+                        v19msg.find("4 frames") != std::string::npos;
+            fprintf(stderr, "verifyselftest: V19 message: \"%s\"%s\n", v19msg.c_str(),
+                    oerr.empty() ? "" : (" err: " + oerr).c_str());
+            check(said, "V19 the open names what opened AND what did not");
+            // (e) the session brings back the same member, with its axis
+            std::string v19sess = (ndir / "npz.vsession").u8string();
+            saveSession(v19sess, true);
+            std::string v19lerr = loadSession(v19sess);
+            loadAll();
+            bool member = false;
+            for (const auto& d : app.images) if (d->src->npzMember == "data") member = true;
+            App::SeqInfo* v19r = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
+            bool raxOk = v19r && v19r->axisVals.size() == 4 &&
+                         v19r->axisVals[3] == 12345.678901234567 &&
+                         v19r->axisName == "exposure_ms" && v19r->axisUnit == "ms";
+            fprintf(stderr, "verifyselftest: V19 after restore: %zu image(s), member=%d, "
+                            "axis=%d%s\n", app.images.size(), (int)member, (int)raxOk,
+                    v19lerr.empty() ? "" : (" load err: " + v19lerr).c_str());
+            check(v19lerr.empty() && app.images.size() == 5 && member,
+                  "V19 the session restores the same member");
+            check(raxOk, "V19 the session restores the axis at full precision");
+
+            // ---- V19b: one image and nothing to decide opens with NO dialog --
+            // The picker exists because a container CAN hold a choice, not
+            // because opening a file should now cost a click.
+            closeAll();
+            std::string oneNpz = (ndir / "one.npz").u8string();
+            writeNpz(oneNpz, {
+                { "data.npy", npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+            });
+            std::string oneErr = loadNpz(oneNpz);
+            fprintf(stderr, "verifyselftest: V19b single-array npz: picker=%d, %zu image(s)"
+                            "%s\n", (int)app.npzPickOpen, app.images.size(),
+                    oneErr.empty() ? "" : (" err: " + oneErr).c_str());
+            check(oneErr.empty() && !app.npzPickOpen && app.images.size() == 4 &&
+                  app.seqs.size() == 1,
+                  "V19b one image-shaped member opens with no picker");
+
+            // ---- V19c: deeper than (F,H,W,C) is refused BY NAME, not sliced --
+            // It used to erase leading axes and take [0] of each in silence.
+            // A string member is metadata and is READ, not merely counted.
+            closeAll();
+            std::vector<uint16_t> cube((size_t)2 * 2 * 4 * 8 * 8, 3);
+            uint32_t note[8] = { 'd', 'a', 'r', 'k', ' ', 'r', 'u', 'n' };
+            std::string oddNpz = (ndir / "odd.npz").u8string();
+            writeNpz(oddNpz, {
+                { "cube.npy", npyBytes("<u2", { 2, 2, 4, 8, 8 }, cube.data(), cube.size() * 2) },
+                { "data.npy", npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                { "note.npy", npyBytes("<U8", { },         note, sizeof note) },
+            });
+            std::string oddErr = loadNpz(oddNpz);
+            std::string oddMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "verifyselftest: V19c \"%s\"\n", oddMsg.c_str());
+            check(oddErr.empty() && app.images.size() == 4,
+                  "V19c a >4-D member is not sliced into a picture");
+            check(oddMsg.find("cube") != std::string::npos &&
+                  oddMsg.find("(2, 2, 4, 8, 8)") != std::string::npos,
+                  "V19c the refusal names the member and its shape");
+            bool sawNote = false;
+            for (const auto& e : app.npzMeta)
+                if (e.path == oddNpz)
+                    for (const auto& kv : e.items)
+                        if (kv.first == "note" && kv.second.find("dark run") != std::string::npos)
+                            sawNote = true;
+            check(sawNote, "V19c a string member is kept as readable metadata");
+
+            std::filesystem::remove_all(ndir, nec);
+            app.npyAxis = npyAxisWas;
+            closeAll();
+        }
+
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
@@ -28484,6 +29423,7 @@ int main(int argc, char** argv) {
         drawSeriesModal();
         drawDeriveModal();
         drawFolderPickModal();
+        drawNpzPickModal();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
         drawHelpAbout();
