@@ -43,6 +43,7 @@ Exit status: 0 wrote the npz, 2 anything else.  A failure always says why (4.9).
 """
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -372,6 +373,84 @@ def meta_key(prefix, key):
 CONTAINER_VERSION = 1
 
 
+STREAM_VERSION = 1
+
+
+def _stream_line(fh, text):
+    fh.write(text.encode("utf-8") + b"\n")
+
+
+def stream_out(fh, nodes):
+    """The same tree as write_npz, handed over a pipe instead of a file.
+
+    An npz cannot serve here: its central directory sits at the END, so reading
+    one means holding all of it first -- which is the buffer this exists to
+    avoid.  So: every small thing in a line-based header, then the pixel blobs
+    raw, in the order their `pixels` lines appeared.  The header borrows the
+    session format's rules (one key per line, the value is the rest of the line,
+    unknown keys are skipped) so a viewer that predates a new key still reads
+    what it does know.
+
+    Text is fine for timestamps, conditions and range: they carry one number per
+    frame or per member, which is nothing beside the pixels, and text is what the
+    session already writes axis values as.
+    """
+    _stream_line(fh, "VIEWERSTREAM %d" % STREAM_VERSION)
+    _stream_line(fh, "n %d" % len(nodes))
+    blobs = []
+    for i, nd in enumerate(nodes):
+        _stream_line(fh, "layer %d %s" % (i, nd.layer))
+        _stream_line(fh, "parent %d %d" % (i, nd.parent))
+        if nd.name:
+            _stream_line(fh, "name %d %s" % (i, nd.name))
+        note = nd.full_note()
+        if note:
+            _stream_line(fh, "note %d %s" % (i, note))
+        if nd.layout:
+            _stream_line(fh, "layout %d %s" % (i, nd.layout))
+        if nd.cfa:
+            _stream_line(fh, "cfa %d %s" % (i, nd.cfa))
+        if nd.range is not None:
+            r = np.asarray(nd.range).reshape(-1)
+            _stream_line(fh, "range %d %d %s"
+                         % (i, r.size, " ".join(repr(float(v)) for v in r)))
+        for field in ("timestamps", "conditions"):
+            got = getattr(nd, field)
+            if got is None:
+                continue
+            values, name, unit = got
+            v = np.asarray(values).reshape(-1)
+            # name and unit on their own lines: both may contain spaces, and the
+            # values line has to stay parseable by splitting on them
+            _stream_line(fh, "%s_name %d %s" % (field, i, name))
+            _stream_line(fh, "%s_unit %d %s" % (field, i, unit))
+            _stream_line(fh, "%s %d %d %s"
+                         % (field, i, v.size, " ".join(repr(float(x)) for x in v)))
+        for k, val in nd.meta.items():
+            _stream_line(fh, "meta %d %s %s"
+                         % (i, meta_key("", str(k)),
+                            json.dumps(val, sort_keys=True, default=json_default)))
+        if nd.pixels is not None:
+            a = np.ascontiguousarray(nd.pixels)
+            _stream_line(fh, "pixels %d %s %d %s %d"
+                         % (i, a.dtype.str.lstrip("<>|=").replace("f8", "f8"),
+                            a.ndim, " ".join(str(d) for d in a.shape), a.nbytes))
+            blobs.append(a)
+    _stream_line(fh, "end")
+    fh.flush()
+    # The pixels, in the order they were announced. Written in slices so a
+    # 755 MB stack does not need a 755 MB copy on the way out.
+    total = 0
+    for a in blobs:
+        mv = memoryview(a.reshape(-1).view(np.uint8))
+        step = 8 << 20
+        for off in range(0, mv.nbytes, step):
+            fh.write(mv[off:off + step])
+        total += mv.nbytes
+    fh.flush()
+    return len(blobs), total
+
+
 def write_npz(path, nodes):
     # __viewer is the discriminator (4.11.1): with it this npz is a viewer
     # container and the layer tree below is authoritative; without it the file is
@@ -428,10 +507,16 @@ def summary(spec, src, nodes, skipped, path, member_count):
             if s not in seen:
                 seen.append(s)
         why = " (%s)" % "; ".join(seen)
-    size = os.path.getsize(path)
+    # `path` is a file on the npz route and a byte count on the streamed one:
+    # there is nothing to stat when the result went down a pipe, and the line
+    # still has to say how much was handed over.
+    if isinstance(path, int):
+        size, where = path, "the viewer"
+    else:
+        size, where = os.path.getsize(path), path
     return ("%s(%s): read %s; skipped %d%s; wrote %d member(s), %.1f kB to %s"
             % (spec, os.path.basename(src.rstrip("/\\")), ", ".join(read),
-               len(skipped), why, member_count, size / 1024.0, path))
+               len(skipped), why, member_count, size / 1024.0, where))
 
 
 # ------------------------------------------------------------------ adapter load
@@ -480,6 +565,9 @@ def main(argv):
     ap.add_argument("adapter", help="<file.py>:<function>")
     ap.add_argument("path", help="what to hand the adapter; a file or a folder")
     ap.add_argument("-o", "--out", default=None, help="npz to write (default: a temp file)")
+    ap.add_argument("--stream", action="store_true",
+                    help="hand the result over stdout as a framed stream instead of "
+                         "writing an npz (the viewer uses this; see docs)")
     args = ap.parse_args(argv)
 
     func, spec = load_function(args.adapter)
@@ -488,7 +576,15 @@ def main(argv):
         raise AdapterError("no such file or directory: %s" % args.path)
 
     try:
-        returned = func(args.path)
+        if args.stream:
+            # stdout is the wire now, so the reader's own print() has to go
+            # somewhere else or it corrupts the payload. stderr is where the
+            # summary already goes and where the viewer's panel already looks,
+            # so a reader that prints its progress still shows it.
+            with contextlib.redirect_stdout(sys.stderr):
+                returned = func(args.path)
+        else:
+            returned = func(args.path)
     except Exception as exc:                                        # 4.9
         traceback.print_exc()
         if not str(exc).strip():
@@ -498,6 +594,12 @@ def main(argv):
 
     build = Build()
     build.walk(returned, -1, spec)
+
+    if args.stream:
+        n_blobs, n_bytes = stream_out(sys.stdout.buffer, build.nodes)
+        sys.stderr.write(summary(spec, args.path, build.nodes, build.skipped,
+                                 n_bytes, n_blobs) + "\n")
+        return 0
 
     out = args.out
     if out is None:
