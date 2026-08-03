@@ -34,10 +34,16 @@ struct Run {
 // Supplying them is what lets the caller READ THEM WHILE THE CHILD IS STILL
 // RUNNING - a reader that prints its progress is only useful if the progress
 // arrives before the end. Left empty, run() picks temporaries of its own.
+//
+// `captureStdout = false` leaves Run::out empty and does not read outFile back.
+// A reader handing over its pixels writes them to stdout, and reading those into
+// a std::string to hand to a caller who is about to stream the file anyway is
+// the very copy the streaming exists to avoid -- 755 MB of it, in one string.
 Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
         std::atomic<bool>* cancel = nullptr,
         const std::string& outFile = std::string(),
-        const std::string& errFile = std::string());
+        const std::string& errFile = std::string(),
+        bool captureStdout = true);
 
 // The interpreter to use, or "" with `why` naming what was tried. `configured`
 // wins when it is set. Probed by RUNNING it: on Windows the bare python3 on PATH

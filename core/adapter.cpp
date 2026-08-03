@@ -106,7 +106,7 @@ std::string showCommand(const std::vector<std::string>& argv) {
 // forever; a traceback plus a numpy warning gets close enough to that to matter.
 // Files cost one temp write and cannot deadlock at all.
 Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* cancel,
-        const std::string& outFile, const std::string& errFile) {
+        const std::string& outFile, const std::string& errFile, bool captureStdout) {
     Run r;
     if (argv.empty()) { r.fail = "no command"; return r; }
     std::filesystem::path outPath = outFile.empty() ? scratch("out")
@@ -241,7 +241,7 @@ Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* 
     }
 #endif
 
-    r.out = readWhole(outPath);
+    if (captureStdout) r.out = readWhole(outPath);
     r.err = readWhole(errPath);
     // Only clean up what we chose ourselves. Caller-supplied paths belong to the
     // caller, which is still holding them open to show what the reader printed.
