@@ -219,7 +219,7 @@ PRNU も e-SFR もノイズフロアも、入力は数 Mpx あっても出力は
 ## 5. 当初の「WebSocket ブリッジ」との関係
 
 [README のロードマップ項目 5](../README.md#ロードマップ)にある
-「WebSocket ブリッジ([pixelscope.html](../pixelscope.html) をリモートフロントエンドに)」は、
+「WebSocket ブリッジ(ブラウザをリモートフロントエンドに)」は、
 **この設計と別物ではありません。同じ設計の transport 違い**です。
 
 [core/serve.cpp](../core/serve.cpp) は最初からそう作ってあります。
@@ -240,7 +240,7 @@ WebSocket 版は `g_sink` に別の関数を差して `handleRequest` を呼ぶ�
 | | v1: ssh stdio(実装中) | 将来: WebSocket ブリッジ |
 |---|---|---|
 | **転送路** | ssh が張った stdin/stdout パイプ 1 本 | TCP / WSS(HTTP アップグレード) |
-| **クライアント** | viewer 本体(ネイティブ、手元で動く) | ブラウザ(`pixelscope.html`) |
+| **クライアント** | viewer 本体(ネイティブ、手元で動く) | ブラウザ(Web フロントエンド) |
 | **サーバ側の仕事** | `handleRequest` + `ReplySink = sendStdio` | **同じ `handleRequest`** + `ReplySink = sendWs` |
 | **フレーミング** | 12 B ヘッダ + payload | WebSocket バイナリフレームに同じ payload |
 | **認証** | ssh(既存の鍵運用のまま) | 別途必要(TLS + トークン等) |
