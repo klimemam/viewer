@@ -42,6 +42,95 @@ FetchContent_Declare(pfd
   SOURCE_SUBDIR does-not-exist)
 FetchContent_MakeAvailable(pfd)
 
+# ---- OpenEXR (official ASWF library) ---------------------------------------
+# docs/media-support.md §1 studied this and recommended tinyexr; the user
+# overruled that and chose the official library. The rest of that section still
+# holds (channel mapping, no tone mapping on load, layers as npz-member-like
+# groups) - only the provider changed.
+#
+# This is by FAR the heaviest dependency in the tree, and it is the only one
+# that is NOT a single file or a header. The measured cost is recorded in
+# docs/media-support.md §1 rather than left for someone to rediscover.
+#
+# Order of resolution, and why:
+#   1. find_package(OpenEXR) - a distro/vcpkg/brew OpenEXR is used as-is. A
+#      packager must never be made to download a second copy of a library the
+#      system already ships.
+#   2. FetchContent, pinned by URL (this repo's flavour: no git needed, the
+#      archive hash is what the pin means).
+# Imath is declared HERE rather than left to OpenEXR's own auto-fetch, which
+# uses GIT_REPOSITORY - that would need git on the build machine and would not
+# honour this repo's pinned-URL convention. OpenEXR checks `TARGET Imath::Imath`
+# before fetching, so declaring it first wins.
+#
+# OFFLINE: both honour the standard overrides, like the four above -
+#     -DFETCHCONTENT_SOURCE_DIR_IMATH=<imath source tree>
+#     -DFETCHCONTENT_SOURCE_DIR_OPENEXR=<openexr source tree>
+# With VIEWER_WITH_EXR=OFF the viewer builds exactly as before and says
+# "built without OpenEXR support" when handed a .exr - it never pretends.
+option(VIEWER_WITH_EXR "read .exr images (uses an installed OpenEXR, else fetches it)" ON)
+if(VIEWER_WITH_EXR)
+  find_package(OpenEXR 3.1 QUIET)
+  if(OpenEXR_FOUND)
+    message(STATUS "OpenEXR ${OpenEXR_VERSION}: using the installed copy (no download)")
+  else()
+    # Measured on this repo (MinGW/GCC 16.1, Ninja, Release, -j8): a cold
+    # configure+build goes 73 s -> 100 s and viewer.exe 7.63 -> 10.70 MiB.
+    # docs/media-support.md §1 carries the full table.
+    message(STATUS "OpenEXR: not installed - fetching v3.4.13 + Imath v3.2.2 "
+                   "(measured +27 s on a cold configure+build, +3.1 MiB on the "
+                   "binary; -DVIEWER_WITH_EXR=OFF to skip)")
+    # Static, no install rules, no tools/examples/tests: we want the reader and
+    # nothing else. BUILD_TESTING is CTest's own switch and this repo turns
+    # enable_testing() on for its selftests, so it must be forced off for the
+    # subprojects or their test suites join our ctest run.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
+    set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_TOOLS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_TEST_LIBRARIES OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_TEST_TOOLS OFF CACHE BOOL "" FORCE)
+    # 3.4 vendors libdeflate; forcing the internal one keeps the build
+    # reproducible instead of depending on whatever the host happens to have.
+    set(OPENEXR_FORCE_INTERNAL_DEFLATE ON CACHE BOOL "" FORCE)
+    # EXCLUDE_FROM_ALL on FetchContent_Declare is 3.28+. Without it the default
+    # target also builds OpenEXRUtil (deep/flat image helpers this viewer never
+    # calls). Guarded rather than raising cmake_minimum_required from 3.21.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+      set(_exr_excl EXCLUDE_FROM_ALL)
+    else()
+      set(_exr_excl "")
+    endif()
+    FetchContent_Declare(Imath
+      URL https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.zip
+      ${_exr_excl})
+    FetchContent_MakeAvailable(Imath)
+    # OpenEXRSetup.cmake runs find_package(Imath CONFIG) BEFORE it checks
+    # whether an Imath target already exists. With Imath declared here (at the
+    # top level) that search lands on _deps/imath-build/config/ImathConfig.cmake,
+    # which include()s an ImathTargets.cmake that is only written when
+    # IMATH_INSTALL is ON - a hard configure error. OpenEXR guards against
+    # exactly this with CMAKE_IGNORE_PATH, but it builds that path from ITS own
+    # binary dir, so it only covers an Imath that OpenEXR itself fetched.
+    # Suppressing the nested find is the honest fix: we have just supplied the
+    # Imath::Imath target it is looking for, so it must not look.
+    set(CMAKE_DISABLE_FIND_PACKAGE_Imath ON)
+    FetchContent_Declare(openexr
+      URL https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.4.13.zip
+      ${_exr_excl})
+    FetchContent_MakeAvailable(openexr)
+    unset(CMAKE_DISABLE_FIND_PACKAGE_Imath)
+    unset(_exr_excl)
+  endif()
+endif()
+
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -96,6 +185,14 @@ set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
 target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
+# Only the GUI binary reads .exr. viewer-serve deliberately does NOT link it:
+# the remote peer still serves .npy only (docs/media-support.md §1 "remote への
+# 波及" - plan (a), local-only, until the loaders move to a shared TU), and the
+# peer is the binary that has to build on a bare compute server.
+if(VIEWER_WITH_EXR)
+  target_link_libraries(viewer PRIVATE OpenEXR::OpenEXR)
+  target_compile_definitions(viewer PRIVATE VIEWER_WITH_EXR)
+endif()
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
 endif()

@@ -12,6 +12,15 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
 読むことだけ。deep / tiled / multipart は当面対象外。
 
+> **決定 (2026-08-03): 公式 OpenEXR を採用。実装済み (`media-openexr`)。**
+> 以下の比較検討は tinyexr を推奨していたが、**ユーザーがこれを覆し**、
+> ASWF 公式 OpenEXR を使うと決めた。**この節の他の分析はすべて有効**である —
+> channel マッピング、挿入点、multi-layer を npz member 相当として扱う設計、
+> remote への波及(案 a: まずローカル専用)、そして「ロード時にトーンマップは
+> **しない**」— いずれもそのまま実装した。変わったのは**提供元だけ**で、
+> 「何を読むか」「どう見せるか」は変わっていない。
+> 覆された理由は下の「却下理由の再評価」に、実測コストは「実測コスト」に置く。
+
 ### 候補比較
 
 | | 公式 OpenEXR 3.x | tinyexr | 自前最小リーダ |
@@ -34,10 +43,119 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 - 公式 lib は品質最高だが、Imath ごと fetch して 4 ライブラリをビルドするのは
   この repo の流儀(miniz を 1 ファイル直コンパイル)に対して重い。scanline 読みだけに
   払う代価ではない。
-- **推奨: tinyexr**。単一ヘッダ、BSD-3、そして `TINYEXR_USE_MINIZ` で
+- ~~**推奨: tinyexr**~~。単一ヘッダ、BSD-3、そして `TINYEXR_USE_MINIZ` で
   **既に FetchContent 済みの miniz をそのまま再利用できる**(include パスを
   `${miniz_SOURCE_DIR}` に向けるだけ。miniz.c の二重コンパイル・シンボル衝突に注意)。
   CVE 歴は「単独ヘッダの画像パーサの通例」レベルで、入力は自分のラボのファイルが主。
+  → **却下 (ユーザー判断)**。
+
+### 却下理由の再評価 — なぜ「重い」が決め手にならなかったか
+
+上の表で公式 lib を退けた根拠は **「4 ライブラリをビルドするのは重い」** の 1 点
+だけだった。これを実測したところ、**その前提が数字として弱い**ことが分かった
+(下記)。加えて、この表が tinyexr 側に置いた利点のうち 2 つは、測定ツールとして
+見ると利点ではない:
+
+- **fuzzing**: 上の表自身が「tinyexr は CVE 複数」「公式は OSS-Fuzz 常時」と書いて
+  いる。入力が自ラボのファイル中心でも、**壊れた EXR は日常的に発生する**
+  (転送断・書き込み中のファイル)。パーサが落ちる/踏み抜くかどうかは
+  ライセンスや行数より重い。
+- **half→float の基準実装**: 「どちらでも測定値は損なわれない」は正しいが、
+  **正しさの立証責任**が違う。Imath は基準実装そのもので、denormal/Inf/NaN の
+  展開が定義どおりであることを自分で証明しなくてよい。測定ツールでは
+  「たぶん合っている」と「基準実装である」の差は大きい。
+
+つまり公式 lib のコストは**ビルド時間とバイナリサイズという測れるもの**で、
+tinyexr のコストは**パーサの堅牢性という測りにくいもの**だった。前者を測って
+許容範囲だったので、後者を引き受ける理由が無くなった。
+
+### 実測コスト (MinGW/GCC 16.1, Ninja, Release, -j8, 本 repo で実測)
+
+| | ベースライン | +OpenEXR | 差 |
+|---|---|---|---|
+| configure (cold, DL 込み) | 4 s | 14 s | **+10 s** |
+| build (cold) | 69 s | 86 s | **+17 s** |
+| 合計 (cold) | 73 s | 100 s | **+27 s (+37%)** |
+| `viewer.exe` | 7,996,319 B | 11,223,727 B | **+3,227,408 B (+3.08 MiB, +40%)** |
+
+- 「CI 時間が倍になる」ようなことは**起きていない** — cold で +27 s。
+  build.yml の 1 ジョブは fixture 生成 + 22 selftest + bench を含むので、
+  **ジョブ全体に対しては 1 割未満**。3 OS × 1 回なので matrix 構造は不変。
+- ビルドされるのは **Imath / Iex / IlmThread / OpenEXR / OpenEXRCore の 5 つだけ**。
+  `EXCLUDE_FROM_ALL`(CMake 3.28+)で tools / examples / tests / OpenEXRUtil を
+  既定ターゲットから外しているため。3.28 未満では OpenEXRUtil も建つ(+数十秒)。
+- バイナリ +3 MiB のうち**一部は書き込み側**である。selftest V23 が fixture を
+  自前で書くため `ImfOutputFile` 等がリンクされる。**アプリは読むだけ**なので、
+  これは「テストのために出荷バイナリが太っている」という素直に不本意な代価で、
+  レビューで議論する価値がある(代案は §「fixture をどこで作るか」)。
+- **libdeflate と OpenJPH は vendored**。外部 zlib を要求しないので、
+  この repo の「重い依存を嫌う」方針との衝突は思ったより小さい。
+
+### 配線 (CMakeLists.txt)
+
+```
+option(VIEWER_WITH_EXR "..." ON)     # 既定 ON
+  find_package(OpenEXR 3.1 QUIET)    # 1) 入っていればそれを使う
+  → 無ければ FetchContent (URL 固定 pin: OpenEXR v3.4.13 / Imath v3.2.2)
+```
+
+- **`find_package` 先行**の理由: distro / vcpkg / brew が既に OpenEXR を持って
+  いるなら、packager に同じライブラリを二重に落とさせる理由がない。
+- **URL pin** は本 repo の流儀(glfw / imgui / miniz / pfd と同じ)。OpenEXR 自身の
+  Imath 自動取得は `GIT_REPOSITORY` を使うため git を要求し、pin の流儀も違う。
+  よって **Imath はこちらで先に宣言**する(OpenEXR は `TARGET Imath::Imath` を
+  見てから取りに行くので、先に置けば勝つ)。
+- **オフライン**: 既存 4 つと同じ override が効く。追加された名前は
+  **`FETCHCONTENT_SOURCE_DIR_IMATH`** と **`FETCHCONTENT_SOURCE_DIR_OPENEXR`**。
+- **ネットワークが無い人**: `-DVIEWER_WITH_EXR=OFF` で従来どおり建つ。その
+  バイナリは `.exr` を渡されると
+  `built without OpenEXR support (configure with -DVIEWER_WITH_EXR=ON)` と
+  **名指しで断る** — 黙って無視も、偽の画像も作らない。
+- `viewer-serve` は**リンクしない**。remote は依然 npy のみ配信(案 a)であり、
+  peer は OpenGL も無い計算機で建つ必要があるため、依存を増やさない。
+
+### 読めるもの / 断るもの (実装済み)
+
+読める: 単一 part の **scanline**、**half (`f16`) / float (`f32`)**、
+`R,G,B(,A)` → 3/4ch、単独 `Y` や単独 AOV → 1ch、multi-layer は prefix で
+グループ化して **1 layer = 1 doc**。dtype は `f16`/`f32` を記録し Inspector に出る。
+表示レンジはデータ自身の min/max から。**トーンマップ・γ・クランプは一切しない。**
+
+断るもの(すべて**名指し＋理由**、`docs/import-adapters.md` §3.2 の作法):
+
+| 対象 | 文言 |
+|---|---|
+| chroma subsample | `chroma-subsampled channel 'BY' (sampling 2x2): only full-resolution channels are read, there is no chroma reconstruction here` |
+| tiled | `tiled EXR: only scanline files are read` |
+| deep | `deep EXR: only flat scanline files are read (a deep pixel is a list of samples, not a value)` |
+| multi-part | `multi-part EXR (N parts): only single-part scanline files are read` |
+| UINT channel | `channel 'X' is UINT: only half and float channels are read` |
+| EXR 無効ビルド | `built without OpenEXR support (configure with -DVIEWER_WITH_EXR=ON)` |
+
+### 決めた細部 (レビューで見てほしい判断)
+
+- **layer は `FrameSource::npzMember` に載せた**。新しい並行フィールドを作らず、
+  session の保存/復元・Inspector 表示・`--compare` の同一性判定をそのまま
+  再利用している(「1 つのコンテナ内の名前付き部分配列」という意味は同一)。
+  名前が npz 寄りなのが唯一の難点。
+- **`R,G,B,A` 以外の並びは 1ch ずつに割る**。`X,Y,Z` を「色」として 3ch に
+  詰めるのは形式が定義していない推測になるため。
+- **1 ファイル = 1 frame**。frame 軸は捏造しない。フォルダに並んだ `.exr` が
+  既存の sequence 機構で stack になる(`SEQ_EXTS` に `.exr` を追加。併せて
+  `isRaw = ext != ".npy"` を `.exr` も除外するよう直した — さもないと
+  形を自分で持っている EXR に対して RAW 寸法ダイアログが出る)。
+- **Browse パネルは対象外**。あそこの「画像か?」判定は `isNpyName` で、remote
+  peer が npy しか配信できないことと結びついている。ここに `.exr` を足すと
+  サーバが応えられない行を出すことになるので、触っていない。
+
+### fixture をどこで作るか
+
+`tools/testdata` は生成物(gitignore・CI が毎回再生成)なので EXR も生成する
+必要があるが、**Python から EXR を書くには repo が持たない依存が要る**
+(CI は numpy しか入れない)。そこで **selftest 内の C++ で書いている** — V21 が
+miniz を使って .npz のバイトを test 内で組むのと同じ理由・同じ形。
+代償は上記のバイナリ +α と、「読み手と書き手が同じプロジェクト」であること
+(バイト列レベルの他人の EXR を parse する証明にはならない)。
 
 ### loadExr の挿入点と channel マッピング
 
@@ -128,7 +246,7 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
 
 | Phase | 内容 | 規模感 |
 |---|---|---|
-| A | tinyexr で loadExr(ローカルのみ、scanline RGB/Y/layer→member) | S(数日) |
+| A | ~~tinyexr で~~ **公式 OpenEXR で** loadExr(ローカルのみ、scanline RGB/Y/layer→member) — **完了** | S(数日) |
 | B | preview slot UX(Space preview → click 設定 → 既定反転の 3 段階) | M(1〜2 週) |
 | C | 動画 Phase 1: ffmpeg-pipe → N フレーム stack(budget 適用) | M(1〜2 週) |
 | D | loader 共有 TU 化 + serve 側 EXR(f32 TILE、プロトコル不変) | S〜M |
@@ -136,7 +254,9 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
 
 A→B→C の順を推す: A は独立で安い。B は C の前提(動画こそ preview が要る)。
 
-参考: [tinyexr](https://github.com/syoyo/tinyexr) /
+参考: [OpenEXR (採用)](https://github.com/AcademySoftwareFoundation/openexr) /
+[Imath](https://github.com/AcademySoftwareFoundation/Imath) /
+[tinyexr (却下)](https://github.com/syoyo/tinyexr) /
 [tinyexr CVE 一覧](https://www.cvedetails.com/product/46936/Tinyexr-Project-Tinyexr.html?vendor_id=18510) /
 [OpenEXR install(Imath/libdeflate)](https://openexr.com/en/latest/install.html) /
 [OpenEXR license](https://openexr.com/en/latest/license.html) /

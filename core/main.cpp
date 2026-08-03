@@ -68,6 +68,28 @@
 #include <thread>
 #include <vector>
 
+// OpenEXR (official ASWF library), behind the VIEWER_WITH_EXR CMake option.
+// Only the reader is needed by the app; the writer headers are here because
+// --verify-selftest V23 builds its own .exr fixtures (tools/testdata is
+// generated, never committed, and CI's python has numpy only - no EXR module).
+#ifdef VIEWER_WITH_EXR
+#include <ImfMultiPartInputFile.h>
+#include <ImfInputPart.h>
+#include <ImfOutputFile.h>
+#include <ImfTiledOutputFile.h>
+#include <ImfDeepScanLineOutputFile.h>
+#include <ImfDeepFrameBuffer.h>
+#include <ImfChannelList.h>
+#include <ImfFrameBuffer.h>
+#include <ImfHeader.h>
+#include <ImfPartType.h>
+#include <ImfIO.h>
+#include <ImfThreading.h>
+#include <IexBaseExc.h>
+#include <ImathBox.h>
+#include <half.h>
+#endif
+
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
@@ -204,7 +226,13 @@ struct FrameSource {
     std::string dtype;
     float vmin = 0, vmax = 1;         // data min/max
     std::string path;
-    std::string npzMember;            // array name when this came from a .npz
+    // The name of this frame's part INSIDE its container file: an .npz array
+    // name, or an .exr layer name. One field for both because it is one idea,
+    // and because the session save/restore, the Inspector line and --compare's
+    // identity tuple all key off it - a parallel field would have meant a
+    // second copy of all of that. (Kept the .npz-flavoured name to keep the
+    // diff small; it is read on ~12 lines.)
+    std::string npzMember;
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -4405,6 +4433,305 @@ static std::string loadNpy(const std::string& path) {
     return {};
 }
 
+// ---- OpenEXR ---------------------------------------------------------------
+// docs/media-support.md §1. Scanline RGB / Y, half or float, PIXEL VALUES
+// UNTOUCHED - no tone mapping, no gamma, no clamping, no RGBA repacking on the
+// way in. This is a measurement tool: the numbers in the file are the point,
+// and a viewer that display-encodes them on load has destroyed the
+// measurement. Whatever cannot be read is refused BY NAME with a reason
+// (docs/import-adapters.md §3.2), never a bare "cannot open".
+#ifdef VIEWER_WITH_EXR
+
+// One group of channels that becomes one ImageDoc. EXR names channels
+// "layer.LEAF"; the layer is everything before the LAST dot, so "diffuse.R" is
+// leaf R of layer "diffuse" and a bare "R" is leaf R of the base (unnamed)
+// layer. A layer is carried in FrameSource::npzMember - the SAME field the
+// .npz members use, because it is the same idea (a named sub-array inside one
+// container file) and sessions already save and restore it. Adding a second,
+// parallel field would have meant a second copy of the session plumbing.
+struct ExrLayer {
+    std::string name;                  // "" = the base layer
+    std::vector<std::string> chans;    // full channel names, in doc order
+    std::string dtype;                 // "f16" / "f32"
+};
+
+static void exrSplitChannel(const std::string& full, std::string& layer, std::string& leaf) {
+    size_t dot = full.rfind('.');
+    if (dot == std::string::npos) { layer.clear(); leaf = full; }
+    else { layer = full.substr(0, dot); leaf = full.substr(dot + 1); }
+}
+
+// The .exr is read into memory first and handed to OpenEXR as a stream, so the
+// library never touches the filesystem: its default stream opens a narrow-char
+// path, which on Windows cannot express the Japanese paths this tool is used
+// with. Every other loader here reads bytes first (readFileBytes) for the same
+// reason.
+class ExrMemStream : public Imf::IStream {
+public:
+    ExrMemStream(const char* name, const uint8_t* d, size_t n)
+        : Imf::IStream(name), d_(d), n_(n), p_(0) {}
+    bool isMemoryMapped() const override { return true; }
+    char* readMemoryMapped(int n) override {
+        if (n < 0 || p_ + (size_t)n > n_)
+            throw IEX_NAMESPACE::InputExc("unexpected end of EXR data");
+        char* r = (char*)d_ + p_;
+        p_ += (size_t)n;
+        return r;
+    }
+    bool read(char c[], int n) override {
+        if (n < 0 || p_ + (size_t)n > n_)
+            throw IEX_NAMESPACE::InputExc("unexpected end of EXR data");
+        memcpy(c, d_ + p_, (size_t)n);
+        p_ += (size_t)n;
+        return p_ < n_;
+    }
+    uint64_t tellg() override { return (uint64_t)p_; }
+    void seekg(uint64_t p) override { p_ = (size_t)p; }
+    void clear() override {}
+private:
+    const uint8_t* d_;
+    size_t n_, p_;
+};
+
+// OpenEXR would otherwise start its own thread pool. The sequence loader
+// already runs decodes on ITS thread against a memory budget, so a second,
+// invisible pool underneath it is not what anyone asked for.
+static void exrInitThreads() {
+    static const bool once = [] { Imf::setGlobalThreadCount(0); return true; }();
+    (void)once;
+}
+
+// Everything this loader refuses, in one place, so the strings stay uniform and
+// greppable. Each names the thing AND says what is read instead.
+static std::string exrRefuseMultiPart(int parts) {
+    return "multi-part EXR (" + std::to_string(parts) +
+           " parts): only single-part scanline files are read";
+}
+static const char* EXR_REFUSE_DEEP =
+    "deep EXR: only flat scanline files are read (a deep pixel is a list of samples, not a value)";
+static const char* EXR_REFUSE_TILED =
+    "tiled EXR: only scanline files are read";
+static std::string exrRefuseSubsampled(const std::string& chan, int xs, int ys) {
+    return "chroma-subsampled channel '" + chan + "' (sampling " + std::to_string(xs) +
+           "x" + std::to_string(ys) + "): only full-resolution channels are read, "
+           "there is no chroma reconstruction here";
+}
+static std::string exrRefuseUint(const std::string& chan) {
+    return "channel '" + chan + "' is UINT: only half and float channels are read";
+}
+
+// Decide which layers this file offers, or say why it offers none.
+// Returns "" and fills `out` on success; otherwise returns the refusal.
+static std::string exrScanLayers(const Imf::Header& hdr, int parts,
+                                 std::vector<ExrLayer>& out) {
+    if (parts > 1) return exrRefuseMultiPart(parts);
+    if (hdr.hasType()) {
+        const std::string& t = hdr.type();
+        if (t == Imf::DEEPSCANLINE || t == Imf::DEEPTILE) return EXR_REFUSE_DEEP;
+        if (t == Imf::TILEDIMAGE) return EXR_REFUSE_TILED;
+    }
+    if (hdr.hasTileDescription()) return EXR_REFUSE_TILED;
+
+    struct Group { std::string layer; std::vector<std::pair<std::string, std::string>> leaves; };
+    std::vector<Group> groups;
+    const Imf::ChannelList& cl = hdr.channels();
+    for (auto it = cl.begin(); it != cl.end(); ++it) {
+        const std::string full = it.name();
+        const Imf::Channel& c = it.channel();
+        if (c.xSampling != 1 || c.ySampling != 1)
+            return exrRefuseSubsampled(full, c.xSampling, c.ySampling);
+        if (c.type == Imf::UINT) return exrRefuseUint(full);
+        std::string layer, leaf;
+        exrSplitChannel(full, layer, leaf);
+        // Y/RY/BY is the luminance-chroma layout. Even at 1x1 sampling we do
+        // not reconstruct RGB from it, and handing back three planes named Y,
+        // RY, BY as if they were pictures would be three lies.
+        if (leaf == "RY" || leaf == "BY")
+            return exrRefuseSubsampled(full, c.xSampling, c.ySampling);
+        Group* g = nullptr;
+        for (auto& q : groups) if (q.layer == layer) { g = &q; break; }
+        if (!g) { groups.push_back({ layer, {} }); g = &groups.back(); }
+        g->leaves.push_back({ leaf, full });
+    }
+    if (groups.empty()) return "no channels in this file";
+
+    auto findLeaf = [](const Group& g, const char* want, std::string& full) {
+        for (const auto& p : g.leaves) if (p.first == want) { full = p.second; return true; }
+        return false;
+    };
+    auto dtypeOf = [&](const std::vector<std::string>& chans) {
+        for (const auto& c : chans)
+            if (cl.findChannel(c.c_str()) && cl.findChannel(c.c_str())->type == Imf::FLOAT)
+                return std::string("f32");
+        return std::string("f16");
+    };
+
+    for (const auto& g : groups) {
+        std::string r, gg, b, a;
+        std::vector<std::string> taken;
+        if (findLeaf(g, "R", r) && findLeaf(g, "G", gg) && findLeaf(g, "B", b)) {
+            ExrLayer L;
+            L.name = g.layer;
+            L.chans = { r, gg, b };
+            if (findLeaf(g, "A", a)) L.chans.push_back(a);
+            L.dtype = dtypeOf(L.chans);
+            taken = L.chans;
+            out.push_back(std::move(L));
+        }
+        // Anything in this layer the RGB(A) doc did not take becomes its own
+        // 1-ch doc. Orders other than R,G,B,A have no meaning defined by the
+        // format, so packing e.g. X,Y,Z as if it were colour would be a guess;
+        // one plane per channel states exactly what is in the file.
+        for (const auto& p : g.leaves) {
+            bool used = false;
+            for (const auto& t : taken) if (t == p.second) used = true;
+            if (used) continue;
+            ExrLayer L;
+            L.name = p.second;             // the channel's own full name
+            L.chans = { p.second };
+            L.dtype = dtypeOf(L.chans);
+            out.push_back(std::move(L));
+        }
+    }
+    if (out.empty()) return "no readable channels in this file";
+    return {};
+}
+
+// Read ONE layer into a doc. half widens to float without loss (every half is
+// exactly representable as a float) and float is copied; the slice type is
+// FLOAT because that is what the DOC holds, and InputFile does that widening.
+static std::unique_ptr<ImageDoc> exrReadLayer(Imf::MultiPartInputFile& mp,
+                                              const ExrLayer& L, const std::string& path,
+                                              const std::string& displayName,
+                                              std::string& errOut) {
+    try {
+        Imf::InputPart part(mp, 0);
+        const Imf::Header& hdr = part.header();
+        Imath::Box2i dw = hdr.dataWindow();
+        int64_t w = (int64_t)dw.max.x - (int64_t)dw.min.x + 1;
+        int64_t h = (int64_t)dw.max.y - (int64_t)dw.min.y + 1;
+        if (w < 1 || h < 1 || w > 65536 || h > 65536) {
+            errOut = "data window is " + std::to_string(w) + "x" + std::to_string(h);
+            return nullptr;
+        }
+        int ch = (int)L.chans.size();
+        auto doc = std::make_unique<ImageDoc>();
+        FrameSource& S = *doc->src;
+        S.data.assign((size_t)w * (size_t)h * (size_t)ch, 0.0f);
+        S.w = (int)w; S.h = (int)h; S.ch = ch;
+        S.dtype = L.dtype;
+        S.path = path;
+
+        Imf::FrameBuffer fb;
+        const size_t xs = sizeof(float) * (size_t)ch;
+        const size_t ys = sizeof(float) * (size_t)ch * (size_t)w;
+        for (int c = 0; c < ch; c++) {
+            // OpenEXR addresses pixels in IMAGE coordinates, so a slice base is
+            // where pixel (0,0) WOULD sit. For a data window that does not
+            // start at the origin that address is outside the buffer, which is
+            // the idiom the format's own headers document.
+            char* base = (char*)(S.data.data() + c)
+                       - ((size_t)dw.min.x * xs + (size_t)dw.min.y * ys);
+            fb.insert(L.chans[c].c_str(), Imf::Slice(Imf::FLOAT, base, xs, ys, 1, 1, 0.0));
+        }
+        part.setFrameBuffer(fb);
+        part.readPixels(dw.min.y, dw.max.y);
+
+        doc->name = displayName;
+        doc->syncMirrors();
+        return doc;
+    } catch (const std::exception& e) {
+        errOut = e.what();
+        return nullptr;
+    }
+}
+#endif  // VIEWER_WITH_EXR
+
+// Decode the FIRST readable layer of a .exr as one frame. This is what the
+// background sequence loader calls, so a folder of .exr files becomes a stack
+// through the machinery that already exists.
+static std::unique_ptr<ImageDoc> decodeExr(const std::string& path, std::string& errOut) {
+#ifndef VIEWER_WITH_EXR
+    (void)path;
+    errOut = "built without OpenEXR support (configure with -DVIEWER_WITH_EXR=ON)";
+    return nullptr;
+#else
+    exrInitThreads();
+    std::vector<uint8_t> bytes;
+    if (!readFileBytes(path, bytes)) { errOut = "cannot read file"; return nullptr; }
+    try {
+        ExrMemStream st(path.c_str(), bytes.data(), bytes.size());
+        Imf::MultiPartInputFile mp(st);
+        std::vector<ExrLayer> layers;
+        std::string r = exrScanLayers(mp.header(0), mp.parts(), layers);
+        if (!r.empty()) { errOut = r; return nullptr; }
+        auto doc = exrReadLayer(mp, layers[0], path, baseName(path), errOut);
+        if (doc && !layers[0].name.empty()) doc->src->npzMember = layers[0].name;
+        return doc;
+    } catch (const std::exception& e) {
+        errOut = e.what();
+        return nullptr;
+    }
+#endif
+}
+
+// Open a .exr. One file is ONE frame - a still image has no frame axis and this
+// loader does not invent one (a folder of them is what makes a stack). A file
+// with several layers opens one doc PER LAYER, the same shape as a
+// multi-member .npz; `onlyLayer` opens exactly one, which is what a session
+// restore asks for.
+static std::string loadExr(const std::string& path, const std::string& onlyLayer = "") {
+#ifndef VIEWER_WITH_EXR
+    (void)path; (void)onlyLayer;
+    return "built without OpenEXR support (configure with -DVIEWER_WITH_EXR=ON)";
+#else
+    exrInitThreads();
+    std::vector<uint8_t> bytes;
+    if (!readFileBytes(path, bytes)) return "cannot read file";
+    std::vector<ExrLayer> layers;
+    ExrMemStream st(path.c_str(), bytes.data(), bytes.size());
+    std::unique_ptr<Imf::MultiPartInputFile> mp;
+    try {
+        mp = std::make_unique<Imf::MultiPartInputFile>(st);
+        std::string r = exrScanLayers(mp->header(0), mp->parts(), layers);
+        if (!r.empty()) return r;
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+
+    std::vector<std::string> opened, failed;
+    for (const auto& L : layers) {
+        if (!onlyLayer.empty() && L.name != onlyLayer) continue;
+        std::string disp = L.name.empty() ? baseName(path) : baseName(path) + ":" + L.name;
+        std::string e;
+        auto doc = exrReadLayer(*mp, L, path, disp, e);
+        std::string shown = L.name.empty() ? std::string("(base)") : L.name;
+        if (!doc) { failed.push_back(shown + ": " + e); continue; }
+        if (!L.name.empty()) doc->src->npzMember = L.name;   // session identity
+        statSourceFile(*doc->src);                           // Watch baseline
+        opened.push_back(shown);
+        addImage(std::move(doc));       // batch + computeMinMax + defaultRange
+    }
+    if (opened.empty()) {
+        if (!failed.empty()) return failed.front();
+        if (!onlyLayer.empty()) return "layer '" + onlyLayer + "' is not in this file";
+        return "no readable layer in this file";
+    }
+    // Say what opened and what did not, BY NAME - never silent in either
+    // direction. The .npz member path sets this convention.
+    if (layers.size() > 1 || !failed.empty()) {
+        std::string m = baseName(path) + ": " + std::to_string(opened.size()) + " layer(s): ";
+        for (size_t i = 0; i < opened.size(); i++) m += (i ? ", " : "") + opened[i];
+        if (!failed.empty()) {
+            m += "  |  not read: ";
+            for (size_t i = 0; i < failed.size(); i++) m += (i ? "; " : "") + failed[i];
+        }
+        toast(m, !failed.empty());
+    }
+    return {};
+#endif
+}
+
 static void runProcessor(int idx) {
     ImageDoc* im = cur();
     if (!im || idx < 0 || idx >= (int)plugin_host::processors().size()) return;
@@ -5957,6 +6284,10 @@ static std::string loadSession(const std::string& path) {
                 std::transform(lowp.begin(), lowp.end(), lowp.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
+                // .exr takes the same "member" line: a layer inside one file is
+                // the same idea as an array inside one .npz, and the saved
+                // session already carries the name (see FrameSource::npzMember)
+                bool isExr = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".exr") == 0;
                 bool isRemote = p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
                 if (isRemote) {
                     // a remote image has no local file to decode: reconnect instead
@@ -5964,7 +6295,9 @@ static std::string loadSession(const std::string& path) {
                     openRemote(p);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
-                    err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
+                    err = isNpz ? loadNpz(p, pendingMember)
+                        : isExr ? loadExr(p, pendingMember)
+                                : loadNpy(p);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -6264,6 +6597,15 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     for (int i = 0; i < (int)files.size(); i++)
         if (i != selfIdx) jobs.push_back({ files[i], i });
     bool isRaw = ref->src->rawDtype >= 0;
+    // .exr decodes through its own reader on the loader thread, the same way
+    // .npy does - the reference frame's path is what says which.
+    bool isExr = false;
+    {
+        std::string rl = ref->src->path;
+        std::transform(rl.begin(), rl.end(), rl.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        isExr = rl.size() > 4 && rl.compare(rl.size() - 4, 4, ".exr") == 0;
+    }
     RawDialog recipe;
     if (isRaw) {
         recipe.dtype = ref->src->rawDtype;
@@ -6292,10 +6634,10 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     }
     app.seqNote.clear();
     fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
-            (int)files.size(), isRaw ? "raw recipe" : "npy");
+            (int)files.size(), isRaw ? "raw recipe" : isExr ? "exr" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
-    app.seqThread = std::thread([jobs, isRaw, recipe, startBytes, budget]() {
+    app.seqThread = std::thread([jobs, isRaw, isExr, recipe, startBytes, budget]() {
         size_t bytes = startBytes;
         int failures = 0;
         double lastPost = 0;
@@ -6307,6 +6649,8 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 RawDialog d = recipe;
                 d.path = j.path;
                 doc = decodeRawFrame(d, err);
+            } else if (isExr) {
+                doc = decodeExr(j.path, err);
             } else {
                 doc = decodeNpy(j.path, err);
             }
@@ -6820,7 +7164,7 @@ static void gotoStack(int delta) {
 }
 
 // ---- open a whole folder tree: every numbered group becomes its own stack ----
-static const char* SEQ_EXTS[] = { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+static const char* SEQ_EXTS[] = { ".npy", ".npz", ".exr", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
 static bool isLoadableExt(const std::string& extLower) {
     for (const char* e : SEQ_EXTS) if (extLower == e) return true;
     return false;
@@ -6887,7 +7231,11 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             std::string ext = std::filesystem::u8path(g.files[0]).extension().u8string();
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            g.isRaw = ext != ".npy";
+            // "raw" here means "headerless: the user must state the geometry".
+            // .npy and .exr both carry their own shape, so neither may be sent
+            // to the RAW dialog - a folder of .exr would otherwise open a
+            // width/height/dtype prompt for a file that already says all three.
+            g.isRaw = ext != ".npy" && ext != ".exr";
             groups.push_back(std::move(g));
         };
         std::vector<std::string> leftover;
@@ -6963,7 +7311,11 @@ static void startNextQueuedGroup() {
         d.replaceIdx = -1;
         err = loadRaw(d);
     } else {
-        err = loadNpy(g.files[0]);
+        std::string gl = g.files[0];
+        std::transform(gl.begin(), gl.end(), gl.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        bool gExr = gl.size() > 4 && gl.compare(gl.size() - 4, 4, ".exr") == 0;
+        err = gExr ? loadExr(g.files[0]) : loadNpy(g.files[0]);
     }
     g_quietLoad = false;
     app.loadBatchId = 0;
@@ -9473,6 +9825,13 @@ static void openPath(const std::string& path) {
         // both what happened and when
         std::string err = loadNpz(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
+    } else if (ends(".exr")) {
+        // loadExr says what it did when there is more than one layer, so a
+        // blanket "loaded x.exr" would be a second, vaguer sentence about the
+        // same event
+        std::string err = loadExr(path);
+        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -9491,7 +9850,7 @@ static void openFileDialog() {
     }
     if (app.openDlg) return;             // one dialog at a time
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (*.npy *.npz *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.bin *.raw *.yuv *.dat",
+        std::vector<std::string>{ "Images (*.npy *.npz *.exr *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.exr *.bin *.raw *.yuv *.dat",
           "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
@@ -11552,7 +11911,15 @@ static void drawInspector() {
         // the reason the file was written that way - so they belong beside it
         // rather than in a panel of their own (docs/npz-design.md §2.5).
         if (!im->src->npzMember.empty()) {
-            ImGui::TextDisabled("npz member  %s", im->src->npzMember.c_str());
+            // ...and an .exr's is the file PLUS the layer name. Same field, so
+            // the label has to say which container it is talking about rather
+            // than calling an EXR layer an "npz member".
+            std::string pl = im->src->path;
+            std::transform(pl.begin(), pl.end(), pl.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            bool exrSrc = pl.size() > 4 && pl.compare(pl.size() - 4, 4, ".exr") == 0;
+            ImGui::TextDisabled(exrSrc ? "exr layer   %s" : "npz member  %s",
+                                im->src->npzMember.c_str());
             for (const auto& e : app.npzMeta) {
                 if (e.path != im->src->path) continue;
                 if (e.items.empty()) break;
@@ -21067,7 +21434,7 @@ static std::string g_browseKeysActs =
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
-        "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
+        "  files:  .npy, .npz, .exr, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
         "  folder: loads every numbered sequence below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
@@ -21287,6 +21654,7 @@ static void parseCli(int argc, char** argv) {
                            [](unsigned char c) { return (char)std::tolower(c); });
             bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
                            (low.size() > 4 && low.compare(low.size() - 4, 4, ".npz") == 0) ||
+                           (low.size() > 4 && low.compare(low.size() - 4, 4, ".exr") == 0) ||
                            (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
             if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
@@ -26730,6 +27098,312 @@ int main(int argc, char** argv) {
 
             std::filesystem::remove_all(ndir, nec);
             app.npyAxis = npyAxisWas;
+            closeAll();
+        }
+
+        // ---- V23: .exr - scanline half/float, the VALUES arrive untouched ---
+        // docs/media-support.md §1. This is a measurement tool, so the only
+        // acceptable transform on load is none: a 12.5 in the file is a 12.5 in
+        // the doc, not a display-encoded 12.5. half widens to float losslessly
+        // (every half IS a float), so "exactly" is the right assert, not
+        // "close" - and if anyone ever adds a tone curve to the loader, the
+        // equality below is what stops it.
+        //
+        // The fixtures are BUILT HERE rather than in tools/gen_testdata.py:
+        // writing .exr from Python needs a module the repo does not depend on
+        // (CI installs numpy and nothing else), while the writer half of the
+        // library we just linked is right there. Same reasoning as V21, which
+        // builds its .npz bytes in-test because miniz was already linked.
+        // The tradeoff is stated: this proves the loader's INTERPRETATION
+        // (channels, layers, dtype, ranges, refusals), not byte-level parsing
+        // of a third party's file - the writer is the same project as the
+        // reader.
+        {
+            closeAll();
+            std::error_code xec;
+            std::filesystem::path xdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-exr-scratch";
+            std::filesystem::create_directories(xdir, xec);
+#ifndef VIEWER_WITH_EXR
+            // A LOUD skip, not a failure. -DVIEWER_WITH_EXR=OFF is a supported
+            // configuration (no network, or a packager who does not want the
+            // dependency), and failing the suite for choosing it would punish
+            // the documented escape hatch. It must never be SILENT either -
+            // same rule as the quarantine block in CMakeLists.txt: say that the
+            // coverage is absent, and why, every single run.
+            fprintf(stderr, "verifyselftest: V23 SKIPPED - built without OpenEXR, so the "
+                            ".exr loader is NOT covered by this run "
+                            "(configure with -DVIEWER_WITH_EXR=ON to cover it)\n");
+#else
+            // OpenEXR reports everything by throwing. A fixture that fails to
+            // WRITE must fail this assert block, not abort the whole suite and
+            // take the 20-odd asserts after it down with it.
+            try {
+            const int XW = 8, XH = 8;
+            const int XN = XW * XH;
+            // Values chosen for what they prove:
+            //   12.5   scene-linear and >1: survives only if nothing tone maps
+            //   -3.25  negative: survives only if nothing clamps
+            //   256.0  >>1, still exact in half
+            //   0.1    NOT exact in half - must come back as half(0.1), which
+            //          is a DIFFERENT number from 0.1f, and exactly that one
+            auto mkchan = [&](float lead) {
+                std::vector<float> v((size_t)XN);
+                for (int i = 0; i < XN; i++) v[(size_t)i] = lead + (float)i * 0.5f;
+                v[0] = 12.5f; v[1] = 0.5f; v[2] = 256.0f; v[3] = -3.25f; v[4] = 0.1f;
+                return v;
+            };
+            // One flat scanline .exr. NB: OutputFile does NOT convert on write -
+            // the slice type must equal the channel type (InputFile is the one
+            // that converts, which is why the loader can ask for FLOAT and get
+            // half widened for free). So a HALF file is fed half memory.
+            auto writeExr = [&](const std::string& p,
+                                const std::vector<std::pair<std::string, std::vector<float>>>& chans,
+                                Imf::PixelType pt) {
+                Imf::Header hdr(XW, XH);
+                for (const auto& c : chans)
+                    hdr.channels().insert(c.first, Imf::Channel(pt));
+                hdr.compression() = Imf::NO_COMPRESSION;
+                Imf::OutputFile out(p.c_str(), hdr);
+                Imf::FrameBuffer fb;
+                std::vector<std::vector<Imath::half>> hbuf;
+                hbuf.reserve(chans.size());        // stable addresses for the slices
+                for (const auto& c : chans) {
+                    if (pt == Imf::HALF) {
+                        hbuf.emplace_back(c.second.begin(), c.second.end());
+                        fb.insert(c.first,
+                                  Imf::Slice(Imf::HALF, (char*)hbuf.back().data(),
+                                             sizeof(Imath::half), sizeof(Imath::half) * XW));
+                    } else {
+                        fb.insert(c.first,
+                                  Imf::Slice(Imf::FLOAT,
+                                             const_cast<char*>((const char*)c.second.data()),
+                                             sizeof(float), sizeof(float) * XW));
+                    }
+                }
+                out.setFrameBuffer(fb);
+                out.writePixels(XH);
+            };
+            std::vector<float> cR = mkchan(0.0f), cG = mkchan(1.0f), cB = mkchan(2.0f),
+                               cA = mkchan(3.0f);
+
+            // ---- V23a: R,G,B half -> one 3-ch doc, dtype f16, values EXACT --
+            std::string pHalf = (xdir / "rgb_half.exr").u8string();
+            writeExr(pHalf, { { "R", cR }, { "G", cG }, { "B", cB } }, Imf::HALF);
+            std::string e23 = loadExr(pHalf);
+            fprintf(stderr, "verifyselftest: V23a loadExr -> %zu image(s)%s\n",
+                    app.images.size(), e23.empty() ? "" : (" err: " + e23).c_str());
+            check(e23.empty() && app.images.size() == 1, "V23a an RGB .exr opens as one doc");
+            if (app.images.size() == 1) {
+                const ImageDoc& d = *app.images[0];
+                check(d.w == XW && d.h == XH && d.ch == 3,
+                      "V23a R,G,B becomes 3 channels at the data-window size");
+                check(d.dtype == "f16", "V23a a half file records dtype f16");
+                // no tone mapping, no clamp, no gamma - the number itself
+                bool exact = d.sample(0, 0, 0) == 12.5f && d.sample(0, 0, 1) == 12.5f &&
+                             d.sample(3, 0, 0) == -3.25f && d.sample(2, 0, 0) == 256.0f;
+                fprintf(stderr, "verifyselftest: V23a px(0,0)=%.9g px(3,0)=%.9g px(2,0)=%.9g "
+                                "dtype=%s\n",
+                        (double)d.sample(0, 0, 0), (double)d.sample(3, 0, 0),
+                        (double)d.sample(2, 0, 0), d.dtype.c_str());
+                check(exact, "V23a 12.5 / -3.25 / 256 arrive EXACTLY (no tone mapping)");
+                // half(0.1) is not 0.1f: the assert is that we get half's value
+                // exactly, which is what "no loss on widening" actually means
+                float want = (float)Imath::half(0.1f);
+                fprintf(stderr, "verifyselftest: V23a half(0.1)=%.9g read=%.9g\n",
+                        (double)want, (double)d.sample(4, 0, 0));
+                check(d.sample(4, 0, 0) == want,
+                      "V23a a half that is not exact widens to exactly that half");
+                check(d.vmin == -3.25f && d.vmax == 256.0f,
+                      "V23a vmin/vmax are the data's own");
+                check(d.black == d.vmin && d.white == d.vmax,
+                      "V23a the display range initialises from the data");
+            }
+
+            // ---- V23b: R,G,B,A float -> 4 ch, dtype f32 ---------------------
+            closeAll();
+            std::string pF32 = (xdir / "rgba_f32.exr").u8string();
+            std::vector<float> fR = cR;
+            fR[5] = 12345.6789f;              // a float that half could not hold
+            writeExr(pF32, { { "R", fR }, { "G", cG }, { "B", cB }, { "A", cA } }, Imf::FLOAT);
+            std::string e23b = loadExr(pF32);
+            check(e23b.empty() && app.images.size() == 1 && app.images[0]->ch == 4,
+                  "V23b R,G,B,A becomes 4 channels");
+            if (app.images.size() == 1) {
+                const ImageDoc& d = *app.images[0];
+                fprintf(stderr, "verifyselftest: V23b dtype=%s ch=%d px(5,0)=%.9g\n",
+                        d.dtype.c_str(), d.ch, (double)d.sample(5, 0, 0));
+                check(d.dtype == "f32", "V23b a float file records dtype f32");
+                check(d.sample(5, 0, 0) == 12345.6789f,
+                      "V23b a float value round-trips exactly");
+            }
+
+            // ---- V23c: a lone Y is one channel ------------------------------
+            closeAll();
+            std::string pY = (xdir / "lum.exr").u8string();
+            writeExr(pY, { { "Y", cR } }, Imf::HALF);
+            std::string e23c = loadExr(pY);
+            fprintf(stderr, "verifyselftest: V23c %zu image(s) ch=%d%s\n", app.images.size(),
+                    app.images.empty() ? -1 : app.images[0]->ch,
+                    e23c.empty() ? "" : (" err: " + e23c).c_str());
+            check(e23c.empty() && app.images.size() == 1 && app.images[0]->ch == 1,
+                  "V23c a single Y channel becomes 1 channel");
+
+            // ---- V23d: multi-layer = one doc per layer, named --------------
+            // The same shape as a multi-member .npz, carried in the same field,
+            // so a session restores the layer it was showing.
+            closeAll();
+            std::string pL = (xdir / "layers.exr").u8string();
+            writeExr(pL, { { "diffuse.R", cR }, { "diffuse.G", cG }, { "diffuse.B", cB },
+                           { "specular.R", cG }, { "specular.G", cB }, { "specular.B", cR } },
+                     Imf::HALF);
+            std::string e23d = loadExr(pL);
+            std::string names, members;
+            for (const auto& d : app.images) {
+                names += (names.empty() ? "" : ", ") + d->name;
+                members += (members.empty() ? "" : ", ") + d->src->npzMember;
+            }
+            fprintf(stderr, "verifyselftest: V23d %zu doc(s): %s   members: %s%s\n",
+                    app.images.size(), names.c_str(), members.c_str(),
+                    e23d.empty() ? "" : (" err: " + e23d).c_str());
+            bool twoLayers = e23d.empty() && app.images.size() == 2 &&
+                             app.images[0]->src->npzMember == "diffuse" &&
+                             app.images[1]->src->npzMember == "specular" &&
+                             app.images[0]->name == "layers.exr:diffuse" &&
+                             app.images[1]->name == "layers.exr:specular" &&
+                             app.images[0]->ch == 3 && app.images[1]->ch == 3;
+            check(twoLayers, "V23d each layer becomes its own 3-ch doc, named for it");
+
+            // ...and asking for ONE layer by name opens only that one - the
+            // call a session restore makes
+            closeAll();
+            std::string e23d2 = loadExr(pL, "specular");
+            check(e23d2.empty() && app.images.size() == 1 &&
+                  app.images[0]->src->npzMember == "specular",
+                  "V23d naming one layer opens exactly that layer");
+
+            // ---- V23e: a session brings back the SAME layer -----------------
+            std::string xsess = (xdir / "exr.vsession").u8string();
+            saveSession(xsess, true);
+            std::string xlerr = loadSession(xsess);
+            loadAll();
+            bool backMember = app.images.size() == 1 &&
+                              app.images[0]->src->npzMember == "specular";
+            fprintf(stderr, "verifyselftest: V23e after restore: %zu image(s) member='%s'%s\n",
+                    app.images.size(),
+                    app.images.empty() ? "-" : app.images[0]->src->npzMember.c_str(),
+                    xlerr.empty() ? "" : (" load err: " + xlerr).c_str());
+            check(xlerr.empty() && backMember,
+                  "V23e the session restores the same .exr layer");
+
+            // ---- V23f: what is NOT read is refused BY NAME ------------------
+            // Never a bare "cannot open" (docs/import-adapters.md §3.2).
+            closeAll();
+            // (1) chroma subsampled Y/RY/BY
+            std::string pSub = (xdir / "chroma.exr").u8string();
+            {
+                Imf::Header hdr(XW, XH);
+                hdr.channels().insert("Y",  Imf::Channel(Imf::HALF, 1, 1));
+                hdr.channels().insert("RY", Imf::Channel(Imf::HALF, 2, 2));
+                hdr.channels().insert("BY", Imf::Channel(Imf::HALF, 2, 2));
+                hdr.compression() = Imf::NO_COMPRESSION;
+                Imf::OutputFile out(pSub.c_str(), hdr);
+                std::vector<Imath::half> full((size_t)XN, Imath::half(1.0f));
+                std::vector<Imath::half> quarter((size_t)(XW / 2) * (XH / 2),
+                                                 Imath::half(0.25f));
+                const size_t hs = sizeof(Imath::half);
+                Imf::FrameBuffer fb;
+                fb.insert("Y", Imf::Slice(Imf::HALF, (char*)full.data(), hs, hs * XW));
+                fb.insert("RY", Imf::Slice(Imf::HALF, (char*)quarter.data(),
+                                           hs, hs * (XW / 2), 2, 2));
+                fb.insert("BY", Imf::Slice(Imf::HALF, (char*)quarter.data(),
+                                           hs, hs * (XW / 2), 2, 2));
+                out.setFrameBuffer(fb);
+                out.writePixels(XH);
+            }
+            std::string eSub = loadExr(pSub);
+            fprintf(stderr, "verifyselftest: V23f subsampled -> \"%s\"\n", eSub.c_str());
+            check(!eSub.empty() && eSub.find("chroma-subsampled") != std::string::npos &&
+                      (eSub.find("RY") != std::string::npos ||
+                       eSub.find("BY") != std::string::npos) &&
+                      app.images.empty(),
+                  "V23f chroma subsampling is refused, naming the channel");
+
+            // (2) tiled
+            std::string pTile = (xdir / "tiled.exr").u8string();
+            {
+                Imf::Header hdr(XW, XH);
+                hdr.channels().insert("R", Imf::Channel(Imf::HALF));
+                hdr.compression() = Imf::NO_COMPRESSION;
+                hdr.setTileDescription(Imf::TileDescription(4, 4, Imf::ONE_LEVEL));
+                Imf::TiledOutputFile out(pTile.c_str(), hdr);
+                std::vector<Imath::half> v((size_t)XN, Imath::half(2.0f));
+                Imf::FrameBuffer fb;
+                fb.insert("R", Imf::Slice(Imf::HALF, (char*)v.data(),
+                                          sizeof(Imath::half), sizeof(Imath::half) * XW));
+                out.setFrameBuffer(fb);
+                out.writeTiles(0, out.numXTiles() - 1, 0, out.numYTiles() - 1);
+            }
+            std::string eTile = loadExr(pTile);
+            fprintf(stderr, "verifyselftest: V23f tiled -> \"%s\"\n", eTile.c_str());
+            check(!eTile.empty() && eTile.find("tiled") != std::string::npos &&
+                      app.images.empty(),
+                  "V23f a tiled .exr is refused, saying it is tiled");
+
+            // (3) deep
+            std::string pDeep = (xdir / "deep.exr").u8string();
+            {
+                Imf::Header hdr(XW, XH);
+                hdr.channels().insert("R", Imf::Channel(Imf::HALF));
+                hdr.setType(Imf::DEEPSCANLINE);
+                hdr.compression() = Imf::NO_COMPRESSION;
+                Imf::DeepScanLineOutputFile out(pDeep.c_str(), hdr);
+                std::vector<unsigned int> counts((size_t)XN, 1u);
+                std::vector<Imath::half> store((size_t)XN, Imath::half(1.0f));
+                std::vector<Imath::half*> ptrs((size_t)XN);
+                for (int i = 0; i < XN; i++) ptrs[(size_t)i] = &store[(size_t)i];
+                Imf::DeepFrameBuffer dfb;
+                dfb.insertSampleCountSlice(
+                    Imf::Slice(Imf::UINT, (char*)counts.data(),
+                               sizeof(unsigned int), sizeof(unsigned int) * XW));
+                dfb.insert("R", Imf::DeepSlice(Imf::HALF, (char*)ptrs.data(),
+                                               sizeof(Imath::half*),
+                                               sizeof(Imath::half*) * XW,
+                                               sizeof(Imath::half)));
+                out.setFrameBuffer(dfb);
+                out.writePixels(XH);
+            }
+            std::string eDeep = loadExr(pDeep);
+            fprintf(stderr, "verifyselftest: V23f deep -> \"%s\"\n", eDeep.c_str());
+            check(!eDeep.empty() && eDeep.find("deep") != std::string::npos &&
+                      app.images.empty(),
+                  "V23f a deep .exr is refused, saying it is deep");
+
+            // ---- V23g: a FOLDER of .exr is a stack, not N raw dialogs -------
+            // One .exr is one frame - the frame axis comes from the files on
+            // disk, through the sequence machinery that already exists.
+            std::filesystem::path sdir = xdir / "seq";
+            std::filesystem::create_directories(sdir, xec);
+            for (int i = 0; i < 3; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "f_%03d.exr", i);
+                writeExr((sdir / nm).u8string(), { { "Y", cR } }, Imf::HALF);
+            }
+            {
+                auto grp = scanFolderGroups(sdir.u8string());
+                fprintf(stderr, "verifyselftest: V23g %zu group(s)%s files=%zu isRaw=%d\n",
+                        grp.size(), grp.empty() ? "" : (" name=" + grp[0].name).c_str(),
+                        grp.empty() ? (size_t)0 : grp[0].files.size(),
+                        grp.empty() ? -1 : (int)grp[0].isRaw);
+                check(grp.size() == 1 && grp[0].files.size() == 3 && !grp[0].isRaw,
+                      "V23g three .exr files scan as ONE non-raw group");
+            }
+            } catch (const std::exception& ex) {
+                fprintf(stderr, "verifyselftest: V23 threw: %s\n", ex.what());
+                check(false, "V23 the .exr fixtures build and read without throwing");
+            }
+#endif  // VIEWER_WITH_EXR
+            std::filesystem::remove_all(xdir, xec);
             closeAll();
         }
 
