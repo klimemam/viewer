@@ -21,6 +21,8 @@ returned.  `__parent_<i>` is what makes it a tree (-1 at the root), which is how
 series says which stacks are its members without the stacks having to carry the
 condition themselves (4.5).
 
+    __viewer                   container format version; its PRESENCE is what
+                               distinguishes a viewer container from a plain npz
     __n                        number of nodes
     __layer_<i>                "frame" | "stack" | "series" | "batch"
     __parent_<i>               parent node index, -1 for the root
@@ -32,9 +34,10 @@ condition themselves (4.5).
     __meta_<k>                 root node meta, JSON encoded value
     __meta_<i>_<k>             meta of node i > 0, JSON encoded value
 
-An axis whose unit is empty is NOT written: a quantity without a unit is not
-applied, the same rule a pasted column obeys (4.3.2).  It is counted as skipped
-in the summary and left in the note.
+An axis whose unit is empty is written WITH AN EMPTY UNIT: a quantity without a
+unit is not applied, the same rule a pasted column obeys (4.3.2), but the values
+are not thrown away -- the viewer carries them and the user supplies the unit.
+It is counted as skipped in the summary and named in the note.
 
 Exit status: 0 wrote the npz, 2 anything else.  A failure always says why (4.9).
 """
@@ -174,13 +177,23 @@ class Build(object):
                                % (where, field, arr.shape[0], count, word))
         if field == "timestamps" and not name:
             name = "time"                                           # 4.3.2
-        if not unit.strip():                                        # 4.3.2
-            self.skipped.append("%s has no unit" % field)
-            node.notes.append("%s dropped (no unit)" % field)
-            return
         if field == "conditions" and not name:
+            # Checked BEFORE the unit: an unnamed sweep is an error whether or
+            # not a unit came with it.  "what was varied" is not recoverable.
             raise AdapterError("%s: conditions has no name -- say what was varied, "
                                'e.g. Values(exposures, "exposure", "ms")' % where)
+        if not unit.strip():                                        # 4.3.2
+            # NOT APPLIED, but NOT DISCARDED.  "no unit" is not "no data": the
+            # values are written with an empty unit and reach the viewer, which
+            # holds exactly this state already (Series::unit empty, axis values
+            # present) and lets the user type the unit in to complete it.
+            # Dropping them here would make the user re-enter measurements by
+            # hand, which is the one cost 4.3.2 names as unacceptable.  It is
+            # still counted as skipped, so the summary says both directions.
+            self.skipped.append("%s has no unit" % field)
+            node.notes.append("%s has no unit (values kept, not applied)" % field)
+            setattr(node, field, (arr, name, ""))
+            return
         setattr(node, field, (arr, name, unit))
 
     # -- the walk -----------------------------------------------------------
@@ -317,8 +330,18 @@ def meta_key(prefix, key):
     return prefix + key
 
 
+#: bumped when the MEANING of a reserved member changes; additions are compatible
+CONTAINER_VERSION = 1
+
+
 def write_npz(path, nodes):
-    out = {"__n": np.array(len(nodes), dtype="int32")}
+    # __viewer is the discriminator (4.11.1): with it this npz is a viewer
+    # container and the layer tree below is authoritative; without it the file is
+    # an ordinary npz and the viewer classifies its members by shape
+    # (docs/npz-design.md).  It is written FIRST and always, because "is this a
+    # container?" must be answerable without understanding anything else here.
+    out = {"__viewer": np.array(CONTAINER_VERSION, dtype="int32"),
+           "__n": np.array(len(nodes), dtype="int32")}
     for i, nd in enumerate(nodes):
         out["__layer_%d" % i] = np.array(nd.layer)
         out["__parent_%d" % i] = np.array(nd.parent, dtype="int32")

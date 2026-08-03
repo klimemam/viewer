@@ -25,6 +25,7 @@
 #include "ui_theme.h"
 #include "version.h"                 // the commit this binary was built from
 #include "remote.h"
+#include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
 #include "remote_proto.h"
 #include "app_icon.h"
 #include "window_frame.h"
@@ -1219,6 +1220,34 @@ struct App {
     // the file's provenance next to the frame it opened (docs/npz-design.md §2.5).
     struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
     std::vector<NpzMeta> npzMeta;
+    // ---- input adapters (docs/input-adapters.md §4.12 / §4.13) ---------------
+    // v1 remembers ONE thing: which reader read which file. Folder and glob
+    // RULES are deliberately absent (§8 item 7) - they need a trust rule first,
+    // because a rule living in a shared data folder would run someone else's
+    // Python without anyone choosing it. This list is a record of choices the
+    // user made, which is why it is visible and removable rather than magic.
+    std::string pythonExe;                  // configured interpreter; "" = probe PATH
+    struct ReaderMemo { std::string path, spec; };
+    std::vector<ReaderMemo> readerMemo;     // most recent first; bounded, see §4.12
+    std::vector<std::string> readerShown;   // specs whose command was shown once (§4.13)
+    // §4.13.0: ONE panel, three entrances, and it does not close. Writing an
+    // adapter is write -> load -> read the failure -> fix -> load again, and a
+    // modal cuts that loop every time the author leaves for their editor.
+    std::string readerPickPath;             // the file or folder the panel is aimed at
+    bool readerPanelOpen = false;
+    bool readerPanelRaise = false;          // an entrance asked for focus
+    bool readerListOpen = false;            // §4.12's visible, removable list
+    char readerPickFile[512] = "";
+    char readerPickFunc[128] = "load";
+    char readerLocalDir[512] = "";          // a folder of the user's own readers
+    std::string readerPickWhy;              // why we are asking (native's own refusal)
+    // The last run, kept WHOLE. A traceback is the only debugging surface an
+    // adapter author has; folding it into "could not open" makes the feature
+    // useless to exactly the people it exists for (§4.13.0).
+    std::string readerLastOut;
+    std::string readerLastSpec;
+    bool readerLastOk = false;
+    bool readerRan = false;
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
     bool anyFileDialog() const {      // see the note on csvDlg
@@ -3823,17 +3852,18 @@ static int npyNativeRead(const std::vector<int64_t>& shape) {
 // that says only "cannot open" sends the reader nowhere, which is how a 1-D
 // exposure vector stayed a one-pixel-tall image for as long as it did.
 //
-// TODO(§4.13): the third line of §3.2 is "[ choose a reader... ]", and THIS is
-// the single place it attaches - the same message that said no. There is no
-// adapter mechanism yet (§4 / stage 1-3), so the affordance has no destination
-// and is deliberately absent rather than half-built: a picker that picks
-// nothing is worse than a sentence that is honest about the state of things.
+// §4.13, now attached: the third line of §3.2 is "choose a reader...", and THIS
+// is the single place it hangs from - the same message that said no. The
+// destination exists (openReaderPicker), and openPath raises it with this very
+// text as the reason, so the refusal is the affordance rather than a dead end
+// the user has to leave in order to act on.
 static std::string npyNotNative(const std::vector<int64_t>& shape) {
     // npyShapeText says "scalar" for a 0-D array, and "shape scalar" is not a
     // sentence; everything else is a shape and is named as one.
     return (shape.empty() ? std::string("a scalar")
                           : "shape " + npyShapeText(shape)) +
-           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS);
+           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS) +
+           "\n  choose a reader to read it another way";
 }
 
 // The layout decision, lifted out of the decoder so the .npz picker can promise
@@ -4387,6 +4417,386 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
     return s;
 }
 
+// ---- the viewer container: an npz that declares its own layers ---------------
+// docs/input-adapters.md §4.11. This is the ONE npz that does not have to be
+// guessed at: the reserved members name the layer of every node, so the file
+// answers the question §1 says a file normally cannot answer about itself.
+//
+// The discriminator is `__viewer` and nothing else (§4.11.1). Without it the
+// file is an ordinary npz and the shape classifier owns it exactly as before -
+// the two readings never overlap, so npz-design.md §2.5's human-written form is
+// untouched by anything here.
+static const int VIEWER_NPZ_VERSION = 1;
+static std::string readerFileOf(const std::string& spec);   // fwd (§4.12, below)
+static std::string readerFuncOf(const std::string& spec);
+
+struct VnzNode {
+    std::string layer;                 // "frame" "stack" "series" "batch"
+    int parent = -1;
+    std::string name, note, cfa;
+    bool hasPixels = false;
+    size_t pixelEntry = 0;
+    std::vector<double> condVals, tsVals, range;
+    std::vector<int64_t> rangeShape;
+    std::string condName, condUnit, tsName, tsUnit;
+    bool hasCond = false, hasTs = false;
+    // filled while building
+    int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
+};
+
+// One reserved member, by name. Everything the container says about itself is
+// small (a word, a number, a vector) except the pixels, which are handed to the
+// same decoder a plain member uses rather than being re-implemented here.
+static bool vnzRead(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                    const std::map<std::string, size_t>& byName, const std::string& name,
+                    std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
+    auto it = byName.find(name);
+    if (it == byName.end()) { err = "missing member " + name; return false; }
+    if (!npzExtract(zip, entries[it->second], buf, err)) return false;
+    if (!npyPeekHeader(buf, H, err)) { err = name + ": " + err; return false; }
+    return true;
+}
+
+static std::string vnzStr(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                          const std::map<std::string, size_t>& byName, const std::string& name) {
+    std::vector<uint8_t> buf; NpyHead H; std::string e;
+    if (!vnzRead(zip, entries, byName, name, buf, H, e)) return {};
+    return npzTextValue(buf, H);
+}
+
+static bool vnzNum(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                   const std::map<std::string, size_t>& byName, const std::string& name,
+                   double& out, std::string& err) {
+    std::vector<uint8_t> buf; NpyHead H;
+    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (H.esize == 0) { err = name + " is not a number"; return false; }
+    out = npyElem(buf, H, 0);
+    return true;
+}
+
+static bool vnzVec(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                   const std::map<std::string, size_t>& byName, const std::string& name,
+                   std::vector<double>& out, std::vector<int64_t>& shape, std::string& err) {
+    std::vector<uint8_t> buf; NpyHead H;
+    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (H.esize == 0) { err = name + " is not numeric"; return false; }
+    size_t n = 1;
+    for (int64_t d : H.shape) {
+        if (d < 0 || (d && n > (size_t)-1 / (size_t)d)) { err = name + " has an impossible shape"; return false; }
+        n *= (size_t)d;
+    }
+    if (H.dataOff + n * (size_t)H.esize > buf.size()) { err = name + " is truncated"; return false; }
+    out.clear();
+    out.reserve(n);
+    // Values at FULL precision: conditions and timestamps are DATA and are
+    // plotted and exported, so they never pass through float on the way in.
+    for (size_t i = 0; i < n; i++) out.push_back(npyElem(buf, H, i));
+    shape = H.shape;
+    return true;
+}
+
+// Is this npz a viewer container? Only `__viewer` answers, and a version from
+// the future is refused by name rather than read with today's meanings.
+static bool vnzIsContainer(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                           int& version) {
+    for (const auto& e : entries)
+        if (e.name == "__viewer.npy") {
+            std::vector<uint8_t> buf; NpyHead H; std::string err;
+            if (!npzExtract(zip, e, buf, err) || !npyPeekHeader(buf, H, err)) return false;
+            version = H.esize ? (int)npyElem(buf, H, 0) : 0;
+            return true;
+        }
+    return false;
+}
+
+static int vnzCfaPattern(const std::string& cfa, int& kind) {
+    std::string p = cfa;
+    kind = 1;
+    if (p.compare(0, 5, "quad:") == 0) { kind = 2; p = p.substr(5); }
+    for (int i = 0; i < 4; i++) if (p == CFA_PATTERNS[i]) return i;
+    kind = 0;
+    return -1;
+}
+
+// Build the layers a container declares. Refusals name the member at fault:
+// stage 6's rule is that a malformed container says WHAT is wrong, and "this
+// npz is invalid" would send the reader back to a hex editor.
+// `origin` is the file the USER opened, which is not always the file these bytes
+// came out of: when a reader produced this container, the bytes live in the
+// cache under a hash. Everything the user sees or that identifies these pixels
+// later - the batch name, the frame labels, FrameSource::path, the key the
+// reader memory and Watch are looked up under - names `origin`. Getting this
+// wrong labelled every frame with a hash and left the Inspector's own reader row
+// unable to find the reader that had just run.
+static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
+                                 const std::vector<NpzEntry>& entries, int version,
+                                 const std::string& readerSpec, const std::string& origin) {
+    if (version > VIEWER_NPZ_VERSION) {
+        char b[192];
+        snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
+                              "(this one reads %d) - the layer meanings may have changed",
+                 version, VIEWER_NPZ_VERSION);
+        return b;
+    }
+    std::map<std::string, size_t> byName;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const std::string& n = entries[i].name;
+        if (n.size() > 4 && n.compare(n.size() - 4, 4, ".npy") == 0)
+            byName[n.substr(0, n.size() - 4)] = i;
+    }
+    std::string err;
+    double nd = 0;
+    if (!vnzNum(zip, entries, byName, "__n", nd, err))
+        return "not a usable container: " + err + " (a container declares __n, the node count)";
+    int n = (int)nd;
+    if (n <= 0 || n > 100000) return "__n is " + std::to_string(n) + ": not a node count";
+
+    std::vector<VnzNode> nodes((size_t)n);
+    for (int i = 0; i < n; i++) {
+        VnzNode& nd2 = nodes[(size_t)i];
+        std::string si = std::to_string(i);
+        if (byName.find("__layer_" + si) == byName.end())
+            return "__layer_" + si + " is missing: every node declares its layer "
+                   "(frame / stack / series / batch)";
+        nd2.layer = vnzStr(zip, entries, byName, "__layer_" + si);
+        if (nd2.layer != "frame" && nd2.layer != "stack" && nd2.layer != "series" &&
+            nd2.layer != "batch")
+            return "__layer_" + si + " is \"" + nd2.layer + "\": not a layer "
+                   "(frame / stack / series / batch)";
+        double pv = -1;
+        if (byName.count("__parent_" + si)) {
+            if (!vnzNum(zip, entries, byName, "__parent_" + si, pv, err)) return err;
+        } else if (i != 0) {
+            return "__parent_" + si + " is missing: a node that is not the root names its parent";
+        }
+        nd2.parent = (int)pv;
+        if (i == 0 && nd2.parent != -1)
+            return "__parent_0 is " + std::to_string(nd2.parent) + ": node 0 is the root (-1)";
+        if (i != 0 && (nd2.parent < 0 || nd2.parent >= i))
+            return "__parent_" + si + " is " + std::to_string(nd2.parent) +
+                   ": a parent must be an earlier node (depth first, root 0)";
+        nd2.name = vnzStr(zip, entries, byName, "__name_" + si);
+        nd2.note = vnzStr(zip, entries, byName, "__note_" + si);
+        nd2.cfa  = vnzStr(zip, entries, byName, "__cfa_" + si);
+        auto px = byName.find("__pixels_" + si);
+        if (px != byName.end()) { nd2.hasPixels = true; nd2.pixelEntry = px->second; }
+        if ((nd2.layer == "frame" || nd2.layer == "stack") && !nd2.hasPixels)
+            return "__pixels_" + si + " is missing: a " + nd2.layer + " is pixels";
+        if (byName.count("__range_" + si) &&
+            !vnzVec(zip, entries, byName, "__range_" + si, nd2.range, nd2.rangeShape, err))
+            return err;
+        for (int f = 0; f < 2; f++) {
+            const char* field = f == 0 ? "timestamps" : "conditions";
+            std::string base = std::string("__") + field + "_values_" + si;
+            if (!byName.count(base)) continue;
+            std::vector<double> vals; std::vector<int64_t> shp;
+            if (!vnzVec(zip, entries, byName, base, vals, shp, err)) return err;
+            if (shp.size() != 1)
+                return base + " is not a 1-D vector: one value per " +
+                       (f == 0 ? "frame" : "stack");
+            std::string nm = vnzStr(zip, entries, byName,
+                                    std::string("__") + field + "_name_" + si);
+            std::string un = vnzStr(zip, entries, byName,
+                                    std::string("__") + field + "_unit_" + si);
+            if (f == 0) { nd2.tsVals = std::move(vals); nd2.tsName = nm; nd2.tsUnit = un; nd2.hasTs = true; }
+            else        { nd2.condVals = std::move(vals); nd2.condName = nm; nd2.condUnit = un; nd2.hasCond = true; }
+        }
+    }
+    // Structure, before anything is opened: a tree that cannot hold is refused
+    // whole rather than half-built into the session.
+    std::vector<int> kids((size_t)n, 0);
+    for (int i = 1; i < n; i++) {
+        const VnzNode& c = nodes[(size_t)i];
+        const VnzNode& p = nodes[(size_t)c.parent];
+        kids[(size_t)c.parent]++;
+        if (p.layer == "frame" || p.layer == "stack")
+            return "__parent_" + std::to_string(i) + " is a " + p.layer +
+                   ": only a series or a batch holds other layers";
+        if (p.layer == "series" && c.layer != "stack" && c.layer != "frame")
+            return "node " + std::to_string(i) + " is a " + c.layer +
+                   " inside a series: a series holds stacks or frames (§4.4)";
+        if (c.layer == "batch")
+            return "__layer_" + std::to_string(i) + " is a batch: a batch does not nest";
+    }
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        if (v.layer == "series") {
+            if (!kids[(size_t)i])
+                return "node " + std::to_string(i) + " is a series with no stacks";
+            if (v.hasCond && (int)v.condVals.size() != kids[(size_t)i]) {
+                char b[192];
+                snprintf(b, sizeof b, "__conditions_values_%d has %d value(s) but the series "
+                                      "holds %d stack(s) - one condition per stack, and a "
+                                      "partial mapping would lie about the rest",
+                         i, (int)v.condVals.size(), kids[(size_t)i]);
+                return b;
+            }
+        }
+    }
+
+    // ---- build ---------------------------------------------------------------
+    int prevBatch = app.loadBatchId;
+    std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
+                                ? nodes[0].name : baseName(origin);
+    app.loadBatchId = newBatch(uniqueBatchName(batchName));
+    int batchId = app.loadBatchId;
+    int frames = 0, stacks = 0, seriesN = 0;
+    std::string firstErr;
+
+    for (int i = 0; i < n; i++) {
+        VnzNode& v = nodes[(size_t)i];
+        if (v.layer == "batch") continue;
+        if (v.layer == "series") {
+            v.seriesId = newSeries(batchId, v.name);
+            seriesN++;
+            for (auto& s : app.series)
+                if (s.id == v.seriesId) {
+                    // §4.5: the condition belongs to the SERIES. Putting it on the
+                    // stacks is exactly what lets sigma_t be computed across a
+                    // sweep, which is the failure the layer split exists to stop.
+                    s.paramName = v.condName;
+                    // An empty unit is a REAL state here, not a missing one:
+                    // Series::unit is documented empty-means-unset and the panel
+                    // lets the user type it in. §4.3.2 - the values stay either way.
+                    snprintf(s.unit, sizeof s.unit, "%s", v.condUnit.c_str());
+                }
+            continue;
+        }
+        // frame / stack: the pixels go through the SAME decoder a plain member
+        // uses, so a container and a loose .npy of the same array cannot drift.
+        std::vector<uint8_t> member;
+        std::string mErr;
+        if (!npzExtract(zip, entries[v.pixelEntry], member, mErr)) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+            break;
+        }
+        size_t before = app.images.size();
+        std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(i) : v.name;
+        std::string lErr = loadNpyBuffer(member, origin, label);
+        if (!lErr.empty()) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + lErr;
+            break;
+        }
+        v.docFirst = (int)before;
+        v.docCount = (int)(app.images.size() - before);
+        if (v.docCount <= 0) { firstErr = "__pixels_" + std::to_string(i) + ": nothing decoded"; break; }
+        v.seqId = app.images[before]->seqId;
+        frames += v.docCount;
+        if (v.layer == "stack") stacks++;
+
+        int cfaKind = 0;
+        int cfaPat = v.cfa.empty() ? -1 : vnzCfaPattern(v.cfa, cfaKind);
+        for (int k = 0; k < v.docCount; k++) {
+            ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+            d->src->npzMember = "__pixels_" + std::to_string(i);
+            statSourceFile(*d->src);
+            if (!v.note.empty())
+                d->note = d->note.empty() ? v.note : d->note + ", " + v.note;
+            if (cfaPat >= 0) { d->cfa = cfaKind; d->cfaPattern = cfaPat; d->texDirty = true; }
+            else if (!v.cfa.empty())
+                d->note += (d->note.empty() ? "" : ", ") + std::string("cfa \"") + v.cfa +
+                           "\" is not a known pattern";
+        }
+        // range: (2,) for the whole node, (F,2) one per frame (§4.3.3)
+        if (v.rangeShape.size() == 1 && v.range.size() == 2) {
+            for (int k = 0; k < v.docCount; k++) {
+                app.images[(size_t)v.docFirst + (size_t)k]->black = (float)v.range[0];
+                app.images[(size_t)v.docFirst + (size_t)k]->white = (float)v.range[1];
+                app.images[(size_t)v.docFirst + (size_t)k]->texDirty = true;
+            }
+        } else if (v.rangeShape.size() == 2 && v.rangeShape[1] == 2 &&
+                   (int)v.rangeShape[0] == v.docCount) {
+            for (int k = 0; k < v.docCount; k++) {
+                ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+                d->black = (float)v.range[(size_t)k * 2];
+                d->white = (float)v.range[(size_t)k * 2 + 1];
+                d->texDirty = true;
+            }
+            // The same warning montage's per-frame range carries: two frames that
+            // look alike may have been stretched differently. Measurements are
+            // untouched; only the display is.
+            for (int k = 0; k < v.docCount; k++) {
+                ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+                d->note += (d->note.empty() ? "" : ", ") + std::string("display range varies per frame");
+            }
+        } else if (!v.range.empty()) {
+            for (int k = 0; k < v.docCount; k++)
+                app.images[(size_t)v.docFirst + (size_t)k]->note +=
+                    (app.images[(size_t)v.docFirst + (size_t)k]->note.empty() ? "" : ", ") +
+                    std::string("__range_") + std::to_string(i) + " does not fit this layer - not applied";
+        }
+        // timestamps: the stack's own frame axis, landing in the very field the
+        // paste path and the .npz picker write, so the panels need no new case.
+        if (v.hasTs && v.seqId) {
+            App::SeqInfo* si = seqInfo(v.seqId);
+            if (si) {
+                if ((int)v.tsVals.size() != v.docCount) {
+                    for (int k = 0; k < v.docCount; k++)
+                        app.images[(size_t)v.docFirst + (size_t)k]->note +=
+                            ", timestamps do not cover every frame - not applied";
+                } else {
+                    // Set directly rather than through applyFrameAxisVals: that
+                    // one requires a unit, and §4.3.2 is explicit that a missing
+                    // unit must not cost the user the numbers. Unit empty = not
+                    // applied as a label; the values are here and the x-axis
+                    // popup is already seeded from them, so typing the unit
+                    // finishes the job instead of retyping the measurements.
+                    si->axisName = v.tsName.empty() ? "time" : v.tsName;
+                    si->axisUnit = v.tsUnit;
+                    si->axisVals = v.tsVals;
+                }
+            }
+        }
+        // join the parent series, in declaration order
+        if (v.parent >= 0 && nodes[(size_t)v.parent].layer == "series") {
+            VnzNode& par = nodes[(size_t)v.parent];
+            int slot = par.memberSeen++;
+            for (auto& s : app.series)
+                if (s.id == par.seriesId && v.seqId) {
+                    App::Series::Member m;
+                    m.seqId = v.seqId;
+                    // No unit does NOT mean no value (§4.3.2): Member::value is
+                    // NaN when unset, and these are set.
+                    if (par.hasCond && slot < (int)par.condVals.size())
+                        m.value = par.condVals[(size_t)slot];
+                    s.members.push_back(m);
+                }
+        }
+    }
+    app.loadBatchId = prevBatch;
+
+    // metadata: __meta_<k> at the root, __meta_<i>_<k> below it. The viewer
+    // CARRIES meta and never rewrites it (§4.3.1), so it lands beside the frame
+    // as provenance rather than becoming a panel of its own.
+    std::vector<std::pair<std::string, std::string>> meta;
+    for (const auto& kv : byName) {
+        if (kv.first.compare(0, 7, "__meta_") != 0) continue;
+        std::vector<uint8_t> b; NpyHead H; std::string e;
+        if (!vnzRead(zip, entries, byName, kv.first, b, H, e)) continue;
+        meta.emplace_back(kv.first.substr(7), npzTextValue(b, H));
+    }
+    if (!readerSpec.empty()) meta.emplace_back("reader", readerSpec);
+    if (!meta.empty()) {
+        bool replaced = false;
+        for (auto& e : app.npzMeta)
+            if (e.path == origin) { e.items = meta; replaced = true; break; }
+        if (!replaced) app.npzMeta.push_back({ origin, meta });
+    }
+
+    if (!firstErr.empty()) return firstErr;
+    if (!frames) return "the container declares no pixels";
+    app.imagesRev++;
+    char say[320];
+    snprintf(say, sizeof say, "%s: %d frame(s), %d stack(s), %d series%s",
+             baseName(origin).c_str(), frames, stacks, seriesN,
+             readerSpec.empty() ? ""
+                 : (" via " + baseName(readerFileOf(readerSpec)) + ":" +
+                    readerFuncOf(readerSpec)).c_str());
+    fprintf(stderr, "viewer npz: %s\n", say);
+    toast(say);
+    return {};
+}
+
 // An .npz is a CONTAINER, not a picture (docs/npz-design.md §2): the FILE is a
 // batch and each member is a stack or a frame. Members are classified by shape
 // first, and nothing that is not an image is opened as one - the (N,) exposure
@@ -4396,12 +4806,34 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
 // onlyMember != "" restores a single array (sessions record which one): no
 // picker and no batch of its own, because the session owns both.
 static std::string loadNpz(const std::string& path, const std::string& onlyMember = "",
-                           int npyRead = 0 /*NR_NATIVE*/) {
+                           int npyRead = 0 /*NR_NATIVE*/,
+                           const std::string& readerSpec = std::string(),
+                           const std::string& origin = std::string()) {
     std::vector<uint8_t> zip;
     if (!readFileBytes(path, zip)) return "cannot read file";
     std::vector<NpzEntry> entries;
     std::string err;
     if (!npzList(zip, entries, err)) return err;
+    // §4.11.1: `__viewer` and nothing else decides which of the two readings
+    // this file gets. Checked before the members are classified, because a
+    // container's reserved members would otherwise be offered as pictures.
+    int vver = 0;
+    if (vnzIsContainer(zip, entries, vver)) {
+        // The file the user opened, which is this one unless a cache artifact
+        // is standing in for it.
+        const std::string& src = origin.empty() ? path : origin;
+        if (!onlyMember.empty()) {
+            // A session records one line per doc, but a container is ONE unit and
+            // rebuilds every doc at once: the second line onward would duplicate
+            // the whole tree. Already-here is the signal, so no state is carried
+            // between the calls.
+            for (const auto& d : app.images)
+                if (d->src->path == src &&
+                    d->src->npzMember.compare(0, 9, "__pixels_") == 0)
+                    return {};
+        }
+        return loadViewerNpz(zip, entries, vver, readerSpec, src);
+    }
     std::vector<NpzMember> mem = npzScan(zip, entries);
     if (mem.empty()) return "no arrays in npz";
     if (!onlyMember.empty()) {
@@ -5606,6 +6038,12 @@ static void savePrefs() {
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
     for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
     for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
+    if (!app.pythonExe.empty()) f << "pythonexe " << app.pythonExe << "\n";
+    if (app.readerLocalDir[0]) f << "readerdir " << app.readerLocalDir << "\n";
+    // §4.12: path -> reader, most recent first. A TAB separates them because
+    // both halves can contain spaces and only one of them can contain a tab
+    // (no filesystem this tool runs on puts one in a path).
+    for (const auto& m : app.readerMemo) f << "readerfor " << m.path << "\t" << m.spec << "\n";
 }
 
 static void loadPrefs() {
@@ -5643,7 +6081,8 @@ static void loadPrefs() {
         else if (key == "rbadv")       { ls >> v; }   // the drawer is gone: read, drop
         else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
-                 key == "rbookmark" || key == "rbrecent") {
+                 key == "rbookmark" || key == "rbrecent" ||
+                 key == "pythonexe" || key == "readerfor" || key == "readerdir") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
@@ -5652,6 +6091,17 @@ static void loadPrefs() {
             if      (key == "remoteexe") app.remoteExe = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
+            else if (key == "pythonexe") app.pythonExe = s;
+            else if (key == "readerdir")
+                snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", s.c_str());
+            else if (key == "readerfor") {
+                // The cap is enforced on the way IN as well as on the way out:
+                // a prefs file edited by hand (or written by a future version
+                // with a larger cap) must not grow this list without bound.
+                size_t tab = s.find('\t');
+                if (tab == std::string::npos || app.readerMemo.size() >= 64) continue;
+                app.readerMemo.push_back({ s.substr(0, tab), s.substr(tab + 1) });
+            }
             else if (app.rbRecents.size() < 10) app.rbRecents.push_back(s);
         }
     }
@@ -5659,6 +6109,230 @@ static void loadPrefs() {
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
     app.seqLoadMode = std::clamp(app.seqLoadMode, 0, 2);
     app.dispGamma = app.dispGamma > 1.5f ? 2.2f : 1.0f;
+}
+
+// ---- input adapters: running one, and remembering which one ------------------
+// docs/input-adapters.md §4.12 / §4.13. The viewer never goes looking for an
+// adapter and never applies one it was not told to apply: everything below
+// starts from a spec the user chose, or from the record of a choice they made
+// earlier. That is the whole trust model, and it is why there is no search path.
+static const size_t READER_MEMO_MAX = 64;      // §4.12: bounded, LRU
+static std::string selfExePath();              // fwd: the harness sits beside the binary
+
+// How many times Python was actually started for a load. The cache's promise is
+// "a second open does not re-run it", and a promise about a thing that does not
+// happen can only be tested by counting it.
+static int g_adapterRuns = 0;
+
+static std::string readerFileOf(const std::string& spec) {
+    size_t c = spec.rfind(':');
+    return c == std::string::npos ? spec : spec.substr(0, c);
+}
+static std::string readerFuncOf(const std::string& spec) {
+    size_t c = spec.rfind(':');
+    return c == std::string::npos ? std::string("load") : spec.substr(c + 1);
+}
+
+static std::string readerFor(const std::string& path) {
+    for (const auto& m : app.readerMemo) if (m.path == path) return m.spec;
+    return {};
+}
+
+static void rememberReader(const std::string& path, const std::string& spec) {
+    for (size_t i = 0; i < app.readerMemo.size(); i++)
+        if (app.readerMemo[i].path == path) { app.readerMemo.erase(app.readerMemo.begin() + (long)i); break; }
+    app.readerMemo.insert(app.readerMemo.begin(), { path, spec });   // most recent first
+    if (app.readerMemo.size() > READER_MEMO_MAX) app.readerMemo.resize(READER_MEMO_MAX);
+    savePrefs();
+}
+
+static void forgetReader(const std::string& path) {
+    for (size_t i = 0; i < app.readerMemo.size(); i++)
+        if (app.readerMemo[i].path == path) {
+            app.readerMemo.erase(app.readerMemo.begin() + (long)i);
+            savePrefs();
+            return;
+        }
+}
+
+// The harness that runs adapters. Searched relative to the binary and the
+// working directory - never guessed at, and its absence is reported as itself.
+static std::string runAdapterScript() {
+    std::error_code ec;
+    std::vector<std::filesystem::path> roots;
+    std::filesystem::path exe = pathFromUtf8(selfExePath());
+    if (!exe.empty()) {
+        std::filesystem::path d = exe.parent_path();
+        for (int i = 0; i < 3 && !d.empty(); i++) { roots.push_back(d); d = d.parent_path(); }
+    }
+    roots.push_back(std::filesystem::current_path(ec));
+    for (const auto& r : roots) {
+        std::filesystem::path p = r / "tools" / "import" / "run_adapter.py";
+        if (std::filesystem::exists(p, ec)) return p.u8string();
+    }
+    return {};
+}
+
+static uint64_t adapterHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// §4.12's cache key, in full: the source and the adapter, each by identity AND
+// by mtime, plus the function and the module's VERSION. Editing the adapter
+// changes its mtime, so the next open re-runs it; nothing else has to be
+// remembered to notice, and no timestamp comparison decides anything on its own.
+static std::string adapterCacheKey(const std::string& src, const std::string& spec) {
+    std::error_code ec;
+    std::filesystem::path sp = pathFromUtf8(src);
+    uint64_t srcMtime = 0, srcSize = 0;
+    auto t = std::filesystem::last_write_time(sp, ec);
+    if (!ec) srcMtime = (uint64_t)t.time_since_epoch().count();
+    // A folder is a legal source (§4.1). Its size is meaningless, but adding or
+    // removing a file inside it moves the directory's own mtime, which is the
+    // signal that matters here.
+    if (!std::filesystem::is_directory(sp, ec)) {
+        auto s = std::filesystem::file_size(sp, ec);
+        if (!ec) srcSize = (uint64_t)s;
+    }
+    std::string af = readerFileOf(spec);
+    uint64_t adMtime = 0;
+    auto at = std::filesystem::last_write_time(pathFromUtf8(af), ec);
+    if (!ec) adMtime = (uint64_t)at.time_since_epoch().count();
+    std::string key = src + "|" + std::to_string(srcMtime) + "|" + std::to_string(srcSize) +
+                      "|" + af + "|" + std::to_string(adMtime) + "|" + readerFuncOf(spec) +
+                      "|" + adapter::moduleVersion(af);
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)adapterHash(key));
+    return hex;
+}
+
+static std::string adapterCacheDir() {
+    std::string cfg = viewerConfigDir();
+    if (cfg.empty()) return {};
+    std::error_code ec;
+    std::filesystem::path d = pathFromUtf8(cfg) / "adapter-cache";
+    std::filesystem::create_directories(d, ec);
+    return d.u8string();
+}
+
+// Run `spec` over `src` and open what it wrote. Returns "" on success; on
+// failure the string is the adapter's OWN message wherever there is one (§4.9),
+// because a message we invent in its place is a message the author cannot fix.
+static std::string openWithReader(const std::string& src, const std::string& spec,
+                                  bool allowCache = true) {
+    // Whatever happens, the panel gets the whole of it (§4.13.0).
+    app.readerRan = true;
+    app.readerLastOk = false;
+    app.readerLastSpec = spec;
+    app.readerLastOut.clear();
+    std::string script = runAdapterScript();
+    if (script.empty())
+        return "cannot find tools/import/run_adapter.py - the adapter harness ships "
+               "with the viewer and this build cannot see it";
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    if (py.empty())
+        return "no Python to run the reader with: " + why +
+               " (set one in Settings, or install numpy for the one you have)";
+
+    std::string cacheDir = adapterCacheDir();
+    std::string cached;
+    if (!cacheDir.empty())
+        cached = (pathFromUtf8(cacheDir) / (adapterCacheKey(src, spec) + ".npz")).u8string();
+    std::error_code ec;
+    if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
+        // §7 stage 5: the second open does not start Python. The key already
+        // covers the adapter's mtime, so "cached" cannot mean "stale".
+        std::string lerr = loadNpz(cached, "", 0, spec, src);
+        if (lerr.empty()) {
+            rememberReader(src, spec);
+            app.readerLastOk = true;
+            app.readerLastOut = "read from cache - the reader was not re-run.\n"
+                                "Edit the reader and press Load again to re-run it.";
+            return {};
+        }
+        std::filesystem::remove(pathFromUtf8(cached), ec);   // unreadable: earn it again
+    }
+
+    std::string out = cached;
+    if (out.empty()) {
+        std::filesystem::path t = std::filesystem::temp_directory_path(ec);
+        char nm[64];
+        snprintf(nm, sizeof nm, "viewer_adapter_%llx.npz",
+                 (unsigned long long)adapterHash(src + spec));
+        out = (t / nm).u8string();
+    }
+    std::vector<std::string> argv = { py, script, spec, src, "-o", out };
+    // §4.13: the exact command, before it runs - every time, not only the first.
+    // The picker shows it in front of the user for a reader they have not used
+    // before; this is the durable record, so "what did it actually start?" is
+    // answerable after the fact as well as before it.
+    app.msgLog.push_back({ "reader: " + adapter::showCommand(argv), false });
+    g_adapterRuns++;
+    adapter::Run r = adapter::run(argv);
+    if (!r.started) {
+        app.readerLastOut = "could not start the reader: " + r.fail + "\n" +
+                            adapter::showCommand(argv);
+        return "could not start the reader: " + r.fail + "\n  " + adapter::showCommand(argv);
+    }
+    if (r.timedOut) {
+        app.readerLastOut = "the reader did not finish (stopped after 5 minutes)\n" +
+                            adapter::showCommand(argv) + "\n" + r.err;
+        return "the reader did not finish (stopped after 5 minutes)\n  " +
+               adapter::showCommand(argv);
+    }
+    if (r.exit != 0) {
+        // The adapter's exception message, unchanged. run_adapter.py has already
+        // printed the traceback with the failing line; passing it through is the
+        // entire point of §4.9, and summarising it would remove the only part
+        // that says which line of their file was wrong.
+        std::string msg = r.err.empty() ? r.out : r.err;
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+        if (msg.empty()) msg = "the reader exited with status " + std::to_string(r.exit) +
+                               " and said nothing";
+        // The panel gets it WHOLE - every frame of the traceback, with the file
+        // and line that raised. The toast gets the same string, but the panel is
+        // where it can be read, and that is the point of §4.13.0.
+        app.readerLastOut = msg;
+        return msg;
+    }
+    std::string lerr = loadNpz(out, "", 0, spec, src);
+    if (!lerr.empty()) return lerr;
+    rememberReader(src, spec);
+    app.readerLastOk = true;
+    // §4.11: the harness writes one line to stderr counting what it read and
+    // what it skipped, and the viewer relays it VERBATIM. It counts both
+    // directions, so paraphrasing it is how a skipped axis becomes invisible.
+    std::string sum = r.err;
+    while (!sum.empty() && (sum.back() == '\n' || sum.back() == '\r')) sum.pop_back();
+    app.readerLastOut = sum.empty() ? std::string("the reader wrote no summary") : sum;
+    size_t lastLine = sum.find_last_of('\n');
+    if (lastLine != std::string::npos) sum = sum.substr(lastLine + 1);
+    if (!sum.empty()) {
+        fprintf(stderr, "adapter: %s\n", sum.c_str());
+        toast(sum);
+    }
+    return {};
+}
+
+// §4.13: only an explicitly chosen adapter runs, and the first time a given one
+// is used the user sees the EXACT command. Not a paraphrase - the thing that
+// will be executed, so that "what is this about to run?" has a real answer.
+static bool readerNeedsConfirming(const std::string& spec) {
+    for (const auto& s : app.readerShown) if (s == spec) return false;
+    return true;
+}
+static void readerConfirmed(const std::string& spec) {
+    if (readerNeedsConfirming(spec)) app.readerShown.push_back(spec);
+}
+static std::string readerCommandLine(const std::string& src, const std::string& spec) {
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    std::string script = runAdapterScript();
+    if (py.empty()) return "(no Python found: " + why + ")";
+    if (script.empty()) return "(run_adapter.py not found next to this build)";
+    return adapter::showCommand({ py, script, spec, src, "-o", "<cache>.npz" });
 }
 
 // ---- Open in new window (todo-open item 28) ---------------------------------
@@ -6213,8 +6887,25 @@ static std::string loadSession(const std::string& path) {
                     openRemote(p);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
-                    err = isNpz ? loadNpz(p, pendingMember, pendingRead)
-                                : loadNpy(p, pendingRead);
+                    // §4.12: a file that was read by an adapter is read by that
+                    // adapter again when the session comes back. Without this
+                    // the restore reaches for a member (__pixels_1) that only
+                    // exists in the container the reader produces, and a session
+                    // that cannot reopen what it saved is not a session.
+                    std::string rspec = readerFor(p);
+                    if (!rspec.empty()) {
+                        // ONE reader run rebuilds every doc that file produced,
+                        // but the session carries one line per doc. Run it for
+                        // the first line and let the rest recognise their own
+                        // pixels as already present - otherwise a six-frame
+                        // series comes back six times over.
+                        bool already = false;
+                        for (const auto& d : app.images)
+                            if (d->src->path == p) { already = true; break; }
+                        err = already ? std::string() : openWithReader(p, rspec);
+                    } else
+                        err = isNpz ? loadNpz(p, pendingMember, pendingRead)
+                                    : loadNpy(p, pendingRead);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -8061,16 +8752,289 @@ static void drawFolderPickModal() {
     ImGui::EndPopup();
 }
 
-// What is inside this .npz, and what each member will BECOME. The folder
-// picker's dialog one layer down: same wording, same All/None/Invert row, same
-// "N selected" footer, same Cancel-decides-nothing rule - a container's members
-// are not a new concept and do not get a second vocabulary.
-//
-// The one thing this picker has that the folder picker does not is the x AXIS:
-// a 1-D key as long as the stack is the quantity its frames were captured
-// against, and it goes into the same SeqInfo the Temporal panel's pasted column
-// fills. Its name and unit are typed here by the person opening the file -
-// nothing is read out of the key name.
+// ---- the Reader panel (docs/input-adapters.md §4.13.0) -----------------------
+// Three entrances, one destination, and IT DOES NOT CLOSE. Writing an adapter is
+// a loop - write, load, read the failure, fix, load again - and the first design
+// here was a modal, which cut that loop every time the author went to their
+// editor. A panel that stays put lets the loop run: press Load, alt-tab, fix the
+// line the traceback named, press Load again.
+static void openReaderPicker(const std::string& path, const std::string& why) {
+    app.readerPickPath = path;
+    app.readerPickWhy = why;
+    app.readerPanelOpen = true;
+    app.readerPanelRaise = true;
+    // The previous run belonged to the previous file: showing its traceback
+    // beside a new path would blame this file for that file's problem.
+    app.readerRan = false;
+    app.readerLastOut.clear();
+    std::string spec = readerFor(path);
+    if (!spec.empty()) {
+        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", readerFileOf(spec).c_str());
+        snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s", readerFuncOf(spec).c_str());
+    } else if (app.readerPickFile[0] == '\0' && !app.readerMemo.empty()) {
+        // Nothing chosen for this path yet: start from the one most recently
+        // used. Applying a reader to several files in a row is the common case,
+        // and retyping the same path each time is the friction that shape has.
+        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                 readerFileOf(app.readerMemo.front().spec).c_str());
+        snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s",
+                 readerFuncOf(app.readerMemo.front().spec).c_str());
+    }
+}
+
+// The adapters that ship with the viewer, beside the harness that runs them.
+static std::vector<std::string> shippedReaders() {
+    std::vector<std::string> out;
+    std::string script = runAdapterScript();
+    if (script.empty()) return out;
+    std::error_code ec;
+    std::filesystem::path d = pathFromUtf8(script).parent_path() / "adapters";
+    if (!std::filesystem::is_directory(d, ec)) return out;
+    for (const auto& e : std::filesystem::directory_iterator(d, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        std::filesystem::path p = e.path();
+        if (p.extension() != ".py") continue;
+        out.push_back(p.u8string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static void drawReaderPanel() {
+    if (!app.readerPanelOpen) return;
+    if (app.readerPanelRaise) {                 // an entrance asked for it
+        ImGui::SetNextWindowFocus();
+        app.readerPanelRaise = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 42, ImGui::GetFontSize() * 30),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Reader", &app.readerPanelOpen)) { ImGui::End(); return; }
+    if (app.readerPickPath.empty()) {
+        ImGui::TextDisabled("No file yet. Open one that the viewer cannot read, or use\n"
+                            "File > Open With a Reader...");
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("%s", app.readerPickPath.c_str());
+    std::error_code dec;
+    if (std::filesystem::is_directory(pathFromUtf8(app.readerPickPath), dec))
+        ImGui::TextDisabled("this is a folder - a reader may take one (§4.1)");
+    if (!app.readerPickWhy.empty()) {
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 38);
+        ImGui::TextColored(ImVec4(1, 0.65f, 0.4f, 1), "%s", app.readerPickWhy.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("A reader is a Python function you write. It is handed this "
+                        "path and returns pixels, or Frame / Stack / Series / Batch.");
+
+    std::vector<std::string> shipped = shippedReaders();
+    if (!shipped.empty() && ImGui::TreeNodeEx("##shipped", ImGuiTreeNodeFlags_SpanAvailWidth,
+                                              "shipped with the viewer (%d)",
+                                              (int)shipped.size())) {
+        for (const auto& s : shipped) {
+            if (ImGui::Selectable(baseName(s).c_str()))
+                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", s.c_str());
+        }
+        ImGui::TreePop();
+    }
+    // A folder of the user's own readers (§4.13.0 "ローカル"). Remembered in
+    // prefs, because the second reader someone writes lives beside the first.
+    if (ImGui::TreeNodeEx("##local", ImGuiTreeNodeFlags_SpanAvailWidth, "your readers%s",
+                          app.readerLocalDir[0] ? "" : " (no folder chosen)")) {
+        if (ImGui::SmallButton("Choose folder...")) {
+            std::string d = pfd::select_folder("Folder of readers", ".").result();
+            if (!d.empty()) {
+                snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", d.c_str());
+                savePrefs();
+            }
+        }
+        if (app.readerLocalDir[0]) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", app.readerLocalDir);
+            std::error_code lec;
+            std::filesystem::path ld = pathFromUtf8(app.readerLocalDir);
+            int shown = 0;
+            if (std::filesystem::is_directory(ld, lec))
+                for (const auto& e : std::filesystem::directory_iterator(ld, lec)) {
+                    if (!e.is_regular_file(lec) || e.path().extension() != ".py") continue;
+                    shown++;
+                    if (ImGui::Selectable(e.path().filename().u8string().c_str()))
+                        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                                 e.path().u8string().c_str());
+                }
+            if (!shown) ImGui::TextDisabled("no .py files in that folder");
+        }
+        ImGui::TreePop();
+    }
+    // What has been used before: applying one reader to a run of files is the
+    // common case, so the last choices are one click away rather than retyped.
+    if (!app.readerMemo.empty() &&
+        ImGui::TreeNodeEx("##used", ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "used before (%d)", (int)app.readerMemo.size())) {
+        std::vector<std::string> seen;
+        for (const auto& m : app.readerMemo) {
+            bool dup = false;
+            for (const auto& s : seen) if (s == m.spec) dup = true;
+            if (dup) continue;
+            seen.push_back(m.spec);
+            if (ImGui::Selectable(m.spec.c_str())) {
+                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                         readerFileOf(m.spec).c_str());
+                snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s",
+                         readerFuncOf(m.spec).c_str());
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26);
+    ImGui::InputText("file", app.readerPickFile, sizeof app.readerPickFile);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        auto sel = pfd::open_file("Reader (.py)", ".", { "Python", "*.py" }).result();
+        if (!sel.empty())
+            snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", sel[0].c_str());
+    }
+    // The functions the file actually defines. Read out of the text, so the list
+    // is what is there rather than what someone hoped was there.
+    std::vector<std::string> funcs = adapter::moduleFunctions(app.readerPickFile);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    ImGui::InputText("function", app.readerPickFunc, sizeof app.readerPickFunc);
+    if (!funcs.empty()) {
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##funcs", "defined", ImGuiComboFlags_NoPreview |
+                                                    ImGuiComboFlags_PopupAlignLeft)) {
+            for (const auto& f : funcs)
+                if (ImGui::Selectable(f.c_str()))
+                    snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s", f.c_str());
+            ImGui::EndCombo();
+        }
+    }
+
+    // §4.13: no built-in editor. New writes the template out and opens it; Edit
+    // opens the one named above. $EDITOR, then `code -g`, then the OS.
+    if (ImGui::Button("New reader...")) {
+        auto dest = pfd::save_file("New reader", "reader.py", { "Python", "*.py" }).result();
+        if (!dest.empty()) {
+            std::string tmpl;
+            std::string script = runAdapterScript();
+            if (!script.empty())
+                tmpl = (pathFromUtf8(script).parent_path() / "adapters" / "template.py").u8string();
+            std::error_code ec;
+            bool copied = !tmpl.empty() &&
+                          std::filesystem::copy_file(pathFromUtf8(tmpl), pathFromUtf8(dest),
+                                                     std::filesystem::copy_options::overwrite_existing, ec);
+            if (copied) {
+                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", dest.c_str());
+                snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "load");
+                std::string how;
+                if (adapter::openInEditor(dest, how)) toast("opened in " + how + ": " + baseName(dest));
+                else toast(how, true);
+            } else {
+                toast("could not write the template to " + dest, true);
+            }
+        }
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(app.readerPickFile[0] == '\0');
+    if (ImGui::Button("Edit reader")) {
+        std::string how;
+        if (adapter::openInEditor(app.readerPickFile, how))
+            toast("opened in " + how + ": " + baseName(app.readerPickFile));
+        else toast(how, true);
+    }
+    ImGui::EndDisabled();
+
+    std::string spec = std::string(app.readerPickFile) + ":" + app.readerPickFunc;
+    bool haveFile = app.readerPickFile[0] != '\0' && app.readerPickFunc[0] != '\0';
+    ImGui::Separator();
+    // §4.13: show the EXACT command before running it, the first time this
+    // reader is used. Not a paraphrase - an external program is about to start.
+    if (haveFile && readerNeedsConfirming(spec)) {
+        ImGui::TextDisabled("this will run:");
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 38);
+        ImGui::TextWrapped("%s", readerCommandLine(app.readerPickPath, spec).c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::BeginDisabled(!haveFile);
+    // §4.13.0: pressable as many times as you like. The cache key carries the
+    // adapter's mtime, so editing the file and pressing this again ALWAYS
+    // re-runs it - a cache that defeated the edit loop would kill the feature.
+    if (ImGui::Button("Load", ImVec2(ImGui::GetFontSize() * 8, 0))) {
+        readerConfirmed(spec);
+        std::string src = app.readerPickPath;
+        // The panel stays open: applying a reader to several files in a row is
+        // the common case, and this is also where the traceback lands.
+        std::string err = openWithReader(src, spec);
+        if (!err.empty())
+            app.msgLog.push_back({ baseName(src) + " via " + spec + ": " + err, true });
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("re-runs whenever the reader file has changed");
+
+    // ---- what the last run said, WHOLE -------------------------------------
+    // The only debugging surface an adapter author has. A traceback folded into
+    // "could not open" would make this feature useless to the people it is for,
+    // so it is shown in full, selectable, and scrolls rather than truncating.
+    ImGui::Separator();
+    if (!app.readerRan) {
+        ImGui::TextDisabled("no run yet");
+    } else {
+        if (app.readerLastOk)
+            ImGui::TextColored(ImVec4(0.5f, 0.85f, 0.5f, 1), "%s read it",
+                               app.readerLastSpec.c_str());
+        else
+            ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s refused it",
+                               app.readerLastSpec.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy")) ImGui::SetClipboardText(app.readerLastOut.c_str());
+        ImGui::BeginChild("##readerout", ImVec2(0, 0), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        // Unwrapped and monospaced-ish: a traceback's indentation is how you
+        // read which frame is which, and wrapping destroys it.
+        ImGui::TextUnformatted(app.readerLastOut.c_str());
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+// §4.12: visible and removable. "Why does this one file open differently?" has
+// to have an answer that does not involve reading prefs.txt in a text editor.
+static void drawReaderList() {
+    if (!app.readerListOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 44, ImGui::GetFontSize() * 20),
+                             ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Readers", &app.readerListOpen)) {
+        ImGui::TextDisabled("Files this viewer opens with a reader instead of natively. "
+                            "%d of %d remembered (oldest is dropped first).",
+                            (int)app.readerMemo.size(), (int)READER_MEMO_MAX);
+        std::string why;
+        std::string py = adapter::findPython(app.pythonExe, why);
+        ImGui::TextDisabled("python: %s", py.empty() ? why.c_str() : py.c_str());
+        ImGui::Separator();
+        if (app.readerMemo.empty()) {
+            ImGui::TextDisabled("nothing remembered yet");
+        }
+        int remove = -1;
+        for (size_t i = 0; i < app.readerMemo.size(); i++) {
+            ImGui::PushID((int)i);
+            if (ImGui::SmallButton("Forget")) remove = (int)i;
+            ImGui::SameLine();
+            ImGui::Text("%s", app.readerMemo[i].spec.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", app.readerMemo[i].path.c_str());
+            ImGui::PopID();
+        }
+        if (remove >= 0) {
+            app.readerMemo.erase(app.readerMemo.begin() + remove);
+            savePrefs();
+        }
+    }
+    ImGui::End();
+}
+
 static void drawNpzPickModal() {
     if (app.npzPickOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         fprintf(stderr, "npz picker: OpenPopup (%s, %d members)\n",
@@ -9707,6 +10671,20 @@ static void openPath(const std::string& path) {
         else                 startRemote(rbActive(), path);
         return;
     }
+    // §4.12: a reader chosen for this path earlier is applied again, before the
+    // extension is consulted at all - that is the point of remembering, and it
+    // is what lets a .dat or a folder open at all. It is a RECORD OF A CHOICE,
+    // never a discovery: nothing puts an entry here except the user picking one.
+    {
+        std::string spec = readerFor(path);
+        if (!spec.empty()) {
+            std::string err = openWithReader(path, spec);
+            if (err.empty()) return;
+            toast(baseName(path) + " via " + spec + ": " + err, true);
+            app.msgLog.push_back({ baseName(path) + " via " + spec + ": " + err, true });
+            return;
+        }
+    }
     std::string low = path;
     std::transform(low.begin(), low.end(), low.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
@@ -9716,14 +10694,17 @@ static void openPath(const std::string& path) {
     };
     if (ends(".npy")) {
         std::string err = loadNpy(path);
-        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        // §3.2's third line, attached: the refusal that named the shape is the
+        // same place the way out is offered. Nothing runs yet - the picker is a
+        // question, and only what the user then chooses is ever executed.
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
         else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
     } else if (ends(".npz")) {
         // loadNpz says what it did (or raises the member picker, which says it
         // after): a blanket "loaded x.npz" over a dialog would be a lie about
         // both what happened and when
         std::string err = loadNpz(path);
-        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -11797,6 +12778,34 @@ static void drawInspector() {
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
+        // ---- how this file was read, and how to read it differently ----------
+        // docs/input-adapters.md §4.13. Every file answers this, including the
+        // ones read natively: "reader native" is a fact about this file, and a
+        // row that only appeared for adapter-read files would leave the user
+        // guessing whether the question even applies to the others.
+        if (!im->src->path.empty() && im->src->remoteUrl.empty()) {
+            std::string spec = readerFor(im->src->path);
+            ImGui::TextDisabled("reader    %s", spec.empty() ? "native" : spec.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("change...")) openReaderPicker(im->src->path, "");
+            if (!spec.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("edit")) {
+                    std::string how;
+                    if (adapter::openInEditor(readerFileOf(spec), how))
+                        toast("opened in " + how + ": " + baseName(readerFileOf(spec)));
+                    else toast(how, true);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("native")) {
+                    // Back to native for this file, and said out loud: the
+                    // memory is a record of a choice, so unmaking it is a choice
+                    // too and must be as reachable as making it was.
+                    forgetReader(im->src->path);
+                    toast(baseName(im->src->path) + ": reader forgotten - opens natively next time");
+                }
+            }
+        }
         // Where these pixels came from inside their container, and what else the
         // container held. An .npz member's provenance is the file PLUS the array
         // name, and the members that are not pixels (exposure, gain, a note) are
@@ -18884,6 +19893,22 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (servable && !r.up && !chevHit && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 rbOpenRow(r);
+            // §4.13.0's first entrance: double-clicking something the viewer
+            // cannot read opens the Reader panel on it, instead of the row being
+            // simply inert. A dimmed row that does nothing when you double-click
+            // it is the tool saying "no" with no way forward, which is the exact
+            // dead end §3.2 set out to remove.
+            // Local only: running the adapter on the peer is §4.13.1, and
+            // pretending a remote path is a local one would hand the reader a
+            // path that does not exist on this machine.
+            if (!servable && !r.ph && !r.up && !r.isDir() && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (B.host.empty())
+                    openReaderPicker(r.full(), "the viewer has no native reading for this file");
+                else
+                    toast("readers run on this machine only for now - copy the file over, "
+                          "or open it from a local folder", true);
+            }
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
@@ -20536,6 +21561,18 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // §4.13: a reader must be reachable for a FOLDER as well as a file -
+        // "one condition per folder" is a common way to store a sweep, so the
+        // folder is often the thing that needs reading, not any file in it.
+        if (ImGui::MenuItem("Open With a Reader...")) {
+            auto sel = pfd::open_file("Open with a reader", ".",
+                                      { "All files", "*" }).result();
+            if (!sel.empty()) openReaderPicker(sel[0], "");
+        }
+        if (ImGui::MenuItem("Open Folder With a Reader...")) {
+            std::string d = pfd::select_folder("Open folder with a reader", ".").result();
+            if (!d.empty()) openReaderPicker(d, "");
+        }
         // The local mirror of browsing a server: look around, preview, use the
         // server-side stats - without loading anything. Same Browse panel, the
         // peer just runs on this machine.
@@ -20820,6 +21857,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("another Browse window with its own place -\n"
                                   "browse two folders or two machines side by side");
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
+            ImGui::MenuItem("Reader", nullptr, &app.readerPanelOpen);
+            ImGui::MenuItem("Readers (remembered)", nullptr, &app.readerListOpen);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
@@ -27377,6 +28416,459 @@ int main(int argc, char** argv) {
             closeAll();
         }
 
+        // ---- V25: an npz that declares its own layers (docs/input-adapters.md §4.11)
+        // The container is built BY HAND here, with no Python involved, because
+        // what is under test is the READER: given the reserved members, does the
+        // viewer build the layers they declare, and does it put the conditions on
+        // the SERIES rather than on the stacks. Python enters only where the
+        // subject is actually the harness or the cache (V25h/V25i), and those
+        // skip out loud rather than failing when it is absent.
+        {
+            std::error_code aec;
+            std::filesystem::path adir =
+                std::filesystem::path(g_verifySelftest) / "vfy-adapter-scratch";
+            std::filesystem::create_directories(adir, aec);   // ours: ours to remove
+
+            auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
+                               const void* data, size_t nbytes) {
+                std::string sh;
+                if (shape.empty()) sh = "()";
+                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+                else {
+                    sh = "(";
+                    for (size_t i = 0; i < shape.size(); i++)
+                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+                    sh += ")";
+                }
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+                out.insert(out.end(), magic, magic + 8);
+                out.push_back((uint8_t)(hdr.size() & 0xff));
+                out.push_back((uint8_t)(hdr.size() >> 8));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                return out;
+            };
+            // numpy writes a str_ scalar as <U<n> in UCS-4; the reader has to
+            // take them exactly as numpy lays them down, so the fixture does too.
+            auto strNpy = [&](const std::string& s) {
+                size_t item = s.empty() ? 1 : s.size();
+                std::vector<uint32_t> cps(item, 0);
+                for (size_t i = 0; i < s.size(); i++) cps[i] = (uint32_t)(unsigned char)s[i];
+                return npyBytes(("<U" + std::to_string(item)).c_str(), {},
+                                cps.data(), cps.size() * 4);
+            };
+            auto i32Npy = [&](int32_t v) { return npyBytes("<i4", {}, &v, 4); };
+            auto f64Npy = [&](const std::vector<double>& v) {
+                return npyBytes("<f8", { (int64_t)v.size() }, v.data(), v.size() * 8);
+            };
+            struct ZipMem2 {
+                std::string name; std::vector<uint8_t> bytes;
+                size_t usize; uint16_t method; uint32_t crc;
+            };
+            auto writeZip = [](const std::string& path, std::vector<ZipMem2> mem) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff)); z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                std::vector<uint32_t> offs;
+                for (const auto& m : mem) {
+                    offs.push_back((uint32_t)z.size());
+                    p32(0x04034b50); p16(20); p16(0); p16(m.method); p16(0); p16(0);
+                    p32(m.crc); p32((uint32_t)m.bytes.size()); p32((uint32_t)m.usize);
+                    p16((uint32_t)m.name.size()); p16(0);
+                    z.insert(z.end(), m.name.begin(), m.name.end());
+                    z.insert(z.end(), m.bytes.begin(), m.bytes.end());
+                }
+                uint32_t cdOff = (uint32_t)z.size();
+                for (size_t i = 0; i < mem.size(); i++) {
+                    p32(0x02014b50); p16(20); p16(20); p16(0); p16(mem[i].method);
+                    p16(0); p16(0);
+                    p32(mem[i].crc); p32((uint32_t)mem[i].bytes.size());
+                    p32((uint32_t)mem[i].usize);
+                    p16((uint32_t)mem[i].name.size()); p16(0); p16(0);
+                    p16(0); p16(0); p32(0); p32(offs[i]);
+                    z.insert(z.end(), mem[i].name.begin(), mem[i].name.end());
+                }
+                uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                p32(0x06054b50); p16(0); p16(0);
+                p16((uint32_t)mem.size()); p16((uint32_t)mem.size());
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            auto writeNpz2 = [&](const std::string& path,
+                                 const std::vector<std::pair<std::string,
+                                                             std::vector<uint8_t>>>& mem) {
+                std::vector<ZipMem2> zm;
+                for (const auto& m : mem)
+                    zm.push_back({ m.first + ".npy", m.second, m.second.size(), 0,
+                                   (uint32_t)mz_crc32(MZ_CRC32_INIT, m.second.data(),
+                                                      m.second.size()) });
+                writeZip(path, std::move(zm));
+            };
+
+            // Two stacks of three frames each, swept over exposure. Pixel values
+            // carry their (stack, frame) so a mis-wired tree shows up as numbers.
+            std::vector<uint16_t> pxA((size_t)3 * 8 * 8), pxB((size_t)3 * 8 * 8);
+            for (int f = 0; f < 3; f++)
+                for (int i = 0; i < 64; i++) {
+                    pxA[(size_t)f * 64 + i] = (uint16_t)(100 + f);
+                    pxB[(size_t)f * 64 + i] = (uint16_t)(200 + f);
+                }
+            const double COND[2] = { 1.5, 40.25 };
+            const double TS[3] = { 0.0, 0.5, 1.0 };
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
+                { "__viewer",              i32Npy(1) },
+                { "__n",                   i32Npy(3) },
+                { "__layer_0",             strNpy("series") },
+                { "__parent_0",            i32Npy(-1) },
+                { "__name_0",              strNpy("exposure sweep") },
+                { "__note_0",              strNpy("") },
+                { "__conditions_values_0", f64Npy({ COND[0], COND[1] }) },
+                { "__conditions_name_0",   strNpy("exposure") },
+                { "__conditions_unit_0",   strNpy("ms") },
+                { "__meta_sensor",         strNpy("\"IMX999\"") },
+                { "__layer_1",             strNpy("stack") },
+                { "__parent_1",            i32Npy(0) },
+                { "__name_1",              strNpy("e1") },
+                { "__note_1",              strNpy("first point") },
+                { "__pixels_1",            npyBytes("<u2", { 3, 8, 8 }, pxA.data(), pxA.size() * 2) },
+                { "__cfa_1",               strNpy("RGGB") },
+                { "__timestamps_values_1", f64Npy({ TS[0], TS[1], TS[2] }) },
+                { "__timestamps_name_1",   strNpy("time") },
+                { "__timestamps_unit_1",   strNpy("s") },
+                { "__layer_2",             strNpy("stack") },
+                { "__parent_2",            i32Npy(0) },
+                { "__name_2",              strNpy("e2") },
+                { "__note_2",              strNpy("") },
+                { "__pixels_2",            npyBytes("<u2", { 3, 8, 8 }, pxB.data(), pxB.size() * 2) },
+            };
+            std::string cpath = (adir / "container.npz").u8string();
+            writeNpz2(cpath, cm);
+
+            closeAll();
+            std::string cerr = loadNpz(cpath);
+            int cSeqs = (int)app.seqs.size();
+            int cSeries = (int)app.series.size();
+            fprintf(stderr, "verifyselftest: V25 container: err=\"%s\" %zu doc(s) %d stack(s) "
+                            "%d series picker=%d\n",
+                    cerr.c_str(), app.images.size(), cSeqs, cSeries, (int)app.npzPickOpen);
+            check(cerr.empty() && !app.npzPickOpen,
+                  "V25a a container opens without the member picker");
+            check(app.images.size() == 6 && cSeqs == 2 && cSeries == 1,
+                  "V25a the declared tree becomes 1 series, 2 stacks, 6 frames");
+
+            // §4.5: the condition belongs to the SERIES. If it lands on the
+            // stacks instead, sigma_t across a sweep becomes computable again,
+            // which is the exact failure the layer split exists to prevent.
+            bool condOk = false, condOffStacks = true;
+            if (cSeries == 1) {
+                const App::Series& s = app.series.front();
+                condOk = s.paramName == "exposure" && std::string(s.unit) == "ms" &&
+                         s.members.size() == 2 &&
+                         s.members[0].value == COND[0] && s.members[1].value == COND[1];
+                fprintf(stderr, "verifyselftest: V25 series: param=\"%s\" unit=\"%s\" "
+                                "members=%zu v0=%g v1=%g\n",
+                        s.paramName.c_str(), s.unit, s.members.size(),
+                        s.members.empty() ? -1 : s.members[0].value,
+                        s.members.size() < 2 ? -1 : s.members[1].value);
+            }
+            for (const auto& sq : app.seqs)
+                if (sq.axisName == "exposure") condOffStacks = false;
+            check(condOk, "V25b the conditions land on the series, with name and unit");
+            check(condOffStacks, "V25b the conditions are NOT copied onto the stacks");
+
+            // timestamps are the stack's own axis and must reach the same field
+            // the paste path and the .npz picker write, or the panels see nothing
+            bool tsOk = false;
+            for (const auto& sq : app.seqs)
+                if (sq.axisVals.size() == 3 && sq.axisName == "time" && sq.axisUnit == "s" &&
+                    sq.axisVals[1] == 0.5)
+                    tsOk = true;
+            check(tsOk, "V25c timestamps land on the stack as its frame axis");
+
+            bool cfaOk = false, noteOk = false;
+            for (const auto& d : app.images) {
+                if (d->cfa == 1 && d->cfaPattern == 0) cfaOk = true;
+                if (d->note.find("first point") != std::string::npos) noteOk = true;
+            }
+            check(cfaOk, "V25d the declared CFA reaches the frames");
+            check(noteOk, "V25d the declared note reaches the frames");
+
+            // §4.11.1: without __viewer this is an ordinary npz and the shape
+            // classifier owns it, untouched. Same bytes, one member removed.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> pm;
+                for (const auto& m : cm) if (m.first != "__viewer") pm.push_back(m);
+                std::string ppath = (adir / "plain.npz").u8string();
+                writeNpz2(ppath, pm);
+                closeAll();
+                std::string perr = loadNpz(ppath);
+                bool old = app.npzPickOpen || !perr.empty();
+                fprintf(stderr, "verifyselftest: V25e plain: err=\"%s\" picker=%d series=%zu\n",
+                        perr.c_str(), (int)app.npzPickOpen, app.series.size());
+                check(old && app.series.empty(),
+                      "V25e without __viewer the plain-npz path still owns the file");
+                app.npzPickOpen = false;
+                app.npzPick.clear();
+            }
+
+            // §4.3.2: no unit means not applied - it does NOT mean discarded.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> um;
+                for (const auto& m : cm)
+                    um.push_back(m.first == "__conditions_unit_0"
+                                     ? std::make_pair(m.first, strNpy("")) : m);
+                std::string upath = (adir / "nounit.npz").u8string();
+                writeNpz2(upath, um);
+                closeAll();
+                std::string uerr = loadNpz(upath);
+                bool kept = app.series.size() == 1 &&
+                            app.series.front().members.size() == 2 &&
+                            app.series.front().members[0].value == COND[0] &&
+                            app.series.front().members[1].value == COND[1] &&
+                            std::string(app.series.front().unit).empty();
+                fprintf(stderr, "verifyselftest: V25f no unit: err=\"%s\" series=%zu "
+                                "unit=\"%s\" v0=%g\n",
+                        uerr.c_str(), app.series.size(),
+                        app.series.empty() ? "?" : app.series.front().unit,
+                        app.series.empty() || app.series.front().members.empty()
+                            ? -1 : app.series.front().members[0].value);
+                check(kept, "V25f a unit-less condition keeps its values, unit left empty");
+            }
+
+            // §4.9 / stage 6: a broken container names what is broken. "could not
+            // open" with no reason is the refusal this whole document exists to
+            // stop, and a container is refused by the same standard as an adapter.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> bm;
+                for (const auto& m : cm) if (m.first != "__layer_2") bm.push_back(m);
+                std::string bpath = (adir / "broken.npz").u8string();
+                writeNpz2(bpath, bm);
+                closeAll();
+                std::string berr = loadNpz(bpath);
+                fprintf(stderr, "verifyselftest: V25g broken: err=\"%s\"\n", berr.c_str());
+                check(!berr.empty() && berr.find("__layer_2") != std::string::npos,
+                      "V25g a malformed container names the member that is wrong");
+            }
+
+            // ---- V25h/V25i: the harness, and the cache around it -------------
+            // These are the only parts whose SUBJECT is Python. CI runners
+            // differ, so a missing interpreter skips them out loud rather than
+            // failing: a red line that means "this machine has no numpy" would
+            // train everyone to ignore red lines.
+            // The user's own prefs must survive this: remembering a reader
+            // writes prefs.txt, and these paths are scratch. Snapshot, then put
+            // it back exactly as it was. The bookmark lists come along because
+            // loadPrefs APPENDS to them - reading prefs twice (which V25k does
+            // on purpose) would otherwise write the user's bookmarks back
+            // doubled, and a selftest that corrupts real settings is worse than
+            // no selftest.
+            std::vector<App::ReaderMemo> memoSnapshot = app.readerMemo;
+            std::vector<std::string> bmSnapshot = app.rbBookmarks;
+            std::vector<std::string> rcSnapshot = app.rbRecents;
+            {
+                std::string pyWhy;
+                std::string py = adapter::findPython(app.pythonExe, pyWhy);
+                std::string script = runAdapterScript();
+                if (py.empty() || script.empty()) {
+                    fprintf(stderr, "verifyselftest: V25h SKIPPED - %s\n",
+                            py.empty() ? pyWhy.c_str()
+                                       : "tools/import/run_adapter.py not found");
+                } else {
+                    // a plain npz for the adapter to read, and an adapter to read it
+                    std::vector<uint16_t> raw((size_t)2 * 3 * 8 * 8);
+                    for (size_t i = 0; i < raw.size(); i++) raw[i] = (uint16_t)(i % 500);
+                    const double EXP2[2] = { 10.0, 20.0 };
+                    std::string srcPath = (adir / "sweep_src.npz").u8string();
+                    writeNpz2(srcPath, {
+                        { "data", npyBytes("<u2", { 2, 3, 8, 8 }, raw.data(), raw.size() * 2) },
+                        { "exp",  npyBytes("<f8", { 2 }, EXP2, sizeof EXP2) },
+                    });
+                    std::string pyPath = (adir / "vfy_reader.py").u8string();
+                    auto writeReader = [&](const char* version) {
+                        std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                        pf << "import numpy as np\n"
+                           << "from viewer_import import Series, Stack, Values\n"
+                           << "VERSION = " << version << "\n"
+                           << "def load(path):\n"
+                           << "    z = np.load(path)\n"
+                           << "    return Series([Stack(z['data'][i]) for i in range(2)],\n"
+                           << "                  conditions=Values(z['exp'], 'exposure', 'ms'))\n";
+                    };
+                    writeReader("1");
+                    std::string spec = pyPath + ":load";
+
+                    closeAll();
+                    int before = g_adapterRuns;
+                    std::string herr = openWithReader(srcPath, spec);
+                    int ranFirst = g_adapterRuns - before;
+                    bool built = herr.empty() && app.series.size() == 1 &&
+                                 app.series.front().members.size() == 2 &&
+                                 std::string(app.series.front().unit) == "ms" &&
+                                 app.series.front().members[1].value == EXP2[1] &&
+                                 app.images.size() == 6;
+                    fprintf(stderr, "verifyselftest: V25h harness: err=\"%s\" runs=%d "
+                                    "%zu doc(s) %zu series unit=\"%s\"\n",
+                            herr.c_str(), ranFirst, app.images.size(), app.series.size(),
+                            app.series.empty() ? "?" : app.series.front().unit);
+                    check(built, "V25h the harness's npz becomes the layers it declares");
+                    check(ranFirst == 1, "V25h the reader ran exactly once");
+
+                    // second open: same everything, so Python must NOT start
+                    closeAll();
+                    int before2 = g_adapterRuns;
+                    std::string h2 = openWithReader(srcPath, spec);
+                    int ranSecond = g_adapterRuns - before2;
+                    fprintf(stderr, "verifyselftest: V25i cache: err=\"%s\" runs=%d %zu doc(s)\n",
+                            h2.c_str(), ranSecond, app.images.size());
+                    check(h2.empty() && app.images.size() == 6 && ranSecond == 0,
+                          "V25i a second open is served from cache, Python not started");
+
+                    // edit the adapter: the key carries its mtime, so it re-runs
+                    writeReader("1");
+                    std::error_code tec;
+                    auto now = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                    std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                     now + std::chrono::seconds(5), tec);
+                    closeAll();
+                    int before3 = g_adapterRuns;
+                    std::string h3 = openWithReader(srcPath, spec);
+                    int ranThird = g_adapterRuns - before3;
+                    fprintf(stderr, "verifyselftest: V25i touched: err=\"%s\" runs=%d\n",
+                            h3.c_str(), ranThird);
+                    check(h3.empty() && ranThird == 1,
+                          "V25i editing the reader makes the next open run it again");
+
+                    // §4.9: the adapter's own words reach the user unchanged
+                    {
+                        std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                        pf << "def load(path):\n"
+                           << "    raise ValueError('header says 12 planes but the file holds 9')\n";
+                    }
+                    closeAll();
+                    std::string berr = openWithReader(srcPath, spec);
+                    fprintf(stderr, "verifyselftest: V25j refusal: \"%s\"\n",
+                            berr.substr(0, 200).c_str());
+                    check(berr.find("header says 12 planes but the file holds 9") !=
+                              std::string::npos,
+                          "V25j a failing reader's own message reaches the user");
+                    // §4.13.0: the panel gets the traceback WHOLE. Folding it
+                    // into one line would remove the file and line that raised,
+                    // which is the only thing the author can act on.
+                    int outLines = 1;
+                    for (char c : app.readerLastOut) if (c == '\n') outLines++;
+                    bool whole = app.readerLastOut.find("Traceback") != std::string::npos &&
+                                 app.readerLastOut.find("vfy_reader.py") != std::string::npos &&
+                                 app.readerLastOut.find("header says 12 planes") !=
+                                     std::string::npos &&
+                                 outLines >= 3;
+                    fprintf(stderr, "verifyselftest: V25j panel holds %d line(s), "
+                                    "traceback=%d file=%d\n", outLines,
+                            (int)(app.readerLastOut.find("Traceback") != std::string::npos),
+                            (int)(app.readerLastOut.find("vfy_reader.py") != std::string::npos));
+                    check(whole && !app.readerLastOk,
+                          "V25j the panel keeps the whole traceback, file and line");
+
+                    // ---- V25l: the loop, in one assert -----------------------
+                    // §4.13.0: write, load, read the failure, FIX, load again.
+                    // The third press must actually re-run - a cache that
+                    // served the previous answer here would kill the feature,
+                    // because the author would be staring at a stale traceback
+                    // for a line they already fixed.
+                    writeReader("1");                 // the fix
+                    auto fixedAt = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                    std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                     fixedAt + std::chrono::seconds(11), tec);
+                    closeAll();
+                    int before4 = g_adapterRuns;
+                    std::string h4 = openWithReader(srcPath, spec);
+                    int ranFourth = g_adapterRuns - before4;
+                    fprintf(stderr, "verifyselftest: V25l loop: err=\"%s\" runs=%d ok=%d "
+                                    "%zu doc(s)\n",
+                            h4.c_str(), ranFourth, (int)app.readerLastOk, app.images.size());
+                    check(h4.empty() && ranFourth == 1 && app.readerLastOk &&
+                              app.images.size() == 6,
+                          "V25l fixing the reader and loading again re-runs it and reads");
+
+                    // ---- V25m: an adapter-read file survives a session -------
+                    // The docs are named after the SOURCE, not the cache file,
+                    // so the session records the source - and the restore has to
+                    // route back through the reader, because the member it
+                    // recorded (__pixels_1) exists only in what the reader makes.
+                    {
+                        std::string asess = (adir / "adapter.vsession").u8string();
+                        saveSession(asess, true);
+                        std::string body;
+                        {
+                            std::ifstream sf(pathFromUtf8(asess));
+                            std::stringstream s2; s2 << sf.rdbuf(); body = s2.str();
+                        }
+                        bool namesSource = body.find("sweep_src.npz") != std::string::npos;
+                        closeAll();
+                        std::string serr = loadSession(asess);
+                        loadAll();
+                        bool back = serr.empty() && app.images.size() == 6 &&
+                                    app.series.size() == 1 &&
+                                    app.series.front().members.size() == 2;
+                        fprintf(stderr, "verifyselftest: V25m session: names source=%d "
+                                        "err=\"%s\" %zu doc(s) %zu series\n",
+                                (int)namesSource, serr.c_str(), app.images.size(),
+                                app.series.size());
+                        check(namesSource,
+                              "V25m the session records the source file, not the cache");
+                        check(back, "V25m reopening the session reads it through the reader");
+                    }
+                }
+            }
+
+            // ---- V25k: the memory survives being written and read back -------
+            {
+                std::string fake = (adir / "remembered.dat").u8string();
+                rememberReader(fake, "acme.py:load");
+                bool hasIt = readerFor(fake) == "acme.py:load";
+                app.readerMemo.clear();
+                loadPrefs();
+                bool survived = readerFor(fake) == "acme.py:load";
+                // §4.12: bounded. The cap holds on the way in as well as out.
+                for (int i = 0; i < 80; i++)
+                    rememberReader((adir / ("f" + std::to_string(i) + ".dat")).u8string(),
+                                   "acme.py:load");
+                bool capped = app.readerMemo.size() == READER_MEMO_MAX;
+                // most recent first: the last one added is still known, the
+                // first one added has been dropped
+                bool lru = !readerFor((adir / "f79.dat").u8string()).empty() &&
+                           readerFor((adir / "f0.dat").u8string()).empty();
+                app.readerMemo.clear();
+                loadPrefs();
+                bool cappedOnRead = app.readerMemo.size() <= READER_MEMO_MAX;
+                fprintf(stderr, "verifyselftest: V25k memo: had=%d survived=%d size=%zu "
+                                "capped=%d lru=%d\n",
+                        (int)hasIt, (int)survived, app.readerMemo.size(),
+                        (int)capped, (int)lru);
+                check(hasIt && survived,
+                      "V25k the per-file reader survives a prefs round trip");
+                check(capped && cappedOnRead, "V25k the memory is bounded at 64 (LRU)");
+                check(lru, "V25k the least recently chosen entry is the one dropped");
+            }
+            app.readerMemo = memoSnapshot;      // the user's prefs, as we found them
+            app.rbBookmarks = bmSnapshot;
+            app.rbRecents = rcSnapshot;
+            savePrefs();
+
+            std::filesystem::remove_all(adir, aec);
+            closeAll();
+        }
+
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
@@ -30974,6 +32466,8 @@ int main(int argc, char** argv) {
         drawDeriveModal();
         drawFolderPickModal();
         drawNpzPickModal();
+        drawReaderPanel();
+        drawReaderList();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
         drawHelpAbout();
