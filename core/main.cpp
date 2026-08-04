@@ -24539,7 +24539,16 @@ int main(int argc, char** argv) {
         };
         auto joinBase = [&](const std::vector<std::string>& v) {
             std::string s;
-            for (const auto& f : v) { s += s.empty() ? "" : ","; s += baseName(f); }
+            if (!v.empty()) {
+                size_t len = 0;
+                for (const auto& f : v) len += f.size() + 1;
+                s.reserve(len);
+                s += baseName(v[0]);
+                for (size_t i = 1; i < v.size(); ++i) {
+                    s += ",";
+                    s += baseName(v[i]);
+                }
+            }
             return s;
         };
         bool ok = true;
