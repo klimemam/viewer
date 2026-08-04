@@ -1041,7 +1041,7 @@ struct App {
     bool rbFlat = false;
     // (rbAdvanced - whether the Browse header's "more" drawer started open -
     // is gone with the drawer. Its contents each moved to the place they are
-    // about: docs/browse-topbar-design.md 10.3.)
+    // about: docs/browse-topbar-design.md 10.2.)
     // Tree mode: a directory expands IN PLACE instead of replacing the listing,
     // so a folder of folders can be compared without losing your place. LAZY -
     // expanding a node costs exactly one LIST, issued on the browse worker and
@@ -1287,7 +1287,8 @@ struct App {
     char npzAxisName[64] = "";
     char npzAxisUnit[16] = "";
     // Members that are NOT pixels, kept per .npz file so the Inspector can show
-    // the file's provenance next to the frame it opened (docs/npz-design.md §2.5).
+    // the file's provenance next to the frame it opened
+    // (docs/npz-design.md §4 item 3 「実装で答えたこと (v1)」).
     struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
     std::vector<NpzMeta> npzMeta;
     // ---- input adapters (docs/input-adapters.md §4.12 / §4.13) ---------------
@@ -4538,8 +4539,8 @@ static std::string npzOpenMember(const std::string& path, const std::vector<uint
 }
 
 // Members that are not pixels, kept against the FILE so the Inspector can show
-// them beside the frame that did open (docs/npz-design.md §2.5 - provenance,
-// not a new panel).
+// them beside the frame that did open (docs/npz-design.md §4 item 3 - metadata
+// は Inspector の Image 節に、開いた frame の隣。専用パネルは作らない).
 static void npzRememberMeta(const std::string& path, const std::vector<NpzMember>& mem) {
     std::vector<std::pair<std::string, std::string>> items;
     for (const auto& m : mem) {
@@ -5277,7 +5278,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
 // page cache to open one file: 12.2 s measured, against 0.35 s reading it once.
 // The duplicated loop is also how the two doors drifted apart - 452c62a taught
 // the .npz copy to say "n of N" on a partial load and this one kept claiming
-// the full count, which docs/terminology.md:93 forbids.
+// the full count, which docs/terminology.md 実装上の不変条件 forbids.
 static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read file";
@@ -13750,7 +13751,7 @@ static void drawInspector() {
         // container held. An .npz member's provenance is the file PLUS the array
         // name, and the members that are not pixels (exposure, gain, a note) are
         // the reason the file was written that way - so they belong beside it
-        // rather than in a panel of their own (docs/npz-design.md §2.5).
+        // rather than in a panel of their own (docs/npz-design.md §4 item 3).
         if (!im->src->npzMember.empty()) {
             ImGui::TextDisabled("npz member  %s", im->src->npzMember.c_str());
             for (const auto& e : app.npzMeta) {
@@ -14225,7 +14226,8 @@ static void drawPanelHistogram() {
         // answer decides how many footer lines and how tall a legend the plot
         // has to leave room for. Side by side stays strictly the A|B pair: two
         // halves hold two sides, and a grid that holds N is the image-side
-        // layout job (docs/compare-n.md 3), not something to fake here.
+        // layout job (docs/compare-n.md 10 「表示レイアウト」), not something
+        // to fake here.
         const float minSide = AB_MIN_SIDE * app.uiScale;
         bool side = Bim && abSideBySide();
         bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
@@ -20492,7 +20494,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // The panel's own menu ENDS the toolbar row: the verbs that are real but
     // rare. They used to be buttons charging every glance - and behind them sat
     // the "more" drawer, whose contents have all gone to the place each one
-    // belongs (docs/browse-topbar-design.md 10.3): the host to the title,
+    // belongs (docs/browse-topbar-design.md 10.2): the host to the title,
     // disconnect to the status line and the root crumb, the star to the path
     // line, open folder to File, and the server search to the popup below.
     rbFlow(rbMenuW);
@@ -22854,7 +22856,7 @@ static void drawMenuBar(GLFWwindow* win) {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
-        // §4.13: a reader must be reachable for a FOLDER as well as a file -
+        // §4.1: a reader must be reachable for a FOLDER as well as a file -
         // "one condition per folder" is a common way to store a sweep, so the
         // folder is often the thing that needs reading, not any file in it.
         if (ImGui::MenuItem("Open With a Reader...") && !app.rdOpenDlg) {
@@ -33076,7 +33078,7 @@ int main(int argc, char** argv) {
     }
 
     // The Temporal panel's unified export, verifiable without a human
-    // (docs/export-design.md 8). This machine cannot screenshot GL, so the
+    // (docs/export-design.md 9 「検証」). This machine cannot screenshot GL, so the
     // assertions are on the STRING the buttons put on the clipboard: the
     // provenance fields, the section order, the per-plane rows, the units,
     // n-of-N honesty, the region statements (including the temporal-vs-profile

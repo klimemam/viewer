@@ -705,15 +705,11 @@ def load(path):
     assert scalar(m, "__timestamps_name_0") == "time"
 
 
-@case
-def harness_torch_duck_typing():
-    """4.10/4.11: no torch import anywhere; .detach()/.cpu()/.numpy() is duck typed, and
-    bfloat16 becomes f32 with the conversion left in the note (4.8)."""
-    need_numpy(); need_runner()
-    path, _ = sample_npz((6, 4, 5))
-    src = """
+# A tensor with torch's surface and none of torch: the harness reaches it through
+# .detach()/.cpu()/.numpy() and never imports the real thing (4.10).  Source, not a
+# class, because the two cases below need it on both sides of a subprocess.
+FAKE_TORCH = """
 import numpy as np
-from viewer_import import Stack
 
 class FakeDtype(object):
     def __init__(self, s): self.s = s
@@ -728,6 +724,17 @@ class FakeTensor(object):
     def cpu(self): return self
     def float(self): return FakeTensor(self._a.astype("float32"), "torch.float32")
     def numpy(self): return self._a
+"""
+
+
+@case
+def harness_torch_duck_typing():
+    """4.10/4.11: no torch import anywhere; .detach()/.cpu()/.numpy() is duck typed, and
+    bfloat16 becomes f32 with the conversion left in the note (4.8)."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((6, 4, 5))
+    src = FAKE_TORCH + """
+from viewer_import import Stack
 
 def load(path):
     a = np.load(path)["data"].astype("float32")
@@ -740,6 +747,70 @@ def load(path):
     assert "bfloat16" in scalar(m, "__note_0"), scalar(m, "__note_0")
     src_run = open(RUNNER).read()
     assert "import torch" not in src_run, "the harness must not import torch"
+
+
+@case
+def harness_torch_refuses_complex_and_strings():
+    """4.8/4.11: the dtype is re-checked AFTER the tensor is unwrapped, and named.
+
+    harness_torch_duck_typing covers only the accepting side.  The refusals need
+    a case of their own because the unwrap is exactly where they can be lost:
+    read the dtype off the tensor rather than off what `.numpy()` returned and a
+    complex tensor is still refused -- as an `object` -- so the message names the
+    wrong thing and sends the author looking for a bug that is not there.  The
+    dtype NAME is asserted, not just the fact of a refusal: it is the only
+    evidence in the message that the unwrap happened first.
+    """
+    need_numpy(); need_runner()
+    import run_adapter as harness       # in-process: the exact message is the point
+    ns = {}
+    exec(FAKE_TORCH, ns)                # the same tensor the accepting case uses
+    FakeTensor = ns["FakeTensor"]
+
+    def unwrap(arr, dt):
+        return lambda: harness.to_numpy("Stack", "pixels", FakeTensor(arr, dt), [])
+
+    tail = (" is not numeric -- pixels must be integer or float "
+            "(strings, objects and complex are refused)")
+    fails(unwrap(np.zeros((2, 4, 5), dtype="complex64"), "torch.complex64"),
+          "=Stack: dtype complex64" + tail, harness.AdapterError)
+    fails(unwrap(np.zeros((2, 4, 5), dtype="complex128"), "torch.complex128"),
+          "=Stack: dtype complex128" + tail, harness.AdapterError)
+    # numpy spells the width into a string dtype's name (<U1 is "str32"), so the
+    # expected name is asked of numpy rather than written out as a literal that
+    # would go stale the first time this fixture's strings get longer.
+    text = np.array([["a", "b"], ["c", "d"]])
+    fails(unwrap(text, "torch.string"),
+          "=Stack: dtype %s%s" % (text.dtype.name, tail), harness.AdapterError)
+
+    # bfloat16 is CONVERTED here, not refused.  Without this line a refusal that
+    # had grown to cover every dtype but float32 would still look correct.
+    notes = []
+    got = harness.to_numpy("Stack", "pixels",
+                           FakeTensor(np.zeros((2, 4, 5), dtype="float32"),
+                                      "torch.bfloat16"), notes)
+    assert got.dtype == np.dtype("float32") and notes == ["bfloat16 -> f32"], (got.dtype, notes)
+
+    # End to end, through a tensor whose LABEL lies.  viewer_import has to believe
+    # `.dtype` -- 4.10 forbids it numpy, so the label is all it can read -- and so
+    # Stack(...) is built without complaint.  Only the harness holds the unwrapped
+    # array, so only the harness can refuse this, which is what 4.11's "re-checks
+    # shapes, dtypes" is for.  The refusal has to reach the user, not be swallowed.
+    path, _ = sample_npz((2, 4, 5))
+    src = FAKE_TORCH + """
+from viewer_import import Stack
+
+def load(path):
+    a = np.load(path)["data"].astype("complex64")
+    return Stack(FakeTensor(a, "torch.float32"))        # the label lies
+"""
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode == 2, "a refused dtype must exit 2, got %d\n%s" % (
+        proc.returncode, proc.stderr)
+    MESSAGES.append("harness: " + proc.stderr.strip().splitlines()[-1])
+    assert "dtype complex64 is not numeric" in proc.stderr, proc.stderr
+    assert "strings, objects and complex are refused" in proc.stderr, \
+        "the message the user got is not the harness's: %s" % proc.stderr
 
 
 @case
