@@ -11,3 +11,8 @@ build-verify/
 build-dbg/
 *.egg-info/
 build-board/
+# tools/run_selftests.sh files a failing test's output here, one file per test.
+# Untracked on purpose: it is written automatically and unreviewed, and a 200 kB
+# ctest log must never arrive in a commit by accident. What gets COMMITTED to
+# docs/diagnostics/ is a human's trim of one of these, down to the signature.
+docs/diagnostics/auto/

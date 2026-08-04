@@ -80,6 +80,23 @@ jobs:
           # Windows and macOS begin gating fully the day they gain a context.
           VIEWER_SELFTEST_REQUIRE_GL: ${{ runner.os == 'Linux' && '1' || '' }}
         run: tools/run_selftests.sh build
+      # The step above is a gate, so when it fails the job stops - and until now
+      # that took the evidence with it. run_selftests.sh files each failing
+      # test's own output under docs/diagnostics/auto/, but that is a directory
+      # on a hosted runner, deleted a minute or two later along with everything
+      # else. The assertion text then existed only inside this job's log, which
+      # is why three intermittent failures were investigated by re-running and
+      # hoping. `if: failure()` is the whole point of the step: it runs BECAUSE
+      # the selftests failed, and turns the one artifact worth having into
+      # something downloadable for as long as the run is kept.
+      - name: Keep the failing selftests' output
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: selftest-failure-${{ matrix.artifact }}
+          path: docs/diagnostics/auto/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Adapter suite
         # 36 cases over viewer_import.py and run_adapter.py that nothing ran.
         # They were written against docs/input-adapters.md section 4 and are the
