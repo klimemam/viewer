@@ -19284,7 +19284,17 @@ struct RbDeferredActions {
 // so this changes nothing that can be seen - it makes "the panel never
 // navigates mid-draw" true by construction rather than by inspection.
 static void rbGoTo(App::BrowseInstance& I, const std::string& dir) {
-    rbDefer([&I, dir] { remoteBrowseTo(I, dir); });
+    rbDefer([&I, dir] {
+        // Going somewhere leaves no cursor behind. The rows this index named are
+        // about to be replaced, and row 1 of the old place is a different row -
+        // or no row - in the new one. This used to be inferred one frame later,
+        // from the listing signature changing, which is true but late: anything
+        // that writes the cursor between the click and that frame wins. Two
+        // attempts to guard the individual writers both missed one. The rule
+        // belongs to the navigation, which is the thing that makes it true.
+        I.cursor = -1;
+        remoteBrowseTo(I, dir);
+    });
 }
 
 // Bookmarks + recents. The ITEMS are their own function because they live in
