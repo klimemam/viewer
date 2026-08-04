@@ -663,9 +663,9 @@ static bool globPatternMatches(const std::string& pat, const std::string& rel) {
     return pat.compare(0, 3, "**/") == 0 && globCross(pat.c_str() + 3, rel.c_str());
 }
 
-template <typename EntryCb, typename DirEndCb>
+template <typename State, typename EntryCb, typename DirEndCb>
 static void walkDirectory(const std::filesystem::path& rootP, uint32_t depth,
-                          uint32_t& skipped, bool& trunc,
+                          uint32_t& skipped, bool& trunc, State initial_state,
                           EntryCb&& onEntry, DirEndCb&& onDirEnd) {
     std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
     while (!todo.empty() && !trunc) {
@@ -674,15 +674,16 @@ static void walkDirectory(const std::filesystem::path& rootP, uint32_t depth,
         std::error_code dec;
         std::filesystem::directory_iterator it(cur.first, dec), end;
         if (dec) { skipped++; continue; }
+        State state = initial_state;
         for (; it != end && !trunc; it.increment(dec)) {
             if (dec) { dec.clear(); skipped++; break; }
             std::error_code fec;
             if (it->is_symlink(fec)) continue;
             bool isDir = it->is_directory(fec);
             if (isDir && cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
-            onEntry(cur.first, *it, isDir, fec);
+            onEntry(state, *it, isDir);
         }
-        if (!trunc) onDirEnd(cur.first);
+        if (!trunc) onDirEnd(cur.first, state);
     }
 }
 
@@ -710,12 +711,14 @@ static void handleGlob(Buf& in) {
     struct Hit { std::string rel; bool dir; };
     std::vector<Hit> hits;
     // same walk discipline as SCAN: no symlinks, unreadable = count and go on
-    walkDirectory(rootP, depth, skipped, trunc, [&](const std::filesystem::path& curDir, const std::filesystem::directory_entry& it, bool isDir, std::error_code& fec) {
+    struct EmptyState {};
+    walkDirectory(rootP, depth, skipped, trunc, EmptyState{},
+    [&](EmptyState&, const std::filesystem::directory_entry& it, bool isDir) {
         std::string rel = it.path().lexically_relative(rootP).generic_u8string();
         if (!globPatternMatches(pattern, rel)) return;
         if (hits.size() >= cap) { trunc = true; return; }
         hits.push_back({ std::move(rel), isDir });
-    }, [](const std::filesystem::path& curDir) {});
+    }, [](const std::filesystem::path&, EmptyState&) {});
 
     std::sort(hits.begin(), hits.end(),
               [](const Hit& a, const Hit& b) { return a.rel < b.rel; });
@@ -760,13 +763,15 @@ static void handleScan(Buf& in) {
     // Manual walk: recursive_directory_iterator aborts everything on one
     // unreadable entry, and symlinks are not followed at all - a cycle must
     // cost nothing, not hang a session.
-    std::vector<std::pair<std::string, std::filesystem::path>> files;
-    walkDirectory(rootP, depth, skipped, trunc, [&](const std::filesystem::path& curDir, const std::filesystem::directory_entry& it, bool isDir, std::error_code& fec) {
+    using ScanState = std::vector<std::pair<std::string, std::filesystem::path>>;
+    walkDirectory(rootP, depth, skipped, trunc, ScanState{},
+    [&](ScanState& files, const std::filesystem::directory_entry& it, bool isDir) {
+        std::error_code fec;
         if (!isDir && it.is_regular_file(fec) &&
             isNpySuffix(it.path().filename().u8string())) {
             files.push_back({ it.path().filename().u8string(), it.path() });
         }
-    }, [&](const std::filesystem::path& curDir) {
+    }, [&](const std::filesystem::path& curDir, ScanState& files) {
         if (files.empty()) return;
         std::sort(files.begin(), files.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -808,7 +813,6 @@ static void handleScan(Buf& in) {
             if (found.size() >= cap) { trunc = true; break; }
             found.push_back({ rel, std::move(g) });
         }
-        files.clear();
     });
 
     Buf out;
