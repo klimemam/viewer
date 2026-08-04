@@ -208,47 +208,16 @@ jobs:
           # accumulates old exe blobs) - which means a plain `git pull` refuses
           # with "divergent histories". Ship the correct update command as a
           # script so nobody has to know that.
-          cat > out/update.cmd <<'EOF'
-          @echo off
-          git fetch origin binaries && git reset --hard origin/binaries
-          EOF
-          cat > out/update.sh <<'EOF'
-          #!/bin/sh
-          git fetch origin binaries && git reset --hard origin/binaries
-          EOF
+          #
+          # These are COPIED from tools/binaries/, not written here. They used to
+          # be heredocs in this file, and that quietly made the published branch
+          # the wrong place to edit them: anything committed there was destroyed
+          # by the next publish, which force-pushes over it. A script nobody can
+          # edit where it lives, and cannot run without a CI round trip, is a
+          # script nobody tests.
+          cp tools/binaries/update.cmd tools/binaries/update.sh tools/binaries/README.md out/
+          cp tools/binaries/.gitignore out/ 2>/dev/null || true
           chmod +x out/update.sh
-          cat > out/README.md <<'EOF'
-          # Prebuilt binaries (branch: binaries)
-
-          Updated automatically from every push to main. To stay current on a
-          machine with no build environment:
-
-              git clone -b binaries --single-branch <this repo> viewer-bin
-
-          and from then on just run `update.cmd` (Windows) / `./update.sh`.
-          (Plain `git pull` will NOT work: this branch's history is replaced on
-          every publish so the repository never grows with old binaries.)
-
-          - win64/viewer.exe            - the GUI (Windows)
-          - win64/viewer-serve.exe      - the headless peer (Windows)
-          - win64/plugins/              - analyzers (keep next to the exe)
-          - win64/install_shortcut.cmd  - put it on the desktop / Start menu
-          - linux-x64/viewer            - the GUI (Linux)
-          - linux-x64/viewer-serve      - the headless peer for a compute server
-          - linux-x64/install_shortcut.sh - the same, as a .desktop entry
-          - macos-arm64/                - the same set for macOS (.app bundle)
-
-          Starting it from an icon instead of a shell:
-
-              win64\install_shortcut.cmd                 (Windows)
-              ./linux-x64/install_shortcut.sh            (Linux / macOS)
-
-          Add `-RemoteHost user@server` / `--host user@server` for a second
-          shortcut that connects to that machine on startup. The shortcuts point
-          at the binary in place, so `update.cmd` keeps them current.
-
-          See docs/startup.md on main for how ssh:// viewing fits together.
-          EOF
       - name: Force-push as the binaries branch
         run: |
           cd out
