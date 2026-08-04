@@ -271,7 +271,9 @@ def cfa_known():
     for pat in ("RGGB", "BGGR", "GRBG", "GBRG"):
         vi.Frame(np.zeros((4, 4)), cfa=pat)
         vi.Stack(np.zeros((2, 4, 4)), cfa="quad:" + pat)
-    fails(lambda: vi.Frame(np.zeros((4, 4)), cfa="RGGX"), 'Frame: cfa "RGGX"')
+    fails(lambda: vi.Frame(np.zeros((4, 4)), cfa="RGGX"),
+          '=Frame: cfa "RGGX" is not a known pattern -- one of RGGB, BGGR, GRBG, GBRG '
+          '(or quad:RGGB and friends)')
     fails(lambda: vi.Frame(np.zeros((4, 4)), cfa="rggb"), 'Frame: cfa "rggb"')
     fails(lambda: vi.Stack(np.zeros((2, 4, 4)), cfa="quad:RGGX"), 'Stack: cfa "quad:RGGX"')
 
