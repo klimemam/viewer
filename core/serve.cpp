@@ -663,6 +663,29 @@ static bool globPatternMatches(const std::string& pat, const std::string& rel) {
     return pat.compare(0, 3, "**/") == 0 && globCross(pat.c_str() + 3, rel.c_str());
 }
 
+template <typename EntryCb, typename DirEndCb>
+static void walkDirectory(const std::filesystem::path& rootP, uint32_t depth,
+                          uint32_t& skipped, bool& trunc,
+                          EntryCb&& onEntry, DirEndCb&& onDirEnd) {
+    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
+    while (!todo.empty() && !trunc) {
+        auto cur = todo.back();
+        todo.pop_back();
+        std::error_code dec;
+        std::filesystem::directory_iterator it(cur.first, dec), end;
+        if (dec) { skipped++; continue; }
+        for (; it != end && !trunc; it.increment(dec)) {
+            if (dec) { dec.clear(); skipped++; break; }
+            std::error_code fec;
+            if (it->is_symlink(fec)) continue;
+            bool isDir = it->is_directory(fec);
+            if (isDir && cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
+            onEntry(cur.first, *it, isDir, fec);
+        }
+        if (!trunc) onDirEnd(cur.first);
+    }
+}
+
 //   -> [str root][str pattern][u32 depthLimit][u32 maxResults]
 //   <- [u32 flags bit0=truncated][u32 skippedDirs][u32 n]
 //      n * ([str relPath][u32 isDir])   relPath uses '/' on every platform
@@ -687,25 +710,13 @@ static void handleGlob(Buf& in) {
     struct Hit { std::string rel; bool dir; };
     std::vector<Hit> hits;
     // same walk discipline as SCAN: no symlinks, unreadable = count and go on
-    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
-    while (!todo.empty() && !trunc) {
-        auto cur = todo.back();
-        todo.pop_back();
-        std::error_code dec;
-        std::filesystem::directory_iterator it(cur.first, dec), end;
-        if (dec) { skipped++; continue; }
-        for (; it != end && !trunc; it.increment(dec)) {
-            if (dec) { dec.clear(); skipped++; break; }
-            std::error_code fec;
-            if (it->is_symlink(fec)) continue;
-            bool isDir = it->is_directory(fec);
-            if (isDir && cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
-            std::string rel = it->path().lexically_relative(rootP).generic_u8string();
-            if (!globPatternMatches(pattern, rel)) continue;
-            if (hits.size() >= cap) { trunc = true; break; }
-            hits.push_back({ std::move(rel), isDir });
-        }
-    }
+    walkDirectory(rootP, depth, skipped, trunc, [&](const std::filesystem::path& curDir, const std::filesystem::directory_entry& it, bool isDir, std::error_code& fec) {
+        std::string rel = it.path().lexically_relative(rootP).generic_u8string();
+        if (!globPatternMatches(pattern, rel)) return;
+        if (hits.size() >= cap) { trunc = true; return; }
+        hits.push_back({ std::move(rel), isDir });
+    }, [](const std::filesystem::path& curDir) {});
+
     std::sort(hits.begin(), hits.end(),
               [](const Hit& a, const Hit& b) { return a.rel < b.rel; });
     Buf out;
@@ -749,26 +760,14 @@ static void handleScan(Buf& in) {
     // Manual walk: recursive_directory_iterator aborts everything on one
     // unreadable entry, and symlinks are not followed at all - a cycle must
     // cost nothing, not hang a session.
-    std::vector<std::pair<std::filesystem::path, uint32_t>> todo{ { rootP, 0 } };
-    while (!todo.empty() && !trunc) {
-        auto cur = todo.back();
-        todo.pop_back();
-        std::error_code dec;
-        std::filesystem::directory_iterator it(cur.first, dec), end;
-        if (dec) { skipped++; continue; }
-        std::vector<std::pair<std::string, std::filesystem::path>> files;
-        for (; it != end; it.increment(dec)) {
-            if (dec) { dec.clear(); skipped++; break; }
-            std::error_code fec;
-            if (it->is_symlink(fec)) continue;
-            if (it->is_directory(fec)) {
-                if (cur.second < depth) todo.push_back({ it->path(), cur.second + 1 });
-            } else if (it->is_regular_file(fec) &&
-                       isNpySuffix(it->path().filename().u8string())) {
-                files.push_back({ it->path().filename().u8string(), it->path() });
-            }
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+    walkDirectory(rootP, depth, skipped, trunc, [&](const std::filesystem::path& curDir, const std::filesystem::directory_entry& it, bool isDir, std::error_code& fec) {
+        if (!isDir && it.is_regular_file(fec) &&
+            isNpySuffix(it.path().filename().u8string())) {
+            files.push_back({ it.path().filename().u8string(), it.path() });
         }
-        if (files.empty()) continue;
+    }, [&](const std::filesystem::path& curDir) {
+        if (files.empty()) return;
         std::sort(files.begin(), files.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
         std::vector<NpyGroup> gs;
@@ -803,13 +802,15 @@ static void handleScan(Buf& in) {
             g.first = files[i].second;
             gs.push_back(std::move(g));
         }
-        std::string rel = cur.first.lexically_relative(rootP).generic_u8string();
+        std::string rel = curDir.lexically_relative(rootP).generic_u8string();
         if (rel == ".") rel.clear();
         for (auto& g : gs) {
             if (found.size() >= cap) { trunc = true; break; }
             found.push_back({ rel, std::move(g) });
         }
-    }
+        files.clear();
+    });
+
     Buf out;
     out.putU32(trunc ? 1u : 0u);
     out.putU32(skipped);
