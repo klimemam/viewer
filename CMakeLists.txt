@@ -331,11 +331,26 @@ function(viewer_selftest name)
       set(launcher "")           # needs no display, so it needs no xvfb either
     endif()
   endif()
+  # A temp directory of its own, per test. The selftests write fixtures to FIXED
+  # names under the system temp dir - viewer_seriesselftest.vsession,
+  # viewer_hlenbomb, viewer_batchselftest and a dozen more - and APPDATA/HOME
+  # alone do not separate those, because TMP and TEMP were inherited. So two
+  # runs on one machine, in any two worktrees, shared one file: one process read
+  # a one-stack session where it had written seven, and selftest.series failed
+  # with "0 stack(s) open" while passing 20/20 alone. Reproduced at 2 failures
+  # in 12 runs with three concurrent processes; the same shape sits under
+  # selftest.browse (viewer_hlenbomb is remove_all'd and recreated by name), the
+  # test whose assertion has now been lost three times.
+  #
+  # Fixing it here rather than at each of the sixteen call sites: the hazard is
+  # "tests share a temp dir", and that is a property of how a test is launched.
+  set(_tmp ${CMAKE_CURRENT_BINARY_DIR}/selftest-tmp/${name})
+  file(MAKE_DIRECTORY ${_tmp})
   add_test(NAME selftest.${name}
            COMMAND ${launcher} $<TARGET_FILE:viewer> ${args})
   set_tests_properties(selftest.${name} PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
+    ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME};TMP=${_tmp};TEMP=${_tmp};TMPDIR=${_tmp}"
     LABELS "${labels}"
     TIMEOUT 900)                 # the loaders' own budgets are 120-600 s
 endfunction()
@@ -452,7 +467,15 @@ viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
 # change or it is intermittent, and nobody has established which. Until someone
 # does, it stays out of the gate rather than being allowed to redden the matrix
 # at random. tools/run_selftests.sh prints this quarantine on every run.
-viewer_selftest(abstats-cfa-bayer --abstats-selftest --cfa bayer tools/testdata/multi)
+# The argument ORDER matters and was wrong here: --abstats-selftest consumes the
+# next token unconditionally (main.cpp next()), so "--cfa" became the selftest's
+# DIRECTORY and the CFA was never applied. The quarantined test was a strictly
+# weaker copy of selftest.abstats - identical A2 numbers, and 12 asserts skipped
+# because sibling fixtures resolved against "." - which is why it "passed 10/10".
+# Corrected, it fails 20/20, so it stays disabled until the defect it names is
+# fixed; the point of correcting it is that lifting the quarantine will now test
+# what the name says.
+viewer_selftest(abstats-cfa-bayer --abstats-selftest tools/testdata/multi --cfa bayer)
 set_tests_properties(selftest.abstats-cfa-bayer PROPERTIES
   DISABLED TRUE
   LABELS "selftest;quarantine")
