@@ -26824,7 +26824,13 @@ int main(int argc, char** argv) {
         const double VAL[7] = { 0, 10, 20, 40, 80, 160, 320 };
         auto reportNames = [&](const char* what, const std::vector<std::string>& nm) {
             std::string j;
-            for (const auto& s : nm) j += (j.empty() ? "" : ", ") + s;
+            size_t len = 0;
+            for (const auto& s : nm) len += s.length() + 2;
+            j.reserve(len);
+            for (const auto& s : nm) {
+                if (!j.empty()) j += ", ";
+                j += s;
+            }
             fprintf(stderr, "sweepfile: %s stack names: %s\n", what, j.c_str());
         };
         auto checkSeries = [&](const char* what) {
