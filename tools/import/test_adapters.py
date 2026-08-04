@@ -351,6 +351,8 @@ def frozen_and_meta():
     d["sensor"] = "changed"
     assert st.meta["sensor"] == "IMX999", "meta must be copied at construction"
     assert vi.Stack(np.zeros((2, 4, 4))).meta == {}
+    fails(lambda: vi.Stack(np.zeros((2, 4, 4)), meta="not a dict"), "Stack: meta must be a dict")
+    fails(lambda: vi.Stack(np.zeros((2, 4, 4)), meta=["a", "b"]), "Stack: meta must be a dict")
     fails(lambda: vi.Stack(np.zeros((2, 4, 4)), meta=[("a", 1)]), "Stack: meta must be a dict")
     fails(lambda: vi.Stack(np.zeros((2, 4, 4)), meta={3: "x"}), "Stack: meta key")
 
