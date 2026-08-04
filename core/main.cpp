@@ -3264,23 +3264,10 @@ static void closeCurrent(bool frameOnly = false) {
     if (!im) return;
     if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
     int seqId = im->seqId;
-    forgetImage(im);
-    if (im->tex) glDeleteTextures(1, &im->tex);
-    app.images.erase(app.images.begin() + app.current);
-    app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
-    app.fitRequested = true;
-    app.imagesRev++;
-    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
-    // same-named frame of another stack (every stack has a frame_001.npy).
-    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
-    // this path duplicates closeImages' body and inherited the omission.
-    if (!resolveB()) {
-        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
-    }
+    closeImages({ app.current });
     // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
     // too, or a zero-frame stack haunts the linearity table
     if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
-    pruneEmptyBatches();
 }
 
 // Drop batches nothing references anymore: no image, no queued group, no
@@ -28100,6 +28087,26 @@ int main(int argc, char** argv) {
             check(app.previewUid == 0 && app.current >= 0 &&
                   app.current < (int)app.images.size(),
                   "V9 dropping the current preview re-points A in range");
+
+            // ...and so does Ctrl+W on it. A preview is an ordinary entry in
+            // app.images that happens to be current, so the close path the key
+            // takes is closeCurrent, not dropPreview - and the slot is a single
+            // uid, so closing the document that occupies it without releasing
+            // it leaves the app believing a preview is live that no longer
+            // exists. dropPreview() heals it on the next look (it clears the
+            // uid after failing to find it), which is exactly why this went
+            // unnoticed: nothing between the two ever reads it and says so.
+            {
+                mkPreview();
+                app.current = 0;
+                size_t nBefore2 = app.images.size();
+                closeCurrent();                     // Ctrl+W, not dropPreview
+                fprintf(stderr, "verifyselftest: V9d Ctrl+W on the preview: "
+                                "previewUid=%llu, images %zu->%zu\n",
+                        (unsigned long long)app.previewUid, nBefore2, app.images.size());
+                check(app.previewUid == 0 && app.images.size() == nBefore2 - 1,
+                      "V9d closing the preview releases the preview slot");
+            }
 
             // ---- V9c: a clicked path segment must rebuild a path that EXISTS.
             // A NAS reported it: clicking the path errored while ".." kept
