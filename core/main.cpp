@@ -68,6 +68,7 @@
 #include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
+#include <deque>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -1022,7 +1023,7 @@ struct App {
     bool focusRemote = false;         // bring the ACTIVE Browse instance forward
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
-    std::vector<Msg> msgLog;          // every toast, kept so it can be copied
+    std::deque<Msg> msgLog;          // every toast, kept so it can be copied
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
@@ -1721,7 +1722,7 @@ static void toast(const std::string& msg, bool err = false) {
     // Messages panel.
     if (app.msgLog.empty() || app.msgLog.back().text != msg) {
         app.msgLog.push_back({ msg, err });
-        if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
+        if (app.msgLog.size() > 300) app.msgLog.pop_front();
         if (err) app.msgUnreadErr = true;
     }
 }
