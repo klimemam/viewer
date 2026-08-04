@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -1125,7 +1126,7 @@ struct App {
     struct PendingGroup { std::string name; std::vector<std::string> files;
                           bool isRaw = false; int batchId = 0; std::string shape;
                           int token = 0; int openId = 0; };
-    std::vector<PendingGroup> seqQueue;
+    std::deque<PendingGroup> seqQueue;
     // Sibling loads a session asked for, drained one at a time.
     // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
     // calling it N times in the parse loop cancelled every load but the last:
@@ -8262,11 +8263,11 @@ static void startNextQueuedGroup() {
             rawDlg.queueCount = 0;             // ...for THIS Open's stacks
             for (const auto& q : app.seqQueue) if (q.openId == g.openId) rawDlg.queueCount++;
         } else {
-            app.seqQueue.erase(app.seqQueue.begin());   // unreadable: skip
+            app.seqQueue.pop_front();   // unreadable: skip
         }
         return;
     }
-    app.seqQueue.erase(app.seqQueue.begin());
+    app.seqQueue.pop_front();
     std::string err;
     g_quietLoad = true;               // keep the user's current image selected
     app.loadBatchId = g.batchId;      // the head frame lands in the group's batch
@@ -11445,7 +11446,7 @@ static void drawRawModal() {
             rawDlg.open = false;
             App::PendingGroup g = app.seqQueue.front();
             app.folderRecipeOpenId = g.openId;   // this Open's geometry, nobody else's
-            app.seqQueue.erase(app.seqQueue.begin());
+            app.seqQueue.pop_front();
             if (g.files.size() >= 2) startSequenceLoad(app.current, g.files, g.name);
             if (app.current >= 0 && app.current < (int)app.images.size())
                 noteGroupStack(g.token, app.images[app.current]->seqId);
