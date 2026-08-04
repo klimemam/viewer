@@ -20586,6 +20586,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
             if (rowClicked && servable) {
                 ImGuiIO& sio = ImGui::GetIO();
+                bool rbLeaving = false;      // this click navigates away
                 bool canSel = !r.up && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
                     rbSel[ei] ^= 1;                    // toggle, plain click still opens
@@ -20629,7 +20630,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // this runs on the release - both firing would toggle twice.
                     if (r.isDir() && !r.up && !chevHit) {
                         std::string full = r.full();
-                        if (!I.tree) rbGoTo(I, full);
+                        if (!I.tree) { rbGoTo(I, full); rbLeaving = true; }
                         else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                         else rbTreeExpand(I, full);
                     } else {
@@ -20637,19 +20638,16 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     }
                     rbSelAnchor = ei;
                 }
-                // ...but not onto a row in a listing we are already leaving. In
-                // a list a folder is entered on click ONE, so the release half
-                // of a double-click arrives after rbGoTo has been queued and
-                // lands on whatever now occupies that row index in the NEW
-                // place. The action is already suppressed above by the click
-                // count; the cursor was not, and it survived the navigation
-                // because the sig-change reset had already run for that frame.
-                // CI caught it: panel 2 came back with cursor=1 where every
-                // navigation is supposed to leave -1.
-                bool leaving = r.isDir() && !r.up && !I.tree &&
-                               sio.MouseClickedLastCount[ImGuiMouseButton_Left] >= 2;
-                if (!leaving)
-                    rbCursor = ei;      // the keyboard picks up where the mouse left off
+                // A click that LEAVES this listing leaves no cursor behind: the
+                // rows it indexed are about to be replaced, and index 1 of the
+                // old place is a different row - or no row - in the new one.
+                // Said here rather than left to the sig-change reset at the top
+                // of the next frame, because the release half of the same
+                // double-click arrives in between and the old code let it write
+                // the cursor back. CI caught exactly that: panel 2 came back
+                // with cursor=1 where every navigation is supposed to leave -1,
+                // on Linux only, while three local runs stayed green.
+                rbCursor = rbLeaving ? -1 : ei;
             }
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
