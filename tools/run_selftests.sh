@@ -204,8 +204,9 @@ fi
 echo
 echo "== selftests =="
 # Deliberately NOT parallel. Every selftest polls the loader against a
-# wall-clock budget (120-600 s); docs/verify-functional.md:55 records that
-# running them at the same time trips those budgets and produces false FAILs.
+# wall-clock budget (120-600 s); docs/verify-functional.md "1. 方法" records, in
+# the 決定性の担保 table, that running them at the same time trips those budgets
+# and produces false FAILs.
 ctest --test-dir "$build_dir" -C "$config" -L "$run_label" \
       --output-on-failure --no-tests=error
 rc=$?
