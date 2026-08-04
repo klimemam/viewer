@@ -68,6 +68,7 @@
 #include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
+#include <deque>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -1142,7 +1143,7 @@ struct App {
                         // once the stack exists (same window, same fix)
                         std::string axisName, axisUnit;
                         std::vector<double> axisVals; };
-    std::vector<SeqRestore> seqRestore;
+    std::deque<SeqRestore> seqRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the
@@ -8094,7 +8095,7 @@ static void pumpSequenceAndQueue() {
     // one restore at a time, matched by uid: indices shift as frames land
     if (!app.seqRestore.empty() && !app.seqRunning && !seqReadyPending()) {
         App::SeqRestore r = std::move(app.seqRestore.front());
-        app.seqRestore.erase(app.seqRestore.begin());
+        app.seqRestore.pop_front();
         for (int i = 0; i < (int)app.images.size(); i++)
             if (app.images[i]->uid == r.uid && app.images[i]->seqId == 0) {
                 startSequenceLoad(i, r.files, r.pattern);
