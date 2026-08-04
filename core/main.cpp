@@ -20637,7 +20637,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     }
                     rbSelAnchor = ei;
                 }
-                rbCursor = ei;          // the keyboard picks up where the mouse left off
+                // ...but not onto a row in a listing we are already leaving. In
+                // a list a folder is entered on click ONE, so the release half
+                // of a double-click arrives after rbGoTo has been queued and
+                // lands on whatever now occupies that row index in the NEW
+                // place. The action is already suppressed above by the click
+                // count; the cursor was not, and it survived the navigation
+                // because the sig-change reset had already run for that frame.
+                // CI caught it: panel 2 came back with cursor=1 where every
+                // navigation is supposed to leave -1.
+                bool leaving = r.isDir() && !r.up && !I.tree &&
+                               sio.MouseClickedLastCount[ImGuiMouseButton_Left] >= 2;
+                if (!leaving)
+                    rbCursor = ei;      // the keyboard picks up where the mouse left off
             }
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
