@@ -2166,6 +2166,16 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
             std::vector<float> mags;
             size_t total = (size_t)w * h;
             size_t step = std::max<size_t>(1, total / 200000);   // bounded sample
+            // ...and the step is forced ODD, which is the f35a79e defect in its
+            // last hiding place. Striding a one-dimensional index and wrapping
+            // it (x = p % w) samples only even columns the moment step and w are
+            // both even - and a sensor width essentially always is. On an RGGB
+            // frame that leaves R and Gb with samples and Gr and B with none, so
+            // this percentile - and with it the whole A/B difference display's
+            // scaling - would be decided by half the sensor. An odd step walks
+            // every column parity, and every row parity with it, because
+            // consecutive samples advance x by an odd amount and wrap.
+            if (step % 2 == 0) step++;
             mags.reserve(total / step + 1);
             for (size_t p = 0; p < total; p += step) {
                 int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
