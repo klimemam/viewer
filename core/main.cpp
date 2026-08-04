@@ -10669,15 +10669,45 @@ static void pumpRemoteOpenQueue() {
 // File > Start Remote: connect (installing the peer if needed), then browse -
 // in the given instance. Everything slow happens on the instance's worker;
 // this returns immediately.
-static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
-    std::string host = hostSpec, dir = "~";
-    int port = 0;
+// Where a spec points, without connecting to it. startRemote used to be the only
+// thing that knew, which is why the caller could not tell whether it was about to
+// replace the panel the user was reading.
+static void rbParseSpec(const std::string& hostSpec, std::string& host, int& port,
+                        std::string& dir) {
+    host = hostSpec; dir = "~"; port = 0;
     // accept a full url here too, so a pasted path still works
     if (hostSpec.find("://") != std::string::npos || hostSpec.find(':') != std::string::npos) {
         std::string h, p;
         if (remote::parseUrl(hostSpec, h, p, &port)) { host = h; dir = p; }
     }
     while (host.size() > 1 && host.back() == '/') host.pop_back();
+}
+
+// Which panel a new place should land in. Connecting somewhere else must NOT
+// take over the panel already showing something: Browse is instanced exactly so
+// a local listing and a machine can sit side by side, and startRemote clears the
+// instance it is given, so reusing the active one made the local view disappear
+// - which reads as the panel having closed (user report, 2026-08-04).
+//
+// Reuse when there is nothing to lose (never connected) or when it is the same
+// place (reconnect, not a second window). Otherwise: a panel already on that
+// place if there is one, else a new one.
+static App::BrowseInstance& rbInstanceFor(const std::string& hostSpec) {
+    std::string host, dir;
+    int port = 0;
+    rbParseSpec(hostSpec, host, port, dir);
+    App::BrowseInstance& cur = rbActive();
+    if (!cur.b.connected && cur.b.host.empty() && cur.b.dir == "~") return cur;
+    if (cur.b.host == host && cur.b.port == port) return cur;
+    for (auto& p : app.browsePanels)
+        if (p->b.connected && p->b.host == host && p->b.port == port) return *p;
+    return rbNewInstance();
+}
+
+static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
+    std::string host, dir;
+    int port = 0;
+    rbParseSpec(hostSpec, host, port, dir);
     if (dir.size() > 4 && isNpyName(dir)) {          // a pasted file path: open it
         size_t s = dir.find_last_of('/');
         std::string parent = s == std::string::npos ? "~" : dir.substr(0, s);
@@ -11062,8 +11092,13 @@ static void openPath(const std::string& path) {
         // File > Start Remote does - which is what a desktop shortcut to a
         // machine passes, and what a half-remembered path pasted on the command
         // line usually is. startRemote keeps the ssh handshake off this thread.
-        if (isNpyName(path)) openRemote(path);
-        else                 startRemote(rbActive(), path);
+        if (isNpyName(path)) {
+            openRemote(path);
+        } else {
+            App::BrowseInstance& I = rbInstanceFor(path);   // never take an open listing
+            startRemote(I, path);
+            rbShowInstance(I);
+        }
         return;
     }
     // §4.12: a reader chosen for this path earlier is applied again, before the
@@ -11139,9 +11174,10 @@ static void browseLocalFolder(std::string p) {
     if (p.empty()) return;
     std::replace(p.begin(), p.end(), '\\', '/');
     while (p.size() > 1 && p.back() == '/') p.pop_back();
-    // the folder lands in the instance the user last worked in - with one
-    // panel open that is exactly the old behaviour
-    App::BrowseInstance& I = rbActive();
+    // Same rule as connecting to a machine: land in the active panel when it
+    // has nothing to lose or is already here, and in its own panel otherwise.
+    // With one panel open that is exactly the old behaviour.
+    App::BrowseInstance& I = rbInstanceFor("local://" + p);
     startRemote(I, "local://" + p);
     rbShowInstance(I);
 }
@@ -22589,9 +22625,12 @@ static void drawRemoteOpenModal() {
         app.prefsDirty = true;
         savePrefs();
         ImGui::CloseCurrentPopup();
-        // errors arrive as toasts and inline in the instance that connects -
-        // the one the user was last working in
-        startRemote(rbActive(), hostbuf);
+        // errors arrive as toasts and inline in the instance that connects.
+        // Which instance that is: not blindly the active one -- connecting to a
+        // machine while a local listing is open used to replace it.
+        App::BrowseInstance& I = rbInstanceFor(hostbuf);
+        startRemote(I, hostbuf);
+        rbShowInstance(I);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
