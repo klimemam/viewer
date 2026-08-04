@@ -227,6 +227,17 @@ def stack_timestamps():
 
 
 @case
+def stack_empty_timestamps():
+    """4.3.2: a 0-length stack accepts empty timestamps without length check failures."""
+    need_lib(); need_numpy()
+    st = vi.Stack(np.zeros((0, 4, 4)), timestamps=vi.Values([], unit="s"))
+    assert len(st.timestamps) == 0
+    assert st.shape == (0, 4, 4)
+    fails(lambda: vi.Stack(np.zeros((1, 4, 4)), timestamps=vi.Values([], unit="s")),
+          "Stack: ")
+
+
+@case
 def values_rules():
     """4.3.2: Values(values, name="", unit=""); conditions must be named; values are 1-D
     and numeric (they get plotted)."""
@@ -614,6 +625,25 @@ def load(path):
     assert np.array_equal(m["__timestamps_values_0"], np.arange(6.0))
     assert scalar(m, "__timestamps_name_0") == "time", "4.3.2: the default name"
     assert scalar(m, "__timestamps_unit_0") == "s"
+
+
+@case
+def harness_empty_timestamps():
+    """4.3.2: the harness must serialize 0-length axes exactly as it does regular ones."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((0, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import Stack, Values
+def load(path):
+    return Stack(np.zeros((0, 4, 5)), timestamps=Values([], unit="s"))
+"""
+    proc, out = run_adapter(src, "load", path)
+    m = members(out)
+    assert m["__timestamps_values_0"].shape == (0,), \
+        "__timestamps_values_0 shape was %s, wanted (0,)" % (m["__timestamps_values_0"].shape,)
+    assert scalar(m, "__timestamps_unit_0") == "s"
+    assert scalar(m, "__timestamps_name_0") == "time"
 
 
 @case
