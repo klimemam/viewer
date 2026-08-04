@@ -67,6 +67,7 @@
 #include <string>
 #include <chrono>
 #include <ctime>                      // wall-clock stamp on measurement results
+#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -1117,6 +1118,7 @@ struct App {
     std::atomic<size_t> rfBytesInFlight{ 0 };
     std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
     std::mutex rfMtx;
+    std::condition_variable rfCv;
     std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
     std::vector<RFetchDone> rfDone;   // guarded by rfMtx
     // pending "load the rest of the folder?" question
@@ -2562,16 +2564,13 @@ static void rfWorker() {
     int sesPort = -1;
     while (!app.rfStop) {
         App::RFetchJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(app.rfMtx);
-            if (!app.rfQueue.empty()) {
-                job = std::move(app.rfQueue.front());
-                app.rfQueue.erase(app.rfQueue.begin());
-                have = true;
-            }
+            std::unique_lock<std::mutex> lk(app.rfMtx);
+            app.rfCv.wait(lk, []{ return app.rfStop || !app.rfQueue.empty(); });
+            if (app.rfStop && app.rfQueue.empty()) break;
+            job = std::move(app.rfQueue.front());
+            app.rfQueue.erase(app.rfQueue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::RFetchDone d;
         d.uid = job.uid;
         d.url = job.url; d.name = job.name;
@@ -2635,6 +2634,7 @@ static void rfEnqueue(App::RFetchJob job) {
             app.rfQueue.insert(it, std::move(job));
         }
     }
+    app.rfCv.notify_one();
     if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
 }
 
@@ -2770,7 +2770,11 @@ static void pumpRemoteFetch() {
 }
 
 static void stopRemoteFetcher() {
-    app.rfStop = true;
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        app.rfStop = true;
+    }
+    app.rfCv.notify_all();
     if (app.rfThread.joinable()) app.rfThread.join();
 }
 
