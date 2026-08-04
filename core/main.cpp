@@ -6813,7 +6813,7 @@ static std::string selfExePath() {
 }
 
 // The command line that makes "the same image look the same" in the child:
-// - a stack passes its HEAD file, and --sequence always regroups the numbered
+// - a stack passes its HEAD file, and --stack always regroups the numbered
 //   siblings there without the picker;
 // - the CFA interpretation rides along when one is set (pattern before --cfa,
 //   which reads best; parseCli accepts either order);
@@ -6832,7 +6832,7 @@ static std::vector<std::string> newWindowArgv(const ImageDoc* d) {
     if (target.empty()) return {};     // nothing on disk behind this row
     std::vector<std::string> av{ selfExePath(), "--secondary",
                                  "--window-offset", "40,40" };
-    if (d->seqId != 0) { av.push_back("--sequence"); av.push_back("always"); }
+    if (d->seqId != 0) { av.push_back("--stack"); av.push_back("always"); }
     if (d->cfa != 0) {
         av.push_back("--bayer-pattern");
         av.push_back(CFA_PATTERNS[d->cfaPattern & 3]);
@@ -7779,7 +7779,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
         app.seqErr.clear();
     }
     app.seqNote.clear();
-    fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
+    fprintf(stderr, "stack: %s - %d files (%s)\n", info.name.c_str(),
             (int)files.size(), isRaw ? "raw recipe" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
@@ -7823,7 +7823,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 char m[192];
                 snprintf(m, sizeof m,
                          "memory budget %.1f GB reached - stopped after %d of %d frames\n"
-                         "(File > Sequence loading > Memory budget)\n",
+                         "(File > Stack loading > Memory budget)\n",
                          budget / 1073741824.0, app.seqDone.load(), (int)jobs.size());
                 fputs(m, stderr);
                 std::lock_guard<std::mutex> lk(app.seqMtx);
@@ -7898,7 +7898,7 @@ static void pumpSequence() {
         app.seqThread.join();
         int n = 0;
         for (const auto& d : app.images) if (d->seqId == app.seqLoadingId) n++;
-        fprintf(stderr, "sequence: loaded %d frames\n", n);
+        fprintf(stderr, "stack: loaded %d frames\n", n);
     }
 }
 
@@ -8685,7 +8685,7 @@ static void openFolder(const std::string& path) {
     std::vector<App::PendingGroup> groups = scanFolderGroups(path);
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
-        toast("scan stopped at 256 sequences - narrow the folder or use the filter", true);
+        toast("scan stopped at 256 stacks - narrow the folder or use the filter", true);
     // ALWAYS ask, one group included - same rule the remote scan follows. The
     // picker is where the file filter lives (UC3: "open only the *_dark*
     // frames of this folder" needs the dialog even when the folder groups into
@@ -8984,14 +8984,14 @@ static void drawFolderPickModal() {
                 : app.folderPickHost.empty() ? "peer on " PEER_HERE
                                              : app.folderPickHost.c_str(),
                 (int)app.folderPick.size());
-        ImGui::OpenPopup("Select sequences");
+        ImGui::OpenPopup("Select stacks");
     }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 18),
                                         ImVec2(FLT_MAX, FLT_MAX));
-    if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
+    if (!ImGui::BeginPopupModal("Select stacks", nullptr)) return;
 
     ImGui::TextDisabled("%s", dispPath(app.folderPickRoot).c_str());
     int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
@@ -9015,14 +9015,14 @@ static void drawFolderPickModal() {
             ImGui::SetTooltip(
                 "Narrows WHICH FILES will load, as you type.\n"
                 "Each word is looked for anywhere in a file's \"folder/filename\"\n"
-                "(shown when you expand a sequence below). All words must match.\n"
+                "(shown when you expand a stack below). All words must match.\n"
                 "    dark          keep files whose folder or name contains \"dark\"\n"
                 "    !ng           drop files matching \"ng\"\n"
                 "    10lx *_A.npy  words combine; * and ? wildcards work anywhere\n"
-                "Sequences show \"kept / total\"; only the kept files are loaded.");
+                "Stacks show \"kept / total\"; only the kept files are loaded.");
         ImGui::SameLine();
         if (app.pickFilter[0]) ImGui::Text("%d / %d files match", matchFiles, totalFiles);
-        else ImGui::TextDisabled("%d sequence(s), %d files", (int)app.folderPick.size(), totalFiles);
+        else ImGui::TextDisabled("%d stack(s), %d files", (int)app.folderPick.size(), totalFiles);
     }
     if (ImGui::SmallButton("All")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = true; }
     ImGui::SameLine();
@@ -9165,7 +9165,7 @@ static void drawFolderPickModal() {
         snprintf(m1, sizeof m1, "ONE stack of %d file(s)###mode1", selFiles);
         ImGui::RadioButton(m0, &app.pickMerge, 0);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("each checked sequence becomes its own stack");
+            ImGui::SetTooltip("each checked group of numbered files becomes its own stack");
         ImGui::SameLine();
         ImGui::RadioButton(m1, &app.pickMerge, 1);
         if (ImGui::IsItemHovered())
@@ -9218,7 +9218,7 @@ static void drawFolderPickModal() {
     if (sweepRow) {
         ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+            ImGui::SetTooltip("The %d selected stacks become one SERIES: each stack keeps\n"
                               "the value read from its name, and linearity / PTC measure the\n"
                               "series as a whole.\n"
                               "Nothing is created unless this is ticked.", selGroups);
@@ -9276,9 +9276,9 @@ static void drawFolderPickModal() {
                            "shapes differ (%s vs %s) - mismatched frames are skipped at load",
                            shapes[0].c_str(), shapes[1].c_str());
     else
-        ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
+        ImGui::Text("selected: %d stack(s), %d files", selGroups, selFiles);
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
-        ImGui::TextDisabled("check the shape column above to see which sequences differ");
+        ImGui::TextDisabled("check the shape column above to see which stacks differ");
     ImGui::BeginDisabled(!loadable);
     bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
                               : app.pickSweep   ? "Load as a sweep"
@@ -9792,7 +9792,7 @@ static void maybeOfferSequence(int imageIdx) {
     if ((int)files.size() < 2) return;
     if (app.seqLoadMode == 1) {                       // always
         startSequenceLoad(imageIdx, files, pattern);
-        toast("loading sequence: " + pattern + " (" + std::to_string(files.size()) + " files)");
+        toast("loading stack: " + pattern + " (" + std::to_string(files.size()) + " files)");
         return;
     }
     app.seqAskImage = imageIdx;                       // ask
@@ -11149,7 +11149,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             char msg[160];
             snprintf(msg, sizeof msg,
                      "memory budget: fetching %d of %d frames\n"
-                     "(File > Sequence loading > Memory budget)", fit + 1, m.frames);
+                     "(File > Stack loading > Memory budget)", fit + 1, m.frames);
             app.seqNote = msg;
         }
     }
@@ -11216,7 +11216,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         char msg[160];
         snprintf(msg, sizeof msg,
                  "memory budget: fetching %d of %d frames\n"
-                 "(File > Sequence loading > Memory budget)", fit + 1, (int)files.size());
+                 "(File > Stack loading > Memory budget)", fit + 1, (int)files.size());
         app.seqNote = msg;
     }
 }
@@ -11364,7 +11364,7 @@ static void openFolderDialog() {
     }
     if (app.folderDlg) return;
     app.folderDlgMode = 0;
-    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all stacks below it)");
 }
 // The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
 // folder opens in the Browse panel through the LOCAL peer - the same listing,
@@ -16343,7 +16343,7 @@ struct FrameAxis {
 };
 static FrameAxis frameAxisOf(int seqId) {
     FrameAxis a;
-    a.label = "frame number (index in sequence)";
+    a.label = "frame number (index in stack)";
     App::SeqInfo* si = seqInfo(seqId);
     if (!si || si->axisVals.empty()) return a;
     int n = (int)framesOfSeq(seqId).size();
@@ -18042,7 +18042,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                  - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
-    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in sequence)";
+    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in stack)";
     // Box-zoom. Drag a rectangle on the chart to narrow both ranges to it;
     // double-click resets. The state is keyed to WHAT is on the axes (A's
     // document and the x label): a zoom in seconds must not survive a switch
@@ -18586,8 +18586,8 @@ static void drawPanelTemporal() {
     ImGui::Text("Temporal");
     ImGui::Separator();
     ImGui::TextDisabled("%s is a single frame: no time axis.", im->name.c_str());
-    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open a "
-                        "sequence, or set a stack as compare B.");
+    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open one, "
+                        "or set a stack as compare B.");
 }
 
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
@@ -20185,7 +20185,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         };
         if (I.flat) {
             rbModeChip("flat##rbchip", "every frame is its own row - the default is "
-                                       "grouped (one row per numbered sequence).\n"
+                                       "grouped (one row per numbered stack).\n"
                                        "change it in the panel menu");
             rbFlow(rbBtnW("tree##rbchip"));
         }
@@ -20353,7 +20353,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
         ImGui::Separator();
         // Radio pairs, not toggles: the state is visible without clicking.
-        if (ImGui::MenuItem("Grouped (a numbered sequence is one row)", nullptr, !I.flat)
+        if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
             && I.flat) {
             I.flat = app.rbFlat = false;   // this panel now; the pref = the default
             app.prefsDirty = true;
@@ -21095,7 +21095,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
-                        snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
+                        snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
@@ -21308,8 +21308,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (rbPropsNoSize) {
             // Never invent one: the listing reply carries the group's total
             // bytes and its newest mtime, and no per-member breakdown.
-            ImGui::TextDisabled("size      -   (not in the sequence listing)");
-            ImGui::TextDisabled("modified  -   (not in the sequence listing)");
+            ImGui::TextDisabled("size      -   (not in the stack listing)");
+            ImGui::TextDisabled("modified  -   (not in the stack listing)");
         } else {
         ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
                     (unsigned long long)e.size, e.group ? "  - all frames" : "");
@@ -22231,7 +22231,7 @@ static void drawFileList() {
               for (int idx : stack)
                   if (app.images[idx]->uid == app.cmpExtra[k]) { badge += slotName(k); break; }
           char lb[600];
-          const char* sname = si ? si->name.c_str() : "sequence";
+          const char* sname = si ? si->name.c_str() : "stack";
           if (mem) {
               // The value LEADS the label. It is the reason the row is in this
               // series at all, and it is not metadata: an unset one has to be
@@ -22533,10 +22533,10 @@ static void drawFileList() {
 
 static void drawSequenceModal() {
     if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
-        ImGui::OpenPopup("Load sequence?");
+        ImGui::OpenPopup("Load stack?");
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal("Load stack?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
     ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(),
                 dispPath(app.seqAskPattern).c_str());
@@ -22544,8 +22544,8 @@ static void drawSequenceModal() {
     ImGui::TextDisabled("Frames decode in the background; you can keep working.");
     ImGui::Separator();
     static bool remember = false;
-    ImGui::Checkbox("remember my choice (File > Sequence loading)", &remember);
-    if (ImGui::Button("Load sequence", ImVec2(150 * app.uiScale, 0))) {
+    ImGui::Checkbox("remember my choice (File > Stack loading)", &remember);
+    if (ImGui::Button("Load stack", ImVec2(150 * app.uiScale, 0))) {
         startSequenceLoad(app.seqAskImage, app.seqAskFiles, app.seqAskPattern);
         if (remember) app.seqLoadMode = 1;
         app.seqAskImage = -1; app.seqAskFiles.clear();
@@ -22790,7 +22790,7 @@ static void drawMenuBar(GLFWwindow* win) {
         }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
-        if (ImGui::BeginMenu("Sequence loading")) {
+        if (ImGui::BeginMenu("Stack loading")) {
             if (ImGui::MenuItem("Ask each time", nullptr, app.seqLoadMode == 0)) app.seqLoadMode = 0;
             if (ImGui::MenuItem("Always load folder", nullptr, app.seqLoadMode == 1)) app.seqLoadMode = 1;
             if (ImGui::MenuItem("Never (single file)", nullptr, app.seqLoadMode == 2)) app.seqLoadMode = 2;
@@ -22819,7 +22819,7 @@ static void drawMenuBar(GLFWwindow* win) {
                     app.procPolicy = App::PolLocalFetch;
                 ImGui::Separator();
             }
-            if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
+            if (ImGui::MenuItem("Load stack for current image", nullptr, false,
                                 cur() && cur()->seqId == 0 && !cur()->src->path.empty())) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
@@ -23107,7 +23107,7 @@ static void drawMenuBar(GLFWwindow* win) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip(inStack
                         ? "sigma_t / sigma_fpn over the loaded stack (whole frames or the selected ROI)"
-                        : "needs a stack: load a numbered sequence first");
+                        : "needs a stack: load numbered files as a stack first");
             }
         }
         ImGui::EndMenu();
@@ -23269,7 +23269,7 @@ static void drawHelpAbout() {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
                 };
                 row("Right / Left",  "next / previous frame (time axis)");
-                row("Down / Up",     "next / previous stack (sequence)");
+                row("Down / Up",     "next / previous stack");
                 row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
                 row("Ctrl+N / Ctrl+P", "next / previous stack");
                 row("Ctrl+A / Ctrl+E", "first / last frame");
@@ -23309,7 +23309,7 @@ static void drawHelpAbout() {
                 row("right / left",  "tree mode: expand / collapse the folder under the cursor");
                 row("Backspace",     "up to the parent folder");
                 row(SC_MOD "+F",     "focus the filter box");
-                row(", / .",         "step the previewed sequence");
+                row(", / .",         "step the previewed stack");
                 ImGui::EndTable();
             }
         }
@@ -23596,7 +23596,7 @@ static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
         "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
-        "  folder: loads every numbered sequence below it, one stack per group\n"
+        "  folder: loads the numbered files below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
         "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
@@ -23609,8 +23609,8 @@ static void printUsage() {
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
-        "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
-        "  --mem-budget <GB>           what the sequence loader may hold (default: auto,\n"
+        "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
+        "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
         "                              60%% of physical RAM)\n"
         "  .npy shapes read natively:  (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)\n"
         "                              any other shape is refused by name; to read one\n"
@@ -23660,7 +23660,7 @@ static void printUsage() {
         "  --tile-selftest <dir>       side-by-side compare panes: geometry\n"
         "  --export-selftest <dir>     PNG export + montage\n"
         "  --export-tsv-selftest <dir> the Temporal export document\n"
-        "  --picker-selftest <dir>     sequence picker: filter cut + merge\n"
+        "  --picker-selftest <dir>     stack picker: filter cut + merge\n"
         "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
@@ -23757,12 +23757,12 @@ static void parseCli(int argc, char** argv) {
                             "colour frame, always. To read one file differently, open it and "
                             "use \"re-read as...\" in the Inspector - it is per file and it "
                             "is remembered.\n");
-        } else if (a == "--sequence") {            // ask | always | never
+        } else if (a == "--stack") {               // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
-            else fprintf(stderr, "--sequence expects ask|always|never\n");
+            else fprintf(stderr, "--stack expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
@@ -23837,7 +23837,7 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--remote-policy expects auto|local-fetch\n");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
-        } else if (a == "--mem-budget") {          // GB the sequence loader may use
+        } else if (a == "--mem-budget") {          // GB the stack loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {             // off | wipe | split
             std::string v = next();
@@ -23878,7 +23878,7 @@ static void parseCli(int argc, char** argv) {
             }
         }
     }
-    // Applied later, not here: with --sequence always the sibling frames are still
+    // Applied later, not here: with --stack always the sibling frames are still
     // arriving on the loader thread, so at this point there may be only one image.
     if (cliCompare >= 0) app.pendingCompare = cliCompare;
     if (haveZoom || haveCenter) {
@@ -25310,7 +25310,7 @@ int main(int argc, char** argv) {
             bool same = g && expanded == g->members;
             bool nogroups = true;
             for (const auto& r : fv) if (r.isGroup()) nogroups = false;
-            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d sequence row(s), "
+            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d stack row(s), "
                             "'%s' x%d], flat %d row(s), members match=%d, no group rows "
                             "when flat=%d, member size/mtime blank=%d: %s\n",
                     dir.c_str(), (int)gv.size(), gRows, g ? g->name.c_str() : "?",
@@ -27850,9 +27850,9 @@ int main(int argc, char** argv) {
                         " --cfa bayer C:/data/flat_003.npy",
                   "N7 CFA frame argv: pattern first, then --cfa");
             check(join(newWindowArgv(tail)) ==
-                  exe + " --secondary --window-offset 40,40 --sequence always"
+                  exe + " --secondary --window-offset 40,40 --stack always"
                         " C:/data/s/frame_000.npy",
-                  "N7 stack argv: HEAD file + --sequence always");
+                  "N7 stack argv: HEAD file + --stack always");
             check(join(newWindowArgv(rem)) ==
                   exe + " --secondary --window-offset 40,40 ssh://user@trc2/data/x.npy",
                   "N7 remote argv passes the ssh url");
@@ -35459,7 +35459,7 @@ int main(int argc, char** argv) {
     // their preferences (the frameless ones return before ever getting here)
     if (g_browseKeys.empty()) {
         autosaveSession();            // also covers a normal quit
-        // Only what the user changed in this run: a one-off --sequence flag or
+        // Only what the user changed in this run: a one-off --stack flag or
         // the gamma inside a --session must not quietly become the default.
         if (app.prefsDirty) savePrefs();
     }

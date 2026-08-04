@@ -91,7 +91,7 @@ jobs:
           # exactly one source.
           python tools/gen_testdata.py --bench
           # --compare exercises the A/B path too: two images, two textures
-          xvfb-run -a ./build/viewer --bench 120 --sequence never --compare wipe \
+          xvfb-run -a ./build/viewer --bench 120 --stack never --compare wipe \
                    tools/testdata/bench_big.npy tools/testdata/bench_stack.npy 2>&1 | tee bench.log
           grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
           # catastrophic-regression gate only: CI runners use software GL and are

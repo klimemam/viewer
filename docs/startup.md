@@ -178,8 +178,8 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 
 キー割り当ては `H`(Keyboard Shortcuts)の「Browse panel」節にも出ます。
 
-フォルダを開くと **Select sequences** ダイアログが**必ず**出ます —— 見つかった連番が 1 つでも、
-`--sequence always` でも省略されません(絞り込みはここにしか無いため)。決めるのは 4 つ:
+フォルダを開くと **Select stacks** ダイアログが**必ず**出ます —— 見つかった連番が 1 つでも、
+`--stack always` でも省略されません(絞り込みはここにしか無いため)。決めるのは 4 つ:
 
 | 行 | 選ぶもの |
 |---|---|
@@ -290,7 +290,7 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 
 | どこ | やり方 |
 |---|---|
-| フォルダを開くとき | Select sequences の **「open as a sweep (creates a series)」**。別スタックが 2 つ以上選ばれているときだけ出ます。チェックするとパラメータ名と単位の欄が現れ、各行に**名前から読めた値のプレビュー**(`-> 100 lx`)が付きます。読めない行は琥珀色で `-> no value in the name`。**「トップフォルダ毎に batch」とは排他**です(series は 1 つの batch に収まるため) |
+| フォルダを開くとき | Select stacks の **「open as a sweep (creates a series)」**。別スタックが 2 つ以上選ばれているときだけ出ます。チェックするとパラメータ名と単位の欄が現れ、各行に**名前から読めた値のプレビュー**(`-> 100 lx`)が付きます。読めない行は琥珀色で `-> no value in the name`。**「トップフォルダ毎に batch」とは排他**です(series は 1 つの batch に収まるため) |
 | 開いた後 | Files で stack を**右クリック > Series ▸**。同じ batch の series 一覧(参加したときに付く値も出ます)、`New series...`、`Remove from this series`。別 batch の series は選べず、「先に Move to batch」と理由が出ます |
 | Linearity パネル | series が 0 個のときの空状態にある「Create a series from this batch's stacks...」、あるいは `New...` / `Edit...`。**このパネルは既定で出ていません** —— `View > Panels > Linearity` で出します |
 
@@ -382,5 +382,5 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 
 なお **サーバ側の `MEASURE` は実装済み**です —— 塊を開くと転送を待たずにサーバ側で時間統計を
 計算し、`[server <ホスト>, N frames]` タグ付きで表示します
-(`File > Sequence loading > Remote processing` で auto / server / local fetch を切替)。
+(`File > Stack loading > Remote processing` で auto / server / local fetch を切替)。
 開いていない連番も、Browse パネルの「Temporal stats (server)」でそのまま測れます。
