@@ -4,8 +4,9 @@
 
 Every fixture the selftests need is written here, deterministically (fixed
 rng seeds), so CI can regenerate the lot from a clean checkout - nothing under
-tools/testdata is in git. `--bench` adds the two large arrays the frame-time
-gate uses; they are ~90 MB and no selftest needs them, so they are opt-in.
+tools/testdata is in git. `--bench` adds the large arrays the frame-time gate
+and the A/B step-throttle measurement use; they are ~330 MB and no selftest
+needs them, so they are opt-in.
 """
 import shutil
 import sys
@@ -266,6 +267,33 @@ if WANT_BENCH:
     # only the frame-time gate needs this one, and it is 48 MB
     np.save(out / "bench_big.npy",
             (np.random.default_rng(0).random((3000, 4000)) * 4095).astype(np.float32))
+
+    # bench_ab_a.npy / bench_ab_b.npy - the A/B step-throttle experiment of
+    # docs/ab-stats-plan.md 1: TWO stacks of 12 Mpx u16 frames, opened together
+    # with --compare split (+ follow-frame) and stepped by --bench-step, so
+    # every benched frame is a real cache miss on BOTH slots. That is the only
+    # shape that measures what the throttle removes; a single big frame keeps
+    # every cache key hit, and bench_stack.npy is 0.08 Mpx.
+    #
+    # The original measurement (f424dae) used a hand-made pair that was never
+    # committed - tools/testdata is not in git - so the number could not be
+    # re-taken when 138da0d asked for it. Six frames a side is what that run
+    # used, and it is the smallest stack that steps for a while without the
+    # bounce at the ends dominating.
+    #
+    # u16, not f32: the histogram's bin path and the projection's accumulate
+    # are dtype-dispatched, and u16 is what a sensor actually delivers.
+    AB_F, AB_H, AB_W = 6, 3000, 4000                      # 12.0 Mpx a frame
+    for name, seed, ped in (("bench_ab_a.npy", 20, 0), ("bench_ab_b.npy", 21, 700)):
+        rng_ab = np.random.default_rng(seed)
+        # a horizontal ramp (so the projection is a line and not a cloud) plus
+        # per-frame noise (so no two frames share a histogram)
+        ramp = np.arange(AB_W, dtype=np.int32) * 3 + ped
+        stack = np.empty((AB_F, AB_H, AB_W), np.uint16)
+        for k in range(AB_F):
+            stack[k] = (ramp + rng_ab.integers(0, 512, (AB_H, AB_W), dtype=np.int32)
+                        ).astype(np.uint16)
+        np.save(out / name, stack)
 
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):

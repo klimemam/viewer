@@ -16,11 +16,22 @@
   性質)ので閉じたパネルの B 側コストはゼロ。
 - **frame step**: `compareFollowFrame` on だと B の uid も毎回変わり hist/proj は A/B 両方が再計算
   = **ステップ当たりのコストがほぼ倍**。temporal は `seqId`+ROI がキーなので再計算されない。
-- 12 Mpx での実コストは**未測定。推測を書かない**。測り方: 12 Mpx の 2 stack を開き
+- 12 Mpx での実コストは策定時点で**未測定。推測を書かない**。測り方: 12 Mpx の 2 stack を開き
   Histogram/Projection を出した状態で `--bench 300` を (a) compare off、(b) CmpSplit+follow on
   で走らせ median frame time の差を取る。ただし `--bench` はフレームを進めないので **bench に
   フレーム送りを足す必要がある**。B 込みの draw が 8 ms を超えるなら `app.annBusy` と同型の
   ガード(キーリピート中は slot 1 を再計算せず B 側見出しに `stale`)を足す。先に測る。
+- **実測** —— f424dae(2026-07-28)で上の実験を実施して throttle を追加、2026-08-05 に
+  同じ形で再測定。フィクスチャは `gen_testdata.py --bench` が書く `bench_ab_a.npy` /
+  `bench_ab_b.npy`(6 枚 x 4000x3000 u16 の 2 スタック)、コマンドは
+  `--bench 300 --bench-step --bench-panels --compare split|off`:
+  compare off **12.31 ms** / CmpSplit+follow(throttle あり)**12.75 ms** /
+  `--no-ab-throttle` **24.57 ms**。B 込みの draw は compare off より **+12.3 ms** で
+  8 ms の閾値を超えるため throttle は**維持**(f424dae の 11.91 / 12.22 / 23.95 ms と
+  ほぼ一致)。`--bench-panels` が要るのは、既定レイアウトが Projection / Histogram /
+  Temporal を 1 ノードにタブ化しており、選択されていないタブは `ImGui::Begin` が false を
+  返して描画されないため —— 3 枚を横に並べないとこの実験の条件(Histogram/Projection を
+  出した状態)にならない。
 
 ## 2. 重ねる (overlay) の描き分け
 色相は CFA plane に割当済(`CFA_COLS`/`RGB_COLS`)なので **B に別色相は使えない**。

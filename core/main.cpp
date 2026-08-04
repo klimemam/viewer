@@ -23793,6 +23793,8 @@ static void printUsage() {
         "                              side, and report the panes the canvas drew\n"
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
+        "  --bench-panels              ...with Projection, Histogram and Temporal side\n"
+        "                              by side rather than tabbed, so all three draw\n"
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --gl-probe                  can this machine make the GL context the viewer\n"
         "                              needs? name it and exit (0 yes, 3 no + why)\n"
@@ -23929,8 +23931,8 @@ static void parseCli(int argc, char** argv) {
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
-        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--secondary" ||
-                   a == "--no-window") {
+        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--bench-panels" ||
+                   a == "--secondary" || a == "--no-window") {
             /* consumed in main(): no value */
         } else if (a == "--no-ab-throttle") {
             g_abNoThrottle = true;     // measure what the B-slot throttle saves
@@ -25290,6 +25292,20 @@ int main(int argc, char** argv) {
     bool benchTiles = false;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-tiles")) benchTiles = true;
+    // --bench-panels: dock Projection, Histogram and Temporal side by side for
+    // the bench instead of tabbing them, so all three DRAW. The default layout
+    // puts them in one node, and ImGui::Begin returns false for a tab that is
+    // not selected - so a bench on the default layout pays for exactly one of
+    // the three, whichever happens to lead. docs/ab-stats-plan.md's A/B
+    // measurement is specified with Histogram AND Projection showing, and until
+    // ba40ba8 it got that by accident, from whatever layout.ini the machine
+    // running the bench happened to have. That is why f424dae's numbers could
+    // not be re-taken: a scripted run is now correctly isolated from the user's
+    // layout, which also isolated it from the arrangement being measured. This
+    // flag names the arrangement instead of inheriting it.
+    bool benchPanels = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--bench-panels")) benchPanels = true;
     app.exePath = argv[0];
     // the out-of-the-box A/B range mode, read before anything can override it:
     // --range-selftest checks it, and prefs on the machine running the test
@@ -34371,9 +34387,18 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Inspector", right);
             // tab order = dock order; Projection leads, and the explicit
             // focus below makes it the SELECTED tab, not merely the leftmost
-            ImGui::DockBuilderDockWindow("Projection", bottom);
-            ImGui::DockBuilderDockWindow("Histogram", bottom);
-            ImGui::DockBuilderDockWindow("Temporal", bottom);
+            if (benchPanels) {          // --bench-panels: all three at once
+                ImGuiID bp1 = bottom, bp2, bp3;
+                bp2 = ImGui::DockBuilderSplitNode(bp1, ImGuiDir_Right, 0.66f, nullptr, &bp1);
+                bp3 = ImGui::DockBuilderSplitNode(bp2, ImGuiDir_Right, 0.50f, nullptr, &bp2);
+                ImGui::DockBuilderDockWindow("Projection", bp1);
+                ImGui::DockBuilderDockWindow("Histogram", bp2);
+                ImGui::DockBuilderDockWindow("Temporal", bp3);
+            } else {
+                ImGui::DockBuilderDockWindow("Projection", bottom);
+                ImGui::DockBuilderDockWindow("Histogram", bottom);
+                ImGui::DockBuilderDockWindow("Temporal", bottom);
+            }
             ImGui::DockBuilderFinish(dockId);
             ImGui::SetWindowFocus("Projection");
             // ROIs and Analysis stay floating (they follow the work, not the frame)

@@ -19,7 +19,7 @@ echo usage: update.cmd [--fetch REF ^| --pr N ^| --commit SHA]
 exit /b 2
 
 :publish
-git fetch origin binaries && git reset --hard origin/binaries
+git fetch origin binaries && call :reset_to origin/binaries
 exit /b %errorlevel%
 
 :gitref
@@ -34,8 +34,62 @@ git fetch origin "%~2" || (
   echo   CI publishes a branch as binaries-^<branch^>, e.g. binaries-dblclick-probe
   exit /b 1
 )
-git reset --hard FETCH_HEAD
+call :reset_to FETCH_HEAD
 exit /b %errorlevel%
+
+rem ---------------------------------------------------------------------------
+rem :reset_to <ref>  - make the tree be <ref>, unless a running program is
+rem holding a file that has to be replaced to get there.
+rem
+rem Windows maps a running .exe (and every DLL it has loaded) and refuses to
+rem unlink or overwrite it, so an update run while the viewer is open dies
+rem partway through:
+rem
+rem     error: unable to unlink old 'win64/viewer.exe': Invalid argument
+rem     fatal: Could not reset index file to revision '...'
+rem
+rem By then git has already rewritten the files it reached first, so the folder
+rem holds a mixture of the two builds while HEAD still names the old one - and
+rem nothing in that message mentions the viewer window that caused it.
+rem
+rem The check is a WRITE PROBE on the files this reset would actually rewrite
+rem (git diff --name-only <ref> - the ref against the working tree, which is
+rem exactly what reset --hard touches), and NOT a search for a process called
+rem viewer.exe. A name match answers a different question: it fires on a build
+rem unpacked under try\, on a copy anywhere else on the disk, and on a viewer
+rem belonging to some other checkout entirely - while staying silent when the
+rem holder is not a viewer at all (an antivirus pass, a backup agent, a
+rem debugger still attached). Opening the file for append is the same operation
+rem git has to perform, on the same file, so what passes here is what git can
+rem do. Appending nothing writes nothing: size and timestamp are untouched.
+rem
+rem With nothing to update, nothing is probed and a running viewer is never
+rem mentioned - the question only comes up when there are files to replace.
+:reset_to
+set "BUSY="
+rem if the ref is bad this lists nothing; the reset below then says so properly
+for /f "usebackq delims=" %%f in (`git diff --name-only %1 2^>nul`) do call :probe "%%f"
+if defined BUSY (
+  echo.
+  echo Close every viewer window ^(and any viewer-serve started from this
+  echo folder^), then run update.cmd again. Nothing has been changed.
+  exit /b 1
+)
+git reset --hard %1
+exit /b %errorlevel%
+
+:probe
+rem a file that is not there yet cannot be held open - and ">>" would create it
+if not exist "%~1" exit /b 0
+( >>"%~1" (call ) ) 2>nul && exit /b 0
+if not defined BUSY (
+  echo.
+  echo This update has to replace files that another program is holding open,
+  echo and Windows does not allow that while the program is running:
+)
+set "BUSY=1"
+echo     %~1
+exit /b 0
 
 :fetch
 if "%~2"=="" (
