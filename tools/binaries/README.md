@@ -7,7 +7,17 @@ machine with no build environment:
 
 and from then on just run `update.cmd` (Windows) / `./update.sh`.
 
-To try a build that is not published yet - a pull request, or one commit:
+To try a build that is not main's:
+
+    update.cmd --fetch binaries-pr64      ./update.sh --fetch binaries-pr64
+
+That one needs **nothing but git**. CI publishes every branch it builds as
+`binaries-<branch>` - so a branch called `dblclick-probe` arrives as
+`binaries-dblclick-probe` - and `--fetch` takes it in place, exactly the way
+the plain form takes main's. Use this on a machine with no GitHub CLI and no
+token, which is most of the machines that need a prebuilt binary at all.
+
+The other two ask GitHub directly, and need the CLI (`gh auth login`):
 
     update.cmd --pr 64            ./update.sh --pr 64
     update.cmd --commit a1b2c3    ./update.sh --commit a1b2c3

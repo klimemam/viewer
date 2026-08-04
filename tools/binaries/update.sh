@@ -1,7 +1,13 @@
 #!/bin/sh
-#   ./update.sh                 - the published build, in place (what it always did)
-#   ./update.sh --pr 64         - that pull request's build, into try/pr64/
-#   ./update.sh --commit a1b2c3 - that commit's build, into try/a1b2c3/
+#   ./update.sh                       - the published build, in place
+#   ./update.sh --fetch binaries-pr64 - that branch's build, in place, git only
+#   ./update.sh --pr 64               - that pull request's build, into try/pr64/
+#   ./update.sh --commit a1b2c3       - that commit's build, into try/a1b2c3/
+#
+# --fetch needs nothing but git. The other two need the GitHub CLI and a token,
+# which the machine that most needs a build is the least likely to have - so CI
+# publishes every branch as `binaries-<branch>` and --fetch takes it the same
+# way the plain form takes main's.
 #
 # The two new forms never touch the published binaries. This branch's history is
 # REPLACED on every publish, so anything unpacked over linux-x64/ would be
@@ -11,9 +17,19 @@
 set -e
 
 case "$1" in
-  "")        git fetch origin binaries && exec git reset --hard origin/binaries ;;
+  "")   git fetch origin binaries && exec git reset --hard origin/binaries ;;
+  --fetch)
+        [ -n "$2" ] || { echo "--fetch needs a ref: ./update.sh --fetch binaries-pr64" >&2; exit 2; }
+        # In place, like the plain form - this branch is disposable by design,
+        # so there is nothing here worth protecting from being replaced.
+        git fetch origin "$2" || {
+          echo "no such ref: $2" >&2
+          echo "  CI publishes a branch as binaries-<branch>, e.g. binaries-dblclick-probe" >&2
+          exit 1
+        }
+        exec git reset --hard FETCH_HEAD ;;
   --pr|--commit) ;;
-  *)         echo "usage: ./update.sh [--pr N | --commit SHA]" >&2; exit 2 ;;
+  *)    echo "usage: ./update.sh [--fetch REF | --pr N | --commit SHA]" >&2; exit 2 ;;
 esac
 
 [ -n "$2" ] || { echo "$1 needs a value: ./update.sh $1 <value>" >&2; exit 2; }

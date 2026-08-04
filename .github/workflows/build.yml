@@ -188,7 +188,12 @@ jobs:
   # pulls are small and the source history never carries exe blobs.
   publish-binaries:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # main publishes to `binaries`; any other branch publishes to
+    # `binaries-<branch>`. The second one exists because the machine that most
+    # needs a build is the one with no build environment - and often no GitHub
+    # CLI and no token either. `git fetch` is the only tool it is guaranteed to
+    # have, so a branch is the only delivery it can actually receive.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -226,6 +231,14 @@ jobs:
           git config user.email "github-actions@users.noreply.github.com"
           git add -A
           git commit -m "binaries for ${GITHUB_SHA}"
-          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" binaries
+          # The branch name carries where it came from, so a machine with only
+          # git can ask for a specific build by name and get exactly it.
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            TARGET=binaries
+          else
+            TARGET="binaries-$(echo "${GITHUB_REF#refs/heads/}" | tr -c 'A-Za-z0-9._-' '-')"
+          fi
+          echo "publishing as ${TARGET}"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

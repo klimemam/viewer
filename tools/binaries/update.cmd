@@ -12,13 +12,29 @@ rem is exactly the thing you would not want quietly replaced. They go under
 rem try\, and you run them from there.
 
 if "%~1"=="" goto :publish
+if /i "%~1"=="--fetch" goto :gitref
 if /i "%~1"=="--pr" goto :fetch
 if /i "%~1"=="--commit" goto :fetch
-echo usage: update.cmd [--pr N ^| --commit SHA]
+echo usage: update.cmd [--fetch REF ^| --pr N ^| --commit SHA]
 exit /b 2
 
 :publish
 git fetch origin binaries && git reset --hard origin/binaries
+exit /b %errorlevel%
+
+:gitref
+if "%~2"=="" (
+  echo --fetch needs a ref: update.cmd --fetch binaries-pr64
+  exit /b 2
+)
+rem In place, like the plain form - this branch is disposable by design, so
+rem there is nothing here worth protecting from being replaced.
+git fetch origin "%~2" || (
+  echo no such ref: %~2
+  echo   CI publishes a branch as binaries-^<branch^>, e.g. binaries-dblclick-probe
+  exit /b 1
+)
+git reset --hard FETCH_HEAD
 exit /b %errorlevel%
 
 :fetch
