@@ -1106,6 +1106,9 @@ struct App {
     // server-side folder becomes an ordinary local stack, one frame at a time.
     struct RFetchJob {
         std::string url, name;
+        std::string note;             // the head frame's note, copied verbatim onto
+                                      // this one: a stack-constant Inspector row
+                                      // (see openRemote, materializeDerivedFrame)
         std::string exe;              // snapshot at enqueue: the UI may edit
                                       // remoteExe while the worker connects
         int frame = 0;
@@ -1123,7 +1126,7 @@ struct App {
                                       // visible hitch on the UI thread
         std::string dtype, err;
         std::vector<float> data;
-        std::string url, name;
+        std::string url, name, note;
         int frame = 0, seqId = 0, seqIndex = 0;
         uint32_t gen = 0;
         size_t bytes = 0;             // what was committed for it, to give back
@@ -2622,7 +2625,7 @@ static void rfWorker() {
         }
         App::RFetchDone d;
         d.uid = job.uid;
-        d.url = job.url; d.name = job.name;
+        d.url = job.url; d.name = job.name; d.note = job.note;
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         d.gen = job.gen;
         d.bytes = job.bytes;
@@ -2749,6 +2752,10 @@ static void pumpRemoteFetch() {
             }
             auto doc = std::make_unique<ImageDoc>();
             doc->name = d.name;
+            doc->note = d.note;                  // the head frame's note, verbatim: the
+                                                 // Inspector's source row is a property
+                                                 // of the STACK, so it never appears or
+                                                 // vanishes as the user steps frames
             FrameSource& S = *doc->src;          // fresh source (remote: no stat)
             S.path = d.url;
             S.remoteUrl = d.url;
@@ -11097,8 +11104,21 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     S.dtype = dt;
     S.w = tw; S.h = th; S.ch = tch;
     S.data = std::move(px);
-    doc->note = "remote " + host + "  -  " + std::to_string(m.w) + "x" + std::to_string(m.h) +
-                (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
+    // The Inspector prints a non-empty note as a LINE OF ITS OWN, directly above
+    // the Interpret combo. A note the head frame carries and its siblings do not
+    // makes that line appear and vanish as the user steps the stack, and every
+    // control under it moves - so the note has to be stack-constant, exactly as
+    // derived stacks decided it (materializeDerivedFrame: "the SAME note on every
+    // frame"). The sibling frames are minted by pumpRemoteFetch, so this string
+    // travels to them through RFetchJob::note.
+    // Two things are deliberately NOT in it. The SIZE: the row immediately above
+    // already prints "%dx%d %dch %s", and docs/todo-open.md item 11 asked for the
+    // duplicate to go. The HOST when there is none: a local:// peer serves files
+    // off this disk and was not fetched "from" anywhere, which is the same call
+    // the "opened X" toast at the end of this function makes.
+    doc->note = "remote";
+    if (!host.empty()) doc->note += " " + host;
+    if (m.frames > 1) doc->note += "  -  " + std::to_string(m.frames) + " frames";
     doc->uid = app.nextUid++;
     S.remoteUrl = url;
     S.remoteFrame = frame;
@@ -11187,6 +11207,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             App::RFetchJob j;
             j.url = url;
             j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.note = first->note;     // one note, every frame: see where it is built
             j.frame = i;
             j.seqId = si.id;
             j.seqIndex = i;
@@ -11255,6 +11276,8 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         App::RFetchJob j;
         j.url = makeRemoteUrl(host, files[i], port);
         j.name = baseName(files[i]);
+        j.note = first->note;         // every file of the folder came from the same
+                                      // peer, so they say so identically or not at all
         j.seqId = si.id;
         j.seqIndex = i;
         j.bytes = perFrame;
@@ -11321,6 +11344,8 @@ static void promotePreview(ImageDoc* d) {
             App::RFetchJob j;
             j.url = d->src->remoteUrl;
             j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.note = d->note;         // promoting a preview mints the same stack the
+                                      // other two paths do, and it says the same thing
             j.seqId = si.id;
             j.seqIndex = i;
             j.frame = i;
@@ -27593,6 +27618,45 @@ int main(int argc, char** argv) {
             for (int i = 0; namesOk && i < 7; i++)
                 namesOk = nm[i] == std::string(LV[i]) + "/capture.npy";
             check("a remote frame-axis stack keeps it too", namesOk);
+        }
+        {   // ---- the Inspector's source row does not come and go mid-stack ----
+            // ImageDoc::note is printed as a LINE OF ITS OWN in the Inspector's
+            // Image section, with the Interpret combo and the rest of the controls
+            // directly below it. openRemote wrote a note on the frame it opened
+            // and pumpRemoteFetch minted the siblings without one, so stepping a
+            // remote stack added and removed a row and everything under it moved
+            // under the pointer. This is --derive-selftest's D4 ("every derived
+            // frame carries the same origin note") for the remote producer, and
+            // it is asserted the same way: EQUAL and non-empty. All-empty would
+            // also hold the row count still, and would also be the regression.
+            int stacks = 0, frames = 0;
+            bool noteConst = true;
+            std::string shown;
+            for (const auto& si : app.seqs) {
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (fr.size() < 2) { noteConst = false; continue; }   // no sibling to differ
+                stacks++;
+                frames += (int)fr.size();
+                const std::string n0 = app.images[fr[0]]->note;
+                if (n0.empty()) noteConst = false;
+                shown = n0;
+                for (int idx : fr)
+                    if (app.images[idx]->note != n0) noteConst = false;
+            }
+            fprintf(stderr, "sweepfile: remote note across %d stack(s) / %d frame(s): "
+                            "\"%s\"\n", stacks, frames, shown.c_str());
+            check("every frame of a remote stack carries the SAME note",
+                  stacks == 7 && noteConst);
+            // ...and it does not repeat the size. docs/todo-open.md item 11 point 3:
+            // the row directly above the note already prints "%dx%d %dch %s", so the
+            // note carrying WxH put the same number twice in two adjacent rows. The
+            // needle is taken from the doc, not typed in, because that is exactly
+            // what the row above formats.
+            char wh[64] = "";
+            if (!app.images.empty())
+                snprintf(wh, sizeof wh, "%dx%d", app.images[0]->w, app.images[0]->h);
+            check("...and it does not repeat the WxH printed one row above",
+                  wh[0] && shown.find(wh) == std::string::npos);
         }
         checkSeries("remote");
         fprintf(stderr, "sweepfile: %s\n", ok ? "ok" : "FAILED");
