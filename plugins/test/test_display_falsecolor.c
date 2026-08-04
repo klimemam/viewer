@@ -29,8 +29,16 @@ int main() {
         return 1;
     }
 
-    // 3. Test a general case, e.g. 10 entries. We assert ALL 10 entries
-    // to catch any errors in the interior mapping.
+    // 3. The resample path, at 10 entries. EVERY entry is asserted, not just
+    // the ends: the ends are where the mapping is pinned by construction
+    // (i=0 -> 0, i=9 -> 255) and so they are exactly where a wrong formula
+    // still looks right. An earlier draft asserted indices 0, 1 and 9 only,
+    // and a mutant that rounds to nearest instead of truncating - s =
+    // (i*255 + 4)/9 - agreed at all three and survived; it disagrees at
+    // i = 2, 5 and 8 (56/57, 141/142, 226/227), which is the interior.
+    // The expected index is written out here rather than reusing the
+    // expression under test, so a change to that expression is a mismatch
+    // and not a matching pair of edits.
     uint8_t rgb10[10 * 3];
     memset(rgb10, 0, sizeof(rgb10));
     fill_lut(rgb10, 10);
