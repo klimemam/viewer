@@ -80,6 +80,15 @@ jobs:
           # Windows and macOS begin gating fully the day they gain a context.
           VIEWER_SELFTEST_REQUIRE_GL: ${{ runner.os == 'Linux' && '1' || '' }}
         run: tools/run_selftests.sh build
+      - name: Adapter suite
+        # 36 cases over viewer_import.py and run_adapter.py that nothing ran.
+        # They were written against docs/input-adapters.md section 4 and are the
+        # only check on what a user's reader is allowed to return - and they had
+        # never gated a merge, so a change that broke them would have landed
+        # green. numpy is already installed for gen_testdata.py, so this costs a
+        # step and no setup. Every OS: the harness spawns a child process and
+        # writes files, and that is exactly where platforms differ.
+        run: python tools/import/test_adapters.py
       - name: Headless render + frame-time check
         if: runner.os == 'Linux'
         run: |
