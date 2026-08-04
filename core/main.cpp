@@ -117,7 +117,13 @@ static double nowSec() {
     static const auto t0 = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+// Whole-file reads, counted so a selftest can assert that opening one file
+// reads it ONCE. loadNpy used to read a 252 MB stack 120 times and nothing
+// noticed, because "it works, slowly" looks exactly like "it works".
+static long long g_fileReads = 0;
+
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {
+    g_fileReads++;
     std::ifstream f(pathFromUtf8(utf8Path), std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize sz = f.tellg();
@@ -1023,6 +1029,9 @@ struct App {
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
+    // msgLog is capped, so its SIZE stops changing once the cap is reached and
+    // cannot be used to notice that it changed. This counter only ever goes up.
+    size_t msgSeq = 0;
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
@@ -1713,17 +1722,25 @@ static void abStatsFrame() {
     app.abSlot1Live = false;
 }
 
+// Put a line in the Messages panel WITHOUT showing a toast. Everything that
+// writes to msgLog goes through here: the cap and the de-duplication are the
+// log's rules, and three call sites that pushed straight onto the vector were
+// keeping neither.
+static void logMsg(const std::string& msg, bool err = false) {
+    if (!app.msgLog.empty() && app.msgLog.back().text == msg) return;
+    app.msgLog.push_back({ msg, err });
+    if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
+    app.msgSeq++;
+    if (err) app.msgUnreadErr = true;
+}
+
 static void toast(const std::string& msg, bool err = false) {
     app.toast = msg; app.toastErr = err;
     app.toastUntil = ImGui::GetTime() + (err ? 6.0 : 2.5);
     // A toast fades after six seconds, which is not long enough to paste it into
     // a bug report. Every message is kept here and shown, selectable, in the
     // Messages panel.
-    if (app.msgLog.empty() || app.msgLog.back().text != msg) {
-        app.msgLog.push_back({ msg, err });
-        if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
-        if (err) app.msgUnreadErr = true;
-    }
+    logMsg(msg, err);
 }
 
 // One batch per OPEN ACTION: reopening a folder deliberately makes a fresh
@@ -5177,49 +5194,28 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
     return {};
 }
 
+// A .npy FILE. The frame loop lives in loadNpyBuffer, which the .npz members
+// have used all along; this reads the bytes and hands them over.
+//
+// It used to have its own copy of that loop calling decodeNpyFrame per frame -
+// and decodeNpyFrame reads the WHOLE FILE every time it is called. A 120-frame
+// 1024x1024 u16 stack (252 MB) was therefore read 120 times, 30 GB through the
+// page cache to open one file: 12.2 s measured, against 0.35 s reading it once.
+// The duplicated loop is also how the two doors drifted apart - 452c62a taught
+// the .npz copy to say "n of N" on a partial load and this one kept claiming
+// the full count, which docs/terminology.md:93 forbids.
 static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/) {
-    std::string err;
-    int frames = 1;
-    int64_t fstride = 0;
-    auto first = decodeNpyFrame(path, err, 0, frames, fstride, npyRead);
-    if (!first) return err.empty() ? "decode failed" : err;
-    if (frames <= 1) { addImage(std::move(first)); return {}; }
-
-    App::SeqInfo info;
-    info.id = app.nextSeqId++;
-    info.name = baseName(path) + "  (" + std::to_string(frames) + " frames)";
-    app.seqs.push_back(info);
-    first->seqId = info.id;
-    first->seqIndex = 0;
-    int firstIdx = (int)app.images.size();
-    addImage(std::move(first));
-    info.lastImageIdx = firstIdx;
-    const ImageDoc* ref = app.images[firstIdx].get();
-    for (int f = 1; f < frames; f++) {
-        std::string e2;
-        int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyFrame(path, e2, f, fr, fs, npyRead);
-        if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
-        doc->seqId = info.id;
-        doc->seqIndex = f;
-        computeMinMax(*doc);
-        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
-        // ...and the batch, which addImage assigns to the HEAD frame only: these
-        // go straight into app.images, so a stack built inside one file used to
-        // have frame 0 in a batch and frames 1..N-1 in none (the folder path
-        // already does this, in pumpSequence). A stack is in ONE batch.
-        doc->batchId = ref->batchId;
-        doc->texDirty = true;
-        doc->uid = app.nextUid++;
-        app.imagesRev++;
-        app.images.push_back(std::move(doc));
-    }
-    for (auto& s : app.seqs)
-        if (s.id == info.id) s.lastImageIdx = firstIdx;
-    int got = 0;
-    for (const auto& d : app.images) if (d->seqId == info.id) got++;
-    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", baseName(path).c_str(), got,
-            ref->w, ref->h, ref->ch);
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) return "cannot read file";
+    size_t before = app.images.size();
+    std::string err = loadNpyBuffer(buf, path, "", npyRead);
+    if (!err.empty()) return err;
+    // decodeNpyFrame stamped the Watch baseline on each frame as it decoded it.
+    // decodeNpyBuffer cannot: for an .npz member the file on disk is the
+    // CONTAINER, not the array, so the buffer path deliberately leaves the
+    // source alone. Here the file on disk IS the array, so stamp it.
+    for (size_t i = before; i < app.images.size(); i++)
+        if (app.images[i]->src) statSourceFile(*app.images[i]->src);
     return {};
 }
 
@@ -6274,7 +6270,7 @@ static void savePrefs() {
         static bool said = false;
         if (!said) {
             said = true;
-            app.msgLog.push_back({ "prefs are read-only in a secondary window", false });
+            logMsg("prefs are read-only in a secondary window");
         }
         return;
     }
@@ -6550,7 +6546,7 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     // The picker shows it in front of the user for a reader they have not used
     // before; this is the durable record, so "what did it actually start?" is
     // answerable after the fact as well as before it.
-    app.msgLog.push_back({ "reader: " + adapter::showCommand(argv), false });
+    logMsg("reader: " + adapter::showCommand(argv));
     g_adapterRuns++;
     std::error_code tec;
     std::filesystem::path td = std::filesystem::temp_directory_path(tec);
@@ -11233,7 +11229,6 @@ static void openPath(const std::string& path) {
             std::string err = openWithReader(path, spec);
             if (err.empty()) return;
             toast(baseName(path) + " via " + spec + ": " + err, true);
-            app.msgLog.push_back({ baseName(path) + " via " + spec + ": " + err, true });
             return;
         }
     }
@@ -22819,9 +22814,13 @@ static void drawRemoteErrorWindow() {
 // InputTextMultiline is what makes an error message quotable.
 static void drawMessagesPanel() {
     static std::string flat;          // rebuilt only when the log changes
+    // Keyed on msgSeq, not msgLog.size(): the log is capped at 300, so past the
+    // cap the size is 300 for every subsequent message and a size-keyed cache
+    // never rebuilds again - the panel went blind exactly when messages were
+    // arriving fastest, which is when it is being read.
     static size_t builtFrom = (size_t)-1;
-    if (builtFrom != app.msgLog.size()) {
-        builtFrom = app.msgLog.size();
+    if (builtFrom != app.msgSeq) {
+        builtFrom = app.msgSeq;
         flat.clear();
         for (const auto& m : app.msgLog) {
             flat += m.err ? "[error] " : "        ";
@@ -22831,7 +22830,7 @@ static void drawMessagesPanel() {
     }
     if (ImGui::Button("copy all")) { ImGui::SetClipboardText(flat.c_str()); toast("copied"); }
     ImGui::SameLine();
-    if (ImGui::Button("clear")) { app.msgLog.clear(); builtFrom = (size_t)-1; }
+    if (ImGui::Button("clear")) { app.msgLog.clear(); app.msgSeq++; }
     ImGui::SameLine();
     ImGui::TextDisabled("select any part and press %s+C", SC_MOD);
     ImGui::InputTextMultiline("##msgs", flat.data(), flat.size() + 1,
@@ -29471,6 +29470,38 @@ int main(int argc, char** argv) {
                 check(restored, "V22e reopening reads it the way it was declared");
             }
 
+            // ---- V22f: opening one .npy file reads it ONCE -------------------
+            // loadNpy used to own a copy of loadNpyBuffer's frame loop calling
+            // decodeNpyFrame, and decodeNpyFrame reads the whole file EVERY time.
+            // Opening a 12-frame file read it 12 times; at 120 frames and 252 MB
+            // that was 12.2 s of pure re-reading. Nothing caught it because the
+            // pictures were right - it was only slow, and slow has no assertion
+            // unless someone writes one.
+            {
+                std::string mpath = npyOf("reads_once.npy", { 12, 8, 8 });
+                closeAll();
+                long long r0 = g_fileReads;
+                std::string merr = loadNpy(mpath);
+                long long reads = g_fileReads - r0;
+                int got = (int)app.images.size();
+                fprintf(stderr, "verifyselftest: V22f (12,8,8): err=\"%s\" %d frame(s),"
+                                " %lld whole-file read(s)\n", merr.c_str(), got, reads);
+                check(merr.empty() && got == 12, "V22f the 12-frame file opens as 12 frames");
+                check(reads == 1, "V22f ...having been read from disk exactly once");
+
+                // The Watch baseline is what decodeNpyFrame used to stamp per
+                // frame. The buffer path cannot stamp it (for an .npz member the
+                // file is the container), so the file path has to, and every
+                // frame needs it - not just the one that opened the stack.
+                int stamped = 0, total = 0;
+                for (const auto& d : app.images)
+                    if (d->src) { total++; if (d->src->fsize > 0) stamped++; }
+                fprintf(stderr, "verifyselftest: V22f Watch baseline on %d of %d frame(s)\n",
+                        stamped, total);
+                check(total == 12 && stamped == total,
+                      "V22f every frame of the stack carries the Watch baseline");
+            }
+
             std::filesystem::remove_all(vdir, vec);
             closeAll();
         }
@@ -29926,6 +29957,49 @@ int main(int argc, char** argv) {
 
             std::filesystem::remove_all(adir, aec);
             closeAll();
+        }
+
+        // ---- V26: the Messages panel past its own cap -------------------------
+        // msgLog holds 300 and then drops from the front, so its SIZE is 300 for
+        // message 300 and for message 3000 alike. The panel used to key its
+        // rebuilt text on that size, so it stopped updating at the cap - it went
+        // blind precisely when messages were arriving fastest. The probe walks
+        // past the cap and asks whether the newest line is actually reachable.
+        {
+            std::vector<App::Msg> logSnapshot = app.msgLog;
+            size_t seqSnapshot = app.msgSeq;
+            app.msgLog.clear();
+
+            size_t seqAt300 = 0;
+            for (int i = 0; i < 400; i++) {
+                logMsg("probe message " + std::to_string(i));
+                if (i == 299) seqAt300 = app.msgSeq;
+            }
+            check(app.msgLog.size() == 300, "V26 the log is capped at 300");
+            check(app.msgSeq > seqAt300,
+                  "V26 the change counter keeps moving after the cap (size does not)");
+            check(app.msgLog.back().text == "probe message 399",
+                  "V26 the newest message is the one at the back");
+            check(app.msgLog.front().text == "probe message 100",
+                  "V26 the oldest 100 were dropped from the front, in order");
+
+            // The panel's own cache key, exercised the way the panel uses it.
+            size_t builtFrom = app.msgSeq;
+            logMsg("one more");
+            check(builtFrom != app.msgSeq,
+                  "V26 one more message invalidates the panel's cache");
+
+            // Consecutive duplicates collapse; a repeat after something else does not.
+            size_t beforeDup = app.msgSeq;
+            logMsg("one more");
+            check(beforeDup == app.msgSeq, "V26 an immediate repeat is not logged twice");
+            logMsg("something else");
+            logMsg("one more");
+            check(app.msgLog.back().text == "one more" && app.msgSeq > beforeDup,
+                  "V26 the same text after another message is logged again");
+
+            app.msgLog = logSnapshot;
+            app.msgSeq = seqSnapshot + 1;       // the panel must rebuild after all that
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
