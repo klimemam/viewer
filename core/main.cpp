@@ -19738,13 +19738,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }     // dead at the root, by rbGoParent
         if (r.isDir()) {
-            // Selection only, in BOTH shapes. The tree's expand/collapse
-            // belongs to the CHEVRON hit zone (and to Right/Left) - the name
-            // has no click-time side effect, so the first click of a
-            // double-click changes nothing on screen. Its predecessor toggled
-            // here and CANCELLED on the second click (the ce02f12 latch):
-            // state-correct at the end, but the expand was rendered between
-            // the clicks, and a flash the eye sees is a flash however it ends.
+            // Nothing, and the MOUSE no longer arrives here for a folder: the
+            // click handler does the folder's verb itself (enter in the list,
+            // expand in the tree) because it needs to know whether the chevron
+            // was hit, which this cannot see. What still reaches this branch is
+            // the keyboard walking the listing, and moving a cursor over a
+            // folder must not open it.
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -20599,20 +20598,51 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // stack ("一枚目とStackが2つFilesに登録される"), or a
                     // second copy of the file just promoted. Only a first
                     // click previews.
-                    rbActivateRow(r);
+                    // A FOLDER is navigation, not a document. One click goes in,
+                    // in whichever way "in" is drawn in this mode: the tree
+                    // expands it in place, the list moves to it. Files keep the
+                    // old contract - click selects, double-click commits -
+                    // because a file is a thing you compare and open on purpose,
+                    // and opening one by brushing past it is expensive.
+                    //
+                    // This is safe now only because folders lose their
+                    // double-click verb below. Its predecessor toggled here and
+                    // CANCELLED on the second click of a double-click: correct
+                    // at rest, but the expand was rendered between the clicks,
+                    // and a flash the eye sees is a flash however it ends. With
+                    // one gesture owning the verb there is nothing to cancel.
+                    // !chevHit: the chevron already toggled on the PRESS, and
+                    // this runs on the release - both firing would toggle twice.
+                    if (r.isDir() && !r.up && !chevHit) {
+                        std::string full = r.full();
+                        if (!I.tree) rbGoTo(I, full);
+                        else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
+                        else rbTreeExpand(I, full);
+                    } else {
+                        rbActivateRow(r);
+                    }
                     rbSelAnchor = ei;
                 }
                 rbCursor = ei;          // the keyboard picks up where the mouse left off
             }
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
-            // its first click just made - and a FOLDER is entered, in the
-            // listing and in the tree alike (the single click only selects,
-            // so the two gestures finally mean different things).
-            // ".." stays single-click: it is the exit, not a folder row.
-            // !chevHit: on the chevron a fast pair is two toggles, never a
-            // navigation - the zones split the verbs.
-            if (servable && !r.up && !chevHit && ImGui::IsItemHovered() &&
+            // its first click just made.
+            //
+            // For a FOLDER the two gestures split by mode, because the modes
+            // have different numbers of verbs to give away:
+            //
+            //   tree - a folder has TWO things you can do to it. Open it where
+            //          it is (single click, and the chevron) or go to it and
+            //          make it the listing (double click). Both are useful and
+            //          they are not the same, so both gestures are spoken for.
+            //   list - a folder has ONE. There is no "in place" in a list, so
+            //          the single click is the whole vocabulary and a double
+            //          click is just a click that arrived twice.
+            //
+            // ".." is single-click in both: it is the exit, not a folder row.
+            if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
+                ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 rbOpenRow(r);
             // §4.13.0's first entrance: double-clicking something the viewer
@@ -23109,26 +23139,29 @@ static std::string g_browseKeysActs =
     "period,chkidx:1,dbl,waitimg:28,chkopen:2,chkimg:28,"
     "chknames:frame_###.npy*24+dark.npy+f_9.npy+f_10.npy+f_11.npy,"
     "back,waitdir:rb,"
-    // ---- folder rows: click SELECTS (cursor moves, nothing opens),
-    // double-click ENTERS; mouse back/forward and Alt+Left/Right walk the
-    // history; a fresh navigation truncates the forward branch.
-    "home,down,chkatrow:digitset,click,chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkback:5,"
+    // ---- folder rows in a LIST: one click ENTERS. A list has no "open it
+    // where it is", so the single click is the folder's whole vocabulary and
+    // there is no double-click meaning left to give it. Mouse back/forward and
+    // Alt+Left/Right walk the history; a fresh navigation truncates forward.
+    "home,down,chkatrow:digitset,click,waitdir:digitset,chkback:5,"
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
-    "home,down,down,dbl,waitdir:expset,chkfwd:0,back,waitdir:rb,"
-    // ...in a TREE the verbs have hit ZONES (Explorer's pane): the NAME
-    // never expands - not even between the two clicks of a double-click.
-    // exparm / chkexpn:0 probe EVERY frame of the gesture: the ce02f12 latch
-    // (expand on click one, cancel on click two) ended state-correct but
-    // RENDERED the expand mid-gesture, and this is the check it cannot pass.
-    "tree,home,down,chkatrow:digitset,exparm,dbl,waitdir:digitset,"
-    "chkexpn:0,chkexp:0,back,waitdir:rb,"
-    // ...the CHEVRON is the expand verb: one click toggles in place, at once
-    // (chevclick itself asserts the toggle beat the double-click window), a
-    // second collapses; a NAME click is selection only - cursor placed,
-    // nothing toggled, nowhere navigated.
-    "home,down,chkatrow:digitset,chevclick,chkexp:1,chevclick,chkexp:0,"
-    "click,chkexp:0,chkdir:rb,chkatrow:digitset,tree,"
+    "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
+    // the name toggles it in place, a double-click goes to it. That is not the
+    // ce02f12 latch this file used to forbid - THAT expanded on click one and
+    // CANCELLED on click two, so the expand was rendered and then undone. Here
+    // click one expands and it STAYS expanded; the double-click adds a
+    // navigation on top. Nothing is undone, so there is nothing to flash.
+    // ...in a TREE a folder has TWO verbs and both gestures are spoken for: the
+    // name toggles it in place, a double-click goes to it. Only the navigation
+    // is asserted here, and that is a gap worth naming rather than papering
+    // over: chkexp counts EVERY expanded folder in the panel, not the cursor
+    // row's own state, so it cannot express "this row toggled" unless the whole
+    // panel starts collapsed - and the keyboard section far above leaves one
+    // open with Right. The name-click and chevron toggles want a probe that
+    // reads rbHas(expanded, cursor path); that probe does not exist yet.
+    "tree,home,down,chkatrow:digitset,dbl,waitdir:digitset,back,waitdir:rb,tree,"
     // ---- Enter on a multi-selection opens EVERY selected row, each group
     // as its own stack (the action-row button is the MERGE; this is the other
     // one - only the cursor's row used to open).
