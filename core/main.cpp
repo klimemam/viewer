@@ -2804,7 +2804,15 @@ static void mWorker() {
         {
             std::unique_lock<std::mutex> lk(app.mMtx);
             app.mCv.wait(lk, []{ return app.mStop || !app.mQueue.empty(); });
-            if (app.mStop && app.mQueue.empty()) break;
+            // Stop wins over pending work - the third time this exact line has
+            // arrived, after rbWorker and rfWorker (3a5f724). The loop it
+            // replaces checked the flag BEFORE dequeuing, so a stop abandoned
+            // the queue; asking for the queue to be empty as well lets a worker
+            // that was notified with a job and stopped before it could reacquire
+            // the mutex run one more measurement inside stopMeasureWorker's
+            // join(), with the UI thread waiting on it. The predicate already
+            // guarantees the queue is non-empty whenever the flag is false.
+            if (app.mStop) break;
             job = std::move(app.mQueue.front());
             app.mQueue.erase(app.mQueue.begin());
         }
