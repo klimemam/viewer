@@ -338,6 +338,8 @@ def layout_field():
     vi.Frame(np.zeros((3, 8, 9)), layout="CHW")
     vi.Stack(np.zeros((4, 3, 8, 9)), layout="FCHW")
     fails(lambda: vi.Frame(np.zeros((3, 8, 9)), layout="HWC"), 'Frame: layout "HWC"')
+    fails(lambda: vi.Frame(np.zeros((8, 9)), layout="CHW"), 'Frame: layout "CHW" needs a 3-D array')
+    fails(lambda: vi.Stack(np.zeros((3, 8, 9)), layout="FCHW"), 'Stack: layout "FCHW" needs a 4-D array')
 
 
 @case
