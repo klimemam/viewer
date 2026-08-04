@@ -18663,18 +18663,56 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
     return s;
 }
 
+// The "PRNU [sigma %]" column: this row's own sd over this row's own mean.
+// DERIVED, not measured, and deliberately not a field of RoiStat - it is the
+// two numbers the row already prints, divided, so it cannot drift from them
+// (which also settles the decimated case for free: the sample the sd describes
+// is the sample the ratio describes) and it cannot be pooled by averaging the
+// planes' values, because the pooled row divides the POOLED sd by the POOLED
+// mean and that is a different quantity.
+// mean <= 0 has no answer: a ratio to a level needs a level, and zero is not
+// one. So the column prints "-" rather than a nan or an inf - these numbers get
+// pasted into reports, and a blank that means "not stated" is recoverable where
+// an inf that means "we divided by zero" is not. It is also the same guard
+// plugins/analyzer_prnu.c already applies before it divides.
+static bool roiPrnuPct(const RoiStat& s, double* out) {
+    if (!s.valid || !(s.mean > 0)) return false;
+    double v = s.sd / s.mean * 100.0;
+    if (!std::isfinite(v)) return false;         // sd finite, mean denormal
+    *out = v;
+    return true;
+}
+
 // What the table cannot show in six characters. Full precision lives here; the
 // columns format at the edge. n both directions: past ~200k samples the sampler
 // reads whole rows at a stride, and n = 1 (a 1x1 ROI) makes sd exactly 0 - the
 // single most confusing number this panel can print, so it says why.
-static void roiStatTooltip(const RoiStat& s) {
+// PRNU gets the longest note in this panel because its NAME claims more than
+// one frame can deliver: what is on screen is the spatial spread of one region
+// as displayed, so the tooltip has to hand back the conditions the name implies
+// and this layer does not have (docs/flat-field-stats.md).
+// planesMixed: channel = "all" on a multi-plane frame pools planes into one
+// population, so the plane LEVELS are inside that sd - the ratio then measures
+// the mosaic more than the sensor, and it must say so where it is read.
+static void roiStatTooltip(const RoiStat& s, bool planesMixed) {
     if (!s.valid || !ImGui::IsItemHovered()) return;
     ImGui::BeginTooltip();
     ImGui::Text("mean %.10g    sd %.10g   [DN]", s.mean, s.sd);
     ImGui::Text("min  %.10g    max %.10g   [DN]", s.mn, s.mx);
+    double pr = 0;
+    if (roiPrnuPct(s, &pr)) ImGui::Text("PRNU %.10g   [σ %%]  = sd / mean * 100", pr);
+    else ImGui::TextDisabled("PRNU: mean is not above 0, so sd / mean states nothing");
+    ImGui::TextDisabled("PRNU here is THIS ROI's sd over its own mean, as displayed:\n"
+                        "one frame, no dark subtraction, no flat-field correction.\n"
+                        "Temporal noise is inside it, so it bounds the fixed pattern\n"
+                        "from above and is not a measurement of it. A PRNU that means\n"
+                        "what EMVA means needs a layer above the frame - a flat stack\n"
+                        "and a dark stack (docs/flat-field-stats.md).");
+    if (planesMixed)
+        ImGui::TextDisabled("channel = all: the planes' level differences are in this sd.");
     if (s.step > 1) ImGui::Text("n = %zu (sampled 1 row in %zu)", s.n, s.step);
     else            ImGui::Text("n = %zu (every row)", s.n);
-    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition");
+    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition, so PRNU is 0");
     ImGui::EndTooltip();
 }
 
@@ -18716,7 +18754,9 @@ static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh,
 // through the cache, inside the clipper, with the button under a span-all-columns
 // Selectable - had no coverage; asserts that call the stats function directly
 // cannot see any of it. id 0 = the "All (whole image)" row (no delete button).
-struct RoiRowProbe { int id; RoiStat s; ImVec2 del, lbl; };
+// prnu/prnuOk are what the PRNU cell PRINTED, taken at the cell: asserting on
+// roiPrnuPct() from the test would only re-run the test's own arithmetic.
+struct RoiRowProbe { int id; RoiStat s; ImVec2 del, lbl; double prnu; bool prnuOk; };
 static std::vector<RoiRowProbe> g_roiRowProbe;
 static bool g_roiRowProbeOn = false;
 
@@ -18757,7 +18797,10 @@ static void drawPanelRois() {
     // fill the window instead of a fixed 9-text-line box: rows are frame-height,
     // so the old constant showed 4 ROIs no matter how large the window was
     const float editH = ImGui::GetFrameHeight() * 2 + ImGui::GetStyle().ItemSpacing.y;
-    if (ImGui::BeginTable("roitable", 8, TF,
+    // channel = "all" over more than one plane pools them: the plane levels are
+    // then part of every sd this table prints, and the tooltip has to say so.
+    const bool planesMixed = app.roiChannel < 0 && (cfa || im->ch > 1);
+    if (ImGui::BeginTable("roitable", 9, TF,
                           ImVec2(0, -(editH + ImGui::GetStyle().ItemSpacing.y * 2 + 1.0f)))) {
         // stretch weights, not fixed widths: four fixed numeric columns would eat
         // the whole table and collapse name/region to a few pixels
@@ -18767,6 +18810,12 @@ static void drawPanelRois() {
         ImGui::TableSetupColumn("region", ImGuiTableColumnFlags_WidthStretch, 1.7f);
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        // Next to the two numbers it is made of, and wider than them: the unit
+        // is part of the name, the way the Analysis grid carries a unit column
+        // rather than leaving a reader to guess what a figure is measured in -
+        // and a header clipped to "PRNU [..." would be the one column nobody
+        // could identify from a screenshot.
+        ImGui::TableSetupColumn("PRNU [σ %]", ImGuiTableColumnFlags_WidthStretch, 1.5f);
         ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
@@ -18777,20 +18826,24 @@ static void drawPanelRois() {
         // measurement target is always explicit
         {
             RoiStat s = roiBasicStats(*im, 0, 0, im->w, im->h, app.roiChannel);
+            double pr = 0;
+            const bool prOk = roiPrnuPct(s, &pr);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TableNextColumn();
             if (ImGui::Selectable("All (whole image)", app.selectedAnn <= 0,
                                   ImGuiSelectableFlags_SpanAllColumns))
                 app.selectedAnn = 0;
-            roiStatTooltip(s);
+            roiStatTooltip(s, planesMixed);
             ImGui::TableNextColumn(); ImGui::Text("%dx%d", im->w, im->h);
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); prOk ? ImGui::Text("%.6g", pr) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
-            if (g_roiRowProbeOn) g_roiRowProbe.push_back({ 0, s, ImVec2(-1, -1), ImVec2(-1, -1) });
+            if (g_roiRowProbeOn)
+                g_roiRowProbe.push_back({ 0, s, ImVec2(-1, -1), ImVec2(-1, -1), pr, prOk });
         }
         int removeId = -1;
         // Only the rows you can see. Submitting all of them cost 1.35 ms/frame at
@@ -18806,6 +18859,8 @@ static void drawPanelRois() {
             // tooltip that says what n these numbers rest on
             RoiStat s{ 0, 0, 0, 0, 0, 0, false };
             if (a.type == 0) s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
+            double pr = 0;
+            const bool prOk = roiPrnuPct(s, &pr);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
@@ -18823,7 +18878,7 @@ static void drawPanelRois() {
             ImVec2 lblC((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
                         (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
             ImGui::PopStyleColor();
-            roiStatTooltip(s);
+            roiStatTooltip(s, planesMixed);
             ImGui::TableNextColumn();
             if (a.type == 0) ImGui::Text("%dx%d @%d,%d", a.w, a.h, a.x, a.y);
             else if (im->cfa && a.x < im->w && a.y < im->h)
@@ -18832,14 +18887,18 @@ static void drawPanelRois() {
             if (a.type == 0) {                          // ROI: area statistics
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); prOk ? ImGui::Text("%.6g", pr) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             } else {                                     // POI: the pixel value itself
+                // one pixel has no spread, so std, PRNU, min and max are all
+                // "-" here: a POI row is a VALUE, not a population
                 bool inside = a.x >= 0 && a.y >= 0 && a.x < im->w && a.y < im->h;
                 int c0 = app.roiChannel < 0 ? 0 : std::min(app.roiChannel, im->ch - 1);
                 ImGui::TableNextColumn();
                 if (inside) ImGui::TextUnformatted(fmtVal(im->sample(a.x, a.y, c0), im->dtype).c_str());
                 else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
@@ -18850,7 +18909,7 @@ static void drawPanelRois() {
                 g_roiRowProbe.push_back({ a.id, s,
                     ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
                            (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f),
-                    lblC });
+                    lblC, pr, prOk });
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -29159,9 +29218,10 @@ int main(int argc, char** argv) {
             auto dump = [&](const char* what) {
                 for (const auto& r : g_roiRowProbe)
                     fprintf(stderr, "verifyselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
-                                    "min=%.10g max=%.10g n=%zu valid=%d del=%.0f,%.0f\n",
+                                    "min=%.10g max=%.10g prnu=%.10g(ok=%d) n=%zu valid=%d "
+                                    "del=%.0f,%.0f\n",
                             what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
-                            r.s.n, (int)r.s.valid, r.del.x, r.del.y);
+                            r.prnu, (int)r.prnuOk, r.s.n, (int)r.s.valid, r.del.x, r.del.y);
             };
             auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
 
@@ -29188,12 +29248,19 @@ int main(int argc, char** argv) {
                       "V19 All row min/max are the true extremes");
                 check(ra->s.n > 0 && ra->s.n < (size_t)1024 * 1024,
                       "V19 All row decimates and can say n");
+                // PRNU is those two numbers divided, so it is pinned to them
+                // rather than to a second scan: on a decimated row that is the
+                // whole point - the ratio describes the sample the sd describes
+                check(ra->prnuOk && nearEq(ra->prnu, sqrt(250004.0) / 30500.0 * 100.0),
+                      "V19 All row PRNU is the sd and mean it printed, divided");
             }
             if (rr) {
                 check(nearEq(rr->s.mean, 30000.0), "V19 ROI row mean is the true mean");
                 check(nearEq(rr->s.sd, 2.0), "V19 ROI row sd is the true sigma");
                 check(nearEq(rr->s.mn, 29998.0) && nearEq(rr->s.mx, 30002.0),
                       "V19 ROI row min/max are the true extremes");
+                check(rr->prnuOk && nearEq(rr->prnu, 2.0 / 30000.0 * 100.0),
+                      "V19 ROI row PRNU is sd / mean x 100");
             }
             // ...and the cached panel path must FOLLOW the ROI when it moves
             findAnn(roiId)->x = 600;                 // wholly in the right half
@@ -29203,6 +29270,10 @@ int main(int argc, char** argv) {
             rr = row(roiId);
             check(rr && nearEq(rr->s.mean, 31000.0) && nearEq(rr->s.sd, 2.0),
                   "V19 moving the ROI updates the printed numbers");
+            // the same sd over a higher mean is a SMALLER percentage: a PRNU
+            // that stayed at the old row's value would still look plausible
+            check(rr && rr->prnuOk && nearEq(rr->prnu, 2.0 / 31000.0 * 100.0),
+                  "V19 PRNU moves with the ROI, not with the cache");
 
             // sigma at the noise floor, on a large pedestal: the regime this
             // panel exists for. sum2/n - mean^2 cancels ~10 of double's 16
@@ -29233,12 +29304,15 @@ int main(int argc, char** argv) {
             addAnn(0, 0, 0, 512, 512);
             const int cfaRoi = app.anns.back().id;
             static const double PLV[4] = { 1000, 2000, 3000, 4000 };
-            bool chOk = true, chSd = true;
+            bool chOk = true, chSd = true, chPr = true;
+            double pooledPr = -1, planeSumPr = 0;
             app.roiChannel = -1;
             settle();
             dump("cfa all");
-            if (const RoiRowProbe* r0 = row(cfaRoi))
+            if (const RoiRowProbe* r0 = row(cfaRoi)) {
                 chOk = chOk && nearEq(r0->s.mean, 2500.0) && nearEq(r0->s.sd, sqrt(1250009.0));
+                if (r0->prnuOk) pooledPr = r0->prnu;
+            }
             for (int c = 0; c < 4; c++) {
                 app.roiChannel = c;
                 settle();
@@ -29246,9 +29320,25 @@ int main(int argc, char** argv) {
                 const RoiRowProbe* rc = row(cfaRoi);
                 if (!rc || !rc->s.valid || !nearEq(rc->s.mean, PLV[c])) chOk = false;
                 if (!rc || !nearEq(rc->s.sd, 3.0)) chSd = false;
+                // each plane divides by ITS OWN level, so the same 3 DN of
+                // dither is 0.3% on R and 0.075% on B
+                if (!rc || !rc->prnuOk || !nearEq(rc->prnu, 3.0 / PLV[c] * 100.0)) chPr = false;
+                if (rc && rc->prnuOk) planeSumPr += rc->prnu;
             }
             check(chOk, "V19 channel switch repoints the panel's numbers");
             check(chSd, "V19 per-plane sd is the plane's own sigma");
+            check(chPr, "V19 per-plane PRNU divides by that plane's own mean");
+            // The pooled row is a different measurement, not a summary of the
+            // four: its sd carries the level differences BETWEEN the planes, so
+            // its PRNU (~44.7%) is two orders above the planes' (~0.16% mean).
+            // Anyone tempted to average the plane column would land on the
+            // second number and it would look like the answer.
+            fprintf(stderr, "verifyselftest: V19 pooled PRNU %.10g %%, planes averaged "
+                            "%.10g %%\n", pooledPr, planeSumPr / 4.0);
+            check(nearEq(pooledPr, sqrt(1250009.0) / 2500.0 * 100.0),
+                  "V19 the pooled row's PRNU is pooled sd over pooled mean");
+            check(pooledPr > planeSumPr / 4.0 * 100.0,
+                  "V19 the pooled PRNU is not the planes' PRNUs averaged");
             app.roiChannel = -1;
 
             // ---- the delete button ------------------------------------------
@@ -29268,6 +29358,10 @@ int main(int argc, char** argv) {
                 check(r1->s.valid && r1->s.n == 1, "V19 a 1x1 ROI measures exactly one pixel");
                 check(r1->s.sd == 0.0 && r1->s.mn == r1->s.mx,
                       "V19 n=1 gives sd 0 - the panel's n is what explains it");
+                // no second convention for n=1: PRNU follows sd, which is 0, so
+                // the column reads 0 and the same n line explains both
+                check(r1->prnuOk && r1->prnu == 0.0,
+                      "V19 n=1 gives PRNU 0 for the same reason sd is 0");
                 check(r1->s.step >= 1, "V19 the stat carries the stride it sampled at");
             }
             // ...and a decimated ROI must report the stride that produced its n
@@ -29319,6 +29413,36 @@ int main(int argc, char** argv) {
                                 "anns %zu -> %zu\n", at.x, at.y, before, app.anns.size());
                 check(app.anns.size() == before - 1, "V19 the x button deletes its ROI");
             }
+
+            // ---- mean == 0 --------------------------------------------------
+            // sd/mean has no value there, and this table's numbers are pasted
+            // into reports: a nan or an inf in a pasted cell is worse than a
+            // blank, because it travels as if it were a measurement. The row
+            // still has a real mean and a real sd - only the ratio is withheld -
+            // so the test pins the sd too, or "-" could mean the row died.
+            // A bipolar frame is the everyday way here (a difference image).
+            closeAll();
+            {
+                auto z = mkMono(256, 256, 0.0, 2.0, 0.0);
+                z->src->dtype = "f32";          // values below zero are not a u16
+                z->syncMirrors();
+                app.images.push_back(std::move(z));
+            }
+            app.current = 0;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 256, 256);
+            const int zeroRoi = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            dump("mean 0");
+            if (const RoiRowProbe* rz = row(zeroRoi)) {
+                check(rz->s.valid && rz->s.mean == 0.0 && nearEq(rz->s.sd, 2.0),
+                      "V19 a bipolar ROI measures mean 0 with a real sd");
+                check(!rz->prnuOk, "V19 mean 0 prints no PRNU - not a nan, not an inf");
+            }
+            if (const RoiRowProbe* rz0 = row(0))
+                check(!rz0->prnuOk, "V19 the All row withholds PRNU at mean 0 too");
+
             g_roiRowProbeOn = false;
             held = -1;
             pio.AddMouseButtonEvent(0, false);
