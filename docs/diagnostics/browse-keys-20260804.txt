@@ -1,0 +1,31 @@
+browse-keys intermittent failure, captured 2026-08-04.
+Run: tools/run_selftests.sh build-mingw, tree = PR #37 on top of 71714b1.
+NOT attributed to #37: the same failure was seen three times on main earlier
+the same day (1/4, 1/8 and 1/2 runs), and 10/10 pass when run alone.
+
+The action list is at core/main.cpp:23066. The failing step opens TWO
+multi-selected remote stacks and waits for 44 images; 36 arrive.
+seqs=3, not 4 - the second stack produced no sequence at all, rather than
+a partial one, so this is the OPEN not finishing, not frames going missing.
+
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=61/370: ok
+browsekeys: 129 down   dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=61/370: ok
+browsekeys: 130 chkatrow:digitset dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chkatrow:digitset  -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy  cursor row=digitset: ok
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=61/370: ok
+browsekeys: 131 chevclick dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chevclick          -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy  expanded 0 -> 1 by two frames after the press: ok
+browsekeys: 132 chkexp:1 dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chkexp:1           -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy: ok
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=71/370: ok
+browsekeys: 133 chevclick dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chevclick          -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy  expanded 1 -> 0 by two frames after the press: ok
+browsekeys: 134 chkexp:0 dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chkexp:0           -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy: ok
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=61/370: ok
+browsekeys: 135 click  dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: 136 chkexp:0 dir=tools/testdata/rb rows=9 imgs=28 preview=-
+browsekeys: chkexp:0           -> imgs=28 seqs=2 pv=0 scrub=0 idx=0 cur=f_9.npy: ok
+browsekeys: panel w=400 content=[23,393] filter=[88,343] menu_r=393 date=0/0 status=61/370: ok
+browsekeys: 137 chkdir:rb dir=tools/testdata/rb rows=9 imgs=28 preview=-
