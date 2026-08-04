@@ -41,6 +41,29 @@ np.save(out / "chw_f32.npy", (rgb.transpose(2, 0, 1) / 255.0).astype(np.float32)
 # big-endian f4 — tests byteswap
 np.save(out / "zone_be_f32.npy", zone.astype(">f4"))
 
+# shapes/ — one file per form the §3.1 rule has to decide, so the rule is
+# testable at all.  The folder existed by hand and was therefore invisible to
+# CI (tools/testdata/ is gitignored and only this script fills it).
+#
+# hw1_ and hw2_ are the two shapes issue #71 is about: the last axis is 1 or 2,
+# where core/main.cpp (== 3 || == 4) and core/serve.cpp (<= 4) disagree today.
+# They are FIXTURES ONLY - nothing asserts on them yet, deliberately: asserting
+# would pick the side the issue exists to decide.  A mono capture saved as
+# img[:, :, None] is an ordinary thing for numpy code to produce.
+shp = out / "shapes"
+shp.mkdir(exist_ok=True)
+sh_h, sh_w = 64, 80
+sbase = (yy[:sh_h, :sh_w] * sh_w + xx[:sh_h, :sh_w]).astype(np.float32)
+np.save(shp / "hw_64x80.npy",        sbase)                              # (H,W)
+np.save(shp / "hw1_64x80x1.npy",     sbase[:, :, None])                  # (H,W,1)  <- #71
+np.save(shp / "hw2_64x80x2.npy",     np.stack([sbase, sbase / 2], -1))   # (H,W,2)  <- #71
+np.save(shp / "hwc_64x80x3.npy",     np.stack([sbase] * 3, -1))          # (H,W,3)
+np.save(shp / "chw_3x64x80.npy",     np.stack([sbase] * 3, 0))           # (C,H,W) = 3 frames
+np.save(shp / "fhw_24x64x80.npy",    np.stack([sbase + k for k in range(24)], 0))
+np.save(shp / "fhw1_12x64x80x1.npy", np.stack([sbase + k for k in range(12)], 0)[..., None])
+np.save(shp / "fhwc_8x64x80x3.npy",
+        np.stack([np.stack([sbase + k] * 3, -1) for k in range(8)], 0))
+
 # raw gray16 with size in filename
 (out / f"noise_{W}x{H}_gray16.raw").write_bytes(
     (np.random.default_rng(0).integers(0, 65536, (H, W)).astype("<u2")).tobytes())
