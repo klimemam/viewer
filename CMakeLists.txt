@@ -247,6 +247,20 @@ else()
   target_compile_options(test_prnu PRIVATE -Wall -Wextra)
 endif()
 
+# The second, and it is built the same way for the same reason: fill_lut is
+# static inside display_falsecolor.c, and the only way to reach it through the
+# viewer is to register the plugin and drive a display. #including the source
+# also keeps this off the shared-library name entirely - an earlier draft
+# dlopen'd "plugins/display_falsecolor.so" by that literal name and was red on
+# Windows, where the file is a .dll.
+add_executable(test_display_falsecolor plugins/test/test_display_falsecolor.c)
+target_link_libraries(test_display_falsecolor PRIVATE ps_api)
+if(MSVC)
+  target_compile_options(test_display_falsecolor PRIVATE /W3)
+else()
+  target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra)
+endif()
+
 # ---- selftests as ctest tests ---------------------------------------------
 # The binary carries 23 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
@@ -355,6 +369,13 @@ set_tests_properties(glprobe PROPERTIES
 # list, which is the one thing that script promises cannot happen.
 add_test(NAME test_prnu COMMAND test_prnu)
 set_tests_properties(test_prnu PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
+
+# Same hand registration, same two labels, and for the same reason - this one
+# was written with `selftest` alone and would have repeated the bug above
+# exactly, on the other branch: it would have run everywhere a GL context
+# exists and nowhere else, silently, in neither list.
+add_test(NAME test_display_falsecolor COMMAND test_display_falsecolor)
+set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
 # through --no-window against this build, and the 17 below came back with output
