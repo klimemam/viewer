@@ -230,10 +230,21 @@ viewer_add_plugin(analyzer_sharpness  plugins/analyzer_sharpness.c)
 viewer_add_plugin(analyzer_esfr       plugins/analyzer_esfr.c)
 viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 
+# The first test binary that is not `viewer` itself. boxblur2d is static inside
+# analyzer_prnu.c and is pure arithmetic over a float buffer; reaching it through
+# the viewer would mean driving a whole PRNU analysis to assert on a low-pass
+# plane, so it gets a direct C unit test that #includes the plugin source.
 add_executable(test_prnu plugins/test/test_prnu.c)
-target_include_directories(test_prnu PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_prnu PRIVATE ps_api)
 if(UNIX AND NOT APPLE)
   target_link_libraries(test_prnu PRIVATE m)
+endif()
+# Held to the same standard as every plugin (viewer_add_plugin does this; a bare
+# add_executable inherits none of it). It is clean today; this keeps it so.
+if(MSVC)
+  target_compile_options(test_prnu PRIVATE /W3)
+else()
+  target_compile_options(test_prnu PRIVATE -Wall -Wextra)
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
@@ -335,8 +346,15 @@ set_tests_properties(glprobe PROPERTIES
   LABELS glprobe
   TIMEOUT 300)
 
+# Not a --*-selftest flag on the viewer binary, so it is registered by hand -
+# but it carries BOTH labels on purpose. run_selftests.sh picks its run set by
+# label: `selftest` when the machine has a GL context, `nogl` when it does not.
+# With `nogl` alone this test never ran on Linux CI (xvfb gives it a context, so
+# CI takes the `selftest` branch) and never ran on any developer box with a
+# working GL driver - and it appeared in neither the ran list nor the skipped
+# list, which is the one thing that script promises cannot happen.
 add_test(NAME test_prnu COMMAND test_prnu)
-set_tests_properties(test_prnu PROPERTIES LABELS nogl)
+set_tests_properties(test_prnu PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
 # through --no-window against this build, and the 17 below came back with output

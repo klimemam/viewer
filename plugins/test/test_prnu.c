@@ -87,10 +87,37 @@ static void test_boxblur2d_edge_clamp() {
     free(tmp);
 }
 
+/*
+ * The mirror of the case above, and it is not decoration: with only the (0,0)
+ * corner asserted, dropping the HIGH clamp (xx >= w -> w-1, yy >= h -> h-1)
+ * survives, because in a field that is zero everywhere else, wrapping to
+ * column 0 reads the same zero that clamping to column 9 reads. Both mutants
+ * die here.
+ */
+static void test_boxblur2d_edge_clamp_high() {
+    int w = 10, h = 10;
+    float *src = calloc((size_t)w * h, sizeof(float));
+    float *dst = calloc((size_t)w * h, sizeof(float));
+    float *tmp = calloc((size_t)w * h, sizeof(float));
+
+    src[(h - 1) * w + (w - 1)] = 81.0f;
+
+    boxblur2d(src, dst, tmp, w, h);
+
+    /* xx clamps down to w-1 five times -> 5*81/9 = 45, then yy to h-1 five
+     * times -> 5*45/9 = 25. The same 25 as the near corner, by symmetry. */
+    ASSERT_FLOAT_EQ(25.0f, dst[(h - 1) * w + (w - 1)], "edge clamp far corner");
+
+    free(src);
+    free(dst);
+    free(tmp);
+}
+
 int main() {
     test_boxblur2d_uniform();
     test_boxblur2d_impulse();
     test_boxblur2d_edge_clamp();
+    test_boxblur2d_edge_clamp_high();
 
     printf("PASS\n");
     return 0;
