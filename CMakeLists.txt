@@ -410,7 +410,12 @@ set_tests_properties(selftest.abstats-cfa-bayer PROPERTIES
   LABELS "selftest;quarantine")
 
 # Add plugin tests
-add_executable(test_display_falsecolor plugins/test_display_falsecolor.c)
+add_executable(test_display_falsecolor plugins/test/test_display_falsecolor.c)
 target_include_directories(test_display_falsecolor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_display_falsecolor PRIVATE /W3)
+else()
+  target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra)
+endif()
 add_test(NAME plugin.display_falsecolor COMMAND test_display_falsecolor)
-set_tests_properties(plugin.display_falsecolor PROPERTIES LABELS selftest)
+set_tests_properties(plugin.display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
