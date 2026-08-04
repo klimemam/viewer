@@ -26983,7 +26983,7 @@ int main(int argc, char** argv) {
                 pumpSequenceAndQueue();
                 if (rbMain().b.connected && !scanSent) {
                     App::RbJob j; j.kind = App::RbScan;
-                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = dir;
+                    j.host = rbMain().b.host; j.gen = ++rbMain().b.scanGen; j.port = rbMain().b.port; j.dir = dir;
                     rbEnqueue(rbMain(), std::move(j));
                     scanSent = true;
                 }
@@ -27089,7 +27089,7 @@ int main(int argc, char** argv) {
             if (rbMain().b.connected && !scanSent) {
                 App::RbJob j;
                 j.kind = App::RbScan;
-                j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                j.host = rbMain().b.host; j.gen = ++rbMain().b.scanGen; j.port = rbMain().b.port; j.dir = scanroot;
                 rbEnqueue(rbMain(), std::move(j));
                 scanSent = true;
             }
@@ -27187,7 +27187,7 @@ int main(int argc, char** argv) {
                 if (rbMain().b.connected && !sent) {
                     App::RbJob j;
                     j.kind = App::RbScan;
-                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                    j.host = rbMain().b.host; j.gen = ++rbMain().b.scanGen; j.port = rbMain().b.port; j.dir = scanroot;
                     rbEnqueue(rbMain(), std::move(j));
                     sent = true;
                 }
@@ -27872,7 +27872,7 @@ int main(int argc, char** argv) {
                 if (rbMain().b.connected && !scanSent) {
                     App::RbJob j;
                     j.kind = App::RbScan;
-                    j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = scanroot;
+                    j.host = rbMain().b.host; j.gen = ++rbMain().b.scanGen; j.port = rbMain().b.port; j.dir = scanroot;
                     rbEnqueue(rbMain(), std::move(j));
                     scanSent = true;
                 }
@@ -31924,7 +31924,7 @@ int main(int argc, char** argv) {
             pumpSequenceAndQueue();
             if (rbMain().b.connected && !scanSent) {
                 App::RbJob j; j.kind = App::RbScan;
-                j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = dir;
+                j.host = rbMain().b.host; j.gen = ++rbMain().b.scanGen; j.port = rbMain().b.port; j.dir = dir;
                 rbEnqueue(rbMain(), std::move(j));
                 scanSent = true;
             }
