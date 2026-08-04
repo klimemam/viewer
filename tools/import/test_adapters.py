@@ -697,6 +697,15 @@ def load(path):
 
 
 @case
+def meta_key_validation():
+    """meta keys are validated against invalid characters."""
+    import run_adapter
+    for bad in ("/", "\\", ":", "\0"):
+        fails(lambda: run_adapter.meta_key("", "hello" + bad + "world"),
+              "cannot be written to an npz", run_adapter.AdapterError)
+
+
+@case
 def harness_bad_spec_and_missing_path():
     """4.9: refuse with a reason, never with a shrug."""
     need_numpy(); need_runner()
