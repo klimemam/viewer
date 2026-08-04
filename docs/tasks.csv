@@ -61,7 +61,7 @@
 対応済み,Preview が勝手に開かれる不具合,autosave の saveSession が全previewを昇格させていた(変更3秒後に発火)。昇格をやめ、セッションに書かないだけにした。stack+一枚の二重登録も同時に解消。fail-first: still a preview=0/named in file=1,"main.cpp writeSessionTo/saveSession, V9b",,3e950e7
 対応済み,Auto Per Frame が選択直後に効かない,per-frame再フィットが selectImage にしか無く、モード選択時に走っていなかった。applyRangeMode() に括り出し、コンボもテストも同一関数を通す。fail-first: -999..1002 -> -999..1002 WRONG,"main.cpp applyRangeMode, rangeselftest",,3e950e7
 対応済み,ImageView のシーケンスバー(表示側),stack の総数で張り、常駐コマの位置を seqIndex から1コマ1マークで描く(順不同で届いた stack はそう見える)。読み込み中の stack は未到着の末尾を薄く。ドラッグは常駐コマの最寄りに着地し、持っていないコマには絵も番号も動かさない(嘘の絵を出さない),報告 2026-08-03,,3d7710c。塗り分けの見た目は未目視 — probe が無い
-残課題,Browse のプレビュー送りを ImageView へ移す(スクラブ2重の解消),"元の仕様は『Browse内のプレビュー送り(< > スライダ , .)をImageView側へ』だが、実装したのは ImageView 側だけで Browse 側(main.cpp:20556 付近の < > スライダ n/N の行)を外していない。結果、プレビュー中はフレーム送りUIが2つ画面に出る — これが別行『項目13 スクラブ2重』そのもの。要実装: ImageView のバーがプレビュー(app.previewFiles / previewFrames + stepPreviewFrame)も歩けるようにし、Browse 側のウィジェット行を落とす。, と . のキーは場所を取らないので Browse に残すかは要判断",main.cpp:20556 付近(Browse) / ImageView のスクラブバー,,実機指摘(2026-08-04)。私が仕様の半分だけ実装して対応済みにしていた
+対応済み,Browse のプレビュー送りを ImageView へ移す(スクラブ2重の解消),"元の仕様は『Browse内のプレビュー送り(< > スライダ , .)をImageView側へ』だが、実装したのは ImageView 側だけで Browse 側(main.cpp:20556 付近の < > スライダ n/N の行)を外していない。結果、プレビュー中はフレーム送りUIが2つ画面に出る — これが別行『項目13 スクラブ2重』そのもの。要実装: ImageView のバーがプレビュー(app.previewFiles / previewFrames + stepPreviewFrame)も歩けるようにし、Browse 側のウィジェット行を落とす。, と . のキーは場所を取らないので Browse に残すかは要判断",main.cpp:20556 付近(Browse) / ImageView のスクラブバー,,"main 済。ImageView のフッタがプレビューも歩く(seqId 0 なので stack のバーとは別枝、stepPreviewFrame 経由 — 各位置が取得なので飛ばずに送る)。Browse 側のウィジェット行を削除し、そのために常時予約していた1行も解放(出現で行がずれる危険は、出現しなくなったので消えた)。, と . のキーは Browse に残した — 画面に2つあったのはウィジェットであってキーではなく、リストに手を置いたまま送れるのがキーの存在理由。パネルにフォーカスがあるときだけ発火するので競合しない。プレビュー中のバーの見た目は未目視(probe は数字しか記録しない)"
 残課題,command palette (Ctrl+P / Ctrl+Shift+P) とメニュー整理,peer updateは自動化してメニューから削除。Ctrl+P=どこへ行くか / Ctrl+Shift+P=何をするか。前提: メニューを1テーブルから生成し palette も同じテーブルを引く(二重登録は必ず腐る),docs/browse-topbar-design.md 10.8,,順序: テーブル化→メニュー生成→palette
 レビュー必要項目,Browse の棚卸しと上部の再設計【1つの判断】,上部21ウィジェット+リスト/列/キー/右クリック10項目を全数列挙し、残す/降格/統合/廃止を判定。重複3件(bookmark・open folder・copy paths)を発見。常設21→6個。判断6点は推奨つき ///// 上部の再設計案(旧・別行): 4系統20パターンのサーベイから収斂文法を抽出し3案提示。推奨=案A(定常1行+打鍵召喚チップ、入口統一で filter/search の二重入口が構成的に消滅)。未決6点は推奨既定値つき。///// 2行に分かれていたが、どちらも『案A/B/C の選択と未決6点』という同じ回答を待っていたので1行にした(ユーザー指摘 2026-08-04),"docs/browse-inventory.md, docs/browse-topbar-design.md, browse-topbar-mockup.html",,案の選択と未決6点の回答待ち。実装は選択後。比較モックアップは絵で確認可。残課題【Fable】の『File Browse を100点へ + 別レポジトリ化』と同じ領域なので、そちらと一緒に見るのが自然
 残課題,参照化 修正34件+再レビュー(クレジット切れで中断),ref-integrate @ 28ef105 は全緑(3 selftest+tripwire+suite21)。再レビュー10体中4体完了・6体がクレジット切れで失敗。確認2件(UNCロック下IO・promotePreview無効化欠落)+未反証3件が残るためmain統合は保留,"ref-integrate, review journal wf_19459efb-b82",,クレジット回復後に残レンズ(lifecycle)と反証4件を再実行
@@ -90,7 +90,7 @@
 残課題,項目7 検索進捗,件数/現在地のインクリメンタル表示。peerのGLOB変更要,todo-open #7,,
 残課題,項目9 Histogram bin,整数/2べき乗スナップ。クリップ数の罠を文書化済み,todo-open #9,,設計済・未実装
 残課題,項目11 Inspector remote行,rfWorkerがnoteを書かず行が出入りする。原因特定済,todo-open #11,,
-残課題,項目13 スクラブ2重,BrowseとImage Viewでフレーム送りUIが2つ,todo-open #13,,上の『Browse のプレビュー送りを ImageView へ移す』で解消される。同じ事象の別記述
+対応済み,項目13 スクラブ2重,BrowseとImage Viewでフレーム送りUIが2つ,todo-open #13,,上の行で解消。同じ事象の別記述だった
 残課題,項目14 filter/search入口,統合の議論アイテム,todo-open #14,,
 残課題,項目18 表示どおりコピー,glReadPixels方式。倍率の焼き込み判断含む,todo-open #18,,
 残課題,項目22 パネル追加ボタン,右上からタブ追加。ImGui docking APIの制約調査済,todo-open #22,,

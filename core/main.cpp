@@ -12716,6 +12716,53 @@ static void drawCanvas(ImVec2 avail) {
                 }
             }
         }
+        // ---- the same bar, for a preview ------------------------------------
+        // A preview is one throwaway doc with seqId 0, so the branch above never
+        // ran for it and the stepping lived in the Browse panel instead: a
+        // second frame-stepping row on screen, under the list rather than under
+        // the picture it steps. The control belongs where the pixels are.
+        //
+        // previewFiles = a stack of numbered files, previewFrames = one file
+        // with a frame axis. Either way the bar walks it one fetched frame at a
+        // time, which is why it steps rather than jumping: each position is a
+        // fetch, and stepPreviewFrame is the one place that knows how.
+        else if (im->preview) {
+            int pvN = app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
+                                                   : app.previewFrames;
+            if (pvN >= 2) {
+                char cnt[48];
+                snprintf(cnt, sizeof cnt, "%d/%d", app.previewIndex + 1, pvN);
+                ImVec2 cs = ImGui::CalcTextSize(cnt);
+                dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
+                g_footerProbe += std::string("previewcount=") + cnt + ";";
+                float barH = 5.0f * s;
+                ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
+                ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
+                if (b1.x > b0.x + 40 * s) {
+                    ImGui::SetCursorScreenPos(ImVec2(b0.x, botY));
+                    ImGui::InvisibleButton("pvscrub", ImVec2(b1.x - b0.x, lh));
+                    bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
+                    int alpha = sh || sa ? 235 : 150;
+                    dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
+                    float fx = b0.x + (b1.x - b0.x) *
+                               ((float)app.previewIndex / (float)(pvN - 1));
+                    dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha),
+                                      barH * 0.5f);
+                    dl->AddCircleFilled(ImVec2(fx, botY + lh * 0.5f),
+                                        barH * (sh || sa ? 1.4f : 1.0f),
+                                        IM_COL32(160, 200, 240, alpha));
+                    if (sa) {
+                        float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
+                        int want = (int)(t * (float)(pvN - 1) + 0.5f);
+                        if (want != app.previewIndex) stepPreviewFrame(want - app.previewIndex);
+                    }
+                    if (sh)
+                        ImGui::SetTooltip("previewing %s\n%d / %d  (drag, or , and .)\n"
+                                          "double-click the row in Browse to open it for real",
+                                          app.previewLabel.c_str(), app.previewIndex + 1, pvN);
+                }
+            }
+        }
     }
 }
 
@@ -20317,15 +20364,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     std::string& rbPropsPath = I.propsPath;
     bool& rbPropsOpen = I.propsOpen;
     bool& rbPropsNoSize = I.propsNoSize; // an expanded frame: no size/mtime of its own
-    // footer space for the preview scrub bar: RESERVED even when no preview is
-    // alive, so starting one never shifts the rows under the cursor (a bar
-    // that appeared above the list moved every row mid-double-click)
-    float rbFootH = ImGui::GetFrameHeightWithSpacing();
-    // ...plus the bottom status line, which is permanent: its separator and its
-    // one text row are taken out of the table's height so the listing stops
+    // A row used to be reserved here for the preview scrub bar, held even when
+    // no preview was alive so that starting one never shifted the rows under
+    // the cursor (a bar that appeared above the list moved every row
+    // mid-double-click). The scrub bar moved to the Image View footer on
+    // 2026-08-04, so the reservation goes with it: an empty row kept against
+    // the return of something that is no longer here is just a lost row, and
+    // this panel works down to 300 px.
+    //
+    // What stays is the bottom status line, which is permanent: its separator
+    // and its one text row come out of the table's height so the listing stops
     // above it instead of scrolling underneath it.
-    rbFootH += ImGui::GetTextLineHeightWithSpacing() +
-               ImGui::GetStyle().ItemSpacing.y * 2 + 1;
+    float rbFootH = ImGui::GetTextLineHeightWithSpacing() +
+                    ImGui::GetStyle().ItemSpacing.y * 2 + 1;
     // Column widths, measured from the widest thing each column actually
     // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
     // SCROLLING table auto-fits over its first frames, which for this table are
@@ -20686,35 +20737,21 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         }
         ImGui::EndTable();
     }
-    // Preview scrub bar lives BELOW the listing, in space reserved above:
-    // appearing must never move the rows (double-click depends on it).
-    // previewFiles = a stack of numbered files; previewFrames = one file with
-    // a frame axis. Either way the bar walks it, one fetched frame at a time.
+    // The preview's scrub WIDGETS are gone from here (2026-08-04): they now sit
+    // in the Image View footer, under the picture they step, which is where the
+    // stack scrub bar already was. Two frame-stepping rows on screen at once
+    // was the whole of the "スクラブ2重" complaint.
+    //
+    // The KEYS stay. They cost no space, and reaching them without moving your
+    // hand off the list is the reason to have them at all - the duplication
+    // that mattered was two widgets, not two ways to press a key. They only
+    // fire while this panel has focus, so they never race the Image View's.
     int pvN = app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
                                            : app.previewFrames;
-    if (pvN >= 2) {
-        int n = pvN;
-        ImGui::PushID("pvstep");
-        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
-        ImGui::SameLine();
-        int slider = app.previewIndex;
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
-        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
-            stepPreviewFrame(slider - app.previewIndex);
-        ImGui::SameLine();
-        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
-                              app.previewLabel.c_str());
-        // , and . while the browser has focus: the same keys the image view uses
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            !ImGui::IsAnyItemActive()) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
-        }
-        ImGui::PopID();
+    if (pvN >= 2 && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
     }
     // ---- the bottom status line (docs/browse-topbar-design.md 10.3) --------
     // One permanent thin row under the listing, carrying the facts that are
