@@ -60,6 +60,7 @@
 #include <unordered_map>
 #include <unordered_set>              // residentImageBytes: dedupe by srcId
 #include <mutex>
+#include <condition_variable>
 #include <limits>
 #include <iomanip>
 #include <sstream>
@@ -932,6 +933,7 @@ struct App {
     std::atomic<bool> mStop{ false };
     std::atomic<int> mPending{ 0 };
     std::mutex mMtx;
+    std::condition_variable mCv;
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
@@ -2753,13 +2755,13 @@ static void mWorker() {
     int sesPort = -1;
     while (!app.mStop) {
         App::MJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(app.mMtx);
-            if (!app.mQueue.empty()) { job = std::move(app.mQueue.front());
-                                       app.mQueue.erase(app.mQueue.begin()); have = true; }
+            std::unique_lock<std::mutex> lk(app.mMtx);
+            app.mCv.wait(lk, []{ return app.mStop || !app.mQueue.empty(); });
+            if (app.mStop && app.mQueue.empty()) break;
+            job = std::move(app.mQueue.front());
+            app.mQueue.erase(app.mQueue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::MDone d;
         d.token = job.token;
         std::string host, rpath, err;
@@ -2805,11 +2807,16 @@ static void mEnqueue(App::MJob job) {
         app.mPending++;
         app.mQueue.push_back(std::move(job));
     }
+    app.mCv.notify_one();
     if (!app.mThread.joinable()) app.mThread = std::thread(mWorker);
 }
 
 static void stopMeasureWorker() {
-    app.mStop = true;
+    {
+        std::lock_guard<std::mutex> lk(app.mMtx);
+        app.mStop = true;
+    }
+    app.mCv.notify_all();
     if (app.mThread.joinable()) app.mThread.join();
 }
 
