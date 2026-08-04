@@ -176,14 +176,30 @@ else()
 endif()
 if(MINGW)   # self-contained exes: no libstdc++/libgcc/libwinpthread DLLs alongside
   foreach(tgt viewer viewer-serve)
+    # -static, NOT --whole-archive on libwinpthread. Both make the binary
+    # self-contained; only one of them leaves it able to say what it is.
+    #
+    # --whole-archive pulls in EVERY object of libwinpthread.a, including its
+    # version.o - a VERSIONINFO resource for libwinpthread-1.dll. Two version
+    # resources with the same id and language collide, the linker prints
+    # ".rsrc merge failure: duplicate leaf: type: 10 (VERSION)" and keeps one,
+    # and the one it kept was NOT ours. viewer.exe told Windows it was "POSIX
+    # WinThreads for Windows", original filename libwinpthread-1.dll, by
+    # MinGW-W64 Project - in Explorer's details pane, in the taskbar tooltip,
+    # in every "what is this program" surface. That is worse than the bare
+    # filename core/viewer.rc.in exists to replace, and it shipped.
+    #
+    # Dropping --whole-archive alone fixes the identity and reintroduces a
+    # runtime dependency on libwinpthread-1.dll, which is the thing it was
+    # there to prevent. -static gives both: verified, on both binaries, that
+    # no libgcc/libstdc++/libwinpthread DLL is imported and that the version
+    # block is viewer's own.
+    #
     # --no-insert-timestamp: mingw stamps the PE header with the link time, so
     # building the same tree twice produced two different binaries. The export
     # provenance line names the commit this build came from; without this, that
     # commit does not name one binary, which is the whole point of writing it.
-    target_link_options(${tgt} PRIVATE -static-libgcc -static-libstdc++
-                                       -Wl,--no-insert-timestamp
-                                       -Wl,-Bstatic,--whole-archive -lwinpthread
-                                       -Wl,--no-whole-archive)
+    target_link_options(${tgt} PRIVATE -static -Wl,--no-insert-timestamp)
   endforeach()
 endif()
 
