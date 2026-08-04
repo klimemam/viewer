@@ -67,7 +67,6 @@
 #include <string>
 #include <chrono>
 #include <ctime>                      // wall-clock stamp on measurement results
-#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -2567,7 +2566,14 @@ static void rfWorker() {
         {
             std::unique_lock<std::mutex> lk(app.rfMtx);
             app.rfCv.wait(lk, []{ return app.rfStop || !app.rfQueue.empty(); });
-            if (app.rfStop && app.rfQueue.empty()) break;
+            // Stop wins over pending work, as it did when this was a poll: the
+            // old `while (!app.rfStop)` was checked BEFORE any dequeue. Asking
+            // for the queue to be empty as well lets a worker that was notified
+            // with a job and stopped before it could reacquire the mutex run one
+            // more fetch INSIDE stopRemoteFetcher's join(), with the UI thread
+            // waiting on it. The predicate above already guarantees the queue is
+            // non-empty whenever the flag is false, so there is nothing to lose.
+            if (app.rfStop) break;
             job = std::move(app.rfQueue.front());
             app.rfQueue.erase(app.rfQueue.begin());
         }
@@ -10309,7 +10315,14 @@ static void rbWorker(App::BrowseInstance* ip) {
         {
             std::unique_lock<std::mutex> lk(I.mtx);
             I.cv.wait(lk, [&I] { return !I.queue.empty() || I.stop; });
-            if (I.stop && I.queue.empty()) break;
+            // Stop wins over pending work - see the same line in rfWorker. It
+            // matters more here: the extra job can be a connect to a host that
+            // has no peer installed, which falls into deployPeer, which takes no
+            // abort pointer and which the comment there calls minutes of ssh.
+            // Quitting, or closing the panel, would freeze for that long with no
+            // window drawn. Session::setAbort cannot help - it only gates the
+            // read loop.
+            if (I.stop) break;
             job = std::move(I.queue.front());
             I.queue.erase(I.queue.begin());
         }
