@@ -10,3 +10,4 @@ build-mingw/
 build-verify/
 build-dbg/
 *.egg-info/
+build-board/
