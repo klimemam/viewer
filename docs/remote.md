@@ -1,8 +1,9 @@
 # リモートのデータを手元から見る (`ssh://`)
 
 計算機に置いた大量の RAW/npy を、手元のマシンの viewer から開いて測るための仕組み。
-実装中の機能です(v1、[core/remote_proto.h](../core/remote_proto.h) /
+稼働中の機能です(プロトコル `VERSION = 5`、[core/remote_proto.h](../core/remote_proto.h) /
 [core/serve.cpp](../core/serve.cpp) / [core/remote.cpp](../core/remote.cpp))。
+残っている制限は §8。
 
 ---
 
@@ -237,7 +238,7 @@ void handleRequest(uint32_t type, Buf& in) { ... }   // transport 非依存
 WebSocket 版は `g_sink` に別の関数を差して `handleRequest` を呼ぶだけで、
 **ハンドラも `readRegion()` も `remote_proto.h` も 1 行も変えずに**ブラウザ対応になります。
 
-| | v1: ssh stdio(実装中) | 将来: WebSocket ブリッジ |
+| | いま: ssh stdio | 将来: WebSocket ブリッジ |
 |---|---|---|
 | **転送路** | ssh が張った stdin/stdout パイプ 1 本 | TCP / WSS(HTTP アップグレード) |
 | **クライアント** | viewer 本体(ネイティブ、手元で動く) | ブラウザ(Web フロントエンド) |
@@ -277,16 +278,19 @@ WebSocket は「ブラウザから見たい」という要求が実際に出た�
 
 ---
 
-## 7. 使い方(予定)
+## 7. 使い方
 
 ```bash
 viewer ssh://user@host/data/run42
 ```
 
 これだけ。内部では
-`ssh -o BatchMode=yes user@host viewer --serve` が起動し、`/data/run42` を LIST します。
+`ssh -o BatchMode=yes -o ConnectTimeout=10 user@host ~/.viewer/viewer-serve --serve`
+が起動し、`/data/run42` を LIST します(`remote.cpp` `Session::start`)。
 
-- リモート側の準備は**同じ `viewer` バイナリが PATH にあること**だけ。
+- リモート側の準備は**`~/.viewer/viewer-serve` があること**だけ。無ければ初回接続時に
+  自動導入します(サーバに git があれば binaries ブランチから、無ければ手元の
+  `viewer-serve` を ssh 越しに送り込む)。`--remote-exe <path>` で明示指定もできます。
 - `~/.ssh/config` の Host エイリアスがそのまま使えます(`ssh://dev-box/data/run42`)。
 - 既存のローカル起動は一切変わりません。パスがローカルなら従来通りローカルで読みます。
 
@@ -295,21 +299,23 @@ viewer ssh://user@host/data/run42
 
 ---
 
-## 8. 制限と今後(実装中)
+## 8. 制限と今後
 
-**この節の内容は実装中につき変わります。** 現時点(v1)の状態:
+現時点(プロトコル `VERSION = 5`、[core/remote_proto.h](../core/remote_proto.h))の状態。
+**残っている制限だけ**を書く節です。済んだものを「これから」の顔で残さないこと —
+この節は一度それで嘘をつきました。
 
 | 項目 | 状態 |
 |---|---|
-| **対応フォーマット** | **`.npy` のみ**。`parseNpyHeader` が u8/i8/u16/i16/u32/i32/f32/f64 と 2〜4 次元の shape を扱う |
+| **対応フォーマット** | **`.npy` のみ**。`parseNpyHeader` が u8/i8/u16/i16/u32/i32/f32/f64 と 2〜4 次元の shape を扱う。`.npz` はサーバ側に無い(ローカルなら開ける) |
 | **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
-| **Fortran order の .npy** | サーバは明示的に拒否(`"fortran-order .npy is not served (open it locally)"`)。行 seek が成立しないため |
+| **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む。ローカルの loader は元から Fortran を読めたので、リンク越しだけ拒否するのは不整合だった([docs/startup.md](startup.md) の「まだ出来ないこと」もそう言っている) |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
 | **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
-| **`ssh://` の CLI 配線** | `remote::parseUrl` はあるが、起動パスへの接続はこれから(`--serve` 側は `main.cpp` に配線済み) |
-| **LIST のファイルサイズ** | 32 bit にクランプされる(4 GB 超は頭打ち表示) |
+| **`ssh://` の CLI 配線** | **配線済み**。`openPath` が `ssh://` と `local://` を受け、`viewer ssh://host/path.npy`(ファイル)と `viewer ssh://host/~/dir`(接続してそこを Browse)の両方が起動パス。`--help` にも出る |
+| **LIST のファイルサイズ** | 64 bit。u32 の lo/hi 2 本で送る(`serve.cpp`、`remote_proto.h` の mtime と同じ形) |
 | **圧縮** | deflate(miniz)固定、level 6。クライアントは常に要求し、縮まなかったときだけ生で返る |
-| **並列・キャンセル** | なし。1 要求 1 返答の同期往復。パン中に古い要求を捨てる仕組みはまだない |
+| **並列・キャンセル** | なし。1 要求 1 返答の同期往復。`rp::Header` に要求 ID が無いので、パン中に古い要求を捨てる仕組みも入れられない(下の所有表がその帰結) |
 
 ### `Session` の所有(鉄則)
 
@@ -331,14 +337,12 @@ viewer ssh://user@host/data/run42
 `App::RemoteBrowse` の**ただの値**を読む。ホストあたり ssh チャネルは
 最大 4 本になるが、これは競合と UI フリーズの両方を同時に消す唯一の形。
 
-**次にやること**(優先順):
+**次にやること**(優先順)。上の表で「実装済み」のものはここに書かない:
 
-1. `ssh://` URL の起動パス配線 + LIST/META をファイルブラウザ UI に載せる
-2. 先読みスレッド(連番の次フレームを投機的に取りに行く)と、視野が変わったときの
-   古い要求のキャンセル
-3. `MSG_MEASURE` — アナライザをデータのある側で走らせ、数値だけ返す
-4. RAW レシピの転送(META 要求にレシピを添える形が有力)
-5. WebSocket transport(`ReplySink` を差し替えるだけ。§5 参照)
+1. 古い要求のキャンセル。まず `rp::Header` に要求 ID を足す(VERSION を上げる)ところから。
+   これが無いうちは並列化もできない
+2. RAW レシピの転送(META 要求にレシピを添える形が有力)
+3. WebSocket transport(`ReplySink` を差し替えるだけ。§5 参照)
 
 ---
 
