@@ -5284,8 +5284,10 @@ static std::string npyReReadLoss(const ImageDoc* d) {
         if (q->seqId != 0 ? q->seqId != d->seqId : q.get() != d) continue;
         if (app.compareBUid == q->uid) slots += slots.empty() ? "B" : ", B";
         for (size_t i = 0; i < app.cmpExtra.size(); i++)
-            if (app.cmpExtra[i] == q->uid)
-                slots += (slots.empty() ? "" : ", ") + slotName(i);
+            if (app.cmpExtra[i] == q->uid) {
+                if (!slots.empty()) slots += ", ";
+                slots += slotName(i);
+            }
     }
     if (!slots.empty()) lost.push_back("compare slot " + slots + " unpins");
     // A crop is a rectangle in a grid the new reading may not even have, so it
@@ -5299,7 +5301,10 @@ static std::string npyReReadLoss(const ImageDoc* d) {
                        "(follow-frame pairing, a pinned frame) is re-established");
     if (lost.empty()) return {};
     std::string s = "re-reading rebuilds this document: ";
-    for (size_t i = 0; i < lost.size(); i++) s += (i ? "; " : "") + lost[i];
+    for (size_t i = 0; i < lost.size(); i++) {
+        if (i > 0) s += "; ";
+        s += lost[i];
+    }
     return s;
 }
 
