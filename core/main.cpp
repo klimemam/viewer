@@ -31915,6 +31915,174 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- N: the panel says something about EVERY slot it holds -----------
+        // The defect (issue #60): with C, D, E armed the Statistics/Histogram
+        // panel drew A and B and said nothing whatever about the rest. The
+        // assertion therefore has to be about what the panel SAYS, not about
+        // what the cache holds - a cache full of correct numbers nobody prints
+        // is precisely the bug. g_histSideProbe records the letters the panel
+        // put on screen: a row in the table, a curve on the plot, or a named
+        // omission under it. The invariant every case below re-checks is that
+        // those last two ACCOUNT FOR the first. A letter with a row and no
+        // curve and no mention is the defect, restated as an equation.
+        {
+            check(app.seqs.size() >= 2, "N fixture: two stacks are open");
+            int sid0 = app.seqs[0].id, sid1 = app.seqs[1].id;
+            std::vector<int> f0 = framesOfSeq(sid0), f1 = framesOfSeq(sid1);
+            check(f0.size() >= 4 && f1.size() >= 4, "N fixture: four frames each");
+            // follow OFF: a pin then stays on the frame it was put on, so the
+            // slots are N DISTINCT documents and the count under test is the
+            // slot count. (Following is S1's subject, not this group's.)
+            app.compareFollowFrame = false;
+            app.compareMode = App::CmpWipe;
+            app.abStepBusyUntil = 0;
+            app.cmpExtra.clear();
+            app.histPlane = 0;          // ONE plane on the axis: the overlay case
+            selectImage(f0[0]);
+            setCompareB(app.images[f1[0]].get());
+            addCompareSlot(app.images[f0[1]].get());     // C
+            addCompareSlot(app.images[f0[2]].get());     // D
+            check(cmpB() != nullptr && app.cmpExtra.size() == 2,
+                  "N fixture: B plus slots C and D are armed");
+
+            auto histFrame = [&]() {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
+                    ImGui::Begin("HistProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawPanelHistogram();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            // "rows=", "curves=" and "said-no-curve=" as letter sets, read back
+            // out of the probe the panel wrote
+            auto field = [](const std::string& probe, const char* key) {
+                size_t k = probe.find(key);
+                if (k == std::string::npos) return std::string();
+                k += strlen(key);
+                size_t e = probe.find(';', k);
+                return probe.substr(k, e == std::string::npos ? e : e - k);
+            };
+            auto rowsOf = [](const std::string& probe) {
+                std::string out;
+                for (size_t k = probe.find("row"); k != std::string::npos;
+                     k = probe.find("row", k + 1))
+                    if (k + 3 < probe.size() && probe[k + 4] == ';') out += probe[k + 3];
+                return out;
+            };
+            // the one sentence this group exists for, asked the same way of
+            // every layout below: is there a letter the panel gave numbers to
+            // and then neither drew nor mentioned?
+            auto accountedFor = [&](const std::string& probe, std::string& unsaidOut) {
+                std::string rows = rowsOf(probe);
+                std::string said = field(probe, "curves=") + field(probe, "said-no-curve=");
+                unsaidOut.clear();
+                for (char c : rows)
+                    if (said.find(c) == std::string::npos) unsaidOut += c;
+                return unsaidOut.empty();
+            };
+
+            // N1: four sides armed, four sides named. This is the assert that
+            // fails against every build before this change: the table stopped
+            // at B because hist[] did.
+            app.abStatsLayout = App::AbOverlay;
+            histFrame();
+            std::string pOver = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N1 overlay probe '%s'\n", pOver.c_str());
+            check(rowsOf(pOver) == "ABCD",
+                  "N1 the statistics table gives A, B, C and D a row each");
+            check(field(pOver, "curves=") == "ABCD",
+                  "N1 ...and one plane on the axis puts all four on the plot");
+            std::string unsaid;
+            check(accountedFor(pOver, unsaid),
+                  "N1 every slot with numbers is drawn or named");
+
+            // N2: the plot cannot take four when four PLANES are on the axis
+            // (four planes times four slots is sixteen curves). It must then
+            // NAME the ones it left off - the table keeps all four either way.
+            app.histPlane = -1;
+            bool multiPlane = app.hist[0].nSeries > 1;
+            histFrame();
+            std::string pAll = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N2 all-planes probe '%s' (nSeries=%d)\n",
+                    pAll.c_str(), app.hist[0].nSeries);
+            check(rowsOf(pAll) == "ABCD",
+                  "N2 the table still holds all four with every plane on the axis");
+            check(accountedFor(pAll, unsaid),
+                  "N2 ...and nothing is dropped in silence");
+            if (multiPlane)
+                check(field(pAll, "said-no-curve=") == "CD",
+                      "N2 ...the slots come off the plot BY NAME, not quietly");
+            else
+                fprintf(stderr, "abstatsselftest: N2 single-plane fixture - the "
+                                "plane limit is not reachable here, invariant only\n");
+            app.histPlane = 0;
+
+            // N3: side by side has two halves, so it holds two sides. The other
+            // two are not on any plot and the panel has to say so.
+            app.abStatsLayout = App::AbSide;
+            histFrame();
+            std::string pSide = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N3 side-by-side probe '%s'\n", pSide.c_str());
+            check(rowsOf(pSide) == "ABCD",
+                  "N3 side by side keeps every slot in the table");
+            check(field(pSide, "curves=") == "AB" &&
+                  field(pSide, "said-no-curve=") == "CD",
+                  "N3 ...and names the two it has no half for");
+            check(accountedFor(pSide, unsaid),
+                  "N3 every slot with numbers is drawn or named");
+            app.abStatsLayout = App::AbOverlay;
+
+            // N4: past the palette. slotInk tells slotInkCount() slots apart
+            // and then its modulo hands slot H back A's green - two slots in
+            // one colour is the same omission wearing a different hat, so the
+            // plot stops at the palette and says which letters it stopped at.
+            {
+                std::vector<ImU32> ink;
+                for (size_t i = 0; i < slotInkCount(); i++) ink.push_back(slotInk(i));
+                std::sort(ink.begin(), ink.end());
+                check(std::adjacent_find(ink.begin(), ink.end()) == ink.end(),
+                      "N4 the palette's own colours are all different");
+            }
+            size_t want = slotInkCount() + 2;     // two more sides than inks
+            for (size_t k = 3; k < f0.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f0[k]].get());
+            for (size_t k = 1; k < f1.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f1[k]].get());
+            size_t nSides = app.cmpExtra.size() + 2;
+            if (nSides > slotInkCount()) {
+                histFrame();
+                std::string pMany = g_histSideProbe;
+                fprintf(stderr, "abstatsselftest: N4 %zu sides, %zu inks: '%s'\n",
+                        nSides, slotInkCount(), pMany.c_str());
+                check(rowsOf(pMany).size() == nSides,
+                      "N4 every armed slot has a row, however many there are");
+                check(field(pMany, "curves=").size() == slotInkCount(),
+                      "N4 the plot draws exactly as many as it has colours for");
+                check(field(pMany, "said-no-curve=").size() == nSides - slotInkCount(),
+                      "N4 ...and names every one it could not colour");
+                check(accountedFor(pMany, unsaid),
+                      "N4 no slot is left with numbers and no word about it");
+            } else {
+                fprintf(stderr, "abstatsselftest: N4 skipped - only %zu images to "
+                                "arm, need more than %zu\n", nSides, slotInkCount());
+            }
+            if (!unsaid.empty())
+                fprintf(stderr, "abstatsselftest: N slots with a row and no word: '%s'\n",
+                        unsaid.c_str());
+            app.cmpExtra.clear();
+            app.compareFollowFrame = true;
+            app.abStatsLayout = App::AbAuto;
+            app.histPlane = -1;
+        }
+
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
