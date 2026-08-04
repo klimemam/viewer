@@ -145,6 +145,14 @@ for lv in ("10lx", "20lx", "40lx"):
 # picker batch-mode fixture (--picker-selftest UC5): three top-level condition
 # folders, each a numbered stack plus a single representative average.npy -
 # "one batch per top folder" must make three batches, stacks intact
+#
+# 00/ is TWO levels deep. "one batch per top folder" reads the top folder off
+# the group name by splitting on '/', so a group two levels down is the only
+# input that can tell whether that name was built from '/' - and on Windows the
+# relative path scanFolderGroups derives comes out of std::filesystem with '\'
+# separators. A one-level tree cannot distinguish the two: it has no separator
+# in it at all. Get it wrong and "00\rep" is a fourth top folder, so the batch
+# count below is the assert that catches it.
 bs = out / "batchset"
 rng4 = np.random.default_rng(21)
 for sub in ("00", "01", "02"):
@@ -153,6 +161,10 @@ for sub in ("00", "01", "02"):
     for k in range(3):
         np.save(d / f"frame_{k:03d}.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
     np.save(d / "average.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
+rep = bs / "00" / "rep"
+rep.mkdir(parents=True, exist_ok=True)
+for k in range(2):
+    np.save(rep / f"shot_{k:03d}.npy", (rng4.random((16, 16)) * 100).astype(np.float32))
 
 # ---------------------------------------------------------------------------
 # Fixtures the selftests take as their <dir> argument. These were hand-made in
