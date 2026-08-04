@@ -29720,6 +29720,19 @@ int main(int argc, char** argv) {
                           app.images[framesOfSeq(nid).front()]->note.find(
                               "not loaded") != std::string::npos;
             check(honest, "D7 the miss is reported in the note, not fetched");
+            // applyDerivePlan() appended a stack, and app.seqs holds SeqInfo BY
+            // VALUE - so that push_back can reallocate, and every SeqInfo* taken
+            // before it (sa, twenty lines up) is dangling afterwards. Ask for it
+            // again rather than reusing the old one.
+            //
+            // This is why the Windows CI job was the only one that failed the
+            // day it first ran these: MSVC's vector grows 1.5x and reallocates
+            // on exactly this push, so the two lines below wrote through freed
+            // memory and the process died with no output. libstdc++ grows 2x and
+            // had spare capacity, so the same write landed on memory that was
+            // still mapped and nothing ever showed. Forcing cap==size here
+            // reproduced it on this box: seqInfo(seqA) != sa.
+            sa = seqInfo(seqA);
             sa->remoteFiles.clear();                 // leave the source honest
             sa->expectedFrames = 8;
         }
