@@ -68,6 +68,7 @@
 #include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
+#include <deque>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -932,7 +933,7 @@ struct App {
     std::atomic<bool> mStop{ false };
     std::atomic<int> mPending{ 0 };
     std::mutex mMtx;
-    std::vector<MJob> mQueue;
+    std::deque<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
     // Linearity: one row per MEMBER of one series (value in, response out), fits
@@ -2757,7 +2758,7 @@ static void mWorker() {
         {
             std::lock_guard<std::mutex> lk(app.mMtx);
             if (!app.mQueue.empty()) { job = std::move(app.mQueue.front());
-                                       app.mQueue.erase(app.mQueue.begin()); have = true; }
+                                       app.mQueue.pop_front(); have = true; }
         }
         if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::MDone d;
