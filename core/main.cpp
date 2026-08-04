@@ -20626,18 +20626,10 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // one gesture owning the verb there is nothing to cancel.
                     // !chevHit: the chevron already toggled on the PRESS, and
                     // this runs on the release - both firing would toggle twice.
-                    // LIST mode is REVERTED to double-click for now, and this
-                    // is why: with one-click entry, CI found that a Down aimed
-                    // at panel 1 also moved panel 2's cursor - Linux only, three
-                    // green local runs, and it survived three attempts to fix it
-                    // at the cursor writers and at rbGoTo. That is key ROUTING
-                    // changing, not a cursor bug, and I have not established the
-                    // mechanism. Shipping a keyboard that reaches the wrong
-                    // panel to save a click is a bad trade. The tree half stays:
-                    // it expands in place and never navigates, and it is green.
-                    if (r.isDir() && !r.up && !chevHit && I.tree) {
+                    if (r.isDir() && !r.up && !chevHit) {
                         std::string full = r.full();
-                        if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
+                        if (!I.tree) { rbGoTo(I, full); rbLeaving = true; }
+                        else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                         else rbTreeExpand(I, full);
                     } else {
                         rbActivateRow(r);
@@ -20671,7 +20663,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             //          click is just a click that arrived twice.
             //
             // ".." is single-click in both: it is the exit, not a folder row.
-            if (servable && !r.up && !chevHit && ImGui::IsItemHovered() &&
+            if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
+                ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 rbOpenRow(r);
             // §4.13.0's first entrance: double-clicking something the viewer
@@ -23172,10 +23165,10 @@ static std::string g_browseKeysActs =
     // where it is", so the single click is the folder's whole vocabulary and
     // there is no double-click meaning left to give it. Mouse back/forward and
     // Alt+Left/Right walk the history; a fresh navigation truncates forward.
-    "home,down,chkatrow:digitset,click,chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkback:5,"
+    "home,down,chkatrow:digitset,click,waitdir:digitset,chkback:5,"
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
-    "home,down,down,dbl,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
     // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
     // the name toggles it in place, a double-click goes to it. That is not the
     // ce02f12 latch this file used to forbid - THAT expanded on click one and
