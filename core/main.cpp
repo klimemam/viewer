@@ -25373,7 +25373,13 @@ int main(int argc, char** argv) {
             };
             auto join = [](const std::vector<std::string>& v) {
                 std::string o;
-                for (const auto& x : v) o += (o.empty() ? "" : " ") + x;
+                size_t len = 0;
+                for (const auto& x : v) len += x.length() + 1;
+                o.reserve(len);
+                for (const auto& x : v) {
+                    if (!o.empty()) o += " ";
+                    o += x;
+                }
                 return o;
             };
             std::vector<std::string> before = order(buildFileGroups(stacksCached()));
@@ -27331,7 +27337,13 @@ int main(int argc, char** argv) {
         {
             auto join = [](const std::vector<std::string>& v) {
                 std::string s;
-                for (const auto& a : v) { if (!s.empty()) s += ' '; s += a; }
+                size_t len = 0;
+                for (const auto& a : v) len += a.length() + 1;
+                s.reserve(len);
+                for (const auto& a : v) {
+                    if (!s.empty()) s += ' ';
+                    s += a;
+                }
                 return s;
             };
             auto mk = [&](const char* path, int seq, int seqIdx, int cfa, int pat,
