@@ -20568,7 +20568,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         I.toolbar.statusShown = shownN;
         I.toolbar.statusSel   = rbNSel;
 
-        std::string line = std::string(peerTag(B.host)) + " " + peerLabel(B.host);
+        std::string line = "";
         const char* DOT = " \xC2\xB7 ";              // U+00B7, in the font's Latin-1
         char cnt[96];
         // Counts BOTH directions. While a filter is narrowing, "34 items" alone
@@ -20581,7 +20581,6 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             snprintf(cnt, sizeof cnt, "%d of %d items", shownN, total);
         else
             snprintf(cnt, sizeof cnt, "%d item%s", total, total == 1 ? "" : "s");
-        line += DOT;
         line += cnt;
         // Selection, and only when there IS one: "0 selected" is noise on every
         // glance to report a state whose absence is already obvious.
@@ -20640,21 +20639,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             warn = true;
         }
         I.toolbar.statusFull = line;
-        // The verb sits at the right end and is measured FIRST: the text gets
-        // what is left, never the other way round. One row, always - the line
-        // elides, it does not wrap (300 px is a width this panel has to work
-        // at, and a status line that becomes two lines is another moving row).
-        const float endW = ImGui::CalcTextSize(rbEndLbl).x +
-                           ImGui::GetStyle().FramePadding.x * 2 +
-                           ImGui::GetStyle().ItemSpacing.x;
+        // One row, always - the line elides, it does not wrap (300 px is a width
+        // this panel has to work at, and a status line that becomes two lines is
+        // another moving row).
         const float avail = ImGui::GetContentRegionAvail().x;
-        // Too narrow for both: the FACT stays and the VERB goes. Disconnect has
-        // a second home - the root crumb's right-click menu - and the sentence
-        // has none, so the sentence wins the pixels. (The row count is the same
-        // either way: what changes with the panel's width is what is ON the row,
-        // never how many rows there are.)
-        const bool showEnd = avail - endW >= ImGui::GetFontSize() * 6;
-        float textW = showEnd ? avail - endW : avail;
+        float textW = avail;
         std::string shownLine = rbElideMiddle(line, textW);
         I.toolbar.statusText  = shownLine;
         I.toolbar.statusAvailW = textW;
@@ -20668,25 +20657,10 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // the untruncated sentence, plus the way to the full failure text -
             // the old band carried a "copy" button, and a second verb is
             // exactly what this line must not grow
-            ImGui::SetTooltip("%s%s%s", line.c_str(),
-                              B.err.empty() ? "" : "\n\nclick for the full failure text",
-                              showEnd ? "" : "\n\ntoo narrow for the disconnect button - "
-                                             "it is on the first crumb's right-click menu");
+            ImGui::SetTooltip("%s%s", line.c_str(),
+                              B.err.empty() ? "" : "\n\nclick for the full failure text");
             if (!B.err.empty() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 app.showRemoteError = true;
-        }
-        if (showEnd) {
-            ImGui::SameLine();
-            const float endX = ImGui::GetWindowContentRegionMax().x -
-                               (endW - ImGui::GetStyle().ItemSpacing.x);
-            if (ImGui::GetCursorPosX() < endX) ImGui::SetCursorPosX(endX);
-            if (ImGui::SmallButton(rbEndLbl)) rbDisconnect();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(rbLocalPeer
-                    ? "stop listing this machine and empty the panel\n"
-                      "(nothing is connected: the peer runs here, over a pipe)"
-                    : "drop the ssh session to %s and empty the panel",
-                    peerLabel(B.host).c_str());
         }
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
@@ -33804,8 +33778,7 @@ int main(int argc, char** argv) {
                                   says == (arg > 0) &&
                                   (arg == 0 ||
                                    g.statusFull.find(wantSel) != std::string::npos) &&
-                                  // it names the machine, and it is one line
-                                  g.statusFull.find(peerTag(rbKeysT().b.host)) == 0 &&
+                                  // it is one line
                                   g.statusText.find('\n') == std::string::npos;
                         chk(ok, "\"" + g.statusFull + "\"");
                     }
