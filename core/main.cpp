@@ -874,6 +874,11 @@ struct App {
         // keyboard cursor (row index into the built view, -1 = none)
         int cursor = -1;
         bool cursorScroll = false;    // bring it into view this frame
+        // A click GESTURE that navigated: how many clicks of it have landed so
+        // far (0 = no such gesture in flight). Everything after that click
+        // belongs to the navigation and not to the listing that replaced the
+        // one it was aimed at - see rbNavGesture in drawPanelRemote.
+        int navChain = 0;
         std::string curSig;           // host|dir|rev the cursor was built for
         bool curFlat = false, curTree = false;
         // sort spec, stashed from the table one frame late (see RB_COL_NAME)
@@ -905,6 +910,10 @@ struct App {
         RbToolbarGeom toolbar;
         ImVec2 cursorRect[2] = { ImVec2(0, 0), ImVec2(0, 0) };
         std::string cursorName;
+        // ...and its FULL path, which is the key the tree's `expanded` set is
+        // written in: "is the cursor row expanded" cannot be asked with a bare
+        // name, and counting the whole set answers a different question.
+        std::string cursorFull;
         // ...and the centre of the cursor row's chevron hit zone (tree dir
         // rows only; x < 0 = the row has no chevron), for "chevclick"
         ImVec2 cursorChev = ImVec2(-1, -1);
@@ -19438,6 +19447,41 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree
     // next frame" deferral that covered the tree cache and nothing else.)
     RbDeferredActions rbActions(I);
+    // ---- A GESTURE THAT NAVIGATES OWNS THE WHOLE GESTURE --------------------
+    // A folder row is entered on ONE click in a list now, and the pointer does
+    // not move afterwards. Two decades of "a folder takes two clicks" say the
+    // second click is coming anyway; it arrives one or two frames later, by
+    // which time the listing it was aimed at has been replaced under it, and
+    // without this it lands on whatever row now occupies that pixel - opening
+    // it, previewing it, or dragging the keyboard cursor onto it.
+    //
+    // That is not a hypothesis. browse-keys' instance segment double-clicks
+    // scanroot/10lx in panel 2, and on the ubuntu runner (where a local listing
+    // of eight files lands inside the ~8 ms frame budget the selftest runs at,
+    // which it does not on Windows) the log reads
+    //     185 dbl        dir=.../rb/scanroot rows=3 imgs=44
+    //     186 waitdir:10lx dir=.../rb/scanroot/10lx rows=1 imgs=52
+    // - eight images and a fifth stack that nobody asked for, because click two
+    // landed on 10lx's own frame_000..007 group, plus cursor=1 written by that
+    // click's release. Three earlier fixes all guarded the row that navigated;
+    // the write to stop belongs to a legitimate click on a DIFFERENT listing,
+    // so none of them could see it.
+    //
+    // The chain is ImGui's own: MouseClickedLastCount counts the clicks of one
+    // gesture and resets to 1 when the next press is too late or too far to
+    // chain. So "still the same gesture" is exactly "the count went up", and
+    // the first press that does not is the listing becoming live again.
+    // (".." is deliberately NOT latched: it is row 0 of every listing, so a
+    // repeat click there is a repeat of the same control - the toolbar's "up"
+    // button case - not a click that landed on something else.)
+    {
+        const ImGuiIO& nio = ImGui::GetIO();
+        if (I.navChain > 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            int n = nio.MouseClickedLastCount[ImGuiMouseButton_Left];
+            I.navChain = n > I.navChain ? n : 0;
+        }
+    }
+    const bool rbNavGesture = I.navChain > 0;
     // the focused panel is the one the File menu's remote commands aim at
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
         g_rbActiveNum = I.num;
@@ -20533,6 +20577,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 I.cursorRect[0] = ImGui::GetItemRectMin();
                 I.cursorRect[1] = ImGui::GetItemRectMax();
                 I.cursorName = rname;
+                I.cursorFull = r.full();   // the key `expanded` is written in
                 I.cursorChev = chevRow
                     ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
                              (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
@@ -20576,13 +20621,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // now. There is no double-click meaning on this zone (a fast pair
             // is two toggles), so nothing here is ever optimistic and nothing
             // ever needs cancelling - the anti-flash guarantee is structural.
-            if (chevHit && !r.ph && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (chevHit && !r.ph && !rbNavGesture &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 std::string full = r.full();
                 if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                 else rbTreeExpand(I, full);
                 rbCursor = ei;          // the mouse also places the keyboard
             }
-            if (rowClicked && servable) {
+            if (rowClicked && servable && !rbNavGesture) {
                 ImGuiIO& sio = ImGui::GetIO();
                 bool rbLeaving = false;      // this click navigates away
                 bool canSel = !r.up && ei < (int)rbSel.size();
@@ -20640,12 +20686,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 // rows it indexed are about to be replaced, and index 1 of the
                 // old place is a different row - or no row - in the new one.
                 // Said here rather than left to the sig-change reset at the top
-                // of the next frame, because the release half of the same
-                // double-click arrives in between and the old code let it write
-                // the cursor back. CI caught exactly that: panel 2 came back
-                // with cursor=1 where every navigation is supposed to leave -1,
-                // on Linux only, while three local runs stayed green.
+                // of the next frame, so that nothing can write it back in
+                // between. (The thing that used to write it back was the second
+                // half of the same double-click; that is handled one level up
+                // now - see rbNavGesture - because it was never only the cursor
+                // it wrote.)
                 rbCursor = rbLeaving ? -1 : ei;
+                // ...and the rest of THIS gesture belongs to the navigation.
+                if (rbLeaving) I.navChain = sio.MouseClickedLastCount[ImGuiMouseButton_Left];
             }
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
@@ -20664,9 +20712,15 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             //
             // ".." is single-click in both: it is the exit, not a folder row.
             if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
-                ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                !rbNavGesture && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 rbOpenRow(r);
+                // the tree's double-click navigates on the PRESS, so the same
+                // rule applies to it: the release is one frame behind, and one
+                // frame is enough for the new listing to be under the pointer
+                if (r.isDir())
+                    I.navChain = ImGui::GetIO().MouseClickedLastCount[ImGuiMouseButton_Left];
+            }
             // §4.13.0's first entrance: double-clicking something the viewer
             // cannot read opens the Reader panel on it, instead of the row being
             // simply inert. A dimmed row that does nothing when you double-click
@@ -20675,7 +20729,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // Local only: running the adapter on the peer is §4.13.1, and
             // pretending a remote path is a local one would hand the reader a
             // path that does not exist on this machine.
-            if (!servable && !r.ph && !r.up && !r.isDir() && ImGui::IsItemHovered() &&
+            if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
+                ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 if (B.host.empty())
                     openReaderPicker(r.full(), "the viewer has no native reading for this file");
@@ -23129,6 +23184,12 @@ static int g_expNeverHits = 0;          // frames rbHas(expanded, path) was true
 static int g_expNeverFrames = 0;        // frames watched
 static int g_chevPreExp = -1;           // "chevclick": expanded count pre-press
 static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
+// "imgmark" / "chkimgmark": how many documents were open before a gesture, and
+// the assertion that the gesture opened none. An absolute chkimg:N says the
+// same thing only as long as every count before it holds, which is a
+// maintenance tax on a 258-action list; this pair says "this gesture opened
+// nothing" in the two actions it takes to say it.
+static int g_rbImgMark = -1;
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,down,back,"
@@ -23168,6 +23229,18 @@ static std::string g_browseKeysActs =
     "home,down,chkatrow:digitset,click,waitdir:digitset,chkback:5,"
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
+    // ...and a folder that is DOUBLE-clicked is entered ONCE, and opens
+    // NOTHING. The habit is older than this panel, so the second click will
+    // arrive whatever the list mode means by one click; it lands a frame or
+    // two after rbGoTo, by which time the row it was aimed at has been
+    // replaced under a pointer that never moved. This is the assertion the
+    // one-click design lives or dies on, and it is the one CI produced the
+    // counter-example for: imgs 44 -> 52 between "dbl" and the listing
+    // landing - eight frames of the folder just entered, opened by a click
+    // aimed at the folder. Checked twice, because an open is asynchronous and
+    // one check right after the navigation could beat it.
+    "home,down,chkatrow:digitset,imgmark,dbl,waitdir:digitset,chkimgmark,"
+    "chkfwd:0,back,waitdir:rb,chkimgmark,"
     "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
     // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
     // the name toggles it in place, a double-click goes to it. That is not the
@@ -23175,15 +23248,29 @@ static std::string g_browseKeysActs =
     // CANCELLED on click two, so the expand was rendered and then undone. Here
     // click one expands and it STAYS expanded; the double-click adds a
     // navigation on top. Nothing is undone, so there is nothing to flash.
-    // ...in a TREE a folder has TWO verbs and both gestures are spoken for: the
-    // name toggles it in place, a double-click goes to it. Only the navigation
-    // is asserted here, and that is a gap worth naming rather than papering
-    // over: chkexp counts EVERY expanded folder in the panel, not the cursor
-    // row's own state, so it cannot express "this row toggled" unless the whole
-    // panel starts collapsed - and the keyboard section far above leaves one
-    // open with Right. The name-click and chevron toggles want a probe that
-    // reads rbHas(expanded, cursor path); that probe does not exist yet.
-    "tree,home,down,chkatrow:digitset,dbl,waitdir:digitset,back,waitdir:rb,tree,"
+    //
+    // The toggles are asserted on THIS ROW now (chkrowexp), which is what the
+    // gap named here used to be: chkexp counts every expanded folder in the
+    // panel, so "the name-click toggled this row" was only expressible when
+    // the panel started fully collapsed - and the keyboard section far above
+    // leaves one open with Right, so it was not expressible at all. cursorFull
+    // is the exact key `expanded` is written in, so the question is asked
+    // directly.
+    //
+    // The two toggles ALTERNATE name / chevron on purpose: two clicks at the
+    // same pixel inside ImGui's double-click window are one gesture with a
+    // count of two, not two gestures, and the second would be read as a
+    // double-click. The name (row centre + 40 px) and the chevron (the left
+    // gutter) are far enough apart that each press starts a fresh chain, so
+    // this reads the same at any frame rate.
+    "tree,home,down,chkatrow:digitset,chkrowexp:0,"
+    "click,chkrowexp:1,chevclick,chkrowexp:0,"
+    "click,chkrowexp:1,chevclick,chkrowexp:0,"
+    // ...and the OTHER verb, on the same row: a double-click navigates, once,
+    // and opens nothing on the way (the tree's navigation happens on the
+    // second PRESS, so its release is one frame behind - the same window the
+    // list's is two frames behind).
+    "imgmark,dbl,waitdir:digitset,chkimgmark,back,waitdir:rb,tree,"
     // ---- Enter on a multi-selection opens EVERY selected row, each group
     // as its own stack (the action-row button is the MERGE; this is the other
     // one - only the cursor's row used to open).
@@ -23215,7 +23302,7 @@ static std::string g_browseKeysActs =
     // selection is per instance too
     "ctrlclick,chksel:1,target:1,chksel:0,target:2,"
     // ...and so is the history: navigating panel 2 records nothing in panel 1
-    "dbl,waitdir:10lx,chkback:1,target:1,chkback:0,"
+    "imgmark,dbl,waitdir:10lx,chkimgmark,chkback:1,target:1,chkback:0,"
     // focus back on panel 1: the same keys now move ITS cursor, and panel 2's
     // (reset to -1 by its own navigation) stays put
     "focus,chkfocus:1,down,chkcursor:0,target:2,chkcursor:-1,"
@@ -34613,12 +34700,29 @@ int main(int argc, char** argv) {
                                                   "back=" + std::to_string((int)rbKeysT().histBack.size()) +
                                                   " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
                     else if (op == "chkexp")  chk((int)rbKeysT().expanded.size() == arg);
+                    // ...and the one chkexp cannot say: is the row the cursor is
+                    // ON expanded? chkexp counts the whole panel, so "this row
+                    // toggled" was only expressible when nothing else in the
+                    // panel was open - and the keyboard section far above leaves
+                    // one open with Right, so it was not expressible at all.
+                    // cursorFull is the exact key `expanded` is written in, at
+                    // any depth, so this asks the question directly.
+                    else if (op == "chkrowexp")
+                        chk(rbHas(rbKeysT().expanded, rbKeysT().cursorFull) == (arg != 0),
+                            "row \"" + rbKeysT().cursorFull + "\" expanded=" +
+                            std::to_string(rbHas(rbKeysT().expanded, rbKeysT().cursorFull) ? 1 : 0) +
+                            " of " + std::to_string((int)rbKeysT().expanded.size()) +
+                            " expanded in the panel");
+                    else if (a == "imgmark") g_rbImgMark = (int)app.images.size();
+                    else if (a == "chkimgmark")
+                        chk((int)app.images.size() == g_rbImgMark,
+                            "opened " + std::to_string((int)app.images.size() - g_rbImgMark) +
+                            " document(s) since the mark (" +
+                            std::to_string(g_rbImgMark) + ")");
                     else if (a == "exparm") {
                         // arm the per-frame watch on the CURSOR row's path -
                         // the row the next gesture will be aimed at
-                        const std::string& d4 = rbKeysT().b.dir;
-                        g_expNeverPath = (d4 == "/" ? "/" : d4 + "/") +
-                                         rbKeysT().cursorName;
+                        g_expNeverPath = rbKeysT().cursorFull;
                         g_expNeverHits = g_expNeverFrames = 0;
                     }
                     else if (op == "chkexpn") {
