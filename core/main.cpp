@@ -23147,19 +23147,6 @@ static void printUsage() {
         "                              selftests that never draw (nothing else runs)\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
-<<<<<<< HEAD
-=======
-        "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
-        "  --tile-selftest <dir>       side-by-side compare panes: geometry, print, exit\n"
-        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
-        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
-        "  --frame-lin-selftest        frame-wise linearity (Temporal section): synthetic\n"
-        "                              stacks with exact means, both fit methods, exit\n"
-        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
-        "  --newwin-selftest <dir>     instance autosave slots + spawn line, print, exit\n"
-        "  --srcmap-selftest <dir>     which document holds which pixels (srcId / rev /\n"
-        "                              use_count / Watch baseline), print, exit\n"
->>>>>>> origin/verify-probes
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
@@ -23187,6 +23174,8 @@ static void printUsage() {
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
+        "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
+        "                              refcounts, Watch baselines\n"
         "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
         "  --browse-selftest <dir>     Browse panel behaviour\n"
         "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
