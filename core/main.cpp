@@ -68,6 +68,7 @@
 #include <ctime>                      // wall-clock stamp on measurement results
 #include <thread>
 #include <vector>
+#include <deque>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -838,7 +839,7 @@ struct App {
         std::unique_ptr<remote::Session> session;   // the worker's, exclusively
         std::thread thread;
         std::mutex mtx;               // guards queue / done / phase
-        std::vector<RbJob> queue;
+        std::deque<RbJob> queue;
         std::vector<RbResult> done;
         std::string phase;            // what the worker is doing, for the UI
         std::atomic<bool> busy{ false };
@@ -10300,7 +10301,7 @@ static void rbWorker(App::BrowseInstance* ip) {
             std::lock_guard<std::mutex> lk(I.mtx);
             if (!I.queue.empty()) {
                 job = std::move(I.queue.front());
-                I.queue.erase(I.queue.begin());
+                I.queue.pop_front();
                 have = true;
             }
         }
