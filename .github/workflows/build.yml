@@ -39,9 +39,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # xvfb + libgl1-mesa-dri: five of the 22 selftests create a real GLFW
+          # xvfb + libgl1-mesa-dri: six of the 27 selftests create a real GLFW
           # window and a GL context, so a headless runner needs a display and a
-          # software GL driver to run those five - and this is the only runner
+          # software GL driver to run those six - and this is the only runner
           # in the matrix where they can run at all. (The bench step needs them
           # too and used to install them itself, halfway down the job.)
           sudo apt-get install -y xorg-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev \
@@ -51,7 +51,7 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # The 22 --*-selftest flags, on every OS in the matrix. The list lives in
+      # The 24 --*-selftest flags, on every OS in the matrix. The list lives in
       # CMakeLists.txt; this script builds, regenerates tools/testdata and runs
       # ctest, printing one line per selftest and the full output of any that
       # fail. Same command a developer runs locally - that is the point of it.
@@ -59,11 +59,11 @@ jobs:
       #
       # The script probes for an OpenGL context first and reports what it found.
       # Only the Linux runner has one (xvfb + libgl1-mesa-dri, installed above),
-      # and it runs all 22. On Windows and macOS the hosted runners have no GL,
-      # so the 17 that take the --no-window startup path run and gate there,
-      # and the five that draw real ImGui frames are skipped BY NAME with GLFW's
-      # own reason printed. Read the "ran N, skipped M" line: it is 22/0 on
-      # Linux and 17/5 on the other two, and a run that selects nothing at all
+      # and it runs all 27. On Windows and macOS the hosted runners have no GL,
+      # so the 21 that take the --no-window startup path run and gate there,
+      # and the six that draw real ImGui frames are skipped BY NAME with GLFW's
+      # own reason printed. Read the "ran N, skipped M" line: it is 27/0 on
+      # Linux and 21/6 on the other two, and a run that selects nothing at all
       # is a failure rather than a very fast pass.
       #
       # Nothing here lists any test. Which set a test belongs to is the word

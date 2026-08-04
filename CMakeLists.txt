@@ -262,7 +262,7 @@ else()
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
-# The binary carries 23 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# The binary carries 24 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
 # script to get exactly what CI got. There is no second copy of the argument
 # lists anywhere - adding a test here adds it to CI.
@@ -277,8 +277,9 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# There are five of them; the other 17 take the --no-window startup path and
-# need neither a display nor this launcher.
+# Six of the tests below do (seven counting the quarantined line at the bottom);
+# the other 19 take the --no-window startup path and need neither a display nor
+# this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_program(XVFB_RUN xvfb-run)
@@ -411,14 +412,23 @@ add_test(NAME test_display_falsecolor COMMAND test_display_falsecolor)
 set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
-# through --no-window against this build, and the 17 below came back with output
+# through --no-window against this build, and the 19 below came back with output
 # byte-identical to the same test with a window (the load-progress line
 # "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
-# mode). The five without it - browse-keys, abstats, verify, tile, frame-lin -
-# stop at needWindow() and say so; they drive real ImGui frames and assert on
-# the LAYOUT that comes back, which is exactly what the backends the window
-# carries are what produce.
+# mode). The six without it - browse-keys, browse-dbl, abstats, verify, tile,
+# frame-lin - stop at needWindow() and say so; they drive real ImGui frames and
+# assert on the LAYOUT that comes back, which is exactly what the backends the
+# window carries are what produce.
+#
+# `roistats` is the one that had to EARN its NOGL rather than merely take it,
+# because it is the only test here that draws ImGui frames without a backend
+# under them (roiStatsSelftest() supplies the display size, the delta time and
+# the rasterised font atlas by hand, which is all the two backends contribute
+# that ImGui cannot proceed without). Measured the same way as the rest and to
+# the same standard - `viewer --roistats-selftest` against
+# `viewer --roistats-selftest --no-window`, byte-identical, no exceptions, which
+# is why its dump prints numbers and no rectangles.
 viewer_selftest(series      NOGL --series-selftest tools/testdata/linset)
 viewer_selftest(lin         NOGL --lin-selftest --stack always
                             --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
@@ -454,9 +464,17 @@ viewer_selftest(range       NOGL --range-selftest tools/testdata/multi)
 viewer_selftest(close       NOGL --close-selftest tools/testdata/multi)
 viewer_selftest(batch       NOGL --batch-selftest tools/testdata/multi)
 viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
-# The ROI row probe: real frames with an injected cursor, asserting on the rows
-# the panel actually laid out.
+# The ROI row probe: real frames with an injected cursor, asserting on where the
+# rows the panel laid out actually are - the delete button's rect and the clicks
+# that have to reach it past a span-all-columns Selectable.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)
+# ...and the same panel's NUMBERS, which are not a rectangle and so do not need
+# a display. V19 used to hold both, which put the PRNU column's arithmetic
+# behind a GL context and therefore on one runner of the three: it was measured
+# on Linux and shipped everywhere. Same panel, same cache, same clipper, same
+# PRNU cell, same probe - a frame with no backend under it. Analytic fixtures
+# built in memory, so it needs no fixture directory.
+viewer_selftest(roistats    NOGL --roistats-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)

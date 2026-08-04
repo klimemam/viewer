@@ -23503,6 +23503,10 @@ static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise line
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
+// --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
+// window. It takes no directory because it needs no file: every fixture it
+// measures is analytic and built in memory (see roiStatsSelftest()).
+static bool g_roiStatsSelftest = false;
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -23822,6 +23826,8 @@ static void printUsage() {
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
+        "  --roistats-selftest         the ROI table's numbers and its PRNU column,\n"
+        "                              through the real panel, on analytic fixtures\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
         "                              refcounts, Watch baselines\n"
@@ -23944,6 +23950,8 @@ static void parseCli(int argc, char** argv) {
             g_exportTsvSelftest = next();          // handled in main()
         } else if (a == "--frame-lin-selftest") {
             g_frameLinSelftest = true;             // handled in main()
+        } else if (a == "--roistats-selftest") {
+            g_roiStatsSelftest = true;             // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
@@ -24887,6 +24895,315 @@ static bool needWindow(const char* what) {
     stopRemoteFetcher();
     stopMeasureWorker();
     return false;
+}
+
+// ---- --roistats-selftest: the ROI table's NUMBERS, anywhere ----------------
+// These assertions used to be the first half of --verify-selftest's V19, and
+// V19 needs a window, so they ran on exactly one runner of the three: Linux,
+// where CI installs xvfb. The PRNU column shipped having been measured on one
+// OS. That is the same shape of mistake as test_prnu labelled `nogl` only and
+// abstats-cfa-bayer measuring the wrong thing, and it is not a property of the
+// arithmetic - it is a property of how the arithmetic was reached.
+//
+// What actually needs the window is LAYOUT: where the delete button landed and
+// whether a click reaches it. That stays in V19. Everything here is a number,
+// and a number does not need a display to be right.
+//
+// It is still the REAL panel, not a second implementation: drawPanelRois() is
+// called, the numbers go through roiBasicStats' hash cache and the clipper, and
+// what is asserted is what the PRNU cell printed, read back through the same
+// g_roiRowProbe V19 uses. The only thing that changes is who supplies the frame.
+//
+// Fixtures are analytic and built in memory, so this test opens no file, needs
+// no fixture directory, and cannot be made to pass by a fixture drifting.
+static int roiStatsSelftest() {
+    bool ok = true;
+    auto check = [&](bool cond, const char* what) {
+        fprintf(stderr, "roistatsselftest: %-46s %s\n", what, cond ? "PASS" : "FAIL");
+        if (!cond) ok = false;
+    };
+    // every row is identical, so whatever rows the stride lands on give exactly
+    // mean=base(+off), sd=amp, min/max=base(+off)-+amp
+    auto mkMono = [](int W2, int H2, double base, double amp, double rightOff) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = "v19mono"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->src->dtype = "u16";
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] =
+                    (float)(base + ((x & 1) ? amp : -amp) + (x >= W2 / 2 ? rightOff : 0));
+        d->syncMirrors();
+        d->uid = app.nextUid++;
+        return d;
+    };
+    // per-plane level plus a within-plane dither, so a plane's sd is NOT zero:
+    // a flat plane would let a broken sd read 0 and look right
+    auto mkCfaD = [](int W2, int H2, double amp) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = "v19cfa"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->cfa = 1; d->cfaPattern = 0; d->src->dtype = "u16";
+        static const double LVL[4] = { 1000, 2000, 3000, 4000 };
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] =
+                    (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] +
+                            (((x >> 1) & 1) ? amp : -amp));
+        d->syncMirrors();
+        d->uid = app.nextUid++;
+        return d;
+    };
+
+    // One frame of the ROI panel, with or without the backends.
+    //
+    // ImGui_ImplGlfw_NewFrame and ImGui_ImplOpenGL3_NewFrame are the only part
+    // of a frame that touches a device, and the only things they contribute
+    // that ImGui cannot proceed without are three values: a display to lay out
+    // in, a delta time, and a font atlas that has actually been rasterised.
+    // Startup builds the ImGui context, the style and the atlas' font list even
+    // under --no-window (it says so at the CreateContext call) - rasterising
+    // the atlas is the RENDERER backend's job, and that is the one thing left
+    // to do by hand. Everything the ROI table is made of downstream of this -
+    // the table, the clipper, every widget's rect, and every number in it - is
+    // pure CPU on both sides of the branch.
+    //
+    // Which is exactly the claim this test would be worthless without, so it is
+    // MEASURED rather than asserted here: run the binary with and without
+    // --no-window and diff the output. See the NOGL comment in CMakeLists.txt.
+    ImGuiIO& io = ImGui::GetIO();
+    auto roiFrame = [&]() {
+        if (g_haveWindow) {
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+        } else {
+            io.DisplaySize = ImVec2(1600, 1000);        // the real window's size
+            io.DisplayFramebufferScale = ImVec2(1, 1);
+            io.DeltaTime = 1.0f / 60.0f;
+            if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+        }
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_Always);
+        ImGui::Begin("RoiStatsProbe", nullptr,
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+        g_roiRowProbeOn = true;
+        drawPanelRois();
+        ImGui::End();
+        ImGui::EndFrame();
+    };
+    auto settle = [&] { for (int f = 0; f < 4; f++) roiFrame(); };
+    auto row = [&](int id) -> const RoiRowProbe* {
+        for (const auto& r : g_roiRowProbe) if (r.id == id) return &r;
+        return nullptr;
+    };
+    // No rect in this dump, deliberately. Where a row landed is a function of
+    // the display the frame was laid out in, and this test's whole point is
+    // that its output does not depend on that: the two runs the NOGL claim
+    // rests on have to be comparable byte for byte.
+    auto dump = [&](const char* what) {
+        for (const auto& r : g_roiRowProbe)
+            fprintf(stderr, "roistatsselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
+                            "min=%.10g max=%.10g prnu=%.10g(ok=%d) n=%zu step=%zu "
+                            "valid=%d\n",
+                    what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
+                    r.prnu, (int)r.prnuOk, r.s.n, r.s.step, (int)r.s.valid);
+    };
+    auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
+
+    closeAll();
+    app.images.push_back(mkMono(1024, 1024, 30000.0, 2.0, 1000.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 100, 100, 256, 256);          // wholly in the left half
+    const int roiId = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("mono left");
+    const RoiRowProbe* ra = row(0);
+    const RoiRowProbe* rr = row(roiId);
+    check(ra && ra->s.valid, "V19 panel prints the All row");
+    check(rr && rr->s.valid, "V19 panel prints a placed ROI row");
+    // sd is the whole point of this panel: assert it is the real sigma, never
+    // 0. All row: values 29998/30002/30998/31002 in equal quarters -> mean
+    // 30500, var = 500^2 + 2^2.
+    if (ra) {
+        check(nearEq(ra->s.mean, 30500.0), "V19 All row mean is the true mean");
+        check(nearEq(ra->s.sd, sqrt(250004.0)), "V19 All row sd is the true sigma");
+        check(nearEq(ra->s.mn, 29998.0) && nearEq(ra->s.mx, 31002.0),
+              "V19 All row min/max are the true extremes");
+        check(ra->s.n > 0 && ra->s.n < (size_t)1024 * 1024,
+              "V19 All row decimates and can say n");
+        // PRNU is those two numbers divided, so it is pinned to them rather
+        // than to a second scan: on a decimated row that is the whole point -
+        // the ratio describes the sample the sd describes
+        check(ra->prnuOk && nearEq(ra->prnu, sqrt(250004.0) / 30500.0 * 100.0),
+              "V19 All row PRNU is the sd and mean it printed, divided");
+    }
+    if (rr) {
+        check(nearEq(rr->s.mean, 30000.0), "V19 ROI row mean is the true mean");
+        check(nearEq(rr->s.sd, 2.0), "V19 ROI row sd is the true sigma");
+        check(nearEq(rr->s.mn, 29998.0) && nearEq(rr->s.mx, 30002.0),
+              "V19 ROI row min/max are the true extremes");
+        check(rr->prnuOk && nearEq(rr->prnu, 2.0 / 30000.0 * 100.0),
+              "V19 ROI row PRNU is sd / mean x 100");
+    }
+    // ...and the cached panel path must FOLLOW the ROI when it moves
+    findAnn(roiId)->x = 600;                 // wholly in the right half
+    app.annRev++;
+    settle();
+    dump("mono right");
+    rr = row(roiId);
+    check(rr && nearEq(rr->s.mean, 31000.0) && nearEq(rr->s.sd, 2.0),
+          "V19 moving the ROI updates the printed numbers");
+    // the same sd over a higher mean is a SMALLER percentage: a PRNU that
+    // stayed at the old row's value would still look plausible
+    check(rr && rr->prnuOk && nearEq(rr->prnu, 2.0 / 31000.0 * 100.0),
+          "V19 PRNU moves with the ROI, not with the cache");
+
+    // sigma at the noise floor, on a large pedestal: the regime this panel
+    // exists for. sum2/n - mean^2 cancels ~10 of double's 16 digits here
+    // (3.6e9 against a variance of 0.25), so if the two-pass form is fragile
+    // for real 16-bit data this is where it shows. It is also the assertion
+    // that most deserved to run on more than one compiler's floating point.
+    closeAll();
+    app.images.push_back(mkMono(1024, 1024, 60000.0, 0.5, 0.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 512, 512);
+    const int floorRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("60000+/-0.5");
+    if (const RoiRowProbe* rf = row(floorRoi)) {
+        fprintf(stderr, "roistatsselftest: V19 noise floor sd err = %.3e (want 0.5)\n",
+                rf->s.sd - 0.5);
+        check(nearEq(rf->s.mean, 60000.0), "V19 noise-floor mean survives the pedestal");
+        check(fabs(rf->s.sd - 0.5) < 1e-9, "V19 sigma 0.5 DN on a 60000 DN pedestal");
+    }
+
+    // channel switching, through the panel, on a Bayer frame: each plane is its
+    // own population and must never be mixed with its neighbours
+    closeAll();
+    app.images.push_back(mkCfaD(1024, 1024, 3.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 512, 512);
+    const int cfaRoi = app.anns.back().id;
+    static const double PLV[4] = { 1000, 2000, 3000, 4000 };
+    bool chOk = true, chSd = true, chPr = true;
+    double pooledPr = -1, planeSumPr = 0;
+    app.roiChannel = -1;
+    settle();
+    dump("cfa all");
+    if (const RoiRowProbe* r0 = row(cfaRoi)) {
+        chOk = chOk && nearEq(r0->s.mean, 2500.0) && nearEq(r0->s.sd, sqrt(1250009.0));
+        if (r0->prnuOk) pooledPr = r0->prnu;
+    }
+    for (int c = 0; c < 4; c++) {
+        app.roiChannel = c;
+        settle();
+        dump(CFA_CH_NAMES[c]);
+        const RoiRowProbe* rc = row(cfaRoi);
+        if (!rc || !rc->s.valid || !nearEq(rc->s.mean, PLV[c])) chOk = false;
+        if (!rc || !nearEq(rc->s.sd, 3.0)) chSd = false;
+        // each plane divides by ITS OWN level, so the same 3 DN of dither is
+        // 0.3% on R and 0.075% on B
+        if (!rc || !rc->prnuOk || !nearEq(rc->prnu, 3.0 / PLV[c] * 100.0)) chPr = false;
+        if (rc && rc->prnuOk) planeSumPr += rc->prnu;
+    }
+    check(chOk, "V19 channel switch repoints the panel's numbers");
+    check(chSd, "V19 per-plane sd is the plane's own sigma");
+    check(chPr, "V19 per-plane PRNU divides by that plane's own mean");
+    // The pooled row is a different measurement, not a summary of the four: its
+    // sd carries the level differences BETWEEN the planes, so its PRNU (~44.7%)
+    // is two orders above the planes' (~0.16% mean). Anyone tempted to average
+    // the plane column would land on the second number and it would look like
+    // the answer.
+    fprintf(stderr, "roistatsselftest: V19 pooled PRNU %.10g %%, planes averaged "
+                    "%.10g %%\n", pooledPr, planeSumPr / 4.0);
+    check(nearEq(pooledPr, sqrt(1250009.0) / 2500.0 * 100.0),
+          "V19 the pooled row's PRNU is pooled sd over pooled mean");
+    check(pooledPr > planeSumPr / 4.0 * 100.0,
+          "V19 the pooled PRNU is not the planes' PRNUs averaged");
+    app.roiChannel = -1;
+
+    // A 1x1 ROI is reachable from the editor's x/y/w/h fields and from a
+    // restored session. n = 1 makes sd exactly 0 and mean = min = max, which
+    // reads exactly like a broken panel - so the panel has to be able to say n.
+    // Pin both the number and the disclosure.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 4, 4, 1, 1);
+    const int oneRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("1x1");
+    if (const RoiRowProbe* r1 = row(oneRoi)) {
+        check(r1->s.valid && r1->s.n == 1, "V19 a 1x1 ROI measures exactly one pixel");
+        check(r1->s.sd == 0.0 && r1->s.mn == r1->s.mx,
+              "V19 n=1 gives sd 0 - the panel's n is what explains it");
+        // no second convention for n=1: PRNU follows sd, which is 0, so the
+        // column reads 0 and the same n line explains both
+        check(r1->prnuOk && r1->prnu == 0.0,
+              "V19 n=1 gives PRNU 0 for the same reason sd is 0");
+        check(r1->s.step >= 1, "V19 the stat carries the stride it sampled at");
+    }
+    // ...and a decimated ROI must report the stride that produced its n
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 1024, 1024);
+    const int bigRoi = app.anns.back().id;
+    settle();
+    dump("full 1024^2");
+    if (const RoiRowProbe* rb = row(bigRoi))
+        check(rb->s.step > 1 && rb->s.n < (size_t)1024 * 1024,
+              "V19 a decimated ROI says both n and its stride");
+
+    // the channel selector's clamp: one past the last plane is not a plane, and
+    // CFA_SEL has no fifth entry
+    app.roiChannel = 99;
+    settle();
+    check(app.roiChannel == 3, "V19 roiChannel clamps to the last CFA plane");
+    app.roiChannel = -1;
+
+    // ---- mean == 0 ---------------------------------------------------------
+    // sd/mean has no value there, and this table's numbers are pasted into
+    // reports: a nan or an inf in a pasted cell is worse than a blank, because
+    // it travels as if it were a measurement. The row still has a real mean and
+    // a real sd - only the ratio is withheld - so the test pins the sd too, or
+    // "-" could mean the row died. A bipolar frame is the everyday way here (a
+    // difference image).
+    closeAll();
+    {
+        auto z = mkMono(256, 256, 0.0, 2.0, 0.0);
+        z->src->dtype = "f32";          // values below zero are not a u16
+        z->syncMirrors();
+        app.images.push_back(std::move(z));
+    }
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 256, 256);
+    const int zeroRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("mean 0");
+    if (const RoiRowProbe* rz = row(zeroRoi)) {
+        check(rz->s.valid && rz->s.mean == 0.0 && nearEq(rz->s.sd, 2.0),
+              "V19 a bipolar ROI measures mean 0 with a real sd");
+        check(!rz->prnuOk, "V19 mean 0 prints no PRNU - not a nan, not an inf");
+    }
+    if (const RoiRowProbe* rz0 = row(0))
+        check(!rz0->prnuOk, "V19 the All row withholds PRNU at mean 0 too");
+
+    g_roiRowProbeOn = false;
+    fprintf(stderr, "roistatsselftest: %s\n", ok ? "ok" : "FAILED");
+    // the same orderly shutdown every early-returning selftest does: an
+    // unjoined worker at exit is std::terminate() under the last line printed
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
@@ -28261,6 +28578,11 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // The ROI table's numbers. Windowless, so it runs on every runner in the
+    // matrix rather than only on the one that has a GL context - see
+    // roiStatsSelftest(), and V19 below for the half of it that does draw.
+    if (g_roiStatsSelftest) return roiStatsSelftest();
+
     if (!g_verifySelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = nowSec();
@@ -29261,32 +29583,24 @@ int main(int argc, char** argv) {
             }
         }
 
-        {   // ---- V19: the ROI TABLE's numbers, and its delete button ---------
-            // V18 and every other ROI assert call roiBasicStats* directly. The
-            // panel reaches those numbers through a hash cache, prints them from
-            // inside a clipper, and puts its delete button in the last column of
-            // a row whose label Selectable spans ALL columns. None of those three
-            // layers had a test. So drive the real panel in real frames and read
-            // back what it actually printed, and where the button actually is.
+        {   // ---- V19: the ROI table's LAYOUT, and its delete button ----------
+            // The panel reaches its numbers through a hash cache, prints them
+            // from inside a clipper, and puts its delete button in the last
+            // column of a row whose label Selectable spans ALL columns. None of
+            // those three layers had a test. So drive the real panel in real
+            // frames and read back where the button actually is.
             //
-            // Fixtures are analytic, never a second implementation of the stats:
-            // every row is identical, so whatever rows the stride lands on give
-            // exactly mean=base(+off), sd=amp, min/max=base(+off)-+amp.
-            auto mkMono = [](int W2, int H2, double base, double amp, double rightOff) {
-                auto d = std::make_unique<ImageDoc>();
-                d->name = "v19mono"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
-                d->src->dtype = "u16";
-                d->src->data.resize((size_t)W2 * H2);
-                for (int y = 0; y < H2; y++)
-                    for (int x = 0; x < W2; x++)
-                        d->px()[(size_t)y * W2 + x] =
-                            (float)(base + ((x & 1) ? amp : -amp) + (x >= W2 / 2 ? rightOff : 0));
-                d->syncMirrors();
-                d->uid = app.nextUid++;
-                return d;
-            };
-            // per-plane level plus a within-plane dither, so a plane's sd is NOT
-            // zero: a flat plane would let a broken sd read 0 and look right
+            // The NUMBERS moved out, to --roistats-selftest (roiStatsSelftest()).
+            // They are the same panel, the same cache, the same clipper and the
+            // same PRNU cell, read back through this same probe - but a number
+            // is not a rectangle, and asking for a GL context to check one had
+            // the PRNU column measured on one runner of the three. What stays
+            // here is what a display genuinely decides: where the row's delete
+            // button landed, and whether a click reaches it past the Selectable
+            // that covers it.
+            //
+            // Fixture is analytic, so this needs no file: per-plane levels plus
+            // a within-plane dither, on a Bayer frame.
             auto mkCfaD = [](int W2, int H2, double amp) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = "v19cfa"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
@@ -29333,174 +29647,21 @@ int main(int argc, char** argv) {
                 for (const auto& r : g_roiRowProbe) if (r.id == id) return &r;
                 return nullptr;
             };
-            auto dump = [&](const char* what) {
-                for (const auto& r : g_roiRowProbe)
-                    fprintf(stderr, "verifyselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
-                                    "min=%.10g max=%.10g prnu=%.10g(ok=%d) n=%zu valid=%d "
-                                    "del=%.0f,%.0f\n",
-                            what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
-                            r.prnu, (int)r.prnuOk, r.s.n, (int)r.s.valid, r.del.x, r.del.y);
-            };
-            auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
 
-            closeAll();
-            app.images.push_back(mkMono(1024, 1024, 30000.0, 2.0, 1000.0));
-            app.current = 0;
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 100, 100, 256, 256);          // wholly in the left half
-            const int roiId = app.anns.back().id;
-            app.roiChannel = -1;
-            settle();
-            dump("mono left");
-            const RoiRowProbe* ra = row(0);
-            const RoiRowProbe* rr = row(roiId);
-            check(ra && ra->s.valid, "V19 panel prints the All row");
-            check(rr && rr->s.valid, "V19 panel prints a placed ROI row");
-            // sd is the whole point of this panel: assert it is the real sigma,
-            // never 0. All row: values 29998/30002/30998/31002 in equal quarters
-            // -> mean 30500, var = 500^2 + 2^2.
-            if (ra) {
-                check(nearEq(ra->s.mean, 30500.0), "V19 All row mean is the true mean");
-                check(nearEq(ra->s.sd, sqrt(250004.0)), "V19 All row sd is the true sigma");
-                check(nearEq(ra->s.mn, 29998.0) && nearEq(ra->s.mx, 31002.0),
-                      "V19 All row min/max are the true extremes");
-                check(ra->s.n > 0 && ra->s.n < (size_t)1024 * 1024,
-                      "V19 All row decimates and can say n");
-                // PRNU is those two numbers divided, so it is pinned to them
-                // rather than to a second scan: on a decimated row that is the
-                // whole point - the ratio describes the sample the sd describes
-                check(ra->prnuOk && nearEq(ra->prnu, sqrt(250004.0) / 30500.0 * 100.0),
-                      "V19 All row PRNU is the sd and mean it printed, divided");
-            }
-            if (rr) {
-                check(nearEq(rr->s.mean, 30000.0), "V19 ROI row mean is the true mean");
-                check(nearEq(rr->s.sd, 2.0), "V19 ROI row sd is the true sigma");
-                check(nearEq(rr->s.mn, 29998.0) && nearEq(rr->s.mx, 30002.0),
-                      "V19 ROI row min/max are the true extremes");
-                check(rr->prnuOk && nearEq(rr->prnu, 2.0 / 30000.0 * 100.0),
-                      "V19 ROI row PRNU is sd / mean x 100");
-            }
-            // ...and the cached panel path must FOLLOW the ROI when it moves
-            findAnn(roiId)->x = 600;                 // wholly in the right half
-            app.annRev++;
-            settle();
-            dump("mono right");
-            rr = row(roiId);
-            check(rr && nearEq(rr->s.mean, 31000.0) && nearEq(rr->s.sd, 2.0),
-                  "V19 moving the ROI updates the printed numbers");
-            // the same sd over a higher mean is a SMALLER percentage: a PRNU
-            // that stayed at the old row's value would still look plausible
-            check(rr && rr->prnuOk && nearEq(rr->prnu, 2.0 / 31000.0 * 100.0),
-                  "V19 PRNU moves with the ROI, not with the cache");
-
-            // sigma at the noise floor, on a large pedestal: the regime this
-            // panel exists for. sum2/n - mean^2 cancels ~10 of double's 16
-            // digits here (3.6e9 against a variance of 0.25), so if the two-pass
-            // form is fragile for real 16-bit data this is where it shows.
-            closeAll();
-            app.images.push_back(mkMono(1024, 1024, 60000.0, 0.5, 0.0));
-            app.current = 0;
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 0, 0, 512, 512);
-            const int floorRoi = app.anns.back().id;
-            app.roiChannel = -1;
-            settle();
-            dump("60000+/-0.5");
-            if (const RoiRowProbe* rf = row(floorRoi)) {
-                fprintf(stderr, "verifyselftest: V19 noise floor sd err = %.3e (want 0.5)\n",
-                        rf->s.sd - 0.5);
-                check(nearEq(rf->s.mean, 60000.0), "V19 noise-floor mean survives the pedestal");
-                check(fabs(rf->s.sd - 0.5) < 1e-9, "V19 sigma 0.5 DN on a 60000 DN pedestal");
-            }
-
-            // channel switching, through the panel, on a Bayer frame: each plane
-            // is its own population and must never be mixed with its neighbours
             closeAll();
             app.images.push_back(mkCfaD(1024, 1024, 3.0));
             app.current = 0;
             app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
             addAnn(0, 0, 0, 512, 512);
-            const int cfaRoi = app.anns.back().id;
-            static const double PLV[4] = { 1000, 2000, 3000, 4000 };
-            bool chOk = true, chSd = true, chPr = true;
-            double pooledPr = -1, planeSumPr = 0;
-            app.roiChannel = -1;
-            settle();
-            dump("cfa all");
-            if (const RoiRowProbe* r0 = row(cfaRoi)) {
-                chOk = chOk && nearEq(r0->s.mean, 2500.0) && nearEq(r0->s.sd, sqrt(1250009.0));
-                if (r0->prnuOk) pooledPr = r0->prnu;
-            }
-            for (int c = 0; c < 4; c++) {
-                app.roiChannel = c;
-                settle();
-                dump(CFA_CH_NAMES[c]);
-                const RoiRowProbe* rc = row(cfaRoi);
-                if (!rc || !rc->s.valid || !nearEq(rc->s.mean, PLV[c])) chOk = false;
-                if (!rc || !nearEq(rc->s.sd, 3.0)) chSd = false;
-                // each plane divides by ITS OWN level, so the same 3 DN of
-                // dither is 0.3% on R and 0.075% on B
-                if (!rc || !rc->prnuOk || !nearEq(rc->prnu, 3.0 / PLV[c] * 100.0)) chPr = false;
-                if (rc && rc->prnuOk) planeSumPr += rc->prnu;
-            }
-            check(chOk, "V19 channel switch repoints the panel's numbers");
-            check(chSd, "V19 per-plane sd is the plane's own sigma");
-            check(chPr, "V19 per-plane PRNU divides by that plane's own mean");
-            // The pooled row is a different measurement, not a summary of the
-            // four: its sd carries the level differences BETWEEN the planes, so
-            // its PRNU (~44.7%) is two orders above the planes' (~0.16% mean).
-            // Anyone tempted to average the plane column would land on the
-            // second number and it would look like the answer.
-            fprintf(stderr, "verifyselftest: V19 pooled PRNU %.10g %%, planes averaged "
-                            "%.10g %%\n", pooledPr, planeSumPr / 4.0);
-            check(nearEq(pooledPr, sqrt(1250009.0) / 2500.0 * 100.0),
-                  "V19 the pooled row's PRNU is pooled sd over pooled mean");
-            check(pooledPr > planeSumPr / 4.0 * 100.0,
-                  "V19 the pooled PRNU is not the planes' PRNUs averaged");
-            app.roiChannel = -1;
-
-            // ---- the delete button ------------------------------------------
-            // Its click has to survive the row label's SpanAllColumns Selectable,
-            // which is submitted first and covers the button's rect.
-            // A 1x1 ROI is reachable from the editor's x/y/w/h fields and from a
-            // restored session. n = 1 makes sd exactly 0 and mean = min = max,
-            // which reads exactly like a broken panel - so the panel has to be
-            // able to say n. Pin both the number and the disclosure.
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 4, 4, 1, 1);
-            const int oneRoi = app.anns.back().id;
-            app.roiChannel = -1;
-            settle();
-            dump("1x1");
-            if (const RoiRowProbe* r1 = row(oneRoi)) {
-                check(r1->s.valid && r1->s.n == 1, "V19 a 1x1 ROI measures exactly one pixel");
-                check(r1->s.sd == 0.0 && r1->s.mn == r1->s.mx,
-                      "V19 n=1 gives sd 0 - the panel's n is what explains it");
-                // no second convention for n=1: PRNU follows sd, which is 0, so
-                // the column reads 0 and the same n line explains both
-                check(r1->prnuOk && r1->prnu == 0.0,
-                      "V19 n=1 gives PRNU 0 for the same reason sd is 0");
-                check(r1->s.step >= 1, "V19 the stat carries the stride it sampled at");
-            }
-            // ...and a decimated ROI must report the stride that produced its n
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 0, 0, 1024, 1024);
-            const int bigRoi = app.anns.back().id;
-            settle();
-            dump("full 1024^2");
-            if (const RoiRowProbe* rb = row(bigRoi))
-                check(rb->s.step > 1 && rb->s.n < (size_t)1024 * 1024,
-                      "V19 a decimated ROI says both n and its stride");
-
-            // the channel selector's clamp: one past the last plane is not a
-            // plane, and CFA_SEL has no fifth entry
-            app.roiChannel = 99;
-            settle();
-            check(app.roiChannel == 3, "V19 roiChannel clamps to the last CFA plane");
-            app.roiChannel = -1;
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 0, 0, 512, 512);
             const int cfaRoi2 = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            for (const auto& r : g_roiRowProbe)
+                fprintf(stderr, "verifyselftest: V19 row %-3s valid=%d lbl=%.0f,%.0f "
+                                "del=%.0f,%.0f\n", r.id ? "roi" : "all", (int)r.s.valid,
+                        r.lbl.x, r.lbl.y, r.del.x, r.del.y);
+            check(row(0) && row(0)->s.valid, "V19 panel prints the All row");
+            check(row(cfaRoi2) && row(cfaRoi2)->s.valid, "V19 panel prints a placed ROI row");
 
             // ...but the row label must STILL select: the button is only reachable
             // because the Selectable now allows overlap, and that must not cost
@@ -29517,6 +29678,9 @@ int main(int argc, char** argv) {
                 check(app.selectedAnn == cfaRoi2, "V19 clicking the row still selects it");
             }
 
+            // ---- the delete button ------------------------------------------
+            // Its click has to survive the row label's SpanAllColumns Selectable,
+            // which is submitted first and covers the button's rect.
             settle();
             const RoiRowProbe* rd = row(cfaRoi2);
             check(rd && rd->del.x > 0, "V19 the row's delete button is on screen");
@@ -29531,35 +29695,6 @@ int main(int argc, char** argv) {
                                 "anns %zu -> %zu\n", at.x, at.y, before, app.anns.size());
                 check(app.anns.size() == before - 1, "V19 the x button deletes its ROI");
             }
-
-            // ---- mean == 0 --------------------------------------------------
-            // sd/mean has no value there, and this table's numbers are pasted
-            // into reports: a nan or an inf in a pasted cell is worse than a
-            // blank, because it travels as if it were a measurement. The row
-            // still has a real mean and a real sd - only the ratio is withheld -
-            // so the test pins the sd too, or "-" could mean the row died.
-            // A bipolar frame is the everyday way here (a difference image).
-            closeAll();
-            {
-                auto z = mkMono(256, 256, 0.0, 2.0, 0.0);
-                z->src->dtype = "f32";          // values below zero are not a u16
-                z->syncMirrors();
-                app.images.push_back(std::move(z));
-            }
-            app.current = 0;
-            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
-            addAnn(0, 0, 0, 256, 256);
-            const int zeroRoi = app.anns.back().id;
-            app.roiChannel = -1;
-            settle();
-            dump("mean 0");
-            if (const RoiRowProbe* rz = row(zeroRoi)) {
-                check(rz->s.valid && rz->s.mean == 0.0 && nearEq(rz->s.sd, 2.0),
-                      "V19 a bipolar ROI measures mean 0 with a real sd");
-                check(!rz->prnuOk, "V19 mean 0 prints no PRNU - not a nan, not an inf");
-            }
-            if (const RoiRowProbe* rz0 = row(0))
-                check(!rz0->prnuOk, "V19 the All row withholds PRNU at mean 0 too");
 
             g_roiRowProbeOn = false;
             held = -1;

@@ -15,7 +15,7 @@
 #      the run instead of quietly testing yesterday's exe;
 #   2. regenerates tools/testdata (deterministic, gitignored, never committed);
 #   3. asks the machine ONCE whether it can make the OpenGL context that every
-#      selftest not labelled `nogl` needs (today that is five of the 22 - the
+#      selftest not labelled `nogl` needs (today that is six of the 26 - the
 #      ones that drive real ImGui frames), because "there is no GL here" and
 #      "an assert failed" are different events that used to look identical;
 #   4. runs ctest, one line per selftest, printing the full output of any that
@@ -62,14 +62,14 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
 fi
 
 # ---- preflight: a display ---------------------------------------------------
-# Five selftests create a real GLFW window and an OpenGL context; the other 17
+# Six selftests create a real GLFW window and an OpenGL context; the other 20
 # take the --no-window startup path and want no display at all. Saying which
-# case this machine is in, once and up front, beats five identical "failed to
+# case this machine is in, once and up front, beats six identical "failed to
 # create window" failures further down.
 if [ "$(uname -s)" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if ! command -v xvfb-run >/dev/null 2>&1; then
-        # NOT fatal any more: the 17 windowless selftests still run and still
-        # gate here, and the probe below will name the five that cannot.
+        # NOT fatal any more: the 20 windowless selftests still run and still
+        # gate here, and the probe below will name the six that cannot.
         echo "run_selftests: headless Linux with no xvfb-run - the selftests that" >&2
         echo "run_selftests: need a window cannot run (they are named at the end)." >&2
         echo "run_selftests: to run everything: apt-get install -y xvfb, or set DISPLAY." >&2
@@ -130,7 +130,17 @@ gl_reason="$(printf '%s\n' "$probe_out" | sed -n 's/.*no OpenGL context on this 
 gl_ok="$(printf '%s\n' "$probe_out" | sed -n 's/.*OpenGL context OK: //p' | head -1)"
 
 have_gl=1
-if [ -n "$gl_reason" ]; then
+# VIEWER_FORCE_NO_GL has been documented at the top of this file since the probe
+# was written and was never implemented, so the switch a developer would use to
+# check what Windows and macOS actually run did nothing at all - which is a
+# small version of the very thing it exists to catch. Three lines, here, so that
+# "21 ran, 6 skipped on the runners with no context" is something a developer
+# can MEASURE on a box that has one, instead of waiting for CI to say it.
+if [ -n "${VIEWER_FORCE_NO_GL:-}" ] && [ "${VIEWER_FORCE_NO_GL}" != "0" ]; then
+    have_gl=0
+    gl_reason="VIEWER_FORCE_NO_GL is set (the machine may well have one)"
+    echo "  $gl_reason"
+elif [ -n "$gl_reason" ]; then
     have_gl=0
     echo "  no OpenGL context on this machine: $gl_reason"
 elif [ -n "$gl_ok" ]; then
@@ -260,8 +270,8 @@ if [ "$n_skip" -gt 0 ]; then
 else
     echo "run_selftests: ran $n_ran, skipped 0"
 fi
-# ctest counts the quarantined test in its "N/23" progress denominator but not
-# in its "out of 22" total, so the two numbers a reader sees above genuinely
+# ctest counts the quarantined test in its "N/M" progress denominator but not in
+# its "out of M-1" total, so the two numbers a reader sees above genuinely
 # differ. Reconcile them here, computed rather than asserted, so nobody has to
 # work out which of the three counts is the one that answers their question.
 echo "run_selftests: (ctest lists $(count "$all_tests") tests labelled 'selftest': \
