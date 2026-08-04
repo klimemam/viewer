@@ -408,3 +408,9 @@ viewer_selftest(abstats-cfa-bayer --abstats-selftest --cfa bayer tools/testdata/
 set_tests_properties(selftest.abstats-cfa-bayer PROPERTIES
   DISABLED TRUE
   LABELS "selftest;quarantine")
+
+# Add plugin tests
+add_executable(test_display_falsecolor plugins/test_display_falsecolor.c)
+target_include_directories(test_display_falsecolor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME plugin.display_falsecolor COMMAND test_display_falsecolor)
+set_tests_properties(plugin.display_falsecolor PROPERTIES LABELS selftest)
