@@ -12964,8 +12964,24 @@ static std::string abDocLabel(const ImageDoc* d) {
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
     if (integer) snprintf(buf, n, "%.0f", v);
-    else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
-    else snprintf(buf, n, "%.4g", v);
+    else {
+        // Plot axes are read at a glance. C's scientific notation ("2e+04")
+        // makes ordinary sensor values look like an implementation detail and
+        // is especially noisy on log paper, where several such labels sit next
+        // to one another. Keep the significand and express the scale once with
+        // an engineering suffix. Reserve e-notation for values outside the
+        // useful SI-prefix range.
+        double a = fabs(v), scale = 1.0;
+        const char* suffix = "";
+        if (a >= 1e9 && a < 1e12)      { scale = 1e9; suffix = "G"; }
+        else if (a >= 1e6 && a < 1e9)  { scale = 1e6; suffix = "M"; }
+        else if (a >= 1e3 && a < 1e6)  { scale = 1e3; suffix = "k"; }
+        else if (a > 0 && a < 1e-6)    { scale = 1e-9; suffix = "n"; }
+        else if (a > 0 && a < 1e-3)    { scale = 1e-6; suffix = "u"; }
+        if (*suffix) snprintf(buf, n, "%.4g%s", v / scale, suffix);
+        else if (a >= 1e12 || (a > 0 && a < 1e-9)) snprintf(buf, n, "%.2e", v);
+        else snprintf(buf, n, "%.4g", v);
+    }
 }
 
 // xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
@@ -19444,12 +19460,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // narrow it down (the filter, the count, the "..." menu). Everything that
     // is state rather than navigation reports on the bottom status line, and
     // the "more" drawer is gone - see docs/browse-topbar-design.md 10.2/10.3.
-    // Server-side search: a different thing from the filter (which only narrows
-    // what is already listed). Referenced up here because the path bar's context
-    // menu can aim it at a folder. (These were function-local statics - one
-    // search box shared by every panel; per instance now.)
-    char* rbSearchBuf = I.searchBuf;
-    bool& rbSearchFocus = I.searchFocus;
+    // A recursive search uses the same text as the immediate filter. Its root
+    // can still be aimed by a breadcrumb or folder context menu.
     // set by "Search under here"; empty = this folder. On App::RemoteBrowse, so
     // it dies with the connection - see the field.
     std::string& rbSearchRoot = B.searchRoot;
@@ -19534,8 +19546,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     remoteScanFolder(I, target);
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
-                    rbSearchFocus = true;
-                    I.searchOpen = true;        // the search box is a popup now
+                    I.searchOpen = true;        // focus the unified filter/search box
                 }
                 if (ImGui::MenuItem("Bookmark")) {
                     std::string u = placeUrl(B.host, B.port, target);
@@ -19875,14 +19886,30 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         // panel too narrow for both still shows a usable filter
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
                                          ImGui::GetFontSize() * 4));
-        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
-                                 rbFilter, sizeof I.filter);
+        // One input, two depths: typing always narrows the rows already here;
+        // on a remote peer Enter commits the same text as a recursive server
+        // search. The old popup had an identical-looking second text box and
+        // made the user choose an engine before stating the question.
+        if (I.searchOpen) {
+            ImGui::SetKeyboardFocusHere();
+            I.searchOpen = false;
+        }
+        bool searchEntered = ImGui::InputTextWithHint(
+            "##rbfilter",
+            B.host.empty() ? "filter (Ctrl+F), * ? glob"
+                           : "filter; Enter searches below",
+            rbFilter, sizeof I.filter, ImGuiInputTextFlags_EnterReturnsTrue);
         I.toolbar.filterL = ImGui::GetItemRectMin().x;
         I.toolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("filters the listing below without asking the server\n"
+            ImGui::SetTooltip("typing filters this listing immediately\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
-                              "comma separates alternatives");
+                              "%s",
+                              B.host.empty()
+                                  ? "comma separates alternatives"
+                                  : "Enter searches recursively on the server");
+        if (searchEntered && rbFilter[0] && !B.host.empty())
+            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbFilter);
     }
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
@@ -19991,53 +20018,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             savePrefs();
         }
         ImGui::Separator();
-        // TEMPORARY HOME. The filter (this listing, instantly) and the server
-        // search (a new set, a round trip) are still two doors onto the same
-        // question - one on the toolbar, one in here. The summoned chip that
-        // replaces BOTH is the next step; until it lands, the second door at
-        // least stops charging a permanent row for a rare, expensive verb.
-        if (ImGui::MenuItem("Search on the server...")) I.searchOpen = true;
+        if (!B.host.empty()) {
+            if (ImGui::MenuItem("Search below (type, then Enter)", "Ctrl+F"))
+                I.searchOpen = true;
+        }
         if (ImGui::MenuItem("Open folder (all stacks below)")) remoteScanFolder(I, B.dir);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
                               "which stacks to open:\n%s", B.dir.c_str());
-        ImGui::EndPopup();
-    }
-    // ---- the server-side search, summoned: from the menu above or from the
-    // crumb's "Search under here". It is recursive and it costs a round trip,
-    // so it is asked for rather than parked on screen; what it is DOING is
-    // reported on the bottom status line, where the rest of the panel's state
-    // already lives.
-    if (I.searchOpen) { ImGui::OpenPopup("rbsearchpop"); I.searchOpen = false; }
-    if (ImGui::BeginPopup("rbsearchpop")) {
-        ImGui::TextDisabled("search under: %s",
-                            rbSearchRoot.empty() ? B.dir.c_str() : rbSearchRoot.c_str());
-        if (!rbSearchRoot.empty()) {
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("search from the folder being browsed instead");
-        }
-        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20);
-        bool go = ImGui::InputTextWithHint("##rbsearch",
-                                           "frame_* or **/dark.npy",
-                                           rbSearchBuf, sizeof I.searchBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
-                              "bare text matches anywhere in the relative path;\n"
-                              "* and ? glob across '/'");
-        ImGui::SameLine();
-        if (I.search.running) {
-            if (ImGui::SmallButton("Stop##rbsearch")) {
-                I.search.gen++;               // in-flight result becomes stale
-                I.search.running = false;
-            }
-        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
-            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
-            ImGui::CloseCurrentPopup();       // the answer arrives in the listing
-        }
         ImGui::EndPopup();
     }
     // How many rows are selected: counted once, here, because two places need
@@ -20633,8 +20621,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(I, full);
                     if (ImGui::MenuItem("Search under here")) {
-                        rbSearchRoot = full;      // the search row shows and clears it
-                        rbSearchFocus = true;
+                        rbSearchRoot = full;
+                        I.searchOpen = true;
                     }
                     if (ImGui::MenuItem("Bookmark")) {
                         std::string u = placeUrl(B.host, B.port, full);
