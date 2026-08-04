@@ -30,6 +30,7 @@
 #include "app_icon.h"
 #include "window_frame.h"
 
+#include <deque>
 #include <algorithm>
 #include <map>
 #include <atomic>
@@ -1106,7 +1107,7 @@ struct App {
     std::atomic<size_t> rfBytesInFlight{ 0 };
     std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
     std::mutex rfMtx;
-    std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
+    std::deque<RFetchJob> rfQueue;   // guarded by rfMtx
     std::vector<RFetchDone> rfDone;   // guarded by rfMtx
     // pending "load the rest of the folder?" question
     int seqAskImage = -1;
@@ -2531,7 +2532,7 @@ static void rfWorker() {
             std::lock_guard<std::mutex> lk(app.rfMtx);
             if (!app.rfQueue.empty()) {
                 job = std::move(app.rfQueue.front());
-                app.rfQueue.erase(app.rfQueue.begin());
+                app.rfQueue.pop_front();
                 have = true;
             }
         }
