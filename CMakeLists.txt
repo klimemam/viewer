@@ -322,6 +322,7 @@ function(viewer_selftest name)
   set(args ${ARGN})
   set(labels selftest)
   set(launcher ${VIEWER_TEST_LAUNCHER})
+  set(extra_env "")
   if(args)
     list(GET args 0 first)
     if(first STREQUAL "NOGL")
@@ -331,6 +332,19 @@ function(viewer_selftest name)
       set(launcher "")           # needs no display, so it needs no xvfb either
     endif()
   endif()
+  # ENV NAME=VALUE, repeatable, before the arguments: one more variable in the
+  # test's environment. It exists for VIEWER_SERVE_LAG_MS, which the peer reads
+  # (core/serve.cpp) - a property of the LINK a test runs over, which is not
+  # something a command-line flag on this side can say.
+  while(args)
+    list(GET args 0 first)
+    if(NOT first STREQUAL "ENV")
+      break()
+    endif()
+    list(GET args 1 kv)
+    list(APPEND extra_env "${kv}")
+    list(REMOVE_AT args 0 1)
+  endwhile()
   # A temp directory of its own, per test. The selftests write fixtures to FIXED
   # names under the system temp dir - viewer_seriesselftest.vsession,
   # viewer_hlenbomb, viewer_batchselftest and a dozen more - and APPDATA/HOME
@@ -346,11 +360,15 @@ function(viewer_selftest name)
   # "tests share a temp dir", and that is a property of how a test is launched.
   set(_tmp ${CMAKE_CURRENT_BINARY_DIR}/selftest-tmp/${name})
   file(MAKE_DIRECTORY ${_tmp})
+  set(_env "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME};TMP=${_tmp};TEMP=${_tmp};TMPDIR=${_tmp}")
+  foreach(kv IN LISTS extra_env)
+    list(APPEND _env "${kv}")
+  endforeach()
   add_test(NAME selftest.${name}
            COMMAND ${launcher} $<TARGET_FILE:viewer> ${args})
   set_tests_properties(selftest.${name} PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME};TMP=${_tmp};TEMP=${_tmp};TMPDIR=${_tmp}"
+    ENVIRONMENT "${_env}"
     LABELS "${labels}"
     TIMEOUT 900)                 # the loaders' own budgets are 120-600 s
 endfunction()
@@ -407,6 +425,27 @@ viewer_selftest(lin         NOGL --lin-selftest --sequence always
 viewer_selftest(browse      NOGL --browse-selftest tools/testdata/rb)
 # Drives the real main loop, injecting keys and mouse frame by frame.
 viewer_selftest(browse-keys --browse-keys-selftest tools/testdata/rb)
+# ...and the same loop over a link that is SLOW. Every gesture browse-keys makes
+# runs against a peer on this disk, so click one of a double-click costs nothing
+# there and the panel's dependence on how long click one takes is invisible.
+# Here meta and tile are held back 400 ms each - past ImGui's 0.30 s
+# double-click window, which is the whole point - so click one blocks the UI
+# thread the way a real ssh peer does. Asserted, in order:
+#   1. a mouse-first double-click on a FILE opens it, even though click one
+#      spent longer fetching the preview than the double-click window allows
+#      (dbloff:6 = dark.npy; chknames without [pv] is "registered, not preview");
+#   2. two clicks a SECOND apart on another file are still two clicks - the
+#      credit for blocked time cannot manufacture a double-click out of them
+#      (flat.npy stays [pv]);
+#   3. the navigation latch is untouched: a folder's double-click enters once
+#      and opens NOTHING (chkimgmark), which is the property CI caught the last
+#      two attempts on.
+viewer_selftest(browse-dbl ENV VIEWER_SERVE_LAG_MS=400
+                --browse-keys-selftest tools/testdata/rb
+                --browse-keys "waitdir:rb,viewreset,w400,home,chkatrow:..,\
+dbloff:6,chkimg:1,chknames:dark.npy,\
+home,clickoff:7,idle:80,clickoff:7,chkimg:2,chknames:dark.npy+flat.npy[pv],\
+home,imgmark,dbloff:1,waitdir:digitset,chkimgmark,chkimg:2")
 # The T group lays out the Temporal panel in real ImGui frames (the chart that
 # was drawn past the panel's bottom edge is a layout fact, invisible to the
 # recompute functions).

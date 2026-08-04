@@ -10984,6 +10984,53 @@ static void stepPreviewFrame(int delta) {
     }
 }
 
+// ---- TIME THE USER DID NOT GET BACK ---------------------------------------
+// A remote open BLOCKS the UI thread: ensureUiSession may start a whole peer,
+// and meta+tile are round trips read to completion inside the frame ("the
+// window is not repainting while this session reads", ensureUiSession). Nothing
+// is drawn and no input is processed for as long as that takes.
+//
+// ImGui decides whether a press is the second half of a double-click by
+// comparing g.Time against the previous press - and g.Time advances by the REAL
+// duration of every frame, blocked or not (UpdateMouseInputs: is_repeated_click
+// needs g.Time - MouseClickedTime < MouseDoubleClickTime, 0.30 s by default).
+// So a first click that fetches something spends, from its own frame, the whole
+// window its second click needs to arrive in.
+//
+// That is the report「ダブルクリックすると一回目はダブルクリック判定されずに
+// previewで表示されてしまう」. Click one previews (that is its job); click two
+// is handed to ImGui a second later, counts as a FIRST click, so
+// IsMouseDoubleClicked is false, rbOpenRow never runs, and what stays on screen
+// is the preview - the Open silently missing. Measured on a peer answering
+// meta/tile with 400 ms of latency: press one at t=0.794, press two seen at
+// t=1.740, MouseClickedCount 1 - and the same gesture against the same peer
+// with no latency reports count 2 and opens the file.
+//
+// The user pressed twice in their own time; the clock ran in ours. So the time
+// the UI thread spends BLOCKED is given back to every button's click clock -
+// the interval is measured in time the user could actually see and act in.
+// MouseClickedPos is deliberately untouched: a click that moved still starts a
+// new gesture, and the pointer is the half of the rule that stayed honest.
+//
+// It cannot manufacture a double-click out of two separate ones: after the
+// credit the clock runs normally again, so a second click that really arrives
+// seconds later is still seconds later.
+struct UiThreadStall {
+    double t0 = nowSec();
+    static int depth;
+    UiThreadStall() { depth++; }
+    ~UiThreadStall() {
+        double d = nowSec() - t0;
+        if (--depth != 0 || d <= 0 || !ImGui::GetCurrentContext()) return;
+        ImGuiIO& io = ImGui::GetIO();
+        for (int i = 0; i < IM_ARRAYSIZE(io.MouseClickedTime); i++) {
+            io.MouseClickedTime[i] += d;
+            io.MouseReleasedTime[i] += d;
+        }
+    }
+};
+int UiThreadStall::depth = 0;
+
 // Returns false when nothing was opened. It has four failure returns AFTER
 // dropPreview() has already cleared the preview state, and its callers used to
 // have no way to know: rbActivateRow repopulated previewFiles unconditionally,
@@ -10991,6 +11038,7 @@ static void stepPreviewFrame(int delta) {
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
 static bool openRemote(const std::string& url, bool asPreview, int frame) {
+    UiThreadStall stallCredit;      // see above: a blocked frame is not the user's
     std::string host, rpath;
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) {
@@ -23133,7 +23181,11 @@ static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds wh
 // left, right, enter, home, end, back, flat, tree, disc, fmenu, rctx,
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
 // img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
-// the cursor's row - a double-click only exists as clicks); chevclick (a click
+// the cursor's row - a double-click only exists as clicks); clickoff:N /
+// dbloff:N (the same two, N rows BELOW the cursor - the only aim the keyboard
+// has not already previewed, and so the only one where click one pays for the
+// fetch, as a human's first click on a row always does); idle:N (hold N frames
+// - a delay knob, so "two clicks a second apart" can be said); chevclick (a click
 // on the cursor row's tree chevron, asserting the toggle landed at once);
 // starclick (a click on the bookmark star at the end of the path line);
 // marklist / starmark / seterr / clrerr (baselines and a fake failure for the
@@ -34406,7 +34458,8 @@ int main(int argc, char** argv) {
                             app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
                     fflush(stderr);
                 }
-                if (op == "dbl" || op == "click" || op == "ctrlclick" ||
+                if (op == "dbl" || op == "dbloff" || op == "click" || op == "clickoff" ||
+                    op == "ctrlclick" ||
                     op == "chevclick" || op == "starclick" ||
                     op == "mback" || op == "mfwd") {
                     // A real gesture into the real queue, aimed at the row the
@@ -34430,11 +34483,21 @@ int main(int argc, char** argv) {
                         // is reachable there, which only a real click can show.
                         if (op == "starclick" && rbKeysT().toolbar.starCentre.x < 0)
                             chk(false, "no bookmark star on the path line");
+                        // "dbloff:N" lands N rows BELOW the cursor row - the one
+                        // aim the keyboard cannot pre-warm. Every other click
+                        // action is aimed at the cursor, and the keyboard put
+                        // the cursor there, which on a file row has ALREADY
+                        // previewed it: click one of such a double-click finds
+                        // its preview live and costs nothing. A human's first
+                        // contact with a row is the mouse, and click one then
+                        // pays for the whole fetch - see rbActivateRow.
+                        float rowH = rbKeysT().cursorRect[1].y - rbKeysT().cursorRect[0].y;
                         g_injMouse = op == "chevclick" ? rbKeysT().cursorChev
                                    : op == "starclick" ? rbKeysT().toolbar.starCentre
                             : ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
                                      (op == "click" ? 40.0f : 0.0f),
-                                     (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
+                                     (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f +
+                                     ((op == "dbloff" || op == "clickoff") ? rowH * arg : 0.0f));
                     }
                     else if (keyPhase == 1 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, true);
@@ -34443,13 +34506,13 @@ int main(int argc, char** argv) {
                     else if (keyPhase == 2)
                         g_injMouseBtn = op == "mback" ? 3 : op == "mfwd" ? 4 : 0;
                     else if (keyPhase == 3) g_injMouseBtn = -1;
-                    else if (keyPhase == 4 && op == "dbl") g_injMouseBtn = 0;
+                    else if (keyPhase == 4 && (op == "dbl" || op == "dbloff")) g_injMouseBtn = 0;
                     else if (keyPhase == 4 && op == "chevclick")
                         chk((int)rbKeysT().expanded.size() != g_chevPreExp,
                             "expanded " + std::to_string(g_chevPreExp) + " -> " +
                             std::to_string((int)rbKeysT().expanded.size()) +
                             " by two frames after the press");
-                    else if (keyPhase == 5 && op == "dbl") g_injMouseBtn = -1;
+                    else if (keyPhase == 5 && (op == "dbl" || op == "dbloff")) g_injMouseBtn = -1;
                     else if (keyPhase == 5 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, false);
                 } else if (op == "altleft" || op == "altright") {
@@ -34621,6 +34684,12 @@ int main(int argc, char** argv) {
                         else if (waitD0 == 0) { waitD0 = nowSec(); hold = true; }
                         else if (nowSec() - waitD0 < 60.0) hold = true;
                         else { chk(false, "dir=" + d3); waitD0 = 0; }
+                    }
+                    else if (op == "idle") {       // burn N frames: a delay knob
+                        static int idleLeft = -1;
+                        if (idleLeft < 0) idleLeft = arg;
+                        if (idleLeft > 0) { idleLeft--; hold = true; }
+                        else idleLeft = -1;
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
@@ -34999,14 +35068,29 @@ int main(int argc, char** argv) {
                 // browse cursor and ran gotoStack(1) on the main view - and
                 // with rangeScope = per frame that rewrote the stored
                 // black/white of an image the user never navigated to.
+                // Both of the summary claims below rest on evidence one named
+                // action collects ("blur", "popupcheck"). A --browse-keys list
+                // that does not contain that action is not making the claim, so
+                // it must not be JUDGED on it - without this, every overridden
+                // list failed on two assertions about actions it never ran, and
+                // the override was useful only for reading logs. Asked for by
+                // the list rather than inferred from the counters: dropping
+                // "blur" from the canned list then drops the claim visibly,
+                // instead of turning it green by leaving no evidence.
+                auto listHas = [&](const char* op) {
+                    for (const auto& s2 : keyActs) if (s2 == op) return true;
+                    return false;
+                };
                 int afterBlur = g_navKeyAtBlur < 0 ? -1 : g_navKeyGlobal - g_navKeyAtBlur;
-                bool routeOk = g_navKeyAtBlur == 0 && g_navKeyYieldAtBlur >= 6 &&
-                               afterBlur >= 4;
+                bool routeAsked = listHas("blur");
+                bool routeOk = !routeAsked ||
+                               (g_navKeyAtBlur == 0 && g_navKeyYieldAtBlur >= 6 &&
+                                afterBlur >= 4);
                 fprintf(stderr, "browsekeys: key routing: with the panel focused the "
                                 "main view ran %d nav key(s) and stood down for %d; "
                                 "after blur it ran %d more: %s\n",
                         g_navKeyAtBlur, g_navKeyYieldAtBlur, afterBlur,
-                        routeOk ? "ok" : "FAIL");
+                        !routeAsked ? "not asked for" : routeOk ? "ok" : "FAIL");
                 // POPUP COLLISION. ImGui's OpenPopupEx closes whatever sits at
                 // the current stack LEVEL when a different id opens there. The
                 // RAW dialog used to be one-shot (its flag consumed the frame it
@@ -35014,13 +35098,16 @@ int main(int argc, char** argv) {
                 // good - and with rawDlg.forQueue set, the only code that clears
                 // that flag lives inside the now-unreachable modal, so every
                 // later Open Folder sat at "queued" until restart.
-                bool popOk = g_popupCheck[0] == 1 && g_popupCheck[1] == 1 &&
-                             (!rawDlg.forQueue || rawDlg.open);
+                bool popAsked = listHas("popupcheck");
+                bool popOk = !popAsked ||
+                             (g_popupCheck[0] == 1 && g_popupCheck[1] == 1 &&
+                              (!rawDlg.forQueue || rawDlg.open));
                 fprintf(stderr, "browsekeys: root popup collision: RAW dialog open "
                                 "before the competing modal=%d, after=%d; forQueue "
                                 "implies a live dialog=%d: %s\n",
                         g_popupCheck[0], g_popupCheck[1],
-                        (!rawDlg.forQueue || rawDlg.open) ? 1 : 0, popOk ? "ok" : "FAIL");
+                        (!rawDlg.forQueue || rawDlg.open) ? 1 : 0,
+                        !popAsked ? "not asked for" : popOk ? "ok" : "FAIL");
                 keysOk = routeOk && popOk && keysCheckBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
                                 "no crash, %d panel check(s) failed: %s\n",

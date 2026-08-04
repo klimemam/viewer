@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <csignal>
 #include <cmath>
 #include <cstring>
@@ -1343,8 +1345,24 @@ static void handleMeasure(Buf& in) {
     sendMeasureReply(1, cols, series);
 }
 
+// VIEWER_SERVE_LAG_MS: hold a META or TILE answer back by that many
+// milliseconds. A real link's latency, on demand - the peer the selftests run
+// against is a pipe on the same disk, and "the UI thread blocks while a file
+// is fetched" is a fact of openRemote that a zero-latency peer can never make
+// visible. Only the two OPEN requests are held: LIST/SCAN keep their speed, so
+// the listing a test navigates through still arrives at once.
+static int serveLagMs() {
+    static int ms = [] {
+        const char* e = getenv("VIEWER_SERVE_LAG_MS");
+        return e ? atoi(e) : 0;
+    }();
+    return ms;
+}
+
 // Transport-independent: give it a request, it answers through the current sink.
 void handleRequest(uint32_t type, Buf& in) {
+    if (serveLagMs() > 0 && (type == MSG_META || type == MSG_TILE))
+        std::this_thread::sleep_for(std::chrono::milliseconds(serveLagMs()));
     switch (type) {
         case MSG_HELLO: {
             uint32_t cv = 0;
