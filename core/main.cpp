@@ -834,6 +834,11 @@ struct App {
         std::string wtitle;           // the ImGui window name, fixed at creation
         bool open = true;             // window shown (num 1 mirrors app.showRemote)
         bool focusReq = false;        // bring the window forward next frame
+        // Where "+" wants this panel to appear: the dock node of the panel whose
+        // "+" was clicked, so a new Browse is a TAB beside the one you were
+        // looking at rather than a floating window somewhere else. Applied once,
+        // then cleared - after that the panel is wherever the user put it.
+        unsigned dockInto = 0;
         // the place, and everything listed there
         RemoteBrowse b;
         RemoteSearch search;
@@ -879,11 +884,12 @@ struct App {
         int selAnchor = -1;
         bool selFlat = false, selTree = false;
         std::string selSig;
-        // filter / server search / path editing
+        // filter / search / path editing. ONE buffer: the filter box is also the
+        // search box, and Enter is the difference between "narrow these rows"
+        // and "walk below this folder". searchBuf/searchFocus fed a second,
+        // identical-looking box in a popup and went with it.
         char filter[256] = "";
-        char searchBuf[256] = "";
-        bool searchFocus = false;
-        bool searchOpen = false;      // ask for the server-search popup next frame
+        bool searchOpen = false;      // put the caret in the filter box next frame
         char pathEdit[1024] = "";
         bool pathEditing = false, pathFocus = false;
         // Properties popup: a snapshot, because the row may scroll out of the
@@ -19338,13 +19344,23 @@ static App::BrowseInstance& rbKeysT() {
     return rbMain();
 }
 
-// The "+" affordance: one more Browse, docked nowhere in particular - the
-// same command View > New Browse Panel runs. Deferred: creating an instance
-// grows app.browsePanels, and the window loop is iterating it.
+// The "+" affordance: one more Browse, as a TAB beside this one. It used to
+// make a panel docked nowhere in particular, which is a different promise from
+// the one a "+" makes anywhere else on a computer - next to tabs it means "one
+// more of these, here", and a window appearing somewhere else reads as a bug.
+// Docking is on (ImGuiConfigFlags_DockingEnable), and ImGui already draws
+// co-docked windows as a tab bar, so the tab strip is not something to build:
+// it is what happens once the new panel lands in the same node.
+//
+// Deferred: creating an instance grows app.browsePanels, and the window loop is
+// iterating it. The dock id has to be read HERE, inside the panel's own window.
 static void rbPlusButton() {
-    if (ImGui::SmallButton("+##rbnew")) rbDefer([] { rbNewInstance(); });
+    if (ImGui::SmallButton("+##rbnew")) {
+        ImGuiID here = ImGui::GetWindowDockID();
+        rbDefer([here] { rbNewInstance().dockInto = (unsigned)here; });
+    }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("new Browse panel - another view onto another place\n"
+        ImGui::SetTooltip("one more Browse, as a tab beside this one\n"
                           "(View > New Browse Panel)");
 }
 
@@ -19471,10 +19487,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // the "more" drawer is gone - see docs/browse-topbar-design.md 10.2/10.3.
     // Server-side search: a different thing from the filter (which only narrows
     // what is already listed). Referenced up here because the path bar's context
-    // menu can aim it at a folder. (These were function-local statics - one
-    // search box shared by every panel; per instance now.)
-    char* rbSearchBuf = I.searchBuf;
-    bool& rbSearchFocus = I.searchFocus;
+    // menu can aim it at a folder.
     // set by "Search under here"; empty = this folder. On App::RemoteBrowse, so
     // it dies with the connection - see the field.
     std::string& rbSearchRoot = B.searchRoot;
@@ -19559,8 +19572,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     remoteScanFolder(I, target);
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
-                    rbSearchFocus = true;
-                    I.searchOpen = true;        // the search box is a popup now
+                    I.searchOpen = true;        // aim the root, then focus the box
                 }
                 if (ImGui::MenuItem("Bookmark")) {
                     std::string u = placeUrl(B.host, B.port, target);
@@ -19841,6 +19853,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     auto rbFilterTailW = [&](bool counted) {
         float w = rbMenuW + rbStyle.ItemSpacing.x;
         if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
+        // Stop and the search root sit between the box and the count, and both
+        // appear WHILE the box is in use. Not reserving them is how a control
+        // that only exists during a search ends up off the right edge exactly
+        // when it is the one control that matters.
+        if (I.search.running) w += rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
+        if (!B.searchRoot.empty()) w += rbBtnW("under: x") + rbStyle.ItemSpacing.x;
         return w;
     };
     char* rbFilter = I.filter;
@@ -19893,21 +19911,76 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         const float tailW = rbFilterTailW(rbFilter[0] != 0);
         const float filterMin = ImGui::GetFontSize() * 8;
         rbFlow(filterMin + tailW);
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+        // Ctrl+F, the "..." menu's "Search below...", and a crumb or folder's
+        // "Search under here" all land in the same place: this box, with the
+        // caret in it. They differ only in whether they also aim the root.
+        if (I.searchOpen ||
+            (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))) {
             ImGui::SetKeyboardFocusHere();
+            I.searchOpen = false;
+        }
         // below the floor the tail wraps instead (rbFlow, further down), so a
         // panel too narrow for both still shows a usable filter
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
                                          ImGui::GetFontSize() * 4));
-        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
-                                 rbFilter, sizeof I.filter);
+        // ONE box, two depths. Typing narrows the rows that are already here,
+        // instantly and without asking anyone. Enter commits the SAME text as a
+        // recursive walk below this folder.
+        //
+        // There used to be a second text box, identical in appearance, in a
+        // popup off the "..." menu - so the panel asked the user to choose an
+        // engine before they were allowed to state the question, and the two
+        // doors were told apart only by which menu you came through. The
+        // question is the same one either way; only how far it reaches differs,
+        // and "how far" is a key, not a place.
+        //
+        // Local panels get the same Enter. A local Browse is served by a peer
+        // session exactly as a remote one is (an empty host means the local://
+        // peer, not a different code path), so glob works there too - and a rule
+        // that means something different depending on where you are is a rule
+        // nobody remembers.
+        bool goSearch = ImGui::InputTextWithHint(
+            "##rbfilter", "filter (Ctrl+F); Enter searches below",
+            rbFilter, sizeof I.filter, ImGuiInputTextFlags_EnterReturnsTrue);
         I.toolbar.filterL = ImGui::GetItemRectMin().x;
         I.toolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("filters the listing below without asking the server\n"
+            ImGui::SetTooltip("typing narrows the rows below, without asking anyone;\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
-                              "comma separates alternatives");
+                              "comma separates alternatives\n"
+                              "\n"
+                              "Enter walks BELOW %s instead (depth 6, first 2000\n"
+                              "hits) - * and ? cross '/' there",
+                              rbSearchRoot.empty() ? B.dir.c_str() : rbSearchRoot.c_str());
+        // Stop, beside the box that started it. A recursive walk is the one verb
+        // in this panel that costs a round trip, and Enter is now an easy way to
+        // start one: it must stay as easy to call off.
+        if (I.search.running) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Stop##rbsearch")) {
+                I.search.gen++;               // the in-flight result becomes stale
+                I.search.running = false;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("stop walking; what has arrived stays listed");
+        }
+        // The root, and the way out of it. "Search under here" aims the next
+        // Enter at a folder that is not the one on screen; without somewhere to
+        // say so AND somewhere to undo it, that is a one-way door whose effect
+        // is invisible until the answers are wrong.
+        if (!rbSearchRoot.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton((std::string("under: ") + baseName(rbSearchRoot) +
+                                    " x##sroot").c_str()))
+                rbSearchRoot.clear();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enter searches under\n%s\nclick to search from "
+                                  "the folder being browsed instead",
+                                  rbSearchRoot.c_str());
+        }
+        if (goSearch && rbFilter[0])
+            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbFilter);
     }
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
@@ -20016,171 +20089,78 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             savePrefs();
         }
         ImGui::Separator();
-        // TEMPORARY HOME. The filter (this listing, instantly) and the server
-        // search (a new set, a round trip) are still two doors onto the same
-        // question - one on the toolbar, one in here. The summoned chip that
-        // replaces BOTH is the next step; until it lands, the second door at
-        // least stops charging a permanent row for a rare, expensive verb.
-        if (ImGui::MenuItem("Search on the server...")) I.searchOpen = true;
+        // The two doors are one door now. This entry does not open anything -
+        // it puts the caret in the box that is already on the toolbar, which is
+        // the whole point: there is one place to state the question and the only
+        // choice left is how far Enter reaches.
+        if (ImGui::MenuItem("Search below...", "Ctrl+F")) I.searchOpen = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("type in the filter box, then press Enter:\n"
+                              "it walks below %s (depth 6, first 2000 hits)",
+                              B.dir.c_str());
         if (ImGui::MenuItem("Open folder (all stacks below)")) remoteScanFolder(I, B.dir);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
                               "which stacks to open:\n%s", B.dir.c_str());
         ImGui::EndPopup();
     }
-    // ---- the server-side search, summoned: from the menu above or from the
-    // crumb's "Search under here". It is recursive and it costs a round trip,
-    // so it is asked for rather than parked on screen; what it is DOING is
-    // reported on the bottom status line, where the rest of the panel's state
-    // already lives.
-    if (I.searchOpen) { ImGui::OpenPopup("rbsearchpop"); I.searchOpen = false; }
-    if (ImGui::BeginPopup("rbsearchpop")) {
-        ImGui::TextDisabled("search under: %s",
-                            rbSearchRoot.empty() ? B.dir.c_str() : rbSearchRoot.c_str());
-        if (!rbSearchRoot.empty()) {
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("search from the folder being browsed instead");
-        }
-        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20);
-        bool go = ImGui::InputTextWithHint("##rbsearch",
-                                           "frame_* or **/dark.npy",
-                                           rbSearchBuf, sizeof I.searchBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
-                              "bare text matches anywhere in the relative path;\n"
-                              "* and ? glob across '/'");
-        ImGui::SameLine();
-        if (I.search.running) {
-            if (ImGui::SmallButton("Stop##rbsearch")) {
-                I.search.gen++;               // in-flight result becomes stale
-                I.search.running = false;
-            }
-        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
-            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
-            ImGui::CloseCurrentPopup();       // the answer arrives in the listing
-        }
-        ImGui::EndPopup();
-    }
+    // (The server-search popup used to be here: a second text box, identical in
+    // appearance to the filter, reached from the menu above or from a crumb's
+    // "Search under here". It is gone - the filter IS the search box now, and
+    // Enter is how far it reaches. Everything it carried survived: Stop and the
+    // root chip sit beside the box, and the depth and hit limits moved into the
+    // box's own tooltip.)
     // How many rows are selected: counted once, here, because two places need
     // it - the action row below and the bottom status line at the end.
     int rbNSel = 0;
     for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) if (rbSel[i]) rbNSel++;
-    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
-        // the frames can actually stack, BEFORE any pixel is transferred
-        int nSel = 0;
+    // (The selection action row lived here: "Open N selected as stack",
+    // "Temporal stats (server)", "Copy paths" and "clear". All four moved into
+    // the row right-click menu, which now acts on the SELECTION when the row
+    // under the pointer is part of it - the way a file manager does. Four
+    // controls charging every glance, to say what a right-click already says.
+    //
+    // The move is only safe because of that rule: right-click used to target
+    // the one row it hit, so deleting the buttons without it would have deleted
+    // the only path for "pick several, then act".)
+    // Everything the selection verbs need, computed once: the files behind the
+    // ticked rows (a group row means the frames it stands for), and whether
+    // those files can actually stack - answered from the v3 metadata BEFORE any
+    // pixel is transferred.
+    auto rbSelFiles = [&]() {
+        std::vector<std::string> files;
+        for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+            if (!rbSel[i]) continue;
+            if (view[i].isGroup())
+                for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+            else files.push_back(view[i].full());
+        }
+        return files;
+    };
+    std::string rbSelStackWhyNot;        // empty = the selection can stack
+    bool rbSelTemporalOk = B.peerVersion >= 2;
+    {
         const remote::Entry* first = nullptr;
-        std::string reason;
         for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
             if (!rbSel[i]) continue;
             const remote::Entry& e = *view[i].e;
-            nSel++;
-            if (!isNpyName(view[i].name())) { reason = "only .npy files can form a stack"; continue; }
+            if (!isNpyName(view[i].name())) {
+                rbSelStackWhyNot = "only .npy files can form a stack";
+                rbSelTemporalOk = false;     // MEASURE is npy-only too
+                continue;
+            }
             if (!e.hasMeta) {
-                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
+                rbSelStackWhyNot = "shape unknown - the peer is protocol 2 "
+                                   "(File > Update remote peer)";
                 continue;
             }
             if (!first) { first = &e; continue; }
             if (e.ndim != first->ndim || e.dtype != first->dtype ||
                 memcmp(e.dims, first->dims, sizeof e.dims) != 0)
-                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
-                         fmtEntryShape(e);
+                rbSelStackWhyNot = "selected files differ: " + fmtEntryShape(*first) +
+                                   " vs " + fmtEntryShape(e);
         }
-        {   // ALWAYS submitted, disabled below two selections. The panel's own
-            // rule, written for the scrub bar: "footer space RESERVED even when
-            // no preview is alive, so starting one never shifts the rows under
-            // the cursor". This row appearing at nSel == 2 pushed the whole
-            // listing down one button height on the frame AFTER the second
-            // Ctrl+click - so the third click of a rapid multi-select landed on
-            // the row above the one under the cursor and toggled the wrong file
-            // into the selection that then feeds "Open N selected as stack".
-            char lb[64];
-            if (nSel >= 2) snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
-            else           snprintf(lb, sizeof lb, "Open selected as stack");
-            bool few = nSel < 2;
-            if (few) reason = "select two or more files (Ctrl / Shift + click)";
-            if (!reason.empty()) ImGui::BeginDisabled();
-            if (ImGui::Button(lb)) {
-                std::vector<std::string> files;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    if (view[i].isGroup())
-                        for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
-                    else files.push_back(view[i].full());
-                }
-                sortFramesNumerically(files);
-                std::vector<std::string> bases;
-                for (const auto& f : files) bases.push_back(baseName(f));
-                openRemoteStack(B.host, files,
-                                stackNameFor(B.dir, patternOfNames(bases)), B.port);
-                rbSel.assign(view.size(), 0);
-            }
-            if (!reason.empty()) ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", reason.empty()
-                    ? "frames stack in numeric name order" : reason.c_str());
-            ImGui::SameLine();
-            {   // the server aggregate for the selection, without opening it.
-                // MEASURE exists from protocol 2, but v2 has no hasMeta to
-                // pre-validate shapes - a mismatch falls to [server failed].
-                int pv2 = B.peerVersion;      // published by the worker; no lock
-                bool tempOk = pv2 >= 2;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
-                    if (rbSel[i] && !isNpyName(view[i].name())) tempOk = false;
-                ImGui::BeginDisabled(!tempOk);
-                if (ImGui::Button("Temporal stats (server)")) {
-                    std::vector<std::string> files;
-                    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                        if (!rbSel[i]) continue;
-                        if (view[i].isGroup())
-                            for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
-                        else files.push_back(view[i].full());
-                    }
-                    std::string leaf = B.dir;
-                    size_t sl2 = leaf.find_last_of('/');
-                    if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
-                        leaf = leaf.substr(sl2 + 1);
-                    requestBrowseTemporal(B.host, files,
-                                          leaf + " (" + std::to_string(files.size()) +
-                                          " selected)", B.port);
-                }
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(tempOk
-                        ? "sigma_t / sigma_fpn computed on the server over the\n"
-                          "selected files, shown in the Temporal panel - nothing\n"
-                          "opens, no pixel transfers. plane=all (no CFA split)."
-                        : pv2 < 2 ? "needs a protocol 2+ peer (File > Update remote peer)"
-                                  : "only .npy files can form a stack");
-            }
-            ImGui::SameLine();
-            // A selection you can open but cannot NAME is half a selection: the
-            // paths are what goes into a script, a ticket or a message. The
-            // single-row context menu has had "Copy path" all along; the
-            // multi-select row simply never grew one.
-            if (ImGui::SmallButton("Copy paths##sel")) {
-                std::string all;
-                int nf = 0;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    if (view[i].isGroup())            // a group row means its frames
-                        for (const auto& m : view[i].e->members) {
-                            all += view[i].join(m); all += "\n"; nf++;
-                        }
-                    else { all += view[i].full(); all += "\n"; nf++; }
-                }
-                ImGui::SetClipboardText(all.c_str());
-                toast("copied " + std::to_string(nf) + " path(s)");
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("one absolute path per line; a numbered group\n"
-                                  "expands to the frames it stands for");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
-        }
+        if (rbNSel < 2) rbSelStackWhyNot = "select two or more files (Ctrl / Shift + click)";
     }
     
     // (The protocol-mismatch warning was a conditional full-width orange row
@@ -20654,12 +20634,72 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
+                // Right-clicking a row that is PART of a multi-row selection acts
+                // on the whole selection, the way every file manager does. This
+                // is what replaced the four buttons that used to sit above the
+                // listing: the verbs did not go away, they stopped charging rent.
+                // Right-clicking a row that is NOT selected still means that row
+                // alone - the pointer beats the ticks, or a menu would act on
+                // something the user is not pointing at.
+                if (isSel && rbNSel >= 2) {
+                    char lb[64];
+                    snprintf(lb, sizeof lb, "Open %d selected as stack", rbNSel);
+                    if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        sortFramesNumerically(files);
+                        std::vector<std::string> bases;
+                        for (const auto& f : files) bases.push_back(baseName(f));
+                        openRemoteStack(B.host, files,
+                                        stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        rbSel.assign(view.size(), 0);
+                    }
+                    if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", rbSelStackWhyNot.empty()
+                            ? "frames stack in numeric name order"
+                            : rbSelStackWhyNot.c_str());
+
+                    snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
+                    ImGui::BeginDisabled(!rbSelTemporalOk);
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        // baseName("/") is empty; the folder at the root of a
+                        // filesystem is still called "/" on screen
+                        std::string leaf = baseName(B.dir);
+                        if (leaf.empty()) leaf = B.dir;
+                        requestBrowseTemporal(B.host, files,
+                                              leaf + " (" + std::to_string(files.size()) +
+                                              " selected)", B.port);
+                    }
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(rbSelTemporalOk
+                            ? "sigma_t / sigma_fpn computed on the server over the\n"
+                              "selected files, shown in the Temporal panel - nothing\n"
+                              "opens and no pixel transfers"
+                            : "needs a protocol 2+ peer and .npy files only");
+
+                    snprintf(lb, sizeof lb, "Copy %d path(s)", rbNSel);
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        std::string all;
+                        for (const auto& f : files) { all += f; all += "\n"; }
+                        ImGui::SetClipboardText(all.c_str());
+                        toast("copied " + std::to_string(files.size()) + " path(s)");
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("one absolute path per line; a numbered group\n"
+                                          "expands to the frames it stands for");
+                    if (ImGui::MenuItem("Clear selection")) rbSel.assign(view.size(), 0);
+                    ImGui::Separator();
+                }
                 if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(I, full);
                     if (ImGui::MenuItem("Search under here")) {
-                        rbSearchRoot = full;      // the search row shows and clears it
-                        rbSearchFocus = true;
+                        rbSearchRoot = full;   // the chip beside the box shows and clears it
+                        I.searchOpen = true;   // ...and the caret goes in the box
                     }
                     if (ImGui::MenuItem("Bookmark")) {
                         std::string u = placeUrl(B.host, B.port, full);
@@ -33421,6 +33461,13 @@ int main(int argc, char** argv) {
                 // with it the docking, the layout file and the session) is
                 // exactly what it was when the title was a fixed string.
                 I.wtitle = rbPanelTitle(I.num, I.b.connected ? I.b.host : std::string());
+                // "+" asked for this one to land beside the panel it came from.
+                // Once only: after the first frame the panel is wherever the
+                // user dragged it, and the layout file owns that.
+                if (I.dockInto) {
+                    ImGui::SetNextWindowDockID((ImGuiID)I.dockInto, ImGuiCond_Always);
+                    I.dockInto = 0;
+                }
                 if (ImGui::Begin(I.wtitle.c_str(), &show)) drawPanelRemote(I);
                 ImGui::End();
                 if (!show && !primordial) destroyNum = I.num;
