@@ -44,7 +44,9 @@ esac
 # available we say nothing at all rather than guess.
 running_pids() {                 # $1 = path to a binary
   [ -e "$1" ] || return 0
-  abs=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+  # -P: the PHYSICAL path. /proc/<pid>/exe is already resolved, so a logical
+  # path picked up through a symlinked parent would never compare equal.
+  abs=$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")
   if [ -r /proc/self/exe ]; then
     for e in /proc/[0-9]*/exe; do
       t=$(readlink "$e" 2>/dev/null) || continue
