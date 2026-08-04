@@ -1227,7 +1227,7 @@ struct App {
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     int folderRecipeOpenId = 0;       // ...and WHOSE Open answered for it
     int nextOpenId = 1;               // one per Open Folder, stamped on its groups
-    // "which sequences do you want?" picker shown after scanning a folder.
+    // "which stacks do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
     // filter matches against exactly these strings, so folder names and file
     // names both narrow the tree. match/nMatch: the filter's current cut;
@@ -8966,7 +8966,7 @@ static void npzPickAccept() {
 }
 
 // Tree of what the scan found. One live filter narrows FILES as you type;
-// checkboxes choose groups; the footer picks between "one stack per sequence"
+// checkboxes choose groups; the footer picks between "one stack per group"
 // and "everything as ONE stack". Group count is capped at 256 by the scans, so
 // the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
