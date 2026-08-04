@@ -2516,6 +2516,23 @@ static void forgetImage(ImageDoc* im) {
     forgetTexture(im);
     app.imagesRev++;
 }
+
+static void ensureSession(remote::Session& ses, std::string& sesHost, int& sesPort,
+                          const std::string& host, int port, const std::string& exe,
+                          std::string& errOut) {
+    std::string err;
+    // startOn, not start(): start() hardwires port 0, i.e. plain
+    // `ssh host` - a DIFFERENT machine when the user named a port
+    if (!ses.alive() || sesHost != host || sesPort != port) {
+        if (!ses.startOn(host, port, exe, err)) {
+            errOut = err;
+        } else {
+            sesHost = host;
+            sesPort = port;
+        }
+    }
+}
+
 // ---- background full-resolution fetch (remote frames) -------------------------
 // The preview is already on screen; the real pixels arrive here on their own ssh
 // connection and are swapped in by the UI thread.
@@ -2547,12 +2564,7 @@ static void rfWorker() {
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
             d.err = "bad remote url";
         } else {
-            // startOn, not start(): start() hardwires port 0, i.e. plain
-            // `ssh host` - a DIFFERENT machine when the user named a port
-            if (!ses.alive() || sesHost != host || sesPort != port) {
-                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
-                else { sesHost = host; sesPort = port; }
-            }
+            ensureSession(ses, sesHost, sesPort, host, port, job.exe, d.err);
             if (d.err.empty()) {
                 int w = 0, h = 0, ch = 0;
                 // the server clamps the rect, so "huge" means "the whole frame"
@@ -2767,10 +2779,7 @@ static void mWorker() {
         if (!remote::parseUrl(job.url, host, rpath, &port)) { d.err = "bad remote url"; }
         else {
             d.host = host;
-            if (!ses.alive() || sesHost != host || sesPort != port) {
-                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
-                else { sesHost = host; sesPort = port; }
-            }
+            ensureSession(ses, sesHost, sesPort, host, port, job.exe, d.err);
             if (d.err.empty()) {
                 remote::MeasureReq q;
                 q.op = job.op;
