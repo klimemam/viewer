@@ -8299,6 +8299,7 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         std::string rel = d.first.u8string();
         if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
         else rel.clear();
+        std::replace(rel.begin(), rel.end(), '\\', '/');
         auto push = [&](std::vector<std::string> fs, std::string pattern) {
             if (groups.size() >= MAX_GROUPS) return;
             App::PendingGroup g;
