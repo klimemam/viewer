@@ -4264,7 +4264,9 @@ static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& 
     const uint8_t* p = buf.data() + H.dataOff;
     std::string s;
     if (H.code[0] == 'S') {
-        for (size_t i = 0; i < avail && p[i]; i++) s += (char)p[i];
+        size_t len = 0;
+        while (len < avail && p[len]) len++;
+        s.assign((const char*)p, len);
     } else if (H.code[0] == 'U') {
         for (size_t i = 0; i + 4 <= avail; i += 4) {
             uint32_t c; memcpy(&c, p + i, 4);
