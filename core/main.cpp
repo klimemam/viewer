@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cctype>
 #include <cfloat>
+#include <deque>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -789,7 +790,7 @@ struct App {
     struct RemoteOpen { std::string host; std::vector<std::string> files;
                         std::string name; int batchId = 0; int port = 0;
                         int token = 0; };
-    std::vector<RemoteOpen> rbOpenQueue;
+    std::deque<RemoteOpen> rbOpenQueue;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
     // one session.
@@ -10781,7 +10782,7 @@ static void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
 static void pumpRemoteOpenQueue() {
     if (app.rbOpenQueue.empty() || app.rfPending > 0 || app.seqRunning) return;
     App::RemoteOpen ro = std::move(app.rbOpenQueue.front());
-    app.rbOpenQueue.erase(app.rbOpenQueue.begin());
+    app.rbOpenQueue.pop_front();
     sortFramesNumerically(ro.files);
     app.loadBatchId = ro.batchId;
     openRemoteStack(ro.host, ro.files, ro.name, ro.port, ro.token);
