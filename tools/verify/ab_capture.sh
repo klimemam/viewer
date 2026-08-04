@@ -43,7 +43,7 @@ run() {
 
 # --- the 21 the orchestrator suite pins, same args, neutral-root paths --------
 run series      --series-selftest linset
-run lin         --lin-selftest --sequence always --cfa bayer --bayer-pattern RGGB linset
+run lin         --lin-selftest --stack always --cfa bayer --bayer-pattern RGGB linset
 run browse      --browse-selftest tools/testdata/rb
 run browsekeys  --browse-keys-selftest tools/testdata/rb
 run abstats     --abstats-selftest tools/testdata/multi
@@ -55,11 +55,11 @@ run verify      --verify-selftest tools/testdata/multi
 run scan        --scan-selftest linset
 run localbrowse --localbrowse-selftest tools/testdata/rb
 run rtemporal   --rtemporal-selftest tools/testdata/rb/scanroot/10lx
-run framestats  --sequence always --framestats-selftest linset/80lx
-run export      --export-selftest tools/testdata/multi --sequence always
+run framestats  --stack always --framestats-selftest linset/80lx
+run export      --export-selftest tools/testdata/multi --stack always
 run tile        --tile-selftest tools/testdata/multi
 run derive      --derive-selftest tools/testdata
-run texport     --export-tsv-selftest tools/testdata/multi --sequence always --cfa bayer --bayer-pattern RGGB
+run texport     --export-tsv-selftest tools/testdata/multi --stack always --cfa bayer --bayer-pattern RGGB
 run framelin    --frame-lin-selftest tools/testdata
 run newwin      --newwin-selftest tools/testdata
 run remote      --remote-selftest tools/testdata/bench_stack.npy --remote-exe "$SERVE"

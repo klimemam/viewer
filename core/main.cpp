@@ -596,6 +596,14 @@ struct App {
         double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
         const char* seriesNames[4] = {};
     } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
+    // ...and one per extra compare slot (C, D, E...), indexed by cmpExtra
+    // position - which IS the letter, and travels with the resolved document
+    // (ResolvedSlot::idx), because after a follow-frame the document is no
+    // longer the pinned uid and a uid lookup would lose the letter. Exactly the
+    // shape projExtra and temporalExtra already have; the histogram was the one
+    // statistics cache still stopping at two, so the Statistics panel could
+    // only ever name A and B however many slots were armed.
+    std::vector<HistState> histExtra;
     bool histLog = true;
     // Which plane the histogram draws: -1 = all, else the series index. Four
     // CFA planes times two sides is eight curves on one axis; the selector is
@@ -1219,7 +1227,7 @@ struct App {
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     int folderRecipeOpenId = 0;       // ...and WHOSE Open answered for it
     int nextOpenId = 1;               // one per Open Folder, stamped on its groups
-    // "which sequences do you want?" picker shown after scanning a folder.
+    // "which stacks do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
     // filter matches against exactly these strings, so folder names and file
     // names both narrow the tree. match/nMatch: the filter's current cut;
@@ -2559,6 +2567,15 @@ static void forgetImage(ImageDoc* im) {
         if (app.proj[k].img == im) { app.proj[k].img = nullptr; app.proj[k].uid = 0; }
         app.temporal[k].seqId = -1;
     }
+    // ...and EVERY lettered slot, for the same reason. Closing C shifts D down
+    // into C's cache entry, and the entry still held C's ImageDoc*: the key
+    // check (uid/dataRev) fails and it is recomputed before it is read, so the
+    // stale pointer was never followed - but "never followed" is a property of
+    // the read path, not of the cache, and the next reader is one edit away
+    // from following it. The cache says what it holds or it says nothing.
+    for (auto& H : app.histExtra) if (H.img == im) { H.img = nullptr; H.uid = 0; }
+    for (auto& P : app.projExtra) if (P.img == im) { P.img = nullptr; P.uid = 0; }
+    for (auto& T : app.temporalExtra) T.seqId = -1;
     forgetTexture(im);
     app.imagesRev++;
 }
@@ -3472,6 +3489,9 @@ static void closeAll() {
         app.proj[k] = App::ProjState{};
         app.temporal[k] = App::TemporalState{};
     }
+    app.histExtra.clear();            // ...and every lettered one
+    app.projExtra.clear();
+    app.temporalExtra.clear();
     app.abSlot1Live = false;
     app.texLru.clear();
     app.imagesRev++;
@@ -6793,7 +6813,7 @@ static std::string selfExePath() {
 }
 
 // The command line that makes "the same image look the same" in the child:
-// - a stack passes its HEAD file, and --sequence always regroups the numbered
+// - a stack passes its HEAD file, and --stack always regroups the numbered
 //   siblings there without the picker;
 // - the CFA interpretation rides along when one is set (pattern before --cfa,
 //   which reads best; parseCli accepts either order);
@@ -6812,7 +6832,7 @@ static std::vector<std::string> newWindowArgv(const ImageDoc* d) {
     if (target.empty()) return {};     // nothing on disk behind this row
     std::vector<std::string> av{ selfExePath(), "--secondary",
                                  "--window-offset", "40,40" };
-    if (d->seqId != 0) { av.push_back("--sequence"); av.push_back("always"); }
+    if (d->seqId != 0) { av.push_back("--stack"); av.push_back("always"); }
     if (d->cfa != 0) {
         av.push_back("--bayer-pattern");
         av.push_back(CFA_PATTERNS[d->cfaPattern & 3]);
@@ -7759,7 +7779,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
         app.seqErr.clear();
     }
     app.seqNote.clear();
-    fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
+    fprintf(stderr, "stack: %s - %d files (%s)\n", info.name.c_str(),
             (int)files.size(), isRaw ? "raw recipe" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
@@ -7803,7 +7823,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 char m[192];
                 snprintf(m, sizeof m,
                          "memory budget %.1f GB reached - stopped after %d of %d frames\n"
-                         "(File > Sequence loading > Memory budget)\n",
+                         "(File > Stack loading > Memory budget)\n",
                          budget / 1073741824.0, app.seqDone.load(), (int)jobs.size());
                 fputs(m, stderr);
                 std::lock_guard<std::mutex> lk(app.seqMtx);
@@ -7878,7 +7898,7 @@ static void pumpSequence() {
         app.seqThread.join();
         int n = 0;
         for (const auto& d : app.images) if (d->seqId == app.seqLoadingId) n++;
-        fprintf(stderr, "sequence: loaded %d frames\n", n);
+        fprintf(stderr, "stack: loaded %d frames\n", n);
     }
 }
 
@@ -8665,7 +8685,7 @@ static void openFolder(const std::string& path) {
     std::vector<App::PendingGroup> groups = scanFolderGroups(path);
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
-        toast("scan stopped at 256 sequences - narrow the folder or use the filter", true);
+        toast("scan stopped at 256 stacks - narrow the folder or use the filter", true);
     // ALWAYS ask, one group included - same rule the remote scan follows. The
     // picker is where the file filter lives (UC3: "open only the *_dark*
     // frames of this folder" needs the dialog even when the folder groups into
@@ -8946,7 +8966,7 @@ static void npzPickAccept() {
 }
 
 // Tree of what the scan found. One live filter narrows FILES as you type;
-// checkboxes choose groups; the footer picks between "one stack per sequence"
+// checkboxes choose groups; the footer picks between "one stack per group"
 // and "everything as ONE stack". Group count is capped at 256 by the scans, so
 // the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
@@ -8964,14 +8984,14 @@ static void drawFolderPickModal() {
                 : app.folderPickHost.empty() ? "peer on " PEER_HERE
                                              : app.folderPickHost.c_str(),
                 (int)app.folderPick.size());
-        ImGui::OpenPopup("Select sequences");
+        ImGui::OpenPopup("Select stacks");
     }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 18),
                                         ImVec2(FLT_MAX, FLT_MAX));
-    if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
+    if (!ImGui::BeginPopupModal("Select stacks", nullptr)) return;
 
     ImGui::TextDisabled("%s", dispPath(app.folderPickRoot).c_str());
     int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
@@ -8995,14 +9015,14 @@ static void drawFolderPickModal() {
             ImGui::SetTooltip(
                 "Narrows WHICH FILES will load, as you type.\n"
                 "Each word is looked for anywhere in a file's \"folder/filename\"\n"
-                "(shown when you expand a sequence below). All words must match.\n"
+                "(shown when you expand a stack below). All words must match.\n"
                 "    dark          keep files whose folder or name contains \"dark\"\n"
                 "    !ng           drop files matching \"ng\"\n"
                 "    10lx *_A.npy  words combine; * and ? wildcards work anywhere\n"
-                "Sequences show \"kept / total\"; only the kept files are loaded.");
+                "Stacks show \"kept / total\"; only the kept files are loaded.");
         ImGui::SameLine();
         if (app.pickFilter[0]) ImGui::Text("%d / %d files match", matchFiles, totalFiles);
-        else ImGui::TextDisabled("%d sequence(s), %d files", (int)app.folderPick.size(), totalFiles);
+        else ImGui::TextDisabled("%d stack(s), %d files", (int)app.folderPick.size(), totalFiles);
     }
     if (ImGui::SmallButton("All")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = true; }
     ImGui::SameLine();
@@ -9145,7 +9165,7 @@ static void drawFolderPickModal() {
         snprintf(m1, sizeof m1, "ONE stack of %d file(s)###mode1", selFiles);
         ImGui::RadioButton(m0, &app.pickMerge, 0);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("each checked sequence becomes its own stack");
+            ImGui::SetTooltip("each checked group of numbered files becomes its own stack");
         ImGui::SameLine();
         ImGui::RadioButton(m1, &app.pickMerge, 1);
         if (ImGui::IsItemHovered())
@@ -9198,7 +9218,7 @@ static void drawFolderPickModal() {
     if (sweepRow) {
         ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+            ImGui::SetTooltip("The %d selected stacks become one SERIES: each stack keeps\n"
                               "the value read from its name, and linearity / PTC measure the\n"
                               "series as a whole.\n"
                               "Nothing is created unless this is ticked.", selGroups);
@@ -9256,9 +9276,9 @@ static void drawFolderPickModal() {
                            "shapes differ (%s vs %s) - mismatched frames are skipped at load",
                            shapes[0].c_str(), shapes[1].c_str());
     else
-        ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
+        ImGui::Text("selected: %d stack(s), %d files", selGroups, selFiles);
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
-        ImGui::TextDisabled("check the shape column above to see which sequences differ");
+        ImGui::TextDisabled("check the shape column above to see which stacks differ");
     ImGui::BeginDisabled(!loadable);
     bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
                               : app.pickSweep   ? "Load as a sweep"
@@ -9772,7 +9792,7 @@ static void maybeOfferSequence(int imageIdx) {
     if ((int)files.size() < 2) return;
     if (app.seqLoadMode == 1) {                       // always
         startSequenceLoad(imageIdx, files, pattern);
-        toast("loading sequence: " + pattern + " (" + std::to_string(files.size()) + " files)");
+        toast("loading stack: " + pattern + " (" + std::to_string(files.size()) + " files)");
         return;
     }
     app.seqAskImage = imageIdx;                       // ask
@@ -11177,7 +11197,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             char msg[160];
             snprintf(msg, sizeof msg,
                      "memory budget: fetching %d of %d frames\n"
-                     "(File > Sequence loading > Memory budget)", fit + 1, m.frames);
+                     "(File > Stack loading > Memory budget)", fit + 1, m.frames);
             app.seqNote = msg;
         }
     }
@@ -11244,7 +11264,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         char msg[160];
         snprintf(msg, sizeof msg,
                  "memory budget: fetching %d of %d frames\n"
-                 "(File > Sequence loading > Memory budget)", fit + 1, (int)files.size());
+                 "(File > Stack loading > Memory budget)", fit + 1, (int)files.size());
         app.seqNote = msg;
     }
 }
@@ -11392,7 +11412,7 @@ static void openFolderDialog() {
     }
     if (app.folderDlg) return;
     app.folderDlgMode = 0;
-    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all stacks below it)");
 }
 // The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
 // folder opens in the Browse panel through the LOCAL peer - the same listing,
@@ -13068,9 +13088,28 @@ static std::string abDocLabel(const ImageDoc* d) {
 }
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
-    if (integer) snprintf(buf, n, "%.0f", v);
-    else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
-    else snprintf(buf, n, "%.4g", v);
+    if (integer) { snprintf(buf, n, "%.0f", v); return; }
+    // Axis labels are read at a glance, and C's scientific notation makes an
+    // ordinary sensor value look like an implementation detail: "2e+04" for
+    // 20000 DN. It is worst on log paper, where several of them sit in a
+    // column. Keep the significand and say the scale once, with the prefix the
+    // reader already uses for it.
+    //
+    // The ladder is closed at both ends on purpose. A suffix is only a
+    // shorthand while the reader knows it, so it stops at G and at n; outside
+    // that, e-notation is the honest form. Leaving the small end open lets
+    // 1e-15 print as "1e-06n", which is neither.
+    const double a = fabs(v);
+    double scale = 1.0;
+    const char* suffix = "";
+    if      (a >= 1e9  && a < 1e12) { scale = 1e9;  suffix = "G"; }
+    else if (a >= 1e6  && a < 1e9 ) { scale = 1e6;  suffix = "M"; }
+    else if (a >= 1e3  && a < 1e6 ) { scale = 1e3;  suffix = "k"; }
+    else if (a >= 1e-6 && a < 1e-3) { scale = 1e-6; suffix = "u"; }
+    else if (a >= 1e-9 && a < 1e-6) { scale = 1e-9; suffix = "n"; }
+    if (*suffix)                            snprintf(buf, n, "%.4g%s", v / scale, suffix);
+    else if (a != 0 && (a >= 1e12 || a < 1e-9)) snprintf(buf, n, "%.2e", v);
+    else                                    snprintf(buf, n, "%.4g", v);
 }
 
 // xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
@@ -13216,6 +13255,67 @@ static void drawABLegendRow(const std::string& aName, const std::string& bName,
     ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x,
                         one ? ImGui::GetTextLineHeight()
                             : ImGui::GetTextLineHeight() + lineAdvance));
+}
+
+// The ink each compare slot is stroked in when they share one plot - Temporal's
+// chart and the Histogram overlay both. A, B and
+// the extras are SLOTS, not CFA planes, so hue is free here - the iron rule is
+// about mixing planes inside a statistic, and the per-frame mean is a pooled
+// level that says so on its axis. A keeps the neutral green every plot draws
+// in and B keeps the blue the shared legend flies, so nothing that already
+// reads as A or B changes colour when a C appears.
+static ImU32 slotInk(size_t i) {
+    static const ImU32 INK[] = {
+        IM_COL32(105, 220, 130, 255),   // A
+        IM_COL32(120, 190, 255, 230),   // B - AB_B_INK
+        IM_COL32(245, 170,  90, 255),   // C
+        IM_COL32(205, 140, 245, 255),   // D
+        IM_COL32(235, 225, 110, 255),   // E
+        IM_COL32(120, 225, 225, 255),   // F
+        IM_COL32(245, 130, 160, 255),   // G
+    };
+    return INK[i % (sizeof INK / sizeof INK[0])];
+}
+// How many slots the palette can tell APART. The modulo above wraps, so slot H
+// comes back in A's green: two curves the same colour on one chart is the panel
+// omitting a slot again, this time behind a colour instead of an array bound.
+// A caller that overlays slots must cap at this and SAY which letters it left
+// off - never draw past it and let the wrap do the lying.
+static size_t slotInkCount() { return 7; }
+
+// The Temporal chart's legend. drawABLegendRow knows exactly two slots; this
+// one takes as many as the compare slots hold and WRAPS, because C/D/E push a
+// single row off the panel. Measuring and drawing are the same code (draw=false
+// only skips the ink), so the height reserved for the plot above is the height
+// the legend actually takes and adding a slot never moves the plot out from
+// under the cursor.
+struct SlotLegendEntry { std::string text; ImU32 ink; };
+static float slotLegendRow(const std::vector<SlotLegendEntry>& e, bool draw) {
+    if (e.empty()) return 0.0f;
+    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
+    const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
+    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImU32 txt = IM_COL32(215, 222, 228, 255);
+    float x = 0;
+    int row = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        float w = sw + gap + ImGui::CalcTextSize(e[i].text.c_str()).x;
+        if (i && x + sep + w > availW) { row++; x = 0; }
+        else if (i) x += sep;
+        if (draw) {
+            float ex = p.x + x, ey = p.y + row * adv;
+            dl->AddLine(ImVec2(ex, ey + fh * 0.5f), ImVec2(ex + sw, ey + fh * 0.5f),
+                        e[i].ink, 1.6f);
+            dl->AddText(ImVec2(ex + sw + gap, ey), txt, e[i].text.c_str());
+        }
+        x += w;
+    }
+    float h = (row + 1) * adv;
+    // consume exactly h (ImGui adds one ItemSpacing after the Dummy)
+    if (draw) ImGui::Dummy(ImVec2(availW, std::max(h - ImGui::GetStyle().ItemSpacing.y, 1.0f)));
+    return h;
 }
 
 // The heading strip over one half of a side-by-side pair. Neutral colour: which
@@ -13899,8 +13999,8 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
     return xl;
 }
 
-// Is the B histogram slot describing something other than the picture in front
-// of the reader? TWO keys, not one. The image is the obvious half. The other is
+// Is a histogram slot describing something other than the picture it is named
+// against? TWO keys, not one. The image is the obvious half. The other is
 // the RANGE the bins were built on: in the union default the bin range is the
 // min/max of the two CURRENT frames, so it moves every time A steps, and A's
 // histogram re-bins each step because its cache keys include black/white while
@@ -13911,30 +14011,97 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
 // so it never fired for the case that needs it most, a B pinned with Shift+B
 // (an advertised workflow: its uid never moves). Once the stepping stops the
 // recompute runs and both comparisons go back to equal.
-static bool abHistBStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
+// It asks the question for ANY side, not only B - every lettered slot is
+// binned on A's black/white and skipped by the same stepping throttle, so it
+// goes stale for the same two reasons and has to say so in the same words.
+static bool abHistSideStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
     if (!a || !b) return false;
     return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a);
 }
 
+// One side of the Statistics panel: A, B, or a lettered slot. It is built ONCE,
+// at the top, and the table, the plot, the legend and the footer all walk this
+// same list - so the table can never name a slot the footer forgets. That is
+// the defect this change exists to remove (issue #60): the cache held two
+// sides, so the panel drew the two it held and said nothing about C onwards.
+struct HistSide {
+    const App::HistState* H;
+    std::string letter;               // "A", "B", "C", ... - the POSITION
+    std::string label;                // the stack this side is looking at
+    bool stale = false;
+    ImU32 ink = 0;
+    double sc = 1;                    // share of THIS side's own sampled pixels
+};
+
+// What the Statistics/Histogram panel ACTUALLY said about the slots on the last
+// frame it drew - the same reasoning as g_filesBadgeProbe and g_paneBadgeProbe:
+// this machine cannot screenshot GL, so the panel writes down the letters it
+// named instead of a test trusting that it did. The bug being guarded is
+// SILENCE, so every field records what the panel SAYS, never what a cache
+// holds:
+//   "rows=ABCD;"        the sides the statistics table gave rows to
+//   "curves=ABC;"       the sides that got a curve on the plot
+//   "said-no-curve=D;"  the sides left OFF the plot AND named on screen for it
+// A letter in `rows` but in neither of the other two would be the old defect
+// back again, which is what the N group of --abstats-selftest asserts.
+static std::string g_histSideProbe;
+
 static void drawPanelHistogram() {
+    g_histSideProbe.clear();
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
         ImageDoc* Bim = abStatsB();
+        pumpCompareSlotRestore();
+        // The lettered slots resolve exactly as B does, follow-frame included,
+        // and rs.idx IS the letter - it travels with the resolved document
+        // because after a follow the document is no longer the pinned uid and a
+        // uid lookup would lose the letter. A slot that is also B is ONE side.
+        std::vector<ResolvedSlot> xslots;
+        for (const ResolvedSlot& rs : resolveSlots())
+            if (rs.doc != Bim) xslots.push_back(rs);
+        // resolveSlots() prunes closed slots first, so this is the pruned size.
+        // NOTHING below resizes histExtra again: the sides hold pointers into
+        // it, and a growth under them would dangle exactly the way seqInfo()'s
+        // pointers into app.seqs did (cc1ee8b) - on MSVC and not here.
+        app.histExtra.resize(app.cmpExtra.size());
         recomputeHistogramIfNeeded(im, app.hist[0]);
-        // B is binned on A's black/white: one x axis, one bin grid, or the two
-        // curves are not comparable. Sizes may differ freely - the y axis below
-        // normalises that away. Skipped while frames are being stepped: an
-        // empty slot is always filled, a filled one waits for the stepping to
-        // stop and is labelled stale until then.
+        // Every other side is binned on A's black/white: one x axis, one bin
+        // grid, or the curves are not comparable. Sizes may differ freely - the
+        // y axis below normalises that away. Skipped while frames are being
+        // stepped: an empty slot is always filled, a filled one waits for the
+        // stepping to stop and is labelled stale until then. The slots take
+        // B's rule unchanged, so N of them cannot turn a held arrow key into N
+        // full passes over N images.
         if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
             recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
+        for (const ResolvedSlot& rs : xslots)
+            if (rs.idx < app.histExtra.size() &&
+                (!abStepBusy() || app.histExtra[rs.idx].uid == 0))
+                recomputeHistogramIfNeeded(rs.doc, app.histExtra[rs.idx],
+                                           effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         // ...or B is not A's partner at all: follow-frame found no frame of
         // B's stack carrying A's number, so what is drawn is the last latched
         // one. Same amber token, because it is the same statement.
-        const bool bStale = abHistBStale(im, Bim, HB) || (Bim && g_abFollowDiverged);
+        const bool bStale = abHistSideStale(im, Bim, HB) || (Bim && g_abFollowDiverged);
         const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
+        auto shareScale = [](const App::HistState& S) {
+            return 100.0 / (double)std::max<size_t>(S.sampled, 1);
+        };
+        std::vector<HistSide> sides;
+        sides.push_back({ &H, "A", abDocLabel(im), false, slotInk(0), shareScale(H) });
+        if (Bim) sides.push_back({ &HB, "B", bLabel, bStale, slotInk(1), shareScale(HB) });
+        for (const ResolvedSlot& rs : xslots) {
+            if (rs.idx >= app.histExtra.size()) continue;
+            const App::HistState& HX = app.histExtra[rs.idx];
+            // slotInk counts A and B first, so a slot's ink is its letter's
+            // ink on the Temporal chart too - one colour per slot across the
+            // application, not one per panel.
+            sides.push_back({ &HX, slotName(rs.idx), abDocLabel(rs.doc),
+                              rs.diverged || abHistSideStale(im, rs.doc, HX),
+                              slotInk(rs.idx + 2), shareScale(HX) });
+        }
         ImGui::Text("Statistics");
         ImGui::SameLine();
         // with a B on screen, an unlabelled table of numbers is ambiguous:
@@ -13944,19 +14111,49 @@ static void drawPanelHistogram() {
         else     ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
         // fixed widths + right-aligned numbers: columns must not reflow while
-        // stepping through frames, otherwise values are impossible to compare
-        if (ImGui::BeginTable("quickstats", 4, ImGuiTableFlags_SizingFixedFit)) {
+        // stepping through frames, otherwise values are impossible to compare.
+        // The SIDE is a row, never a column pair: a column pair has exactly two
+        // operands - which is what a delta needs and what A|B|delta is - and
+        // there are N sides. The Projection table settled this axis already
+        // (docs/ab-stats-plan.md 4); the rows are the axis that grows.
+        const bool anySide = sides.size() > 1;
+        if (ImGui::BeginTable("quickstats", anySide ? 5 : 4,
+                              ImGuiTableFlags_SizingFixedFit |
+                              (anySide ? ImGuiTableFlags_RowBg : 0))) {
+            if (anySide)
+                ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
+                                        ImGui::GetFontSize() * 1.8f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
             ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableSetupColumn("var", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
-            for (int s = 0; s < H.nSeries; s++) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", H.seriesNames[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.mean[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s] * H.sd[s]);
+            // EVERY side, always - the table has no readability limit a plot
+            // has, so whatever the chart below cannot draw is still numbers
+            // here. Side major: one capture's planes stay together.
+            for (const HistSide& sd : sides) {
+                g_histSideProbe += "row" + sd.letter + ";";
+                // A lagging side may lag if it is VISIBLY not current (the A4
+                // ruling): its cells dim, the same way the Projection table
+                // dims a stale side's.
+                if (sd.stale)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+                for (int s = 0; s < sd.H->nSeries; s++) {
+                    ImGui::TableNextRow();
+                    if (anySide) {
+                        // the letter in the slot's OWN ink, so the row and the
+                        // curve carrying the same numbers are the same colour
+                        ImGui::TableNextColumn();
+                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(sd.ink),
+                                           "%s", sd.letter.c_str());
+                    }
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sd.H->seriesNames[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->mean[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->sd[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->sd[s] * sd.H->sd[s]);
+                }
+                if (sd.stale) ImGui::PopStyleColor();
             }
             ImGui::EndTable();
         }
@@ -13999,24 +14196,71 @@ static void drawPanelHistogram() {
         int nDrawn = 0;
         for (int s = 0; s < H.nSeries; s++) if (drawn(s)) nDrawn++;
 
-        // ---- y axis. Without a B: pixel counts, exactly as before. With a B:
-        // a share of each side's OWN sampled pixels, because two images of
-        // different size put incomparable bar heights on one axis.
-        const bool norm = Bim != nullptr;
-        const double scA = 100.0 / (double)std::max<size_t>(H.sampled, 1);
-        const double scB = 100.0 / (double)std::max<size_t>(HB.sampled, 1);
-        double yTop = 0;
-        for (int s = 0; s < H.nSeries; s++) {
-            if (!drawn(s)) continue;
-            for (int b = 0; b < 256; b++)
-                yTop = std::max(yTop, H.bins[s][b] * (norm ? scA : 1.0));
+        // ---- the layout question, asked BEFORE anything is sized, because the
+        // answer decides how many footer lines and how tall a legend the plot
+        // has to leave room for. Side by side stays strictly the A|B pair: two
+        // halves hold two sides, and a grid that holds N is the image-side
+        // layout job (docs/compare-n.md 3), not something to fake here.
+        const float minSide = AB_MIN_SIDE * app.uiScale;
+        bool side = Bim && abSideBySide();
+        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+        if (tooNarrow) side = false;
+
+        // ---- how many sides the PLOT can take. The table above always takes
+        // all of them; a chart has two hard limits and both of them have to be
+        // SPOKEN, never applied in silence:
+        //   - PLANES. Four CFA planes times five slots is twenty curves, which
+        //     is not a comparison, it is a texture. So slots overlay when ONE
+        //     plane is on the axis (docs/compare-n.md 4 - the general form of
+        //     ab-stats-plan 2's "eight curves are unreadable"), and the plane
+        //     selector above is how you get there.
+        //   - INK. slotInk can tell slotInkCount() slots apart and then wraps;
+        //     drawing past that would put two slots in one colour, which is
+        //     this panel omitting a slot again with a different mechanism.
+        // Whatever is left off is named on screen, right under the plot.
+        const size_t nSides = sides.size();
+        const bool onePlane = nDrawn <= 1;
+        size_t nPlot;
+        const char* offWhy = nullptr;
+        if (side || (!xslots.empty() && !onePlane)) {
+            nPlot = Bim ? 2 : 1;           // the A|B pair the two-image modes mean
+            offWhy = side ? "side by side has two halves - set the A/B layout to "
+                            "overlay and every slot goes on one plot"
+                          : "pick ONE plane above and every slot overlays on it";
+        } else if (nSides > slotInkCount()) {
+            nPlot = slotInkCount();
+            offWhy = "the palette runs out - these would repeat a colour already "
+                     "on the plot, and two slots in one ink is not a comparison";
+        } else {
+            nPlot = nSides;
         }
-        if (norm)
-            for (int s = 0; s < HB.nSeries; s++) {
-                int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+        std::string offPlot;              // the letters that get no curve
+        for (size_t i = nPlot; i < nSides; i++) {
+            if (!offPlot.empty()) offPlot += ", ";
+            offPlot += sides[i].letter;
+        }
+        std::string offMsg;
+        if (!offPlot.empty())
+            offMsg = "slot " + offPlot + ": no curve - " + offWhy +
+                     ". Their numbers are in the table above.";
+
+        // ---- y axis. One side: pixel counts, exactly as before. More than
+        // one: a share of each side's OWN sampled pixels, because images of
+        // different size put incomparable bar heights on one axis.
+        const bool norm = nSides > 1;
+        double yTop = 0;
+        for (size_t i = 0; i < nPlot; i++) {
+            const HistSide& sd = sides[i];
+            for (int s = 0; s < sd.H->nSeries; s++) {
+                // every side's planes are matched to A's BY NAME (R <-> R):
+                // the canon forbids mixing planes, and ch0 is not R
+                int a = i == 0 ? s : abSeriesMatch(H.seriesNames, H.nSeries,
+                                                   sd.H->seriesNames[s]);
                 if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                for (int b = 0; b < 256; b++) yTop = std::max(yTop, HB.bins[s][b] * scB);
+                for (int b = 0; b < 256; b++)
+                    yTop = std::max(yTop, sd.H->bins[s][b] * (norm ? sd.sc : 1.0));
             }
+        }
         if (!(yTop > 0)) yTop = 1;
         const double logTop = log1p(yTop);
         char yl[96];
@@ -14062,69 +14306,108 @@ static void drawPanelHistogram() {
             else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, 1.4f,
                                    5 * app.uiScale, 4 * app.uiScale);
         };
-        // Four CFA planes (or three RGB ones) as eight filled areas is unreadable,
-        // so at three drawn curves or more BOTH sides become outlines. Below that
-        // A keeps its fill and only B is an outline.
-        const bool outlineA = Bim && nDrawn >= 3;
-        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantB) {
+        // Once SLOTS share the plot, the colour has to say which SLOT. With one
+        // plane on the axis (the condition for putting them there at all) the
+        // plane is fixed and named on the axis, so hue is free to carry the
+        // letter - and it carries the SAME letter the Temporal chart, the
+        // statistics rows and the tile badges use, because slotInk is asked
+        // once per slot and every panel asks it. A palette invented here would
+        // be a second, unrelated naming of a thing that already has a name.
+        //
+        // A and B alone keep exactly the colours they had: A's planes in the
+        // plane colours, B lifted from the same hue so R stays R.
+        const bool bySlotInk = nPlot > 2;
+        // Four CFA planes (or three RGB ones) as eight filled areas is
+        // unreadable, so at three drawn curves or more BOTH sides become
+        // outlines. Below that A keeps its fill and only B is an outline.
+        // Slot ink means outlines throughout: N filled areas hide each other,
+        // and the fill was only ever how "this one is A" got said when there
+        // were two. With a legend and one hue per letter, the hue says it.
+        const bool outlineA = (nSides > 1 && nDrawn >= 3) || bySlotInk;
+        auto drawSide = [&](const PlotRect& pr, size_t i) {
+            const HistSide& sd = sides[i];
+            for (int s = 0; s < sd.H->nSeries; s++) {
+                // matched by NAME; a series only this side has is drawn neutral,
+                // and never coloured as if it were one of A's planes
+                int a = i == 0 ? s : abSeriesMatch(H.seriesNames, H.nSeries,
+                                                   sd.H->seriesNames[s]);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                // A single grey series gave B the SAME colour as A's fill,
+                // leaving a 1.4 px dashed line at ~30/255 contrast wherever
+                // it crossed that fill - the dash pattern was B's only cue.
+                // Mono B gets a cool tint so it reads against A's grey; the
+                // coloured cases already differ by hue per plane.
+                //
+                // ...and every side past A is drawn SOLID, like the profile and
+                // temporal curves. A dash reads as a broken curve rather than
+                // as "this one is B", and a histogram is dense enough that the
+                // dashes close up at one zoom and open at the next.
+                ImU32 col;
+                if (bySlotInk)           col = sd.ink;
+                else if (a < 0)          col = ODD_COL;
+                else if (cfaHist)        col = CFA_COLS[a];
+                else if (H.nSeries == 1) col = i == 0 ? IM_COL32(200, 205, 210, 200) : AB_B_INK;
+                else                     col = i == 0 ? RGB_COLS[a]
+                                                      : abLiftInk(RGB_COLS[a], 0.45f);
+                plotSeries(pr, sd.H->bins[s], norm ? sd.sc : 1.0, col,
+                           i == 0 && !outlineA ? 0 : 1);
+            }
+        };
+        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantRest) {
             if (!pr.ok) return;
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(pr.p0, pr.p1, true);
-            if (wantA)
-                for (int s = 0; s < H.nSeries; s++) {
-                    if (!drawn(s)) continue;
-                    ImU32 col = cfaHist ? CFA_COLS[s]
-                              : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
-                    plotSeries(pr, H.bins[s], norm ? scA : 1.0, col, outlineA ? 1 : 0);
-                }
-            if (wantB && Bim)
-                for (int s = 0; s < HB.nSeries; s++) {
-                    // matched by NAME; a series only B has is drawn neutral, and
-                    // never coloured as if it were one of A's planes
-                    int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
-                    if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                    // A single grey series gave B the SAME colour as A's fill,
-                    // leaving a 1.4 px dashed line at ~30/255 contrast wherever
-                    // it crossed that fill - the dash pattern was B's only cue.
-                    // Mono B gets a cool tint so it reads against A's grey; the
-                    // coloured cases already differ by hue per plane.
-                    //
-                    // ...and B is drawn SOLID, like the profile and temporal
-                    // curves. A dash reads as a broken curve rather than as
-                    // "this one is B", and a histogram is dense enough that the
-                    // dashes close up at one zoom and open at the next. A is a
-                    // filled bar, B is an outline in its own ink: the fill and
-                    // the hue already carry the distinction the dash was for.
-                    ImU32 col = a < 0 ? ODD_COL
-                              : (cfaHist ? CFA_COLS[a]
-                                         : (H.nSeries == 1 ? AB_B_INK
-                                                           : abLiftInk(RGB_COLS[a], 0.45f)));
-                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 1);
-                }
+            for (size_t i = 0; i < nPlot; i++) {
+                if (i == 0 ? !wantA : !wantRest) continue;
+                drawSide(pr, i);
+            }
             dl->PopClipRect();
         };
 
-        const float minSide = AB_MIN_SIDE * app.uiScale;
-        bool side = Bim && abSideBySide();
-        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
-        if (tooNarrow) side = false;
+        // The legend names every side that got a curve. Two sides keep the
+        // fixed A/B row; three or more fly the wrapping N-slot legend, because
+        // C/D/E push a single row off the panel. Both are MEASURED before the
+        // plot is sized, so adding a slot never moves the plot out from under
+        // the cursor.
+        std::vector<SlotLegendEntry> leg;
+        if (!side && bySlotInk)
+            for (size_t i = 0; i < nPlot; i++)
+                leg.push_back({ abLegendText(sides[i].letter.c_str(), sides[i].label) +
+                                (sides[i].stale ? std::string("  ") + AB_STALE_TOKEN
+                                                : std::string()),
+                                sides[i].ink });
         // fill the rest of the panel: a fixed height overflowed the bottom dock
-        float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
-                      + (tooNarrow ? abNarrowNoteH() : 0.0f);
+        float offMsgH = offMsg.empty() ? 0.0f
+                      : ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
+                                            ImGui::GetContentRegionAvail().x).y +
+                        ImGui::GetStyle().ItemSpacing.y;
+        float footerH = ImGui::GetTextLineHeightWithSpacing() * (float)nSides
+                      + (tooNarrow ? abNarrowNoteH() : 0.0f) + offMsgH;
         // the legend row lives under the overlaid plot, and its height comes off
         // the plot BEFORE the plot is laid out
-        float legendH = Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f;
+        float legendH = !leg.empty() ? slotLegendRow(leg, false)
+                      : (Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f);
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
                      - footerH - legendH;
         if (side) hAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // heading band
         float plotH = std::max(hAvail, 70.0f * app.uiScale);
 
+        {   // what the plot took, and what it left - as the panel says it, so a
+            // letter that is in neither list is a silent omission by definition
+            std::string got, off;
+            for (size_t i = 0; i < nSides; i++)
+                (i < nPlot ? got : off) += sides[i].letter;
+            g_histSideProbe += "curves=" + got + ";";
+            if (!off.empty()) g_histSideProbe += "said-no-curve=" + off + ";";
+        }
+
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
+            if (!leg.empty())  slotLegendRow(leg, true);
+            else if (Bim)      drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -14149,15 +14432,34 @@ static void drawPanelHistogram() {
             ImGui::EndChild();
         }
         if (tooNarrow) abNarrowNote();
-        // the real pixel counts survive the normalised axis
-        ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
-                            H.clipLo * 100.0, H.clipHi * 100.0,
-                            cfaHist ? " | R/Gr/Gb/B" : "");
-        if (Bim) {
-            ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
-                                HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
-                                bLabel.c_str());
-            if (bStale) {   // never inside the disabled string: it must stand out
+        // A slot the plot could not take is named HERE, in the panel, next to
+        // the plot that does not have it. This is the whole point of the
+        // change: the failure being removed is a panel that shows a subset and
+        // says nothing, and a limit that is spoken is not that failure.
+        if (!offMsg.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(offMsg.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+        // the real pixel counts survive the normalised axis - one line per
+        // side, including the ones with no curve: the counts and the clipping
+        // are what the table cannot show, and they are per side too
+        for (size_t i = 0; i < nSides; i++) {
+            const HistSide& sd = sides[i];
+            std::string tail;
+            if (i > 0) {
+                tail = "  | " + sd.label;
+                // a side stored differently from A is worth saying so where the
+                // numbers are: the x-axis label only ever names A against B
+                if (i >= 2 && sd.H->img && sd.H->img->dtype != im->dtype)
+                    tail += "  [" + sd.H->img->dtype + " vs A " + im->dtype + "]";
+            } else if (cfaHist) tail = " | R/Gr/Gb/B";
+            ImGui::TextDisabled("%s  %zu px | <black %.2f%%  >white %.2f%%%s",
+                                sd.letter.c_str(), sd.H->sampled,
+                                sd.H->clipLo * 100.0, sd.H->clipHi * 100.0, tail.c_str());
+            if (sd.stale) {   // never inside the disabled string: it must stand out
                 ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
                 ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
             }
@@ -16108,7 +16410,7 @@ struct FrameAxis {
 };
 static FrameAxis frameAxisOf(int seqId) {
     FrameAxis a;
-    a.label = "frame number (index in sequence)";
+    a.label = "frame number (index in stack)";
     App::SeqInfo* si = seqInfo(seqId);
     if (!si || si->axisVals.empty()) return a;
     int n = (int)framesOfSeq(seqId).size();
@@ -17355,60 +17657,6 @@ static bool temporalChartVisible() {
     return g_tchart.plotted && g_tchart.plotBot <= g_tchart.winBot + 1.0f;
 }
 
-// The ink each compare slot is stroked in when they share one plot. A, B and
-// the extras are SLOTS, not CFA planes, so hue is free here - the iron rule is
-// about mixing planes inside a statistic, and the per-frame mean is a pooled
-// level that says so on its axis. A keeps the neutral green every plot draws
-// in and B keeps the blue the shared legend flies, so nothing that already
-// reads as A or B changes colour when a C appears.
-static ImU32 temporalSlotInk(size_t i) {
-    static const ImU32 INK[] = {
-        IM_COL32(105, 220, 130, 255),   // A
-        IM_COL32(120, 190, 255, 230),   // B - AB_B_INK
-        IM_COL32(245, 170,  90, 255),   // C
-        IM_COL32(205, 140, 245, 255),   // D
-        IM_COL32(235, 225, 110, 255),   // E
-        IM_COL32(120, 225, 225, 255),   // F
-        IM_COL32(245, 130, 160, 255),   // G
-    };
-    return INK[i % (sizeof INK / sizeof INK[0])];
-}
-
-// The Temporal chart's legend. drawABLegendRow knows exactly two slots; this
-// one takes as many as the compare slots hold and WRAPS, because C/D/E push a
-// single row off the panel. Measuring and drawing are the same code (draw=false
-// only skips the ink), so the height reserved for the plot above is the height
-// the legend actually takes and adding a slot never moves the plot out from
-// under the cursor.
-struct TemporalLegendEntry { std::string text; ImU32 ink; };
-static float temporalLegendRow(const std::vector<TemporalLegendEntry>& e, bool draw) {
-    if (e.empty()) return 0.0f;
-    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
-    const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
-    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
-    ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImU32 txt = IM_COL32(215, 222, 228, 255);
-    float x = 0;
-    int row = 0;
-    for (size_t i = 0; i < e.size(); i++) {
-        float w = sw + gap + ImGui::CalcTextSize(e[i].text.c_str()).x;
-        if (i && x + sep + w > availW) { row++; x = 0; }
-        else if (i) x += sep;
-        if (draw) {
-            float ex = p.x + x, ey = p.y + row * adv;
-            dl->AddLine(ImVec2(ex, ey + fh * 0.5f), ImVec2(ex + sw, ey + fh * 0.5f),
-                        e[i].ink, 1.6f);
-            dl->AddText(ImVec2(ex + sw + gap, ey), txt, e[i].text.c_str());
-        }
-        x += w;
-    }
-    float h = (row + 1) * adv;
-    // consume exactly h (ImGui adds one ItemSpacing after the Dummy)
-    if (draw) ImGui::Dummy(ImVec2(availW, std::max(h - ImGui::GetStyle().ItemSpacing.y, 1.0f)));
-    return h;
-}
-
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
 // (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
@@ -17728,7 +17976,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                        const ImageDoc* d, size_t inkIdx, bool stale) {
         TSlot s;
         s.letter = letter; s.label = abDocLabel(d); s.t = &t; s.doc = d;
-        s.ink = temporalSlotInk(inkIdx);
+        s.ink = slotInk(inkIdx);
         s.stale = stale;
         s.has = t.mean && t.idx && t.mean->size() >= 2 && t.idx->size() >= 2;
         if (!s.has)
@@ -17833,7 +18081,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     };
     // the legend names only the curves that exist; the slots that have none are
     // named in their own line under the plot, with the reason
-    std::vector<TemporalLegendEntry> leg;
+    std::vector<SlotLegendEntry> leg;
     for (const TSlot& s : slots) {
         if (!s.has) continue;
         std::string t = s.letter + ": " + elideFront(s.label, 22);
@@ -17857,11 +18105,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     float tAvail = ImGui::GetContentRegionAvail().y
                  - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
                  - (tooNarrow ? abNarrowNoteH() : 0.0f)
-                 - (side ? 0.0f : temporalLegendRow(leg, false))
+                 - (side ? 0.0f : slotLegendRow(leg, false))
                  - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
-    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in sequence)";
+    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in stack)";
     // Box-zoom. Drag a rectangle on the chart to narrow both ranges to it;
     // double-click resets. The state is keyed to WHAT is on the axes (A's
     // document and the x label): a zoom in seconds must not survive a switch
@@ -17923,7 +18171,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             dl->PopClipRect();
             zoomUI(tp);
         }
-        temporalLegendRow(leg, true);
+        slotLegendRow(leg, true);
     } else {
         g_tchart.sideBySide = true;
         float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
@@ -17944,7 +18192,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                     g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     dl->PushClipRect(tp.p0, tp.p1, true);
-                    curve(tp, i, temporalSlotInk(0));   // its own panel: A's stroke
+                    curve(tp, i, slotInk(0));   // its own panel: A's stroke
                     marker(tp, slots[i].doc, i);
                     dl->PopClipRect();
                     zoomUI(tp);         // shared limits: a zoom in one panel zooms all
@@ -18405,8 +18653,8 @@ static void drawPanelTemporal() {
     ImGui::Text("Temporal");
     ImGui::Separator();
     ImGui::TextDisabled("%s is a single frame: no time axis.", im->name.c_str());
-    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open a "
-                        "sequence, or set a stack as compare B.");
+    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open one, "
+                        "or set a stack as compare B.");
 }
 
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
@@ -20004,7 +20252,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         };
         if (I.flat) {
             rbModeChip("flat##rbchip", "every frame is its own row - the default is "
-                                       "grouped (one row per numbered sequence).\n"
+                                       "grouped (one row per numbered stack).\n"
                                        "change it in the panel menu");
             rbFlow(rbBtnW("tree##rbchip"));
         }
@@ -20172,7 +20420,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
         ImGui::Separator();
         // Radio pairs, not toggles: the state is visible without clicking.
-        if (ImGui::MenuItem("Grouped (a numbered sequence is one row)", nullptr, !I.flat)
+        if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
             && I.flat) {
             I.flat = app.rbFlat = false;   // this panel now; the pref = the default
             app.prefsDirty = true;
@@ -20914,7 +21162,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
-                        snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
+                        snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
@@ -21127,8 +21375,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (rbPropsNoSize) {
             // Never invent one: the listing reply carries the group's total
             // bytes and its newest mtime, and no per-member breakdown.
-            ImGui::TextDisabled("size      -   (not in the sequence listing)");
-            ImGui::TextDisabled("modified  -   (not in the sequence listing)");
+            ImGui::TextDisabled("size      -   (not in the stack listing)");
+            ImGui::TextDisabled("modified  -   (not in the stack listing)");
         } else {
         ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
                     (unsigned long long)e.size, e.group ? "  - all frames" : "");
@@ -22050,7 +22298,7 @@ static void drawFileList() {
               for (int idx : stack)
                   if (app.images[idx]->uid == app.cmpExtra[k]) { badge += slotName(k); break; }
           char lb[600];
-          const char* sname = si ? si->name.c_str() : "sequence";
+          const char* sname = si ? si->name.c_str() : "stack";
           if (mem) {
               // The value LEADS the label. It is the reason the row is in this
               // series at all, and it is not metadata: an unset one has to be
@@ -22352,10 +22600,10 @@ static void drawFileList() {
 
 static void drawSequenceModal() {
     if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
-        ImGui::OpenPopup("Load sequence?");
+        ImGui::OpenPopup("Load stack?");
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal("Load stack?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
     ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(),
                 dispPath(app.seqAskPattern).c_str());
@@ -22363,8 +22611,8 @@ static void drawSequenceModal() {
     ImGui::TextDisabled("Frames decode in the background; you can keep working.");
     ImGui::Separator();
     static bool remember = false;
-    ImGui::Checkbox("remember my choice (File > Sequence loading)", &remember);
-    if (ImGui::Button("Load sequence", ImVec2(150 * app.uiScale, 0))) {
+    ImGui::Checkbox("remember my choice (File > Stack loading)", &remember);
+    if (ImGui::Button("Load stack", ImVec2(150 * app.uiScale, 0))) {
         startSequenceLoad(app.seqAskImage, app.seqAskFiles, app.seqAskPattern);
         if (remember) app.seqLoadMode = 1;
         app.seqAskImage = -1; app.seqAskFiles.clear();
@@ -22609,7 +22857,7 @@ static void drawMenuBar(GLFWwindow* win) {
         }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
-        if (ImGui::BeginMenu("Sequence loading")) {
+        if (ImGui::BeginMenu("Stack loading")) {
             if (ImGui::MenuItem("Ask each time", nullptr, app.seqLoadMode == 0)) app.seqLoadMode = 0;
             if (ImGui::MenuItem("Always load folder", nullptr, app.seqLoadMode == 1)) app.seqLoadMode = 1;
             if (ImGui::MenuItem("Never (single file)", nullptr, app.seqLoadMode == 2)) app.seqLoadMode = 2;
@@ -22638,7 +22886,7 @@ static void drawMenuBar(GLFWwindow* win) {
                     app.procPolicy = App::PolLocalFetch;
                 ImGui::Separator();
             }
-            if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
+            if (ImGui::MenuItem("Load stack for current image", nullptr, false,
                                 cur() && cur()->seqId == 0 && !cur()->src->path.empty())) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
@@ -22926,7 +23174,7 @@ static void drawMenuBar(GLFWwindow* win) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip(inStack
                         ? "sigma_t / sigma_fpn over the loaded stack (whole frames or the selected ROI)"
-                        : "needs a stack: load a numbered sequence first");
+                        : "needs a stack: load numbered files as a stack first");
             }
         }
         ImGui::EndMenu();
@@ -23088,7 +23336,7 @@ static void drawHelpAbout() {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
                 };
                 row("Right / Left",  "next / previous frame (time axis)");
-                row("Down / Up",     "next / previous stack (sequence)");
+                row("Down / Up",     "next / previous stack");
                 row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
                 row("Ctrl+N / Ctrl+P", "next / previous stack");
                 row("Ctrl+A / Ctrl+E", "first / last frame");
@@ -23128,7 +23376,7 @@ static void drawHelpAbout() {
                 row("right / left",  "tree mode: expand / collapse the folder under the cursor");
                 row("Backspace",     "up to the parent folder");
                 row(SC_MOD "+F",     "focus the filter box");
-                row(", / .",         "step the previewed sequence");
+                row(", / .",         "step the previewed stack");
                 ImGui::EndTable();
             }
         }
@@ -23419,7 +23667,7 @@ static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
         "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
-        "  folder: loads every numbered sequence below it, one stack per group\n"
+        "  folder: loads the numbered files below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
         "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
@@ -23432,8 +23680,8 @@ static void printUsage() {
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
-        "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
-        "  --mem-budget <GB>           what the sequence loader may hold (default: auto,\n"
+        "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
+        "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
         "                              60%% of physical RAM)\n"
         "  .npy shapes read natively:  (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)\n"
         "                              any other shape is refused by name; to read one\n"
@@ -23483,7 +23731,7 @@ static void printUsage() {
         "  --tile-selftest <dir>       side-by-side compare panes: geometry\n"
         "  --export-selftest <dir>     PNG export + montage\n"
         "  --export-tsv-selftest <dir> the Temporal export document\n"
-        "  --picker-selftest <dir>     sequence picker: filter cut + merge\n"
+        "  --picker-selftest <dir>     stack picker: filter cut + merge\n"
         "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
@@ -23580,12 +23828,12 @@ static void parseCli(int argc, char** argv) {
                             "colour frame, always. To read one file differently, open it and "
                             "use \"re-read as...\" in the Inspector - it is per file and it "
                             "is remembered.\n");
-        } else if (a == "--sequence") {            // ask | always | never
+        } else if (a == "--stack") {               // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
-            else fprintf(stderr, "--sequence expects ask|always|never\n");
+            else fprintf(stderr, "--stack expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
@@ -23660,7 +23908,7 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--remote-policy expects auto|local-fetch\n");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
-        } else if (a == "--mem-budget") {          // GB the sequence loader may use
+        } else if (a == "--mem-budget") {          // GB the stack loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {             // off | wipe | split
             std::string v = next();
@@ -23701,7 +23949,7 @@ static void parseCli(int argc, char** argv) {
             }
         }
     }
-    // Applied later, not here: with --sequence always the sibling frames are still
+    // Applied later, not here: with --stack always the sibling frames are still
     // arriving on the loader thread, so at this point there may be only one image.
     if (cliCompare >= 0) app.pendingCompare = cliCompare;
     if (haveZoom || haveCenter) {
@@ -25133,7 +25381,7 @@ int main(int argc, char** argv) {
             bool same = g && expanded == g->members;
             bool nogroups = true;
             for (const auto& r : fv) if (r.isGroup()) nogroups = false;
-            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d sequence row(s), "
+            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d stack row(s), "
                             "'%s' x%d], flat %d row(s), members match=%d, no group rows "
                             "when flat=%d, member size/mtime blank=%d: %s\n",
                     dir.c_str(), (int)gv.size(), gRows, g ? g->name.c_str() : "?",
@@ -27673,9 +27921,9 @@ int main(int argc, char** argv) {
                         " --cfa bayer C:/data/flat_003.npy",
                   "N7 CFA frame argv: pattern first, then --cfa");
             check(join(newWindowArgv(tail)) ==
-                  exe + " --secondary --window-offset 40,40 --sequence always"
+                  exe + " --secondary --window-offset 40,40 --stack always"
                         " C:/data/s/frame_000.npy",
-                  "N7 stack argv: HEAD file + --sequence always");
+                  "N7 stack argv: HEAD file + --stack always");
             check(join(newWindowArgv(rem)) ==
                   exe + " --secondary --window-offset 40,40 ssh://user@trc2/data/x.npy",
                   "N7 remote argv passes the ssh url");
@@ -31044,7 +31292,7 @@ int main(int argc, char** argv) {
             abStatsFrame();
             recomputeHistogramIfNeeded(cur(), app.hist[0]);
             recomputeHistogramIfNeeded(cmpB(), app.hist[1], effBlack(*cur()), effWhite(*cur()));
-            bool freshFirst = !abHistBStale(cur(), cmpB(), app.hist[1]);
+            bool freshFirst = !abHistSideStale(cur(), cmpB(), app.hist[1]);
             float binned0 = app.hist[1].black, binned1 = app.hist[1].white;
             gotoFrame(1); gotoFrame(1);            // two switches inside 300 ms
             ImageDoc* Bp = cmpB();
@@ -31053,7 +31301,7 @@ int main(int argc, char** argv) {
             bool uidUnchanged = Bp && app.hist[1].uid == Bp->uid;
             bool rangeMoved = app.hist[1].black != effBlack(*cur()) ||
                               app.hist[1].white != effWhite(*cur());
-            bool flagged = abHistBStale(cur(), Bp, app.hist[1]);
+            bool flagged = abHistSideStale(cur(), Bp, app.hist[1]);
             fprintf(stderr, "abstatsselftest: P2c pinned B: binned on %.6g..%.6g, axis now "
                             "%.6g..%.6g, B uid unchanged=%d, stale=%d\n",
                     binned0, binned1, effBlack(*cur()), effWhite(*cur()),
@@ -31065,7 +31313,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(350));
             if (Bp && (!abStepBusy() || app.hist[1].uid == 0))
                 recomputeHistogramIfNeeded(Bp, app.hist[1], effBlack(*cur()), effWhite(*cur()));
-            check(!abHistBStale(cur(), Bp, app.hist[1]),
+            check(!abHistSideStale(cur(), Bp, app.hist[1]),
                   "P2c ...and is fresh again once the stepping stops");
             app.compareFollowFrame = saveFollow;
             app.compareRangeMode = saveShare;
@@ -31736,6 +31984,174 @@ int main(int argc, char** argv) {
                       g_filesBadgeProbe.find(row1 + "=B;") != std::string::npos,
                       "S6 ...and the letters are back at full ink");
             }
+        }
+
+        // ---- N: the panel says something about EVERY slot it holds -----------
+        // The defect (issue #60): with C, D, E armed the Statistics/Histogram
+        // panel drew A and B and said nothing whatever about the rest. The
+        // assertion therefore has to be about what the panel SAYS, not about
+        // what the cache holds - a cache full of correct numbers nobody prints
+        // is precisely the bug. g_histSideProbe records the letters the panel
+        // put on screen: a row in the table, a curve on the plot, or a named
+        // omission under it. The invariant every case below re-checks is that
+        // those last two ACCOUNT FOR the first. A letter with a row and no
+        // curve and no mention is the defect, restated as an equation.
+        {
+            check(app.seqs.size() >= 2, "N fixture: two stacks are open");
+            int sid0 = app.seqs[0].id, sid1 = app.seqs[1].id;
+            std::vector<int> f0 = framesOfSeq(sid0), f1 = framesOfSeq(sid1);
+            check(f0.size() >= 4 && f1.size() >= 4, "N fixture: four frames each");
+            // follow OFF: a pin then stays on the frame it was put on, so the
+            // slots are N DISTINCT documents and the count under test is the
+            // slot count. (Following is S1's subject, not this group's.)
+            app.compareFollowFrame = false;
+            app.compareMode = App::CmpWipe;
+            app.abStepBusyUntil = 0;
+            app.cmpExtra.clear();
+            app.histPlane = 0;          // ONE plane on the axis: the overlay case
+            selectImage(f0[0]);
+            setCompareB(app.images[f1[0]].get());
+            addCompareSlot(app.images[f0[1]].get());     // C
+            addCompareSlot(app.images[f0[2]].get());     // D
+            check(cmpB() != nullptr && app.cmpExtra.size() == 2,
+                  "N fixture: B plus slots C and D are armed");
+
+            auto histFrame = [&]() {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
+                    ImGui::Begin("HistProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawPanelHistogram();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            // "rows=", "curves=" and "said-no-curve=" as letter sets, read back
+            // out of the probe the panel wrote
+            auto field = [](const std::string& probe, const char* key) {
+                size_t k = probe.find(key);
+                if (k == std::string::npos) return std::string();
+                k += strlen(key);
+                size_t e = probe.find(';', k);
+                return probe.substr(k, e == std::string::npos ? e : e - k);
+            };
+            auto rowsOf = [](const std::string& probe) {
+                std::string out;
+                for (size_t k = probe.find("row"); k != std::string::npos;
+                     k = probe.find("row", k + 1))
+                    if (k + 3 < probe.size() && probe[k + 4] == ';') out += probe[k + 3];
+                return out;
+            };
+            // the one sentence this group exists for, asked the same way of
+            // every layout below: is there a letter the panel gave numbers to
+            // and then neither drew nor mentioned?
+            auto accountedFor = [&](const std::string& probe, std::string& unsaidOut) {
+                std::string rows = rowsOf(probe);
+                std::string said = field(probe, "curves=") + field(probe, "said-no-curve=");
+                unsaidOut.clear();
+                for (char c : rows)
+                    if (said.find(c) == std::string::npos) unsaidOut += c;
+                return unsaidOut.empty();
+            };
+
+            // N1: four sides armed, four sides named. This is the assert that
+            // fails against every build before this change: the table stopped
+            // at B because hist[] did.
+            app.abStatsLayout = App::AbOverlay;
+            histFrame();
+            std::string pOver = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N1 overlay probe '%s'\n", pOver.c_str());
+            check(rowsOf(pOver) == "ABCD",
+                  "N1 the statistics table gives A, B, C and D a row each");
+            check(field(pOver, "curves=") == "ABCD",
+                  "N1 ...and one plane on the axis puts all four on the plot");
+            std::string unsaid;
+            check(accountedFor(pOver, unsaid),
+                  "N1 every slot with numbers is drawn or named");
+
+            // N2: the plot cannot take four when four PLANES are on the axis
+            // (four planes times four slots is sixteen curves). It must then
+            // NAME the ones it left off - the table keeps all four either way.
+            app.histPlane = -1;
+            bool multiPlane = app.hist[0].nSeries > 1;
+            histFrame();
+            std::string pAll = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N2 all-planes probe '%s' (nSeries=%d)\n",
+                    pAll.c_str(), app.hist[0].nSeries);
+            check(rowsOf(pAll) == "ABCD",
+                  "N2 the table still holds all four with every plane on the axis");
+            check(accountedFor(pAll, unsaid),
+                  "N2 ...and nothing is dropped in silence");
+            if (multiPlane)
+                check(field(pAll, "said-no-curve=") == "CD",
+                      "N2 ...the slots come off the plot BY NAME, not quietly");
+            else
+                fprintf(stderr, "abstatsselftest: N2 single-plane fixture - the "
+                                "plane limit is not reachable here, invariant only\n");
+            app.histPlane = 0;
+
+            // N3: side by side has two halves, so it holds two sides. The other
+            // two are not on any plot and the panel has to say so.
+            app.abStatsLayout = App::AbSide;
+            histFrame();
+            std::string pSide = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N3 side-by-side probe '%s'\n", pSide.c_str());
+            check(rowsOf(pSide) == "ABCD",
+                  "N3 side by side keeps every slot in the table");
+            check(field(pSide, "curves=") == "AB" &&
+                  field(pSide, "said-no-curve=") == "CD",
+                  "N3 ...and names the two it has no half for");
+            check(accountedFor(pSide, unsaid),
+                  "N3 every slot with numbers is drawn or named");
+            app.abStatsLayout = App::AbOverlay;
+
+            // N4: past the palette. slotInk tells slotInkCount() slots apart
+            // and then its modulo hands slot H back A's green - two slots in
+            // one colour is the same omission wearing a different hat, so the
+            // plot stops at the palette and says which letters it stopped at.
+            {
+                std::vector<ImU32> ink;
+                for (size_t i = 0; i < slotInkCount(); i++) ink.push_back(slotInk(i));
+                std::sort(ink.begin(), ink.end());
+                check(std::adjacent_find(ink.begin(), ink.end()) == ink.end(),
+                      "N4 the palette's own colours are all different");
+            }
+            size_t want = slotInkCount() + 2;     // two more sides than inks
+            for (size_t k = 3; k < f0.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f0[k]].get());
+            for (size_t k = 1; k < f1.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f1[k]].get());
+            size_t nSides = app.cmpExtra.size() + 2;
+            if (nSides > slotInkCount()) {
+                histFrame();
+                std::string pMany = g_histSideProbe;
+                fprintf(stderr, "abstatsselftest: N4 %zu sides, %zu inks: '%s'\n",
+                        nSides, slotInkCount(), pMany.c_str());
+                check(rowsOf(pMany).size() == nSides,
+                      "N4 every armed slot has a row, however many there are");
+                check(field(pMany, "curves=").size() == slotInkCount(),
+                      "N4 the plot draws exactly as many as it has colours for");
+                check(field(pMany, "said-no-curve=").size() == nSides - slotInkCount(),
+                      "N4 ...and names every one it could not colour");
+                check(accountedFor(pMany, unsaid),
+                      "N4 no slot is left with numbers and no word about it");
+            } else {
+                fprintf(stderr, "abstatsselftest: N4 skipped - only %zu images to "
+                                "arm, need more than %zu\n", nSides, slotInkCount());
+            }
+            if (!unsaid.empty())
+                fprintf(stderr, "abstatsselftest: N slots with a row and no word: '%s'\n",
+                        unsaid.c_str());
+            app.cmpExtra.clear();
+            app.compareFollowFrame = true;
+            app.abStatsLayout = App::AbAuto;
+            app.histPlane = -1;
         }
 
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
@@ -35149,7 +35565,7 @@ int main(int argc, char** argv) {
     // their preferences (the frameless ones return before ever getting here)
     if (g_browseKeys.empty()) {
         autosaveSession();            // also covers a normal quit
-        // Only what the user changed in this run: a one-off --sequence flag or
+        // Only what the user changed in this run: a one-off --stack flag or
         // the gamma inside a --session must not quietly become the default.
         if (app.prefsDirty) savePrefs();
     }

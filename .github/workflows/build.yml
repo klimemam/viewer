@@ -91,7 +91,7 @@ jobs:
           # exactly one source.
           python tools/gen_testdata.py --bench
           # --compare exercises the A/B path too: two images, two textures
-          xvfb-run -a ./build/viewer --bench 120 --sequence never --compare wipe \
+          xvfb-run -a ./build/viewer --bench 120 --stack never --compare wipe \
                    tools/testdata/bench_big.npy tools/testdata/bench_stack.npy 2>&1 | tee bench.log
           grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
           # catastrophic-regression gate only: CI runners use software GL and are
@@ -188,7 +188,12 @@ jobs:
   # pulls are small and the source history never carries exe blobs.
   publish-binaries:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # main publishes to `binaries`; any other branch publishes to
+    # `binaries-<branch>`. The second one exists because the machine that most
+    # needs a build is the one with no build environment - and often no GitHub
+    # CLI and no token either. `git fetch` is the only tool it is guaranteed to
+    # have, so a branch is the only delivery it can actually receive.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -208,47 +213,16 @@ jobs:
           # accumulates old exe blobs) - which means a plain `git pull` refuses
           # with "divergent histories". Ship the correct update command as a
           # script so nobody has to know that.
-          cat > out/update.cmd <<'EOF'
-          @echo off
-          git fetch origin binaries && git reset --hard origin/binaries
-          EOF
-          cat > out/update.sh <<'EOF'
-          #!/bin/sh
-          git fetch origin binaries && git reset --hard origin/binaries
-          EOF
+          #
+          # These are COPIED from tools/binaries/, not written here. They used to
+          # be heredocs in this file, and that quietly made the published branch
+          # the wrong place to edit them: anything committed there was destroyed
+          # by the next publish, which force-pushes over it. A script nobody can
+          # edit where it lives, and cannot run without a CI round trip, is a
+          # script nobody tests.
+          cp tools/binaries/update.cmd tools/binaries/update.sh tools/binaries/README.md out/
+          cp tools/binaries/.gitignore out/ 2>/dev/null || true
           chmod +x out/update.sh
-          cat > out/README.md <<'EOF'
-          # Prebuilt binaries (branch: binaries)
-
-          Updated automatically from every push to main. To stay current on a
-          machine with no build environment:
-
-              git clone -b binaries --single-branch <this repo> viewer-bin
-
-          and from then on just run `update.cmd` (Windows) / `./update.sh`.
-          (Plain `git pull` will NOT work: this branch's history is replaced on
-          every publish so the repository never grows with old binaries.)
-
-          - win64/viewer.exe            - the GUI (Windows)
-          - win64/viewer-serve.exe      - the headless peer (Windows)
-          - win64/plugins/              - analyzers (keep next to the exe)
-          - win64/install_shortcut.cmd  - put it on the desktop / Start menu
-          - linux-x64/viewer            - the GUI (Linux)
-          - linux-x64/viewer-serve      - the headless peer for a compute server
-          - linux-x64/install_shortcut.sh - the same, as a .desktop entry
-          - macos-arm64/                - the same set for macOS (.app bundle)
-
-          Starting it from an icon instead of a shell:
-
-              win64\install_shortcut.cmd                 (Windows)
-              ./linux-x64/install_shortcut.sh            (Linux / macOS)
-
-          Add `-RemoteHost user@server` / `--host user@server` for a second
-          shortcut that connects to that machine on startup. The shortcuts point
-          at the binary in place, so `update.cmd` keeps them current.
-
-          See docs/startup.md on main for how ssh:// viewing fits together.
-          EOF
       - name: Force-push as the binaries branch
         run: |
           cd out
@@ -257,6 +231,14 @@ jobs:
           git config user.email "github-actions@users.noreply.github.com"
           git add -A
           git commit -m "binaries for ${GITHUB_SHA}"
-          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" binaries
+          # The branch name carries where it came from, so a machine with only
+          # git can ask for a specific build by name and get exactly it.
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            TARGET=binaries
+          else
+            TARGET="binaries-$(echo "${GITHUB_REF#refs/heads/}" | tr -c 'A-Za-z0-9._-' '-')"
+          fi
+          echo "publishing as ${TARGET}"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
