@@ -398,7 +398,15 @@ CI (`.github/workflows/build.yml`) は **windows / ubuntu / macos の3面マト�
 ビルドし、Linux でのみ `xvfb-run ./build/viewer --bench 120 ...` を回して
 フレーム時間の中央値が 50ms を超えないことだけを見ます (ランナーはソフトウェア GL
 なので、これは破滅的退行の門であってベンチマークではありません)。
-**セルフテストは CI では走りません。**
+
+**セルフテストは3面すべてで走ります** (`tools/run_selftests.sh` が CI と手元の
+共通入口)。22本のうち実 ImGui フレームを描く5本 (`browse-keys` / `abstats` /
+`verify` / `tile` / `frame-lin`) だけが GL コンテキストを要り、Linux では
+xvfb + ソフトウェア GL で走ります。残り17本は `--no-window` 起動経路
+(ウィンドウも GL も作らない) を通るので、GL の無い windows / macos ランナーでも
+走ります。どちらに属するかは `CMakeLists.txt` の `viewer_selftest(...)` 行の
+`NOGL` の一語が唯一の宣言で、この語がラベルと `--no-window` の両方を出します。
+走れなかったものは**名指しで** skip と報告され、pass には決してなりません。
 
 ---
 

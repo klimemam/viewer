@@ -226,12 +226,12 @@ viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 enable_testing()
 
 # Every selftest NOT marked NOGL below builds a real GLFW window and an OpenGL
-# context - most of them VISIBLE, since GLFW_VISIBLE is only cleared for --bench
-# and --browse-keys-selftest - so on a headless Linux box they need a display.
-# Each test gets its own server via `xvfb-run -a` rather than sharing one, so a
+# context - VISIBLE, since GLFW_VISIBLE is only cleared for --bench and
+# --browse-keys-selftest - so on a headless Linux box they need a display. Each
+# test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# (Only --remote-selftest returns before glfwCreateWindow() today. That is a
-# fact about startup, not about the tests: most of them never draw anything.)
+# There are five of them; the other 17 take the --no-window startup path and
+# need neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_program(XVFB_RUN xvfb-run)
@@ -261,14 +261,16 @@ file(MAKE_DIRECTORY ${VIEWER_TEST_HOME})
 #     viewer_selftest(something NOGL --something-selftest tools/testdata/x)
 #
 # "Does this test need a GL context" is a PROPERTY OF THE TEST, carried here
-# beside the test itself, and deliberately NOT a list kept somewhere else.
-# Startup creates a window unconditionally today, so all but one of these need a
-# context even though only about six of them actually draw frames or inject
-# clicks. When a windowless startup path lands and a test stops needing one, the
-# entire edit is this one word - and that test starts running on all three OSes
-# with nothing in tools/run_selftests.sh to update. A list living in the harness
-# would have to be edited fifteen more times, and would go stale in silence the
-# first time it was not.
+# beside the test itself, and deliberately NOT a list kept somewhere else. The
+# one word does BOTH halves of it: it labels the test `nogl` for
+# tools/run_selftests.sh, and it passes --no-window to the binary, which is the
+# startup path that makes no window and calls no GL. There is no second list to
+# keep in step - in the harness, in the workflow, or in main.cpp - and a test
+# moves between the two sets by gaining or losing this word.
+#
+# Get it wrong in the unsafe direction (NOGL on a test that draws) and the test
+# stops at needWindow() in main.cpp, which names the test and this line. It
+# cannot pass by accident.
 function(viewer_selftest name)
   set(args ${ARGN})
   set(labels selftest)
@@ -278,6 +280,7 @@ function(viewer_selftest name)
     if(first STREQUAL "NOGL")
       list(REMOVE_AT args 0)
       list(APPEND labels nogl)
+      list(APPEND args --no-window)   # ...and take the startup path to match
       set(launcher "")           # needs no display, so it needs no xvfb either
     endif()
   endif()
@@ -310,40 +313,59 @@ set_tests_properties(glprobe PROPERTIES
   LABELS glprobe
   TIMEOUT 300)
 
-viewer_selftest(series      --series-selftest tools/testdata/linset)
-viewer_selftest(lin         --lin-selftest --sequence always
+# Which of these carry NOGL was MEASURED, not reasoned about: every one was run
+# through --no-window against this build, and the 17 below came back with output
+# byte-identical to the same test with a window (the load-progress line
+# "sequence: loaded N frames" excepted - it is a snapshot of a race between the
+# loader thread and the integrating pump, and it varies run to run in either
+# mode). The five without it - browse-keys, abstats, verify, tile, frame-lin -
+# stop at needWindow() and say so; they drive real ImGui frames and assert on
+# the LAYOUT that comes back, which is exactly what the backends the window
+# carries are what produce.
+viewer_selftest(series      NOGL --series-selftest tools/testdata/linset)
+viewer_selftest(lin         NOGL --lin-selftest --sequence always
                             --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
-viewer_selftest(browse      --browse-selftest tools/testdata/rb)
+viewer_selftest(browse      NOGL --browse-selftest tools/testdata/rb)
+# Drives the real main loop, injecting keys and mouse frame by frame.
 viewer_selftest(browse-keys --browse-keys-selftest tools/testdata/rb)
+# The T group lays out the Temporal panel in real ImGui frames (the chart that
+# was drawn past the panel's bottom edge is a layout fact, invisible to the
+# recompute functions).
 viewer_selftest(abstats     --abstats-selftest tools/testdata/multi)
-viewer_selftest(range       --range-selftest tools/testdata/multi)
-viewer_selftest(close       --close-selftest tools/testdata/multi)
-viewer_selftest(batch       --batch-selftest tools/testdata/multi)
-viewer_selftest(picker      --picker-selftest tools/testdata/abset)
+viewer_selftest(range       NOGL --range-selftest tools/testdata/multi)
+viewer_selftest(close       NOGL --close-selftest tools/testdata/multi)
+viewer_selftest(batch       NOGL --batch-selftest tools/testdata/multi)
+viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
+# The ROI row probe: real frames with an injected cursor, asserting on the rows
+# the panel actually laid out.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)
-viewer_selftest(scan        --scan-selftest tools/testdata/linset)
-viewer_selftest(localbrowse --localbrowse-selftest tools/testdata/rb)
-viewer_selftest(rtemporal   --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
-viewer_selftest(framestats  --sequence always
+viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
+viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
+viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
+# Windowless despite touching ImGui: its one call is GetClipboardText, and with
+# no backend installed ImGui's own default clipboard handler answers it (the
+# Win32 clipboard on Windows, an in-process buffer elsewhere). Verified: the TSV
+# it prints is identical with and without a window.
+viewer_selftest(framestats  NOGL --sequence always
                             --framestats-selftest tools/testdata/linset/80lx)
-viewer_selftest(export      --export-selftest tools/testdata/multi --sequence always)
+viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --sequence always)
+# T12 lays the canvas out for real to read back the pane rectangles and badges.
 viewer_selftest(tile        --tile-selftest tools/testdata/multi)
-viewer_selftest(derive      --derive-selftest tools/testdata)
-viewer_selftest(export-tsv  --export-tsv-selftest tools/testdata/multi --sequence always
+viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
+viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --sequence always
                             --cfa bayer --bayer-pattern RGGB)
+# F11 draws the Temporal section itself and asserts on the plot geometry.
 viewer_selftest(frame-lin   --frame-lin-selftest tools/testdata)
-viewer_selftest(newwin      --newwin-selftest tools/testdata)
+viewer_selftest(newwin      NOGL --newwin-selftest tools/testdata)
 # The 22nd flag, which the scratchpad orchestrator never ran: its fixture
 # (levelfiles/) was hand-made and lived outside the repo. gen_testdata.py
 # writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
-viewer_selftest(sweepfile   --sweepfile-selftest tools/testdata/levelfiles)
+viewer_selftest(sweepfile   NOGL --sweepfile-selftest tools/testdata/levelfiles)
 
-# --remote-selftest is the one flag that returns before glfwInit(), so it is the
-# one test that carries NOGL today - and it must be told where the standalone
-# peer is, or it silently tests this binary against itself instead of
-# viewer-serve. Being the only NOGL test makes it the only thing standing
-# between "we skipped the GL tests" and "we ran nothing and called it a pass",
-# which is why the summary counts what ran rather than trusting an exit code.
+# --remote-selftest returns before startup reaches GLFW at all, so it was the
+# one test carrying NOGL before there was a windowless startup path - and it
+# must be told where the standalone peer is, or it silently tests this binary
+# against itself instead of viewer-serve.
 viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
                             --remote-exe $<TARGET_FILE:viewer-serve>)
 
