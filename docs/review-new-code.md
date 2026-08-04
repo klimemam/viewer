@@ -266,6 +266,10 @@ fits the 32-char buffer) — then even the touched path re-parses to the exact d
 
 ## 2. Patterns, not instances
 
+P1〜P6をコード上の境界へ落とす決定と段階移行は
+[structural-remediation.md](structural-remediation.md) を正典とする。以下は発見時の
+症状分類と背景として残す。
+
 **P1 — Resolution by display name instead of identity stamped at creation.**
 Instances: fixes 2, 3 (pending sweeps), 9 (batch restore by name), 8a (members by
 first-frame path). The pending layer defers binding until drain, but the only keys it

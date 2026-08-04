@@ -95,9 +95,11 @@ seriesend
 
 - footer 3行目、`pickMerge==0 && selGroups>=2` の時だけ出す: `掃引として開く (series を作る)` ＋ パラメータ名・単位・各
   グループの推定値プレビュー列。`pickBatchMode==1` とは**排他**（series が batch をまたぐため）— チェック時は 0 に固定し disable。
-- `pickerAccept()` は `app.seriesPending{name,param,unit,kind,{stack名→値}}` を積むだけ。local は `enqueueGroups` 後、
-  remote は `rbOpenQueue` 消化後に、§3 と同じ pump 位置で `resolvePendingSeries()` が stack 名（＝`PendingGroup::name`
-  ＝`SeqInfo::name`）で解決。`rbOpenQueue` は seqId を持たず名前解決以外の手が無い（`RemoteOpen::name` が保持済み）。
+- `pickerAccept()` は各 Open と group に `OpenId` / `LoadToken` を発行し、
+  `app.seriesPending{name,param,unit,kind,{token→値}}` を積む。local / remote の producer は
+  stack 作成時に token→seqId を記録し、§3 と同じ pump 位置で token により解決する。
+  表示名はリネーム可能なので同定には使わない。詳細と段階移行は
+  [structural-remediation.md](structural-remediation.md) §1〜2を正典とする。
 - phase 6: `app.seriesPick`(seqId 集合) を Ctrl+click で溜め、フッタに「N stacks selected → Group as series…」（modal は §2 と同一物）。
 
 **やってはいけない（受け入れ条件）**: 自動生成しない / batch をまたがせない / 単位を仮定しない（既定は空文字）/
