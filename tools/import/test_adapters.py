@@ -341,6 +341,30 @@ def layout_field():
 
 
 @case
+def shape_of_edge_cases():
+    """Missing shape edge cases in _shape_of.
+
+    The issue rationale states: 'pass an irregular nested list to `_shape_of` and
+    asserting it returns `None`'. This refers to the `TypeError` block where
+    an object's `shape` attribute is an irregular nested list (e.g., `[1, [2]]`),
+    causing `tuple(int(d) for d in shape)` to raise a TypeError. The list-parsing
+    path of `_shape_of` always returns a tuple and never returns `None`.
+    """
+    need_lib()
+
+    class BadShape:
+        shape = [1, [2]]
+
+    assert vi._shape_of(BadShape()) is None
+
+    class CallableShape:
+        def shape(self):
+            return (1, 2)
+
+    assert vi._shape_of(CallableShape()) == (1, 2)
+
+
+@case
 def plain_lists_work_without_numpy():
     """4.10: viewer_import must be copyable and work with nothing installed."""
     need_lib()
