@@ -13040,9 +13040,28 @@ static std::string abDocLabel(const ImageDoc* d) {
 }
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
-    if (integer) snprintf(buf, n, "%.0f", v);
-    else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
-    else snprintf(buf, n, "%.4g", v);
+    if (integer) { snprintf(buf, n, "%.0f", v); return; }
+    // Axis labels are read at a glance, and C's scientific notation makes an
+    // ordinary sensor value look like an implementation detail: "2e+04" for
+    // 20000 DN. It is worst on log paper, where several of them sit in a
+    // column. Keep the significand and say the scale once, with the prefix the
+    // reader already uses for it.
+    //
+    // The ladder is closed at both ends on purpose. A suffix is only a
+    // shorthand while the reader knows it, so it stops at G and at n; outside
+    // that, e-notation is the honest form. Leaving the small end open lets
+    // 1e-15 print as "1e-06n", which is neither.
+    const double a = fabs(v);
+    double scale = 1.0;
+    const char* suffix = "";
+    if      (a >= 1e9  && a < 1e12) { scale = 1e9;  suffix = "G"; }
+    else if (a >= 1e6  && a < 1e9 ) { scale = 1e6;  suffix = "M"; }
+    else if (a >= 1e3  && a < 1e6 ) { scale = 1e3;  suffix = "k"; }
+    else if (a >= 1e-6 && a < 1e-3) { scale = 1e-6; suffix = "u"; }
+    else if (a >= 1e-9 && a < 1e-6) { scale = 1e-9; suffix = "n"; }
+    if (*suffix)                            snprintf(buf, n, "%.4g%s", v / scale, suffix);
+    else if (a != 0 && (a >= 1e12 || a < 1e-9)) snprintf(buf, n, "%.2e", v);
+    else                                    snprintf(buf, n, "%.4g", v);
 }
 
 // xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
