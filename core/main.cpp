@@ -20643,7 +20643,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 else rbTreeExpand(I, full);
                 rbCursor = ei;          // the mouse also places the keyboard
             }
-            if (rowClicked && servable && !(rbNavGesture && r.isDir())) {
+            if (rowClicked && servable && !rbNavGesture) {
                 ImGuiIO& sio = ImGui::GetIO();
                 bool rbLeaving = false;      // this click navigates away
                 bool canSel = !r.up && ei < (int)rbSel.size();
@@ -20726,14 +20726,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             //          click is just a click that arrived twice.
             //
             // ".." is single-click in both: it is the exit, not a folder row.
-            // The latch applies to FOLDERS only. It exists because a folder's
-            // click changes the listing under the pointer, so the rest of that
-            // gesture can land on a row nobody aimed at. A file changes nothing
-            // under the pointer, so there is no stale listing to protect against
-            // - and gating a file's open on it took Open away from the one
-            // gesture everyone uses, which is worse than the bug it prevents.
             if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
-                !(rbNavGesture && r.isDir()) && ImGui::IsItemHovered() &&
+                !rbNavGesture && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 rbOpenRow(r);
                 // the tree's double-click navigates on the PRESS, so the same
@@ -20750,9 +20744,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // Local only: running the adapter on the peer is §4.13.1, and
             // pretending a remote path is a local one would hand the reader a
             // path that does not exist on this machine.
-            // Same reasoning: this row is not a folder at all, so the latch
-            // has nothing to say about it.
-            if (!servable && !r.ph && !r.up && !r.isDir() &&
+            if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
                 ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 if (B.host.empty())
