@@ -132,8 +132,11 @@ zip64 のサイズ拡張にも対応。読めない配列があっても他の�
 
 ### 形状の曖昧さ
 
-`(3,H,W)` のように **先頭が4以下だと「3チャンネル画像」と「3フレーム」が曖昧**です。
-既定はチャンネル(従来の挙動)。フレームとして読みたい場合は `--npy-axis frames` を指定します。
+**先頭の軸は見ません。** 次元数と最後の軸だけで決まり、`(H,W)` / `(H,W,3|4)` /
+`(F,H,W)` / `(F,H,W,C)` が native、それ以外の形は理由を名指しして開きません。
+なので `(3,H,W)` は **3 フレーム**です(3 チャンネル画像ではありません)。
+そう読みたくないファイルは、開いてから Inspector の **「re-read as...」**で言い直します
+—— ファイルごと・画面に見える形で・セッションに残ります(旧 `--npy-axis` の後継)。
 塊として読まれた場合は Files パネルに `12f` のようにフレーム数が出て、
 時間方向解析(Temporal)と `←`/`→` のフレーム送りがそのまま使えます。
 
@@ -492,16 +495,23 @@ viewer [options] [files...]
   --zoom <z>  --center <x,y> 起動時の表示状態
   --compare <off|wipe|split|diff>  先頭2枚を A/B 比較で開く
   --sequence <ask|always|never>  1枚開いたときの連番兄弟の扱い(フォルダ Open には効かない)
-  --npy-axis <auto|frames>   先頭軸が4以下の (N,H,W) を ch と見るか frame と見るか
+  --mem-budget <GB>          連番ローダが握ってよい量(既定 auto = 物理 RAM の 60%)
   --frame <system|integrated>  タイトルバー: OS のもの / メニューバー統合(既定は前回値)
   ssh://user@host/path.npy   リモートのファイルを開く
   ssh://user@host/~/dir      リモートに接続してそのフォルダを表示(ホストだけでも可)
-  --remote-exe <path>        向こうで peer を起動する方法(既定 viewer)
+  --remote-exe <path>        向こうで peer を起動する方法
+                             (既定 ~/.viewer/viewer-serve、初回接続時に自動導入)
+  --remote-policy <auto|local-fetch>  測定をどちら側で走らせるか
+                             (既定 auto = サーバ側 / local-fetch = タイルを引いて手元で)
   --serve                    自分が peer になる(stdin/stdout で応答)
 ```
 例: `viewer --raw-dtype f32 --raw-interp bayer --bayer-pattern rggb --raw-size 4096x3072 dump.raw`
 
-`viewer --help` が常に正典です(自己診断用の `--*-selftest` や `--bench` もそちらに出ます)。
+`--cfa` と `--bayer-pattern` は**どちらの順でも効きます**。
+
+`viewer --help` が常に正典です(自己診断用の `--*-selftest` 22 個も `--bench` も
+そちらに全部出ます)。ここに無い旧オプション(`--npy-axis` など)は撤去済みで、
+渡すと理由を言って続行します。
 
 ## 10. トラブルシューティング
 

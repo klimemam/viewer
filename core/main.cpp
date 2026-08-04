@@ -6712,8 +6712,8 @@ static std::string selfExePath() {
 // The command line that makes "the same image look the same" in the child:
 // - a stack passes its HEAD file, and --sequence always regroups the numbered
 //   siblings there without the picker;
-// - the CFA interpretation rides along when one is set (--bayer-pattern first:
-//   --cfa captures the pattern seen so far, see parseCli);
+// - the CFA interpretation rides along when one is set (pattern before --cfa,
+//   which reads best; parseCli accepts either order);
 // - --window-offset 40,40 cascades the child off its parent;
 // - --secondary makes the child's prefs read-only (see savePrefs).
 // Remote docs pass their ssh:// url - the CLI already parses it. Pure on
@@ -22966,6 +22966,8 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
         "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
+        "  --mem-budget <GB>           what the sequence loader may hold (default: auto,\n"
+        "                              60%% of physical RAM)\n"
         "  .npy shapes read natively:  (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)\n"
         "                              any other shape is refused by name; to read one\n"
         "                              differently, use \"re-read as...\" in the Inspector\n"
@@ -22974,7 +22976,11 @@ static void printUsage() {
         "  ssh://user@host/~/dir       connect and browse there instead (a host on\n"
         "                              its own works too) - what a desktop shortcut\n"
         "                              made by tools/install_shortcut.* passes\n"
-        "  --remote-exe <path>         how to start the peer there (default: viewer)\n"
+        "  --remote-exe <path>         how to start the peer there (default:\n"
+        "                              ~/.viewer/viewer-serve, self-installed on the\n"
+        "                              first connection)\n"
+        "  --remote-policy <p>         where a measurement runs: auto (default, on the\n"
+        "                              server) | local-fetch (pull tiles, measure here)\n"
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
@@ -22985,23 +22991,44 @@ static void printUsage() {
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --gl-probe                  can this machine make the GL context the viewer\n"
         "                              needs? name it and exit (0 yes, 3 no + why)\n"
-        "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
-        "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
-        "  --tile-selftest <dir>       side-by-side compare panes: geometry, print, exit\n"
-        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
-        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
-        "  --frame-lin-selftest        frame-wise linearity (Temporal section): synthetic\n"
-        "                              stacks with exact means, both fit methods, exit\n"
-        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
-        "  --newwin-selftest <dir>     instance autosave slots + spawn line, print, exit\n"
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
-        "  -h, --help                  show this help\n");
+        "  -h, --help                  show this help\n"
+        // All of them, always. docs/manual.md 9 promises this list is the canon,
+        // and it said 8 of 22 for long enough that --verify-selftest could be
+        // believed not to exist. Adding a flag means adding its line here.
+        "self-tests (load, check, print, exit; 0 = pass). ctest runs all 22:\n"
+        "  --lin-selftest              linearity fit over the stacks given\n"
+        "  --frame-lin-selftest        frame-wise linearity (Temporal section):\n"
+        "                              synthetic stacks with exact means, both methods\n"
+        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit\n"
+        "  --series-selftest <dir>     series (系列) model + invariants\n"
+        "  --range-selftest <dir>      every A/B display-range combination (2 stacks)\n"
+        "  --framestats-selftest       per-frame statistics, TSV to stdout\n"
+        "  --abstats-selftest <dir>    A/B statistics caches: two slots\n"
+        "  --tile-selftest <dir>       side-by-side compare panes: geometry\n"
+        "  --export-selftest <dir>     PNG export + montage\n"
+        "  --export-tsv-selftest <dir> the Temporal export document\n"
+        "  --picker-selftest <dir>     sequence picker: filter cut + merge\n"
+        "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
+        "  --close-selftest <dir>      closing, per stack\n"
+        "  --batch-selftest <dir>      move-to-batch + session round trip\n"
+        "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
+        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
+        "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
+        "  --browse-selftest <dir>     Browse panel behaviour\n"
+        "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
+        "  --browse-keys-selftest <dir>  the Browse panel's KEYBOARD, replayed as real\n"
+        "                              input into real frames (--browse-keys <script>\n"
+        "                              overrides the canned action list)\n"
+        "  --rtemporal-selftest <dir>  temporal analysis driven from the browser\n"
+        "  --remote-selftest <file>    remote round trip against a peer started here;\n"
+        "                              pass --remote-exe to test viewer-serve itself\n");
 }
 
 static void parseCli(int argc, char** argv) {
@@ -23061,6 +23088,13 @@ static void parseCli(int argc, char** argv) {
                            [](unsigned char c) { return (char)std::toupper(c); });
             for (int p = 0; p < 4; p++)
                 if (v == CFA_PATTERNS[p]) d.cfaPattern = p;
+            // ...and forward it to --cfa NOW, so the two can be given in either
+            // order. Only --cfa used to publish the pattern, which made
+            // "--cfa bayer --bayer-pattern GRBG" demosaic as RGGB without a word
+            // - the CMake tests write exactly that order and only escape it
+            // because RGGB is index 0. Nothing reads forceCfaPattern unless
+            // --cfa was given (addImage tests forceCfa >= 0 first).
+            app.forceCfaPattern = d.cfaPattern;
         } else if (a == "--quad-bayer") {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
@@ -23093,7 +23127,7 @@ static void parseCli(int argc, char** argv) {
             app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
                          : v == "none" ? 0 : -1;
             if (app.forceCfa < 0) fprintf(stderr, "--cfa expects none|bayer|quad\n");
-            app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
+            app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern seen so far, if any
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
         } else if (a == "--range-selftest") {

@@ -9,7 +9,11 @@ Measure メニューはそれをツールチップに出す(UX 設計は [measur
 ## 出力キーの規約(単位・見出し)
 
 - **単位はキー名が自己申告する**: `snr_db`(dB)、`*_pct`(%)、`mtf50 (cy/px)`、
-  `edge_angle_deg`。ホストはこれを unit 列に展開する
+  `edge_angle_deg`。ホストはこれを unit 列に展開する(`unitForAnalysisKey`)。
+  **これは `emit_number` に単位のフィールドが無いからで**、キー名がこの経路での
+  唯一の宣言だからです。宣言する場所がある側 —— adapter の `meta` —— では逆に
+  キー名に単位を埋めず `{"value":…, "unit":…}` を使います
+  ([input-adapters.md §4.3.1](input-adapters.md))。**宣言できるなら宣言が勝つ。**
 - 画像値系のキー(`.mean` `.std` `.noise` `.min/.max/.p1/.p50/.p99` `.var`)は
   **ファイルの単位**: ホストが dtype から決める(整数 → DN、float → dtype 名。
   float ファイルの物理単位はファイルに書かれていないので断定しない)

@@ -1,4 +1,4 @@
-/* ps_plugin.h — viewer plugin ABI v1.
+/* ps_plugin.h — viewer plugin ABI v2 (PS_ABI_VERSION below is the one truth).
  * Pure C header. This file IS the contract; never break it, only extend
  * via new V2 structs and the reserved fields. */
 #ifndef PS_PLUGIN_H
