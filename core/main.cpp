@@ -3206,23 +3206,10 @@ static void closeCurrent(bool frameOnly = false) {
     if (!im) return;
     if (im->seqId != 0 && !frameOnly) { closeStack(im->seqId); return; }
     int seqId = im->seqId;
-    forgetImage(im);
-    if (im->tex) glDeleteTextures(1, &im->tex);
-    app.images.erase(app.images.begin() + app.current);
-    app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
-    app.fitRequested = true;
-    app.imagesRev++;
-    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
-    // same-named frame of another stack (every stack has a frame_001.npy).
-    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
-    // this path duplicates closeImages' body and inherited the omission.
-    if (!resolveB()) {
-        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
-    }
+    closeImages({ app.current });
     // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
     // too, or a zero-frame stack haunts the linearity table
     if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
-    pruneEmptyBatches();
 }
 
 // Drop batches nothing references anymore: no image, no queued group, no
