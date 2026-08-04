@@ -4164,29 +4164,13 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
 // Shared by .npy files and .npz members: build a stack when the array has a
 // frame axis, otherwise a single image. npyRead is the user's declaration
 // (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
-static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
-                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/) {
-    std::string err;
-    int frames = 1;
-    int64_t fstride = 0;
-    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
-    if (!first) return err.empty() ? "decode failed" : err;
-    std::string label = first->name;
-    if (frames <= 1) { addImage(std::move(first)); return {}; }
 
-    App::SeqInfo info;
-    info.id = app.nextSeqId++;
-    info.name = label + "  (" + std::to_string(frames) + " frames)";
-    app.seqs.push_back(info);
-    first->seqId = info.id;
-    first->seqIndex = 0;
-    int firstIdx = (int)app.images.size();
-    addImage(std::move(first));
+static void finalizeNpyFrameBatch(const App::SeqInfo& info, int firstIdx, int frames, const std::string& label,
+                                  const std::function<std::unique_ptr<ImageDoc>(int f, std::string& err)>& decodeFrame) {
     const ImageDoc* ref = app.images[firstIdx].get();
     for (int f = 1; f < frames; f++) {
         std::string e2;
-        int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
+        auto doc = decodeFrame(f, e2);
         if (!doc) { toast(label + ": frame " + std::to_string(f) + ": " + e2, true); break; }
         doc->seqId = info.id;
         doc->seqIndex = f;
@@ -4219,6 +4203,31 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     }
     fprintf(stderr, "npy stack: %s - %d of %d frames (%dx%d %dch)\n", label.c_str(), got,
             frames, ref->w, ref->h, ref->ch);
+}
+
+static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
+                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/) {
+    std::string err;
+    int frames = 1;
+    int64_t fstride = 0;
+    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
+    if (!first) return err.empty() ? "decode failed" : err;
+    std::string label = first->name;
+    if (frames <= 1) { addImage(std::move(first)); return {}; }
+
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = label + "  (" + std::to_string(frames) + " frames)";
+    app.seqs.push_back(info);
+    first->seqId = info.id;
+    first->seqIndex = 0;
+    int firstIdx = (int)app.images.size();
+    addImage(std::move(first));
+    finalizeNpyFrameBatch(info, firstIdx, frames, label,
+                          [&](int f, std::string& err) {
+                              int fr = 1; int64_t fs = 0;
+                              return decodeNpyBuffer(buf, path, displayName, err, f, fr, fs, npyRead);
+                          });
     return {};
 }
 
@@ -5194,32 +5203,11 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
     int firstIdx = (int)app.images.size();
     addImage(std::move(first));
     info.lastImageIdx = firstIdx;
-    const ImageDoc* ref = app.images[firstIdx].get();
-    for (int f = 1; f < frames; f++) {
-        std::string e2;
-        int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyFrame(path, e2, f, fr, fs, npyRead);
-        if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
-        doc->seqId = info.id;
-        doc->seqIndex = f;
-        computeMinMax(*doc);
-        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
-        // ...and the batch, which addImage assigns to the HEAD frame only: these
-        // go straight into app.images, so a stack built inside one file used to
-        // have frame 0 in a batch and frames 1..N-1 in none (the folder path
-        // already does this, in pumpSequence). A stack is in ONE batch.
-        doc->batchId = ref->batchId;
-        doc->texDirty = true;
-        doc->uid = app.nextUid++;
-        app.imagesRev++;
-        app.images.push_back(std::move(doc));
-    }
-    for (auto& s : app.seqs)
-        if (s.id == info.id) s.lastImageIdx = firstIdx;
-    int got = 0;
-    for (const auto& d : app.images) if (d->seqId == info.id) got++;
-    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", baseName(path).c_str(), got,
-            ref->w, ref->h, ref->ch);
+    finalizeNpyFrameBatch(info, firstIdx, frames, baseName(path),
+                          [&](int f, std::string& err) {
+                              int fr = 1; int64_t fs = 0;
+                              return decodeNpyFrame(path, err, f, fr, fs, npyRead);
+                          });
     return {};
 }
 
