@@ -52,7 +52,7 @@
     {
       "label": "test: frame-time benchmark",
       "type": "shell",
-      "command": "./build-mingw/viewer --bench 200 --sequence never tools/testdata/grad_u16.npy",
+      "command": "./build-mingw/viewer --bench 200 --stack never tools/testdata/grad_u16.npy",
       "dependsOn": "build",
       "problemMatcher": [],
       "detail": "Offscreen render with every panel visible; prints frame-time statistics."

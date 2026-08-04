@@ -24,6 +24,32 @@ batch）。batch は仮想的な柵にすぎず、移動しても画素のコピ
 これで「series はどこに表示されるか」「batch を閉じたら series はどうなるか」が
 すべて自明になる。
 
+### 使わない語: `sequence`
+
+**`sequence`(シーケンス)は使わない** — 画面・ドキュメント・CLI のどれでも。
+上の表が名前を与えているのは stack であって、同じ物に2つ名前があると
+1つの文の中で両方が出る(実際に出ていた: "each checked **sequence** becomes
+its own **stack**", "needs a **stack**: load a numbered **sequence** first")。
+言い換えの規則:
+
+- **読み込まれた連番の並び** = **stack**。まだ開いていないディスク上の連番も
+  stack と呼んでよい(ブラウザのグループ行・picker の候補行がそれで、
+  操作マトリクスの「未オープンの stack」がこれ)。
+- **ファイルの側だけ**を指したいときは「**連番ファイル (numbered files)**」。
+  これは層の名前ではなく、ディスクに何が並んでいるかの説明にすぎない。
+  picker のツールチップが "each checked **group of numbered files** becomes
+  its own stack" と書けるのはこの理由による。
+- **時間方向の並び**そのものを指す語は **時間軸 (time axis)**。stack が持つ
+  ものであって、別の層ではない。
+- **条件を振った並び**は series。stack の複数形ではない(上の表のとおり)。
+
+CLI も同じ。`--sequence <mode>` は **`--stack <mode>`** に改名した。旧綴りは
+**削除**であって別名として残していない — 残せば `--help` に引退した語が
+永久に生き続け、引退の意味が無くなる。
+
+**コード識別子は対象外**(`SeqInfo` / `seqId` / `startSequenceLoad` / …)。
+人間の目に触れないので急がない。改名するなら文言とは別コミットで。
+
 ### なぜ series が要るか
 
 「バッチ」には2つの意味が混ざっていた。

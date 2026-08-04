@@ -395,14 +395,14 @@ set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" T
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
 # through --no-window against this build, and the 17 below came back with output
 # byte-identical to the same test with a window (the load-progress line
-# "sequence: loaded N frames" excepted - it is a snapshot of a race between the
+# "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
 # mode). The five without it - browse-keys, abstats, verify, tile, frame-lin -
 # stop at needWindow() and say so; they drive real ImGui frames and assert on
 # the LAYOUT that comes back, which is exactly what the backends the window
 # carries are what produce.
 viewer_selftest(series      NOGL --series-selftest tools/testdata/linset)
-viewer_selftest(lin         NOGL --lin-selftest --sequence always
+viewer_selftest(lin         NOGL --lin-selftest --stack always
                             --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
 viewer_selftest(browse      NOGL --browse-selftest tools/testdata/rb)
 # Drives the real main loop, injecting keys and mouse frame by frame.
@@ -425,13 +425,13 @@ viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot
 # no backend installed ImGui's own default clipboard handler answers it (the
 # Win32 clipboard on Windows, an in-process buffer elsewhere). Verified: the TSV
 # it prints is identical with and without a window.
-viewer_selftest(framestats  NOGL --sequence always
+viewer_selftest(framestats  NOGL --stack always
                             --framestats-selftest tools/testdata/linset/80lx)
-viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --sequence always)
+viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --stack always)
 # T12 lays the canvas out for real to read back the pane rectangles and badges.
 viewer_selftest(tile        --tile-selftest tools/testdata/multi)
 viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
-viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --sequence always
+viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # F11 draws the Temporal section itself and asserts on the plot geometry.
 viewer_selftest(frame-lin   --frame-lin-selftest tools/testdata)

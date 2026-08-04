@@ -199,7 +199,7 @@ x 軸にできる**ようにする。設計は家風が決める:
   マッピングの主キーはフレーム番号である。
 - **UI**: チャート近くの `x axis...` ボタン → popup(name / unit / 値の
   multiline、Apply=検証、Clear=フレーム番号へ)。チャートの x ラベルは有効時
-  `<name> (<unit>)`、無効時 `frame number (index in sequence)`。
+  `<name> (<unit>)`、無効時 `frame number (index in stack)`。
 
 ## 9. 検証 — `--export-tsv-selftest <dir>`
 

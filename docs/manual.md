@@ -159,19 +159,19 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 - **Reinterpret raw...**: RAW 由来の画像を画素フォーマットから読み直し(ダイアログ再表示、
   ビュー位置・ズームは維持)
 
-## 2.4 連番(シーケンス / 塊)
+## 2.4 連番(stack)
 
 **1枚開くと、同じフォルダの連番を1つの「塊」として裏で読み込めます。** 塊は
 **時間方向の解析ができる単位**で、フレームは同じデコードレシピ・同じ表示レンジを共有します。
 
 - **検出**: ファイル名のうち **フォルダ内で実際に変化している数字フィールド**を番号と判定
   (`shot_0007_1920x1080.raw` は `0007` でグループ化され、解像度の数字では割れない)
-- **読み込むかの選択**: 既定は毎回確認。`File > Sequence loading` で
+- **読み込むかの選択**: 既定は毎回確認。`File > Stack loading` で
   「毎回確認 / 常に読む / 読まない」を切替、モーダルの「remember my choice」でも設定される。
-  CLI は `--sequence ask|always|never`
+  CLI は `--stack ask|always|never`
 - **バックグラウンド**: 読み込み中も操作可能。Files パネルに進捗と Stop ボタン。
   **メモリ予算**に達すると自動停止します
-- **メモリ予算**: 既定は**物理メモリの 60%**(最低 2 GB)。`File > Sequence loading > Memory budget`
+- **メモリ予算**: 既定は**物理メモリの 60%**(最低 2 GB)。`File > Stack loading > Memory budget`
   で GB 単位に固定でき、いま何 GB 使っているかも同じ所に出ます
 - **GPU テクスチャ**: 直近12フレームのみ常駐(古いものは自動的に解放・再生成)
 - **セッション**: 塊ごとに1行(**見ていたフレーム番号**+再読込レシピ)を保存。全フレームは書きません
@@ -187,9 +187,9 @@ A/01/*.npy   →  塊 "01/frame_000‥023.npy"   ← A を1回開くだけで全
 A/02/*.npy   →  塊 "02/frame_000‥023.npy"
 ```
 
-- **読み込む塊を選べます**: **Select sequences** ダイアログが**必ず**開きます —— 見つかった塊が
-  1つでも、`--sequence always` でも省略されません(絞り込みがここにしか無いため)。
-  `--sequence` の3値は「**1枚のファイルを開いたとき、その連番兄弟をどうするか**」の設定で、
+- **読み込む塊を選べます**: **Select stacks** ダイアログが**必ず**開きます —— 見つかった塊が
+  1つでも、`--stack always` でも省略されません(絞り込みがここにしか無いため)。
+  `--stack` の3値は「**1枚のファイルを開いたとき、その連番兄弟をどうするか**」の設定で、
   フォルダ Open には効きません
 - ダイアログは**フォルダ階層のツリー**。フォルダ単位のチェックで一括切替、個別チェックで除外、
   `All` / `None` / `Invert`。選択中の塊数・ファイル数が下部に出ます
@@ -212,7 +212,7 @@ A/02/*.npy   →  塊 "02/frame_000‥023.npy"
 | 操作 | キー |
 |---|---|
 | 次 / 前のフレーム(時間方向) | `→` / `←`、`Ctrl+F` / `Ctrl+B` |
-| 次 / 前の塊(シーケンス) | `↓` / `↑`、`Ctrl+N` / `Ctrl+P` |
+| 次 / 前の stack | `↓` / `↑`、`Ctrl+N` / `Ctrl+P` |
 | 先頭 / 末尾フレーム | `Home` / `End`、`Ctrl+A` / `Ctrl+E` |
 
 **Image View の下端のスクラブバー**でも移動できます(ドラッグ)。塊を切り替えると
@@ -384,7 +384,7 @@ ROI ごとの mean/std/min/max は **ROIs** パネルの表です。
 
 加えて **frame number(横軸)vs ROI mean value(縦軸)** のグラフを表示(現在フレームの位置に
 マーカー)。フレーム間のドリフト・フリッカ確認に使えます。EMVA 1288 の温度/固定パターン分離と
-同じ考え方ですが、単一シーケンスからの簡易版です。
+同じ考え方ですが、単一 stack からの簡易版です。
 
 - **`Copy (TSV)` / `Save (CSV)...`** で、temporal summary(plane 毎の σ_t/σ_fpn/σ_tot)・
   同じ画像/ROI の **H/V profile statistics**(Projection パネルの数値そのまま)・per-frame 表
@@ -398,7 +398,7 @@ ROI ごとの mean/std/min/max は **ROIs** パネルの表です。
   貼って Apply。個数がフレーム数と合わなければ両方の数字を言って拒否します。stack 毎に
   保存され(セッション往復可)、export の per-frame 表にも列として載ります
 - リモートの塊は**サーバ側で集計**され、`[server <ホスト>, N frames]` と出ます
-  (`File > Sequence loading > Remote processing` で切替)。
+  (`File > Stack loading > Remote processing` で切替)。
   開いてすらいない連番も Browse パネルの「Temporal stats (server)」から測れて、
   そのときは `not opened:` 付きで出ます
 - compare が入っていると **A / B / delta の表**になります(§3c)
@@ -494,7 +494,7 @@ viewer [options] [files...]
   --cfa <none|bayer|quad>    1ch ファイル(.npy 含む)がモザイクで届く場合の指定
   --zoom <z>  --center <x,y> 起動時の表示状態
   --compare <off|wipe|split|diff>  先頭2枚を A/B 比較で開く
-  --sequence <ask|always|never>  1枚開いたときの連番兄弟の扱い(フォルダ Open には効かない)
+  --stack <ask|always|never> 1枚開いたときの連番兄弟の扱い(フォルダ Open には効かない)
   --mem-budget <GB>          連番ローダが握ってよい量(既定 auto = 物理 RAM の 60%)
   --frame <system|integrated>  タイトルバー: OS のもの / メニューバー統合(既定は前回値)
   ssh://user@host/path.npy   リモートのファイルを開く

@@ -121,8 +121,8 @@ A/B のフレーム追従 (`compareFollowFrame`) は **B の stack に A と同�
 既存の操作語は Close / ungroup / Move to batch / rename。
 新しいのは「**既存の stack から部分集合の stack を作る**」操作なので、
 `Derive stack...` / `Filter stack...` / `Rebuild stack...` あたり。
-**項目5 (sequence と stack の用語混在) と同時に決めること** — ここで
-新しい語を増やすと、混在をもう1つ作ることになる。
+**項目5 (`sequence` の廃止) は済んだ** ので、名前は正典の語彙だけで決まる —— ここで
+新しい語を増やすと、たった今片付けた混在をもう1つ作ることになる。
 
 ### 検証
 
@@ -263,67 +263,47 @@ WM_NCPAINT/UAH/WM_NCACTIVATE を潰す修正を入れている。統合後の ma
 
 ---
 
-## 5. `sequence` と `stack` が混在している — 用語を定義しなおす
+## 5. ~~`sequence` と `stack` が混在している~~ — 済 (issue #58 の決定を適用)
 
 ユーザー指摘 (2026-07-29): 「sequencesとstackという言葉が混在している．terminologyを
 改めて定義しなおしましょう．」
+**決定 (2026-08-04, issue #58)**: 「sequence という言葉は廃止で決定．」
 
-正典 (`docs/terminology.md`) は **stack** を層の名前として定義している
-(`frame ⊂ stack ⊂ series ⊂ batch`)。にもかかわらず UI は今も `sequence` と言う。
-**同じ物を2つの名前で呼んでいる**のが今の状態。
+`docs/terminology.md` に**「使わない語」**の節を足し、そこが正典になった。画面と
+ドキュメントは stack / series で言い切る。言い換えの規則(正典より):
 
-### 実測した混在 (UI 文字列)
+- 読み込まれた連番の並び = **stack**。未オープンのブラウザ行・picker の候補行も含む。
+- ファイルの側だけを指すときは「**連番ファイル (numbered files)**」。層の名前ではない。
+  症状の代表だった `"each checked sequence becomes its own stack"` は
+  `"each checked group of numbered files becomes its own stack"` になった。
+- 時間方向の並びそのものは **時間軸 (time axis)**。stack が持つものであって別の層ではない。
 
-    "Select sequences"            "Load sequence"        "Load sequence?"
-    "Sequence loading"            "which sequences do you want?"
-    "%d sequence(s), %d files"    "selected: %d sequence(s), %d files"
-    "Open folder (all sequences below it)"   "Open the whole sequence (%u frames)"
-    "each checked sequence becomes its own stack"      ← 1文に両方
-    "folder: loads every numbered sequence below it, one stack per group"  ← 同上
-    "step the previewed sequence"  "loading sequence: "  "frame number (index in sequence)"
-    "needs a stack: load a numbered sequence first"    ← 同上
+### やったこと
 
-最後の3つが症状を一番よく表している: **1つの文の中で両方使っている。**
+1. `docs/terminology.md` に「使わない語: `sequence`」。定義があるだけでは混ざる
+   —— `sequence` を**禁じる**記述が無かったのが原因だった、というのが今回の教訓。
+2. `core/main.cpp` の画面文字列 48 箇所(メニュー、モーダル、ツールチップ、`--help`、
+   toast、stderr のログ行)。`File > Sequence loading` → `File > Stack loading` は
+   メニューと、それを引用する 3 つの注記を**同時に**変えた —— 片方だけ変えると
+   注記が存在しないメニューを指す。
+3. docs 8 ファイル(terminology / manual / startup / picker-ux / export-design /
+   verify-ui / reference-design / browse-topbar-design)。
+4. CLI: `--sequence <mode>` → **`--stack <mode>`**。下の選択肢のうち**改名して削除**
+   —— 別名で残すと引退した語が `--help` に永久に生き続ける(手元で `--sequence` を
+   使っていない、と確認済み)。呼び出し側は `CMakeLists.txt` の selftest 4 本、
+   `tools/verify/ab_capture.sh`、`tools/verify/run_ui_matrix.sh`、`newWindowArgv` と
+   その assert (`--newwin-selftest` の N7)。
 
-### まず決めるべきこと (これが設計判断で、だから Fable)
+### 触っていないもの(意図して)
 
-`sequence` は消すべき同義語なのか、それとも**別の物を指しているのか**。
-後者に見える根拠がある:
-
-- **ディスク上の連番ファイル群** (`frame_000.npy … frame_023.npy`) と、
-- **読み込まれて時間軸を持つ計測対象** (`SeqInfo`、σ_t が意味を持つ単位)
-
-は同じものではない。前者はまだ何も開いていない状態でも存在する
-(ブラウザのグループ行、picker の候補)。正典が名前を与えているのは後者 = **stack**。
-
-**推奨**: ディスク側は「連番ファイル (numbered files)」と呼び、`sequence` という
-語を UI から**引退**させる。読み込まれた物は常に **stack**。
-"each checked sequence becomes its own stack" は
-"each checked group of numbered files becomes its own stack" になる。
-ただし最終判断はユーザーに確認すること — 日本語の画面表記も併せて決める。
-
-### 触ってよい範囲と、触ってはいけない範囲
-
-**互換性のある表面** — 変えると既存のセッション/スクリプトが壊れる。改名しない
-(するなら読み込み側で旧キーも受ける移行が要る):
-
-- セッションのキー: `seqload` `seqname` `seqframe` `seqlevel`
-- CLI: `--sequence ask|always|never`
-- selftest 名 (`--lin-selftest` 等の内部名は自由だが、既存スクリプトが叩いている)
-
-**自由に変えてよい**: UI 文字列、`docs/*.md`、トースト、ログ。
-
-**コード識別子** (`SeqInfo` `seqId` `seqQueue` `seqLoadingId` … 約40個) は
-機械的な一括改名になるので**別コミット**にすること。混ぜると意味のある変更が
-レビューで埋もれる。急ぎではない — 画面の言葉が先。
-
-### 成果物
-
-1. `docs/terminology.md` に「`sequence` は使わない。ディスク上の連番ファイル群は
-   〜、読み込まれた物は stack」と**明記**する (今は stack の定義はあるが、
-   `sequence` を禁じる記述がない。だから混ざった)。
-2. UI 文字列の置換。
-3. 回帰: 文字列を assert しているテスト (`--browse-selftest` の row 文言など) の追随。
+- **コード識別子** (`SeqInfo` / `seqId` / `startSequenceLoad` … 1383 箇所)。画面に出ない。
+  改名するなら文言とは別コミット —— 正典にもそう書いた。
+- **セッションのキー** (`seqload` / `seqname` / `seqframe` / `seqlevel`)。改名すると
+  既存セッションが読めなくなる。
+- **`docs/diagnostics/*.txt`** —— 実行の記録。当時そう出力されたという証拠なので
+  書き換えない(いまの版は `stack: loaded N frames` と出る)。
+- **`tools/import/*.py`** の "a series is a sequence of stacks" —— ここの sequence は
+  Python の列 (list / tuple) の意味で、この語彙の sequence ではない。
 
 ---
 
