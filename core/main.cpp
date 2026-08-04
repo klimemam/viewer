@@ -60,6 +60,7 @@
 #include <unordered_map>
 #include <unordered_set>              // residentImageBytes: dedupe by srcId
 #include <mutex>
+#include <condition_variable>
 #include <limits>
 #include <iomanip>
 #include <sstream>
@@ -844,6 +845,7 @@ struct App {
         std::unique_ptr<remote::Session> session;   // the worker's, exclusively
         std::thread thread;
         std::mutex mtx;               // guards queue / done / phase
+        std::condition_variable cv;
         std::vector<RbJob> queue;
         std::vector<RbResult> done;
         std::string phase;            // what the worker is doing, for the UI
@@ -10300,16 +10302,13 @@ static void rbWorker(App::BrowseInstance* ip) {
     App::BrowseInstance& I = *ip;
     while (!I.stop) {
         App::RbJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(I.mtx);
-            if (!I.queue.empty()) {
-                job = std::move(I.queue.front());
-                I.queue.erase(I.queue.begin());
-                have = true;
-            }
+            std::unique_lock<std::mutex> lk(I.mtx);
+            I.cv.wait(lk, [&I] { return !I.queue.empty() || I.stop; });
+            if (I.stop && I.queue.empty()) break;
+            job = std::move(I.queue.front());
+            I.queue.erase(I.queue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         I.busy = true;
         App::RbResult r;
         r.kind = job.kind;
@@ -10421,6 +10420,7 @@ static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
         std::lock_guard<std::mutex> lk(I.mtx);
         I.queue.push_back(std::move(job));
     }
+    I.cv.notify_one();
     if (!I.thread.joinable()) I.thread = std::thread(rbWorker, &I);
 }
 
@@ -10428,7 +10428,11 @@ static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
 // this thread is the Session's only toucher, so letting the unique_ptr destroy
 // it later is single-threaded by construction.
 static void rbStopWorkerOf(App::BrowseInstance& I) {
-    I.stop = true;
+    {
+        std::lock_guard<std::mutex> lk(I.mtx);
+        I.stop = true;
+    }
+    I.cv.notify_all();
     if (I.thread.joinable()) I.thread.join();
 }
 static void stopRbWorker() {          // shutdown: every instance's worker
