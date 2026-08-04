@@ -4166,7 +4166,8 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
 // (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
 
 static void finalizeNpyFrameBatch(const App::SeqInfo& info, int firstIdx, int frames, const std::string& label,
-                                  const std::function<std::unique_ptr<ImageDoc>(int f, std::string& err)>& decodeFrame) {
+                                  const std::function<std::unique_ptr<ImageDoc>(int f, std::string& e2)>& decodeFrame,
+                                  bool sayNofN) {
     const ImageDoc* ref = app.images[firstIdx].get();
     for (int f = 1; f < frames; f++) {
         std::string e2;
@@ -4193,16 +4194,21 @@ static void finalizeNpyFrameBatch(const App::SeqInfo& info, int firstIdx, int fr
     // n of N, both numbers, when the frame loop broke early: the stack's NAME
     // still says "(N frames)" and the stack holds fewer, and a partially loaded
     // stack that does not say so is the silent lie docs/terminology.md forbids.
-    if (got < frames) {
-        for (auto& s : app.seqs)
-            if (s.id == info.id)
-                s.name = label + "  (" + std::to_string(got) + " of " +
-                         std::to_string(frames) + " frames)";
-        toast(label + ": " + std::to_string(got) + " of " + std::to_string(frames) +
-              " frames loaded - the rest could not be decoded", true);
+    if (sayNofN) {
+        if (got < frames) {
+            for (auto& s : app.seqs)
+                if (s.id == info.id)
+                    s.name = label + "  (" + std::to_string(got) + " of " +
+                             std::to_string(frames) + " frames)";
+            toast(label + ": " + std::to_string(got) + " of " + std::to_string(frames) +
+                  " frames loaded - the rest could not be decoded", true);
+        }
+        fprintf(stderr, "npy stack: %s - %d of %d frames (%dx%d %dch)\n", label.c_str(), got,
+                frames, ref->w, ref->h, ref->ch);
+    } else {
+        fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", label.c_str(), got,
+                ref->w, ref->h, ref->ch);
     }
-    fprintf(stderr, "npy stack: %s - %d of %d frames (%dx%d %dch)\n", label.c_str(), got,
-            frames, ref->w, ref->h, ref->ch);
 }
 
 static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
@@ -4224,10 +4230,10 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     int firstIdx = (int)app.images.size();
     addImage(std::move(first));
     finalizeNpyFrameBatch(info, firstIdx, frames, label,
-                          [&](int f, std::string& err) {
+                          [&](int f, std::string& e2) {
                               int fr = 1; int64_t fs = 0;
-                              return decodeNpyBuffer(buf, path, displayName, err, f, fr, fs, npyRead);
-                          });
+                              return decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
+                          }, true);
     return {};
 }
 
@@ -5204,10 +5210,10 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
     addImage(std::move(first));
     info.lastImageIdx = firstIdx;
     finalizeNpyFrameBatch(info, firstIdx, frames, baseName(path),
-                          [&](int f, std::string& err) {
+                          [&](int f, std::string& e2) {
                               int fr = 1; int64_t fs = 0;
-                              return decodeNpyFrame(path, err, f, fr, fs, npyRead);
-                          });
+                              return decodeNpyFrame(path, e2, f, fr, fs, npyRead);
+                          }, false);
     return {};
 }
 
