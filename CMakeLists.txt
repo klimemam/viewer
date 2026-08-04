@@ -215,7 +215,7 @@ viewer_add_plugin(analyzer_esfr       plugins/analyzer_esfr.c)
 viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 
 # ---- selftests as ctest tests ---------------------------------------------
-# The binary carries 22 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# The binary carries 23 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
 # script to get exactly what CI got. There is no second copy of the argument
 # lists anywhere - adding a test here adds it to CI.
@@ -337,6 +337,12 @@ viewer_selftest(newwin      --newwin-selftest tools/testdata)
 # (levelfiles/) was hand-made and lived outside the repo. gen_testdata.py
 # writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
 viewer_selftest(sweepfile   --sweepfile-selftest tools/testdata/levelfiles)
+
+# The 23rd: which document holds which pixels (docs/verify-functional.md
+# D-1/D-2/D-7). multi/ because it is three stacks of five frames - enough
+# documents for "N documents, N sources" to say something - and its parent
+# carries the .raw fixture the second decode path needs.
+viewer_selftest(srcmap      --srcmap-selftest tools/testdata/multi)
 
 # --remote-selftest is the one flag that returns before glfwInit(), so it is the
 # one test that carries NOGL today - and it must be told where the standalone

@@ -1936,9 +1936,27 @@ static void cycleCompare() {
 // can never do two of them at once; the return value is what the press
 // consumed, which is how --abstats-selftest proves that ordering.
 enum class EscTook { Nothing, RoiDeselected, CompareOff };
+// Which layer ACTUALLY took each Escape, one name per press in the order the
+// presses arrived: "popup;textedit;roi;compare;nothing;". The four steps above
+// are decided in four different places - two of them inside ImGui, where this
+// app's state never hears about them - so "one press, one step outward" was
+// only ever checkable for the two that end in escapePressed(). A14/A14b assert
+// the ROI/compare pair and, separately, that a popup went away; neither can
+// say that ONE press did not do two of them, which is the whole rule.
+// (docs/verify-ui.md E7.) Recorded at the point each layer acts, so a press
+// consumed twice appears as two entries rather than being reasoned away.
+static std::string g_escProbe;
+static int g_escProbeN = 0;              // entries, so a caller can take a delta
+static int g_escProbeFrame = -1;         // the frame the last entry was made in
+static void escProbeNote(const char* layer) {
+    g_escProbe += std::string(layer) + ";";
+    g_escProbeN++;
+    if (ImGui::GetCurrentContext()) g_escProbeFrame = ImGui::GetFrameCount();
+}
 static EscTook escapePressed() {
     if (app.selectedAnn != 0) {          // back to All - the old ESC meaning
         app.selectedAnn = 0;
+        escProbeNote("roi");
         return EscTook::RoiDeselected;
     }
     if (app.compareMode != App::CmpOff) {
@@ -1950,8 +1968,10 @@ static EscTook escapePressed() {
         // rule in drawFileList).
         app.compareMode = App::CmpOff;
         toast("comparison off - B/C assignments kept (C to resume)");
+        escProbeNote("compare");
         return EscTook::CompareOff;
     }
+    escProbeNote("nothing");
     return EscTook::Nothing;
 }
 
@@ -7363,6 +7383,93 @@ static size_t claimedImageBytes() {
     return residentImageBytes() + app.rfBytesInFlight.load();
 }
 
+// ---- the source map: which documents are holding which pixels ---------------
+// Sharing is invisible from outside this process. srcId is read in exactly one
+// place (residentImageBytes' dedupe, just above), use_count() in exactly one
+// (the crop CoW), rev in none at all, and none of the three has a printing
+// path - so "these two stacks are one source" cannot be asserted from a CLI,
+// which is why docs/verify-functional.md D-1/D-2/D-7 stand at 要probe and A-12
+// could be settled only by reading the code. This writes down what the
+// documents ACTUALLY point at, one line per membership.
+//
+// Two decisions, both of them about being readable back:
+//   - the source is named by a DENSE ordinal, not by srcId. srcId is a global
+//     counter, so its value depends on how many frames were decoded before
+//     this one and differs between runs; nothing can assert on it. "Shared"
+//     means two documents print the SAME ordinal, and that is stable.
+//   - the rows are sorted by (stack, position, uid). app.images is in arrival
+//     order, and a background loader does not promise one.
+// Like g_tilePanesDrawn and g_filesBadgeProbe, this records what IS, never
+// what ought to be: refs is use_count() as it stands, and mtime/fsize are
+// whatever statSourceFile left there, 0 included.
+struct SrcMapRow {
+    uint64_t uid = 0;
+    int seqId = 0, seqIndex = 0;
+    int src = 0;              // dense source ordinal: equal ordinal = shared
+    long refs = 0;            // src.use_count()
+    int rev = 0, dataRev = 0;
+    int64_t mtime = 0;
+    uint64_t fsize = 0;
+    size_t bytes = 0;
+    int w = 0, h = 0, ch = 1;
+    bool preview = false;
+    std::string name, member, path;
+};
+static std::vector<SrcMapRow> srcMapRows() {
+    std::vector<const ImageDoc*> ds;
+    ds.reserve(app.images.size());
+    for (const auto& d : app.images) if (d) ds.push_back(d.get());
+    std::stable_sort(ds.begin(), ds.end(), [](const ImageDoc* a, const ImageDoc* b) {
+        if (a->seqId != b->seqId) return a->seqId < b->seqId;
+        if (a->seqIndex != b->seqIndex) return a->seqIndex < b->seqIndex;
+        return a->uid < b->uid;
+    });
+    std::vector<SrcMapRow> rows;
+    std::unordered_map<uint64_t, int> dense;
+    for (const ImageDoc* d : ds) {
+        const FrameSource& S = *d->src;
+        auto it = dense.find(S.srcId);
+        if (it == dense.end()) it = dense.emplace(S.srcId, (int)dense.size()).first;
+        SrcMapRow r;
+        r.uid = d->uid; r.seqId = d->seqId; r.seqIndex = d->seqIndex;
+        r.src = it->second;
+        r.refs = d->src.use_count();
+        r.rev = S.rev; r.dataRev = d->dataRev;
+        r.mtime = S.mtime; r.fsize = S.fsize;
+        r.bytes = S.data.size() * sizeof(float);
+        r.w = S.w; r.h = S.h; r.ch = S.ch;
+        r.preview = d->preview;
+        r.name = d->name; r.member = S.npzMember; r.path = S.path;
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+// How many distinct sources the open documents hold between them.
+static int srcMapSources() {
+    std::unordered_set<uint64_t> seen;
+    for (const auto& d : app.images) if (d) seen.insert(d->src->srcId);
+    return (int)seen.size();
+}
+// The map as stderr lines. <tag> names the moment, because the interesting
+// question is always "the same map before and after WHAT".
+static void srcMapDump(const std::string& tag) {
+    std::vector<SrcMapRow> rows = srcMapRows();
+    for (const SrcMapRow& r : rows) {
+        std::string tail = " name='" + r.name + "'";
+        if (!r.member.empty()) tail += " member='" + r.member + "'";
+        if (!r.path.empty())   tail += " path='" + r.path + "'";
+        fprintf(stderr, "srcmap: %s uid=%llu seq=%d idx=%d src=#%d refs=%ld rev=%d "
+                        "datarev=%d %dx%dx%d bytes=%zu mtime=%lld fsize=%llu%s%s\n",
+                tag.c_str(), (unsigned long long)r.uid, r.seqId, r.seqIndex, r.src,
+                r.refs, r.rev, r.dataRev, r.w, r.h, r.ch, r.bytes,
+                (long long)r.mtime, (unsigned long long)r.fsize,
+                r.preview ? " preview" : "", tail.c_str());
+    }
+    fprintf(stderr, "srcmap: %s %zu doc(s), %d source(s), %zu resident byte(s)\n",
+            tag.c_str(), rows.size(), srcMapSources(), residentImageBytes());
+    fflush(stderr);
+}
+
 // split a stem into alternating text / digit segments: "flat_0007_640x480" ->
 // ["flat_"]["0007"]["_"]["640"]["x"]["480"]
 struct NameSeg { bool digit; std::string s; };
@@ -11502,6 +11609,15 @@ static float g_tileCanvasW = 0;    // what it had to work with, when it refused
 // Same reasoning as g_tilePanesDrawn: this machine cannot screenshot GL, so
 // --tile-selftest T12 asserts the composition as state.
 static std::string g_paneBadgeProbe;
+// What the footer strip under the canvas ACTUALLY said on the last frame
+// drawCanvas drew: "ctx=<batch  >  series>;zoom=<zoom NN%>;name=<file>;count=
+// <n/N>;", empty when there was no image and so no strip. Same reasoning as
+// g_paneBadgeProbe, and the same rule: it records the STRINGS that went to
+// AddText, not the numbers they were built from - the zoom readout has two
+// formats and the one it chose is the thing worth asserting, which a test
+// re-deriving "zoom * 100" would never see. (docs/verify-ui.md E3: the row was
+// moved out of the A section precisely because nothing here was observable.)
+static std::string g_footerProbe;
 static std::string elideFront(const std::string& s, size_t keep);   // fwd
 // The batch a document belongs to - the context line of the two-line identity
 // (the footer already leads with it; the pane badges follow the same rule).
@@ -11512,6 +11628,7 @@ static std::string batchNameOf(const ImageDoc* d) {
 
 static void drawCanvas(ImVec2 avail) {
     g_paneBadgeProbe.clear();
+    g_footerProbe.clear();
     // DPI/font-aware ruler geometry (fixed px constants break on 150-200% Windows scaling)
     const float s = app.uiScale;
     const float RULER_H = ImGui::GetFontSize() + 5.0f * s;
@@ -12430,6 +12547,10 @@ static void drawCanvas(ImVec2 avail) {
             dl->AddText(ImVec2(canvasP0.x, topY), IM_COL32(140, 148, 156, 190), ctx);
             dl->PopClipRect();
         }
+        // ...and as state a selftest can read: the context line is written down
+        // whether or not it was drawn, because "no batch, so no context line"
+        // is itself part of what the strip said.
+        g_footerProbe += std::string("ctx=") + ctx + ";";
         {   // zoom, right end of the context line (C3): the magnification is a
             // property of the pixels being judged, so it lives beside them.
             // Moved here FROM the status bar, not duplicated.
@@ -12438,12 +12559,14 @@ static void drawCanvas(ImVec2 avail) {
             else                         snprintf(zs, sizeof zs, "zoom %.3g%%", app.view.zoom * 100);
             ImVec2 zts = ImGui::CalcTextSize(zs);
             dl->AddText(ImVec2(canvasP1.x - zts.x, topY), IM_COL32(140, 148, 156, 190), zs);
+            g_footerProbe += std::string("zoom=") + zs + ";";
         }
         ImVec2 ts = ImGui::CalcTextSize(name);
         float nameW = std::min(ts.x, canvasSize.x * 0.45f);
         dl->PushClipRect(ImVec2(canvasP0.x, botY), ImVec2(canvasP0.x + nameW, botY + lh), true);
         dl->AddText(ImVec2(canvasP0.x, botY), IM_COL32(175, 183, 191, 200), name);
         dl->PopClipRect();
+        g_footerProbe += std::string("name=") + name + ";";
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
@@ -12460,6 +12583,7 @@ static void drawCanvas(ImVec2 avail) {
                 snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
             ImVec2 cs = ImGui::CalcTextSize(cnt);
             dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
+            g_footerProbe += std::string("count=") + cnt + ";";
             float barH = 5.0f * s;
             ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
             ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
@@ -22741,6 +22865,7 @@ static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal
 static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise linearity, synthetic, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
+static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -22996,6 +23121,8 @@ static void printUsage() {
         "                              stacks with exact means, both fit methods, exit\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
         "  --newwin-selftest <dir>     instance autosave slots + spawn line, print, exit\n"
+        "  --srcmap-selftest <dir>     which document holds which pixels (srcId / rev /\n"
+        "                              use_count / Watch baseline), print, exit\n"
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
@@ -23138,6 +23265,8 @@ static void parseCli(int argc, char** argv) {
             g_sweepFileSelftest = next();          // handled in main()
         } else if (a == "--newwin-selftest") {
             g_newwinSelftest = next();             // handled in main()
+        } else if (a == "--srcmap-selftest") {
+            g_srcmapSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | local-fetch
@@ -27109,6 +27238,207 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // ---- who holds which pixels (docs/verify-functional.md D-1/D-2/D-7) ------
+    // The probe this test exists to exercise is srcMapDump(); the asserts below
+    // are what it makes sayable. Every one of them is about a fact that had no
+    // printing path at all before: the number of SOURCES behind N documents,
+    // how many documents hold each one, and the Watch baseline statSourceFile
+    // wrote (A-12 could only be settled by reading the code - the three decode
+    // paths were traced by eye and the values never seen).
+    //
+    // M1 is the stage-1 baseline: nothing shares. It is not a law - stage 2
+    // exists to break it - and it is written so that breaking it is LOUD.
+    // M4/M5 do the sharing by hand (white-box, as S6 sets app.selectedAnn) for
+    // two reasons: a probe that can only ever print refs=1 proves nothing about
+    // the day something shares, and the crop CoW is unreachable in stage 1
+    // (cropInPlace's own comment says so) yet is the whole of C2-3.
+    if (!g_srcmapSelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = glfwGetTime();
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "srcmapselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        openFolder(g_srcmapSelftest);
+        loadAll();
+        if (app.images.size() < 2) {
+            fprintf(stderr, "srcmapselftest: need 2 images under %s\n",
+                    g_srcmapSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+        srcMapDump("M1 after open");
+
+        // ---- M1: one source per membership, and the mirrors agree with it ---
+        {
+            std::vector<SrcMapRow> rows = srcMapRows();
+            bool one = !rows.empty();
+            int shared = 0;
+            for (const SrcMapRow& r : rows) if (r.refs != 1) { one = false; shared++; }
+            check(one && (int)rows.size() == srcMapSources(),
+                  "M1 stage 1: N documents, N sources, one holder each");
+            fprintf(stderr, "srcmapselftest: M1 %zu doc(s) over %d source(s), "
+                            "%d with more than one holder\n",
+                    rows.size(), srcMapSources(), shared);
+            bool mirrors = true;
+            for (const auto& d : app.images)
+                if (d->w != d->src->w || d->h != d->src->h || d->ch != d->src->ch ||
+                    d->dtype != d->src->dtype)
+                    mirrors = false;
+            // §2.1: w/h/ch/dtype are per-doc MIRRORS. Nothing printed them
+            // beside the source they mirror, so a stale one was invisible.
+            check(mirrors, "M1 every mirror field agrees with the source it mirrors");
+        }
+
+        // ---- M2: the Watch baseline is really in there (D-2 / A-12) ---------
+        // A-12 established BY READING that statSourceFile covers npy, npz and
+        // raw. This is the npy path, executed: the values are compared against
+        // the file on disk, so "the baseline is set" cannot pass on a zero.
+        {
+            int withPath = 0, good = 0;
+            std::string firstBad;
+            for (const auto& d : app.images) {
+                const FrameSource& S = *d->src;
+                if (S.path.empty()) continue;
+                std::error_code sec;
+                auto p = pathFromUtf8(S.path);
+                if (!std::filesystem::exists(p, sec)) continue;
+                withPath++;
+                auto t = std::filesystem::last_write_time(p, sec);
+                int64_t wantM = sec ? 0 : (int64_t)t.time_since_epoch().count();
+                auto sz = std::filesystem::file_size(p, sec);
+                uint64_t wantF = sec ? 0 : (uint64_t)sz;
+                if (S.mtime == wantM && S.fsize == wantF && S.mtime != 0 && S.fsize != 0)
+                    good++;
+                else if (firstBad.empty())
+                    firstBad = d->name + " mtime=" + std::to_string(S.mtime) + "/" +
+                               std::to_string(wantM) + " fsize=" +
+                               std::to_string(S.fsize) + "/" + std::to_string(wantF);
+            }
+            fprintf(stderr, "srcmapselftest: M2 npy: %d of %d file-backed frame(s) "
+                            "carry the disk's own mtime+size%s%s\n",
+                    good, withPath, firstBad.empty() ? "" : "; first miss: ",
+                    firstBad.c_str());
+            check(withPath > 0 && good == withPath,
+                  "M2 the npy decode path leaves the Watch baseline on disk's values");
+        }
+
+        // ---- M3: ...and so does the raw decode path -------------------------
+        {
+            std::filesystem::path raw = std::filesystem::path(g_srcmapSelftest).parent_path() /
+                                        "noise_640x480_gray16.raw";
+            std::error_code rec;
+            bool have = std::filesystem::exists(raw, rec);
+            check(have, "M3 fixture: the raw frame is where the generator puts it");
+            if (have) {
+                size_t before = app.images.size();
+                RawDialog rd;
+                rd.path = raw.u8string();
+                rd.w = 640; rd.h = 480;
+                rd.dtype = RD_U16; rd.interp = RI_GRAY;
+                std::string rerr = loadRaw(rd);
+                check(rerr.empty() && app.images.size() == before + 1,
+                      "M3 the raw frame opens");
+                if (app.images.size() == before + 1) {
+                    const FrameSource& S = *app.images[before]->src;
+                    auto sz = std::filesystem::file_size(pathFromUtf8(S.path), rec);
+                    fprintf(stderr, "srcmapselftest: M3 raw: mtime=%lld fsize=%llu "
+                                    "(file %llu)\n", (long long)S.mtime,
+                            (unsigned long long)S.fsize,
+                            (unsigned long long)(rec ? 0 : sz));
+                    check(S.mtime != 0 && !rec && S.fsize == (uint64_t)sz,
+                          "M3 the raw decode path leaves the Watch baseline too");
+                }
+            }
+        }
+
+        // ---- M4: the probe can SEE sharing (its own calibration) ------------
+        // Nothing in stage 1 shares, so M1 would read the same if the probe
+        // printed a constant. Alias two memberships onto one source - which is
+        // what stage 2 will do for real - and the map has to say so, in the
+        // ordinal, in refs, and in the byte accounting (C1-2's 1x).
+        std::vector<int> f0;
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->seqId != 0 && app.images[i]->seqId == app.images[0]->seqId)
+                f0.push_back(i);
+        if (f0.size() < 2) { f0.clear(); f0.push_back(0); f0.push_back(1); }
+        {
+            ImageDoc* a = app.images[f0[0]].get();
+            ImageDoc* b = app.images[f0[1]].get();
+            size_t bytesBefore = residentImageBytes();
+            size_t oneFrame = b->px().size() * sizeof(float);
+            b->src = a->src;                    // stage 2, by hand
+            b->syncMirrors();
+            srcMapDump("M4 two documents, one source");
+            std::vector<SrcMapRow> rows = srcMapRows();
+            int ordA = -1, ordB = -2;
+            long refsA = 0, refsB = 0;
+            for (const SrcMapRow& r : rows) {
+                if (r.uid == a->uid) { ordA = r.src; refsA = r.refs; }
+                if (r.uid == b->uid) { ordB = r.src; refsB = r.refs; }
+            }
+            check(ordA >= 0 && ordB == ordA,
+                  "M4 both memberships print the SAME source ordinal");
+            check(refsA == 2 && refsB == 2,
+                  "M4 ...and both say two holders (use_count is readable at last)");
+            check((int)rows.size() == srcMapSources() + 1,
+                  "M4 one fewer source than documents");
+            fprintf(stderr, "srcmapselftest: M4 resident %zu -> %zu B (one frame is "
+                            "%zu B)\n", bytesBefore, residentImageBytes(), oneFrame);
+            check(residentImageBytes() == bytesBefore - oneFrame,
+                  "M4 shared pixels are counted once, not twice");
+
+            // ---- M5: the crop CoW (C2-3), which stage 1 cannot reach --------
+            // cropInPlace's use_count()>1 branch is dead code until something
+            // shares; with M4's alias in place it is live, and the assert is
+            // the one C2-3 asks for: the OTHER side's pixels do not move.
+            int aw = a->w, ah = a->h;
+            std::vector<float> aPixels = a->px();
+            cropInPlace(*b, 0, 0, std::max(1, b->w / 2), std::max(1, b->h / 2));
+            srcMapDump("M5 after cropping one of them");
+            rows = srcMapRows();
+            long ra = 0, rb = 0; int oa = -1, ob = -1;
+            for (const SrcMapRow& r : rows) {
+                if (r.uid == a->uid) { ra = r.refs; oa = r.src; }
+                if (r.uid == b->uid) { rb = r.refs; ob = r.src; }
+            }
+            check(ra == 1 && rb == 1 && oa != ob,
+                  "M5 the crop CoW split them: one holder each, two sources");
+            check(a->w == aw && a->h == ah && a->px() == aPixels,
+                  "M5 ...and the other side's pixels never moved (C2-3)");
+            check(b->w == std::max(1, aw / 2) && b->dataRev > 0,
+                  "M5 ...while the cropped side really was cropped");
+        }
+
+        // ---- M6: a clone is a new identity, not a second name for one -------
+        {
+            ImageDoc* a = app.images[f0[0]].get();
+            a->src->rev = 7;                    // any non-zero: it must not travel
+            auto fresh = cloneSource(*a->src);
+            check(fresh->srcId != a->src->srcId && fresh->rev == 0 &&
+                  fresh->data == a->src->data,
+                  "M6 cloneSource: same content, own identity, rev back to 0 (D-7)");
+            a->src->rev = 0;
+        }
+
+        srcMapDump("M7 final");
+        fprintf(stderr, "srcmapselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
     if (!g_verifySelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = glfwGetTime();
@@ -28503,6 +28833,21 @@ int main(int argc, char** argv) {
             check(app.seqs.size() == 1 && v21frames == 4,
                   "V21 the frame-axis member opens as ONE stack of 4");
             check(app.images.size() == 5, "V21 only the image-shaped members opened");
+            // ...and every one of them carries the Watch baseline of the FILE
+            // it came out of. This is the third of statSourceFile's decode
+            // paths; docs/verify-functional.md A-12 traced all three by eye and
+            // recorded 要probe because nothing printed mtime/fsize. srcMapDump
+            // prints them, so the npz path is now checked by execution, against
+            // the container's own size on disk.
+            srcMapDump("V21 npz members");
+            {
+                std::error_code zec;
+                uint64_t zsz = (uint64_t)std::filesystem::file_size(pathFromUtf8(npzPath), zec);
+                bool baseOk = !zec && !app.images.empty();
+                for (const auto& d : app.images)
+                    if (d->src->mtime == 0 || d->src->fsize != zsz) baseOk = false;
+                check(baseOk, "V21 every npz member carries the container's Watch baseline");
+            }
             // the FILE is the batch: two members of different shapes are two
             // stacks under one heading, not two unrelated opens
             {
@@ -30786,6 +31131,7 @@ int main(int argc, char** argv) {
                 // ESC with an ROI selected AND compare on: the first press
                 // releases the ROI and ONLY that - one press, one step.
                 app.selectedAnn = 4242;               // white-box: a selected ROI
+                g_escProbe.clear(); g_escProbeN = 0;  // the chain starts here
                 EscTook took = escapePressed();
                 check(took == EscTook::RoiDeselected && app.selectedAnn == 0 &&
                       app.compareMode == App::CmpWipe,
@@ -30799,6 +31145,13 @@ int main(int argc, char** argv) {
                       "S6 ...keeping the B pin and the slot letters (seats survive)");
                 check(escapePressed() == EscTook::Nothing,
                       "S6 a third ESC has nothing left to take");
+                // ...and the three presses as ONE record, which is the form the
+                // rule is written in: each press took exactly one step and they
+                // came in that order. Three separate return values cannot say
+                // "and nothing else happened in between" (E7).
+                fprintf(stderr, "abstatsselftest: S6 esc chain: '%s'\n", g_escProbe.c_str());
+                check(g_escProbe == "roi;compare;nothing;" && g_escProbeN == 3,
+                      "S6 the three presses read as one chain, one step each");
                 // compare OFF: the seats stay visible, dimmed ("armed, not
                 // active"); A is not a seat and is gone entirely
                 filesFrame();
@@ -31311,6 +31664,54 @@ int main(int argc, char** argv) {
             check(aline2 != ta->name &&
                   (aline2.empty() || aline2.compare(0, 3, "...") == 0),
                   "T12 narrow: the name elides from the front or drops, never overflows");
+
+            // ---- T13: the footer strip, through the same real frames --------
+            // docs/verify-ui.md E3. Everything here goes straight to AddText
+            // and was kept nowhere, so the whole strip was untestable and the
+            // row had to be moved out of the A section. g_footerProbe records
+            // the strings as drawn, and these are the claims about them.
+            app.compareMode = App::CmpOff;
+            float saveZoom = app.view.zoom;
+            app.view.zoom = 1.0f;
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T13 footer at zoom 1: '%s'\n",
+                    g_footerProbe.c_str());
+            // (a) the two-line identity leads with the CONTEXT - the batch, and
+            // the series when there is one. Same rule the pane badges follow.
+            check(g_footerProbe.find("ctx=" + batchNameOf(cur()) + ";") != std::string::npos,
+                  "T13 the footer's context line names the batch");
+            check(g_footerProbe.find("zoom=zoom 100%;") != std::string::npos,
+                  "T13 zoom 1 reads as 'zoom 100%'");
+            // (b) a magnification below the whole-percent threshold must still
+            // name a magnification. %.0f would print "zoom 0%" here, and 0% is
+            // not small - it is nothing, which is a different claim about the
+            // pixels on screen. This is the reason the readout has two formats
+            // and the only check that can tell them apart.
+            app.view.zoom = 0.005f;
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T13 footer at zoom 0.005: '%s'\n",
+                    g_footerProbe.c_str());
+            check(g_footerProbe.find("zoom=zoom 0.5%;") != std::string::npos &&
+                  g_footerProbe.find("zoom 0%") == std::string::npos,
+                  "T13 a sub-percent zoom says 0.5%, never 0%");
+            app.view.zoom = saveZoom;
+            // (c) a partially loaded stack says n of N (docs/terminology.md).
+            // The counter had no reader at all, so the rule was carried only by
+            // the comment beside it; expectedFrames is forced here the way a
+            // stack still loading would have it.
+            if (App::SeqInfo* t13s = cur() ? seqInfo(cur()->seqId) : nullptr) {
+                int saveExp = t13s->expectedFrames;
+                int resident = (int)framesOfSeq(t13s->id).size();
+                t13s->expectedFrames = resident + 4;
+                canvasFrame(1720.0f, 980.0f);
+                fprintf(stderr, "tileselftest: T13 footer, %d of %d resident: '%s'\n",
+                        resident, t13s->expectedFrames, g_footerProbe.c_str());
+                check(g_footerProbe.find("count=1/" + std::to_string(resident) +
+                                         " of " + std::to_string(resident + 4) + ";")
+                      != std::string::npos,
+                      "T13 a part-loaded stack's counter says n of N, not n of n");
+                t13s->expectedFrames = saveExp;
+            }
             app.compareMode = App::CmpSplit;
             app.compareFollowFrame = saveFollow;
         }
@@ -33043,10 +33444,26 @@ int main(int argc, char** argv) {
         //   - an ACTIVE item gets the key first, so Escape in the "New batch"
         //     field inside Move to batch reverts the text instead of throwing
         //     the whole menu away.
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
-            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
-                                        ImGuiPopupFlags_AnyPopupLevel))
-            ImGui::ClosePopupsExceptModals();
+        {
+            bool escNow = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+            bool anyPopup = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                                        ImGuiPopupFlags_AnyPopupLevel);
+            if (escNow && !ImGui::IsAnyItemActive() && anyPopup) {
+                ImGui::ClosePopupsExceptModals();
+                escProbeNote("popup");                  // step 1
+            } else if (escNow && io.WantTextInput) {
+                // Step 2, and it is ImGui that performs it: an active text item
+                // reverts its own edit. Both steps below are gated on this same
+                // flag, so nothing else has run - which is exactly the claim
+                // that had nowhere to be written down (E7).
+                escProbeNote("textedit");
+            } else if (escNow && g_escProbeFrame != ImGui::GetFrameCount()) {
+                // The press reached no layer at all (a modifier held, say). It
+                // still gets an entry: a chain that silently drops presses
+                // cannot be read as a chain.
+                escProbeNote("unclaimed");
+            }
+        }
         // after every panel has had its say about the mouse: drag, resize and
         // the cursor shape along the window edges
         window_frame::endFrame();
@@ -33341,6 +33758,20 @@ int main(int argc, char** argv) {
             static double reproT0 = glfwGetTime();
             static int reproIdle = 0;
             static bool reproReady = false;
+            static double reproActT0 = 0;      // the ACTION phase's own clock
+            // A wall clock on the action phase, the same shape as the listing
+            // phase's 60 s above. It had none: waitdir/waitimg bound each WAIT
+            // at 60 s, and nothing bounds the run. Measured on this build, a
+            // list with three impossible waits sits for 3m03s (60 s apiece);
+            // the stock list carries fifteen waits, so an abnormal run - A-16's
+            // shape, where a stale layout puts every scripted click somewhere
+            // else and every wait therefore expires - waits about a quarter of
+            // an hour and is then killed by ctest's own 900 s TIMEOUT, which
+            // says only "Timeout" and names no action. This is eight times a
+            // healthy run (~35 s) and comfortably inside that TIMEOUT, so the
+            // test dies by its own hand, names the action it died on, and
+            // FAILS. A suite that waits is a suite nobody runs.
+            const double reproActBudget = 300.0;
             ImGuiIO& rio = ImGui::GetIO();
             auto reproKey = [](const std::string& a) -> ImGuiKey {
                 if (a == "down")  return ImGuiKey_DownArrow;
@@ -33359,6 +33790,9 @@ int main(int argc, char** argv) {
             if (!reproReady) {
                 if (rbKeysT().b.connected && !rbKeysT().b.entries.empty()) {
                     reproReady = true;
+                    reproActT0 = glfwGetTime();  // the actions start HERE, not
+                                                 // at startup: the listing has
+                                                 // its own 60 s below
                     rbMain().focusReq = true;    // = clicking the panel
                     fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
                             (int)rbKeysT().b.entries.size());
@@ -33367,6 +33801,15 @@ int main(int argc, char** argv) {
                             g_browseKeys.c_str(), rbKeysT().b.err.c_str());
                     break;
                 }
+            } else if (keyAct < keyActs.size() &&
+                       glfwGetTime() - reproActT0 > reproActBudget) {
+                fprintf(stderr, "browsekeys: action phase gave up after %.0f s at "
+                                "action %d/%d '%s' (phase %d), dir=%s imgs=%d: FAILED\n",
+                        glfwGetTime() - reproActT0, (int)keyAct, (int)keyActs.size(),
+                        keyActs[keyAct].c_str(), keyPhase, rbKeysT().b.dir.c_str(),
+                        (int)app.images.size());
+                fflush(stderr);
+                break;                          // keysOk stays false: rc = 1
             } else if (keyAct < keyActs.size()) {
                 // the armed never-expanded watch (see g_expNeverPath): probed
                 // HERE, once per frame, whatever the current action or phase -
@@ -33420,8 +33863,12 @@ int main(int argc, char** argv) {
                 };
                 bool hold = false;                 // waitimg: stay on this action
                 static size_t klogged = (size_t)-1;
+                static int escProbeAtPress = 0;
                 if (keyPhase == 0 && klogged != keyAct) {
                     klogged = keyAct;
+                    // one press, one layer: the count is taken BEFORE the key
+                    // goes into the queue, and read back at phase 7
+                    if (a == "esc") escProbeAtPress = g_escProbeN;
                     // every action names what the panel is showing when it runs,
                     // so a crash log ends on the action that caused it
                     fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d imgs=%d preview=%s\n",
@@ -33923,6 +34370,26 @@ int main(int argc, char** argv) {
                             rio.MousePos.x, rio.MousePos.y,
                             up == want ? "ok" : "FAIL");
                     fflush(stderr);
+                    if (a == "esc") {
+                        // ...and it was the POPUP layer that took it, and only
+                        // that layer. "the popup went away" is compatible with
+                        // the same press also reaching escapePressed() and
+                        // dropping an ROI or leaving a comparison underneath -
+                        // the exact failure the one-step-outward rule forbids,
+                        // and the one thing this test could not see before
+                        // g_escProbe existed (docs/verify-ui.md E7).
+                        int took = g_escProbeN - escProbeAtPress;
+                        std::string chain = g_escProbe.size() > 60
+                            ? g_escProbe.substr(g_escProbe.size() - 60) : g_escProbe;
+                        bool escOk = took == 1 &&
+                                     g_escProbe.size() >= 6 &&
+                                     g_escProbe.compare(g_escProbe.size() - 6, 6, "popup;") == 0;
+                        if (!escOk) keysCheckBad++;
+                        fprintf(stderr, "browsekeys: esc consumed by %d layer(s), "
+                                        "chain ...'%s': %s\n",
+                                took, chain.c_str(), escOk ? "ok" : "FAIL");
+                        fflush(stderr);
+                    }
                 } else if (keyPhase == 7 && a == "disc") {
                     // View > Panels > Browse lands here with nothing open, and
                     // it must not be a remote-only dead end: the panel browses

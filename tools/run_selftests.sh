@@ -62,13 +62,13 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
 fi
 
 # ---- preflight: a display ---------------------------------------------------
-# Only --remote-selftest runs before the window exists; the other 21 create a
-# real GLFW window and an OpenGL context. Saying so once here beats 21
+# Only --remote-selftest runs before the window exists; the other 22 create a
+# real GLFW window and an OpenGL context. Saying so once here beats 22
 # identical "failed to create window" failures.
 if [ "$(uname -s)" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if ! command -v xvfb-run >/dev/null 2>&1; then
         echo "run_selftests: SKIPPING EVERYTHING - headless Linux with no xvfb-run." >&2
-        echo "run_selftests: 21 of the 22 selftests create a real GLFW window." >&2
+        echo "run_selftests: 22 of the 23 selftests create a real GLFW window." >&2
         echo "run_selftests: install it (apt-get install -y xvfb) or set DISPLAY." >&2
         exit 2
     fi
