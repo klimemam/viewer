@@ -19253,7 +19253,6 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // so the local wording is "close browse" - the panel never claims a network
     // connection it does not have.
     const bool rbLocalPeer = B.host.empty();
-    const char* rbEndLbl = rbLocalPeer ? "close browse" : "disconnect";
     auto rbDisconnect = [&I] {
         rbDefer([&I] {                   // another machine, other children
             app.uiSession.stop();        // ours to stop; the worker's is a job
@@ -33778,6 +33777,15 @@ int main(int argc, char** argv) {
                                   says == (arg > 0) &&
                                   (arg == 0 ||
                                    g.statusFull.find(wantSel) != std::string::npos) &&
+                                  // The host is NOT on this line: the panel
+                                  // title names the machine, and the bottom row
+                                  // says only what nothing else on screen says.
+                                  // Kept as an assert pointing the other way
+                                  // rather than deleted with the text it used
+                                  // to check, or nothing would notice the host
+                                  // coming back.
+                                  g.statusFull.find(peerTag(rbKeysT().b.host)) ==
+                                      std::string::npos &&
                                   // it is one line
                                   g.statusText.find('\n') == std::string::npos;
                         chk(ok, "\"" + g.statusFull + "\"");
