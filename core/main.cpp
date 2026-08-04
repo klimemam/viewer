@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <map>
+#include <deque>
 #include <atomic>
 #include <cctype>
 #include <cfloat>
@@ -1240,7 +1241,7 @@ struct App {
     // Dropping several .npz files calls openPath in a LOOP, and one picker can
     // be up at a time: the rest WAIT here and are named, rather than the second
     // silently overwriting the first one's pending choice.
-    std::vector<std::string> npzPickQueue;
+    std::deque<std::string> npzPickQueue;
     // The axis' NAME and UNIT are the user's to confirm. The key name is offered
     // as the default label because it is the only honest starting point; the
     // unit starts EMPTY and is never read out of the key name ("exposure_ms"
@@ -8806,7 +8807,7 @@ static std::string trimAxisLabel(const std::string& s);                       //
 static void npzPickNext() {
     if (app.npzPickOpen || app.npzPickQueue.empty()) return;
     std::string next = app.npzPickQueue.front();
-    app.npzPickQueue.erase(app.npzPickQueue.begin());
+    app.npzPickQueue.pop_front();
     std::string err = loadNpz(next);
     if (!err.empty()) toast(baseName(next) + ": " + err, true);
 }
