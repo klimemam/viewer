@@ -17129,9 +17129,12 @@ static void frameAxisPopupButton(ImageDoc* im) {
             vbuf[0] = 0;
             if (si) {
                 std::string s;
-                for (size_t i = 0; i < si->axisVals.size(); i++) {
-                    if (i) s += ", ";
-                    s += fmtExact(si->axisVals[i]);
+                if (!si->axisVals.empty()) {
+                    s += fmtExact(si->axisVals[0]);
+                    for (size_t i = 1; i < si->axisVals.size(); i++) {
+                        s += ", ";
+                        s += fmtExact(si->axisVals[i]);
+                    }
                 }
                 snprintf(vbuf, sizeof vbuf, "%s", s.c_str());
             }
@@ -24538,8 +24541,14 @@ int main(int argc, char** argv) {
             return out;
         };
         auto joinBase = [&](const std::vector<std::string>& v) {
+            if (v.empty()) return std::string();
             std::string s;
-            for (const auto& f : v) { s += s.empty() ? "" : ","; s += baseName(f); }
+            auto it = v.begin();
+            s += baseName(*it++);
+            for (; it != v.end(); ++it) {
+                s += ',';
+                s += baseName(*it);
+            }
             return s;
         };
         bool ok = true;
@@ -25372,9 +25381,18 @@ int main(int argc, char** argv) {
                 return o;
             };
             auto join = [](const std::vector<std::string>& v) {
-                std::string o;
-                for (const auto& x : v) o += (o.empty() ? "" : " ") + x;
-                return o;
+                if (v.empty()) return std::string();
+                size_t len = v.size() - 1;
+                for (const auto& a : v) len += a.size();
+                std::string s;
+                s.reserve(len);
+                auto it = v.begin();
+                s += *it++;
+                for (; it != v.end(); ++it) {
+                    s += ' ';
+                    s += *it;
+                }
+                return s;
             };
             std::vector<std::string> before = order(buildFileGroups(stacksCached()));
             moveStackToBatch(tri[0], bC);        // first batch -> last batch
@@ -27330,8 +27348,17 @@ int main(int argc, char** argv) {
         // N7: the EXACT argv the Files menu would spawn, all four shapes
         {
             auto join = [](const std::vector<std::string>& v) {
+                if (v.empty()) return std::string();
+                size_t len = v.size() - 1;
+                for (const auto& a : v) len += a.size();
                 std::string s;
-                for (const auto& a : v) { if (!s.empty()) s += ' '; s += a; }
+                s.reserve(len);
+                auto it = v.begin();
+                s += *it++;
+                for (; it != v.end(); ++it) {
+                    s += ' ';
+                    s += *it;
+                }
                 return s;
             };
             auto mk = [&](const char* path, int seq, int seqIdx, int cfa, int pat,
@@ -34005,8 +34032,10 @@ int main(int argc, char** argv) {
                 };
                 auto imgNames = []() {
                     std::string s;
+                    bool first = true;
                     for (const auto& d : app.images) {
-                        if (!s.empty()) s += ",";
+                        if (!first) s += ",";
+                        first = false;
                         s += d->name;
                         if (d->preview) s += "[pv]";
                     }
