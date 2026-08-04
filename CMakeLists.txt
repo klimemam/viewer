@@ -230,6 +230,12 @@ viewer_add_plugin(analyzer_sharpness  plugins/analyzer_sharpness.c)
 viewer_add_plugin(analyzer_esfr       plugins/analyzer_esfr.c)
 viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 
+add_executable(test_prnu plugins/test/test_prnu.c)
+target_include_directories(test_prnu PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(test_prnu PRIVATE m)
+endif()
+
 # ---- selftests as ctest tests ---------------------------------------------
 # The binary carries 23 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
@@ -328,6 +334,9 @@ set_tests_properties(glprobe PROPERTIES
   ENVIRONMENT "APPDATA=${VIEWER_TEST_HOME};HOME=${VIEWER_TEST_HOME}"
   LABELS glprobe
   TIMEOUT 300)
+
+add_test(NAME test_prnu COMMAND test_prnu)
+set_tests_properties(test_prnu PROPERTIES LABELS nogl)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
 # through --no-window against this build, and the 17 below came back with output
