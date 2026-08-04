@@ -20917,13 +20917,10 @@ static void drawPanelRemote(App::BrowseInstance& I) {
 // path and a second answer to the same question, which is the defect class
 // TODO_one_implementation.md exists to stamp out. One path, both origins.
 //
-// The structure is deliberately two-phase, because the copy is a stopgap for
-// reference-sharing (one frame in several stacks, which today's single
-// ImageDoc::seqId forbids):
+// The structure is deliberately two-phase:
 //   - buildDerivePlan  = WHICH frames are chosen (pure, no mutation)
-//   - applyDerivePlan  = HOW a chosen frame becomes a member; the copy lives
-//     in materializeDerivedFrame and ONLY there, so replacing copies with
-//     references replaces one function, not the dialog and not the tests.
+//   - applyDerivePlan  = HOW a chosen frame becomes a member (via reference sharing
+//     in materializeDerivedFrame).
 
 // One member of a stack, as the FILE LIST knows it. For a remote folder stack
 // the membership is SeqInfo::remoteFiles - matching must work before (or
@@ -21061,29 +21058,17 @@ static std::string deriveRuleText(const DerivePlan& P) {
     }
 }
 
-// HOW a chosen frame becomes a member: TODAY, a deep copy of the resident
-// pixels. This is the single function reference-sharing will replace.
+// HOW a chosen frame becomes a member: By sharing a reference to the resident
+// pixels (FrameSource), avoiding a deep copy.
 static ImageDoc* materializeDerivedFrame(const ImageDoc& s, int seqId, int seqIndex,
                                          int batchId, const std::string& note) {
     auto d = std::make_unique<ImageDoc>();
     d->name = s.name;
-    // its OWN source (fresh srcId), holding a copy of s's pixels and provenance:
-    // stage 3 replaces this whole block with d->src = s.src (mtime/fsize stay 0
-    // until then - a copy is not the file on disk)
-    FrameSource& D = *d->src;
-    D.path = s.src->path; D.dtype = s.dtype;
-    D.w = s.w; D.h = s.h; D.ch = s.ch;
-    D.data = s.px();                      // the pixels, copied from RAM
-    D.vmin = s.vmin; D.vmax = s.vmax;
+    d->src = s.src;
     d->syncMirrors();
     d->black = s.black; d->white = s.white;   // frames stay directly comparable
     d->cfa = s.cfa; d->cfaPattern = s.cfaPattern; d->cfaColorize = s.cfaColorize;
-    D.rawDtype = s.src->rawDtype; D.rawInterp = s.src->rawInterp;
-    D.rawOffset = s.src->rawOffset; D.rawLE = s.src->rawLE;
-    D.srcW = s.src->srcW; D.srcH = s.src->srcH; D.cropX = s.src->cropX; D.cropY = s.src->cropY;
     d->displayLut = s.displayLut;
-    D.npzMember = s.src->npzMember;
-    D.remoteUrl = s.src->remoteUrl; D.remoteFrame = s.src->remoteFrame;  // provenance only
     d->note = note;    // the SAME note on every frame: a stack-constant row, so
                        // the Inspector never gains or loses a line mid-stack
     d->seqId = seqId; d->seqIndex = seqIndex; d->batchId = batchId;
