@@ -17,6 +17,8 @@ import sys
 import tempfile
 import traceback
 
+import run_adapter as harness_module
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -694,6 +696,13 @@ def load(path):
     assert "display range varies per frame" in scalar(m, "__note_0"), scalar(m, "__note_0")
     assert scalar(m, "__meta_sensor") == '"IMX999"'
     assert scalar(m, "__meta_gain") == '{"unit": "dB", "value": 6.0}'
+
+
+@case
+def harness_split_spec_missing_colon():
+    fails(lambda: harness_module.split_spec("some_file.py"),
+          "adapter must be given as <file.py>:<function>",
+          exc=harness_module.AdapterError)
 
 
 @case
