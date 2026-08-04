@@ -288,6 +288,33 @@ def dtype_refused():
 
 
 @case
+def dtype_name_edge_cases():
+    """Test _dtype_name with weird objects."""
+    vi = need_lib()
+
+    class NoDtype(object):
+        pass
+
+    class NamedDtype(object):
+        @property
+        def dtype(self):
+            class DType(object):
+                name = "my_named_dtype"
+            return DType()
+
+    class WeirdDtype(object):
+        @property
+        def dtype(self):
+            class DType(object):
+                def __str__(self): return "my_weird_dtype"
+            return DType()
+
+    assert vi._dtype_name(NoDtype()) is None
+    assert vi._dtype_name(NamedDtype()) == "my_named_dtype"
+    assert vi._dtype_name(WeirdDtype()) == "my_weird_dtype"
+
+
+@case
 def misspelled_field():
     """4.3: a misspelled field is a TypeError on the spot -- the point of naming a type."""
     need_lib(); need_numpy()
