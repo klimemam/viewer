@@ -1,9 +1,17 @@
 name: build
 
 on:
+  # Every branch, not just main. A pull_request run builds refs/pull/N/merge,
+  # which GitHub cannot produce once the PR CONFLICTS with main - so the
+  # workflow does not start at all: no run, no red X, nothing to notice. That
+  # is worse than a failure, because a failure is visible, and it read as
+  # "still queued" for an hour before anyone checked `gh pr view --json
+  # mergeable`. A push-triggered run builds the branch as it stands, which
+  # conflicts cannot stop, so a branch always has a verdict of its own.
   push:
-    branches: [main, native-v0.1]
-  # the selftests are a gate, so they have to run BEFORE a merge, not after it
+    branches: ['**']
+  # ...and the merge result stays gated separately: a branch that is green on
+  # its own can still break main, which is the thing this was always for.
   pull_request:
     branches: [main]
   workflow_dispatch:
