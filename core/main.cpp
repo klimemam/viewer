@@ -102,6 +102,21 @@ static std::string jpFontPath() {
         if (std::filesystem::exists(pathFromUtf8(c))) return c;
     return {};
 }
+// Seconds since the first call, monotonic - the app's clock.
+//
+// It used to be GLFW's own timer, which is only a clock once glfwInit() has run:
+// before that it answers 0.0 forever and reports GLFW_NOT_INITIALIZED. The
+// windowless startup path (--no-window) deliberately never calls glfwInit, and
+// under a frozen 0.0 every "give up after 120 s" budget in the selftests -
+// `while (t() - t0 < 120)` - becomes a loop with no way out, so a load that
+// never finishes would hang until ctest's 900 s timeout instead of failing.
+// steady_clock needs nothing initialised, and anchoring on first use gives it
+// the same epoch glfwGetTime had, so the two are interchangeable. There is
+// exactly one of them now: mixing the epochs would be far worse than either.
+static double nowSec() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {
     std::ifstream f(pathFromUtf8(utf8Path), std::ios::binary | std::ios::ate);
     if (!f) return false;
@@ -500,7 +515,7 @@ struct App {
     // exactly once and then costs nothing at all.
     bool abSlot1Live = false;
     // While frames are being stepped faster than a person reads them, the B
-    // caches are NOT recomputed (see selectImage). glfwGetTime() deadline.
+    // caches are NOT recomputed (see selectImage). nowSec() deadline.
     double abStepBusyUntil = 0;
     // Compare slots BEYOND B: C, D, E... An interim shape, deliberately bolted
     // ON TOP of A/B rather than replacing it - every existing mode (wipe,
@@ -1682,7 +1697,7 @@ static bool g_abNoThrottle = false;
 // True while frames are being stepped continuously. The B slots skip their
 // recompute then; whoever draws B must say "stale" (docs/ab-stats-plan.md 1).
 static bool abStepBusy() {
-    return !g_abNoThrottle && app.abStepBusyUntil > glfwGetTime();
+    return !g_abNoThrottle && app.abStepBusyUntil > nowSec();
 }
 
 // Slot 1 of every statistics cache belongs to the B side and is filled only
@@ -2120,7 +2135,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
         D.w == w && D.h == h)
         return;                                     // cache hit: nothing changed
 
-    double t0 = glfwGetTime();
+    double t0 = nowSec();
     static std::vector<uint8_t> rgba;
     rgba.resize((size_t)w * h * 4);
     const float inv = 1.0f / std::max(gain, 1e-20f);
@@ -2167,7 +2182,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
     D.clipped = (double)clipped / ((double)w * h);
     fprintf(stderr, "diff: %s - %s  full scale +-%g  (%.3f%% off scale, %.0f ms)\n",
             a.name.c_str(), b.name.c_str(), gain, D.clipped * 100,
-            (glfwGetTime() - t0) * 1000);
+            (nowSec() - t0) * 1000);
 }
 
 // upload/normalize into RGBA8 texture
@@ -6533,7 +6548,7 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         // Only the wait is off-thread - readerFinish touches images and GL.
         job->src = src; job->spec = spec; job->out = out; job->argv = argv;
         job->outFile = outFile; job->errFile = errFile;
-        job->startedAt = glfwGetTime();
+        job->startedAt = nowSec();
         app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
         App::ReaderJob* j = job;
         j->th = std::thread([j]() {
@@ -7625,7 +7640,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             app.seqDone++;
             // wake the UI at most ~10 Hz: one post per decoded frame would defeat
             // the idle throttle on a fast disk
-            double now = glfwGetTime();
+            double now = nowSec();
             if (now - lastPost > 0.1) { lastPost = now; glfwPostEmptyEvent(); }
             if (bytes > budget) {
                 // say what stopped it, with the numbers: silently loading 60 of
@@ -7699,7 +7714,7 @@ static void pumpSequence() {
     }
     // invalidating per pump made this O(frames^2) over a load; refresh at ~2 Hz
     static double lastTemporalInvalidate = 0;
-    double nowT = glfwGetTime();
+    double nowT = nowSec();
     if (!app.seqRunning || nowT - lastTemporalInvalidate > 0.5) {
         lastTemporalInvalidate = nowT;
         app.temporal[0].seqId = app.temporal[1].seqId = -1;
@@ -8061,7 +8076,7 @@ static void selectImage(int idx) {
     // so, and refresh once the stepping stops. Same shape as annBusy.
     {
         static double lastSwitch = -1e9;
-        double now = glfwGetTime();
+        double now = nowSec();
         if (now - lastSwitch < 0.30) app.abStepBusyUntil = now + 0.30;
         lastSwitch = now;
     }
@@ -9341,9 +9356,9 @@ static void drawReaderPanel() {
         // Something turning, how long it has been turning, and a way out. A
         // reader takes as long as the user's data takes, and a window that only
         // stops answering does not say whether it is working or wedged.
-        double el = glfwGetTime() - app.rdJob->startedAt;
+        double el = nowSec() - app.rdJob->startedAt;
         const char* spin = "|/-\\";
-        ImGui::Text("%c  running  %.1f s", spin[(int)(glfwGetTime() * 8) & 3], el);
+        ImGui::Text("%c  running  %.1f s", spin[(int)(nowSec() * 8) & 3], el);
         ImGui::SameLine();
         if (ImGui::SmallButton("Stop")) {
             app.rdJob->cancel.store(true);
@@ -18497,7 +18512,7 @@ static void drawPanelAnalysis() {
                      ana.cfaPattern != im->cfaPattern;
         bool ranNow = runClicked || (app.anaAuto && stale && !app.annBusy);
         if (ranNow) {
-            double runT0 = glfwGetTime();
+            double runT0 = nowSec();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
             ana.colColor.clear(); ana.units.clear(); ana.headline.clear();
             if (im->preview) promotePreview(im);   // measuring it = keeping it
@@ -18557,7 +18572,7 @@ static void drawPanelAnalysis() {
                     runOne(&rr, a->label, a->color & 7);
                 }
             }
-            ana.runMs = (float)((glfwGetTime() - runT0) * 1000.0);
+            ana.runMs = (float)((nowSec() - runT0) * 1000.0);
             // per-row presentation, derived once here so the draw loop below
             // only reads cached strings (no per-frame string building)
             {
@@ -22985,6 +23000,8 @@ static void printUsage() {
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
         "  --gl-probe                  can this machine make the GL context the viewer\n"
         "                              needs? name it and exit (0 yes, 3 no + why)\n"
+        "  --no-window                 start WITHOUT a window or a GL context, for the\n"
+        "                              selftests that never draw (nothing else runs)\n"
         "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
@@ -23084,7 +23101,8 @@ static void parseCli(int argc, char** argv) {
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
-        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--secondary") {
+        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--secondary" ||
+                   a == "--no-window") {
             /* consumed in main(): no value */
         } else if (a == "--no-ab-throttle") {
             g_abNoThrottle = true;     // measure what the B-slot throttle saves
@@ -23545,9 +23563,9 @@ static int remoteSelfTest(const char* exe, const char* path) {
         bool started = s2.startOn("", 0, exe, e2);
         bool listedOk = started && s2.list(dir, ents2, e2);
         stopFlag = true;                       // exactly what stop*() sets
-        double at0 = glfwGetTime();
+        double at0 = nowSec();
         bool listedAfter = s2.list(dir, ents2, e2);
-        double asecs = glfwGetTime() - at0;
+        double asecs = nowSec() - at0;
         bool abortOk = started && listedOk && !listedAfter && asecs < 1.0;
         fprintf(stderr, "selftest: abortable read: LIST before the flag %s, after it %s "
                         "in %.3f s: %s\n",
@@ -23852,8 +23870,8 @@ static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
     g_inputSeq++;
-    if (g_lastInputAt == 0) g_lastInputAt = glfwGetTime();   // first of a burst
-    if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
+    if (g_lastInputAt == 0) g_lastInputAt = nowSec();   // first of a burst
+    if (!app.lowBandwidth) g_wakeUntil = nowSec() + 0.25;
 }
 
 // ---- window / taskbar icon ---------------------------------------------------
@@ -24013,6 +24031,40 @@ static int glProbe() {
     return 0;
 }
 
+// Did startup make a window? False under --no-window, and nowhere else.
+static bool g_haveWindow = false;
+// The guard on the selftest groups that drive REAL ImGui frames.
+//
+// A frame goes through ImGui_ImplOpenGL3_NewFrame + ImGui_ImplGlfw_NewFrame,
+// and those backends are not initialised when there is no window: calling them
+// is a null device and a crash with nothing in it that names the test. Five
+// groups do it (--tile-selftest T12, --verify-selftest's ROI probe,
+// --abstats-selftest's T chart, --frame-lin-selftest F11, and the whole of
+// --browse-keys-selftest, which runs the real loop), and every one of them is
+// asserting on LAYOUT - which is exactly the thing that cannot be computed
+// without the backend that reports the display.
+//
+// So they are the tests that keep needing a GL context, and this says so by
+// name, with the line to change, if one is ever marked NOGL by mistake.
+static bool needWindow(const char* what) {
+    if (g_haveWindow) return true;
+    fprintf(stderr, "%s drives real ImGui frames and needs a window: it cannot "
+                    "run with --no-window.\n", what);
+    fprintf(stderr, "  remove NOGL from its viewer_selftest() line in "
+                    "CMakeLists.txt - that word is what passed --no-window.\n");
+    // The caller returns from main() straight after this, and an unjoined
+    // std::thread at exit is std::terminate() - "terminate called without an
+    // active exception" printed right under the message above, which reads like
+    // a crash in the thing being reported rather than the orderly refusal it
+    // is. The selftests that exit early shut the same four workers down (see
+    // --scan-selftest); by the time a test is drawing, it has started them.
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return false;
+}
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -24043,6 +24095,26 @@ int main(int argc, char** argv) {
     // question ABOUT the machine must not alter the machine it is asking about.
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--gl-probe")) return glProbe();
+    // --no-window: the startup path that makes no window and touches no GL.
+    //
+    // Startup created a window unconditionally, so every selftest but
+    // --remote-selftest died inside glfwCreateWindow on a runner with no GL
+    // context - even though most of them never draw anything. They load data,
+    // call the panels' own helpers and assert on the state that comes back;
+    // the window they were given was pure ceremony. This flag skips the whole
+    // ceremony: no glfwInit, no window, no ImGui backends, no OpenGL symbol
+    // called at any point. Everything else about startup is unchanged - prefs,
+    // plugins, the ImGui context itself and the CLI are all still there,
+    // because those are what the tests are made of.
+    //
+    // Which selftests can take it is declared ONCE, in CMakeLists.txt: the word
+    // NOGL on a viewer_selftest() line both labels the test for
+    // tools/run_selftests.sh and passes this flag. A test that DOES draw and is
+    // marked NOGL by mistake stops at needWindow() below with its name and the
+    // line to fix, rather than dying inside a backend with no device.
+    bool noWindow = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--no-window")) noWindow = true;
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
@@ -24096,52 +24168,57 @@ int main(int argc, char** argv) {
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
     // Installed before anything can fail, so the two messages below can quote
     // GLFW instead of shrugging. Storing only - it prints nothing by itself.
-    glfwSetErrorCallback(glfwErrorSink);
-    if (!glfwInit()) {
-        fprintf(stderr, "glfwInit failed: %s\n",
-                glfwReasonOr("no GLFW error reported").c_str());
-        return 1;
-    }
-    const char* glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
-    if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    // How a Linux desktop matches a window to its launcher: without these the
-    // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
-    // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
-    // generic icon in a second, ungrouped dock entry. Ignored elsewhere.
-    glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
-    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
-    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
-    GLFWwindow* win = glfwCreateWindow(1600, 1000,
-                                       (std::string("viewer  ") + viewerVersion()).c_str(),
-                                       nullptr, nullptr);
-    if (!win) {
-        // THE line the Windows and macOS CI runners printed once per selftest,
-        // with no reason attached - which is what made a machine with no GL
-        // indistinguishable from 21 broken tests. GLFW knew why the whole time.
-        fprintf(stderr, "window creation failed: %s\n",
-                glfwReasonOr("no GLFW error reported").c_str());
-        fprintf(stderr, "  is it this machine or is it this test? "
-                        "`viewer --gl-probe` answers that alone.\n");
-        return 1;
-    }
-    applyWindowIcon(win, false);
-    // The frame comes up before the first frame is drawn, so the window never
-    // flashes a system title bar it is about to lose. --frame on the command
-    // line wins over the preference for this run and is not written back: it is
-    // the way out if a window manager makes a mess of the integrated one.
-    window_frame::init(win);
-    window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
-    if (winOffX || winOffY) {
-        // "Open in new window" passes --window-offset 40,40: the child must not
-        // land exactly on top of its parent, or nobody can tell it opened
-        int wx = 0, wy = 0;
-        glfwGetWindowPos(win, &wx, &wy);
-        glfwSetWindowPos(win, wx + winOffX, wy + winOffY);
-    }
-    glfwMakeContextCurrent(win);
-    glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
-    installWakeCallbacks(win);        // before ImGui's backend: it chains to these
-    glfwSetDropCallback(win, dropCallback);
+    GLFWwindow* win = nullptr;
+    const char* glslVersion = nullptr;
+    if (!noWindow) {
+        glfwSetErrorCallback(glfwErrorSink);
+        if (!glfwInit()) {
+            fprintf(stderr, "glfwInit failed: %s\n",
+                    glfwReasonOr("no GLFW error reported").c_str());
+            return 1;
+        }
+        glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
+        if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        // How a Linux desktop matches a window to its launcher: without these the
+        // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
+        // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
+        // generic icon in a second, ungrouped dock entry. Ignored elsewhere.
+        glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
+        glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
+        glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
+        win = glfwCreateWindow(1600, 1000,
+                               (std::string("viewer  ") + viewerVersion()).c_str(),
+                               nullptr, nullptr);
+        if (!win) {
+            // THE line the Windows and macOS CI runners printed once per selftest,
+            // with no reason attached - which is what made a machine with no GL
+            // indistinguishable from 21 broken tests. GLFW knew why the whole time.
+            fprintf(stderr, "window creation failed: %s\n",
+                    glfwReasonOr("no GLFW error reported").c_str());
+            fprintf(stderr, "  is it this machine or is it this test? "
+                            "`viewer --gl-probe` answers that alone.\n");
+            return 1;
+        }
+        applyWindowIcon(win, false);
+        // The frame comes up before the first frame is drawn, so the window never
+        // flashes a system title bar it is about to lose. --frame on the command
+        // line wins over the preference for this run and is not written back: it is
+        // the way out if a window manager makes a mess of the integrated one.
+        window_frame::init(win);
+        window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
+        if (winOffX || winOffY) {
+            // "Open in new window" passes --window-offset 40,40: the child must not
+            // land exactly on top of its parent, or nobody can tell it opened
+            int wx = 0, wy = 0;
+            glfwGetWindowPos(win, &wx, &wy);
+            glfwSetWindowPos(win, wx + winOffX, wy + winOffY);
+        }
+        glfwMakeContextCurrent(win);
+        glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
+        installWakeCallbacks(win);        // before ImGui's backend: it chains to these
+        glfwSetDropCallback(win, dropCallback);
+        g_haveWindow = true;
+    }   // if (!noWindow)
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -24160,9 +24237,10 @@ int main(int argc, char** argv) {
 #else
         if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
 #endif
-        // scripted runs (bench, browse-keys) must neither read nor write the
-        // user's layout - same rule the exit path applies to autosave/prefs
-        if (benchFrames || !g_browseKeys.empty()) cfg.clear();
+        // scripted runs (bench, browse-keys, --no-window) must neither read nor
+        // write the user's layout - same rule the exit path applies to
+        // autosave/prefs. A run with no window has no layout to remember either.
+        if (benchFrames || !g_browseKeys.empty() || noWindow) cfg.clear();
         if (!cfg.empty()) {
             cfg /= "viewer";
             std::filesystem::create_directories(cfg, ec);
@@ -24191,7 +24269,10 @@ int main(int argc, char** argv) {
     }
 
     float xs = 1, ys = 1;
-    glfwGetWindowContentScale(win, &xs, &ys);
+    // 1.0 with no window: the scale is a property of the monitor the window
+    // landed on, and there is neither. Everything downstream (uiScale, the font
+    // size, ui_theme) then reads exactly what a 100% display would give.
+    if (win) glfwGetWindowContentScale(win, &xs, &ys);
 #if defined(__APPLE__)
     float uiScale = 1.0f;                    // Cocoa coords are points; backend handles px
     float fontScale = std::max(xs, 1.0f);    // rasterize glyphs at retina resolution
@@ -24231,8 +24312,15 @@ int main(int argc, char** argv) {
     io.FontGlobalScale = 1.0f / fontScale;
 #endif
 
-    ImGui_ImplGlfw_InitForOpenGL(win, true);
-    ImGui_ImplOpenGL3_Init(glslVersion);
+    // The two BACKENDS - platform and renderer - are the only part of ImGui that
+    // needs the window and the GL context. The context itself, the style, the
+    // font atlas and every panel helper that computes rather than draws are
+    // pure CPU and are set up above regardless, which is what lets a selftest
+    // run with --no-window. Drawing a frame still needs these: see needWindow().
+    if (win) {
+        ImGui_ImplGlfw_InitForOpenGL(win, true);
+        ImGui_ImplOpenGL3_Init(glslVersion);
+    }
 
     // write the session on the way out of any crash, then let it crash normally.
     // The file is opened now, while opening files still works.
@@ -24261,8 +24349,8 @@ int main(int argc, char** argv) {
     // the same numbering in one directory).
     if (!g_pickerSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -24452,8 +24540,8 @@ int main(int argc, char** argv) {
     // panel through the LOCAL peer - connected, empty host, entries listed.
     if (!g_localbrowseSelftest.empty()) {
         browseLocalFolder(g_localbrowseSelftest);   // exactly what the menu does
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 120.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
             if (!rbMain().b.err.empty()) break;
@@ -24502,8 +24590,8 @@ int main(int argc, char** argv) {
         std::replace(dir.begin(), dir.end(), '\\', '/');
         while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 120.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
             if (!rbMain().b.err.empty()) break;
@@ -24614,8 +24702,8 @@ int main(int argc, char** argv) {
                 // nothing is listed until it is asked for
                 bool lazy0 = rbMain().treeCache.empty();
                 rbTreeExpand(rbMain(), subPath);
-                double t1 = glfwGetTime();
-                while (glfwGetTime() - t1 < 120.0) {
+                double t1 = nowSec();
+                while (nowSec() - t1 < 120.0) {
                     pumpRemoteBrowse();
                     if (rbMain().treeCache.count(subPath)) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -24658,8 +24746,8 @@ int main(int argc, char** argv) {
                         if (tv[i].isDir()) { atDeep = i; break; }
                 if (atDeep >= 0) {
                     rbTreeExpand(rbMain(), rv[atDeep].full());
-                    double t2 = glfwGetTime();
-                    while (glfwGetTime() - t2 < 120.0) {
+                    double t2 = nowSec();
+                    while (nowSec() - t2 < 120.0) {
                         pumpRemoteBrowse();
                         if (rbMain().treeCache.count(rv[atDeep].full())) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -24717,8 +24805,8 @@ int main(int argc, char** argv) {
             // folder prefix), which is exactly what the old row-only entry
             // could not reach without first going up a level.
             remoteScanFolder(rbMain(), B.dir);
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 120.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
                 pumpRemoteBrowse();
                 if (app.folderPickOpen) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -24793,8 +24881,8 @@ int main(int argc, char** argv) {
             // parses its first digit run as a LEVEL, and a lit stack gets
             // proposed at 0 - which is the dark-reference value.
             remoteBrowseTo(rbMain(), dir + "/scanroot/10lx");
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 120.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
                 pumpRemoteBrowse();
                 if (B.dir == dir + "/scanroot/10lx" && !B.entries.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -24842,9 +24930,9 @@ int main(int argc, char** argv) {
             remoteScanFolder(rbMain(), B.dir);
             uint32_t genAt = rbMain().b.scanGen;
             rbMain().b.scanGen++;            // exactly what the cancel button does
-            double t3 = glfwGetTime();
+            double t3 = nowSec();
             bool sawScan = false;
-            while (glfwGetTime() - t3 < 60.0) {
+            while (nowSec() - t3 < 60.0) {
                 {   // wait for the worker to actually produce the scan result
                     std::lock_guard<std::mutex> lk(rbMain().mtx);
                     for (const auto& rr : rbMain().done)
@@ -24889,15 +24977,15 @@ int main(int argc, char** argv) {
             }
             std::string bdir = bomb.u8string();
             std::replace(bdir.begin(), bdir.end(), '\\', '/');
-            double bt0 = glfwGetTime();
+            double bt0 = nowSec();
             remoteBrowseTo(rbMain(), bdir);
-            double t2 = glfwGetTime();
-            while (glfwGetTime() - t2 < 120.0) {
+            double t2 = nowSec();
+            while (nowSec() - t2 < 120.0) {
                 pumpRemoteBrowse();
                 if (B.dir == bdir) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
-            double secs = glfwGetTime() - bt0;
+            double secs = nowSec() - bt0;
             int meta = 0, nb = 0;
             for (const auto& e : B.entries) {
                 if (e.name.rfind("bomb", 0) == 0) nb++;
@@ -25007,9 +25095,9 @@ int main(int argc, char** argv) {
         }
         // connect the browser, then fire the SAME call the group row's menu makes
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool fired = false, ok = true;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpMeasure();
             if (rbMain().b.connected && !fired) {
@@ -25060,8 +25148,8 @@ int main(int argc, char** argv) {
     // name survives a session save/load round-trip (imgbatch travels by name).
     if (!g_batchSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -25249,8 +25337,8 @@ int main(int argc, char** argv) {
             if (!c) ok = false;
         };
         auto drain = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -25390,8 +25478,8 @@ int main(int argc, char** argv) {
 
     if (!g_seriesSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 600.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 600.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -25504,8 +25592,8 @@ int main(int argc, char** argv) {
             std::string lerr = loadSession(sess);       // closeAll happens inside
             check("session reloaded", lerr.empty());
             loadAll();                                  // stacks come back first
-            double tr = glfwGetTime();                  // ...the series after them
-            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+            double tr = nowSec();                  // ...the series after them
+            while (nowSec() - tr < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -25679,8 +25767,8 @@ int main(int argc, char** argv) {
             std::string lerr = loadSession(legacy);
             check("legacy (seqlevel) session loaded", lerr.empty());
             loadAll();
-            double tm = glfwGetTime();
-            while (glfwGetTime() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm = nowSec();
+            while (nowSec() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -25715,8 +25803,8 @@ int main(int argc, char** argv) {
             }
             loadSession(legacy);
             loadAll();
-            double tm2 = glfwGetTime();
-            while (glfwGetTime() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm2 = nowSec();
+            while (nowSec() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -25743,8 +25831,8 @@ int main(int argc, char** argv) {
             }
             loadSession(legacy);
             loadAll();
-            double tm3 = glfwGetTime();
-            while (glfwGetTime() - tm3 < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm3 = nowSec();
+            while (nowSec() - tm3 < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -25962,8 +26050,8 @@ int main(int argc, char** argv) {
             }
             loadSession(hostile);
             loadAll();
-            double th = glfwGetTime();
-            while (glfwGetTime() - th < 120.0 && !app.seriesRestore.empty()) {
+            double th = nowSec();
+            while (nowSec() - th < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26007,8 +26095,8 @@ int main(int argc, char** argv) {
             saveSession(dup, true);
             loadSession(dup);
             loadAll();
-            double td = glfwGetTime();
-            while (glfwGetTime() - td < 120.0 && !app.seriesRestore.empty()) {
+            double td = nowSec();
+            while (nowSec() - td < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26067,8 +26155,8 @@ int main(int argc, char** argv) {
             saveSession(same, true);
             loadSession(same);
             loadAll();
-            double ts = glfwGetTime();
-            while (glfwGetTime() - ts < 120.0 && !app.seriesRestore.empty()) {
+            double ts = nowSec();
+            while (nowSec() - ts < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26127,8 +26215,8 @@ int main(int argc, char** argv) {
             closeAll();
             loadSession(cut);
             loadAll();
-            double tc = glfwGetTime();
-            while (glfwGetTime() - tc < 120.0 && !app.seriesRestore.empty()) {
+            double tc = nowSec();
+            while (nowSec() - tc < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26161,16 +26249,16 @@ int main(int argc, char** argv) {
                   app.series.empty() && !app.seriesRestore.empty());
             saveSession(mid, true);        // <- the save INSIDE the window
             loadAll();
-            double tw = glfwGetTime();
-            while (glfwGetTime() - tw < 120.0 && !app.seriesRestore.empty()) {
+            double tw = nowSec();
+            while (nowSec() - tw < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             closeAll();
             loadSession(mid);
             loadAll();
-            double tm = glfwGetTime();
-            while (glfwGetTime() - tm < 120.0 && !app.seriesRestore.empty()) {
+            double tm = nowSec();
+            while (nowSec() - tm < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26212,8 +26300,8 @@ int main(int argc, char** argv) {
             saveSession(rn, true);
             loadSession(rn);
             loadAll();
-            double tr = glfwGetTime();
-            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+            double tr = nowSec();
+            while (nowSec() - tr < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26367,8 +26455,8 @@ int main(int argc, char** argv) {
             check("closeBatch takes the batch's pending sweep with it",
                   app.seriesPending.empty());
             loadAll();
-            double tb = glfwGetTime();
-            while (glfwGetTime() - tb < 1.0) {
+            double tb = nowSec();
+            while (nowSec() - tb < 1.0) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26395,8 +26483,8 @@ int main(int argc, char** argv) {
             check("the box is cleared on accept (a sweep is never sticky)",
                   !app.pickSweep);
             loadAll();
-            double t5 = glfwGetTime();
-            while (glfwGetTime() - t5 < 120.0 && !app.seriesPending.empty()) {
+            double t5 = nowSec();
+            while (nowSec() - t5 < 120.0 && !app.seriesPending.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26451,8 +26539,8 @@ int main(int argc, char** argv) {
             check("the sweep box came up UNTICKED", !app.pickSweep);
             pickerAccept();
             loadAll();
-            double t6 = glfwGetTime();             // give a late resolve every chance
-            while (glfwGetTime() - t6 < 1.0) {
+            double t6 = nowSec();             // give a late resolve every chance
+            while (nowSec() - t6 < 1.0) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26491,8 +26579,8 @@ int main(int argc, char** argv) {
             check("the second does not overwrite it - both are queued",
                   app.seriesPending.size() == 2);
             loadAll();
-            double t7 = glfwGetTime();
-            while (glfwGetTime() - t7 < 240.0 && !app.seriesPending.empty()) {
+            double t7 = nowSec();
+            while (nowSec() - t7 < 240.0 && !app.seriesPending.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -26541,8 +26629,8 @@ int main(int argc, char** argv) {
             if (!cond) ok = false;
         };
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen && app.seriesPending.empty()) break;
@@ -26643,8 +26731,8 @@ int main(int argc, char** argv) {
             snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
             pickerAccept();
             int renamed = 0;
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 pumpSequenceAndQueue();
                 if (!renamed && app.seqs.size() == 2) {      // lv000, lv010 are up
                     renamed = app.seqs[1].id;
@@ -26674,9 +26762,9 @@ int main(int argc, char** argv) {
         closeAll();
         startRemote(rbMain(), "local://" + dir);
         {
-            double t0 = glfwGetTime();
+            double t0 = nowSec();
             bool scanSent = false;
-            while (glfwGetTime() - t0 < 300.0) {
+            while (nowSec() - t0 < 300.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -26723,8 +26811,8 @@ int main(int argc, char** argv) {
     // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
     if (!g_closeSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -26778,10 +26866,10 @@ int main(int argc, char** argv) {
         }
         int seqsNow = (int)app.seqs.size();
         startRemote(rbMain(), "local://" + scanroot);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool scanSent = false, closed = false;
         int rsid = 0, rfLeft = -1;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
@@ -26813,8 +26901,8 @@ int main(int argc, char** argv) {
         } else {
             // the in-flight job (and the rest of the queue) gets 2 s to land;
             // nothing of the closed stack may grow back
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 2.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 2.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -26848,8 +26936,8 @@ int main(int argc, char** argv) {
             bool stopped = app.seqQueue.empty() && app.seqRestore.empty() &&
                            !app.seqRunning && app.seqLoadingId == 0 &&
                            app.rbOpenQueue.empty();
-            double t2 = glfwGetTime();        // give the producers 2 s to regrow
-            while (glfwGetTime() - t2 < 2.0) {
+            double t2 = nowSec();        // give the producers 2 s to regrow
+            while (nowSec() - t2 < 2.0) {
                 pumpSequenceAndQueue();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -26876,10 +26964,10 @@ int main(int argc, char** argv) {
             closeAll();
             rbMain().b = App::RemoteBrowse{};
             startRemote(rbMain(), "local://" + scanroot);
-            double t3 = glfwGetTime();
+            double t3 = nowSec();
             bool sent = false, caught = false;
             int rq0 = 0;
-            while (glfwGetTime() - t3 < 120.0) {
+            while (nowSec() - t3 < 120.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -26907,8 +26995,8 @@ int main(int argc, char** argv) {
             } else {
                 closeAll();
                 bool emptied = app.rbOpenQueue.empty();
-                double t4 = glfwGetTime();
-                while (glfwGetTime() - t4 < 3.0) {
+                double t4 = nowSec();
+                while (nowSec() - t4 < 3.0) {
                     pumpRemoteBrowse();
                     pumpRemoteFetch();
                     pumpRemoteOpenQueue();
@@ -27111,8 +27199,8 @@ int main(int argc, char** argv) {
 
     if (!g_verifySelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -27290,8 +27378,8 @@ int main(int argc, char** argv) {
             openFolder(g_verifySelftest);
             if (app.folderPickOpen) pickerAccept();
             int movedSeq = 0, target = 0;
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {    // catch it mid-load
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {    // catch it mid-load
                 pumpSequenceAndQueue();
                 if (!movedSeq && app.seqRunning && app.seqLoadingId &&
                     framesOfSeq(app.seqLoadingId).size() >= 1 &&
@@ -27360,10 +27448,10 @@ int main(int argc, char** argv) {
             scanroot = (sl == std::string::npos ? std::string(".")
                                                 : scanroot.substr(0, sl)) + "/rb/scanroot";
             startRemote(rbMain(), "local://" + scanroot);
-            double t0 = glfwGetTime();
+            double t0 = nowSec();
             bool scanSent = false, closed = false;
             int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
-            while (glfwGetTime() - t0 < 120.0) {
+            while (nowSec() - t0 < 120.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -27397,8 +27485,8 @@ int main(int argc, char** argv) {
                 if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 3.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 3.0) {
                 pumpRemoteBrowse(); pumpRemoteFetch();
                 pumpRemoteOpenQueue(); pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -27597,8 +27685,8 @@ int main(int argc, char** argv) {
             saveSession(sess2, true);
             std::string lerr2 = loadSession(sess2);
             loadAll();
-            double tn = glfwGetTime();
-            while (glfwGetTime() - tn < 60.0 &&
+            double tn = nowSec();
+            while (nowSec() - tn < 60.0 &&
                    (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -27633,8 +27721,8 @@ int main(int argc, char** argv) {
                                                   : scanroot2.substr(0, sl2)) + "/rb/scanroot";
             rbMain().b = App::RemoteBrowse{};
             startRemote(rbMain(), "local://" + scanroot2);
-            double t0b = glfwGetTime();
-            while (glfwGetTime() - t0b < 120.0) {
+            double t0b = nowSec();
+            while (nowSec() - t0b < 120.0) {
                 pumpRemoteBrowse();
                 if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
                 if (!rbMain().b.err.empty()) break;
@@ -27645,8 +27733,8 @@ int main(int argc, char** argv) {
                 if (e.dir && e.name == "10lx") {
                     // list it, then take its frames
                     remoteBrowseTo(rbMain(), scanroot2 + "/10lx");
-                    double t1b = glfwGetTime();
-                    while (glfwGetTime() - t1b < 120.0) {
+                    double t1b = nowSec();
+                    while (nowSec() - t1b < 120.0) {
                         pumpRemoteBrowse();
                         if (rbMain().b.dir == scanroot2 + "/10lx") break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -27674,8 +27762,8 @@ int main(int argc, char** argv) {
                         app.rfPending.load());
                 check(budgetOk, "V14 committed-but-unlanded bytes count against the budget");
                 // ...and they are given back as the frames land
-                double t2b = glfwGetTime();
-                while (glfwGetTime() - t2b < 60.0 && app.rfPending > 0) {
+                double t2b = nowSec();
+                while (nowSec() - t2b < 60.0 && app.rfPending > 0) {
                     pumpRemoteFetch();
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
@@ -28131,6 +28219,7 @@ int main(int argc, char** argv) {
                 return d;
             };
 
+            if (!needWindow("--verify-selftest (the ROI row probe)")) return 1;
             ImGuiIO& pio = ImGui::GetIO();
             int held = -1;
             auto roiFrame = [&](ImVec2 mouse, int btn) {
@@ -29439,8 +29528,8 @@ int main(int argc, char** argv) {
     //   D8     range + hand-picked rules; new batch on request; no series joined
     if (!g_deriveSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -29685,8 +29774,8 @@ int main(int argc, char** argv) {
     //       dangling ImageDoc* behind in it
     if (!g_abstatsSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -30281,6 +30370,7 @@ int main(int argc, char** argv) {
         // client area for OpenGL content, and glReadPixels of a 1600x1000
         // window is not a regression test anyone will keep running.
         {
+            if (!needWindow("--abstats-selftest (the Temporal chart group)")) return 1;
             auto temporalFrame = [&](float w, float h) {
                 // two passes: the first settles the window, the second is the
                 // one whose layout is measured
@@ -30845,8 +30935,8 @@ int main(int argc, char** argv) {
     // and concludes the wrong thing.
     if (!g_tileSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -31257,6 +31347,7 @@ int main(int argc, char** argv) {
             setCompareB(tb);
             addCompareSlot(tc);
             app.compareMode = App::CmpSplit;
+            if (!needWindow("--tile-selftest (T12, the canvas probe)")) return 1;
             auto canvasFrame = [&](float w, float h) {
                 for (int pass = 0; pass < 2; pass++) {
                     ImGui_ImplOpenGL3_NewFrame();
@@ -31327,9 +31418,9 @@ int main(int argc, char** argv) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool scanSent = false;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
@@ -31369,8 +31460,8 @@ int main(int argc, char** argv) {
         std::replace(dir.begin(), dir.end(), '\\', '/');
         app.seqLoadMode = 1;
         openFolder(dir);
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 300.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 300.0) {
             if (app.folderPickOpen && !app.folderPickRemote) {
                 std::vector<App::PendingGroup> sel;
                 for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
@@ -31521,8 +31612,8 @@ int main(int argc, char** argv) {
     // chart draws from, the export column and the session round-trip.
     if (!g_exportTsvSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -31797,8 +31888,8 @@ int main(int argc, char** argv) {
             saveSession(sess, true);
             std::string lerr = loadSession(sess);
             loadAll();
-            double tn = glfwGetTime();
-            while (glfwGetTime() - tn < 60.0 &&
+            double tn = nowSec();
+            while (nowSec() - tn < 60.0 &&
                    (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -32167,6 +32258,7 @@ int main(int argc, char** argv) {
 
         // ---- F11: the panel section itself, through real ImGui frames ------
         {
+            if (!needWindow("--frame-lin-selftest (F11, the panel section)")) return 1;
             auto temporalFrame = [&](float w, float h) {
                 for (int pass = 0; pass < 2; pass++) {
                     ImGui_ImplOpenGL3_NewFrame();
@@ -32226,8 +32318,8 @@ int main(int argc, char** argv) {
     // the command line, run the exact clipboard path, print the TSV to stdout.
     // An independent numpy implementation must reproduce every number.
     if (g_fstatSelftest) {
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 600.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 600.0) {
             if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();   // headless accept
             pumpSequenceAndQueue();
             if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -32247,8 +32339,8 @@ int main(int argc, char** argv) {
     // numbers. A synthetic set with a known sensitivity and a known gain has to
     // come back out of this, or the panel is showing decoration.
     if (g_linSelftest) {
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 600.0) {       // wall clock: the loader is a thread
+        double t0 = nowSec();
+        while (nowSec() - t0 < 600.0) {       // wall clock: the loader is a thread
             // headless "Load selected": Open Folder ALWAYS shows the picker,
             // so a selftest accepts it the way the Load button would
             if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
@@ -32390,6 +32482,19 @@ int main(int argc, char** argv) {
         return (fitOk && snrOk) ? 0 : 1;
     }
 
+    // Everything past this point draws. Every selftest that can run windowless
+    // has returned above, so reaching here with no window means either
+    // --no-window on a test that needs one (say so, by name) or --no-window on
+    // a normal start, which is a window the user asked for and cannot have.
+    if (!g_haveWindow) {
+        if (!g_browseKeys.empty()) needWindow("--browse-keys-selftest");
+        else if (benchFrames)      needWindow("--bench");
+        else fprintf(stderr, "--no-window: there is nothing to run without a "
+                             "window - it exists for the selftests that never "
+                             "draw, and none was asked for.\n");
+        return 1;
+    }
+
     // --browse-keys-selftest: connect the local peer and open the panel; the
     // action list is replayed inside the loop, below.
     std::vector<std::string> keyActs;
@@ -32440,7 +32545,7 @@ int main(int argc, char** argv) {
         app.showHistogram = app.showTemporal = app.showProjection = false;
         app.showLinearity = false;
     }
-    double lastFrameEnd = glfwGetTime();
+    double lastFrameEnd = nowSec();
     // The frame body lives in a callable so it can also run from the window
     // refresh/size callbacks. Win32 runs a MODAL message loop while the user
     // drags a window edge: DispatchMessage never returns until the drag ends, so
@@ -32448,7 +32553,7 @@ int main(int argc, char** argv) {
     // whole resize. GLFW 3.4 sets no timer there, so the repaint has to come from
     // inside the callback.
     g_drawFrame = [&]() {
-        double frameBodyT0 = glfwGetTime();
+        double frameBodyT0 = nowSec();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         if (g_injMouse.x >= 0) {            // see g_injMouse: after the backend
@@ -33061,12 +33166,12 @@ int main(int argc, char** argv) {
         // Split the frame: our drawing versus getting it onto the screen. Over a
         // remote display the second number is the whole story (a full window per
         // frame across the link), and no amount of work on our side moves it.
-        double swapT0 = glfwGetTime();
+        double swapT0 = nowSec();
         glfwSwapBuffers(win);
-        app.swapMs = (float)((glfwGetTime() - swapT0) * 1000.0);
+        app.swapMs = (float)((nowSec() - swapT0) * 1000.0);
         app.cpuMs = (float)((swapT0 - frameBodyT0) * 1000.0);
         if (g_lastInputAt != 0) {      // this frame answered an input: how late was it?
-            float ms = (float)((glfwGetTime() - g_lastInputAt) * 1000.0);
+            float ms = (float)((nowSec() - g_lastInputAt) * 1000.0);
             app.inputLagMs = ms;
             app.inputLagMaxMs = std::max(app.inputLagMaxMs, ms);
             g_lastInputAt = 0;
@@ -33106,7 +33211,7 @@ int main(int argc, char** argv) {
     }
 
     while (!glfwWindowShouldClose(win)) {
-        double frameT0 = glfwGetTime();
+        double frameT0 = nowSec();
         // work that must keep animating even without input
         // rbBusy / mPending: a connect, a peer install or a server measurement is
         // in flight. Without these the idle path draws NOTHING while they run -
@@ -33137,7 +33242,7 @@ int main(int argc, char** argv) {
             benchWarm = (app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
                          app.folderPickOpen || app.rfPending > 0 ||
                          app.pendingCompare >= 0) &&
-                        glfwGetTime() < 600.0;
+                        nowSec() < 600.0;
             // ...and only once the folder HAS loaded can the slots be armed: at
             // setup time app.images is still empty for a folder argument
             if (benchTiles && !benchWarm && app.cmpExtra.empty() && app.images.size() >= 4) {
@@ -33178,7 +33283,7 @@ int main(int argc, char** argv) {
                 // p90) against 1.7 ms without it. That is the difference between
                 // a text field and a teletype.
                 do { glfwWaitEventsTimeout(left);
-                     left = budget - (glfwGetTime() - lastFrameEnd);
+                     left = budget - (nowSec() - lastFrameEnd);
                 } while (left > 0.0005);
             } else {
                 glfwWaitEventsTimeout(left);   // returns at once on input
@@ -33222,7 +33327,7 @@ int main(int argc, char** argv) {
                 // a session's series wait for their stacks, then need one frame
                 working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
                 working |= !app.seriesPending.empty();   // ...and so do the picker's
-                working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
+                working |= nowSec() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
                 working |= rbAnyTreePending();
@@ -33231,7 +33336,7 @@ int main(int argc, char** argv) {
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
             app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
         }
-        lastFrameEnd = glfwGetTime();
+        lastFrameEnd = nowSec();
         if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
         if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
             ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
@@ -33300,7 +33405,7 @@ int main(int argc, char** argv) {
                              (uint64_t)(app.showFiles + app.showInspector * 2 + app.showRois * 4 +
                                         app.showAnalysis * 8 + app.showHistogram * 16 +
                                         app.showTemporal * 32 + app.showProjection * 64) * 131ull;
-            double nowA = glfwGetTime();
+            double nowA = nowSec();
             static double lastSnap = -1;
             if (state != lastState) { lastState = state; dirtySince = nowA; }
             // Re-render the crash copy far more often than the autosave debounce
@@ -33338,7 +33443,7 @@ int main(int argc, char** argv) {
         // --browse-keys-selftest: one scripted UI action per 8 frames, replayed
         // into the REAL input queue so the panel cannot tell it from a human.
         if (!g_browseKeys.empty()) {
-            static double reproT0 = glfwGetTime();
+            static double reproT0 = nowSec();
             static int reproIdle = 0;
             static bool reproReady = false;
             ImGuiIO& rio = ImGui::GetIO();
@@ -33362,7 +33467,7 @@ int main(int argc, char** argv) {
                     rbMain().focusReq = true;    // = clicking the panel
                     fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
                             (int)rbKeysT().b.entries.size());
-                } else if (glfwGetTime() - reproT0 > 60.0) {
+                } else if (nowSec() - reproT0 > 60.0) {
                     fprintf(stderr, "browsekeys: no listing for %s (%s)\n",
                             g_browseKeys.c_str(), rbKeysT().b.err.c_str());
                     break;
@@ -33642,15 +33747,15 @@ int main(int argc, char** argv) {
                         size_t sl3 = d3.find_last_of('/');
                         bool at = (sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg;
                         if (at) { chk(true, "dir=" + d3); waitD0 = 0; }
-                        else if (waitD0 == 0) { waitD0 = glfwGetTime(); hold = true; }
-                        else if (glfwGetTime() - waitD0 < 60.0) hold = true;
+                        else if (waitD0 == 0) { waitD0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitD0 < 60.0) hold = true;
                         else { chk(false, "dir=" + d3); waitD0 = 0; }
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
                         if ((int)app.images.size() >= arg) { chk(true); waitT0 = 0; }
-                        else if (waitT0 == 0) { waitT0 = glfwGetTime(); hold = true; }
-                        else if (glfwGetTime() - waitT0 < 60.0) hold = true;
+                        else if (waitT0 == 0) { waitT0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitT0 < 60.0) hold = true;
                         else { chk(false, imgNames()); waitT0 = 0; }   // timed out
                     }
                     else if (op == "chkimg")  chk((int)app.images.size() == arg, imgNames());
@@ -34012,7 +34117,7 @@ int main(int argc, char** argv) {
         redrawNow();
         if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
-            benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
+            benchMs.push_back((nowSec() - frameT0) * 1000.0);
             if (--benchLeft <= 0) break;
         }
     }

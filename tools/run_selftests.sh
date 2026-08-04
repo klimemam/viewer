@@ -15,9 +15,9 @@
 #      the run instead of quietly testing yesterday's exe;
 #   2. regenerates tools/testdata (deterministic, gitignored, never committed);
 #   3. asks the machine ONCE whether it can make the OpenGL context that every
-#      selftest not labelled `nogl` needs (today that is all but one), because
-#      "there is no GL here" and "an assert failed" are different events that
-#      used to look identical;
+#      selftest not labelled `nogl` needs (today that is five of the 22 - the
+#      ones that drive real ImGui frames), because "there is no GL here" and
+#      "an assert failed" are different events that used to look identical;
 #   4. runs ctest, one line per selftest, printing the full output of any that
 #      fail - these tests say "NAME: assert text PASS/FAIL", and that text is
 #      what you need, not an exit code;
@@ -62,17 +62,20 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
 fi
 
 # ---- preflight: a display ---------------------------------------------------
-# Only --remote-selftest runs before the window exists; the other 21 create a
-# real GLFW window and an OpenGL context. Saying so once here beats 21
-# identical "failed to create window" failures.
+# Five selftests create a real GLFW window and an OpenGL context; the other 17
+# take the --no-window startup path and want no display at all. Saying which
+# case this machine is in, once and up front, beats five identical "failed to
+# create window" failures further down.
 if [ "$(uname -s)" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if ! command -v xvfb-run >/dev/null 2>&1; then
-        echo "run_selftests: SKIPPING EVERYTHING - headless Linux with no xvfb-run." >&2
-        echo "run_selftests: 21 of the 22 selftests create a real GLFW window." >&2
-        echo "run_selftests: install it (apt-get install -y xvfb) or set DISPLAY." >&2
-        exit 2
+        # NOT fatal any more: the 17 windowless selftests still run and still
+        # gate here, and the probe below will name the five that cannot.
+        echo "run_selftests: headless Linux with no xvfb-run - the selftests that" >&2
+        echo "run_selftests: need a window cannot run (they are named at the end)." >&2
+        echo "run_selftests: to run everything: apt-get install -y xvfb, or set DISPLAY." >&2
+    else
+        echo "run_selftests: headless Linux - each selftest gets its own xvfb server"
     fi
-    echo "run_selftests: headless Linux - each selftest gets its own xvfb server"
 fi
 
 # Probe by RUNNING it, not by looking it up: on Windows a "python3" App
@@ -110,10 +113,11 @@ fi
 echo
 echo "== OpenGL probe =="
 # WHY this exists: every selftest not labelled `nogl` opens a real 1600x1000
-# window and an OpenGL context, so on a machine that has none they ALL die
-# inside glfwCreateWindow - and nothing in the output said so. They read as that
-# many broken asserts, which is how the matrix stayed red with no way to see
-# why. The question is asked once, up front, and answered in GLFW's own words.
+# window and an OpenGL context, so on a machine that has none they die inside
+# glfwCreateWindow - and nothing in the output said so. They read as that many
+# broken asserts, which is how the matrix stayed red with no way to see why
+# (back when startup made a window for all 22 of them, not just these five).
+# The question is asked once, up front, and answered in GLFW's own words.
 #
 # It is a question about the MACHINE, not about its OS name. Where a context
 # exists, everything runs; where none does, the `nogl` tests still run and the
@@ -185,6 +189,17 @@ fi
 n_ran="$(count "$ran")"
 n_skip="$(count "$skipped")"
 skip_line="$(printf '%s\n' "$skipped" | tr '\n' ' ' | sed 's/  *$//')"
+
+# "We skipped everything and called it a pass" is the one outcome this script
+# must never produce. It is not hypothetical: ctest exits 0 for an empty
+# selection, so a labelling mistake that emptied the set would turn the whole
+# gate green and silent. The count is what decides, not the exit code.
+if [ "$n_ran" -eq 0 ]; then
+    echo "run_selftests: NOTHING WOULD RUN - 0 selftests selected." >&2
+    echo "run_selftests: labels come from ctest, so this means the build tree is" >&2
+    echo "run_selftests: stale or the viewer_selftest() labels are wrong." >&2
+    exit 1
+fi
 
 echo
 echo "== selftests =="

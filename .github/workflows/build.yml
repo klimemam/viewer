@@ -39,10 +39,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # xvfb + libgl1-mesa-dri: 21 of the 22 selftests create a real GLFW
+          # xvfb + libgl1-mesa-dri: five of the 22 selftests create a real GLFW
           # window and a GL context, so a headless runner needs a display and a
-          # software GL driver. (The bench step needed these too and used to
-          # install them itself, halfway down the job.)
+          # software GL driver to run those five - and this is the only runner
+          # in the matrix where they can run at all. (The bench step needs them
+          # too and used to install them itself, halfway down the job.)
           sudo apt-get install -y xorg-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev \
                                   wayland-protocols xvfb libgl1-mesa-dri
       - name: Configure
@@ -57,10 +58,18 @@ jobs:
       # It comes BEFORE packaging so a failed assert cannot ship a binary.
       #
       # The script probes for an OpenGL context first and reports what it found.
-      # Only the Linux runner has one (xvfb + libgl1-mesa-dri, installed above);
-      # on Windows and macOS the hosted runners have no GL, so the tests that
-      # need a window are skipped BY NAME with GLFW's own reason printed, and
-      # the rest still run and still gate. Read the "ran N, skipped M" line.
+      # Only the Linux runner has one (xvfb + libgl1-mesa-dri, installed above),
+      # and it runs all 22. On Windows and macOS the hosted runners have no GL,
+      # so the 17 that take the --no-window startup path run and gate there,
+      # and the five that draw real ImGui frames are skipped BY NAME with GLFW's
+      # own reason printed. Read the "ran N, skipped M" line: it is 22/0 on
+      # Linux and 17/5 on the other two, and a run that selects nothing at all
+      # is a failure rather than a very fast pass.
+      #
+      # Nothing here lists any test. Which set a test belongs to is the word
+      # NOGL on its viewer_selftest() line, and the script asks ctest for the
+      # labels - so a test that gains or loses a window moves between the two
+      # counts above with no edit to this file.
       - name: Selftests
         shell: bash
         env:
