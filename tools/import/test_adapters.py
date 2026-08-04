@@ -234,7 +234,7 @@ def stack_empty_timestamps():
     assert len(st.timestamps) == 0
     assert st.shape == (0, 4, 4)
     fails(lambda: vi.Stack(np.zeros((1, 4, 4)), timestamps=vi.Values([], unit="s")),
-          "Stack: ")
+          "=Stack: timestamps has 0 value(s) but there are 1 frame(s)")
 
 
 @case
