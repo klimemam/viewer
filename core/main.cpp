@@ -20832,6 +20832,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         rbSelFlat = I.flat;
         rbSelTree = I.tree;
         // an expand or a collapse moved every row below it: start clean
+        // Going somewhere ends the selection too, and this used to be inferred
+        // from the row COUNT changing - so walking into a different folder with
+        // the same number of rows carried the ticks across, pointing at files
+        // that were no longer listed. The listing's identity is the signature,
+        // not its length.
+        {
+            // I.selSig, not a function-local static: this file already learned
+            // that lesson once - one search box was shared by every panel - and
+            // a shared signature would clear panel 2's selection whenever panel
+            // 1 navigated.
+            std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
+            if (sig != I.selSig) { I.selSig = sig; rbSel.assign(view.size(), 0); }
+        }
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
     // What a plain click does: show a throwaway PREVIEW of a file / of a
@@ -21714,6 +21727,15 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                             rbSel[shown[k]] = 1;
                 } else if (!sio.KeyCtrl && !sio.KeyShift &&
                            sio.MouseClickedLastCount[ImGuiMouseButton_Left] < 2) {
+                    // A plain click ENDS the selection. Everywhere else a list
+                    // works this way - Ctrl and Shift build a selection, a bare
+                    // click replaces it - and here it did not, so ticks made
+                    // three folders ago were still armed and still feeding
+                    // "Open N selected", with nothing on screen tying them to
+                    // what the user was now looking at. Clearing rather than
+                    // selecting this row: in this panel a bare click PREVIEWS,
+                    // and a preview is not a selection.
+                    if (rbNSel > 0) rbSel.assign(view.size(), 0);
                     // (Ctrl / Shift on a row that cannot join the selection -
                     // ".." - must not fall through and act as a plain click:
                     // Ctrl+clicking the exit walked up a directory.)
