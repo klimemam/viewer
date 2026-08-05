@@ -23714,7 +23714,9 @@ static bool g_roiStatsSelftest = false;
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
 // left, right, enter, home, end, back, flat, tree, disc, fmenu, rctx,
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
-// img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
+// img0 (select the first image); natorder (flip the NAME column between
+// natural and text order - relative, like flat / tree, and pinned back by
+// viewreset); click / ctrlclick / dbl (real mouse clicks on
 // the cursor's row - a double-click only exists as clicks); clickoff:N /
 // dbloff:N (the same two, N rows BELOW the cursor - the only aim the keyboard
 // has not already previewed, and so the only one where click one pays for the
@@ -23907,8 +23909,14 @@ static std::string g_browseKeysActs =
     "blur,down,up,end,home,"
     // ...then the panel geometry sweep: the toolbar must stay inside the panel
     // at every docked width, and Escape must close a menu and a context popup.
+    // Swept with EVERY chip lit (viewreset pins the absolute state first, then
+    // one toggle each): a chip only appears when its setting is off the
+    // default, so the widest the toolbar can ever be is the case no default
+    // run would ever draw - which is exactly the one where the filter box gets
+    // pushed off the right edge.
+    "viewreset,flat,tree,natorder,"
     "w271,w200,w180,w420,w700,w1150,w271,w700,w180,w0,"
-    "rctx,esc,fmenu,esc,disc,"
+    "viewreset,rctx,esc,fmenu,esc,disc,"
     // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
     // singleton). Reconnect the primordial panel, then open a SECOND Browse
     // standing in a DIFFERENT place at the same moment - the one sentence a
@@ -35777,6 +35785,8 @@ int main(int argc, char** argv) {
                     // ("more" - fold the drawer open - is gone with the drawer.)
                     if (a == "flat")       rbKeysT().flat = !rbKeysT().flat;
                     else if (a == "tree")  rbKeysT().tree = !rbKeysT().tree;
+                    else if (a == "natorder")
+                        rbKeysT().nameNatural = !rbKeysT().nameNatural;
                     else if (a == "viewreset") {
                         // an ABSOLUTE state pin: the toggles above are relative,
                         // and a segment that assumes grouped+list must not
