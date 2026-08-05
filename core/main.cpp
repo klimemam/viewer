@@ -547,6 +547,14 @@ struct App {
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
+    // The main window's geometry, remembered across runs (prefs.txt "window").
+    // winW/winH are LOGICAL pixels and winX/winY desktop coordinates - the two
+    // units are deliberate and are argued at fitSavedWindow. winW == 0 means
+    // nothing has been saved yet. While the window is MAXIMIZED these hold the
+    // rectangle to restore DOWN to, not the maximized one, which is why sampling
+    // them stops the moment winMax goes true.
+    int winX = 0, winY = 0, winW = 0, winH = 0;
+    bool winMax = false;
     float inputLagMs = 0, inputLagMaxMs = 0;   // input event -> the frame answering it
     float cpuMs = 0, swapMs = 0;               // our drawing vs presenting it
     float wipeFrac = 0.5f;            // divider position, fraction of canvas width
@@ -6502,6 +6510,81 @@ static std::string prefsPath() {
     return p.substr(0, slash == std::string::npos ? 0 : slash + 1) + "prefs.txt";
 }
 
+// ---- the window's own geometry ----------------------------------------------
+// The panels remember where they are (layout.ini); the window around them did
+// not, so every start began by dragging it back to the size it had yesterday.
+// It goes in prefs.txt with everything else that answers "how does this app
+// come up" - one file, one writer, one place to look.
+//
+// UNITS, because the two disagree exactly when it matters. The SIZE is stored
+// in LOGICAL pixels: screen coordinates divided by the same uiScale startup
+// derives from the monitor's content scale (1.0 on macOS, where Cocoa's
+// coordinates are already points). What the user chose when they sized the
+// window is an amount of CONTENT - this many rows of the Files list beside a
+// canvas this wide - and holding that same content at 200 % takes twice the
+// physical pixels. Storing logical is what makes a size chosen on the 4K dock
+// still mean the same window on the laptop panel. The POSITION is stored raw:
+// desktop coordinates are a single global space, and scaling a location in it
+// would only move the window somewhere nobody asked for.
+struct WinRect { int x = 0, y = 0, w = 0, h = 0; };
+
+static const int WIN_DEF_W  = 1600, WIN_DEF_H  = 1000;  // the size before any of this
+static const int WIN_MIN_W  = 640,  WIN_MIN_H  = 400;   // a saved 1x1 is not a window
+static const int WIN_GRAB_W = 160,  WIN_GRAB_H = 32;    // the strip you drag it by
+
+static long long rectOverlap(const WinRect& a, const WinRect& b) {
+    long long w = std::min(a.x + a.w, b.x + b.w) - std::max(a.x, b.x);
+    long long h = std::min(a.y + a.h, b.y + b.h) - std::max(a.y, b.y);
+    return w > 0 && h > 0 ? w * h : 0;
+}
+
+// Monitors get unplugged. A window restored onto a screen that is no longer
+// there cannot be reached with a mouse, and that is strictly worse than
+// forgetting where it was - the user who hits it has no way back except editing
+// prefs.txt by hand. So the saved rectangle has to earn its position:
+//
+//   * the monitor whose work area holds the most of it decides everything (work
+//     area, so the taskbar or dock is already out of the way);
+//   * the POSITION is kept only if at least a quarter of the window lands in
+//     that work area AND a 160x32 strip along its top edge - the part you grab
+//     to drag it - is inside as well. The strip is measured downwards from the
+//     window's CONTENT top, which is what GLFW reports and sets; a system title
+//     bar sits in the frame just above it, so "content top at or below the work
+//     area top" is the honest form of "the title bar is reachable";
+//   * failing either test the position is dropped and the window manager places
+//     the window as it would on a first run. The SIZE still comes back: it is
+//     what the user actually complained about, and a size cannot be off-screen;
+//   * the size is clamped to that work area either way, so a window sized on a
+//     4K screen never comes up larger than the panel it is restored onto.
+//
+// Returns true when the caller should apply r.x/r.y as well as r.w/r.h. Pure,
+// and tested that way (--newwin-selftest N8): a monitor set that no longer
+// contains the saved rectangle is the case nobody can reproduce by hand later.
+static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work) {
+    r.w = std::max(r.w, WIN_MIN_W);
+    r.h = std::max(r.h, WIN_MIN_H);
+    if (work.empty()) return false;          // nothing answered: keep the size, place it nowhere
+    size_t best = 0;
+    long long bestOv = 0;
+    for (size_t i = 0; i < work.size(); i++) {
+        long long ov = rectOverlap(r, work[i]);
+        if (ov > bestOv) { bestOv = ov; best = i; }
+    }
+    // No overlap anywhere: the primary still gets to bound the size.
+    const WinRect& wa = work[bestOv > 0 ? best : 0];
+    long long area = (long long)r.w * r.h;
+    int grabW = std::min(r.x + r.w, wa.x + wa.w) - std::max(r.x, wa.x);
+    int grabH = std::min(r.y + WIN_GRAB_H, wa.y + wa.h) - std::max(r.y, wa.y);
+    bool keep = bestOv * 4 >= area && grabW >= WIN_GRAB_W && grabH >= WIN_GRAB_H;
+    r.w = std::min(r.w, wa.w);
+    r.h = std::min(r.h, wa.h);
+    if (!keep) return false;
+    // Kept, but not allowed to hang off the screen it was kept for.
+    r.x = std::clamp(r.x, wa.x, wa.x + wa.w - r.w);
+    r.y = std::clamp(r.y, wa.y, wa.y + wa.h - r.h);
+    return true;
+}
+
 static void savePrefs() {
     if (g_secondary) {
         // Secondary windows read prefs but never write them: prefs.txt is one
@@ -6534,6 +6617,13 @@ static void savePrefs() {
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "frame " << app.frameMode << "\n";
+    // The window: logical size, raw position, then the maximized flag (see
+    // fitSavedWindow). Written only once a real window has reported a geometry,
+    // so a run that never samples one - every scripted run - hands back exactly
+    // the bytes it read.
+    if (app.winW > 0 && app.winH > 0)
+        f << "window " << app.winX << " " << app.winY << " "
+          << app.winW << " " << app.winH << " " << (app.winMax ? 1 : 0) << "\n";
     f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
     // ("rbadv" - the Browse drawer's open/closed state - is no longer written.
     //  A prefs file that still carries one is read and ignored, below.)
@@ -6583,6 +6673,21 @@ static void loadPrefs() {
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;
                                          app.frameMode = std::clamp(app.frameMode, 0, 1); }
+        else if (key == "window")      {
+            // All five or none: a truncated or hand-edited line means "nothing
+            // saved", not a 0x0 window at wherever the reads gave up. The upper
+            // bound is not a display size, it is the point past which the value
+            // is certainly garbage - fitSavedWindow does the real clamping, and
+            // it needs a monitor list this path does not have.
+            int mx = 0;
+            ls >> app.winX >> app.winY >> app.winW >> app.winH >> mx;
+            app.winMax = mx != 0;
+            if (ls.fail() || app.winW <= 0 || app.winH <= 0 ||
+                app.winW > 32767 || app.winH > 32767) {
+                app.winW = app.winH = 0;
+                app.winMax = false;
+            }
+        }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
         else if (key == "rbadv")       { ls >> v; }   // the drawer is gone: read, drop
         else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
@@ -25661,6 +25766,88 @@ static int glProbe() {
     return 0;
 }
 
+// ---- restoring and remembering the window -----------------------------------
+// The three things fitSavedWindow cannot know on its own, all of them questions
+// about the machine at THIS moment rather than about the saved numbers. They sit
+// here because they need glfwInit() to have happened and nothing else.
+
+// The monitors as they are right now, work areas only. GLFW promises the primary
+// monitor is first, which is what makes work[0] the sane fallback.
+static std::vector<WinRect> monitorWorkAreas() {
+    std::vector<WinRect> out;
+    int n = 0;
+    GLFWmonitor** m = glfwGetMonitors(&n);
+    for (int i = 0; i < n && m; i++) {
+        WinRect r;
+        glfwGetMonitorWorkarea(m[i], &r.x, &r.y, &r.w, &r.h);
+        if (r.w > 0 && r.h > 0) out.push_back(r);
+    }
+    return out;
+}
+
+// The scale to turn the SAVED logical size back into screen coordinates: the
+// content scale of the monitor the saved position falls on, expressed the way
+// startup expresses uiScale so the two can never drift apart. Asked before the
+// window exists, which is the whole reason it goes by position rather than by
+// glfwGetWindowContentScale.
+static float scaleAtPos(int x, int y) {
+#if defined(__APPLE__)
+    (void)x; (void)y;
+    return 1.0f;                     // Cocoa coordinates are points; the backend does the rest
+#else
+    int n = 0;
+    GLFWmonitor** m = glfwGetMonitors(&n);
+    GLFWmonitor* hit = (n > 0 && m) ? m[0] : nullptr;
+    for (int i = 0; i < n && m; i++) {
+        WinRect r;
+        glfwGetMonitorWorkarea(m[i], &r.x, &r.y, &r.w, &r.h);
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) { hit = m[i]; break; }
+    }
+    if (!hit) return 1.0f;
+    float sx = 1, sy = 1;
+    glfwGetMonitorContentScale(hit, &sx, &sy);
+    (void)sy;
+    return sx > 0.1f ? std::max(sx, 1.0f) : 1.0f;
+#endif
+}
+
+// What to remember, read off the live window.
+//
+// Maximized is a STATE, not a size. A maximized window reports the maximized
+// rectangle, and writing that back would mean quitting maximized and coming back
+// to a window that fills the screen but no longer knows how to restore DOWN. So
+// the flag is always sampled and the rectangle only while the window is not
+// maximized: together they say "come up maximized, and this is what the restore
+// button gives back". Fullscreen is NOT in scope - this viewer has no fullscreen
+// mode to be in; window_frame's two modes are System and Integrated, and both
+// are ordinary windows.
+//
+// The divisor is app.uiScale, fixed at startup from the monitor the window was
+// born on. It does not follow the window to a differently scaled screen, and it
+// should not: it is the scale the app is actually DRAWING at, so it is the scale
+// the size on screen actually means.
+// A geometry change that has been seen but not yet written, waiting out the
+// rate limit below. It is at file scope because the IDLE path has to know the
+// loop still owes prefs.txt a write: the frame body is skipped entirely while
+// nothing is happening, and "nothing is happening" is the precise state a
+// window sits in for the two seconds after it was resized. Without this, a
+// resize followed by a kill loses the resize.
+static bool g_geomWriteDue = false;
+
+static void sampleWindowGeometry(GLFWwindow* w) {
+    app.winMax = glfwGetWindowAttrib(w, GLFW_MAXIMIZED) == GLFW_TRUE;
+    if (app.winMax) return;
+    int x = 0, y = 0, ww = 0, hh = 0;
+    glfwGetWindowPos(w, &x, &y);
+    glfwGetWindowSize(w, &ww, &hh);
+    if (ww <= 0 || hh <= 0) return;
+    float s = app.uiScale > 0.1f ? app.uiScale : 1.0f;
+    app.winX = x;
+    app.winY = y;
+    app.winW = (int)lround(ww / s);
+    app.winH = (int)lround(hh / s);
+}
+
 // Did startup make a window? False under --no-window, and nowhere else.
 static bool g_haveWindow = false;
 // The guard on the selftest groups that drive REAL ImGui frames.
@@ -26054,6 +26241,27 @@ int main(int argc, char** argv) {
     bool noWindow = false;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--no-window")) noWindow = true;
+    // Is this run SCRIPTED - a selftest, a bench, or the windowless path? Then
+    // its window is a fixed 1600x1000 and nothing about it is written back.
+    //
+    // ba40ba8 stopped scripted runs reading the user's layout.ini for exactly
+    // this reason, and tonight's benchmark that was silently measuring one panel
+    // of three is what it costs when a measurement inherits geometry instead of
+    // naming it. A remembered WINDOW size is the same hazard with the same
+    // answer: a suite whose window is whatever the developer last dragged is a
+    // suite that measures the developer. Read once, here, from argv, because
+    // that is the only thing that exists this early - the layout.ini guard
+    // below asks parseCli's g_browseKeys instead and is dead for it, which is a
+    // mistake this must not copy.
+    //
+    // --window-offset and g_rbForceW stay exactly as they are: those are
+    // overrides a run asked for BY NAME, which is the opposite of inheriting one.
+    bool scriptedRun = noWindow;
+    for (int i = 1; i < argc; i++) {
+        size_t n = strlen(argv[i]);
+        if (n >= 9 && !strcmp(argv[i] + n - 9, "-selftest")) scriptedRun = true;
+        if (!strncmp(argv[i], "--bench", 7)) scriptedRun = true;
+    }
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
@@ -26139,7 +26347,32 @@ int main(int argc, char** argv) {
         glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
         glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
         glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
-        win = glfwCreateWindow(1600, 1000,
+        // How big, and where. Restored from prefs unless this run has a reason
+        // not to, and there are three:
+        //   * a SCRIPTED run has to be reproducible on any machine (above);
+        //   * a SECONDARY window is placed by the --window-offset cascade it was
+        //     spawned with, and restoring the main window's geometry on top of
+        //     that offset would undo the one thing the offset exists to do -
+        //     it would also come up maximized over the parent that spawned it,
+        //     which is the parent it was meant to sit beside;
+        //   * nothing has been saved yet, which is every first run.
+        // The size is created directly rather than set afterwards, so the window
+        // never flashes at 1600x1000 on its way to the size it is supposed to be.
+        int startW = WIN_DEF_W, startH = WIN_DEF_H;
+        WinRect want;
+        bool wantPos = false, wantMax = false;
+        if (!scriptedRun && !g_secondary && !winOffX && !winOffY && app.winW > 0) {
+            float s = scaleAtPos(app.winX, app.winY);
+            want.x = app.winX;
+            want.y = app.winY;
+            want.w = (int)lround(app.winW * s);
+            want.h = (int)lround(app.winH * s);
+            wantPos = fitSavedWindow(want, monitorWorkAreas());
+            startW = want.w;
+            startH = want.h;
+            wantMax = app.winMax;
+        }
+        win = glfwCreateWindow(startW, startH,
                                (std::string("viewer  ") + viewerVersion()).c_str(),
                                nullptr, nullptr);
         if (!win) {
@@ -26159,6 +26392,12 @@ int main(int argc, char** argv) {
         // the way out if a window manager makes a mess of the integrated one.
         window_frame::init(win);
         window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
+        // After setMode, never before: switching the frame off changes the
+        // decoration, and a window manager is entitled to move the window when
+        // it does. Maximizing last, so the rectangle above stays the one the
+        // restore button gives back.
+        if (wantPos) glfwSetWindowPos(win, want.x, want.y);
+        if (wantMax) glfwMaximizeWindow(win);
         if (winOffX || winOffY) {
             // "Open in new window" passes --window-offset 40,40: the child must not
             // land exactly on top of its parent, or nobody can tell it opened
@@ -26193,6 +26432,20 @@ int main(int argc, char** argv) {
         // scripted runs (bench, browse-keys, --no-window) must neither read nor
         // write the user's layout - same rule the exit path applies to
         // autosave/prefs. A run with no window has no layout to remember either.
+        //
+        // NOT switched to scriptedRun, though the window geometry above is, and
+        // it is worth writing down why rather than leaving it to look like an
+        // oversight. `!g_browseKeys.empty()` is set by parseCli - several
+        // hundred lines BELOW this point - so for the keys selftests it is
+        // always false here, and only the APPDATA that CMakeLists.txt pins
+        // keeps ctest off the developer's real layout.ini (docs/verify-ui.md
+        // measured the md5 changing on a run by hand). Closing that hole makes
+        // selftest.browse-dbl fail every time: its scripted double-click is
+        // aimed at a panel whose place currently comes from the layout.ini an
+        // EARLIER test in the same pinned home left behind. That is a real
+        // defect and it is not this change's - a test that only lands its
+        // clicks because of another test's leftovers needs its own geometry
+        // pinned first, the way g_rbForceW already pins the width.
         if (benchFrames || !g_browseKeys.empty() || noWindow) cfg.clear();
         if (!cfg.empty()) {
             cfg /= "viewer";
@@ -29322,6 +29575,158 @@ int main(int argc, char** argv) {
                   exe + " --secondary --window-offset 40,40 ssh://user@trc2/data/x.npy",
                   "N7 remote argv passes the ssh url");
             closeAll();
+        }
+
+        // N8: the window's geometry - the clamp against a monitor set, and the
+        // round trip through prefs.txt.
+        //
+        // The clamp is a pure function of the saved rectangle and the screens
+        // that exist NOW, which is the only way to test the case that actually
+        // matters: the screen that is no longer there. Nobody can unplug a
+        // monitor from inside a test, nobody reproduces it by hand a year later,
+        // and the failure it hides is the unrecoverable one - a window restored
+        // where no mouse can reach it and no menu can bring it back.
+        {
+            // Two 1920x1080 screens side by side, taskbar along the bottom of
+            // each, so the work areas are 1040 tall.
+            const std::vector<WinRect> two = { { 0, 0, 1920, 1040 },
+                                               { 1920, 0, 1920, 1040 } };
+            const std::vector<WinRect> one = { { 0, 0, 1920, 1040 } };
+            bool kept = false;
+            auto fit = [&](WinRect r, const std::vector<WinRect>& w) {
+                kept = fitSavedWindow(r, w);
+                return r;
+            };
+
+            WinRect r = fit({ 100, 80, 1600, 900 }, two);
+            check(kept && r.x == 100 && r.y == 80 && r.w == 1600 && r.h == 900,
+                  "N8 a rectangle that still fits comes back untouched");
+
+            r = fit({ 2100, 80, 1600, 900 }, two);
+            check(kept && r.x == 2100 && r.y == 80 && r.w == 1600,
+                  "N8 the second screen is a place a window is allowed to be");
+
+            // The same prefs.txt, opened after the second screen went away.
+            r = fit({ 2100, 80, 1600, 900 }, one);
+            check(!kept && r.w == 1600 && r.h == 900,
+                  "N8 a screen that is gone drops the position and keeps the size");
+
+            // Docked laptop: the window was on a 4K panel and the laptop is
+            // alone now. Position unusable, size larger than the screen.
+            r = fit({ 2400, 1300, 2600, 1600 }, one);
+            check(!kept && r.w == 1920 && r.h == 1040,
+                  "N8 a size larger than the only screen is clamped to it");
+
+            // On screen, but the title bar is above the top of it: nothing left
+            // to grab, so the position goes.
+            r = fit({ 300, -200, 1600, 900 }, one);
+            check(!kept, "N8 a window whose drag strip is above the screen is not restored");
+
+            // Only a corner left on screen - 60x40 of a 1600x900 window.
+            r = fit({ 1860, 1000, 1600, 900 }, one);
+            check(!kept, "N8 a corner peeking onto the screen is not enough to be reachable");
+
+            // Hanging off the right and bottom edges but plainly reachable:
+            // slid back on rather than thrown away.
+            r = fit({ 600, 400, 1600, 900 }, one);
+            check(kept && r.x == 320 && r.y == 140 && r.w == 1600 && r.h == 900,
+                  "N8 a window hanging off the edge is slid back, not forgotten");
+
+            // No monitor answered at all (a headless or mid-hotplug moment):
+            // the size survives, the position does not.
+            r = fit({ 100, 80, 1600, 900 }, {});
+            check(!kept && r.w == 1600 && r.h == 900,
+                  "N8 with no monitors the size still survives");
+
+            r = fit({ 100, 80, 4, 4 }, one);
+            check(r.w == WIN_MIN_W && r.h == WIN_MIN_H,
+                  "N8 a degenerate saved size comes back as a usable window");
+
+            // ---- the round trip, against the real prefs.txt ------------------
+            // The hermetic APPDATA/HOME that CMakeLists.txt pins for every
+            // selftest is what makes this safe; the bytes are put back anyway,
+            // because a test that edits the file it is testing must leave it as
+            // it found it.
+            std::string pp = prefsPath();
+            std::vector<uint8_t> before;
+            bool hadBefore = readFileBytes(pp, before);
+            int sx = app.winX, sy = app.winY, sw = app.winW, sh = app.winH;
+            bool sm = app.winMax;
+            auto bmSnap = app.rbBookmarks;
+            auto rcSnap = app.rbRecents;
+            auto memoSnap = app.readerMemo;
+            auto reload = [&]() {
+                // loadPrefs APPENDS to the list-valued prefs (V25k says so):
+                // clear them first or reading twice doubles them.
+                app.rbBookmarks.clear();
+                app.rbRecents.clear();
+                app.readerMemo.clear();
+                loadPrefs();
+            };
+
+            app.winX = -7; app.winY = 33; app.winW = 1234; app.winH = 777;
+            app.winMax = true;
+            savePrefs();
+            app.winX = app.winY = app.winW = app.winH = 0;
+            app.winMax = false;
+            reload();
+            check(app.winX == -7 && app.winY == 33 && app.winW == 1234 &&
+                  app.winH == 777 && app.winMax,
+                  "N8 position, size and the maximized flag survive prefs.txt");
+
+            // Quitting maximized has to come back maximized WITH a rectangle to
+            // restore down to - the flag alone would leave nothing to restore.
+            std::vector<uint8_t> savedBytes;
+            readFileBytes(pp, savedBytes);
+            std::string txt(savedBytes.begin(), savedBytes.end());
+            check(txt.find("window -7 33 1234 777 1\n") != std::string::npos,
+                  "N8 one line carries both: the rectangle and the state");
+
+            // A hand-edited or truncated line is "nothing saved", not a 0x0
+            // window at whatever the reads gave up on.
+            {
+                std::string bad = txt;
+                size_t p = bad.find("window -7 33 1234 777 1");
+                if (p == std::string::npos) { bad += "window 12 34\n"; p = 0; }
+                else bad.replace(p, strlen("window -7 33 1234 777 1"), "window 12 34");
+                std::ofstream bf(pathFromUtf8(pp), std::ios::binary);
+                bf << bad;
+                bf.close();
+                app.winW = 999;
+                reload();
+                check(app.winW == 0 && app.winH == 0 && !app.winMax,
+                      "N8 a truncated window line means nothing saved");
+            }
+
+            // A run that never samples a window - every scripted run - writes
+            // back exactly what it read. This is the whole reason savePrefs
+            // gates the line on winW > 0 rather than always emitting one.
+            {
+                app.winX = app.winY = app.winW = app.winH = 0;
+                app.winMax = false;
+                savePrefs();
+                std::vector<uint8_t> a1;
+                readFileBytes(pp, a1);
+                reload();
+                savePrefs();
+                std::vector<uint8_t> a2;
+                readFileBytes(pp, a2);
+                check(a1 == a2 && std::string(a1.begin(), a1.end()).find("window ") ==
+                                  std::string::npos,
+                      "N8 a run that saw no window writes no window line");
+            }
+
+            app.winX = sx; app.winY = sy; app.winW = sw; app.winH = sh;
+            app.winMax = sm;
+            app.rbBookmarks = bmSnap;
+            app.rbRecents = rcSnap;
+            app.readerMemo = memoSnap;
+            if (hadBefore) {
+                std::ofstream rf(pathFromUtf8(pp), std::ios::binary);
+                rf.write((const char*)before.data(), (std::streamsize)before.size());
+            } else {
+                std::filesystem::remove(pathFromUtf8(pp), ec);
+            }
         }
 
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
@@ -36520,6 +36925,10 @@ int main(int argc, char** argv) {
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
                 working |= rbAnyTreePending();
+                // A window that was just resized owes prefs.txt a write, and it
+                // sits perfectly still until the user does something else. The
+                // write lives in the frame body, so the frame has to happen.
+                working |= g_geomWriteDue;
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
@@ -36578,6 +36987,50 @@ int main(int argc, char** argv) {
                          (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
             if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
             lastPrefs = h;
+        }
+        {   // The window's own geometry, on the same cadence but not in the hash
+            // above: a checkbox changes once and is worth a write, whereas a
+            // window changes on every frame of a drag and rewriting prefs.txt
+            // sixty times a second to record a resize in progress is not saving
+            // a preference, it is following a mouse. So the sample is taken
+            // every frame and the WRITE is rate-limited to one every two
+            // seconds, which bounds what a kill can cost to the last two
+            // seconds of dragging. The exit path takes whatever the last change
+            // left dirty, so a clean quit always records the final rectangle.
+            //
+            // Scripted runs and secondary windows never get here at all - the
+            // first must not inherit or leave a geometry, the second must not
+            // write prefs.txt at all (savePrefs says why).
+            static uint64_t lastGeom = 0;
+            static double lastGeomWrite = -1e9;
+            static bool geomPrimed = false;
+            if (win && !g_secondary && !scriptedRun &&
+                !glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {
+                sampleWindowGeometry(win);
+                uint64_t g = (uint64_t)(uint32_t)app.winX * 2654435761ull +
+                             (uint64_t)(uint32_t)app.winY * 40503ull +
+                             (uint64_t)(uint32_t)app.winW * 2246822519ull +
+                             (uint64_t)(uint32_t)app.winH * 3266489917ull +
+                             (app.winMax ? 1u : 0u);
+                double nowG = nowSec();
+                // The first sample is what the restore produced, not a change
+                // the user made, so priming it keeps a launch-and-quit from
+                // rewriting prefs.txt for nothing. It does NOT make a refused
+                // position sticky: once the window settles anywhere the
+                // fallback becomes the new saved position, and the geometry
+                // from the screen that went away is gone. That is the choice
+                // between two imperfect things - the alternative is freezing
+                // the position for the whole run, which would also throw away
+                // a move the user made deliberately on that same run. This one
+                // always converges on where they last put it.
+                if (!geomPrimed) { geomPrimed = true; lastGeom = g; lastGeomWrite = nowG; }
+                else if (g != lastGeom) { lastGeom = g; g_geomWriteDue = true; app.prefsDirty = true; }
+                if (g_geomWriteDue && nowG - lastGeomWrite > 2.0) {
+                    g_geomWriteDue = false;
+                    lastGeomWrite = nowG;
+                    savePrefs();
+                }
+            }
         }
         {   // Autosave on change, debounced. A hard kill cannot run any handler,
             // so the safety net has to be written while things still work.
