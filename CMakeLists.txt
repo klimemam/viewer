@@ -513,6 +513,11 @@ viewer_selftest(verify      --verify-selftest tools/testdata/multi)
 # PRNU cell, same probe - a frame with no backend under it. Analytic fixtures
 # built in memory, so it needs no fixture directory.
 viewer_selftest(roistats    NOGL --roistats-selftest)
+# A and B (and a letter past B) on ONE document: the Statistics panel must draw
+# BOTH sides, coinciding, rather than fold them into one. Same NOGL reasoning as
+# roistats - it asserts what the panel prints, not where it landed - and the
+# same analytic in-memory fixtures, so it needs no fixture directory either.
+viewer_selftest(abeq        NOGL --abeq-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
