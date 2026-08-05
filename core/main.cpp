@@ -3973,6 +3973,42 @@ static std::string npyShapeText(const std::vector<int64_t>& shape) {
     return s + ")";
 }
 
+// One .npy FILE on disk from a shape, a dtype and its bytes. v1.0 header, C
+// order, padded to the 64-byte boundary numpy itself pads to.
+//
+// Shared rather than written twice: two selftests need fixtures of an exactly
+// named shape, and both are testing the rule that reads the shape back - so a
+// second copy of the header spelling would be a second thing that can be wrong
+// in the direction that hides the fault. Returns the path it was handed.
+static std::string npyWriteFile(const std::string& path, const char* descr,
+                                const std::vector<int64_t>& shape,
+                                const void* data, size_t nbytes) {
+    std::string sh;
+    if (shape.empty()) sh = "()";
+    else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+    else {
+        sh = "(";
+        for (size_t i = 0; i < shape.size(); i++)
+            sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+        sh += ")";
+    }
+    std::string hdr = std::string("{'descr': '") + descr +
+                      "', 'fortran_order': False, 'shape': " + sh + ", }";
+    hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+    hdr += '\n';
+    std::vector<uint8_t> out;
+    const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+    out.insert(out.end(), magic, magic + 8);
+    out.push_back((uint8_t)(hdr.size() & 0xff));
+    out.push_back((uint8_t)(hdr.size() >> 8));
+    out.insert(out.end(), hdr.begin(), hdr.end());
+    const uint8_t* p = (const uint8_t*)data;
+    out.insert(out.end(), p, p + nbytes);
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    f.write((const char*)out.data(), (std::streamsize)out.size());
+    return path;
+}
+
 // ---- which axis is what -----------------------------------------------------
 // docs/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
 // name. The decision is RANK and the LAST AXIS, and never the first axis's
@@ -3992,12 +4028,19 @@ static std::string npyShapeText(const std::vector<int64_t>& shape) {
 enum NpyRead {
     NR_NATIVE = 0,   // no choice recorded: §3.1 decides from rank + last axis
     NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
-    NR_HWC    = 2,   // 3-D as ONE colour frame, channels last: (H,W,C)
-    NR_CHW    = 3,   // 3-D as ONE colour frame, planes first:  (C,H,W)
+    NR_HWC    = 2,   // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
+    NR_CHW    = 3,   // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
 };
 
 // The four forms, spelled the way §3.2 spells them to a user.
-static const char* NPY_NATIVE_FORMS = "(H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)";
+//
+// "C<=4", not "3|4": the rule is a CEILING (§3.1's table, and issue #71), and a
+// refusal that still quotes 3|4 once (H,W,1) opens sends the next reader looking
+// for a rule nobody implements. Spelled in ASCII on purpose - §4.13.0 draws it
+// with U+2264, but this string is printed to a console whose codepage may be
+// cp932 (which cannot encode that character at all) and is quoted back verbatim
+// by tools/import/run_adapter.py through a pipe.
+static const char* NPY_NATIVE_FORMS = "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)";
 
 // Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
 // -1 = "this reading has no such axis". False = r does not apply to this rank,
@@ -4017,8 +4060,23 @@ static bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) 
 
 // §3.1, entire: rank, then the last axis, then stop. NR_NATIVE for a rank that
 // has no reading at all (1-D, 5-D and up) - the caller refuses those by name.
+//
+// The last axis is CHANNELS when it is 4 OR FEWER - not "3 or 4" (issue #71).
+// This line used to test ==3||==4 while core/serve.cpp tested <=4, so the same
+// file read one way through File > Open and another way through a peer: a mono
+// (480,640,1) capture - which is just what img[:, :, None] and np.expand_dims
+// produce - opened locally as 480 frames of 1x640, and remotely as one 640x480
+// picture. The stack reading is the dangerous one, because inventing a frame
+// axis invents a TIME axis: Temporal reported sigma_t = 36.2 DN for a frame
+// whose real read noise was 5.0 DN, and the number came from the scene's
+// vertical structure rather than the sensor. docs/terminology.md is the canon
+// that settles it ("a frame has no time axis", and "if the implementation
+// disagrees with this table it is a bug"), and every downstream ceiling in this
+// codebase is already 1..4 rather than {3,4}. What this costs is a stack of
+// frames 1 to 4 pixels wide, which §3.1 wrote off as not a real thing, and
+// which §3.3 can say again per file anyway.
 static int npyNativeRead(const std::vector<int64_t>& shape) {
-    if (shape.size() == 3) return (shape[2] == 3 || shape[2] == 4) ? NR_HWC : NR_STACK;
+    if (shape.size() == 3) return shape[2] <= 4 ? NR_HWC : NR_STACK;
     if (shape.size() == 4) return NR_STACK;
     return NR_NATIVE;
 }
@@ -13546,6 +13604,22 @@ static void textNumStr(const std::string& s) {
 // content width for a full-precision number; the table adds CellPadding itself
 static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x; }
 
+// What the channels of a ch-channel document are CALLED, at least four entries
+// long whatever ch is, so a caller that indexes 0..3 cannot walk off it.
+//
+// 2ch is usually UV, or a complex pair, and almost never RG - so it is C0/C1
+// rather than the first two of R/G/B/A. That branch was written long ago and
+// was UNREACHABLE for a local .npy until issue #71: (H,W,2) was read as a
+// stack of 1-channel frames, so nothing ever arrived here with ch == 2. Lifted
+// out of drawInspector() so the selftest can assert it is reached now, instead
+// of the rule change quietly landing on a branch nobody has ever seen run.
+static const char* const* channelLabels(int ch) {
+    static const char* const LB1[] = { "V",  "?",  "?", "?" };
+    static const char* const LB2[] = { "C0", "C1", "?", "?" };
+    static const char* const LB3[] = { "R",  "G",  "B", "A" };
+    return ch == 1 ? LB1 : ch == 2 ? LB2 : LB3;
+}
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::SeparatorText("Pixel");
@@ -13561,11 +13635,8 @@ static void drawInspector() {
             ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
         else
             ImGui::TextDisabled("(-, -)  hover the image");
-        static const char* LB1[] = { "V" };
-        static const char* LB2[] = { "C0", "C1" };            // 2ch is usually UV/complex, not RG
-        static const char* LB3[] = { "R", "G", "B", "A" };
         int nch = im ? im->ch : 1;
-        const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
+        const char* const* lb = channelLabels(nch);
         float inv = im ? 1.0f / std::max(effWhite(*im) - effBlack(*im), 1e-20f) : 1.0f;
         // With compare on, the same pixel in B (and A-B) is the number the eye
         // cannot read off a wipe: two extra columns, present whenever compare is.
@@ -23773,7 +23844,10 @@ static void printUsage() {
         "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
         "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
         "                              60%% of physical RAM)\n"
-        "  .npy shapes read natively:  (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)\n"
+        // %s, not a copy: this line said "(H,W,3|4)" while the refusal it is
+        // describing said something else, which is exactly the drift issue #71
+        // was. There is now one spelling and it lives in one place.
+        "  .npy shapes read natively:  %s\n"
         "                              any other shape is refused by name; to read one\n"
         "                              differently, use \"re-read as...\" in the Inspector\n"
         "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
@@ -23841,7 +23915,8 @@ static void printUsage() {
         "                              overrides the canned action list)\n"
         "  --rtemporal-selftest <dir>  temporal analysis driven from the browser\n"
         "  --remote-selftest <file>    remote round trip against a peer started here;\n"
-        "                              pass --remote-exe to test viewer-serve itself\n");
+        "                              pass --remote-exe to test viewer-serve itself\n",
+        NPY_NATIVE_FORMS);
 }
 
 static void parseCli(int argc, char** argv) {
@@ -23918,10 +23993,10 @@ static void parseCli(int argc, char** argv) {
             // all. Say so and carry on - silence would leave the user believing
             // the old meaning still applied.
             next();                                // swallow its value, not a path
-            fprintf(stderr, "--npy-axis is gone: (F,H,W) is F frames and (H,W,3|4) is one "
-                            "colour frame, always. To read one file differently, open it and "
-                            "use \"re-read as...\" in the Inspector - it is per file and it "
-                            "is remembered.\n");
+            fprintf(stderr, "--npy-axis is gone: (F,H,W) is F frames and (H,W,C<=4) is one "
+                            "frame of C channels, always. To read one file differently, open "
+                            "it and use \"re-read as...\" in the Inspector - it is per file "
+                            "and it is remembered.\n");
         } else if (a == "--stack") {               // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
@@ -24669,6 +24744,114 @@ static int remoteSelfTest(const char* exe, const char* path) {
         fprintf(stderr, "selftest: FRAME_ROI_STATS over %d frames: %s\n",
                 r2.framesUsed, bad4 ? "FAIL" : "ok");
         bad += bad4 ? 1 : 0;
+    }
+    {   // ---- the channel rule, through BOTH doors (issue #71) ---------------
+        //
+        // This whole harness exists to compare what the LOCAL decoder makes of
+        // a file against what the PEER makes of it, so it was always the thing
+        // that would catch core/main.cpp and core/serve.cpp disagreeing. It had
+        // simply never been aimed at a shape where they did. main.cpp read the
+        // last axis as channels only when it was exactly 3 or 4; serve.cpp read
+        // it as channels whenever it was 4 or fewer. So (H,W,1) - what
+        // img[:, :, None] produces, and an ordinary way to save one mono
+        // capture - opened here as H frames of 1xW and there as one WxH frame.
+        // Pointed at a (48,640,1) fixture before the rule was unified, this
+        // printed exactly that:
+        //
+        //   selftest: meta 640x48 1ch u16 frames=1        <- the peer: 1 frame
+        //   npy stack: ... 48 of 48 frames (1x640 1ch)    <- here: 48 frames
+        //   selftest: rect 1x640@0,0 step 1 -> 1x48 1ch u16 : FAIL (47 mismatches)
+        //
+        // Aiming an existing test is worth more than writing a new one: this
+        // one was built to catch this class of fault and had been sitting
+        // unused against it.
+        //
+        // The sweep walks the last axis ACROSS the ceiling - 1,2,3,4 are one
+        // frame of C channels, 5 is a stack - because the fault was never
+        // "channels or not", it was the two sides putting the boundary in
+        // different places. A rule that agrees at 3 and 4 and nowhere else is
+        // the bug that was here.
+        //
+        // Fixtures are written here rather than read from tools/testdata for
+        // two reasons: that tree is gitignored and generated, so a machine
+        // without it would silently skip the check; and a fixture that lives
+        // apart from the rule it pins can drift away from it.
+        std::error_code cec;
+        std::filesystem::path cdir =
+            std::filesystem::temp_directory_path(cec) / "viewer_chanrule";
+        std::filesystem::remove_all(cdir, cec);
+        std::filesystem::create_directories(cdir, cec);
+        std::vector<uint16_t> ramp(48 * 40 * 5);
+        for (size_t i = 0; i < ramp.size(); i++) ramp[i] = (uint16_t)(i * 11 + 5);
+        struct Want { int64_t lastAxis; int frames, w, h, ch; const char* why; };
+        const Want SWEEP[] = {
+            { 1, 1, 40, 48, 1, "(H,W,1) is ONE mono frame" },
+            { 2, 1, 40, 48, 2, "(H,W,2) is ONE two-channel frame" },
+            { 3, 1, 40, 48, 3, "(H,W,3) is ONE colour frame" },
+            { 4, 1, 40, 48, 4, "(H,W,4) is ONE RGBA frame" },
+            { 5, 48, 5, 40, 1, "(H,W,5) is past the ceiling: a stack" },
+        };
+        size_t badC = 0;
+        for (const Want& t : SWEEP) {
+            const std::vector<int64_t> shape = { 48, 40, t.lastAxis };
+            std::string p = npyWriteFile(
+                (cdir / ("chan_48x40x" + std::to_string(t.lastAxis) + ".npy")).u8string(),
+                "<u2", shape, ramp.data(), (size_t)48 * 40 * t.lastAxis * 2);
+            remote::Meta cm;
+            std::string cerr;
+            if (!s.meta(p, cm, cerr)) {
+                fprintf(stderr, "selftest CHANNEL META %s: %s\n",
+                        npyShapeText(shape).c_str(), cerr.c_str());
+                badC++;
+                continue;
+            }
+            closeAll();
+            std::string lerr = loadNpy(p);
+            const ImageDoc* lref = cur();
+            if (!lerr.empty() || !lref) {
+                fprintf(stderr, "selftest CHANNEL local %s: %s\n",
+                        npyShapeText(shape).c_str(),
+                        lerr.empty() ? "nothing opened" : lerr.c_str());
+                badC++;
+                continue;
+            }
+            int lframes = (int)app.images.size();
+            // The geometry first: the two doors must MAKE the same thing of the
+            // file before comparing pixels is even a meaningful question.
+            bool geom = lframes == cm.frames && lref->w == cm.w &&
+                        lref->h == cm.h && lref->ch == cm.ch;
+            bool wanted = lframes == t.frames && lref->w == t.w &&
+                          lref->h == t.h && lref->ch == t.ch;
+            // ...then the pixels, which is where a geometry agreement that is
+            // only a coincidence would still come apart.
+            size_t mism = 0;
+            std::vector<float> got;
+            int gw = 0, gh = 0, gch = 0;
+            std::string gdt;
+            if (!s.tile(p, 0, 0, 0, lref->w, lref->h, 1, got, gw, gh, gch, gdt, cerr)) {
+                fprintf(stderr, "selftest CHANNEL TILE %s: %s\n",
+                        npyShapeText(shape).c_str(), cerr.c_str());
+                badC++;
+                continue;
+            }
+            for (int y = 0; y < gh; y++)
+                for (int x = 0; x < gw; x++)
+                    for (int ci = 0; ci < gch; ci++)
+                        if (got[((size_t)y * gw + x) * gch + ci] != lref->sample(x, y, ci))
+                            mism++;
+            bool ok = geom && wanted && mism == 0;
+            fprintf(stderr, "selftest: channel rule %-13s local %d frame(s) %dx%d %dch"
+                            " == peer %d frame(s) %dx%d %dch, %zu pixel mismatch(es)"
+                            " : %s  (%s)\n",
+                    npyShapeText(shape).c_str(), lframes, lref->w, lref->h, lref->ch,
+                    cm.frames, cm.w, cm.h, cm.ch, mism, ok ? "ok" : "FAIL", t.why);
+            badC += ok ? 0 : 1;
+        }
+        closeAll();
+        std::filesystem::remove_all(cdir, cec);          // ours: ours to remove
+        fprintf(stderr, "selftest: channel rule over %d shape(s), both doors: %s\n",
+                (int)(sizeof SWEEP / sizeof SWEEP[0]), badC ? "FAIL" : "ok");
+        bad += badC ? 1 : 0;
     }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
@@ -30131,10 +30314,17 @@ int main(int argc, char** argv) {
         // one-pixel-tall image. Both are fabrication, and both flip here.
         //
         //   (H,W)        1 frame, 1 ch
-        //   (H,W,3|4)    1 colour frame        <- the ONE size-based exception,
-        //                                        and it is on the LAST axis
+        //   (H,W,C<=4)   1 frame of C channels <- the ONE size-based exception,
+        //                                        and it is on the LAST AXIS
         //   (F,H,W)      F frames, 1 ch each   <- so (3,H,W) is THREE FRAMES
         //   (F,H,W,C)    F frames of C channels
+        //
+        // The exception is a CEILING, not the set {3,4} (issue #71). (H,W,1) is
+        // ONE mono frame and (H,W,2) is ONE two-channel frame - the shapes that
+        // img[:, :, None] and np.expand_dims(a, -1) produce every day, and the
+        // shapes this table had no row for, which is why the local reader and
+        // core/serve.cpp were free to disagree about them for as long as they
+        // did. They have rows now.
         //
         // Anything else is refused BY NAME and the refusal names what native
         // does read (§3.2), because "cannot open" sends nobody anywhere.
@@ -30150,31 +30340,7 @@ int main(int argc, char** argv) {
             auto writeNpy = [&](const std::string& name, const char* descr,
                                 const std::vector<int64_t>& shape,
                                 const void* data, size_t nbytes) {
-                std::string sh;
-                if (shape.empty()) sh = "()";
-                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
-                else {
-                    sh = "(";
-                    for (size_t i = 0; i < shape.size(); i++)
-                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
-                    sh += ")";
-                }
-                std::string hdr = std::string("{'descr': '") + descr +
-                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
-                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
-                hdr += '\n';
-                std::vector<uint8_t> out;
-                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
-                out.insert(out.end(), magic, magic + 8);
-                out.push_back((uint8_t)(hdr.size() & 0xff));
-                out.push_back((uint8_t)(hdr.size() >> 8));
-                out.insert(out.end(), hdr.begin(), hdr.end());
-                const uint8_t* p = (const uint8_t*)data;
-                out.insert(out.end(), p, p + nbytes);
-                std::string path = (vdir / name).u8string();
-                std::ofstream f(pathFromUtf8(path), std::ios::binary);
-                f.write((const char*)out.data(), (std::streamsize)out.size());
-                return path;
+                return npyWriteFile((vdir / name).u8string(), descr, shape, data, nbytes);
             };
             // every fixture is a slice of ONE ramp, so a re-reading of the same
             // file is comparable to the reading it replaced pixel for pixel
@@ -30202,6 +30368,15 @@ int main(int argc, char** argv) {
                           size_t docs; int w, h, ch; };
             const Want ACCEPT[] = {
                 { "a_hw.npy",   { 8, 8 },       1, 8, 8, 1 },   // (H,W)
+                // "a_mono"/"a_uv" and not "a_hw1"/"a_hw2": a_hw1..a_hw4 would be
+                // four NUMBERED SIBLINGS, and the sequence loader groups those
+                // into one stack - of four different shapes, which it then reads
+                // through the first member's geometry. This test is about the
+                // shape rule, and it must not manufacture a second subject by
+                // accident. (That the grouper mis-reads a mixed-shape run at all
+                // is its own defect, and not this change's to fix.)
+                { "a_mono.npy", { 8, 8, 1 },    1, 8, 8, 1 },   // (H,W,1)  ONE mono frame
+                { "a_uv.npy",   { 8, 8, 2 },    1, 8, 8, 2 },   // (H,W,2)  ONE 2ch frame
                 { "a_hw3.npy",  { 8, 8, 3 },    1, 8, 8, 3 },   // (H,W,3)  colour
                 { "a_hw4.npy",  { 8, 8, 4 },    1, 8, 8, 4 },   // (H,W,4)  RGBA
                 { "a_fhw.npy",  { 3, 8, 8 },    3, 8, 8, 1 },   // (3,H,W) = 3 FRAMES
@@ -30216,6 +30391,24 @@ int main(int argc, char** argv) {
                         npyShapeText(t.shape).c_str(), o.docs, o.w, o.h, o.ch,
                         t.docs, t.w, t.h, t.ch, o.err.empty() ? "" : "  err=", o.err.c_str());
                 check(good, ("V22a native reads " + npyShapeText(t.shape)).c_str());
+            }
+
+            // ---- V22a2: (H,W,2) actually REACHES the 2-channel labels --------
+            // The C0/C1 branch of the Pixel readout exists because "2ch is
+            // usually UV or complex, not RG" - and until issue #71 no local
+            // .npy could reach it, because (H,W,2) was read as a stack of
+            // 1-channel frames. Accepting the shape is only half the change;
+            // asking the SAME function drawInspector asks is what turns "the
+            // branch should now be reachable" into something that is checked.
+            {
+                Opened o = openOne(npyOf("a_uvlabel.npy", { 8, 8, 2 }));
+                const char* const* lb = channelLabels(o.ch);
+                bool two = o.err.empty() && o.ch == 2 &&
+                           !strcmp(lb[0], "C0") && !strcmp(lb[1], "C1");
+                fprintf(stderr, "verifyselftest: V22a (8, 8, 2) -> %d ch, pixel labels "
+                                "%s/%s (2ch is UV/complex, not RG)\n",
+                        o.ch, lb[0], lb[1]);
+                check(two, "V22a (H,W,2) opens 2ch and reads out as C0/C1");
             }
 
             // ---- V22b: everything else is REFUSED, and nothing is built ------
@@ -30242,9 +30435,9 @@ int main(int argc, char** argv) {
                 Opened o = openOne(npyOf("c_odd.npy", { 4, 8, 8, 8, 2 }));
                 bool namesShape = o.err.find("(4, 8, 8, 8, 2)") != std::string::npos;
                 bool namesForms = o.err.find("(H,W)") != std::string::npos &&
-                                  o.err.find("(H,W,3|4)") != std::string::npos &&
+                                  o.err.find("(H,W,C<=4)") != std::string::npos &&
                                   o.err.find("(F,H,W)") != std::string::npos &&
-                                  o.err.find("(F,H,W,C)") != std::string::npos;
+                                  o.err.find("(F,H,W,C<=4)") != std::string::npos;
                 fprintf(stderr, "verifyselftest: V22c refusal = \"%s\"\n", o.err.c_str());
                 check(namesShape, "V22c the refusal names the shape that arrived");
                 check(namesForms, "V22c the refusal names every form native reads");

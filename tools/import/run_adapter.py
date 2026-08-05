@@ -56,7 +56,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROG = "run_adapter"
 
 LAYERS = ("frame", "stack", "series", "batch")
-NATIVE_FORMS = "(H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)"
+# 3.1: the last axis is channels when it is 4 or FEWER.  Byte-for-byte the same
+# sentence core/main.cpp prints (NPY_NATIVE_FORMS) -- the viewer and this harness
+# refusing the same array in two different wordings is how issue #71 stayed
+# invisible.  ASCII "<=" because this is written to stderr through a pipe, where
+# the encoding is the locale's (cp932 cannot represent U+2264 at all).
+NATIVE_FORMS = "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)"
 BARE_ARRAY_NOTE = "repeats (returned as a bare array)"      # 4.6
 
 
@@ -334,8 +339,8 @@ class Build(object):
         shape = arr.shape
         if arr.ndim == 2:
             layer = "frame"
-        elif arr.ndim == 3 and shape[2] in (3, 4):
-            layer = "frame"                                         # 3.1's one exception
+        elif arr.ndim == 3 and shape[2] <= 4:
+            layer = "frame"                     # 3.1's one exception: LAST axis, 4 or fewer
         elif arr.ndim in (3, 4):
             layer = "stack"
         else:

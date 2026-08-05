@@ -475,7 +475,7 @@ def harness_bare_array_is_stack_arr():
 
 @case
 def harness_bare_native_shapes():
-    """3.1: (H,W) and (H,W,3|4) are one frame; (F,H,W) and (F,H,W,C) are a stack."""
+    """3.1: (H,W) and (H,W,C<=4) are one frame; (F,H,W) and (F,H,W,C) are a stack."""
     need_numpy(); need_runner()
     for shape, layer in (((4, 5), "frame"), ((4, 5, 3), "frame"), ((4, 5, 4), "frame"),
                          ((6, 4, 5), "stack"), ((6, 4, 5, 2), "stack"),
@@ -485,6 +485,32 @@ def harness_bare_native_shapes():
         m = members(out)
         assert scalar(m, "__layer_0") == layer, "%s read as %s, wanted %s" % (
             shape, scalar(m, "__layer_0"), layer)
+        assert np.array_equal(m["__pixels_0"], a)
+
+
+@case
+def harness_bare_last_axis_is_channels_at_four_or_fewer():
+    """3.1, issue #71: the last axis is CHANNELS when it is 4 or FEWER -- not when it
+    is exactly 3 or 4.  So (H,W,1) is ONE mono frame and (H,W,2) is ONE two-channel
+    frame, which are the shapes img[:, :, None] and np.expand_dims(a, -1) produce all
+    day.  Reading them as a stack invents a frame axis, and a frame axis is a TIME
+    axis: docs/terminology.md says a frame has none, and the viewer duly reported a
+    sigma_t of 36.2 DN for a single 5.0 DN picture until this was settled.
+
+    The sweep crosses the ceiling rather than sampling one side of it, because the
+    fault was never "channels or not" -- it was this harness and core/serve.cpp putting
+    the boundary in two different places, which agrees at 3 and 4 and nowhere else."""
+    need_numpy(); need_runner()
+    for shape, layer, note in (((4, 5, 1), "frame", "one mono frame"),
+                               ((4, 5, 2), "frame", "one two-channel frame"),
+                               ((4, 5, 3), "frame", "one colour frame"),
+                               ((4, 5, 4), "frame", "one RGBA frame"),
+                               ((4, 5, 5), "stack", "past the ceiling: 4 frames")):
+        path, a = sample_npz(shape)
+        _, out = run_adapter(BARE, "load", path)
+        m = members(out)
+        assert scalar(m, "__layer_0") == layer, "%s (%s) read as %s, wanted %s" % (
+            shape, note, scalar(m, "__layer_0"), layer)
         assert np.array_equal(m["__pixels_0"], a)
 
 
@@ -499,7 +525,9 @@ def harness_refuses_non_native_bare_shape():
     MESSAGES.append("harness: " + [l for l in err.splitlines() if "not a native form" in l][0]
                     if "not a native form" in err else "harness: " + err.strip()[-200:])
     assert "shape (4, 8, 8, 8, 2) is not a native form" in err, err
-    assert "(H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C)" in err, err
+    # Byte-for-byte core/main.cpp's NPY_NATIVE_FORMS: the viewer and this harness
+    # refusing the same array in two different wordings is the drift of issue #71.
+    assert "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)" in err, err
 
 
 @case
