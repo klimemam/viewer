@@ -29044,6 +29044,48 @@ int main(int argc, char** argv) {
                   "M8 a file that is none of them is refused with its first bytes");
         }
 
+        // ---- M9: a session that saved a .png reopens a .png ------------------
+        // The session file records a path and lets the loader decide what to do
+        // with it, and that loader was loadNpy for everything that was not an
+        // .npz. Without this branch a restored PNG comes back as "not a .npy
+        // file (bad magic)" - a session that cannot reopen what it saved.
+        {
+            ImageDoc* d = open1("gray16.png");
+            const std::string sess =
+                (std::filesystem::temp_directory_path() / "viewer_mediaselftest.vsession").u8string();
+            bool saved = d != nullptr;
+            if (saved) saveSession(sess, true);
+            closeAll();
+            std::string lerr = loadSession(sess);
+            ImageDoc* r = app.images.empty() ? nullptr : app.images[0].get();
+            bool back = lerr.empty() && app.images.size() == 1 && r &&
+                        r->w == 64 && r->h == 48 && r->ch == 1 && r->dtype == "u16" &&
+                        r->px().size() == 64u * 48u && r->px()[7] == (float)(7 * 21);
+            fprintf(stderr, "mediaselftest: M9 restored %zu doc(s) %s err=\"%s\"\n",
+                    app.images.size(), r ? r->dtype.c_str() : "-", lerr.c_str());
+            check(saved && back, "M9 a session that saved a PNG opens the PNG again");
+            std::error_code sec;
+            std::filesystem::remove(pathFromUtf8(sess), sec);
+        }
+
+        // ---- M10: crop, then Restore full, on a picture file -----------------
+        // Restore full re-reads the FILE, and it reached for loadNpy too.
+        {
+            ImageDoc* d = open1("rgb8.png");
+            bool cropped = false, restored = false;
+            if (d) {
+                cropInPlace(*d, 8, 4, 16, 12);
+                cropped = d->w == 16 && d->h == 12;
+                restoreFull();
+                ImageDoc* r = app.images.empty() ? nullptr : app.images[0].get();
+                restored = r && r->w == 64 && r->h == 48 && r->ch == 3 &&
+                           r->sample(63, 0, 0) == 255;
+            }
+            fprintf(stderr, "mediaselftest: M10 cropped=%d restored=%d\n",
+                    (int)cropped, (int)restored);
+            check(cropped && restored, "M10 crop and Restore full re-read the picture file");
+        }
+
         closeAll();
         fprintf(stderr, "mediaselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
