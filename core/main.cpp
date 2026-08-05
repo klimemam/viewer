@@ -1681,7 +1681,20 @@ static ImageDoc* followFrame(ImageDoc* d, bool& diverged) {
     return d;
 }
 
-// The B side of an A/B compare, or null when compare is off / B is gone / B is A.
+// The B side of an A/B compare, or null when compare is off / B is gone.
+//
+// B RESOLVING TO THE SAME DOCUMENT AS A IS NOT A SPECIAL CASE. This used to
+// answer null there ("paused"), and every surface downstream - the histogram,
+// the projection and temporal panels, the Inspector's B column, the canvas -
+// then rendered as if there were no comparison at all. The kindness was
+// counterproductive (user report, 2026-08-04: 「A/B比較で，A=Bの時，ヒストグラム
+// の表示を切り替えているけど，このケアはかえってみずらい．比較の際に同じもの
+// を選んだ時に，同じことを確認できる方がよいので，こういうの全般不要です」):
+// putting the same document on both sides is something people do ON PURPOSE,
+// to confirm the two sides agree, and a panel that hides B at that moment makes
+// the confirmation impossible - "B is identical to A" and "B is not being
+// drawn" look the same. So B is B, and two coinciding sides are DRAWN
+// coinciding: two curves in their own slotInk, two rows, two labels.
 static ImageDoc* resolveB() {
     g_abFollowDiverged = false;
     if (app.compareBUid) {
@@ -1689,14 +1702,13 @@ static ImageDoc* resolveB() {
         for (const auto& d : app.images)
             if (d->uid == app.compareBUid) { b = d.get(); break; }
         if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
-        b = followFrame(b, g_abFollowDiverged);
-        return b == cur() ? nullptr : b;
+        return followFrame(b, g_abFollowDiverged);
     }
     if (app.compareB.empty()) return nullptr;
     // session fallback: match the saved name (and frame, for a stack), then latch
     // the uid so navigation cannot re-point B at a different frame
     for (const auto& d : app.images) {
-        if (d->name != app.compareB || d.get() == cur()) continue;
+        if (d->name != app.compareB) continue;
         if (app.compareBSeq >= 0 && d->seqId != 0 && d->seqIndex != app.compareBSeq) continue;
         app.compareBUid = d->uid;
         return d.get();
@@ -1740,8 +1752,8 @@ static void setCompareB(const ImageDoc* d) {
 // The uid holding the B SEAT: the live pin, or the remembered one after an
 // exit path cleared it (A9: compare off and on returns to the same B). The
 // Files letters are seat assignments, so they key on this - never on cmpB(),
-// which answers null while compare is off or while A stands on the pin, and
-// a letter that vanishes there reads as the assignment being lost.
+// which answers null while compare is off, and a letter that vanishes there
+// reads as the assignment being lost.
 static uint64_t bSeatUid() {
     return app.compareBUid ? app.compareBUid : app.lastCompareBUid;
 }
@@ -1888,9 +1900,12 @@ static void selectImage(int idx);   // fwd (defined with the sequence helpers)
 // pinned uid and a uid lookup would lose the letter.
 struct ResolvedSlot { ImageDoc* doc; size_t idx; bool diverged; };
 static std::vector<uint8_t> g_slotDiverged;   // by cmpExtra index, last resolve
+// A slot standing on the same document as A resolves like any other: the same
+// rule resolveB now follows, for the same reason. Dropping it here made a
+// letter's row, curve and pane vanish the moment A walked onto it, which is
+// indistinguishable from the slot having been lost.
 static std::vector<ResolvedSlot> resolveSlots() {
     std::vector<ResolvedSlot> out;
-    const ImageDoc* a = cur();
     g_slotDiverged.assign(app.cmpExtra.size(), 0);
     for (size_t i = 0; i < app.cmpExtra.size();) {
         ImageDoc* d = nullptr;
@@ -1900,12 +1915,10 @@ static std::vector<ResolvedSlot> resolveSlots() {
             g_slotDiverged.erase(g_slotDiverged.begin() + i);
             continue;
         }
-        if (d != a) {
-            bool div = false;
-            ImageDoc* r = followFrame(d, div);
-            g_slotDiverged[i] = div ? 1 : 0;
-            out.push_back({ r, i, div });
-        }
+        bool div = false;
+        ImageDoc* r = followFrame(d, div);
+        g_slotDiverged[i] = div ? 1 : 0;
+        out.push_back({ r, i, div });
         i++;
     }
     return out;
@@ -1928,7 +1941,11 @@ static std::string slotOf(const ImageDoc* d) {
     return "";
 }
 static void addCompareSlot(ImageDoc* d) {
-    if (!d || d == cur()) return;
+    if (!d) return;
+    // A is the CURSOR, not a seat, so the image under it may hold a letter like
+    // any other - that is how you park the frame you are on as C and go looking
+    // for what to set against it. (It used to be refused outright, which is the
+    // same "you cannot compare a thing with itself" care resolveB carried.)
     if (d->uid == app.compareBUid) {   // one image, one letter: it is B already
         toast("that image is B - wipe / split / difference compare it already", true);
         return;
@@ -2081,12 +2098,15 @@ static EscTook escapePressed() {
 
 // Pin the frame you are looking at as B, then walk A somewhere else: this is how
 // you compare frame 12 against frame 13 of one stack, or a source against its
-// processed result.
+// processed result. Staying put is a comparison too - A and B on one document,
+// both sides drawn coinciding - so the toast invites the walk rather than
+// instructing it ("move A somewhere else" read as a precondition, back when
+// the pair really did stay silent until you did).
 static void pinCurrentAsB() {
     if (!cur()) return;
     setCompareB(cur());
     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-    toast("B = " + abDocLabel(cur()) + "  (move A somewhere else)");
+    toast("B = " + abDocLabel(cur()) + "  (A and B agree - move A to compare)");
 }
 
 static void swapCompare() {
@@ -2098,6 +2118,13 @@ static void swapCompare() {
         return;
     }
     const ImageDoc* a = cur();
+    // Both sides on one document is a legal comparison now, and swapping it
+    // moves nothing. Saying "swapped" over an unchanged screen is how a no-op
+    // becomes a bug report, so say what actually happened instead.
+    if (b == a) {
+        toast("A and B are the same image - nothing to swap  (" + abDocLabel(a) + ")");
+        return;
+    }
     std::string an = abDocLabel(a), bn = abDocLabel(b);
     uint64_t bUid = b->uid;
     setCompareB(a);                       // set B before moving A: cur() changes
@@ -2112,15 +2139,11 @@ static std::string abStatusChipText() {
     if (app.compareMode == App::CmpOff) return "";
     ImageDoc* b = cmpB();
     char buf[320];
-    if (!b) {
-        // Two different silences, two different sentences: no B at all, or A
-        // STANDING on the pinned B. The pin holds and the compare is merely
-        // paused (see A8 in --abstats-selftest) - but saying nothing about it
-        // read as 「比較を抜けてしまう」.
-        if (app.compareBUid && cur() && cur()->uid == app.compareBUid)
-            return "A = B (paused: this image IS the pinned B - move A to resume)";
-        return "A/B: no B image";
-    }
+    // One silence left, and it means one thing: there is no B. The second
+    // sentence here used to be "A = B (paused)" - the chip explaining why the
+    // panels had gone quiet while A stood on the pinned B. Nothing goes quiet
+    // any more (resolveB), so the chip names the pair like any other.
+    if (!b) return "A/B: no B image";
     if (app.compareMode == App::CmpDiff) {
         snprintf(buf, sizeof buf, "%s +-%g  B: %s", app.diffAbs ? "|A-B|" : "A-B",
                  app.diff.gain, abDocLabel(b).c_str());
@@ -2136,23 +2159,27 @@ static std::string abStatusChipText() {
 // What the A/B item on a Files row offers, for the frame or stack that row
 // would hand to B.
 //
-// The row you are LOOKING AT is A - the cursor, not a seat - and it offers
-// NOTHING. It used to offer "Swap A and B" there, and that line was care
-// nobody needed (user report, 2026-07-30: 「swapはショートカットキーで対応
-// されているから右クリックメニューでのケアは不要では」): the swap lives on
-// Shift+\ , the View menu and the status-bar button, and selecting B's row
-// simply makes it A - the pin survives, resolveB going quiet while A stands
-// on B is shipped behavior (A8). Every other row is the simple pair the user
-// asked to read: "Set as compare B" and the slot item.
+// EVERY row offers it, the one you are looking at included. That row used to
+// offer nothing at all, on the reasoning that it IS A and a thing cannot be
+// compared with itself - which is the very care the user threw out (2026-08-04,
+// 「比較の際に同じものを選んだ時に，同じことを確認できる方がよい」). Setting
+// this row as B is now a legitimate and useful move: both sides show the same
+// document, the panels draw two curves and two rows on top of each other, and
+// that coincidence is the confirmation you were after.
+//
+// (It also used to offer "Swap A and B" here, and THAT line really was care
+// nobody needed - user report 2026-07-30: 「swapはショートカットキーで対応され
+// ているから右クリックメニューでのケアは不要では」. The swap lives on Shift+\ ,
+// the View menu and the status-bar button; it is not coming back.)
 //
 // Out here rather than in the menu so it can be checked without a frame
 // (--abstats-selftest, A7).
 enum AbRowItem {
-    AbSetB,        // a different image: it can become B
-    AbNone         // this row IS A: no A/B item at all
+    AbSetB,        // this row can become B - and every row can
+    AbNone         // reserved: nothing on this row (no image at all)
 };
 static AbRowItem abRowItem(const ImageDoc* pick) {
-    return pick != cur() ? AbSetB : AbNone;
+    return pick ? AbSetB : AbNone;
 }
 
 static void computeMinMax(ImageDoc& im) {
@@ -2546,8 +2573,11 @@ static ImageDoc* cmpB();          // fwd: the B side, or null when compare is of
 // as you step. Mode 1 means "the reference side dictates": A's black-white
 // for every other letter. The slots join only while compare is ON - the
 // letters survive compare-off as seats, but a seat is not a comparison.
-// cur() is never B or a slot (resolveB / resolveSlots guarantee it), so none
-// of this recurses.
+// A, B and the slots may now name the SAME document (resolveB no longer goes
+// quiet there), which this handles by construction: a union of min/max does
+// not care how many times a side appears, and the `rs.doc != b` below is kept
+// only so a duplicate cannot eat one of the fixed 16 places. It changes no
+// number - unlike the panels, where dropping a duplicate side dropped a curve.
 static bool abRange(const ImageDoc& im, float& lo, float& hi) {
     if (app.compareRangeMode == 0) return false;
     ImageDoc* a = cur();
@@ -8534,9 +8564,10 @@ static void selectImage(int idx) {
     // Walking A onto the image pinned as B used to SWAP them, so that looking
     // at B stopped it from being B and rewrote the pin to whatever A had been.
     // B is something the user pinned deliberately; navigating must not rewrite
-    // it. Nothing is needed here: resolveB already answers null while A sits on
-    // B, so the comparison goes quiet for exactly as long as you are standing
-    // on it and comes back, still pinned, when you step away. Shift+\ (or the
+    // it. Nothing is needed here: the pin is a uid and this function does not
+    // touch it. Standing on B is not a state that needs handling either - both
+    // sides simply resolve to the one document and are drawn coinciding, which
+    // is a comparison people set up ON PURPOSE (see resolveB). Shift+\ (or the
     // status bar's "swap A/B") is how you swap - on purpose.
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
@@ -12124,9 +12155,11 @@ static std::vector<TileSlot> tileSlots() {
     out.push_back({ a, "A", false });
     ImageDoc* b = cmpB();                      // sets g_abFollowDiverged
     if (b) out.push_back({ b, "B", g_abFollowDiverged });
+    // One pane per LETTER, not per document. Two letters resolving to one
+    // document get two panes showing the same pixels - which is the point:
+    // side by side is where you SEE that they coincide.
     for (const ResolvedSlot& rs : resolveSlots())
-        if (rs.doc != b)                       // one image, one pane
-            out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
+        out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
     return out;
 }
 // Tiling engages only when there is a third slot to show, and ONLY in Split -
@@ -12829,16 +12862,13 @@ static void drawCanvas(ImVec2 avail) {
                                           IM_COL32(60, 66, 74, 255));
                 }
             } else if (!imB) {
-                // compare is on but B is gone (closed, renamed, never picked)
-                // - or A is STANDING on the pinned B, which pauses the pair
-                // (resolveB answers null, correctly) and used to render exactly
-                // like compare-off: the user read it as leaving the comparison.
+                // compare is on but B is gone (closed, renamed, never picked).
+                // A standing on the pinned B used to land here too, under an
+                // "A = B (paused)" banner; it now resolves as an ordinary B and
+                // draws as one, so the only case left is the honest absence.
                 if (app.compareMode != App::CmpOff) {
-                    const bool paused = app.compareBUid && im &&
-                                        im->uid == app.compareBUid;
-                    const char* msg = paused
-                        ? "A = B (paused): this IS the pinned B - move A, or Shift+\\ swaps"
-                        : "compare is on, but no B image - View > Compare A/B > B image";
+                    const char* msg =
+                        "compare is on, but no B image - View > Compare A/B > B image";
                     ImVec2 ts = ImGui::CalcTextSize(msg);
                     float y = canvasP0.y + 6 * s;
                     dl->AddRectFilled(ImVec2(canvasP0.x + 6 * s, y),
@@ -14436,10 +14466,11 @@ static void drawPanelHistogram() {
         // The lettered slots resolve exactly as B does, follow-frame included,
         // and rs.idx IS the letter - it travels with the resolved document
         // because after a follow the document is no longer the pinned uid and a
-        // uid lookup would lose the letter. A slot that is also B is ONE side.
-        std::vector<ResolvedSlot> xslots;
-        for (const ResolvedSlot& rs : resolveSlots())
-            if (rs.doc != Bim) xslots.push_back(rs);
+        // uid lookup would lose the letter. A slot that resolves to the same
+        // document as B keeps its own side: two letters landing on one document
+        // is a COINCIDENCE, and folding it away leaves no way to tell "C agrees
+        // with B" from "C was dropped".
+        std::vector<ResolvedSlot> xslots = resolveSlots();
         // resolveSlots() prunes closed slots first, so this is the pruned size.
         // NOTHING below resizes histExtra again: the sides hold pointers into
         // it, and a growth under them would dangle exactly the way seqInfo()'s
@@ -15026,10 +15057,8 @@ static void drawPanelProjection() {
     // The slots resolve exactly as B does - follow-frame included - and the
     // cache is per SLOT, indexed by the letter (= position in cmpExtra), so a
     // followed sibling recomputes into ITS slot and a slot A stands on keeps
-    // its cache. A slot that is also B draws as B alone: one image, one column.
-    std::vector<ResolvedSlot> xslots;
-    for (const ResolvedSlot& rs : resolveSlots())
-        if (rs.doc != Bim) xslots.push_back(rs);
+    // its cache. A slot that is also B keeps its own column: see the histogram.
+    std::vector<ResolvedSlot> xslots = resolveSlots();
     app.projExtra.resize(app.cmpExtra.size());
     recomputeProjectionIfNeeded(im, app.proj[0]);
     // The extras follow B's rule exactly: skipped while frames are being
@@ -17898,7 +17927,6 @@ static std::vector<TExpSide> temporalExportSides() {
     app.projExtra.resize(app.cmpExtra.size());
     static const App::ServerTemporal NO_SERVER;   // extras are local-only
     for (const ResolvedSlot& rs : resolveSlots()) {
-        if (rs.doc == Bim) continue;
         if (rs.idx >= app.temporalExtra.size()) continue;
         recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
         recomputeProjectionIfNeeded(rs.doc, app.projExtra[rs.idx]);
@@ -18291,7 +18319,6 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         app.temporalExtra.resize(app.cmpExtra.size());
         static const App::ServerTemporal NO_SERVER;        // extras are local-only
         for (const ResolvedSlot& rs : resolveSlots()) {
-            if (rs.doc == Bim) continue; // B may also hold a numbered slot: one curve
             if (rs.idx >= app.temporalExtra.size()) continue;
             recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
             XS.push_back({ rs.doc, slotName(rs.idx),
@@ -22863,7 +22890,7 @@ static void drawFileList() {
     // contains is invisible until someone tells you about it, and the letter in
     // the label ("Add as compare slot D") says what will happen before it does.
     auto compareSlotItem = [](ImageDoc* pick) {
-        if (!pick || pick == cur()) return;
+        if (!pick) return;                 // the current row gets it too, like every other
         std::string held = slotOf(pick);
         if (!held.empty()) {
             if (ImGui::MenuItem(("Remove from compare slot " + held).c_str()))
@@ -22882,8 +22909,9 @@ static void drawFileList() {
                               "A against B - those only mean two.");
     };
     // Returns whether it put anything in the menu, so a caller can skip the
-    // separator that would otherwise lead an empty group: the CURRENT row -
-    // A itself - contributes no compare items at all (see abRowItem).
+    // separator that would otherwise lead an empty group. Every row with a
+    // document contributes now, the current one included (see abRowItem); the
+    // false return is left for a row that has no document at all.
     auto compareBItem = [&compareSlotItem](ImageDoc* pick) -> bool {
         if (abRowItem(pick) != AbSetB) return false;
         if (ImGui::MenuItem("Set as compare B")) {
@@ -23180,8 +23208,9 @@ static void drawFileList() {
             }
             ImGui::Separator();
             {   // B = the frame this stack is showing; with "B follows A's
-                // frame number" on, it tracks A from there anyway. The stack
-                // A stands in gets no compare group (and no stray separator).
+                // frame number" on, it tracks A from there anyway. The stack A
+                // stands in gets the group too - setting it as B is how you put
+                // one document on both sides and see that they agree.
                 ImageDoc* bpick = app.images[stack.front()].get();
                 if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
                     app.images[si->lastImageIdx]->seqId == si->id)
@@ -23821,9 +23850,11 @@ static void drawMenuBar(GLFWwindow* win) {
             // one row per stack (its frame in view), not one per frame: a
             // 120-frame stack must not produce a 120-row menu
             int shown = 0;
+            // A itself is on the list: setting B to the document already on the
+            // A side is a supported comparison (both sides draw, coinciding),
+            // and leaving it out was the same omission resolveB used to make.
             for (int i = 0; i < (int)app.images.size(); i++) {
                 ImageDoc* d = app.images[i].get();
-                if (d == cur()) continue;
                 if (d->seqId != 0) {
                     App::SeqInfo* si = seqInfo(d->seqId);
                     int rep = si && si->lastImageIdx >= 0 ? si->lastImageIdx : -1;
@@ -24254,6 +24285,12 @@ static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF
 // measures is analytic and built in memory (see roiStatsSelftest()).
 static bool g_roiStatsSelftest = false;
 
+// --abeq-selftest: A and B (and a letter past B) on ONE document - the
+// comparison people set up on purpose, to confirm the two sides agree. Takes no
+// directory for the same reason as --roistats-selftest, and is windowless for
+// the same reason: see abEqSelftest().
+static bool g_abEqSelftest = false;
+
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
 // is enough for what the rows contain but blind to everything that only exists
@@ -24609,6 +24646,8 @@ static void printUsage() {
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
         "  --roistats-selftest         the ROI table's numbers and its PRNU column,\n"
         "                              through the real panel, on analytic fixtures\n"
+        "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
+        "                              coinciding, through the real panel\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
         "                              value, NaN exclusion, CFA planes, provenance\n"
@@ -24737,6 +24776,8 @@ static void parseCli(int argc, char** argv) {
             g_frameLinSelftest = true;             // handled in main()
         } else if (a == "--roistats-selftest") {
             g_roiStatsSelftest = true;             // handled in main()
+        } else if (a == "--abeq-selftest") {
+            g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
@@ -26184,6 +26225,204 @@ static int roiStatsSelftest() {
     fprintf(stderr, "roistatsselftest: %s\n", ok ? "ok" : "FAILED");
     // the same orderly shutdown every early-returning selftest does: an
     // unjoined worker at exit is std::terminate() under the last line printed
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return ok ? 0 : 1;
+}
+
+// ---- --abeq-selftest: two sides on ONE document ----------------------------
+// Putting the same document on both sides of a comparison is something people
+// do ON PURPOSE - to confirm the two sides agree. The viewer used to treat it
+// as a mistake to be smoothed over: resolveB answered null, so the histogram
+// drew one curve instead of two, the projection and temporal panels lost their
+// B column, the Inspector lost its B and A-B columns, the canvas put up an
+// "A = B (paused)" banner, and the Files row you were standing on would not
+// even offer "Set as compare B". The user's ruling (2026-08-04): 「A/B比較で，
+// A=Bの時，ヒストグラムの表示を切り替えているけど，このケアはかえってみずらい．
+// 比較の際に同じものを選んだ時に，同じことを確認できる方がよいので，こういうの
+// 全般不要です」- the kindness makes it HARDER to read, because a panel that
+// hides B at that moment makes the confirmation impossible: "B is identical to
+// A" and "B is not being drawn" look exactly the same.
+//
+// So what is asserted here is the panel's OUTPUT, never the absence of a
+// branch: with B set to A the Statistics panel reports TWO sides, two rows,
+// two curves, in two different inks - and the numbers behind them coincide,
+// which is the thing the user opened the comparison to see.
+//
+// Windowless, on the roiStatsSelftest() pattern and for the same reason: this
+// is a statement about what a panel puts on screen, not about layout, and a
+// statement that only runs on the one runner with a GL context has been
+// verified on one OS. Fixtures are analytic and built in memory, so this test
+// opens no file and cannot be made to pass by a fixture drifting.
+//
+// And the windowless claim is MEASURED, not asserted, exactly as roistats
+// measures its own: run the binary with and without --no-window and diff the
+// output. 25 lines, byte for byte identical (MinGW, 2026-08-05). Everything the
+// Statistics panel is made of downstream of the backends' NewFrame - the table,
+// the clipper, the bins, and the probe string this reads back - is pure CPU.
+static int abEqSelftest() {
+    bool ok = true;
+    auto check = [&](bool cond, const char* what) {
+        fprintf(stderr, "abeqselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+        if (!cond) ok = false;
+    };
+    auto mk = [](const char* nm, int W2, int H2, double base, double amp) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = nm; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->src->dtype = "u16";
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] = (float)(base + ((x & 1) ? amp : -amp));
+        d->syncMirrors();
+        computeMinMax(*d);
+        defaultRange(*d);
+        d->uid = app.nextUid++;
+        return d;
+    };
+    ImGuiIO& io = ImGui::GetIO();
+    auto histFrame = [&]() {
+        // twice: the first frame sizes the window the table lays out in
+        for (int pass = 0; pass < 2; pass++) {
+            if (g_haveWindow) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+            } else {
+                io.DisplaySize = ImVec2(1600, 1000);
+                io.DisplayFramebufferScale = ImVec2(1, 1);
+                io.DeltaTime = 1.0f / 60.0f;
+                if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+            }
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(560, 720), ImGuiCond_Always);
+            ImGui::Begin("AbEqProbe", nullptr,
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+            abStatsFrame();
+            drawPanelHistogram();
+            ImGui::End();
+            ImGui::EndFrame();
+        }
+    };
+    // "rows=" is written one letter at a time as "rowX;"; the other two fields
+    // are letter sets. Same readers the N group of --abstats-selftest uses.
+    auto field = [](const std::string& probe, const char* key) {
+        size_t k = probe.find(key);
+        if (k == std::string::npos) return std::string();
+        k += strlen(key);
+        size_t e = probe.find(';', k);
+        return probe.substr(k, e == std::string::npos ? e : e - k);
+    };
+    auto rowsOf = [](const std::string& probe) {
+        std::string out;
+        for (size_t k = probe.find("row"); k != std::string::npos;
+             k = probe.find("row", k + 1))
+            if (k + 3 < probe.size() && probe[k + 4] == ';') out += probe[k + 3];
+        return out;
+    };
+
+    closeAll();
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    app.cmpExtra.clear();
+    app.compareFollowFrame = false;
+    app.abStepBusyUntil = 0;
+    app.abStatsLayout = App::AbOverlay;   // one axis, so "on the plot" means all of them
+    app.histPlane = 0;                    // one plane, so the plot is not palette-limited
+    app.images.push_back(mk("abeq_a", 512, 512, 30000.0, 4.0));
+    app.images.push_back(mk("abeq_b", 512, 512, 20000.0, 4.0));
+    app.current = 0;
+
+    // ---- E1: B set to the document A is on -> TWO sides ---------------------
+    app.compareMode = App::CmpWipe;
+    setCompareB(cur());                   // Shift+B on the frame you are looking at
+    check(cmpB() == cur(), "E1 B set to A resolves to A, not to silence");
+    check(abStatsB() == cur(), "E1 ...and the statistics panels are given that B");
+    histFrame();
+    std::string p = g_histSideProbe;
+    fprintf(stderr, "abeqselftest: E1 probe '%s'\n", p.c_str());
+    check(rowsOf(p) == "AB", "E1 the statistics table gives A and B a row each");
+    check(field(p, "curves=") == "AB", "E1 ...and both are drawn on the plot");
+    check(field(p, "said-no-curve=").empty(),
+          "E1 ...with neither side left off and named");
+    // The coincidence has to be LEGIBLE, not merely present: two identical
+    // curves in one colour are one curve. slotInk gives each side its own.
+    check(slotInk(0) != slotInk(1), "E1 A and B are drawn in different inks");
+
+    // ---- E2: and the two sides really do coincide ---------------------------
+    // This is the confirmation the user opened the comparison for, so assert it
+    // as the panel computed it: same document, same bin axis, same bins.
+    {
+        const App::HistState& A = app.hist[0];
+        const App::HistState& B = app.hist[1];
+        check(A.uid == cur()->uid && B.uid == cur()->uid,
+              "E2 both sides measured the same document");
+        check(A.black == B.black && A.white == B.white,
+              "E2 ...on the same bin axis");
+        bool sameBins = A.nSeries == B.nSeries && A.sampled == B.sampled &&
+                        memcmp(A.bins, B.bins, sizeof A.bins) == 0;
+        fprintf(stderr, "abeqselftest: E2 A n=%zu mean=%.10g / B n=%zu mean=%.10g\n",
+                A.sampled, A.mean[0], B.sampled, B.mean[0]);
+        check(sameBins, "E2 ...and the two curves are bin-for-bin identical");
+    }
+
+    // ---- E3: the chip names the pair, with no second vocabulary -------------
+    // "A = B (paused: this image IS the pinned B - move A to resume)" existed
+    // only to explain the silence. There is no silence, so there is nothing to
+    // explain, and a state with its own sentence reads as a state you are stuck
+    // in rather than one you chose.
+    {
+        std::string chip = abStatusChipText();
+        fprintf(stderr, "abeqselftest: E3 chip '%s'\n", chip.c_str());
+        check(chip.find("B:") != std::string::npos, "E3 the chip names B");
+        check(chip.find("paused") == std::string::npos &&
+              chip.find("no B image") == std::string::npos,
+              "E3 ...and has no 'paused' / 'no B image' vocabulary for A == B");
+    }
+
+    // ---- E4: every Files row can be set as B, the current one included ------
+    check(abRowItem(cur()) == AbSetB,
+          "E4 the row you are standing on offers Set as compare B");
+    check(abRowItem(app.images[1].get()) == AbSetB,
+          "E4 ...and so does every other row");
+
+    // ---- E5: a LETTER past B on A's document keeps its own side -------------
+    // Same rule, one seat further out: two letters landing on one document is a
+    // coincidence to be shown, not folded away. A slot standing on A used to
+    // vanish from resolveSlots outright.
+    setCompareB(app.images[1].get());     // B is the other image again
+    addCompareSlot(cur());                // ...and C is the document A is on
+    check(slotOf(cur()) == "C", "E5 the document A is on can hold a letter");
+    check(resolveSlots().size() == 1 && resolveSlots()[0].doc == cur(),
+          "E5 ...and it still resolves");
+    histFrame();
+    p = g_histSideProbe;
+    fprintf(stderr, "abeqselftest: E5 probe '%s'\n", p.c_str());
+    check(rowsOf(p) == "ABC", "E5 A, B and a C that IS A all get a row");
+    check(field(p, "curves=") == "ABC", "E5 ...and all three are on the plot");
+
+    // ---- E6: one pane per LETTER, not per document --------------------------
+    // Side by side is where the coincidence is seen, so a pane is owed to every
+    // seat. Three seats, three panes, even though two of them hold one image.
+    {
+        app.compareMode = App::CmpSplit;
+        std::vector<TileSlot> sl = tileSlots();
+        std::string tags;
+        for (const TileSlot& t : sl) tags += t.tag;
+        fprintf(stderr, "abeqselftest: E6 panes '%s'\n", tags.c_str());
+        check(tags == "ABC", "E6 three seats give three panes, two of them one image");
+        check(sl.size() == 3 && sl[0].doc == sl[2].doc,
+              "E6 ...and A's pane and C's pane really are the same document");
+    }
+
+    app.cmpExtra.clear();
+    app.compareMode = App::CmpOff;
+    app.compareFollowFrame = true;
+    app.abStatsLayout = App::AbAuto;
+    app.histPlane = -1;
+    fprintf(stderr, "abeqselftest: %s\n", ok ? "ok" : "FAILED");
     stopRbWorker();
     stopSequenceLoader();
     stopRemoteFetcher();
@@ -30187,6 +30426,11 @@ int main(int argc, char** argv) {
     // roiStatsSelftest(), and V19 below for the half of it that does draw.
     if (g_roiStatsSelftest) return roiStatsSelftest();
 
+    // A and B on one document. Windowless for the same reason - what it asserts
+    // is what the Statistics panel PRINTS, and that is CPU on both sides of the
+    // window branch.
+    if (g_abEqSelftest) return abEqSelftest();
+
     if (!g_verifySelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = nowSec();
@@ -33956,11 +34200,14 @@ int main(int argc, char** argv) {
         // ---- A7: the Files row's A/B item is never a dead grey line ----------
         // Reported from the shipped build: "Set as compare B" is greyed out.
         // It was greyed on exactly one row - the CURRENT one, which is the row
-        // you right-click first - and nothing said so. The rule now (user
-        // ruling, 2026-07-30): a row that is not A offers "Set as compare B"
-        // and the slot item, the simple pair; the row that IS A offers
-        // NOTHING - the swap lives on Shift+\ and the status bar, and a menu
-        // line for it was care nobody needed.
+        // you right-click first - and nothing said so. The rule now: EVERY row
+        // offers "Set as compare B" and the slot item, the current one
+        // included. That last row was still withheld until 2026-08-04, on the
+        // reasoning that it IS A; the user threw that reasoning out (「比較の際
+        // に同じものを選んだ時に，同じことを確認できる方がよい」), so setting
+        // this row as B is a supported move and the menu has to offer it.
+        // (The "Swap A and B" line that used to sit here is still gone - a
+        // different ruling, 2026-07-30, and not the one being reversed.)
         {   // A6 closed one stack; multi/ has three, so two are still open
             check(app.seqs.size() >= 2, "A7 fixture: two stacks still open");
             std::vector<int> fa, fb;
@@ -33978,19 +34225,20 @@ int main(int argc, char** argv) {
                         (int)abRowItem(app.images[fb.front()].get()));
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 another row offers Set as compare B");
-                // The current row offers NOTHING, in every mode: it is A -
-                // the cursor - and the swap that used to sit here lives on
-                // Shift+\ and the status bar (user ruling, 2026-07-30).
-                check(abRowItem(app.images[fa.front()].get()) == AbNone,
-                      "A7 compare off: the current row offers no items");
+                // The current row offers it too, in every mode: putting the
+                // document you are looking at on the B side is how you confirm
+                // two sides agree, and it used to be the one row you could not
+                // do it from.
+                check(abRowItem(app.images[fa.front()].get()) == AbSetB,
+                      "A7 compare off: the current row offers Set as compare B");
                 // ...and turning compare on changes NOTHING about another row:
                 // the user read the greying as "compare has to be armed first".
                 app.compareMode = App::CmpWipe;
                 ensureCompareB();
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 compare on: another row still offers Set as compare B");
-                check(abRowItem(app.images[fa.front()].get()) == AbNone,
-                      "A7 compare on: the current row STILL offers no items (was Swap)");
+                check(abRowItem(app.images[fa.front()].get()) == AbSetB,
+                      "A7 compare on: the current row offers it here too");
                 // every other frame of A's own stack is still a legal B
                 if (fa.size() > 1)
                     check(abRowItem(app.images[fa[1]].get()) == AbSetB,
@@ -34003,8 +34251,12 @@ int main(int argc, char** argv) {
                       "A7 after the swap the old A is a Set-as-B row again");
                 // A8: B is a PIN. Walking A onto it used to swap the two, so
                 // looking at B stopped it from being B and rewrote the pin to
-                // whatever A had been. Now the comparison goes quiet while A
-                // stands on B, and B is still B when A steps away.
+                // whatever A had been. The pin holding is still the subject
+                // here - but the comparison no longer goes QUIET while A stands
+                // on it. That silence was the "kindness" the user removed on
+                // 2026-08-04: B resolves to the document A is on, both sides
+                // draw, and the panels show them coinciding. The assertion
+                // below therefore reads the opposite of what it used to.
                 {
                     uint64_t pin = app.compareBUid;
                     int bIdx = -1;
@@ -34015,15 +34267,16 @@ int main(int argc, char** argv) {
                         if (app.images[i]->uid != pin && app.images[i]->seqId != 0) { away = i; break; }
                     if (bIdx >= 0 && away >= 0) {
                         selectImage(bIdx);                 // stand on B
-                        bool kept = app.compareBUid == pin, quiet = cmpB() == nullptr;
+                        bool kept = app.compareBUid == pin;
+                        bool live = cmpB() == cur() && abStatsB() == cur();
                         selectImage(away);                 // and step off it
                         bool back = app.compareBUid == pin && cmpB() &&
                                     cmpB()->uid == pin;
                         fprintf(stderr, "abstatsselftest: A8 stand on B: pin kept=%d "
-                                        "compare quiet=%d; step away: B is back=%d\n",
-                                kept ? 1 : 0, quiet ? 1 : 0, back ? 1 : 0);
+                                        "B resolves to A=%d; step away: B is back=%d\n",
+                                kept ? 1 : 0, live ? 1 : 0, back ? 1 : 0);
                         check(kept, "A8 selecting B does not rewrite the pin");
-                        check(quiet, "A8 ...the comparison goes quiet while A stands on it");
+                        check(live, "A8 ...and A standing on it leaves a real B, not silence");
                         check(back, "A8 ...and B is still B when A steps away");
                     }
                 }
@@ -34161,23 +34414,31 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "abstatsselftest: S4 lone-frame check skipped "
                                 "(%s/rgb_u8.npy not there)\n", root.c_str());
 
-            // S5: A standing on the pinned B is a PAUSE, and the chip says so.
-            // resolveB answering null there is correct (A8) - the silence that
-            // read as 「比較を抜けてしまう」 is what has to go.
+            // S5: A standing on the pinned B is an ORDINARY comparison, and
+            // the chip names the pair like any other. It used to be a PAUSE,
+            // announced as "A = B (paused)" - the sentence that existed only to
+            // explain why every panel had gone quiet. Nothing goes quiet now
+            // (2026-08-04: 「こういうの全般不要です」), so there is nothing to
+            // explain, and the chip must not have a second vocabulary for it:
+            // the reading BEFORE and AFTER stepping off is the same sentence.
             app.cmpExtra.clear();
             app.compareMode = App::CmpWipe;
             selectImage(f0[0]);
             setCompareB(cur());                  // Shift+B's path: pin THIS frame
             std::string chip = abStatusChipText();
             fprintf(stderr, "abstatsselftest: S5 chip while A==B: '%s'\n", chip.c_str());
-            check(chip.find("A = B") != std::string::npos &&
-                  chip.find("paused") != std::string::npos,
-                  "S5 standing on the pinned B says paused, not 'no B image'");
-            selectImage(f0[1]);                  // step off: the pair resumes
+            check(chip.find("B:") != std::string::npos,
+                  "S5 A standing on the pinned B still names B in the chip");
+            check(chip.find("paused") == std::string::npos &&
+                  chip.find("no B image") == std::string::npos,
+                  "S5 ...with no 'paused' or 'no B image' vocabulary left");
+            check(cmpB() == cur() && abStatsB() == cur(),
+                  "S5 ...and the panels get a B: the same document A is on");
+            selectImage(f0[1]);                  // step off: the pair is unchanged
             chip = abStatusChipText();
             fprintf(stderr, "abstatsselftest: S5 chip after stepping off: '%s'\n", chip.c_str());
             check(chip.find("B:") != std::string::npos,
-                  "S5 ...and stepping off resumes the pair");
+                  "S5 ...and stepping off changes nothing about the chip's shape");
 
             // S6: ESC steps outward one claim per press, and the Files letters
             // are SEATS: full ink while a comparison runs, visible but dimmed
@@ -34491,12 +34752,22 @@ int main(int argc, char** argv) {
         check(sl.size() == 4 && sl[0].doc == cur() && sl[1].doc == cmpB() &&
               sl[2].doc == ex[0] && sl[3].doc == ex[1],
               "T1 the documents are in slot order too");
-        {   // no image may hold two panes: a thing compared with itself is not one
-            bool dup = false;
+        {   // One pane per LETTER. Four distinct documents are armed here, so
+            // four distinct documents is what must come out - but the reason is
+            // that the SEATS are distinct, not that an image may never appear
+            // twice. Two letters resolving onto one document (A walked onto a
+            // slot, or follow-frame landing both on one sibling) now get a pane
+            // each, deliberately: side by side is where you see them coincide.
+            bool dupTag = false;
             for (size_t i = 0; i < sl.size(); i++)
                 for (size_t j = i + 1; j < sl.size(); j++)
-                    if (sl[i].doc == sl[j].doc) dup = true;
-            check(!dup, "T1 no image occupies two panes");
+                    if (sl[i].tag == sl[j].tag) dupTag = true;
+            check(!dupTag, "T1 no letter occupies two panes");
+            bool dupDoc = false;
+            for (size_t i = 0; i < sl.size(); i++)
+                for (size_t j = i + 1; j < sl.size(); j++)
+                    if (sl[i].doc == sl[j].doc) dupDoc = true;
+            check(!dupDoc, "T1 four distinct seats give four distinct documents");
         }
 
         // ---- T2: which modes tile, and which four must not -------------------
