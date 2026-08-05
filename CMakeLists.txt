@@ -443,18 +443,30 @@ viewer_selftest(browse-keys --browse-keys-selftest tools/testdata/rb)
 # thread the way a real ssh peer does. Asserted, in order:
 #   1. a mouse-first double-click on a FILE opens it, even though click one
 #      spent longer fetching the preview than the double-click window allows
-#      (dbloff:6 = dark.npy; chknames without [pv] is "registered, not preview");
+#      (chknames without [pv] is "registered, not preview");
 #   2. two clicks a SECOND apart on another file are still two clicks - the
 #      credit for blocked time cannot manufacture a double-click out of them
 #      (flat.npy stays [pv]);
 #   3. the navigation latch is untouched: a folder's double-click enters once
 #      and opens NOTHING (chkimgmark), which is the property CI caught the last
 #      two attempts on.
+#
+# The aim is SHORT and relative: the arrows walk the cursor down the folder
+# rows - which the keyboard does not preview, so the file below is still cold -
+# and each gesture is then one row off the cursor. It used to be "home" plus an
+# absolute offset, which has two problems: the offset silently means a
+# different row whenever rb/ gains an entry, and after a click the cursor has
+# MOVED to the row that was clicked, so the second half of "two clicks a second
+# apart" was aiming N rows below its own first click and landing past the end
+# of the listing. `click` is the same pixel by construction, which is what that
+# claim needs.
 viewer_selftest(browse-dbl ENV VIEWER_SERVE_LAG_MS=400
                 --browse-keys-selftest tools/testdata/rb
                 --browse-keys "waitdir:rb,viewreset,w400,home,chkatrow:..,\
-dbloff:6,chkimg:1,chknames:dark.npy,\
-home,clickoff:7,idle:80,clickoff:7,chkimg:2,chknames:dark.npy+flat.npy[pv],\
+down,down,down,down,down,down,chkatrow:unpadded,\
+dbloff:1,chkimg:1,chknames:dark.npy,chkatrow:dark.npy,\
+clickoff:1,idle:80,click,chkatrow:flat.npy,chkimg:2,\
+chknames:dark.npy+flat.npy[pv],\
 home,imgmark,dbloff:1,waitdir:digitset,chkimgmark,chkimg:2")
 # The T group lays out the Temporal panel in real ImGui frames (the chart that
 # was drawn past the panel's bottom edge is a layout fact, invisible to the

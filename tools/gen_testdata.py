@@ -160,6 +160,38 @@ pset.mkdir(exist_ok=True)
 for k in (9, 10, 11):
     np.save(pset / f"f_{k}.npy", (rng3.random((16, 16)) * 4095).astype(np.float32))
 
+# unpadded/ - the ONE fixture where lexicographic and natural name order give
+# different answers, which until now nothing generated here did: every other
+# numbered set is zero-padded to a fixed width (frame_000, gain10_007, 0000),
+# and for those two the two orders are the same sequence. So the listing could
+# sort names as text while the stack it opened sorted them by value, and no
+# test could see it (--browse-selftest, --browse-keys-selftest and
+# --localbrowse-selftest all browse rb/).
+#
+#   lv1 / lv2 / lv10   as DIRECTORIES, because directories never collapse into
+#                      a group: they are the rows themselves, so this is what
+#                      the listing sort and the tree's per-level sort are
+#                      asserted on. Text order says lv1, lv10, lv2.
+#   frame_1 / frame_2 / frame_10  as .npy, so they DO collapse into one group -
+#                      whose members (and whose displayed extent,
+#                      "frame_1‥10.npy") are what the flat listing shows and
+#                      what the stack is built from. Text order says
+#                      frame_1, frame_10, frame_2.
+#
+# The name sorts after every other directory in rb/ on purpose: rb's rows are
+# addressed by index in the --browse-keys action script, and inserting a folder
+# earlier in the alphabet would renumber the ones already spoken for.
+# The folders hold capture.npy and not frame_000.npy on purpose: --remote-selftest
+# counts `**/frame_*.npy` under rb/ against a literal number, and only the three
+# names this fixture is ABOUT should move it.
+uset = rb / "unpadded"
+uset.mkdir(exist_ok=True)
+for k in (1, 2, 10):
+    np.save(uset / f"frame_{k}.npy", (rng3.random((16, 16)) * 4095).astype(np.float32))
+    d = uset / f"lv{k}"
+    d.mkdir(exist_ok=True)
+    np.save(d / "capture.npy", (rng3.random((8, 8)) * 4095).astype(np.float32))
+
 for lv in ("10lx", "20lx", "40lx"):
     d = rb / "scanroot" / lv
     d.mkdir(parents=True, exist_ok=True)

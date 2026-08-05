@@ -874,10 +874,14 @@ struct App {
         std::string histKey;          // host:port the history belongs to
         bool histNav = false;         // set while back/forward itself navigates
         // ---- the shape of the listing. Per instance; app.rbFlat / rbTree /
-        // remain the persisted DEFAULTS a new instance starts from, and a
-        // toggle writes through to them (last toggle wins next start).
+        // rbNatural remain the persisted DEFAULTS a new instance starts from,
+        // and a toggle writes through to them (last toggle wins next start).
         // (`advanced` - was the "more" drawer open - went with the drawer.)
         bool flat = false, tree = false;
+        // ...and the order the NAME column puts rows in. Natural by default
+        // (rp::naturalLess): see rbNameCmp for why the listing gets a choice
+        // here and a stack never does.
+        bool nameNatural = true;
         // ---- panel state, formerly function-local statics of drawPanelRemote.
         // keyboard cursor (row index into the built view, -1 = none)
         int cursor = -1;
@@ -1051,6 +1055,12 @@ struct App {
     bool rbTree = false;                                        // persisted
     // (the tree cache, expanded set and pending list live per Browse instance
     // now - BrowseInstance::treeCache / expanded / treePending)
+    // Name order in the listing: true = natural (frame_2 before frame_10, the
+    // order a stack is built in and the order the peer folds a scan in),
+    // false = plain lexicographic. Persisted, and the DEFAULT a new panel
+    // starts from - the panel that changes it changes only itself, exactly as
+    // rbFlat / rbTree do. There is no Preferences panel to put it in (#50).
+    bool rbNatural = true;                                      // persisted
     bool focusRemote = false;         // bring the ACTIVE Browse instance forward
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
@@ -1525,6 +1535,7 @@ static App::BrowseInstance& rbMain() {
         p->wtitle = rbPanelTitle(1, "");    // the singleton's id: layouts survive
         p->flat = app.rbFlat;
         p->tree = app.rbTree;
+        p->nameNatural = app.rbNatural;
         app.browsePanels.push_back(std::move(p));
     }
     return *app.browsePanels[0];
@@ -1552,6 +1563,7 @@ static App::BrowseInstance& rbNewInstance(int wantNum = 0) {
     p->wtitle = rbPanelTitle(num, "");
     p->flat = app.rbFlat;                   // a new view starts from the prefs
     p->tree = app.rbTree;
+    p->nameNatural = app.rbNatural;
     p->open = true;
     p->focusReq = true;
     app.browsePanels.push_back(std::move(p));
@@ -6435,6 +6447,7 @@ static void savePrefs() {
     // ("rbadv" - the Browse drawer's open/closed state - is no longer written.
     //  A prefs file that still carries one is read and ignored, below.)
     f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
+    f << "rbnatural " << (app.rbNatural ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -6482,6 +6495,9 @@ static void loadPrefs() {
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
         else if (key == "rbadv")       { ls >> v; }   // the drawer is gone: read, drop
         else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
+        // absent from a prefs file written before the toggle existed, which is
+        // exactly right: the default this initialises to IS natural
+        else if (key == "rbnatural")   { ls >> v; app.rbNatural = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent" ||
                  key == "pythonexe" || key == "readerfor" || key == "readerdir") {
@@ -10044,6 +10060,18 @@ static void openRawDialogFor(const std::string& path) {
 // time axis. Shared by the browser and anything else that builds a stack.
 // Frames need not be a strict counter pattern to stack in the order a human
 // expects - rp::naturalLess (shared with the peer) is the contract.
+//
+// THIS ONE TAKES NO SETTING, AND MUST NOT GROW ONE. The Browse listing can be
+// asked to show names in plain lexicographic order (rbNameCmp / the panel's
+// "..." menu), and the temptation is to thread that flag through to here "for
+// consistency". It is the opposite of consistent: for a STACK the order of the
+// frames is a measurement property - sigma_t, the drift, the whole temporal
+// axis are computed over the frames in the order they were stacked, so a
+// different order is a different number - while for a LISTING it is a display
+// preference, like which column you sorted by. Keeping the two comparators
+// apart is what makes it structurally impossible for a display toggle to move
+// a measurement: there is no code path from the menu item to this function.
+// (user decision, 2026-08-05: "stack を積むときは natural のみ")
 static void sortFramesNumerically(std::vector<std::string>& files) {
     std::sort(files.begin(), files.end(), rp::naturalLess);
 }
@@ -19605,6 +19633,40 @@ struct RbRow {
 // earlier). A sort change therefore lands on the next frame - invisible, and
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+
+// RB_COL_NAME's comparator, and the ONE place both listing shapes ask for it.
+// There are two sorts - the flat listing sorts row indices in rbSortShown, the
+// tree sorts each LEVEL inside rbAddRows - and a comparator written out twice
+// is how a listing comes to disagree with itself. It is written once here.
+//
+// NATURAL is the default (rp::naturalLess, remote_proto.h - the same function
+// the peer sorts a group's members with, so a local listing and a remote one
+// of the same folder read identically). Digit runs compare by value, so
+// frame_2 comes before frame_10; letters compare case-insensitively.
+//
+// Plain lexicographic is what std::string::compare gives, what this listing
+// did unconditionally until 2026-08-05, and what the panel menu can still ask
+// for - per panel. It was the wrong default because the stack you open FROM
+// the listing is built with naturalLess (sortFramesNumerically), so the order
+// on screen was not the order sigma_t was computed over, and a tooltip in the
+// same panel already told the user frames stack in numeric name order.
+//
+// Only NAMES. RB_COL_SIZE and RB_COL_MTIME are numbers and have exactly one
+// order; this cannot reach them. And it cannot reach a stack either - see the
+// comment on sortFramesNumerically, which is the half of this that has no
+// setting on purpose.
+//
+// Returns <0 / 0 / >0, not a bool, because the callers negate it for a
+// descending sort. Two naturalLess calls rather than one: names that are equal
+// BY VALUE but different as text ("img01" vs "img1") must come out 0 here, so
+// that the callers' stable_sort leaves them in the order the peer sent them -
+// which is deterministic, where picking either one arbitrarily would not be.
+static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
+    if (!natural) return a.compare(b);
+    if (rp::naturalLess(a, b)) return -1;
+    if (rp::naturalLess(b, a)) return 1;
+    return 0;
+}
 // (The keyboard cursor and the stashed sort spec were file-scope singletons
 // here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
 // BrowseInstance::cursor / sortCol / sortDesc.)
@@ -19655,6 +19717,8 @@ static void rbAddRows(const App::BrowseInstance& I,
     if (tree) {
         // Per LEVEL: a global sort over a flattened tree would tear children
         // away from their parents. Directories first, as in the flat listing.
+        // Same name comparator as the flat listing (rbNameCmp), or the two
+        // shapes of the same panel would put the same folder in two orders.
         std::stable_sort(order.begin(), order.end(), [&](int ia, int ib) {
             const remote::Entry& a = ents[ia];
             const remote::Entry& b = ents[ib];
@@ -19663,7 +19727,7 @@ static void rbAddRows(const App::BrowseInstance& I,
             switch (I.sortCol) {
                 case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
                 case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
-                default:           cmp = a.name.compare(b.name); break;
+                default:           cmp = rbNameCmp(a.name, b.name, I.nameNatural); break;
             }
             return I.sortDesc ? cmp > 0 : cmp < 0;
         });
@@ -19692,6 +19756,39 @@ static void rbAddRows(const App::BrowseInstance& I,
               out.push_back(r); }
         }
     }
+}
+
+// The listing's own sort: `shown` holds row indices into `view` and comes back
+// in SCREEN order. A free function for the same reason rbBuildView is one -
+// the headless selftest sorts exactly what the panel sorts, rather than a
+// second copy of the rules that can drift from it.
+//
+// TREE mode never comes here. Its levels were sorted inside the builder, one
+// frame earlier (the sort spec is stashed in I.sortCol because
+// TableGetSortSpecs only exists between Begin/EndTable), and sorting the
+// flattened tree would tear children away from their parents.
+//
+// Directories sort before files under every key: this is a browser, not a
+// table of numbers.
+static void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
+                        std::vector<int>& shown) {
+    std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+        const RbRow& a = view[ia];
+        const RbRow& b = view[ib];
+        if (a.up != b.up) return a.up;      // ".." is row 0 under every sort
+        if (a.isDir() != b.isDir()) return a.isDir();
+        // an expanded frame has no size / mtime of its own: it sorts as
+        // unknown (0) rather than borrowing the group's totals
+        uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
+        int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
+        int cmp = 0;
+        switch (I.sortCol) {
+            case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
+            case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
+            default:           cmp = rbNameCmp(a.name(), b.name(), I.nameNatural); break;
+        }
+        return I.sortDesc ? cmp > 0 : cmp < 0;
+    });
 }
 
 // ---- deferred panel actions -------------------------------------------------
@@ -20417,6 +20514,20 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             rbModeChip("tree##rbchip", "folders open in place - the default is a "
                                        "list, one folder at a time.\n"
                                        "change it in the panel menu");
+            rbFlow(rbBtnW("a-z##rbchip"));
+        }
+        if (!I.nameNatural) {
+            // The order the rows are IN is the least visible setting on this
+            // panel - nothing on screen says which of two plausible orders you
+            // are reading - so the chip names it rather than merely marking it
+            // non-default. It also says what did NOT change, because that is
+            // the question this toggle raises.
+            rbModeChip("a-z##rbchip", "names sort as text: frame_10 before frame_2.\n"
+                                      "the default is natural order (frame_2 first, "
+                                      "digits by value).\n"
+                                      "frames still STACK in natural order - that one "
+                                      "is not a setting.\n"
+                                      "change it in the panel menu");
             rbFlow(rbBtnW("filter"));
         }
         // F5 is the refresh that lost its button; the panel must be the one
@@ -20535,28 +20646,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // than the one the cursor was on and SetScrollHereY never fired. The spec
     // itself is stashed from the table one frame earlier (I.sortCol), exactly
     // as the tree builder needs it - see RB_COL_NAME.
-    // Directories sort before files no matter the key: this is a browser, not a
-    // table of numbers. In TREE mode the sort has already happened per level,
-    // inside the builder; sorting the flattened tree here would tear children
-    // away from their parents.
-    if (!I.tree)
-        std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
-            const RbRow& a = view[ia];
-            const RbRow& b = view[ib];
-            if (a.up != b.up) return a.up;      // ".." is row 0 under every sort
-            if (a.isDir() != b.isDir()) return a.isDir();
-            // an expanded frame has no size / mtime of its own: it sorts as
-            // unknown (0) rather than borrowing the group's totals
-            uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
-            int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
-            int cmp = 0;
-            switch (I.sortCol) {
-                case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
-                case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
-                default:           cmp = a.name().compare(b.name()); break;
-            }
-            return I.sortDesc ? cmp > 0 : cmp < 0;
-        });
+    if (!I.tree) rbSortShown(I, view, shown);
     if (rbFilter[0]) {
         rbFlow(ImGui::CalcTextSize("9999/9999").x);
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
@@ -20611,6 +20701,31 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             app.prefsDirty = true;
             savePrefs();
         }
+        ImGui::Separator();
+        // The third thing that changes the LISTING's shape, so it sits with
+        // the other two - one place for everything that changes what the rows
+        // look like (there is no Preferences panel yet, issue #50).
+        //
+        // Each item names the order it IS, with the example that distinguishes
+        // them, because a listing whose order you cannot name is how the
+        // listing and the stack came to disagree without anyone noticing. And
+        // it says NAMES: the size and modified columns are numbers with one
+        // order each, and this cannot touch them.
+        auto rbOrderItem = [&](const char* label, bool wantNatural) {
+            if (ImGui::MenuItem(label, nullptr, I.nameNatural == wantNatural) &&
+                I.nameNatural != wantNatural) {
+                I.nameNatural = app.rbNatural = wantNatural;   // this panel; the pref = the default
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("the NAME column only - size and modified are numbers.\n"
+                                  "frames always STACK in natural order whatever this "
+                                  "says: for a stack the order is part of the "
+                                  "measurement, not a way of looking at it");
+        };
+        rbOrderItem("Names in natural order (frame_2 before frame_10)", true);
+        rbOrderItem("Names in text order (frame_10 before frame_2)", false);
         ImGui::Separator();
         // The two doors are one door now. This entry does not open anything -
         // it puts the caret in the box that is already on the toolbar, which is
@@ -21230,10 +21345,20 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         rbSel.assign(view.size(), 0);
                     }
                     if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
+                    // This line has always claimed numeric name order, and
+                    // until the listing was natural too it was the only place
+                    // saying so while the rows above it said otherwise. Now it
+                    // can say which of the two it is - and when the panel is
+                    // in text order it names the disagreement instead of
+                    // leaving the user to find it in the frame numbers.
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("%s", rbSelStackWhyNot.empty()
-                            ? "frames stack in numeric name order"
-                            : rbSelStackWhyNot.c_str());
+                        ImGui::SetTooltip("%s", !rbSelStackWhyNot.empty()
+                            ? rbSelStackWhyNot.c_str()
+                            : I.nameNatural
+                            ? "frames stack in natural name order - the order this "
+                              "listing is showing them in"
+                            : "frames stack in natural name order (frame_2 before "
+                              "frame_10), NOT the text order this listing is showing");
 
                     snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
                     ImGui::BeginDisabled(!rbSelTemporalOk);
@@ -23600,7 +23725,8 @@ static bool g_roiStatsSelftest = false;
 // marklist / starmark / seterr / clrerr (baselines and a fake failure for the
 // drawer-removal checks below); mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
-// viewreset (absolute grouped+list+folded state - the toggles are relative);
+// viewreset (absolute grouped+list+folded+natural-name state - the toggles are
+// relative);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
 // leaf is LEAF); and the assertions chkimg:N (count + NAMES), chkpv:N,
 // chkidx:K, chkopen:S, chkcur, chkcurn:NAME, chknames:SPEC, chkdir:LEAF,
@@ -23678,7 +23804,7 @@ static std::string g_browseKeysActs =
     // scrub going dead right after asking for stats was defect 1).
     // (waitdir first: the prefix ends on "back", and keys fired before that
     // listing lands would walk the OLD rows and be reset mid-sequence.)
-    "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,"
+    "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,down,"
     "chkimg:1,chkpv:24,chkidx:0,period,chkidx:1,chknames:frame_001.npy[pv],"
     "comma,chkidx:0,svtemp,chkfocus:1,period,chkidx:1,comma,chkidx:0,"
     // Double-click = the stack opens exactly ONCE, poster dropped, nothing
@@ -23689,7 +23815,7 @@ static std::string g_browseKeysActs =
     // ...same overlap on a single-file row: promote once, no duplicate
     // preview, and Enter afterwards re-shows the open file instead of doing
     // nothing (the old final branch) or opening a second copy.
-    "home,down,down,down,down,down,down,chkpv:0,dbl,chkimg:25,"
+    "home,down,down,down,down,down,down,down,chkpv:0,dbl,chkimg:25,"
     "chknames:frame_###.npy*24+dark.npy,enter,chkimg:25,chkcurn:dark.npy,"
     // ...and a group whose numbering starts at 9 (padset): grouping, preview
     // scrub and the double-click open all work by POSITION, not by the
@@ -23705,6 +23831,26 @@ static std::string g_browseKeysActs =
     "home,down,chkatrow:digitset,click,waitdir:digitset,chkback:5,"
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
+    // ---- THE ORDER THE ROWS ARE IN (user decision 2026-08-05: natural).
+    // rb/unpadded is the one fixture whose names are not zero-padded, so it is
+    // the only one where the two candidate orders differ at all: read as TEXT,
+    // lv10 falls between lv1 and lv2. Walking down with the arrow keys asserts
+    // the order the panel actually laid out, through the real sort - and the
+    // group row below the folders makes the same claim about the file names,
+    // because the peer's extent spans frame_1 to frame_10 only if the run was
+    // read by value.
+    //
+    // Placed after the history checks and before the next chkfwd: entering a
+    // folder and backing out costs two history entries (chkback above counts
+    // them) and truncates the forward stack (the double-click below sets it
+    // back to 0 itself).
+    //
+    // This is the on-screen half. --browse-selftest owns the other half: that
+    // this is also the order the stack is BUILT in.
+    "home,down,down,down,down,down,down,enter,waitdir:unpadded,"
+    "home,down,chkatrow:lv1,down,chkatrow:lv2,down,chkatrow:lv10,"
+    "down,chkatrow:frame_1\xE2\x80\xA5" "10.npy,"
+    "back,waitdir:rb,"
     // ...and a folder that is DOUBLE-clicked is entered ONCE, and opens
     // NOTHING. The habit is older than this panel, so the second click will
     // arrive whatever the list mode means by one click; it lands a frame or
@@ -24399,8 +24545,10 @@ static int remoteSelfTest(const char* exe, const char* path) {
         if (!s.glob(groot, "**/frame_*.npy", 6, 2000, hits, trunc, skipped, err)) {
             fprintf(stderr, "selftest: GLOB: skipped (%s: %s)\n", groot.c_str(), err.c_str());
         } else {
-            // 24 in rb/ itself + 3 x 8 under scanroot/
-            bool ok = hits.size() == 48 && !trunc;
+            // 24 in rb/ itself + 3 x 8 under scanroot/ + 3 under unpadded/
+            // (frame_1, frame_2, frame_10 - the unpadded names, which is the
+            //  whole of what that fixture contributes here)
+            bool ok = hits.size() == 51 && !trunc;
             for (const auto& h : hits) if (h.dir) ok = false;
             fprintf(stderr, "selftest: GLOB **/frame_*.npy under %s -> %d hit(s), "
                             "truncated=%d: %s\n",
@@ -25915,6 +26063,52 @@ int main(int argc, char** argv) {
                     viewingHost().empty() ? 0 : 1, said ? "ok" : "FAIL");
             if (!said) ok = false;
         }
+        {   // WHICH END DECIDES THE ORDER. The peer sends a LIST in plain
+            // lexicographic order - serve.cpp merges directories, singles and
+            // groups into one row list and sorts it with `<` on the name - and
+            // this end sorts it AGAIN before drawing, with rbSortShown. That
+            // is the reason a local listing and an ssh listing of the same
+            // folder read identically, and the reason the natural default
+            // needed no protocol change and no peer update: the bytes on the
+            // wire are unchanged and the order is decided here.
+            //
+            // rb/unpadded is where the claim is falsifiable, because its names
+            // are not zero-padded: the REPLY arrives lv1, lv10, lv2 and the
+            // SCREEN must read lv1, lv2, lv10. If the client ever stopped
+            // sorting and drew the reply's order, this is the assertion that
+            // notices - on the local door, which is the same LIST path.
+            std::string sub = B.dir + "/unpadded";
+            remoteBrowseTo(rbMain(), sub);
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == sub && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<std::string> wire, screen;
+            for (const auto& e : B.entries)
+                if (e.dir && e.name.rfind("lv", 0) == 0) wire.push_back(e.name);
+            rbMain().nameNatural = true;
+            std::vector<RbRow> v = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+            std::vector<int> idx(v.size());
+            for (int i = 0; i < (int)v.size(); i++) idx[i] = i;
+            rbSortShown(rbMain(), v, idx);
+            for (int i : idx)
+                if (v[i].isDir() && !v[i].up && v[i].name().rfind("lv", 0) == 0)
+                    screen.push_back(v[i].name());
+            auto say = [](const std::vector<std::string>& s) {
+                std::string t;
+                for (const auto& n : s) t += (t.empty() ? "" : " ") + n;
+                return t;
+            };
+            bool ordOk = wire == std::vector<std::string>{ "lv1", "lv10", "lv2" } &&
+                         screen == std::vector<std::string>{ "lv1", "lv2", "lv10" };
+            fprintf(stderr, "localbrowseselftest: order in %s: peer sent [%s], "
+                            "panel lays out [%s]: %s\n",
+                    sub.c_str(), say(wire).c_str(), say(screen).c_str(),
+                    ordOk ? "ok" : "FAIL");
+            if (!ordOk) ok = false;
+        }
         fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
@@ -26340,6 +26534,100 @@ int main(int argc, char** argv) {
                     (int)B.entries.size(), nb, meta, secs, bombOk ? "ok" : "FAIL");
             if (!bombOk) ok = false;
             std::filesystem::remove_all(bomb, bec);
+        }
+        {   // NAME ORDER (user decision, 2026-08-05: the default is natural).
+            //
+            // The listing used to sort names as text while the stack it opened
+            // was built with rp::naturalLess, so the order on screen was not
+            // the order sigma_t is computed over - and a tooltip in the same
+            // panel already claimed numeric name order. rb/unpadded is the one
+            // fixture that can tell the two apart: every other numbered set
+            // here is zero-padded, and for those the two orders agree.
+            //
+            // Asserted, in order: the listing's own sort (rbSortShown, the
+            // exact function the panel calls), the TREE's per-level sort
+            // (inside the builder, a different code path that has to reach the
+            // same comparator), that the toggle actually still reaches text
+            // order - a test that only checks the default cannot tell a
+            // working switch from a hardwired one - and last, the one that
+            // matters: the frames in the order the panel SHOWS them are the
+            // frames in the order the stack is BUILT from.
+            remoteBrowseTo(rbMain(), dir + "/unpadded");
+            double t4 = nowSec();
+            while (nowSec() - t4 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == dir + "/unpadded" && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            // exactly what the panel lays out: build the view, then sort the
+            // shown-index list with the panel's own sort (a tree is sorted per
+            // level while it is built, so it never comes through rbSortShown)
+            auto onScreen = [&](bool natural, bool flat, bool tree) {
+                rbMain().nameNatural = natural;
+                std::vector<RbRow> v = rbBuildView(rbMain(), &B.dir, B.entries, flat, tree);
+                std::vector<int> idx(v.size());
+                for (int i = 0; i < (int)v.size(); i++) idx[i] = i;
+                if (!tree) rbSortShown(rbMain(), v, idx);
+                std::vector<std::string> names;
+                for (int i : idx) names.push_back(v[i].name());
+                return names;
+            };
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : " ") + n;
+                return s;
+            };
+            // the folder rows, which are what a listing sort can be read off:
+            // directories never collapse into a group, so they ARE the rows
+            auto dirsOf = [](const std::vector<std::string>& v) {
+                std::vector<std::string> d;
+                for (const auto& n : v) if (n.rfind("lv", 0) == 0) d.push_back(n);
+                return d;
+            };
+            const std::vector<std::string> wantNat = { "lv1", "lv2", "lv10" };
+            const std::vector<std::string> wantTxt = { "lv1", "lv10", "lv2" };
+            std::vector<std::string> listNat = onScreen(true, false, false);
+            std::vector<std::string> treeNat = onScreen(true, false, true);
+            std::vector<std::string> listTxt = onScreen(false, false, false);
+            std::vector<std::string> treeTxt = onScreen(false, false, true);
+            // ...and the frames, which only exist as rows when the group is
+            // expanded (flat). The natural listing must agree with the stack.
+            rbMain().nameNatural = true;
+            std::vector<RbRow> fv = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
+            std::vector<int> fidx(fv.size());
+            for (int i = 0; i < (int)fv.size(); i++) fidx[i] = i;
+            rbSortShown(rbMain(), fv, fidx);
+            std::vector<std::string> shownFrames;
+            for (int i : fidx) if (fv[i].member >= 0) shownFrames.push_back(fv[i].name());
+            std::vector<std::string> stacked = shownFrames;
+            sortFramesNumerically(stacked);          // what openRemoteStack gets
+            // the same question asked of TEXT order, which must fail it - the
+            // disagreement is the defect this whole change exists to remove,
+            // so a test that cannot still see it is not testing anything
+            std::vector<std::string> txtFrames;
+            {
+                rbMain().nameNatural = false;
+                std::vector<RbRow> tf = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
+                std::vector<int> ti(tf.size());
+                for (int i = 0; i < (int)tf.size(); i++) ti[i] = i;
+                rbSortShown(rbMain(), tf, ti);
+                for (int i : ti) if (tf[i].member >= 0) txtFrames.push_back(tf[i].name());
+            }
+            rbMain().nameNatural = true;             // leave the panel as found
+            bool listOk  = dirsOf(listNat) == wantNat && dirsOf(listTxt) == wantTxt;
+            bool treeOk2 = dirsOf(treeNat) == wantNat && dirsOf(treeTxt) == wantTxt;
+            bool framesOk = shownFrames.size() == 3 && shownFrames == stacked &&
+                            txtFrames != stacked;
+            bool ordOk = listOk && treeOk2 && framesOk;
+            fprintf(stderr, "browseselftest: name order in %s: listing natural [%s] "
+                            "text [%s]; tree natural [%s] text [%s]; frames shown [%s] "
+                            "vs stacked [%s] agree=%d, text order [%s] differs=%d: %s\n",
+                    B.dir.c_str(), say(dirsOf(listNat)).c_str(), say(dirsOf(listTxt)).c_str(),
+                    say(dirsOf(treeNat)).c_str(), say(dirsOf(treeTxt)).c_str(),
+                    say(shownFrames).c_str(), say(stacked).c_str(),
+                    shownFrames == stacked ? 1 : 0, say(txtFrames).c_str(),
+                    txtFrames != stacked ? 1 : 0, ordOk ? "ok" : "FAIL");
+            if (!ordOk) ok = false;
         }
         {   // PORT. A non-default ssh port used to survive only inside the
             // browse worker: makeRemoteUrl dropped it, and that string is what
@@ -34335,6 +34623,10 @@ int main(int argc, char** argv) {
         // every later action was aimed at - reproduced, two hours of forensics.
         rbMain().flat = app.rbFlat = false;
         rbMain().tree = app.rbTree = false;
+        // ...and the same for the NAME ORDER, for the same reason: with
+        // rbnatural off in the developer's prefs, rb/unpadded lists lv1, lv10,
+        // lv2 and every chkatrow below it is aimed at the wrong row.
+        rbMain().nameNatural = app.rbNatural = true;
         // Key REPEAT is a human affordance; for injected keys it is a race.
         // Each scripted press is held for ~one frame, but a trickle-delayed
         // release across a slow frame (texture uploads after a stack lands)
@@ -35491,6 +35783,7 @@ int main(int argc, char** argv) {
                         // depend on the parity of every toggle before it
                         rbKeysT().flat = false;
                         rbKeysT().tree = false;
+                        rbKeysT().nameNatural = true;
                         rbTreeForget(rbKeysT());
                     }
                     else if (a == "focus") rbShowInstance(rbKeysT());
