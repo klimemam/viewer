@@ -46,6 +46,13 @@
 
 namespace imagefile {
 
+// The viewer's own ceiling on a dimension, the same number core/main.cpp's
+// npyLayout enforces and refuses in the same words. It lives in the header
+// because a backend has to be able to refuse an absurd header BEFORE it
+// allocates for it: 32769 squared in f32 is 4 GB, and "refuse after decoding"
+// would mean the machine swaps first and reads the message second.
+enum { MAX_DIM = 32768 };
+
 // One decoded picture: exactly the fields a FrameSource needs, and no others.
 // There is deliberately no frame axis here - PNG and JPEG hold one picture, and
 // a multi-page TIFF is a stack, which is the caller's word (App::SeqInfo) and

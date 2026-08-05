@@ -74,6 +74,15 @@ static bool stbDecode(const uint8_t* p, size_t n, Image& out, std::string& err) 
     // hand it a length that is not the file's, so the size is a refusal - one
     // more thing the seam checks so that a backend cannot be wrong quietly.
     if (n > (size_t)0x7fffffff) { err = "file is too large for this decoder (> 2 GiB)"; return false; }
+    // Ask the header first. decode() checks the dimensions again afterwards -
+    // that is the seam's guarantee and it stays - but a header claiming 60000
+    // square would have been believed by the decoder long before the seam got
+    // to see it, and 14 GB of float32 is not a thing to allocate on the way to
+    // saying no.
+    if (stbi_info_from_memory(p, (int)n, &w, &h, &comp) && (w > MAX_DIM || h > MAX_DIM)) {
+        err = "unsupported image size (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+        return false;
+    }
     const bool png = sniffPng(p, n);
     // 16 bits is the case this audience actually has: a camera engineer's PNG
     // is far more likely to be 16-bit than 8, and reading it through the 8-bit
@@ -284,7 +293,7 @@ bool decode(const std::string& path, const std::vector<uint8_t>& bytes,
         err = std::string(b->format) + ": no pixels in it" + CHOOSE_A_READER;
         return false;
     }
-    if (img.w > 32768 || img.h > 32768) {
+    if (img.w > MAX_DIM || img.h > MAX_DIM) {
         err = "unsupported image size";
         return false;
     }
