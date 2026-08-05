@@ -310,6 +310,14 @@ struct ImageDoc {
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
     float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
+    // A COMPUTED frame - today only a stack's frame average - has no file behind
+    // it, so the session cannot round-trip it the way it round-trips an open.
+    // What it CAN round-trip is the RECIPE: this holds the first-frame path of
+    // the stack that was averaged (the key Series members already travel by,
+    // for the same reason - paths round-trip, ids and names do not), and the
+    // restore recomputes the mean once that stack is back. Empty on every frame
+    // that came from a file, which is every other frame in the program.
+    std::string avgOfPath;
 
     // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
     // fields because they are read on 240+ lines (docs/reference-design.md
@@ -1182,6 +1190,18 @@ struct App {
                         std::string axisName, axisUnit;
                         std::vector<double> axisVals; };
     std::vector<SeqRestore> seqRestore;
+    // "Open as frame average" on a stack that is not here yet. Browse opens are
+    // asynchronous - the first frame shows and the rest stream in - so the mean
+    // cannot be taken at click time; the request is parked on the seqId it is
+    // waiting for and fired by pumpStackAverages() once nothing more is coming.
+    // A session restore pushes into the SAME list (through avgRestore below), so
+    // there is one place where a stack becomes an average and one set of rules
+    // about when it is allowed to happen.
+    std::vector<int> pendingAvg;
+    // ...and the session's side of it, by PATH, resolved lazily exactly like
+    // seriesRestore: at parse time a folder stack is one loose image plus a
+    // queued rescan, so the stack this names does not exist yet.
+    std::vector<std::string> avgRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the
@@ -3489,6 +3509,8 @@ static void closeAll() {
     app.seqLoadingId = 0;
     app.seqQueue.clear();
     app.seqRestore.clear();
+    app.pendingAvg.clear();           // they name stacks being thrown away...
+    app.avgRestore.clear();           // ...and paths that will not be open either
     app.rbOpenQueue.clear();
     for (auto& bp : app.browsePanels) bp->pendingOpen.clear();
     app.ana.img = nullptr;
@@ -6033,12 +6055,13 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // A derived image (a ROI montage) has no file behind it, so isSavedLine
     // drops it - correctly, since nothing could reload it. But dropping it in
     // silence is the one thing this format does not do: say how many.
-    int derived = 0;
+    int derived = 0, avgs = 0;
     for (auto& d : app.images)
-        if (d->src->path.empty()) derived++;
+        if (d->src->path.empty()) { derived++; if (!d->avgOfPath.empty()) avgs++; }
     if (derived)
-        fprintf(stderr, "session: %d derived image(s) not saved "
-                        "(no file to reload them from)\n", derived);
+        fprintf(stderr, "session: %d derived image(s) not saved (no file to reload "
+                        "them from); %d of those are frame averages, whose RECIPE "
+                        "is saved instead\n", derived, avgs);
     for (auto& d : app.images) {
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
@@ -6117,6 +6140,32 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 if (r.uid == d->uid) { f << "seqload 1\n"; break; }
         }
     }
+    // ---- computed frames: the RECIPE, never the pixels ----------------------
+    // A frame average has no file, so isSavedLine dropped it above - correctly,
+    // nothing could reload those pixels. What survives instead is the
+    // derivation: the stack it averaged, named by the path of that stack's FIRST
+    // FRAME (the key series members already travel by, for the same reasons -
+    // ids do not survive a session and names are renameable and not unique), and
+    // the mean is taken again on restore.
+    //
+    // The alternative was to give the frame its source's path so an ordinary
+    // `image` line would carry it. That is what materializeDerivedFrame does and
+    // it is why a derived stack comes back as its whole source; here it would be
+    // worse still - the session would reload frame 0 from disk and hand it back
+    // under the name "frame average", with the note that said otherwise gone.
+    // A computed frame either comes back computed or does not come back.
+    int avgLost = 0;
+    for (auto& d : app.images) {
+        if (d->avgOfPath.empty()) continue;
+        bool live = false;                    // its stack must still be open, or
+        for (auto& o : app.images)            // there is nothing left to average
+            if (o->seqId != 0 && o->src->path == d->avgOfPath) { live = true; break; }
+        if (!live) { avgLost++; continue; }
+        f << "stackavg " << d->avgOfPath << "\n";   // path last: may contain spaces
+    }
+    if (avgLost)
+        fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
+                        "not saved, because the frames they averaged are gone\n", avgLost);
     // ---- series (系列), after the image lines -------------------------------
     // A FLAT block with unique keys, on purpose: an older viewer skips every
     // line it does not know and still opens the session, and this one opens a
@@ -7272,6 +7321,11 @@ static std::string loadSession(const std::string& path) {
             if (lastImageOk && cur() && !cur()->src->path.empty() && std::isfinite(lv))
                 app.seqLevelLegacy.push_back({ cur()->src->path, lv });
         }
+        // A computed frame's RECIPE: "the mean of the stack whose first frame is
+        // this path". Collected here and resolved after everything is open, for
+        // exactly the reason the series block gives below - and taken again
+        // rather than reloaded, because there is no file holding the answer.
+        else if (key == "stackavg") app.avgRestore.push_back(restOfLine(ls));
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
         // with a queued rescan behind it. See resolveSeriesRestore.
@@ -8223,6 +8277,7 @@ static void resolvePendingSeries() {
 }
 
 // called once per frame: integrate decoded frames, then chain the next stack
+static void pumpStackAverages();   // fwd: it needs computeStackStats, defined below
 static void pumpSequenceAndQueue() {
     pumpSequence();
     // one restore at a time, matched by uid: indices shift as frames land
@@ -8259,6 +8314,12 @@ static void pumpSequenceAndQueue() {
         if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
         if (!app.seriesPending.empty()) resolvePendingSeries();
     }
+    // Parked frame averages last, and behind the same "everything has landed"
+    // gate: a mean taken while the stack is still filling would be a mean of
+    // however many frames happened to have arrived by then. It rides here so
+    // every selftest's drain loop drives it too, without a second pump to keep
+    // in step.
+    pumpStackAverages();
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -11349,6 +11410,34 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                  "(File > Stack loading > Memory budget)", fit + 1, (int)files.size());
         app.seqNote = msg;
     }
+}
+
+static void requestStackAverage(int seqId);   // fwd: needs computeStackStats, defined below
+// "Open as frame average" from Browse: open the stack exactly as "Open as
+// stack" does, and park the mean until its frames are here. Browse opens are
+// asynchronous by design (first frame now, the rest in the background), so
+// there is no seqId to hand back at click time and nothing to average yet.
+//
+// The stack really is OPENED - this is not a way of computing a mean without
+// paying for the frames. It cannot be: the mean is over the pixels, so the
+// pixels have to arrive. What the user gets is both, which is also what makes
+// the result checkable against its own source.
+static void openStackForAverage(const std::string& host, const std::vector<std::string>& files,
+                                const std::string& name, int port = 0) {
+    if (files.empty()) return;
+    const int firstNewSeq = app.nextSeqId;
+    openRemoteStack(host, files, name, port);
+    int got = 0;
+    for (const auto& s : app.seqs)
+        if (s.id >= firstNewSeq) { got = s.id; break; }
+    // ...or an existing stack was reused: openRemote builds the SeqInfo itself
+    // for a frame-axis file, and takes an early return through openRemoteStack.
+    if (!got && !app.images.empty()) got = app.images.back()->seqId;
+    if (!got) {
+        toast("frame average: that did not open as a stack (a mean needs a time axis)", true);
+        return;
+    }
+    requestStackAverage(got);
 }
 
 // A preview becomes a registered open the moment it is USED: double-click,
@@ -15407,13 +15496,25 @@ struct StackStats {
     double mean[4] = {}, sigmaT[4] = {};
     uint64_t nonFinite = 0;       // samples EXCLUDED, reported not hidden
     size_t dropped = 0;           // pixels with fewer than 2 valid frames
+    size_t unknown = 0;           // samples with NO valid frame: the mean does not exist
     std::string err;
 };
 
 // Per-plane mean and temporal sigma of one stack's resident frames, over the
 // given ROI. The same statistic the server aggregate computes, evaluated on
 // whatever is local - which covers NAS data and fully fetched remote stacks.
-static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
+//
+// meanOut (optional): the PER-PIXEL temporal mean over the ROI, interleaved
+// exactly like a frame's pixels (rw*rh*C floats). This is the picture "Open as
+// frame average" opens, and it comes out of THIS accumulator on purpose - the
+// mean drawn on screen and the mean printed in the Temporal table are then the
+// same number by construction, not by two functions agreeing today. (Doing it
+// twice is the defect this codebase keeps finding: PRNU twice, naturalLess
+// versus compare, the channel rule in three places.) A sample no frame had a
+// finite value for is NaN there - unknown, and said so, rather than 0, which
+// would be a measurement.
+static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
+                                    std::vector<float>* meanOut = nullptr) {
     StackStats out;
     std::vector<int> fr = framesOfSeq(seqId);
     const ImageDoc* first = nullptr;
@@ -15453,6 +15554,18 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
                 s1[i] += v; s2[i] += v * v; cn[i]++;
             }
         }
+    if (meanOut) {
+        // float32 out, DOUBLE all the way in. sum[] is double for exactly this
+        // reason: adding hundreds of float32 samples in float32 loses low bits
+        // at up to half a ULP per add, and a dark-current map IS its low bits -
+        // the whole point of averaging N frames is to see what one frame's noise
+        // buries. A pixel no frame had a finite value for comes out NaN, which
+        // every panel already reads as "not measured"; 0 would be a measurement.
+        meanOut->resize(samples);
+        for (size_t i = 0; i < samples; i++)
+            (*meanOut)[i] = cnt[i] ? (float)(sum[i] / (double)cnt[i])
+                                   : std::numeric_limits<float>::quiet_NaN();
+    }
     out.nPl = first->cfa ? 4 : 1;
     double plM[4] = {}, plV[4] = {};
     size_t plC[4] = {};
@@ -15462,6 +15575,7 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
             for (int c = 0; c < C; c++) {
                 size_t i = ((size_t)y * rw + x) * C + c;
                 double nI = (double)cnt[i];
+                if (nI < 1) out.unknown++;                 // and no mean either
                 if (nI < 2) { out.dropped++; continue; }   // no variance to speak of
                 double m = sum[i] / nI;
                 double var = std::max(0.0, sum2[i] / nI - m * m) * (nI / (nI - 1.0));
@@ -15476,6 +15590,199 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
     out.frames = (int)use.size();
     out.valid = true;
     return out;
+}
+
+// ---- frame average: a stack's per-pixel mean, opened as ONE frame ----------
+// One tooltip for every door into it: the five Browse entry points and the
+// Files panel item must not describe the same operation five different ways.
+static const char* AVG_TIP =
+    "Open the stack's PER-PIXEL MEAN across frames as one frame -\n"
+    "a dark-current map, a flat field, the level sigma_t is the noise\n"
+    "around. Accumulated in double; non-finite samples are excluded\n"
+    "per pixel and counted. A mosaic stays a mosaic. The result is a\n"
+    "computed frame, not a capture, and says so in its name and note;\n"
+    "the stack itself stays open beside it.";
+
+// A STACK-level operation whose VALUE is a FRAME. docs/terminology.md makes that
+// an ordinary frame hanging straight off the source's batch ("単発 frame は stack
+// を経由せず batch に直接ぶら下がってよい"), seqId 0 - so Histogram, Projection
+// and ROIs work on it because there is nothing here for them to special-case.
+// The picture is the point: a dark-current map, a flat field, the thing sigma_t
+// is the noise AROUND. Getting it today means opening N frames and leaving.
+//
+// PROVENANCE IS THE HARD PART. This image looks exactly like a capture and will
+// end up in a report as one if it does not keep saying otherwise. So it says it
+//   - in its NAME, which is what the Files panel and every title bar show,
+//   - in its NOTE, which is what the Inspector shows (and the Files tooltip,
+//     which now falls back to the note when there is no path to print),
+//   - and through a session, by avgOfPath below.
+// src->path stays EMPTY - deliberately, and this is the load-bearing line. Give
+// it the source file's path, the way materializeDerivedFrame does, and
+// isSavedLine writes an ordinary `image` line; the next session then reloads
+// frame 0 from disk and presents ONE CAPTURE as the mean, under this name, with
+// no note left to contradict it. Empty path means the session cannot save the
+// pixels, so it saves the RECIPE instead and takes the mean again.
+//
+// THE SOURCE STACK STAYS OPEN. Averaging reads every frame to yield one, so
+// closing the source afterwards would look like a saving. It is not: the note
+// names that stack, and provenance pointing at something the program silently
+// destroyed is worth less than the memory. Close stack is one click away in the
+// same menu, and there the user can see what they are closing.
+static bool stackAverageFrame(int seqId, std::string& err) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) { err = "that stack is not open"; return false; }
+    const std::string srcName = si->name;
+    const int expected = si->expectedFrames;
+    std::vector<int> fr = framesOfSeq(seqId);
+    // The reference frame is the first RESIDENT full-resolution one - the same
+    // frame computeStackStats measures against, since a remote preview is a
+    // decimated stand-in and its pixels are not this stack's pixels.
+    const ImageDoc* ref = nullptr;
+    for (int idx : fr) {
+        const ImageDoc* d = app.images[idx].get();
+        if (d->src->remoteStep > 1 || d->px().empty()) continue;
+        ref = d;
+        break;
+    }
+    if (!ref) { err = "no frame of \"" + srcName + "\" is loaded yet"; return false; }
+    // Everything read off ref or si must be COPIED OUT before addImage: the
+    // push_back below can reallocate app.images and both pointers dangle.
+    const int W = ref->w, H = ref->h, C = ref->ch;
+    const int refCfa = ref->cfa, refCfaPat = ref->cfaPattern, refLut = ref->displayLut;
+    const bool refColorize = ref->cfaColorize;
+    const float refBlack = ref->black, refWhite = ref->white;
+    const int refBatch = ref->batchId;
+    // The stack's FIRST frame names it for the session, resident or not - the
+    // same key Series members travel by, for the same reason (paths round-trip;
+    // ids do not survive a session and names are renameable and not unique).
+    const std::string firstPath = app.images[fr.front()]->src->path;
+    std::vector<float> mean;
+    // ONE averaging in the program. This is the accumulator the Temporal panel's
+    // mean and sigma_t come out of, so the number under the picture and the
+    // number in the table cannot disagree - see computeStackStats.
+    StackStats st = computeStackStats(seqId, 0, 0, W, H, &mean);
+    if (!st.valid) { err = "frame average of \"" + srcName + "\": " + st.err; return false; }
+    const int n = st.frames;
+    const int N = std::max(expected, n);
+
+    auto out = std::make_unique<ImageDoc>();
+    FrameSource& S = *out->src;
+    S.w = W; S.h = H; S.ch = C;
+    // NOT the source dtype. The mean of N integers is not an integer, and
+    // labelling fractional DN "u16" would misdescribe every number printed off
+    // this frame. Same call montageROI makes when its values stop being DN.
+    S.dtype = "f32";
+    S.data = std::move(mean);
+    // The mean is PER PIXEL: nothing moves, nothing resamples, every pixel keeps
+    // its coordinate and therefore its Bayer phase. So a Bayer stack's mean IS
+    // still Bayer and the declaration travels verbatim - per-plane statistics on
+    // the result are the per-plane statistics of the stack, which is the whole
+    // reason a mosaic must never be silently dropped here.
+    out->cfa = refCfa; out->cfaPattern = refCfaPat; out->cfaColorize = refColorize;
+    out->displayLut = refLut;
+    out->syncMirrors();
+    out->batchId = refBatch;
+    const std::string ofN = n < N ? std::to_string(n) + " of " + std::to_string(N)
+                                  : std::to_string(n);
+    out->name = srcName + "  frame average (" + ofN + " frames)";
+    // docs/terminology.md, 実装上の不変条件: "部分ロードされた stack の集計は
+    // 「何枚中何枚か」を必ず併記する". The canon says STATE the ratio, not refuse
+    // the aggregate - every other stack-level statistic in the program (montage,
+    // Temporal, the linearity rows) already reads that way, and a mean over 8 of
+    // 24 frames is a real measurement of 8 frames. What it must never do is call
+    // itself "the average", so the count is in the name, in the note, and in a
+    // warning toast; and the count is of frames actually AVERAGED (st.frames),
+    // not of frames present, so a ragged or preview frame cannot inflate it.
+    std::string note = "frame average of \"" + srcName + "\": per-pixel mean over " +
+                       ofN + " frame(s), accumulated in double";
+    if (st.nonFinite)
+        note += "; " + std::to_string((unsigned long long)st.nonFinite) +
+                " non-finite sample(s) EXCLUDED - each pixel's own denominator";
+    if (st.unknown)
+        note += "; " + std::to_string((unsigned long long)st.unknown) +
+                " sample(s) had no finite frame at all and are NaN here";
+    if (n < N)
+        note += "; the stack is PARTLY LOADED - this is the mean of the " +
+                std::to_string(n) + " frame(s) present, not of all " + std::to_string(N);
+    if (firstPath.empty())
+        note += "; no file path behind the source stack, so a session cannot "
+                "recompute this frame";
+    out->note = note;
+    out->avgOfPath = firstPath;
+    out->texDirty = true;
+    fprintf(stderr, "frame average: %s - %d of %d frame(s), %dx%d %dch, cfa=%d, "
+                    "%llu excluded, %llu unknown\n", srcName.c_str(), n, N, W, H, C,
+            refCfa, (unsigned long long)st.nonFinite, (unsigned long long)st.unknown);
+    addImage(std::move(out));
+    // addImage runs defaultRange, which is right for a file just opened and
+    // wrong here. Averaging suppresses exactly the spread an auto-range keys
+    // off, so the mean would come back stretched to full contrast over its own
+    // residue and look nothing like the frames it summarises. It inherits the
+    // source's display range instead, and is directly comparable with them.
+    ImageDoc* made = app.images.back().get();
+    made->black = refBlack; made->white = refWhite;
+    if (n < N)
+        toast("frame average: " + std::to_string(n) + " of " + std::to_string(N) +
+              " frames are loaded - the result says so", true);
+    else
+        toast("frame average of \"" + srcName + "\": " + std::to_string(n) + " frames");
+    return true;
+}
+
+// Everything settled: no local loader running, no decoded frame waiting to be
+// integrated, no queued open and no remote fetch outstanding anywhere. This is
+// the same predicate every selftest's drain loop waits on, and it is the gate a
+// parked frame average fires behind - a stack that is still filling has a
+// different mean every second, and taking one mid-flight would silently answer
+// a question about however many frames happened to have landed.
+static bool loadingSettled() {
+    return !app.seqRunning && !seqReadyPending() && app.seqQueue.empty() &&
+           app.seqRestore.empty() && app.rbOpenQueue.empty() && app.rfPending <= 0;
+}
+
+// The ONE door every menu item goes through, so that all of them mean the same
+// thing. If everything has landed, the mean is taken now; if anything is still
+// arriving, the request waits. That distinction is not about WHERE it was asked
+// from - a stack half-open in the Files panel is as unfinished as one Browse has
+// only just started fetching, and averaging either of them early would answer a
+// question about "however many frames had arrived by the time you clicked".
+// n of N therefore appears only when the load really did stop short (the memory
+// budget did), which is a fact about the stack rather than about timing.
+static void requestStackAverage(int seqId) {
+    if (!seqId) return;
+    if (!loadingSettled()) {
+        app.pendingAvg.push_back(seqId);
+        const App::SeqInfo* si = seqInfo(seqId);
+        toast("frame average: \"" + (si ? si->name : std::string("stack")) +
+              "\" will be averaged once its frames are here");
+        return;
+    }
+    std::string err;
+    if (!stackAverageFrame(seqId, err)) toast(err, true);
+}
+
+// The parked "Open as frame average" requests, from Browse and from a session.
+static void pumpStackAverages() {
+    if (app.pendingAvg.empty() && app.avgRestore.empty()) return;
+    if (!loadingSettled()) return;
+    // A session's recipes name their stack by path; resolve them the moment
+    // everything is open, exactly as resolvePendingSeries does with members.
+    for (const auto& p : app.avgRestore) {
+        int found = 0;
+        for (const auto& d : app.images)
+            if (d->seqId != 0 && d->src->path == p) { found = d->seqId; break; }
+        if (found) app.pendingAvg.push_back(found);
+        else fprintf(stderr, "session: a frame average named \"%s\", which is not "
+                             "open - not recomputed\n", p.c_str());
+    }
+    app.avgRestore.clear();
+    std::vector<int> todo;
+    todo.swap(app.pendingAvg);
+    for (int id : todo) {
+        if (!seqInfo(id)) continue;              // closed while it was waiting
+        std::string err;
+        if (!stackAverageFrame(id, err)) toast(err, true);
+    }
 }
 
 // least squares y = a*x + b; returns false with fewer than 2 distinct points
@@ -16656,6 +16963,17 @@ static void drawBrowseTemporal() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("open %s for real (frames transfer in the background)",
                           S.label.c_str());
+    ImGui::SameLine();
+    // The server just measured this stack's mean as a NUMBER; this opens the
+    // same mean as a PICTURE. Same copy-first rule as the button beside it -
+    // openRemoteStack fires its own server temporal, which resets S under us.
+    if (ImGui::SmallButton("Open as frame average")) {
+        std::string host = S.host, label = S.label;
+        std::vector<std::string> files = S.files;
+        openStackForAverage(host, files, label);
+        return;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", AVG_TIP);
     ImGui::SameLine();
     if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
     ImGui::Separator();
@@ -21235,6 +21553,24 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                             ? "frames stack in numeric name order"
                             : rbSelStackWhyNot.c_str());
 
+                    // the same selection as ONE frame - the same gate, because
+                    // it is the same open followed by a mean over it
+                    snprintf(lb, sizeof lb, "Open %d selected as frame average", rbNSel);
+                    if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        sortFramesNumerically(files);
+                        std::vector<std::string> bases;
+                        for (const auto& f : files) bases.push_back(baseName(f));
+                        openStackForAverage(B.host, files,
+                                            stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        rbSel.assign(view.size(), 0);
+                    }
+                    if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", rbSelStackWhyNot.empty()
+                            ? AVG_TIP : rbSelStackWhyNot.c_str());
+
                     snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
                     ImGui::BeginDisabled(!rbSelTemporalOk);
                     if (ImGui::MenuItem(lb)) {
@@ -21293,6 +21629,17 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                     }
+                    // ...and the same stack as ONE frame: its per-pixel mean
+                    // across the frame axis. Beside "Open as stack" because it
+                    // is the same subject and the same click, answering the
+                    // other question you open a dark or flat set to ask.
+                    if (ImGui::MenuItem("Open as frame average")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(r.join(m));
+                        openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", AVG_TIP);
                     // the server aggregates WITHOUT opening: "is this set even
                     // worth transferring?" costs zero pixels this way. Group
                     // rows only exist from protocol 3 on, so no version gate.
@@ -21316,6 +21663,10 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
                         openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
+                    if (ImGui::MenuItem("Open as frame average"))
+                        openStackForAverage(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", AVG_TIP);
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
@@ -21325,6 +21676,15 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                             for (const auto& m : e.members) files.push_back(r.join(m));
                             openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                         }
+                        snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
+                                 e.frames);
+                        if (ImGui::MenuItem(sl)) {
+                            std::vector<std::string> files;
+                            for (const auto& m : e.members) files.push_back(r.join(m));
+                            openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", AVG_TIP);
                     }
                     ImGui::Separator();
                 }
@@ -22170,6 +22530,9 @@ static void drawFileList() {
     std::string pendingSerName;
     int pendingJoinSeq = 0, pendingJoinSer = 0, pendingLeaveSeq = 0, pendingNewSerBatch = 0;
     int pendingDeriveSeq = 0;   // opens the Derive stack dialog after the walk
+    int pendingAvgSeq = 0;      // ...and the frame average, for the same reason:
+                                // it appends to app.images, which this walk is
+                                // iterating over
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -22353,7 +22716,17 @@ static void drawFileList() {
                                                        ImGui::GetTextLineHeight()) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
             }
-            if (hov) ImGui::SetTooltip("%s\n%s", dispPath(d.src->path).c_str(), meta);
+            // A COMPUTED frame has no path, so this tooltip led with a blank
+            // line and told the reader nothing at all - and the Files panel is
+            // where a frame average sits beside the captures it will be
+            // confused with. Its provenance note takes the path's place, which
+            // is what the note is for.
+            if (hov) {
+                if (d.src->path.empty() && !d.note.empty())
+                    ImGui::SetTooltip("%s\n%s", d.note.c_str(), meta);
+                else
+                    ImGui::SetTooltip("%s\n%s", dispPath(d.src->path).c_str(), meta);
+            }
             return clicked;
         };
         // One row. mem != nullptr means the row is being drawn INSIDE a series
@@ -22573,6 +22946,13 @@ static void drawFileList() {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
+            // A stack that is ALREADY open gets the same operation Browse
+            // offers at open time - one item, one meaning, one code path
+            // (requestStackAverage). Sitting beside Derive is deliberate: both
+            // make a NEW thing out of this stack and leave this stack alone,
+            // and this is the one that crosses a layer (stack -> frame).
+            if (ImGui::MenuItem("Open frame average")) pendingAvgSeq = si->id;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", AVG_TIP);
             // A NEW stack from a subset of this one - the dialog offers the
             // matching rules (same names / numbers as another stack, a range,
             // hand-picked). Copies frames; this stack is not touched.
@@ -22724,6 +23104,7 @@ static void drawFileList() {
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
     if (pendingDeriveSeq) deriveModalOpen(pendingDeriveSeq);
+    if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {
@@ -23565,6 +23946,7 @@ static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Brows
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack from stack, exit
+static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean as a frame, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -23905,6 +24287,8 @@ static void printUsage() {
         "  --roistats-selftest         the ROI table's numbers and its PRNU column,\n"
         "                              through the real panel, on analytic fixtures\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
+        "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
+        "                              value, NaN exclusion, CFA planes, provenance\n"
         "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
         "                              refcounts, Watch baselines\n"
         "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
@@ -24051,6 +24435,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--derive-selftest") {
             g_deriveSelftest = next();             // handled in main()
+        } else if (a == "--stackavg-selftest") {
+            g_stackAvgSelftest = next();           // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {
@@ -31349,6 +31735,339 @@ int main(int argc, char** argv) {
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "deriveselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
+    // ---- --stackavg-selftest: the frame average's NUMBERS ---------------------
+    // The VALUE, never the menu item. A menu item that opens the wrong image is
+    // a passing test and a wrong measurement, and this image is the one that
+    // ends up in a report as if it had been captured. Every fixture is written
+    // here so CI has seen exactly these numbers: a stack whose mean is known
+    // exactly, a NaN that must be excluded and counted rather than folded into
+    // the divisor, a sample with no finite frame at all, a sum that float32
+    // cannot carry, a mosaic whose four planes must survive per pixel, a partly
+    // loaded stack that must name its count, and a session that must bring the
+    // provenance back rather than a capture wearing its name.
+    if (!g_stackAvgSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "stackavgselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        auto loadAll = [&]() {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        // f4 .npy, pixels given: the NaN and the precision fixtures need
+        // per-pixel control, which a constant-fill writer cannot give.
+        auto writeNpy = [](const std::string& path, int w, int h,
+                           const std::vector<float>& px) {
+            char dict[128];
+            snprintf(dict, sizeof dict,
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+            std::string hdr = dict;
+            size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+            hdr.append(pad, ' ');
+            hdr += '\n';
+            std::ofstream f(pathFromUtf8(path), std::ios::binary);
+            uint16_t hl = (uint16_t)hdr.size();
+            f.write("\x93NUMPY\x01\x00", 8);
+            f.write((const char*)&hl, 2);
+            f.write(hdr.data(), (std::streamsize)hdr.size());
+            f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+        };
+        auto flat = [&](int w, int h, float v) { return std::vector<float>((size_t)w * h, v); };
+        // A scratch subdirectory this test CREATES - never the directory it was
+        // handed, which is a shared fixture root (the derive selftest's comment
+        // records what happened the one time that rule was broken).
+        std::string root = g_stackAvgSelftest;
+        std::replace(root.begin(), root.end(), '\\', '/');
+        while (!root.empty() && root.back() == '/') root.pop_back();
+        root += "/stackavg-scratch";
+        std::error_code ec;
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        const std::string dA = root + "/A", dN = root + "/N", dC = root + "/C",
+                          dP = root + "/P";
+        for (const std::string& d : { dA, dN, dC, dP })
+            std::filesystem::create_directories(pathFromUtf8(d), ec);
+        const int W = 4, H = 4;
+        const float NA = std::numeric_limits<float>::quiet_NaN();
+        // A: 100, 200, 300 -> exactly 200, everywhere.
+        writeNpy(dA + "/f_000.npy", W, H, flat(W, H, 100.0f));
+        writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));
+        writeNpy(dA + "/f_002.npy", W, H, flat(W, H, 300.0f));
+        // N: same three levels, but pixel 0 is NaN in the MIDDLE frame (mean of
+        // the other two = 200 - the same answer, which is the point: excluding
+        // must not shift it) and pixel 1 is NaN in ALL THREE (no mean exists).
+        for (int k = 0; k < 3; k++) {
+            std::vector<float> px = flat(W, H, 100.0f * (k + 1));
+            if (k == 1) px[0] = NA;
+            px[1] = NA;
+            char nm[32]; snprintf(nm, sizeof nm, "/f_%03d.npy", k);
+            writeNpy(dN + nm, W, H, px);
+        }
+        // C: a mosaic. Each Bayer plane gets its own level, so mixing planes
+        // anywhere shows up immediately as a wrong per-plane number.
+        const float BASE[4] = { 1000.0f, 2000.0f, 3000.0f, 4000.0f };   // R Gr Gb B
+        for (int k = 0; k < 3; k++) {
+            std::vector<float> px((size_t)W * H);
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
+                    int p = CFA_MAP[0][(y & 1) * 2 + (x & 1)];          // RGGB
+                    px[(size_t)y * W + x] = BASE[p] + 10.0f * k;
+                }
+            char nm[32]; snprintf(nm, sizeof nm, "/f_%03d.npy", k);
+            writeNpy(dC + nm, W, H, px);
+        }
+        // P: a sum float32 cannot carry. 2^24 + 1 + 1 is 2^24 in float32 (both
+        // ones fall off the end of the mantissa) and 16777218 in double, and the
+        // two means differ by more than a float32 ULP at that magnitude - so
+        // this fixture fails if the accumulator is ever narrowed back to float.
+        writeNpy(dP + "/f_000.npy", W, H, flat(W, H, 16777216.0f));
+        writeNpy(dP + "/f_001.npy", W, H, flat(W, H, 1.0f));
+        writeNpy(dP + "/f_002.npy", W, H, flat(W, H, 1.0f));
+
+        app.seqLoadMode = 1;                    // always load numbered runs
+        // Opens the average of the ONE stack the given folder holds, and hands
+        // back the frame it made. Goes through requestStackAverage, the same
+        // door every menu item uses - a test that called stackAverageFrame
+        // directly would not be testing what the menu does.
+        auto averageOf = [&](const std::string& dir, int* seqOut) -> ImageDoc* {
+            closeAll();
+            openFolder(dir);
+            loadAll();
+            int seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            if (seqOut) *seqOut = seq;
+            if (!seq) return nullptr;
+            size_t before = app.images.size();
+            requestStackAverage(seq);
+            loadAll();                          // settled already, but drive the pump
+            if (app.images.size() != before + 1) return nullptr;
+            return app.images.back().get();
+        };
+
+        {   // ---- A1: the mean is the mean, and the source is untouched --------
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "A1 the average opened as exactly one new image");
+            if (m) {
+                bool allTwoHundred = true;
+                for (float v : m->px()) if (v != 200.0f) allTwoHundred = false;
+                fprintf(stderr, "stackavgselftest: A1 100/200/300 -> %.9g (%dx%d %dch), "
+                                "stack still %zu frames\n",
+                        (double)m->px()[0], m->w, m->h, m->ch, framesOfSeq(seq).size());
+                check(allTwoHundred, "A1 frames at 100, 200, 300 average to exactly 200");
+                check(m->w == W && m->h == H && m->ch == 1,
+                      "A1 ...at the source's size, one frame's worth of pixels");
+                // A frame, per docs/terminology.md: the layer below the stack,
+                // hanging off the same batch. Nothing about it needs a special
+                // case for Histogram / Projection / ROIs to work (issue #48).
+                check(m->seqId == 0, "A2 the result is a FRAME, not a stack");
+                check(m->batchId == app.images[framesOfSeq(seq).front()]->batchId,
+                      "A2 ...in the source stack's batch");
+                check(framesOfSeq(seq).size() == 3,
+                      "A2 ...and averaging did NOT close or consume the source stack");
+            }
+            if (m) {   // ---- A3: provenance, in all three places ---------------
+                const std::string fp = app.images[framesOfSeq(seq).front()]->src->path;
+                fprintf(stderr, "stackavgselftest: A3 name='%s'\n  note='%s'\n",
+                        m->name.c_str(), m->note.c_str());
+                check(m->name.find("frame average") != std::string::npos,
+                      "A3 the NAME says it is a frame average");
+                check(m->note.find("frame average of") != std::string::npos &&
+                      m->note.find("3 frame(s)") != std::string::npos,
+                      "A3 the NOTE names the stack and how many frames");
+                check(m->note.find("double") != std::string::npos,
+                      "A3 ...and says the accumulation was in double");
+                // The load-bearing one: an empty path is what keeps the session
+                // from writing an `image` line that would reload frame 0 from
+                // disk and hand it back under this name as a capture.
+                check(m->src->path.empty(),
+                      "A3 no file path: a computed frame is not a file");
+                check(m->avgOfPath == fp && !fp.empty(),
+                      "A3 ...but it records the stack it averaged, for the session");
+            }
+            if (m) {   // ---- A4: ONE averaging, shared with the stack statistic -
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                double pic = 0;
+                for (float v : m->px()) pic += v;
+                pic /= (double)m->px().size();
+                fprintf(stderr, "stackavgselftest: A4 picture mean %.9g, "
+                                "computeStackStats mean %.9g\n", pic, st.mean[0]);
+                check(st.valid && fabs(pic - st.mean[0]) < 1e-9,
+                      "A4 the picture and the Temporal table are the same number");
+            }
+        }
+
+        {   // ---- A5: a NaN is EXCLUDED and COUNTED, never folded into N -------
+            int seq = 0;
+            ImageDoc* m = averageOf(dN, &seq);
+            check(m != nullptr, "A5 the NaN stack averages");
+            if (m) {
+                // pixel 0: NaN in the middle frame only -> mean(100, 300) = 200.
+                // Folding the NaN in as 0 would give 133.33; keeping N = 3 as
+                // the divisor would give the same 133.33 - both plausible, both
+                // wrong, and both invisible without this assert.
+                // pixel 1: NaN in every frame -> no mean exists, so NaN out.
+                fprintf(stderr, "stackavgselftest: A5 px0=%.9g (want 200), px1=%.9g "
+                                "(want NaN), note='%s'\n",
+                        (double)m->px()[0], (double)m->px()[1], m->note.c_str());
+                check(m->px()[0] == 200.0f,
+                      "A5 a pixel's NaN frame leaves the OTHER frames' mean intact");
+                check(std::isnan(m->px()[1]),
+                      "A6 a pixel with no finite frame at all is NaN, not 0");
+                check(m->note.find("4 non-finite sample(s) EXCLUDED") != std::string::npos,
+                      "A6 ...and the note reports how many samples were excluded");
+                check(m->note.find("1 sample(s) had no finite frame") != std::string::npos,
+                      "A6 ...and how many have no mean at all");
+                // the stack statistic counts the same four, off the same pass
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                check(st.valid && st.nonFinite == 4 && st.unknown == 1,
+                      "A6 computeStackStats reports the identical exclusion counts");
+            }
+        }
+
+        {   // ---- A7: double accumulation, which float32 cannot do -------------
+            int seq = 0;
+            ImageDoc* m = averageOf(dP, &seq);
+            check(m != nullptr, "A7 the precision stack averages");
+            if (m) {
+                const float want = (float)((16777216.0 + 1.0 + 1.0) / 3.0);
+                float f32 = 0;                       // what a float32 accumulator
+                f32 += 16777216.0f; f32 += 1.0f; f32 += 1.0f;   // would have got
+                const float got32 = f32 / 3.0f;
+                fprintf(stderr, "stackavgselftest: A7 double %.9g, float32 %.9g, "
+                                "got %.9g\n", (double)want, (double)got32,
+                        (double)m->px()[0]);
+                check(want != got32,
+                      "A7 the fixture really does separate double from float32");
+                check(m->px()[0] == want, "A7 the mean is the DOUBLE sum's mean");
+            }
+        }
+
+        {   // ---- A8: a mosaic stays a mosaic, per plane -----------------------
+            app.forceCfa = 1; app.forceCfaPattern = 0;      // --cfa bayer, RGGB
+            int seq = 0;
+            ImageDoc* m = averageOf(dC, &seq);
+            check(m != nullptr, "A8 the CFA stack averages");
+            if (m) {
+                check(m->cfa == 1 && m->cfaPattern == 0,
+                      "A8 the CFA declaration travels to the result");
+                // The mean is per pixel, so every pixel keeps its Bayer phase
+                // and each plane's mean is that plane's own level + 10.
+                bool planesOk = true;
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++) {
+                        int p = cfaChannelAt(*m, x, y);
+                        if (m->px()[(size_t)y * W + x] != BASE[p] + 10.0f) planesOk = false;
+                    }
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                fprintf(stderr, "stackavgselftest: A8 per-plane stack means "
+                                "%.9g %.9g %.9g %.9g (want %.9g %.9g %.9g %.9g), "
+                                "nPl=%d\n", st.mean[0], st.mean[1], st.mean[2], st.mean[3],
+                        BASE[0] + 10.0, BASE[1] + 10.0, BASE[2] + 10.0, BASE[3] + 10.0,
+                        st.nPl);
+                check(planesOk, "A8 every pixel is its OWN plane's mean - no plane mixing");
+                bool statOk = st.valid && st.nPl == 4;
+                for (int p = 0; p < 4 && statOk; p++)
+                    if (fabs(st.mean[p] - (BASE[p] + 10.0)) > 1e-6) statOk = false;
+                check(statOk, "A8 ...and the stack's per-plane statistics agree with it");
+            }
+            app.forceCfa = -1;
+        }
+
+        {   // ---- A9: a partly loaded stack NAMES its count --------------------
+            // What the memory budget leaves behind, reproduced exactly as every
+            // other consumer sees it: more frames expected than are resident.
+            // docs/terminology.md requires the ratio to be STATED, not the
+            // aggregate refused - 8 of 24 frames is a real measurement of 8.
+            int seq = 0;
+            closeAll();
+            openFolder(dA);
+            loadAll();
+            seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            if (App::SeqInfo* si = seqInfo(seq)) si->expectedFrames = 5;
+            size_t before = app.images.size();
+            requestStackAverage(seq);
+            loadAll();
+            check(app.images.size() == before + 1, "A9 the partial stack still averages");
+            if (app.images.size() == before + 1) {
+                ImageDoc* m = app.images.back().get();
+                fprintf(stderr, "stackavgselftest: A9 name='%s'\n  note='%s'\n",
+                        m->name.c_str(), m->note.c_str());
+                check(m->name.find("3 of 5") != std::string::npos,
+                      "A9 the NAME says 3 of 5, so it cannot read as 'the average'");
+                check(m->note.find("PARTLY LOADED") != std::string::npos &&
+                      m->note.find("not of all 5") != std::string::npos,
+                      "A9 ...and the note says which 3 and out of how many");
+                check(m->px()[0] == 200.0f,
+                      "A9 ...over the frames that ARE here, not a different denominator");
+            }
+        }
+
+        {   // ---- A10: through a session, as a RECIPE -------------------------
+            // The pixels cannot be saved (the format is a list of files) and the
+            // note is not a session key, so what has to survive is the
+            // derivation. What must NOT happen is the frame coming back as an
+            // ordinary image line pointing at the source file - a single capture
+            // wearing the name "frame average".
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "A10 an average to round-trip");
+            std::string sess = root + "/stackavg.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            check(txt.find("stackavg ") != std::string::npos,
+                  "A10 the session writes the recipe, not the pixels");
+            std::string lerr = loadSession(sess);      // closeAll happens inside
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int avgs = 0, captures = 0;
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images) {
+                if (!d->avgOfPath.empty()) { avgs++; back = d.get(); }
+                else if (d->seqId == 0) captures++;   // a lone frame that is not one
+            }
+            fprintf(stderr, "stackavgselftest: A10 load='%s', %d average(s), %d loose "
+                            "frame(s), %zu image(s)\n", lerr.c_str(), avgs, captures,
+                    app.images.size());
+            check(lerr.empty() && avgs == 1,
+                  "A10 exactly one frame average comes back");
+            check(captures == 0,
+                  "A10 ...and nothing came back as a loose capture in its place");
+            if (back) {
+                bool same = back->w == W && back->h == H;
+                for (float v : back->px()) if (v != 200.0f) same = false;
+                fprintf(stderr, "stackavgselftest: A10 restored note='%s'\n",
+                        back->note.c_str());
+                check(same, "A10 ...recomputed to the same 200, from the reopened stack");
+                check(back->note.find("frame average of") != std::string::npos,
+                      "A10 ...and it is saying what it came from again");
+                check(back->src->path.empty(),
+                      "A10 ...and it still has no file behind it");
+            }
+        }
+
+        closeAll();
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        fprintf(stderr, "stackavgselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
         stopRemoteFetcher();

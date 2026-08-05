@@ -488,6 +488,11 @@ viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --stack 
 # T12 lays the canvas out for real to read back the pane rectangles and badges.
 viewer_selftest(tile        --tile-selftest tools/testdata/multi)
 viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
+# The frame average is arithmetic over pixels, so none of it needs a context:
+# it writes its own fixtures (exact means, NaN, a mosaic, a float32-defeating
+# sum) under a scratch subdirectory and asserts the VALUES, the way
+# --roistats-selftest does rather than the way a menu-item test would.
+viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # F11 draws the Temporal section itself and asserts on the plot geometry.
