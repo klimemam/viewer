@@ -8,8 +8,11 @@ tools/testdata is in git. `--bench` adds the large arrays the frame-time gate
 and the A/B step-throttle measurement use; they are ~330 MB and no selftest
 needs them, so they are opt-in.
 """
+import base64
 import shutil
+import struct
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -317,6 +320,162 @@ if WANT_BENCH:
             stack[k] = (ramp + rng_ab.integers(0, 512, (AB_H, AB_W), dtype=np.int32)
                         ).astype(np.uint16)
         np.save(out / name, stack)
+
+
+# ---------------------------------------------------------------- media/ ----
+# PNG / JPEG / TIFF for --media-selftest (core/imagefile.h).
+#
+# Written with zlib and struct, NOT with Pillow: CI installs numpy and nothing
+# else (.github/workflows/build.yml), and a fixture that only exists on a
+# machine with Pillow is a fixture CI has never seen - which is how the shapes/
+# folder came to be checked on one laptop and nowhere else.
+#
+# Every PNG here is written by hand from its raw samples, so the file's declared
+# bit depth and its values are both known EXACTLY on this side of the round
+# trip. That is what makes "an 8-bit PNG is 0..255 of something, and the viewer
+# must not silently rescale it" a test rather than an opinion.
+media = out / "media"
+media.mkdir(exist_ok=True)
+
+
+def _png_chunk(tag, data):
+    return (struct.pack(">I", len(data)) + tag + data +
+            struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def write_png(path, arr, bit=8, ctype=0, palette=None):
+    """arr: (H,W) or (H,W,C) of ints already in range. ctype: 0 grey, 2 RGB,
+    3 palette, 4 grey+alpha, 6 RGBA. bit: 4, 8 or 16 (4 is greyscale only)."""
+    a = np.asarray(arr)
+    h, w = a.shape[0], a.shape[1]
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                       # filter type 0: none
+        row = a[y]
+        if bit == 16:
+            raw += row.astype(">u2").tobytes()
+        elif bit == 8:
+            raw += row.astype("u1").tobytes()
+        elif bit == 4:                      # two samples to a byte, high nibble first
+            flat = row.astype("u1").ravel()
+            if flat.size % 2:
+                flat = np.append(flat, 0)
+            raw += bytes(((flat[0::2] & 0xF) << 4) | (flat[1::2] & 0xF))
+        else:
+            raise ValueError("bit depth %r" % bit)
+    body = b"\x89PNG\r\n\x1a\n" + _png_chunk(
+        b"IHDR", struct.pack(">IIBBBBB", w, h, bit, ctype, 0, 0, 0))
+    if palette is not None:
+        body += _png_chunk(b"PLTE", np.asarray(palette, "u1").tobytes())
+    body += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    body += _png_chunk(b"IEND", b"")
+    path.write_bytes(body)
+
+
+mh, mw = 48, 64
+myy, mxx = np.mgrid[0:mh, 0:mw]
+
+# 16-bit greyscale: THE case this audience has. The values run past 255 on
+# purpose - a viewer that read this through an 8-bit door, or divided by 65535,
+# would show the same picture and the wrong numbers.
+g16 = ((myy * mw + mxx) * 21 % 65536).astype(np.uint16)
+write_png(media / "gray16.png", g16, bit=16, ctype=0)
+
+# 8-bit greyscale: one frame, ONE channel (the last-axis rule, docs/
+# input-adapters.md 3.1) - not one RGBA frame with three copies of it.
+g8 = ((mxx * 4 + myy) % 256).astype(np.uint8)
+write_png(media / "gray8.png", g8, bit=8, ctype=0)
+
+# 8-bit RGB and RGBA
+rgb8 = np.stack([mxx * 255 // (mw - 1), myy * 255 // (mh - 1),
+                 np.full_like(mxx, 96)], -1).astype(np.uint8)
+write_png(media / "rgb8.png", rgb8, bit=8, ctype=2)
+rgba8 = np.concatenate([rgb8, np.full((mh, mw, 1), 200, np.uint8)], -1)
+write_png(media / "rgba8.png", rgba8, bit=8, ctype=6)
+
+# palette: 8-bit indices that come back as colour samples. The viewer has to say
+# that happened - the numbers on screen are palette entries, not what was stored.
+pal = np.arange(256 * 3, dtype=np.uint8).reshape(256, 3) % 251
+write_png(media / "pal8.png", (mxx % 256).astype(np.uint8), bit=8, ctype=3,
+          palette=pal)
+
+# 4-bit greyscale: the one case where the decoder MULTIPLIES (stb expands 0..15
+# to 0..255 by 17). The fixture exists so that the note saying so is asserted.
+write_png(media / "gray4.png", (mxx % 16).astype(np.uint8), bit=4, ctype=0)
+
+# A JPEG, and the reason it is a literal.
+#
+# There is no JPEG encoder in the standard library and CI installs only numpy,
+# so this one is embedded rather than computed. It was produced ONCE, here, with
+# Pillow 12.3 - the same ramp as rgb8 at 32x24, saved with quality=90,
+# subsampling=0, progressive=False - and everything asserted about it is
+# structural (dimensions, channels, corners within a tolerance), never
+# pixel-exact: it is a LOSSY format, and a different decoder behind the same
+# seam is allowed to differ by a few DN. 859 bytes.
+JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoM"
+    "DAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsN"
+    "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAAR"
+    "CAAYACADAREAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA"
+    "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkK"
+    "FhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWG"
+    "h4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl"
+    "5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
+    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYk"
+    "NOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk"
+    "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD4a0nwJ0/d/pX6jWzHzPFyzNdtTtNI8Cfd"
+    "/d/pXhVsx8z9YyzNdtTtdI8Cfd/d/pXg1sx8z9XyzNdtTtNJ8Cfd/d/pXg1sx8z9YyzNdtTM"
+    "0jwH0/d/pXXWzHzP8lcszXbU7XSfAf3f3f6V4NbMfM/WMszXbU7TSfAf3f3f6V4VbMfM/WMs"
+    "zXbU7XSPAf3f3f6V4NbMfM/WMszXbUzNJ8CdP3f6V11sx8z/ACUyzNdtTtNJ8Cfd/d/pXg1s"
+    "x8z9YyzNdtTtdI8Cfd/d/pXg1sx8z9XyzNdtTtNJ8Cfd/d/pXhVsx8z9YyzNdtT/2Q==")
+jpeg_bytes = base64.b64decode(JPEG_B64)
+(media / "gradient.jpg").write_bytes(jpeg_bytes)
+
+# ...and the same bytes under a .png name. The extension is a claim, the bytes
+# are evidence: this one asserts which of the two the viewer believes, and that
+# it says out loud that they disagreed.
+(media / "mislabelled.png").write_bytes(jpeg_bytes)
+
+
+# A REAL TIFF - baseline, uncompressed, 8-bit greyscale, one strip. This build
+# refuses it for want of a decoder, and that refusal has to be about the missing
+# decoder and not about a malformed file, so the file is genuinely valid. The
+# day a TIFF decoder is linked behind the same seam, this is its round trip.
+def write_tiff_gray8(path, arr):
+    a = np.asarray(arr, np.uint8)
+    h, w = a.shape
+    pixels = a.tobytes()
+    entries = [                                  # (tag, type, count, value)
+        (256, 3, 1, w),                          # ImageWidth
+        (257, 3, 1, h),                          # ImageLength
+        (258, 3, 1, 8),                          # BitsPerSample
+        (259, 3, 1, 1),                          # Compression: none
+        (262, 3, 1, 1),                          # Photometric: BlackIsZero
+        (273, 4, 1, 0),                          # StripOffsets (patched below)
+        (277, 3, 1, 1),                          # SamplesPerPixel
+        (278, 3, 1, h),                          # RowsPerStrip
+        (279, 4, 1, len(pixels)),                # StripByteCounts
+    ]
+    ifd_off = 8
+    data_off = ifd_off + 2 + 12 * len(entries) + 4
+    entries = [(t, ty, c, data_off if t == 273 else v) for (t, ty, c, v) in entries]
+    ifd = struct.pack("<H", len(entries))
+    for tag, typ, cnt, val in entries:
+        # a SHORT value sits in the low half of the 4-byte value field
+        ifd += struct.pack("<HHI", tag, typ, cnt) + (
+            struct.pack("<HH", val, 0) if typ == 3 else struct.pack("<I", val))
+    ifd += struct.pack("<I", 0)                  # no next IFD
+    path.write_bytes(struct.pack("<HHI", 0x4949, 42, ifd_off) + ifd + pixels)
+
+
+write_tiff_gray8(media / "gray8.tif", g8)
+
+# Two ways to be refused, both of which have to say something better than
+# "unsupported": a PNG whose signature is right and whose body is not, and a
+# file that is a .png in name only.
+(media / "broken.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+(media / "notanimage.png").write_bytes(b"hello, this is not a picture\n")
 
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):

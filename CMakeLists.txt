@@ -42,6 +42,23 @@ FetchContent_Declare(pfd
   SOURCE_SUBDIR does-not-exist)
 FetchContent_MakeAvailable(pfd)
 
+# stb_image: the PNG/JPEG decoder behind core/imagefile.h. ONE HEADER, fetched
+# as one file rather than as the whole stb repository - the archive is 6 MB of
+# twenty other libraries and their test images, and none of it would be built.
+# DOWNLOAD_NO_EXTRACT says it is not an archive; SOURCE_SUBDIR keeps
+# MakeAvailable from looking for a CMakeLists.txt beside it, the same trick pfd
+# uses above. Pinned by COMMIT and checked by hash, because a raw.githubusercontent
+# URL on a branch is not a version - the hash is what makes this reproducible.
+#
+# It is NOT vendored into the repository: no third-party source is committed
+# here, which is the rule every other dependency already follows.
+FetchContent_Declare(stb
+  URL https://raw.githubusercontent.com/nothings/stb/013ac3beddff3dbffafd5177e7972067cd2b5083/stb_image.h
+  URL_HASH SHA256=594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
+  DOWNLOAD_NO_EXTRACT TRUE
+  SOURCE_SUBDIR does-not-exist)
+FetchContent_MakeAvailable(stb)
+
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -70,6 +87,7 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
+                      core/imagefile.cpp core/stb_image_impl.c
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
 # configure-time hash goes stale the moment you commit, and this string is
@@ -90,12 +108,16 @@ target_include_directories(viewer PRIVATE ${CMAKE_BINARY_DIR}/generated)
 set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
                             COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>"
                             COMPILE_DEFINITIONS "MINIZ_NO_STDIO")
+# ...and the same for stb_image's implementation, for the same reason. The
+# wrapper around it (core/imagefile.cpp) is OURS and stays under -Wall -Wextra.
+set_source_files_properties(core/stb_image_impl.c PROPERTIES
+                            COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>;$<$<C_COMPILER_ID:MSVC>:/w>")
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
 # where the server pulls its own peer binary from (binaries branch)
 set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
 target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
-target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR})
+target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} ${stb_SOURCE_DIR})
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
 endif()
@@ -262,7 +284,7 @@ else()
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
-# The binary carries 24 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# The binary carries 25 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
 # script to get exactly what CI got. There is no second copy of the argument
 # lists anywhere - adding a test here adds it to CI.
@@ -278,7 +300,7 @@ enable_testing()
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
 # Six of the tests below do (seven counting the quarantined line at the bottom);
-# the other 19 take the --no-window startup path and need neither a display nor
+# the other 20 take the --no-window startup path and need neither a display nor
 # this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -412,7 +434,7 @@ add_test(NAME test_display_falsecolor COMMAND test_display_falsecolor)
 set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
-# through --no-window against this build, and the 19 below came back with output
+# through --no-window against this build, and the 20 below came back with output
 # byte-identical to the same test with a window (the load-progress line
 # "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
@@ -504,6 +526,12 @@ viewer_selftest(sweepfile   NOGL --sweepfile-selftest tools/testdata/levelfiles)
 # carries the .raw fixture the second decode path needs. NOGL: it dumps a
 # table and draws nothing, verified by running it both ways.
 viewer_selftest(srcmap NOGL --srcmap-selftest tools/testdata/multi)
+
+# The 24th: PNG and JPEG through core/imagefile.h, and TIFF's refusal.
+# Deliberately NOGL - what it asserts is bit depth, channel count, the note the
+# Inspector prints and the wording of a refusal, none of which is a rectangle,
+# so it gates on all three runners rather than on the one with a GL context.
+viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 
 # --remote-selftest returns before startup reaches GLFW at all, so it was the
 # one test carrying NOGL before there was a windowless startup path - and it

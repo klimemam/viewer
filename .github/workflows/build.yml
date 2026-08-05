@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # xvfb + libgl1-mesa-dri: six of the 27 selftests create a real GLFW
+          # xvfb + libgl1-mesa-dri: six of the 28 selftests create a real GLFW
           # window and a GL context, so a headless runner needs a display and a
           # software GL driver to run those six - and this is the only runner
           # in the matrix where they can run at all. (The bench step needs them
@@ -59,7 +59,7 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # The 24 --*-selftest flags, on every OS in the matrix. The list lives in
+      # The 25 --*-selftest flags, on every OS in the matrix. The list lives in
       # CMakeLists.txt; this script builds, regenerates tools/testdata and runs
       # ctest, printing one line per selftest and the full output of any that
       # fail. Same command a developer runs locally - that is the point of it.
@@ -67,11 +67,11 @@ jobs:
       #
       # The script probes for an OpenGL context first and reports what it found.
       # Only the Linux runner has one (xvfb + libgl1-mesa-dri, installed above),
-      # and it runs all 27. On Windows and macOS the hosted runners have no GL,
-      # so the 21 that take the --no-window startup path run and gate there,
+      # and it runs all 28. On Windows and macOS the hosted runners have no GL,
+      # so the 22 that take the --no-window startup path run and gate there,
       # and the six that draw real ImGui frames are skipped BY NAME with GLFW's
-      # own reason printed. Read the "ran N, skipped M" line: it is 27/0 on
-      # Linux and 21/6 on the other two, and a run that selects nothing at all
+      # own reason printed. Read the "ran N, skipped M" line: it is 28/0 on
+      # Linux and 22/6 on the other two, and a run that selects nothing at all
       # is a failure rather than a very fast pass.
       #
       # Nothing here lists any test. Which set a test belongs to is the word
@@ -174,6 +174,12 @@ jobs:
           Copy-Item build/Release/viewer.exe stage/
           Copy-Item build/Release/viewer-serve.exe stage/
           Copy-Item -Recurse build/plugins stage/plugins
+          # The attribution the bundled libraries require travels WITH the
+          # binaries: the binaries branch is the distribution, and a notice
+          # file that only exists in the source tree has not been given to
+          # anybody who received a build. (LICENSE joins it here once the
+          # project has one - that choice is the owner's to make.)
+          Copy-Item THIRD-PARTY-NOTICES.md stage/
           # desktop shortcut installer, and the icons it points at (the green
           # viewer-remote.ico is what a connect-to-a-server shortcut gets)
           Copy-Item tools/install_shortcut.cmd stage/
@@ -200,12 +206,14 @@ jobs:
           # install_shortcut.sh writes the .desktop entry / .app bundle and wants
           # icons/viewer.png next to it, so both travel with the binaries
           cp tools/install_shortcut.sh build/
+          # ...and the third-party attribution, for the reason in the Windows step
+          cp THIRD-PARTY-NOTICES.md build/
           # the reader harness travels with the binary - see the Windows step
           mkdir -p build/tools/import
           cp tools/import/run_adapter.py tools/import/viewer_import.py build/tools/import/
           cp -r tools/import/adapters build/tools/import/adapters
           rm -rf build/tools/import/adapters/__pycache__
-          tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh tools
+          tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh tools THIRD-PARTY-NOTICES.md
       # upload-artifact v6 / download-artifact v7 are the Node 24-native pairs
       # (the major numbers differ by one across the two actions); v5 of each
       # still declared node20 and warned on every run.
