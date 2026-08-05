@@ -156,8 +156,8 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 **入口は1つ**: [`core/imagefile.h`](../core/imagefile.h) の `imagefile::decode()`。
 返るのは `.npy` が返すのと同じもの (w/h/ch・dtype 名・float32 の画素・note) で、
 `loadImageFile()` がそれを `ImageDoc` にする。**ライブラリの名前を知っている
-翻訳単位は `core/imagefile.cpp` ただ1つ**で、差し替えは表の1行と関数1つの
-入れ替えで済む (§ の表の `Backend` 行)。
+翻訳単位は `core/imagefile.cpp` ただ1つ**で、差し替えは `backends()` の表の1行と、
+その行が指す関数1つの入れ替えで済む。
 
 | 形式 | いま読んでいるもの | 状態 |
 |---|---|---|
