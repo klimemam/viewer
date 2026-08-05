@@ -42,22 +42,26 @@ FetchContent_Declare(pfd
   SOURCE_SUBDIR does-not-exist)
 FetchContent_MakeAvailable(pfd)
 
-# stb_image: the PNG/JPEG decoder behind core/imagefile.h. ONE HEADER, fetched
-# as one file rather than as the whole stb repository - the archive is 6 MB of
-# twenty other libraries and their test images, and none of it would be built.
-# DOWNLOAD_NO_EXTRACT says it is not an archive; SOURCE_SUBDIR keeps
-# MakeAvailable from looking for a CMakeLists.txt beside it, the same trick pfd
-# uses above. Pinned by COMMIT and checked by hash, because a raw.githubusercontent
-# URL on a branch is not a version - the hash is what makes this reproducible.
+# stb_image: the PNG/JPEG decoder behind core/imagefile.h. VENDORED as one
+# header in third_party/stb/, deliberately breaking this project's own rule
+# that no third-party source is committed.
 #
-# It is NOT vendored into the repository: no third-party source is committed
-# here, which is the rule every other dependency already follows.
-FetchContent_Declare(stb
-  URL https://raw.githubusercontent.com/nothings/stb/013ac3beddff3dbffafd5177e7972067cd2b5083/stb_image.h
-  URL_HASH SHA256=594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
-  DOWNLOAD_NO_EXTRACT TRUE
-  SOURCE_SUBDIR does-not-exist)
-FetchContent_MakeAvailable(stb)
+# The rule is there so dependencies stay updatable and their provenance stays
+# obvious, and fetching served both - until it was the ONLY thing a build
+# needed the network for. glfw, imgui, miniz and pfd are all fetched too, but
+# an existing checkout has them cached, so a new dependency is the only kind
+# that surfaces: adding stb made a clean clone unbuildable offline, on the
+# machine of the person who most needs to build one. That is a worse property
+# than a committed file.
+#
+# Provenance is kept in the file, not in the build: stb_image.h carries its own
+# version banner, THIRD-PARTY-NOTICES.md records the licence, and the commit
+# below is the one it came from. It is MIT-or-public-domain, so committing it
+# is permitted; the MIT option is the one taken.
+#
+#   https://raw.githubusercontent.com/nothings/stb/013ac3beddff3dbffafd5177e7972067cd2b5083/stb_image.h
+#   SHA256 594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
+set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
