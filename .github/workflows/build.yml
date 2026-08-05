@@ -267,10 +267,16 @@ jobs:
           git commit -m "binaries for ${GITHUB_SHA}"
           # The branch name carries where it came from, so a machine with only
           # git can ask for a specific build by name and get exactly it.
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+          # GITHUB_REF is refs/pull/N/merge on a pull_request event, which
+          # sanitises into "binaries-refs-pull-64-merge-" - a name nobody can
+          # guess and `update.cmd --fetch` cannot be told. GITHUB_HEAD_REF
+          # carries the actual branch there and is empty everywhere else, so
+          # prefer it and fall back to the ref name.
+          SRC="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          if [ "${SRC}" = "main" ]; then
             TARGET=binaries
           else
-            TARGET="binaries-$(echo "${GITHUB_REF#refs/heads/}" | tr -c 'A-Za-z0-9._-' '-')"
+            TARGET="binaries-$(echo "${SRC}" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
           fi
           echo "publishing as ${TARGET}"
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
