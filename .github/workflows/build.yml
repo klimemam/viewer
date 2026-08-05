@@ -172,14 +172,14 @@ jobs:
         run: |
           New-Item -ItemType Directory stage | Out-Null
           Copy-Item build/Release/viewer.exe stage/
+          Copy-Item build/Release/viewer-serve.exe stage/
+          Copy-Item -Recurse build/plugins stage/plugins
           # The attribution the bundled libraries require travels WITH the
           # binaries: the binaries branch is the distribution, and a notice
           # file that only exists in the source tree has not been given to
           # anybody who received a build. (LICENSE joins it here once the
           # project has one - that choice is the owner's to make.)
           Copy-Item THIRD-PARTY-NOTICES.md stage/
-          Copy-Item build/Release/viewer-serve.exe stage/
-          Copy-Item -Recurse build/plugins stage/plugins
           # desktop shortcut installer, and the icons it points at (the green
           # viewer-remote.ico is what a connect-to-a-server shortcut gets)
           Copy-Item tools/install_shortcut.cmd stage/
@@ -213,7 +213,7 @@ jobs:
           cp tools/import/run_adapter.py tools/import/viewer_import.py build/tools/import/
           cp -r tools/import/adapters build/tools/import/adapters
           rm -rf build/tools/import/adapters/__pycache__
-          tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh tools \n                                THIRD-PARTY-NOTICES.md
+          tar -czf viewer.tgz -C build viewer viewer-serve plugins icons install_shortcut.sh tools THIRD-PARTY-NOTICES.md
       # upload-artifact v6 / download-artifact v7 are the Node 24-native pairs
       # (the major numbers differ by one across the two actions); v5 of each
       # still declared node20 and warned on every run.
