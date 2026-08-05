@@ -70,6 +70,10 @@ static const char* pngColourName(int colour) {
 
 static bool stbDecode(const uint8_t* p, size_t n, Image& out, std::string& err) {
     int w = 0, h = 0, comp = 0;
+    // This library takes the buffer length as an int. Truncating silently would
+    // hand it a length that is not the file's, so the size is a refusal - one
+    // more thing the seam checks so that a backend cannot be wrong quietly.
+    if (n > (size_t)0x7fffffff) { err = "file is too large for this decoder (> 2 GiB)"; return false; }
     const bool png = sniffPng(p, n);
     // 16 bits is the case this audience actually has: a camera engineer's PNG
     // is far more likely to be 16-bit than 8, and reading it through the 8-bit
