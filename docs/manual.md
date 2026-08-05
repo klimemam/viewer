@@ -181,6 +181,29 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 - **Reinterpret raw...**: RAW 由来の画像を画素フォーマットから読み直し(ダイアログ再表示、
   ビュー位置・ズームは維持)
 
+### 2.3b PNG / JPEG(TIFF は現状 未対応)
+
+そのまま開けます。**値は保存されたまま** —— 8bit は 0..255、16bit は 0..65535 [DN] で、
+**0..1 に正規化しません**。表示レンジの初期値だけがビット深度から決まります。
+
+| | 読めるもの | 備考 |
+|---|---|---|
+| **PNG** | 1/2/4/8/16 bit、grey / grey+alpha / RGB / RGBA / palette / interlace | **16bit がそのまま 16bit で入ります** |
+| **JPEG** | baseline / progressive、8bit | codec の YCbCr→RGB を通った値である旨が note に出ます |
+| **TIFF** | **無し** | 「この build には TIFF デコーダがありません」と**名指しで断ります** |
+
+- チャンネル数は npy と同じ規則: **grey は 1ch、RGBA は 4ch**(モノクロが 4ch に
+  水増しされることはありません)
+- **何をして、何をしなかったかは Inspector の note に出ます** ——
+  `PNG greyscale, 16-bit; values as stored, no scaling or transfer curve applied` のように。
+  4bit 以下の PNG だけはデコーダが 0..255 へ展開する(×17 等)ので、**その倍率も note に出ます**
+- PNG/JPEG は CFA を運ばないので **Bayer とは名乗りません**。モザイクとして扱いたい
+  場合は Inspector の **Interpret** か `--cfa`(=ユーザーの宣言)を使います
+- **Browse パネルの一覧には出ません**(一覧とサーバ側統計は npy 前提)。
+  File > Open・drag & drop・コマンドライン・セッション復元では開きます
+
+設計と、ライブラリの差し替え方: [input-adapters.md §3.6](input-adapters.md)
+
 ## 2.4 連番(stack)
 
 **1枚開くと、同じフォルダの連番を1つの「塊」として裏で読み込めます。** 塊は

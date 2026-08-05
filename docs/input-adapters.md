@@ -142,6 +142,75 @@ read as   1 frame x 3 ch   (H,W,C)         [ re-read as... ]
 raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示するので、
 そもそも推測が無い — 今のままでよい。
 
+### 3.6 PNG / JPEG / TIFF — 形を推測しない形式は、器に訊く
+
+**決定 (2026-08-04、ユーザー)**:
+
+> PNG/JPEG/TIFF を native で読む。提案のライブラリでよし、**自前でラッパーを
+> 作っておいて後で中身を差し替えられる**ようにしておいてください。
+
+これらの形式は `.npy` と違って**寸法もチャンネル数もビット深度も器が名乗る**ので、
+§3.1 の形の判定は要らない。代わりに決めることは「**何のライブラリが読むか**」と
+「**その値をどう扱うと宣言するか**」の2つで、前者は変わりうるので隠す。
+
+**入口は1つ**: [`core/imagefile.h`](../core/imagefile.h) の `imagefile::decode()`。
+返るのは `.npy` が返すのと同じもの (w/h/ch・dtype 名・float32 の画素・note) で、
+`loadImageFile()` がそれを `ImageDoc` にする。**ライブラリの名前を知っている
+翻訳単位は `core/imagefile.cpp` ただ1つ**で、差し替えは表の1行と関数1つの
+入れ替えで済む (§ の表の `Backend` 行)。
+
+| 形式 | いま読んでいるもの | 状態 |
+|---|---|---|
+| PNG | stb_image 2.30 (1ヘッダ、MIT/PD、FetchContent でハッシュ固定) | 8/16bit、grey/GA/RGB/RGBA/palette |
+| JPEG | 同上 | baseline / progressive、8bit |
+| TIFF | **無し** | **未実装。名指しで断る** (下記) |
+
+**値の扱い — 宣言する、推測しない。**
+
+- **保存されたままの値**。8bit は 0..255、16bit は 0..65535。**0..1 に割らない。**
+  画素の単位は [DN] 固定 (§8-9) で、整数は値を保ったまま f32 に載る (§4.8)。
+  ここで正規化すると「**リンクされたライブラリによって同じファイルの測定値が
+  変わる**」ことになり、ラッパーが防ぐべき最大の事故がそれである
+- **16bit が主役**。この分野の PNG は 8bit より 16bit のほうが多い。ファイルの
+  ビット深度がどちらの経路を通るかを決めるのであって、8bit が「普通」で 16bit が
+  その変種、という作りにはしない
+- **伝達特性は当てない**。PNG も JPEG も「この数字が何か」を名乗らないので、
+  viewer は**自分が何をしなかったか**を note に書く
+  (`values as stored, no scaling or transfer curve applied`)。Inspector に出る
+- **唯一スケールが変わる場所は宣言する**: 1/2/4bit PNG はデコーダが 0..255 へ
+  展開する (×255/×85/×17)。note が深度と倍率を名指しする
+- **JPEG は codec の色変換を通った値**である旨を note に書く (`YCbCr->RGB`)。
+  可逆/非可逆で振る舞いは変えない (2026-08-03 決定) が、**何が起きたかは書く**
+- チャンネル数は §3.1 と同じ規則: **grey は 1ch、RGBA は 4ch**。デコーダに
+  「常に RGBA でくれ」と頼めば実装は短くなるが、モノクロ画像が 4ch になり
+  per-channel 統計が無意味になる
+
+**断り方は §3.2 の体裁のまま** (ファイル名・理由・次にすること)。3種類ある:
+
+```
+gray8.tif: TIFF is not read by this build
+  no TIFF decoder is linked in this build - TIFF carries 16-bit and float
+  samples and sometimes a CFA pattern, and this viewer will not guess at any of them
+  PNG and JPEG are read natively
+  choose a reader to read it another way
+```
+
+**TIFF を実装しなかった理由**: TIFF は3つの中で唯一**測定値を運ぶ**器
+(16bit/float、黒レベル、CFA パターン) で、**中途半端に読むのは読まないより悪い**。
+LZW/deflate/tiled/planar/float と分岐が多く、CFA (`PhotometricInterpretation=32803`)
+のパターンを読み違えれば**色も per-plane 統計も静かに間違う**。したがって
+**RGGB と決め打ちして開くくらいなら断る**。器としては表に載っているので、
+libtiff を入れる日に変わるのは `Backend` の1行と関数1つだけである。
+
+**CFA の規則**: `cfa` は**読めたときだけ**立てる。PNG/JPEG は CFA を運ばないので
+常に 0。`--cfa bayer` はユーザーの宣言なので従来どおり効く (推測ではない)。
+
+**既知の境界**: Browse パネル (`local://` peer 経由) の一覧は `isNpyName` で
+絞られており、peer (`core/serve.cpp`) は npy しか読まない。したがって
+**PNG/JPEG は Browse の一覧には出ない** — File > Open・drag & drop・
+コマンドライン引数・セッション復元では開く。peer に配らせるのは別件
+(docs/media-support.md の (b) と同じ形になる)。
+
 ---
 
 ## 4. リーダの仕様

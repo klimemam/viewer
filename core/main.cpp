@@ -1,5 +1,5 @@
 // viewer v0.1 — native image viewer for engineering data
-// Features: .npy / .bin/.raw loading, hover pixel inspection, coordinate rulers,
+// Features: .npy / .bin/.raw / .png/.jpg loading, hover pixel inspection, rulers,
 //           zoom/pan, black/white point normalization.
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -26,6 +26,7 @@
 #include "version.h"                 // the commit this binary was built from
 #include "remote.h"
 #include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
+#include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
 #include "app_icon.h"
 #include "window_frame.h"
@@ -5352,6 +5353,45 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
     return {};
 }
 
+// A PICTURE FILE: PNG, JPEG - and TIFF, which refuses by name in this build.
+// The decoding is behind core/imagefile.h so that the library can be replaced
+// without this file learning its name; what comes back is the same Image the
+// .npy door produces, so everything downstream is unchanged.
+//
+// It sits HERE, next to loadNpy, deliberately. The alternative - a second
+// "open a picture" path with its own document creation, its own note and its
+// own error wording - is how two doors to the same room drift apart, which
+// this file has already paid for once (loadNpy and the .npz member loop said
+// different things about a partial stack until they were made one function).
+static std::string loadImageFile(const std::string& path) {
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) return "cannot read file";
+    imagefile::Image img;
+    std::string err;
+    if (!imagefile::decode(path, buf, img, err)) return err;
+
+    auto im = std::make_unique<ImageDoc>();
+    im->name = baseName(path);
+    FrameSource& S = *im->src;
+    S.path = path;
+    S.w = img.w; S.h = img.h; S.ch = img.ch;
+    S.dtype = img.dtype;
+    S.data = std::move(img.data);
+    // npyShape stays empty on purpose: these formats declare their own axes, so
+    // there is no second reading of them to offer (§3.3's menu is computed from
+    // that shape, and an empty one means "no other reading exists").
+    im->note = img.note;
+    // Only what the decoder READ. No format here can be relied on to declare a
+    // CFA pattern, so none of them claims one - and --cfa still applies in
+    // addImage, because that is the user declaring it rather than us guessing.
+    im->cfa = img.cfa;
+    im->cfaPattern = img.cfaPattern & 3;
+    im->syncMirrors();
+    statSourceFile(S);              // the file on disk IS these pixels: Watch baseline
+    addImage(std::move(im));
+    return {};
+}
+
 // ---- §3.3: say it again, and mean it ----------------------------------------
 // The successor to --npy-axis. Not one guess corrected by another: the reading
 // is a DECLARATION, so it is remembered on the source, saved with the session,
@@ -5880,7 +5920,9 @@ static void restoreFull() {
         // the reading is part of what "the same file" means: restoring the full
         // frame must not quietly hand back the native reading of a file the user
         // has already said is read some other way (§3.3)
-        std::string err = loadNpy(im->src->path, im->src->npyRead);
+        std::string err = imagefile::forPath(im->src->path)
+                        ? loadImageFile(im->src->path)
+                        : loadNpy(im->src->path, im->src->npyRead);
         if (!err.empty() || (int)app.images.size() == before) {
             toast("restore failed: " + (err.empty() ? std::string("reload error") : err), true);
             return;
@@ -7428,9 +7470,15 @@ static std::string loadSession(const std::string& path) {
                         for (const auto& d : app.images)
                             if (d->src->path == p) { already = true; break; }
                         err = already ? std::string() : openWithReader(p, rspec);
-                    } else
-                        err = isNpz ? loadNpz(p, pendingMember, pendingRead)
-                                    : loadNpy(p, pendingRead);
+                    } else if (isNpz)
+                        err = loadNpz(p, pendingMember, pendingRead);
+                    else if (imagefile::forPath(p))
+                        // a session that saved a .png must reopen a .png:
+                        // loadNpy would fail its magic check and the document
+                        // would come back as "cannot open", not as pixels
+                        err = loadImageFile(p);
+                    else
+                        err = loadNpy(p, pendingRead);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -11470,6 +11518,15 @@ static void openPath(const std::string& path) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else toast("session restored: " + baseName(path));
+    } else if (imagefile::forPath(path)) {
+        // PNG / JPEG / TIFF. The extension only chooses this door; what decodes
+        // is decided by the bytes behind it. A format that is listed but has no
+        // decoder in this build (TIFF) refuses HERE, by name and with a reason,
+        // instead of falling through to the raw dialog and asking a user who
+        // opened a .tif to type in its width.
+        std::string err = loadImageFile(path);
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+        else toast("loaded " + baseName(path));
     } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
         openFolder(path);                     // dropping a folder loads every stack below it
     } else {
@@ -11483,8 +11540,13 @@ static void openFileDialog() {
         return;
     }
     if (app.openDlg) return;             // one dialog at a time
+    // The picture formats come from the format table rather than from a literal
+    // here, so a format gained or lost in core/imagefile.cpp cannot leave the
+    // dialog offering (or hiding) something the viewer no longer does.
+    const std::string media = imagefile::dialogPattern();
+    const std::string pat = "*.npy *.npz *.bin *.raw *.yuv *.dat " + media;
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (*.npy *.npz *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.bin *.raw *.yuv *.dat",
+        std::vector<std::string>{ "Images (" + pat + ")", pat,
           "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
@@ -23574,6 +23636,7 @@ static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise line
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
+static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
 // --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
 // window. It takes no directory because it needs no file: every fixture it
 // measures is analytic and built in memory (see roiStatsSelftest()).
@@ -23827,7 +23890,8 @@ static std::string g_browseKeysActs =
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
-        "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
+        "  files:  .npy, .npz, .png, .jpg, .vsession (saved session),\n"
+        "          or raw binaries (.bin/.raw/...)\n"
         "  folder: loads the numbered files below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
@@ -23907,6 +23971,7 @@ static void printUsage() {
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
         "                              refcounts, Watch baselines\n"
+        "  --media-selftest <dir>      PNG/JPEG bit depth, channels and notes; TIFF's refusal\n"
         "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
         "  --browse-selftest <dir>     Browse panel behaviour\n"
         "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
@@ -24065,6 +24130,8 @@ static void parseCli(int argc, char** argv) {
             g_newwinSelftest = next();             // handled in main()
         } else if (a == "--srcmap-selftest") {
             g_srcmapSelftest = next();             // handled in main()
+        } else if (a == "--media-selftest") {
+            g_mediaSelftest = next();              // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | local-fetch
@@ -24108,7 +24175,11 @@ static void parseCli(int argc, char** argv) {
                            [](unsigned char c) { return (char)std::tolower(c); });
             bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
                            (low.size() > 4 && low.compare(low.size() - 4, 4, ".npz") == 0) ||
-                           (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
+                           (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0) ||
+                           // ...and a picture format, which carries its own
+                           // dimensions and dtype: --raw-* on the same command
+                           // line is for the files that carry none
+                           imagefile::forPath(a) != nullptr;
             if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;
@@ -28770,6 +28841,211 @@ int main(int argc, char** argv) {
 
         srcMapDump("M7 final");
         fprintf(stderr, "srcmapselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
+    // ---- PNG / JPEG / TIFF, through the format seam (core/imagefile.h) ------
+    // What this test is FOR, in one line: a picture format must arrive as the
+    // same kind of thing a .npy arrives as, with its own numbers intact.
+    //
+    // So the assertions are about meaning, not about "it opened":
+    //   * the 16-bit PNG comes back sample for sample, 0..65535 - not divided
+    //     by anything, not read through an 8-bit door;
+    //   * a greyscale PNG is ONE channel and RGBA is FOUR (the last-axis rule),
+    //     rather than everything being padded to 4 the way a decoder's
+    //     convenience API would have delivered it;
+    //   * where the decoder DID change the scale (a 4-bit PNG, expanded x17)
+    //     the note says so, because the Inspector is where a user finds out
+    //     what happened to their numbers;
+    //   * a refusal names the file and the reason (docs/input-adapters.md
+    //     §3.2) - "unsupported" is not a message, and TIFF being absent from
+    //     this build is a different sentence from a file being corrupt.
+    //
+    // Every case goes through openPath, the door a drop or a command line uses,
+    // so what is asserted is the sentence the user actually gets.
+    if (!g_mediaSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "mediaselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        const std::string root = g_mediaSelftest;
+        auto open1 = [&](const char* name) -> ImageDoc* {
+            closeAll();
+            app.toast.clear();
+            openPath(root + "/" + name);
+            return app.images.empty() ? nullptr : app.images[0].get();
+        };
+        auto has = [](const std::string& hay, const char* needle) {
+            return hay.find(needle) != std::string::npos;
+        };
+
+        // ---- M1: the seam's own contract ------------------------------------
+        // Every row either decodes or explains itself. A row with neither is a
+        // format that would refuse with an empty sentence, which is the exact
+        // failure this table exists to prevent.
+        {
+            bool sound = !imagefile::backends().empty();
+            for (const imagefile::Backend& b : imagefile::backends()) {
+                if (!b.format || !b.exts || !b.sniff) sound = false;
+                if (b.decode && (b.absent || !b.library || !*b.library)) sound = false;
+                if (!b.decode && (!b.absent || !*b.absent)) sound = false;
+            }
+            fprintf(stderr, "mediaselftest: table = %zu format(s), decodable: %s\n",
+                    imagefile::backends().size(), imagefile::decodableFormats().c_str());
+            check(sound, "M1 every format either decodes or says why it does not");
+            check(imagefile::decodableFormats() == "PNG, JPEG",
+                  "M1 this build decodes PNG and JPEG");
+        }
+
+        // ---- M2: 16-bit PNG, sample for sample ------------------------------
+        // The round trip: tools/gen_testdata.py wrote (y*W+x)*21, and that is
+        // what has to come back. A decoder that normalised to 0..1, or that
+        // took the 8-bit path, passes "it opened" and fails here.
+        {
+            ImageDoc* d = open1("gray16.png");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 1;
+            bool exact = shape;
+            if (shape)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)((i * 21) % 65536)) exact = false;
+            fprintf(stderr, "mediaselftest: M2 %s dtype=%s min=%g max=%g white=%g note=\"%s\"\n",
+                    d ? "opened" : "NOT OPENED", d ? d->dtype.c_str() : "",
+                    d ? d->vmin : 0.0f, d ? d->vmax : 0.0f, d ? d->white : 0.0f,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M2 a 16-bit greyscale PNG is one 1-channel frame");
+            check(exact, "M2 every sample survives: (y*W+x)*21, unscaled");
+            check(d && d->dtype == "u16" && d->vmax == 64491,
+                  "M2 the dtype is the FILE's (u16) and the range is 0..65535 DN");
+            check(d && d->white == 65535, "M2 the display range defaults to the u16 full scale");
+            check(d && has(d->note, "16-bit") && has(d->note, "no scaling"),
+                  "M2 the note says what was read and what was NOT done to it");
+            check(d && d->src->fsize > 0, "M2 the Watch baseline is stamped (file, size)");
+        }
+
+        // ---- M3: the channel rule, all four ways ----------------------------
+        // docs/input-adapters.md §3.1: the last axis, four or fewer, is
+        // channels. Greyscale is 1 - asking the decoder for RGBA always (the
+        // usual way to call one) would have made every mono capture 4-channel
+        // and every per-channel statistic meaningless.
+        {
+            ImageDoc* g = open1("gray8.png");
+            bool grey = g && g->ch == 1 && g->dtype == "u8" && g->w == 64 && g->h == 48;
+            bool greyVals = grey;
+            if (grey)
+                for (int y = 0; y < 48 && greyVals; y++)
+                    for (int x = 0; x < 64 && greyVals; x++)
+                        if (g->px()[(size_t)y * 64 + x] != (float)((x * 4 + y) % 256))
+                            greyVals = false;
+            check(grey && greyVals, "M3 8-bit greyscale is 1 channel, values as stored");
+            check(g && g->white == 255, "M3 an 8-bit file's default range is 0..255 DN");
+
+            ImageDoc* c = open1("rgb8.png");
+            bool rgb = c && c->ch == 3 &&
+                       c->sample(0, 0, 0) == 0 && c->sample(0, 0, 2) == 96 &&
+                       c->sample(63, 0, 0) == 255 && c->sample(0, 47, 1) == 255;
+            check(rgb, "M3 RGB is 3 channels, in file order");
+
+            ImageDoc* a = open1("rgba8.png");
+            check(a && a->ch == 4 && a->sample(0, 0, 3) == 200,
+                  "M3 RGBA is 4 channels and alpha is a channel, not applied");
+
+            ImageDoc* p = open1("pal8.png");
+            bool pal = p && p->ch == 3 && p->sample(0, 0, 0) == 0 &&
+                       p->sample(0, 0, 1) == 1 && p->sample(0, 0, 2) == 2;
+            check(pal, "M3 a palette PNG becomes colour samples");
+            check(p && has(p->note, "palette"),
+                  "M3 ...and says so: the numbers are palette entries now");
+        }
+
+        // ---- M4: where the decoder changes the scale, it is declared --------
+        // A 4-bit PNG holds 0..15 and stb hands back 0..255 (x17). That is the
+        // ONE place these formats are rescaled, and an undeclared rescale is
+        // precisely the failure this project refuses to ship.
+        {
+            ImageDoc* d = open1("gray4.png");
+            bool vals = d && d->ch == 1 && d->px()[0] == 0 && d->px()[1] == 17 &&
+                        d->px()[2] == 34 && d->px()[3] == 51;
+            fprintf(stderr, "mediaselftest: M4 note = \"%s\"\n", d ? d->note.c_str() : "");
+            check(vals, "M4 a 4-bit PNG arrives expanded to 0..255");
+            check(d && has(d->note, "4-bit") && has(d->note, "x17"),
+                  "M4 ...and the note names the depth AND the factor");
+        }
+
+        // ---- M5: JPEG - lossy, and honest about the colour transform --------
+        // Structural, never pixel-exact: a different decoder behind this seam
+        // is allowed to differ by a few DN, and a test that forbade that would
+        // be a test of stb_image rather than of the viewer.
+        {
+            ImageDoc* d = open1("gradient.jpg");
+            bool shape = d && d->w == 32 && d->h == 24 && d->ch == 3 && d->dtype == "u8";
+            // (not "near": <windows.h> defines that one away)
+            auto about = [](float v, float want) { return v > want - 12 && v < want + 12; };
+            bool corners = shape &&
+                           about(d->sample(0, 0, 0), 0) && about(d->sample(31, 0, 0), 255) &&
+                           about(d->sample(0, 23, 1), 255) && about(d->sample(0, 0, 2), 96);
+            fprintf(stderr, "mediaselftest: M5 %dx%d %dch corners %g/%g/%g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0,
+                    d ? d->sample(0, 0, 0) : -1.f, d ? d->sample(31, 0, 0) : -1.f,
+                    d ? d->sample(0, 23, 1) : -1.f, d ? d->note.c_str() : "");
+            check(shape, "M5 a baseline JPEG opens as one 3-channel 8-bit frame");
+            check(corners, "M5 the ramp comes back where it was written");
+            check(d && has(d->note, "YCbCr"),
+                  "M5 the note names the codec's colour transform - it happened to the numbers");
+        }
+
+        // ---- M6: the bytes decide, and the disagreement is said out loud ----
+        {
+            ImageDoc* d = open1("mislabelled.png");
+            fprintf(stderr, "mediaselftest: M6 note = \"%s\"\n", d ? d->note.c_str() : "");
+            check(d && d->ch == 3 && d->w == 32,
+                  "M6 a JPEG named .png decodes as the JPEG it is");
+            check(d && has(d->note, "the name says PNG but the bytes are JPEG"),
+                  "M6 ...and the note says the name and the bytes disagreed");
+        }
+
+        // ---- M7: TIFF is absent, and that is a SENTENCE ---------------------
+        // §3.2's register: the file, the reason, and what to do instead. The
+        // fixture is a valid baseline TIFF, so this cannot pass by accident on
+        // a malformed-file path.
+        {
+            ImageDoc* d = open1("gray8.tif");
+            const std::string msg = app.toast;
+            fprintf(stderr, "mediaselftest: M7 toast = \"%s\"\n", msg.c_str());
+            check(!d && app.images.empty(), "M7 a TIFF opens nothing in this build");
+            check(has(msg, "gray8.tif"), "M7 the refusal names the file");
+            check(has(msg, "TIFF is not read by this build") &&
+                  has(msg, "no TIFF decoder is linked"),
+                  "M7 ...and names what is missing, not just 'unsupported'");
+            check(has(msg, "PNG and JPEG are read natively") && has(msg, "choose a reader"),
+                  "M7 ...and says what does work, and where to go next");
+            check(app.readerPanelOpen && app.readerPickPath.find("gray8.tif") != std::string::npos,
+                  "M7 the refusal IS the affordance: the Reader panel is raised on it");
+        }
+
+        // ---- M8: the two other ways to be refused ---------------------------
+        {
+            ImageDoc* d = open1("broken.png");
+            std::string msg = app.toast;
+            fprintf(stderr, "mediaselftest: M8 broken = \"%s\"\n", msg.c_str());
+            check(!d && has(msg, "broken.png") && has(msg, "PNG:"),
+                  "M8 a corrupt PNG is refused, by name, as a PNG");
+            check(has(msg, "stb_image"),
+                  "M8 ...and names the decoder that said so");
+
+            d = open1("notanimage.png");
+            msg = app.toast;
+            fprintf(stderr, "mediaselftest: M8 not-an-image = \"%s\"\n", msg.c_str());
+            check(!d && has(msg, "not a PNG, JPEG or TIFF file") && has(msg, "68 65 6c 6c"),
+                  "M8 a file that is none of them is refused with its first bytes");
+        }
+
+        closeAll();
+        fprintf(stderr, "mediaselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
         stopMeasureWorker();
