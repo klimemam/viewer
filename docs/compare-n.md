@@ -95,7 +95,12 @@ C は frame 200 を持ち D は 150 で終わる、が普通に起きる (再撮
 
 ## 4. 数値側 — 残っている N 化
 
-Projection は済 (行 = スロット、wide 表は行軸をスロットに空けてある)。
+~~Projection は済~~ → **表のみ済・チャートは A/B のまま** (行 = スロット、wide 表は
+行軸をスロットに空けてある)。この行の「済」が #60 の実機報告「projection が
+3個以上にならん」の正体だった — projExtra への供給と表の行は N だが、
+プロファイル曲線を描く側はスロットを一度も撫でていない (2026-08-06 棚卸し)。
+今は画面がそう**言う**ようになった (「slot C, D: no curve here yet …」、
+`g_projSideProbe` + selftest N6 が固定)。重ねる本体は §12 の I7。
 Temporal はチャート済・表は A|B|Δ のまま。残り:
 
 - **キャッシュの N 化が先決。** ~~`hist[2]` / `temporal[2]`~~ → **`hist[2]` のみ**。
@@ -277,13 +282,141 @@ issue #60 の続きとして、**画像側の見せ方**が決まった。原文
   `rows ⊆ curves ∪ said-no-curve` を検査する。これは「黙って落とす」ことだけを
   狙って書かれており、突然変異 (表を2件で打ち切る) で赤くなることを確認済み。
 
+**済 (2026-08-06, branch `compare-n-audit` — #60 の棚卸し)**:
+
+- **アーミング経路の検査** (selftest N5)。#60 の第一の問い「スロットを3つ以上
+  armed にする経路はあるか」への答え: **経路は 93cc9ad 時点で壊れていない**。
+  Files 行メニューの判断を `slotRowItem()` に出し (abRowItem と同じ理由:
+  フレーム無しで検査できる場所へ)、N5 が C・D・E をその門を通して armed にし、
+  5 側すべてが行と曲線に出ることを実機で固定した。N1–N4 は addCompareSlot を
+  直接呼んでいたので「N 個渡せるか」を誰も見ていなかった — 等式
+  rows ⊆ curves ∪ said-no-curve は空集合でも成り立つ、の再発防止がこれ。
+- **Projection の沈黙の返済** (§4 の訂正参照)。プロットが取らなかった letter を
+  画面が名指しし (`slot C, D: no curve here yet …`)、`g_projSideProbe` +
+  selftest N6 が等式をこのパネルにも張った。**曲線そのものはまだ A/B のみ**
+  (I7 が本体)。
+- **2前提の語彙の一掃** (#60 named: 「auto over both」)。直したもの:
+  Inspector コンボと View メニューの display range 3件 (`auto over both (union)`
+  → `auto over every side (union)`、`B uses A's range` → `every side uses A's
+  range`)、`Overlay (A solid, B dashed)` → `(every side on one plot)` (dash は
+  既に存在しない描き方だった)、スロット項目のツールチップ (Split を「2枚専用」
+  側に数えていた — Split こそタイルが出るモード)、ヒストグラムの
+  `bins both sides` → `bins every side`、ヘルプの比較サイクル (diff / blink が
+  抜けていた)。manual.md / startup.md の引用も同時に更新。
+  **残っている2前提の語彙は §12 の「開いている判断」参照** — 置き換えが
+  レイアウト設計に依存するもの (チップの `A/B split 50%` など) は直していない。
+
 **未**:
 
 - **`compareBUid` + `cmpExtra` → `slots[0..]` の一本化** (§8-1)。
   約50箇所。挙動不変の機械的作業だが、このブランチには入っていない。
-- **グリッド / side-by-side のモード化** (§10)。今の `tileLayout` は
-  `TilePane { x0, w }` しか返さない**1行専用**なので、行を持つには
-  `TilePane` に `y0/h` を足し、`drawCanvas`・バッジ probe・tile selftest の
-  T 群を追う必要がある。加えてモード enum と永続化と View メニュー。
-- N-blink (§8-4)、`SLOT_LETTERS` の 14 → 6 (§8-3)、Release all slots、
-  ROI 表の N 行トグル、`Run on slot` (§4, §5)。
+- **グリッド / side-by-side のモード化** (§10 → 仕様は §12 I6)。
+- **Projection の N 重ね** (§12 I7)。
+- N-blink (§8-4 → 仕様は §12)、`SLOT_LETTERS` の 14 → 6 (§8-3)、
+  Release all slots、ROI 表の N 行トグル、`Run on slot` (§4, §5)。
+
+---
+
+## 12. 次の増分 — レイアウトのモード化 (I6) と Projection の N 重ね (I7)
+
+2026-08-06、#60 の棚卸しの出口。§10 の判断を実装できる粒度まで下ろす。
+**ここは仕様であって実装ではない** — 作業は機械的になるまで分解してある。
+設計判断が残る箇所は末尾「開いている判断」に**名指しで**分離した。
+
+### I6: 並べる系のモード (side-by-side / grid)
+
+**状態**:
+
+- `enum CmpLayout { LayoutRow = 0, LayoutGrid = 1 }` — `App::cmpLayout`、
+  既定 `LayoutRow` (今のタイル1行と同一の見た目なので、入れた日の挙動は不変)。
+- `App::cmpGridCols` (int、既定 2、最小 1) — グリッドの**列数はユーザーが
+  明示する** (§10 の原文「モードの列挙 + グリッドの列数」)。枚数からの導出は
+  しない — 導出はモード自動切替と同じ穴に落ちる。
+
+**永続化**: セッションの `compare` 行の末尾に 2 フィールド追記
+(`compare <mode> <wipeFrac> <splitFrac> <diffGain> <diffAbs> <flipAuto>
+<flipPeriod> <layout> <gridCols>`)。古いセッションは短い行のまま読めて
+既定に落ちる — 既存キーの読み方を変えない (正典どおり)。
+
+**エンジンは1つ** (§10): `tileLayout` が `cols` を取り、`TilePane` が
+`y0/h` を持つ。side-by-side は **cols = n を渡すだけ** (行数1に固定した
+グリッド)。レイアウト経路を2本書かない。
+
+**安定性の不変条件** — これが要求の核心 (§10):
+
+- **armed/disarm でモードも行の所属も変わらない。** k 枚が画面にあるとき
+  k+1 枚目を armed にして許される変化は: LayoutRow では各ペインが**等幅の
+  まま狭くなる**こと、LayoutGrid (列数固定) では**新しいセルが末尾に増える**
+  ことだけ。既存ペインの行が変わる・並び順が変わる・グリッドが組み変わる、は
+  すべて違反。tile selftest T 群に追加する検査はこの文そのもの:
+  「4枚のペイン矩形を記録 → 5枚目を armed → 先の4枚の (行, 順序) が不変、
+  LayoutGrid なら矩形そのものが不変」。
+- 狭すぎるときは今と同じく**言って退く** (`tileMinPaneW` の式を
+  セル幅に適用)。LayoutRow で n×minW が幅を超える場合も同文。
+  横スクロールは入れない (開いている判断 3)。
+
+**Blink の N (N-blink、§8-4 の実体)**: flip の一般化で、**collapsed 系**の
+N の顔。巡回順は**スロット順 A → B → C → … → A** (letter が読まれる順、
+他のパネルと同一)。`B` / `Space` は1歩進める (今の2枚トグルはこの退化形)、
+`flipPeriod` の auto はその自動版。現在の letter を大きく重畳 (今の A/B と
+同じ位置・同じ描き方)。2枚のときの見た目は今と**同一** — つまり置き換えで
+あって追加モードではない。diverged なスロットは [stale] バッジ付きで巡回に
+残る (§2 の「消すと壊れたに読める」と同じ理由)。
+
+**ステータスバーのチップ** (`abStatusChipText`): タイル中の
+`A/B split 50%` は、仕切りが存在しない画面に仕切り位置を言う嘘。
+モード化と同時にこう変える:
+
+- laid out (3枚以上): `A/B tiles ×N  B: <name>` (LayoutGrid なら
+  `A/B grid <cols>×<rows> ×N  B: <name>`)。% は仕切りがあるときだけ。
+- 2枚の split / wipe は今のまま (仕切りは実在する)。
+
+**View メニュー**: 既存の compare モード群の直下に
+`Layout: side by side (one row)` / `Layout: grid` + 列数の入力。
+モード enum と同じ場所・同じ永続化 (§10「既存の compare モードの隣」)。
+
+**触らないもの**: wipe / diff は厳密に A 対 B (§3)。統計パネルの
+side-by-side (`abStatsLayout`) は**別物** — 画像レイアウトの話をそちらに
+波及させるのは開いている判断 1 の後。
+
+### I7: Projection の N 重ね
+
+チャートは重ねる (§10 の判断)。ヒストグラムが既に払った形をなぞる:
+
+- スロット曲線は `slotInk` で**重ねる**。凡例は `slotLegendRow` (同じ部品)。
+- **軸の一致はスロット単位で問う**: `abProjOverlayable` を A 対各スロットに
+  適用し、一致しないスロットは**描かず・引き伸ばさず・名指しする**
+  (B の「never stretched」と同じ文型)。B の不一致が全体を side-by-side に
+  落とす今の規則はそのまま — スロットは落とさない (N 枚の side-by-side は
+  I6 のグリッドの仕事で、このパネルの仕事ではない)。
+- **plane の規則はヒストグラムの一般形** (§10「1面に絞れば重なる、と言う」):
+  スロットが重なるのは**1面が軸に乗っているときだけ**。乗っていなければ
+  今の文で退く。Projection には plane セレクタが無いので**足す**必要がある —
+  これが開いている判断 2。
+- 配色の上限 `slotInkCount()` と「打ち切った letter の名指し」はヒストグラムと
+  同文・同機構。range bars は A のみ (重なった B が今そうであるように)。
+- 着地の定義: `g_projSideProbe` の `curves=` に letter が入り、selftest N6 の
+  `curves == "AB"` の固定が `"ABCDE"` に**動く** (N6 のコメントに明記済み)。
+
+### 開いている判断 — ユーザーの裁定待ち
+
+1. **統計パネルの Auto (`abStatsLayout = AbAuto`) は N で何に解決するか。**
+   今は「画像が split なら plot も side-by-side」— つまり **2枚の答え**で、
+   タイルが5枚出ている画面の隣で plot は A|B の2枚に割れる (N3 が固定して
+   いる現状)。#60 の「histogram が3個以上にならん」の半分はこれ (もう半分は
+   plane)。**提案**: スロットが1つでも armed なら Auto は overlay に解決する
+   (チャートは重ねる、の一般化)。settled な既定の挙動が変わるので裁定が要る。
+2. **Projection の plane セレクタ**をヒストグラムの `histPlane` と**共有**
+   するか、パネル独立にするか。**提案**: 共有 (「1面に絞る」は比較の状態で
+   あってパネルの状態ではない — 絞った面をパネルごとに変えて見るのは
+   比較ではなく探索)。ただし histPlane は今セッションの `abstats` 行に
+   居るので、名前が histogram を指したまま projection も従うことになる。
+   改名するなら別コミット (terminology の規則)。
+3. **side-by-side の大 N**: §10 の原文は「狭くなるか、横にスクロールする」と
+   **OR のまま**置かれている。**提案**: 縮む、`tileMinPaneW` を割ったら
+   言って退く (今のタイルと同じ) — 横スクロールは pan と衝突する新しい
+   操作面で、退き方の文は既にある。裁定が要る。
+4. **チップと機能名の語彙**: `A/B` という機能名そのもの (View > Compare A/B、
+   チップの `A/B`) は3枚目からは厳密には嘘だが、**機能の固有名**として
+   残す前提で上の仕様を書いた (「compare (A/B)」は terminology.md の正典
+   語彙)。改名するなら terminology.md の管轄で、このブランチは触っていない。
