@@ -1,5 +1,5 @@
 // viewer v0.1 — native image viewer for engineering data
-// Features: .npy / .bin/.raw loading, hover pixel inspection, coordinate rulers,
+// Features: .npy / .bin/.raw / .png/.jpg loading, hover pixel inspection, rulers,
 //           zoom/pan, black/white point normalization.
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -23,7 +23,10 @@
 #include "plugin_host.h"
 #include "miniz.h"                   // deflate for compressed .npz members
 #include "ui_theme.h"
+#include "version.h"                 // the commit this binary was built from
 #include "remote.h"
+#include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
+#include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
 #include "app_icon.h"
 #include "window_frame.h"
@@ -58,6 +61,7 @@
 #include <unordered_map>
 #include <unordered_set>              // residentImageBytes: dedupe by srcId
 #include <mutex>
+#include <condition_variable>
 #include <limits>
 #include <iomanip>
 #include <sstream>
@@ -100,7 +104,28 @@ static std::string jpFontPath() {
         if (std::filesystem::exists(pathFromUtf8(c))) return c;
     return {};
 }
+// Seconds since the first call, monotonic - the app's clock.
+//
+// It used to be GLFW's own timer, which is only a clock once glfwInit() has run:
+// before that it answers 0.0 forever and reports GLFW_NOT_INITIALIZED. The
+// windowless startup path (--no-window) deliberately never calls glfwInit, and
+// under a frozen 0.0 every "give up after 120 s" budget in the selftests -
+// `while (t() - t0 < 120)` - becomes a loop with no way out, so a load that
+// never finishes would hang until ctest's 900 s timeout instead of failing.
+// steady_clock needs nothing initialised, and anchoring on first use gives it
+// the same epoch glfwGetTime had, so the two are interchangeable. There is
+// exactly one of them now: mixing the epochs would be far worse than either.
+static double nowSec() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+// Whole-file reads, counted so a selftest can assert that opening one file
+// reads it ONCE. loadNpy used to read a 252 MB stack 120 times and nothing
+// noticed, because "it works, slowly" looks exactly like "it works".
+static long long g_fileReads = 0;
+
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {
+    g_fileReads++;
     std::ifstream f(pathFromUtf8(utf8Path), std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize sz = f.tellg();
@@ -130,6 +155,60 @@ static std::string dispPath(std::string p) {
     std::replace(p.begin(), p.end(), '\\', '/');
     return p;
 }
+
+// The shortest path that still names a volume - where "up" stops and what the
+// first breadcrumb points at. A UNC share is ONE root: \\nas\share names the
+// volume, and neither \\nas nor a bare \\ can be listed, so it must not be cut
+// into clickable "nas" / "share" pieces. A bare "C:" is not the drive's root
+// either - on Windows it means the process's current directory ON that drive.
+static std::string pathRootOf(const std::string& d) {
+    if (d.size() > 1 && d[0] == '/' && d[1] == '/') {          // //server/share
+        size_t srv = d.find('/', 2);
+        size_t shr = srv == std::string::npos ? std::string::npos : d.find('/', srv + 1);
+        return shr == std::string::npos ? d : d.substr(0, shr);
+    }
+    if (!d.empty() && d[0] == '~') return "~";
+    if (d.size() >= 2 && d[1] == ':') return d.substr(0, 2) + "/";
+    return "/";
+}
+
+// The path as clickable pieces: {what it reads as, where it goes}. Splitting a
+// path is not splitting on '/' - the root can be "/", "~", "C:/" or a whole
+// UNC share, and rebuilding a prefix from the pieces has to give back a path
+// that exists (a NAS reported 2026-08-03: clicking the path errored, while ".."
+// kept working, because "//nas/share/x" was being rebuilt as "/nas").
+struct PathSeg { std::string label, path; };
+static std::vector<PathSeg> pathSegments(const std::string& d) {
+    std::vector<PathSeg> segs;
+    size_t i = 0;
+    std::string root = pathRootOf(d);
+    if (d.size() > 1 && d[0] == '/' && d[1] == '/') {
+        segs.push_back({ root, root });
+        i = root.size() < d.size() ? root.size() + 1 : d.size();
+    } else if (!d.empty() && d[0] == '/') {
+        segs.push_back({ "/", "/" });
+        i = 1;
+    } else if (!d.empty() && d[0] == '~') {
+        segs.push_back({ "~", "~" });
+        i = d.size() > 1 && d[1] == '/' ? 2 : 1;
+    } else if (d.size() >= 2 && d[1] == ':') {
+        segs.push_back({ d.substr(0, 2), root });               // "C:" -> "C:/"
+        i = d.size() > 2 && d[2] == '/' ? 3 : 2;
+    }
+    while (i < d.size()) {
+        size_t s = d.find('/', i);
+        std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
+        if (!part.empty()) {
+            const std::string base = segs.empty() ? std::string() : segs.back().path;
+            segs.push_back({ part, base.empty()            ? part
+                                 : base.back() == '/'      ? base + part
+                                                           : base + "/" + part });
+        }
+        if (s == std::string::npos) break;
+        i = s + 1;
+    }
+    return segs;
+}
 static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
     float mag = powf(10.0f, floorf(log10f(std::max(raw, 1e-9f))));
     for (float m : {1.0f, 2.0f, 5.0f, 10.0f})
@@ -142,6 +221,18 @@ static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
 // §2.1). Held by ImageDoc through a shared_ptr so one frame can belong to
 // several stacks from stage 2 on; in stage 1 every source has exactly one
 // owner (use_count == 1) and behaviour is identical to the pre-split code.
+// The platform's shortcut modifier, spelled two ways: SC_MOD for the label a
+// menu shows, MODK for the chord a key test compares. They are declared
+// together because a build where they disagree advertises one key and answers
+// to another, and Browse needs MODK long before the menu bar is written.
+#if defined(__APPLE__)
+  #define SC_MOD "Cmd"
+  static const ImGuiKeyChord MODK = ImGuiMod_Super;
+#else
+  #define SC_MOD "Ctrl"
+  static const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
+#endif
+
 static std::atomic<uint64_t> g_nextSrcId{ 1 };
 struct FrameSource {
     std::vector<float> data;          // raw values, size w*h*ch
@@ -154,12 +245,17 @@ struct FrameSource {
                                       // (npy frame axis; npz members too). With path +
                                       // npzMember it completes the provenance a reload
                                       // re-decodes - remoteFrame is the remote twin
-    int frameAxis = -1;               // npy layout provenance: 1 = the leading axis
-                                      // was consumed as a FRAME axis, 0 = it was not
-                                      // (single image / CHW), -1 = not an npy decode.
-                                      // Registry identity + replayed on reload, so an
-                                      // ambiguous (small-leading-axis) shape never
-                                      // silently reinterprets under a changed pref
+    // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
+    // the shape the FILE declared, kept so the Inspector can compute which
+    // other readings that shape permits instead of offering a fixed list; empty
+    // = these pixels did not come from a .npy. npyRead is NR_NATIVE until a
+    // user says otherwise, and then it is a DECLARATION, not a guess: it
+    // survives reload and session, and it is what --npy-axis stopped being.
+    // It is also registry identity (srcIdentityKey embeds the EFFECTIVE
+    // reading), so two readings of one file are two tuples and never
+    // silently share pixels.
+    std::vector<int64_t> npyShape;
+    int npyRead = 0;                  // NpyRead; 0 = NR_NATIVE
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -204,11 +300,13 @@ static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // Entries are weak: a source whose last membership closes disappears from here
 // by itself, so the registry never keeps pixels alive.
 //
-// The tuple is (path-or-url, npzMember, frame-within-file, raw recipe, mtime,
-// fsize). mtime+fsize are the point: a file that changed on disk is a DIFFERENT
-// tuple, so re-opening still reads the new bytes - sharing never overrides
-// "re-open reads the disk". Remote sources carry mtime/fsize 0 and rely on the
-// url; server-side change detection is Watch's (stage 6).
+// The tuple is (path-or-url, npzMember, frame-within-file, raw recipe, npy
+// reading, mtime, fsize). mtime+fsize are the point: a file that changed on
+// disk is a DIFFERENT tuple, so re-opening still reads the new bytes - sharing
+// never overrides "re-open reads the disk". The npy reading (§3.3, normalized
+// by npyKeyRead) keeps two READINGS of one file apart the same way. Remote
+// sources carry mtime/fsize 0 and rely on the url; server-side change
+// detection is Watch's (stage 6).
 // Lock order: g_srcRegMtx is a LEAF lock - nothing else is ever acquired while
 // it is held. It serializes (a) the map itself and (b) every cross-thread read
 // or write of a REGISTERED source's shared fields: writers hold it across the
@@ -247,6 +345,15 @@ static std::string srcKeyPath(const std::string& p) {
     return s;
 }
 
+// The reading that names this source's tuple (defined by npyLayout's §3.1
+// machinery, below): NR_NATIVE stays 0 whatever the shape - a pre-decode
+// probe knows no shape, and a native open must still find a native resident -
+// and a DECLARATION that merely spells out what native would do anyway
+// collapses onto 0 too, so "read as (H,W,C)" on a natively-HWC file and a
+// plain open are ONE tuple. Only a declaration that actually changes the
+// reading keys its own tuple.
+static int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);
+
 static std::string srcIdentityKey(const FrameSource& s) {
     char t[160];
     if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
@@ -255,10 +362,11 @@ static std::string srcIdentityKey(const FrameSource& s) {
                  (int)s.rawLE, s.srcW, s.srcH,
                  (long long)s.mtime, (unsigned long long)s.fsize);
     else                    // npy/npz: the file bytes decide, mtime+fsize name
-                            // them; frameAxis keeps the two interpretations of
-                            // an ambiguous shape from collapsing onto one key
-        snprintf(t, sizeof t, "\n%d|%d\nax%d\n%lld,%llu",
-                 s.fileFrame, s.remoteFrame, s.frameAxis,
+                            // them; npyRead (§3.3) keeps two READINGS of one
+                            // file from collapsing onto one key - two readings
+                            // are two different sets of pixels
+        snprintf(t, sizeof t, "\n%d|%d\nnr%d\n%lld,%llu",
+                 s.fileFrame, s.remoteFrame, npyKeyRead(s.npyShape, s.npyRead),
                  (long long)s.mtime, (unsigned long long)s.fsize);
     return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" + s.npzMember + t;
 }
@@ -343,6 +451,14 @@ struct ImageDoc {
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
     float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
+    // A COMPUTED frame - today only a stack's frame average - has no file behind
+    // it, so the session cannot round-trip it the way it round-trips an open.
+    // What it CAN round-trip is the RECIPE: this holds the first-frame path of
+    // the stack that was averaged (the key Series members already travel by,
+    // for the same reason - paths round-trip, ids and names do not), and the
+    // restore recomputes the mean once that stack is back. Empty on every frame
+    // that came from a file, which is every other frame in the program.
+    std::string avgOfPath;
 
     // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
     // fields because they are read on 240+ lines (docs/reference-design.md
@@ -408,10 +524,64 @@ struct ViewState {
 // (Defined up here because every Browse INSTANCE carries one - see
 // App::BrowseInstance below.)
 struct RbToolbarGeom {
-    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, moreR = 0;
+    // menuR was moreR until the drawer went away: the row's LAST permanent item
+    // is the "..." panel menu now, and the contract it stands for is unchanged -
+    // whatever ends the toolbar row must still be inside the panel at any width.
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, menuR = 0;
     float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
     int   emptyLocalBtn = 0;               // the not-connected state's local entry
     float rowX = 0, rowY = 0;              // centre of the first row submitted
+    // ---- the bottom status line, and the star that ends the path line -------
+    // The line is built as one string and then elided to fit, so the selftest
+    // reads the LITERAL text the user sees rather than re-deriving it.
+    std::string statusText;                // after elision: what is on screen
+    std::string statusFull;                // before elision: the whole sentence
+    int   statusShown = 0, statusTotal = 0, statusSel = 0;
+    // what the drawn line MEASURES against the room it had. The line elides
+    // middle-out and must never wrap into a second row, so textW <= availW is
+    // the whole contract, checked at every width the geometry sweep uses.
+    float statusTextW = 0, statusAvailW = 0;
+    float listTopY = 0;                    // where the listing starts: a band
+                                           // above it would push this down
+    ImVec2 starCentre = ImVec2(-1, -1);    // the path line's bookmark star
+    int   starLit = 0;                     // 1 = this place is bookmarked
+    // ---- the ancestors held at the top of a scrolled tree -------------------
+    // What the reader can still see of where they are. Recorded rather than
+    // inferred because the whole claim this feature makes is about the SCREEN:
+    // "the folder you are inside is laid out, at the top", and a flag saying
+    // the feature is enabled would not have caught a band that drew nothing.
+    int   pinnedRows = 0;                  // how many levels are held
+    std::string pinnedNames;               // which, outermost first, ";"-joined
+    // ...and where the outermost one landed, so an injected click can be aimed
+    // at it. A pinned row that cannot be clicked would be a picture of a row.
+    ImVec2 pinCentre = ImVec2(-1, -1);
+};
+
+// One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
+// (docs/npz-design.md §2.1). An .npz is a container: the file is a batch, a
+// member is a stack or a frame - and a member that is not pixels must never
+// become pixels. (Defined up here because App carries the member picker; the
+// scanner that fills these lives with the zip reader.)
+struct NpzMember {
+    enum Role {
+        RImage,    // 2-D+ and interpretable: opens as a stack or a frame
+        RAxis,     // 1-D numeric: the per-frame x axis, or metadata. NOT pixels
+        RMeta,     // scalar / string / object dtype: provenance, never opened
+        RAmbig,    // deeper than (F,H,W,C): which axis is frames? we do not guess
+        RBad       // this viewer cannot read it, and says why
+    };
+    std::string name;         // array name, without the ".npy" the zip member has
+    std::string shapeText;    // "(24, 480, 640)" / "scalar" - as WRITTEN
+    std::string dtype;        // "u16" ... or the raw descr when unreadable
+    std::string becomes;      // what it will become, in the picker's own words
+    std::string why;          // why it is not an image (RAxis/RMeta/RAmbig/RBad)
+    int role = RMeta;
+    int frames = 1;           // RImage: frames of the stack it makes (1 = a frame)
+    int w = 0, h = 0, ch = 1;
+    std::vector<double> vals; // RAxis: every value, at FULL precision (never float)
+    std::string text;         // RMeta: the value as text (fmtExact / the string)
+    bool selected = false;
+    size_t entry = 0;         // index into the zip listing
 };
 
 struct App {
@@ -532,7 +702,7 @@ struct App {
     // exactly once and then costs nothing at all.
     bool abSlot1Live = false;
     // While frames are being stepped faster than a person reads them, the B
-    // caches are NOT recomputed (see selectImage). glfwGetTime() deadline.
+    // caches are NOT recomputed (see selectImage). nowSec() deadline.
     double abStepBusyUntil = 0;
     // Compare slots BEYOND B: C, D, E... An interim shape, deliberately bolted
     // ON TOP of A/B rather than replacing it - every existing mode (wipe,
@@ -548,6 +718,14 @@ struct App {
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
+    // The main window's geometry, remembered across runs (prefs.txt "window").
+    // winW/winH are LOGICAL pixels and winX/winY desktop coordinates - the two
+    // units are deliberate and are argued at fitSavedWindow. winW == 0 means
+    // nothing has been saved yet. While the window is MAXIMIZED these hold the
+    // rectangle to restore DOWN to, not the maximized one, which is why sampling
+    // them stops the moment winMax goes true.
+    int winX = 0, winY = 0, winW = 0, winH = 0;
+    bool winMax = false;
     float inputLagMs = 0, inputLagMaxMs = 0;   // input event -> the frame answering it
     float cpuMs = 0, swapMs = 0;               // our drawing vs presenting it
     float wipeFrac = 0.5f;            // divider position, fraction of canvas width
@@ -606,6 +784,14 @@ struct App {
         double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
         const char* seriesNames[4] = {};
     } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
+    // ...and one per extra compare slot (C, D, E...), indexed by cmpExtra
+    // position - which IS the letter, and travels with the resolved document
+    // (ResolvedSlot::idx), because after a follow-frame the document is no
+    // longer the pinned uid and a uid lookup would lose the letter. Exactly the
+    // shape projExtra and temporalExtra already have; the histogram was the one
+    // statistics cache still stopping at two, so the Statistics panel could
+    // only ever name A and B however many slots were armed.
+    std::vector<HistState> histExtra;
     bool histLog = true;
     // Which plane the histogram draws: -1 = all, else the series index. Four
     // CFA planes times two sides is eight curves on one axis; the selector is
@@ -849,6 +1035,11 @@ struct App {
         std::string wtitle;           // the ImGui window name, fixed at creation
         bool open = true;             // window shown (num 1 mirrors app.showRemote)
         bool focusReq = false;        // bring the window forward next frame
+        // Where "+" wants this panel to appear: the dock node of the panel whose
+        // "+" was clicked, so a new Browse is a TAB beside the one you were
+        // looking at rather than a floating window somewhere else. Applied once,
+        // then cleared - after that the panel is wherever the user put it.
+        unsigned dockInto = 0;
         // the place, and everything listed there
         RemoteBrowse b;
         RemoteSearch search;
@@ -860,6 +1051,7 @@ struct App {
         std::unique_ptr<remote::Session> session;   // the worker's, exclusively
         std::thread thread;
         std::mutex mtx;               // guards queue / done / phase
+        std::condition_variable cv;
         std::vector<RbJob> queue;
         std::vector<RbResult> done;
         std::string phase;            // what the worker is doing, for the UI
@@ -875,13 +1067,23 @@ struct App {
         std::string histKey;          // host:port the history belongs to
         bool histNav = false;         // set while back/forward itself navigates
         // ---- the shape of the listing. Per instance; app.rbFlat / rbTree /
-        // rbAdvanced remain the persisted DEFAULTS a new instance starts from,
+        // rbNatural remain the persisted DEFAULTS a new instance starts from,
         // and a toggle writes through to them (last toggle wins next start).
-        bool flat = false, tree = false, advanced = false;
+        // (`advanced` - was the "more" drawer open - went with the drawer.)
+        bool flat = false, tree = false;
+        // ...and the order the NAME column puts rows in. Natural by default
+        // (rp::naturalLess): see rbNameCmp for why the listing gets a choice
+        // here and a stack never does.
+        bool nameNatural = true;
         // ---- panel state, formerly function-local statics of drawPanelRemote.
         // keyboard cursor (row index into the built view, -1 = none)
         int cursor = -1;
         bool cursorScroll = false;    // bring it into view this frame
+        // A click GESTURE that navigated: how many clicks of it have landed so
+        // far (0 = no such gesture in flight). Everything after that click
+        // belongs to the navigation and not to the listing that replaced the
+        // one it was aimed at - see rbNavGesture in drawPanelRemote.
+        int navChain = 0;
         std::string curSig;           // host|dir|rev the cursor was built for
         bool curFlat = false, curTree = false;
         // sort spec, stashed from the table one frame late (see RB_COL_NAME)
@@ -892,10 +1094,12 @@ struct App {
         int selAnchor = -1;
         bool selFlat = false, selTree = false;
         std::string selSig;
-        // filter / server search / path editing
+        // filter / search / path editing. ONE buffer: the filter box is also the
+        // search box, and Enter is the difference between "narrow these rows"
+        // and "walk below this folder". searchBuf/searchFocus fed a second,
+        // identical-looking box in a popup and went with it.
         char filter[256] = "";
-        char searchBuf[256] = "";
-        bool searchFocus = false;
+        bool searchOpen = false;      // put the caret in the filter box next frame
         char pathEdit[1024] = "";
         bool pathEditing = false, pathFocus = false;
         // Properties popup: a snapshot, because the row may scroll out of the
@@ -911,9 +1115,22 @@ struct App {
         RbToolbarGeom toolbar;
         ImVec2 cursorRect[2] = { ImVec2(0, 0), ImVec2(0, 0) };
         std::string cursorName;
+        // ...and its FULL path, which is the key the tree's `expanded` set is
+        // written in: "is the cursor row expanded" cannot be asked with a bare
+        // name, and counting the whole set answers a different question.
+        std::string cursorFull;
         // ...and the centre of the cursor row's chevron hit zone (tree dir
         // rows only; x < 0 = the row has no chevron), for "chevclick"
         ImVec2 cursorChev = ImVec2(-1, -1);
+        // The listing's row PITCH, measured from the rows the clipper actually
+        // laid out. The pinned-ancestor band has to know which row is at the
+        // top of the viewport BEFORE it submits anything (ImGui wants the
+        // frozen-row count before the first row), so it divides the scroll
+        // offset by this instead of asking the clipper - which has not run yet.
+        // Measured, not derived: a row is a Selectable inside a table cell, and
+        // reconstructing that height from font size and two paddings is a
+        // second copy of ImGui's arithmetic that would drift from it.
+        float listRowH = 0;
     };
     // Never empty once rbMain() ran; [0] is always the primordial instance.
     std::vector<std::unique_ptr<BrowseInstance>> browsePanels;
@@ -952,6 +1169,7 @@ struct App {
     std::atomic<bool> mStop{ false };
     std::atomic<int> mPending{ 0 };
     std::mutex mMtx;
+    std::condition_variable mCv;
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
     // last server temporal result, keyed to the stack it describes
@@ -1017,16 +1235,19 @@ struct App {
         std::vector<Row> rows;
     } seriesEdit;
     int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
-    bool showRemote = false;          // the server browser, its own panel
+    // Open by default (2026-08-03, user): Browse is how a file is found, and a
+    // tool you have to summon through the OS dialog it replaces is the wrong
+    // way round. The saved layout wins after the first run - close it and it
+    // stays closed, because layout.ini remembers.
+    bool showRemote = true;           // the server browser, its own panel
     // Browse listing view: false = the collapsed group rows the peer sends,
     // true = every frame of every sequence as its own row. Expansion is a pure
     // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
     // so the toggle costs no round trip. Persisted: it is a way of working.
     bool rbFlat = false;
-    // Browse header: false = just the path bar and the toolbar (the common
-    // case), true = also the connection row and the server-side search. Also
-    // persisted - "I always search" and "I never do" are both ways of working.
-    bool rbAdvanced = false;
+    // (rbAdvanced - whether the Browse header's "more" drawer started open -
+    // is gone with the drawer. Its contents each moved to the place they are
+    // about: docs/browse-topbar-design.md 10.2.)
     // Tree mode: a directory expands IN PLACE instead of replacing the listing,
     // so a folder of folders can be compared without losing your place. LAZY -
     // expanding a node costs exactly one LIST, issued on the browse worker and
@@ -1036,10 +1257,19 @@ struct App {
     bool rbTree = false;                                        // persisted
     // (the tree cache, expanded set and pending list live per Browse instance
     // now - BrowseInstance::treeCache / expanded / treePending)
+    // Name order in the listing: true = natural (frame_2 before frame_10, the
+    // order a stack is built in and the order the peer folds a scan in),
+    // false = plain lexicographic. Persisted, and the DEFAULT a new panel
+    // starts from - the panel that changes it changes only itself, exactly as
+    // rbFlat / rbTree do. There is no Preferences panel to put it in (#50).
+    bool rbNatural = true;                                      // persisted
     bool focusRemote = false;         // bring the ACTIVE Browse instance forward
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
     std::vector<Msg> msgLog;          // every toast, kept so it can be copied
+    // msgLog is capped, so its SIZE stops changing once the cap is reached and
+    // cannot be used to notice that it changed. This counter only ever goes up.
+    size_t msgSeq = 0;
     bool showMessages = false, msgUnreadErr = false;
     struct ServerTemporal {
         uint64_t token = 0;           // matches the MJob that produced it
@@ -1088,6 +1318,9 @@ struct App {
     // server-side folder becomes an ordinary local stack, one frame at a time.
     struct RFetchJob {
         std::string url, name;
+        std::string note;             // the head frame's note, copied verbatim onto
+                                      // this one: a stack-constant Inspector row
+                                      // (see openRemote, materializeDerivedFrame)
         std::string exe;              // snapshot at enqueue: the UI may edit
                                       // remoteExe while the worker connects
         int frame = 0;
@@ -1105,7 +1338,7 @@ struct App {
                                       // visible hitch on the UI thread
         std::string dtype, err;
         std::vector<float> data;
-        std::string url, name;
+        std::string url, name, note;
         int frame = 0, seqId = 0, seqIndex = 0;
         uint32_t gen = 0;
         size_t bytes = 0;             // what was committed for it, to give back
@@ -1123,6 +1356,7 @@ struct App {
     std::atomic<size_t> rfBytesInFlight{ 0 };
     std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
     std::mutex rfMtx;
+    std::condition_variable rfCv;
     std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
     std::vector<RFetchDone> rfDone;   // guarded by rfMtx
     // pending "load the rest of the folder?" question
@@ -1160,6 +1394,18 @@ struct App {
                         std::string axisName, axisUnit;
                         std::vector<double> axisVals; };
     std::vector<SeqRestore> seqRestore;
+    // "Open as frame average" on a stack that is not here yet. Browse opens are
+    // asynchronous - the first frame shows and the rest stream in - so the mean
+    // cannot be taken at click time; the request is parked on the seqId it is
+    // waiting for and fired by pumpStackAverages() once nothing more is coming.
+    // A session restore pushes into the SAME list (through avgRestore below), so
+    // there is one place where a stack becomes an average and one set of rules
+    // about when it is allowed to happen.
+    std::vector<int> pendingAvg;
+    // ...and the session's side of it, by PATH, resolved lazily exactly like
+    // seriesRestore: at parse time a folder stack is one loose image plus a
+    // queued rescan, so the stack this names does not exist yet.
+    std::vector<std::string> avgRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the
@@ -1208,7 +1454,7 @@ struct App {
     bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
     int folderRecipeOpenId = 0;       // ...and WHOSE Open answered for it
     int nextOpenId = 1;               // one per Open Folder, stamped on its groups
-    // "which sequences do you want?" picker shown after scanning a folder.
+    // "which stacks do you want?" picker shown after scanning a folder.
     // rel: each file's "folder/name" relative to the scanned root - the live
     // filter matches against exactly these strings, so folder names and file
     // names both narrow the tree. match/nMatch: the filter's current cut;
@@ -1245,10 +1491,88 @@ struct App {
     char pickSweepParam[64] = "";
     char pickSweepUnit[16] = "";
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
+    // ---- .npz member picker (docs/npz-design.md §2.3) ----------------------
+    // The SAME dialog as the folder picker, one layer down: an .npz is a batch
+    // and its members are the stacks and frames inside it, so the vocabulary,
+    // the All/None/Invert row and the accept path are the folder picker's.
+    // Raised only when there is a choice to make - a file holding one image and
+    // nothing else opens with no dialog at all, exactly as it does today.
+    std::vector<NpzMember> npzPick;
+    bool npzPickOpen = false;
+    std::string npzPickPath;          // the .npz these members came from
+    // Dropping several .npz files calls openPath in a LOOP, and one picker can
+    // be up at a time: the rest WAIT here and are named, rather than the second
+    // silently overwriting the first one's pending choice.
+    std::vector<std::string> npzPickQueue;
+    // The axis' NAME and UNIT are the user's to confirm. The key name is offered
+    // as the default label because it is the only honest starting point; the
+    // unit starts EMPTY and is never read out of the key name ("exposure_ms"
+    // does not prove milliseconds - docs/terminology.md: 単位を仮定しない).
+    char npzAxisName[64] = "";
+    char npzAxisUnit[16] = "";
+    // Members that are NOT pixels, kept per .npz file so the Inspector can show
+    // the file's provenance next to the frame it opened
+    // (docs/npz-design.md §4 item 3 「実装で答えたこと (v1)」).
+    struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
+    std::vector<NpzMeta> npzMeta;
+    // ---- input adapters (docs/input-adapters.md §4.12 / §4.13) ---------------
+    // v1 remembers ONE thing: which reader read which file. Folder and glob
+    // RULES are deliberately absent (§8 item 7) - they need a trust rule first,
+    // because a rule living in a shared data folder would run someone else's
+    // Python without anyone choosing it. This list is a record of choices the
+    // user made, which is why it is visible and removable rather than magic.
+    std::string pythonExe;                  // configured interpreter; "" = probe PATH
+    struct ReaderMemo { std::string path, spec; };
+    std::vector<ReaderMemo> readerMemo;     // most recent first; bounded, see §4.12
+    std::vector<std::string> readerShown;   // specs whose command was shown once (§4.13)
+    // §4.13.0: ONE panel, three entrances, and it does not close. Writing an
+    // adapter is write -> load -> read the failure -> fix -> load again, and a
+    // modal cuts that loop every time the author leaves for their editor.
+    std::string readerPickPath;             // the file or folder the panel is aimed at
+    bool readerPanelOpen = false;
+    bool readerPanelRaise = false;          // an entrance asked for focus
+    bool readerListOpen = false;            // §4.12's visible, removable list
+    char readerPickFile[512] = "";
+    char readerPickFunc[128] = "load";
+    char readerLocalDir[512] = "";          // a folder of the user's own readers
+    std::string readerPickWhy;              // why we are asking (native's own refusal)
+    // The last run, kept WHOLE. A traceback is the only debugging surface an
+    // adapter author has; folding it into "could not open" makes the feature
+    // useless to exactly the people it exists for (§4.13.0).
+    std::string readerLastOut;
+    std::string readerLastSpec;
+    bool readerLastOk = false;
+    bool readerRan = false;
     std::unique_ptr<pfd::select_folder> folderDlg;
     int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+    // The reader panel's own dialogs. These went in as pfd::open_file(...).
+    // result() - blocking, inside the frame - which broke the rule the openDlg
+    // comment states, skipped the one-at-a-time guard every other dialog has,
+    // and left anyFileDialog() saying "no dialog" while one was on screen.
+    std::unique_ptr<pfd::open_file>     rdOpenDlg;
+    int rdOpenMode = 0;               // 0 = pick a reader .py, 1 = open a file with one
+    std::unique_ptr<pfd::select_folder> rdFolderDlg;
+    int rdFolderMode = 0;             // 0 = the folder of readers, 1 = open a folder with one
+    std::unique_ptr<pfd::save_file>     rdNewDlg;   // where to write the template
+    // A reader runs for as long as the user's data takes. Waiting for it on the
+    // UI thread made the whole window stop answering - up to the five-minute
+    // timeout - with nothing on screen to say why or to stop it. Only the wait
+    // moves off-thread: reading what it produced touches images and GL.
+    struct ReaderJob {
+        std::string src, spec, out;        // what it is reading, with what, to where
+        std::vector<std::string> argv;
+        std::string outFile, errFile;      // the child's streams, readable AS it writes
+        std::thread th;
+        std::atomic<bool> done{ false };
+        std::atomic<bool> cancel{ false };
+        adapter::Run r;
+        double startedAt = 0;
+        size_t shown = 0;                  // how much of the live output is on screen
+    };
+    std::unique_ptr<ReaderJob> rdJob;
     bool anyFileDialog() const {      // see the note on csvDlg
-        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg;
+        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg ||
+               rdOpenDlg || rdFolderDlg || rdNewDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
@@ -1329,7 +1653,9 @@ struct App {
     float projYLo = 0, projYHi = 1;   // used by mode 2
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
-    int npyAxis = 0;                  // ambiguous 3D npy: 0 = auto, 1 = leading axis is frames
+    // (npyAxis lived here: one global override for every 3-D .npy in a run.
+    //  docs/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
+    //  is per file, visible in the Inspector, and saved with that image.)
     // shared display range: every open image (and every newly loaded one) uses it
     bool linkRange = false;
     float linkBlack = 0, linkWhite = 1;
@@ -1397,16 +1723,37 @@ static bool isNpyName(const std::string& n);
 static void sortFramesNumerically(std::vector<std::string>& files);
 
 // ---- Browse instances (docs/todo-open.md item 17: instance-able views) -----
+// What a Browse panel is CALLED. The host is the most important fact about a
+// panel and it used to live inside the "more" drawer, which meant that with two
+// panels open the two were pixel-identical until you unfolded one
+// (docs/browse-topbar-design.md 10.3). It belongs in the title: a title is read
+// once, changes rarely, and costs no row.
+//
+//   Browse                    - this machine (local:// is LOCAL, not a remote:
+//                               the panel never says "ssh" about a pipe)
+//   Browse [ssh: trc2]        - a machine reached over ssh
+//   Browse 2 [ssh: trc2]      - ...and which panel it is
+//
+// The ### id is NOT touched by any of this: layouts, the dock builder and the
+// session file key off "###Remote" / "###BrowseN", so a panel that renames
+// itself on connect still docks where the user left it.
+static std::string rbPanelTitle(int num, const std::string& host) {
+    std::string t = "Browse";
+    if (num > 1) t += " " + std::to_string(num);
+    if (!host.empty()) t += " [ssh: " + host + "]";   // cf. ICON_SSH on the status line
+    t += num > 1 ? "###Browse" + std::to_string(num) : std::string("###Remote");
+    return t;
+}
 // The primordial instance. Lazy so it exists whenever anything asks - the
 // selftests, the menus and the first frame all funnel through here.
 static App::BrowseInstance& rbMain() {
     if (app.browsePanels.empty()) {
         auto p = std::make_unique<App::BrowseInstance>();
         p->num = 1;
-        p->wtitle = "Browse###Remote";      // the singleton's id: layouts survive
+        p->wtitle = rbPanelTitle(1, "");    // the singleton's id: layouts survive
         p->flat = app.rbFlat;
         p->tree = app.rbTree;
-        p->advanced = app.rbAdvanced;
+        p->nameNatural = app.rbNatural;
         app.browsePanels.push_back(std::move(p));
     }
     return *app.browsePanels[0];
@@ -1431,10 +1778,10 @@ static App::BrowseInstance& rbNewInstance(int wantNum = 0) {
     while (rbFindNum(num)) num++;
     auto p = std::make_unique<App::BrowseInstance>();
     p->num = num;
-    p->wtitle = "Browse " + std::to_string(num) + "###Browse" + std::to_string(num);
+    p->wtitle = rbPanelTitle(num, "");
     p->flat = app.rbFlat;                   // a new view starts from the prefs
     p->tree = app.rbTree;
-    p->advanced = app.rbAdvanced;
+    p->nameNatural = app.rbNatural;
     p->open = true;
     p->focusReq = true;
     app.browsePanels.push_back(std::move(p));
@@ -1523,7 +1870,20 @@ static ImageDoc* followFrame(ImageDoc* d, bool& diverged) {
     return d;
 }
 
-// The B side of an A/B compare, or null when compare is off / B is gone / B is A.
+// The B side of an A/B compare, or null when compare is off / B is gone.
+//
+// B RESOLVING TO THE SAME DOCUMENT AS A IS NOT A SPECIAL CASE. This used to
+// answer null there ("paused"), and every surface downstream - the histogram,
+// the projection and temporal panels, the Inspector's B column, the canvas -
+// then rendered as if there were no comparison at all. The kindness was
+// counterproductive (user report, 2026-08-04: 「A/B比較で，A=Bの時，ヒストグラム
+// の表示を切り替えているけど，このケアはかえってみずらい．比較の際に同じもの
+// を選んだ時に，同じことを確認できる方がよいので，こういうの全般不要です」):
+// putting the same document on both sides is something people do ON PURPOSE,
+// to confirm the two sides agree, and a panel that hides B at that moment makes
+// the confirmation impossible - "B is identical to A" and "B is not being
+// drawn" look the same. So B is B, and two coinciding sides are DRAWN
+// coinciding: two curves in their own slotInk, two rows, two labels.
 static ImageDoc* resolveB() {
     g_abFollowDiverged = false;
     if (app.compareBUid) {
@@ -1531,14 +1891,13 @@ static ImageDoc* resolveB() {
         for (const auto& d : app.images)
             if (d->uid == app.compareBUid) { b = d.get(); break; }
         if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
-        b = followFrame(b, g_abFollowDiverged);
-        return b == cur() ? nullptr : b;
+        return followFrame(b, g_abFollowDiverged);
     }
     if (app.compareB.empty()) return nullptr;
     // session fallback: match the saved name (and frame, for a stack), then latch
     // the uid so navigation cannot re-point B at a different frame
     for (const auto& d : app.images) {
-        if (d->name != app.compareB || d.get() == cur()) continue;
+        if (d->name != app.compareB) continue;
         if (app.compareBSeq >= 0 && d->seqId != 0 && d->seqIndex != app.compareBSeq) continue;
         app.compareBUid = d->uid;
         return d.get();
@@ -1582,8 +1941,8 @@ static void setCompareB(const ImageDoc* d) {
 // The uid holding the B SEAT: the live pin, or the remembered one after an
 // exit path cleared it (A9: compare off and on returns to the same B). The
 // Files letters are seat assignments, so they key on this - never on cmpB(),
-// which answers null while compare is off or while A stands on the pin, and
-// a letter that vanishes there reads as the assignment being lost.
+// which answers null while compare is off, and a letter that vanishes there
+// reads as the assignment being lost.
 static uint64_t bSeatUid() {
     return app.compareBUid ? app.compareBUid : app.lastCompareBUid;
 }
@@ -1620,7 +1979,7 @@ static bool g_abNoThrottle = false;
 // True while frames are being stepped continuously. The B slots skip their
 // recompute then; whoever draws B must say "stale" (docs/ab-stats-plan.md 1).
 static bool abStepBusy() {
-    return !g_abNoThrottle && app.abStepBusyUntil > glfwGetTime();
+    return !g_abNoThrottle && app.abStepBusyUntil > nowSec();
 }
 
 // Slot 1 of every statistics cache belongs to the B side and is filled only
@@ -1636,17 +1995,25 @@ static void abStatsFrame() {
     app.abSlot1Live = false;
 }
 
+// Put a line in the Messages panel WITHOUT showing a toast. Everything that
+// writes to msgLog goes through here: the cap and the de-duplication are the
+// log's rules, and three call sites that pushed straight onto the vector were
+// keeping neither.
+static void logMsg(const std::string& msg, bool err = false) {
+    if (!app.msgLog.empty() && app.msgLog.back().text == msg) return;
+    app.msgLog.push_back({ msg, err });
+    if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
+    app.msgSeq++;
+    if (err) app.msgUnreadErr = true;
+}
+
 static void toast(const std::string& msg, bool err = false) {
     app.toast = msg; app.toastErr = err;
     app.toastUntil = ImGui::GetTime() + (err ? 6.0 : 2.5);
     // A toast fades after six seconds, which is not long enough to paste it into
     // a bug report. Every message is kept here and shown, selectable, in the
     // Messages panel.
-    if (app.msgLog.empty() || app.msgLog.back().text != msg) {
-        app.msgLog.push_back({ msg, err });
-        if (app.msgLog.size() > 300) app.msgLog.erase(app.msgLog.begin());
-        if (err) app.msgUnreadErr = true;
-    }
+    logMsg(msg, err);
 }
 
 // One batch per OPEN ACTION: reopening a folder deliberately makes a fresh
@@ -1722,9 +2089,12 @@ static void selectImage(int idx);   // fwd (defined with the sequence helpers)
 // pinned uid and a uid lookup would lose the letter.
 struct ResolvedSlot { ImageDoc* doc; size_t idx; bool diverged; };
 static std::vector<uint8_t> g_slotDiverged;   // by cmpExtra index, last resolve
+// A slot standing on the same document as A resolves like any other: the same
+// rule resolveB now follows, for the same reason. Dropping it here made a
+// letter's row, curve and pane vanish the moment A walked onto it, which is
+// indistinguishable from the slot having been lost.
 static std::vector<ResolvedSlot> resolveSlots() {
     std::vector<ResolvedSlot> out;
-    const ImageDoc* a = cur();
     g_slotDiverged.assign(app.cmpExtra.size(), 0);
     for (size_t i = 0; i < app.cmpExtra.size();) {
         ImageDoc* d = nullptr;
@@ -1734,12 +2104,10 @@ static std::vector<ResolvedSlot> resolveSlots() {
             g_slotDiverged.erase(g_slotDiverged.begin() + i);
             continue;
         }
-        if (d != a) {
-            bool div = false;
-            ImageDoc* r = followFrame(d, div);
-            g_slotDiverged[i] = div ? 1 : 0;
-            out.push_back({ r, i, div });
-        }
+        bool div = false;
+        ImageDoc* r = followFrame(d, div);
+        g_slotDiverged[i] = div ? 1 : 0;
+        out.push_back({ r, i, div });
         i++;
     }
     return out;
@@ -1762,7 +2130,11 @@ static std::string slotOf(const ImageDoc* d) {
     return "";
 }
 static void addCompareSlot(ImageDoc* d) {
-    if (!d || d == cur()) return;
+    if (!d) return;
+    // A is the CURSOR, not a seat, so the image under it may hold a letter like
+    // any other - that is how you park the frame you are on as C and go looking
+    // for what to set against it. (It used to be refused outright, which is the
+    // same "you cannot compare a thing with itself" care resolveB carried.)
     if (d->uid == app.compareBUid) {   // one image, one letter: it is B already
         toast("that image is B - wipe / split / difference compare it already", true);
         return;
@@ -1779,6 +2151,30 @@ static void removeCompareSlot(const ImageDoc* d) {
     if (!d) return;
     for (size_t i = 0; i < app.cmpExtra.size(); i++)
         if (app.cmpExtra[i] == d->uid) { app.cmpExtra.erase(app.cmpExtra.begin() + i); return; }
+}
+
+// What the slot item on a Files row OFFERS for this document - and `letter` is
+// the letter the offer would name ("Add as compare slot D" / "Remove from
+// compare slot C"). Out here rather than in the menu for the same reason
+// abRowItem is: so it can be checked without a frame (--abstats-selftest, N5).
+// Issue #60 established what that costs when it is skipped: every panel could
+// HANDLE letters past B, the selftests proved it - by arming slots with a
+// direct call - and whether the one path a user has to arm them still offered
+// anything was checked by nobody, over an equation that holds on the empty set.
+enum SlotRowItem {
+    SlotRowNone,       // no document, or the pinned B: its row's B items say so,
+                       // and a slot on top would put one image in two panes
+    SlotRowAdd,        // "Add as compare slot <letter>" - the next free letter
+    SlotRowRemove,     // "Remove from compare slot <letter>" - the letter held
+};
+static SlotRowItem slotRowItem(const ImageDoc* pick, std::string& letter) {
+    letter.clear();
+    if (!pick) return SlotRowNone;
+    letter = slotOf(pick);
+    if (!letter.empty()) return SlotRowRemove;
+    if (pick->uid == app.compareBUid) return SlotRowNone;
+    letter = slotName(app.cmpExtra.size());
+    return SlotRowAdd;
 }
 
 // Did slot i's follow-frame land on nothing the last time the slots resolved?
@@ -1874,9 +2270,27 @@ static void cycleCompare() {
 // can never do two of them at once; the return value is what the press
 // consumed, which is how --abstats-selftest proves that ordering.
 enum class EscTook { Nothing, RoiDeselected, CompareOff };
+// Which layer ACTUALLY took each Escape, one name per press in the order the
+// presses arrived: "popup;textedit;roi;compare;nothing;". The four steps above
+// are decided in four different places - two of them inside ImGui, where this
+// app's state never hears about them - so "one press, one step outward" was
+// only ever checkable for the two that end in escapePressed(). A14/A14b assert
+// the ROI/compare pair and, separately, that a popup went away; neither can
+// say that ONE press did not do two of them, which is the whole rule.
+// (docs/verify-ui.md E7.) Recorded at the point each layer acts, so a press
+// consumed twice appears as two entries rather than being reasoned away.
+static std::string g_escProbe;
+static int g_escProbeN = 0;              // entries, so a caller can take a delta
+static int g_escProbeFrame = -1;         // the frame the last entry was made in
+static void escProbeNote(const char* layer) {
+    g_escProbe += std::string(layer) + ";";
+    g_escProbeN++;
+    if (ImGui::GetCurrentContext()) g_escProbeFrame = ImGui::GetFrameCount();
+}
 static EscTook escapePressed() {
     if (app.selectedAnn != 0) {          // back to All - the old ESC meaning
         app.selectedAnn = 0;
+        escProbeNote("roi");
         return EscTook::RoiDeselected;
     }
     if (app.compareMode != App::CmpOff) {
@@ -1888,19 +2302,24 @@ static EscTook escapePressed() {
         // rule in drawFileList).
         app.compareMode = App::CmpOff;
         toast("comparison off - B/C assignments kept (C to resume)");
+        escProbeNote("compare");
         return EscTook::CompareOff;
     }
+    escProbeNote("nothing");
     return EscTook::Nothing;
 }
 
 // Pin the frame you are looking at as B, then walk A somewhere else: this is how
 // you compare frame 12 against frame 13 of one stack, or a source against its
-// processed result.
+// processed result. Staying put is a comparison too - A and B on one document,
+// both sides drawn coinciding - so the toast invites the walk rather than
+// instructing it ("move A somewhere else" read as a precondition, back when
+// the pair really did stay silent until you did).
 static void pinCurrentAsB() {
     if (!cur()) return;
     setCompareB(cur());
     if (app.compareMode == App::CmpOff) app.compareMode = App::CmpWipe;
-    toast("B = " + abDocLabel(cur()) + "  (move A somewhere else)");
+    toast("B = " + abDocLabel(cur()) + "  (A and B agree - move A to compare)");
 }
 
 static void swapCompare() {
@@ -1912,6 +2331,13 @@ static void swapCompare() {
         return;
     }
     const ImageDoc* a = cur();
+    // Both sides on one document is a legal comparison now, and swapping it
+    // moves nothing. Saying "swapped" over an unchanged screen is how a no-op
+    // becomes a bug report, so say what actually happened instead.
+    if (b == a) {
+        toast("A and B are the same image - nothing to swap  (" + abDocLabel(a) + ")");
+        return;
+    }
     std::string an = abDocLabel(a), bn = abDocLabel(b);
     uint64_t bUid = b->uid;
     setCompareB(a);                       // set B before moving A: cur() changes
@@ -1926,27 +2352,24 @@ static std::string abStatusChipText() {
     if (app.compareMode == App::CmpOff) return "";
     ImageDoc* b = cmpB();
     char buf[320];
-    if (!b) {
-        // Two different silences, two different sentences: no B at all, or A
-        // STANDING on the pinned B. The pin holds and the compare is merely
-        // paused (see A8 in --abstats-selftest) - but saying nothing about it
-        // read as 「比較を抜けてしまう」.
-        if (app.compareBUid && cur() && cur()->uid == app.compareBUid)
-            return "A = B (paused: this image IS the pinned B - move A to resume)";
-        return "A/B: no B image";
-    }
+    // One silence left, and it means one thing: there is no B. The second
+    // sentence here used to be "A = B (paused)" - the chip explaining why the
+    // panels had gone quiet while A stood on the pinned B. Nothing goes quiet
+    // any more (resolveB), so the chip names the pair like any other.
+    if (!b) return "A/B: no B image";
     // §3.1: A and B mapping the SAME source is a true comparison whose
-    // difference is all zero - the chip says why, in the paused sentence's
-    // family above. A slot sharing A's source is said the same way.
+    // difference is all zero - the chip says why. A slot sharing A's source
+    // is said the same way. (When A IS B - allowed now - the sentence is
+    // still true, and stops pretending otherwise.)
     std::string share;
     if (const ImageDoc* a = cur()) {
         if (a->src == b->src) {
             share = "  -  A and B share the same pixels";
         } else {
             // The slots the panes actually SHOW: follow-frame-resolved, exactly
-            // as B above (resolveSlots IS that resolution, and it skips a
-            // dormant slot A stands on). Testing the pinned uid instead claimed
-            // or withheld the share against a frame nobody was comparing.
+            // as B above (resolveSlots IS that resolution). Testing the pinned
+            // uid instead claimed or withheld the share against a frame nobody
+            // was comparing.
             for (const ResolvedSlot& rs : resolveSlots())
                 if (rs.doc->src == a->src) {
                     share = "  -  A and " + slotName(rs.idx) + " share the same pixels";
@@ -1969,23 +2392,27 @@ static std::string abStatusChipText() {
 // What the A/B item on a Files row offers, for the frame or stack that row
 // would hand to B.
 //
-// The row you are LOOKING AT is A - the cursor, not a seat - and it offers
-// NOTHING. It used to offer "Swap A and B" there, and that line was care
-// nobody needed (user report, 2026-07-30: 「swapはショートカットキーで対応
-// されているから右クリックメニューでのケアは不要では」): the swap lives on
-// Shift+\ , the View menu and the status-bar button, and selecting B's row
-// simply makes it A - the pin survives, resolveB going quiet while A stands
-// on B is shipped behavior (A8). Every other row is the simple pair the user
-// asked to read: "Set as compare B" and the slot item.
+// EVERY row offers it, the one you are looking at included. That row used to
+// offer nothing at all, on the reasoning that it IS A and a thing cannot be
+// compared with itself - which is the very care the user threw out (2026-08-04,
+// 「比較の際に同じものを選んだ時に，同じことを確認できる方がよい」). Setting
+// this row as B is now a legitimate and useful move: both sides show the same
+// document, the panels draw two curves and two rows on top of each other, and
+// that coincidence is the confirmation you were after.
+//
+// (It also used to offer "Swap A and B" here, and THAT line really was care
+// nobody needed - user report 2026-07-30: 「swapはショートカットキーで対応され
+// ているから右クリックメニューでのケアは不要では」. The swap lives on Shift+\ ,
+// the View menu and the status-bar button; it is not coming back.)
 //
 // Out here rather than in the menu so it can be checked without a frame
 // (--abstats-selftest, A7).
 enum AbRowItem {
-    AbSetB,        // a different image: it can become B
-    AbNone         // this row IS A: no A/B item at all
+    AbSetB,        // this row can become B - and every row can
+    AbNone         // reserved: nothing on this row (no image at all)
 };
 static AbRowItem abRowItem(const ImageDoc* pick) {
-    return pick != cur() ? AbSetB : AbNone;
+    return pick ? AbSetB : AbNone;
 }
 
 static void computeMinMax(ImageDoc& im) {
@@ -2052,6 +2479,16 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
             std::vector<float> mags;
             size_t total = (size_t)w * h;
             size_t step = std::max<size_t>(1, total / 200000);   // bounded sample
+            // ...and the step is forced ODD, which is the f35a79e defect in its
+            // last hiding place. Striding a one-dimensional index and wrapping
+            // it (x = p % w) samples only even columns the moment step and w are
+            // both even - and a sensor width essentially always is. On an RGGB
+            // frame that leaves R and Gb with samples and Gr and B with none, so
+            // this percentile - and with it the whole A/B difference display's
+            // scaling - would be decided by half the sensor. An odd step walks
+            // every column parity, and every row parity with it, because
+            // consecutive samples advance x by an odd amount and wrap.
+            if (step % 2 == 0) step++;
             mags.reserve(total / step + 1);
             for (size_t p = 0; p < total; p += step) {
                 int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
@@ -2077,7 +2514,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
         D.w == w && D.h == h)
         return;                                     // cache hit: nothing changed
 
-    double t0 = glfwGetTime();
+    double t0 = nowSec();
     static std::vector<uint8_t> rgba;
     rgba.resize((size_t)w * h * 4);
     const float inv = 1.0f / std::max(gain, 1e-20f);
@@ -2124,7 +2561,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
     D.clipped = (double)clipped / ((double)w * h);
     fprintf(stderr, "diff: %s - %s  full scale +-%g  (%.3f%% off scale, %.0f ms)\n",
             a.name.c_str(), b.name.c_str(), gain, D.clipped * 100,
-            (glfwGetTime() - t0) * 1000);
+            (nowSec() - t0) * 1000);
 }
 
 // upload/normalize into RGBA8 texture
@@ -2341,6 +2778,23 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
+// The Range panel's one mode control (0 auto per frame / 1 per stack /
+// 2 linked). It lives here, not inside the combo, because choosing a mode has
+// to act on the frame ALREADY on screen: the per-frame policy is otherwise
+// applied only by selectImage, on a frame change, and the mode read as dead
+// until the first step (report 2026-08-03).
+static void applyRangeMode(int mode, ImageDoc* on) {
+    bool wasLinked = app.linkRange;
+    app.linkRange = mode == 2;
+    app.rangeScope = mode == 0 ? 0 : 1;
+    if (on) {
+        if (app.linkRange && !wasLinked) {     // seed from what is on screen
+            app.linkBlack = on->black; app.linkWhite = on->white;
+        }
+        if (mode == 0 && !app.linkRange) { defaultRange(*on); on->texDirty = true; }
+    }
+    if (app.linkRange != wasLinked) markAllTexDirty();
+}
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
 static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
@@ -2352,8 +2806,11 @@ static ImageDoc* cmpB();          // fwd: the B side, or null when compare is of
 // as you step. Mode 1 means "the reference side dictates": A's black-white
 // for every other letter. The slots join only while compare is ON - the
 // letters survive compare-off as seats, but a seat is not a comparison.
-// cur() is never B or a slot (resolveB / resolveSlots guarantee it), so none
-// of this recurses.
+// A, B and the slots may now name the SAME document (resolveB no longer goes
+// quiet there), which this handles by construction: a union of min/max does
+// not care how many times a side appears, and the `rs.doc != b` below is kept
+// only so a duplicate cannot eat one of the fixed 16 places. It changes no
+// number - unlike the panels, where dropping a duplicate side dropped a curve.
 static bool abRange(const ImageDoc& im, float& lo, float& hi) {
     if (app.compareRangeMode == 0) return false;
     ImageDoc* a = cur();
@@ -2418,14 +2875,37 @@ static void forgetImage(ImageDoc* im) {
         if (app.proj[k].img == im) { app.proj[k].img = nullptr; app.proj[k].uid = 0; }
         app.temporal[k].seqId = -1;
     }
-    // ...and the extra compare slots' states (C, D, ...): the same cache one
-    // layer out, missed here since the slots were added - reachable through a
-    // slot stack's preview->full swap even before reload existed
-    // (docs/reference-design.md §3.2)
+    // ...and EVERY lettered slot, for the same reason. Closing C shifts D down
+    // into C's cache entry, and the entry still held C's ImageDoc*: the key
+    // check (uid/dataRev) fails and it is recomputed before it is read, so the
+    // stale pointer was never followed - but "never followed" is a property of
+    // the read path, not of the cache, and the next reader is one edit away
+    // from following it. The cache says what it holds or it says nothing.
+    // (Reachable through a slot stack's preview->full swap even before reload
+    // existed - docs/reference-design.md §3.2 - hence temporalExtra too.)
+    for (auto& H : app.histExtra) if (H.img == im) { H.img = nullptr; H.uid = 0; }
+    for (auto& P : app.projExtra) if (P.img == im) { P.img = nullptr; P.uid = 0; }
     for (auto& T : app.temporalExtra) T.seqId = -1;
     forgetTexture(im);
     app.imagesRev++;
 }
+
+static void ensureSession(remote::Session& ses, std::string& sesHost, int& sesPort,
+                          const std::string& host, int port, const std::string& exe,
+                          std::string& errOut) {
+    std::string err;
+    // startOn, not start(): start() hardwires port 0, i.e. plain
+    // `ssh host` - a DIFFERENT machine when the user named a port
+    if (!ses.alive() || sesHost != host || sesPort != port) {
+        if (!ses.startOn(host, port, exe, err)) {
+            errOut = err;
+        } else {
+            sesHost = host;
+            sesPort = port;
+        }
+    }
+}
+
 // ---- background full-resolution fetch (remote frames) -------------------------
 // The preview is already on screen; the real pixels arrive here on their own ssh
 // connection and are swapped in by the UI thread.
@@ -2436,19 +2916,23 @@ static void rfWorker() {
     int sesPort = -1;
     while (!app.rfStop) {
         App::RFetchJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(app.rfMtx);
-            if (!app.rfQueue.empty()) {
-                job = std::move(app.rfQueue.front());
-                app.rfQueue.erase(app.rfQueue.begin());
-                have = true;
-            }
+            std::unique_lock<std::mutex> lk(app.rfMtx);
+            app.rfCv.wait(lk, []{ return app.rfStop || !app.rfQueue.empty(); });
+            // Stop wins over pending work, as it did when this was a poll: the
+            // old `while (!app.rfStop)` was checked BEFORE any dequeue. Asking
+            // for the queue to be empty as well lets a worker that was notified
+            // with a job and stopped before it could reacquire the mutex run one
+            // more fetch INSIDE stopRemoteFetcher's join(), with the UI thread
+            // waiting on it. The predicate above already guarantees the queue is
+            // non-empty whenever the flag is false, so there is nothing to lose.
+            if (app.rfStop) break;
+            job = std::move(app.rfQueue.front());
+            app.rfQueue.erase(app.rfQueue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::RFetchDone d;
         d.uid = job.uid;
-        d.url = job.url; d.name = job.name;
+        d.url = job.url; d.name = job.name; d.note = job.note;
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         d.gen = job.gen;
         d.bytes = job.bytes;
@@ -2457,12 +2941,7 @@ static void rfWorker() {
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
             d.err = "bad remote url";
         } else {
-            // startOn, not start(): start() hardwires port 0, i.e. plain
-            // `ssh host` - a DIFFERENT machine when the user named a port
-            if (!ses.alive() || sesHost != host || sesPort != port) {
-                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
-                else { sesHost = host; sesPort = port; }
-            }
+            ensureSession(ses, sesHost, sesPort, host, port, job.exe, d.err);
             if (d.err.empty()) {
                 int w = 0, h = 0, ch = 0;
                 // the server clamps the rect, so "huge" means "the whole frame"
@@ -2514,6 +2993,7 @@ static void rfEnqueue(App::RFetchJob job) {
             app.rfQueue.insert(it, std::move(job));
         }
     }
+    app.rfCv.notify_one();
     if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
 }
 
@@ -2579,6 +3059,10 @@ static void pumpRemoteFetch() {
             }
             auto doc = std::make_unique<ImageDoc>();
             doc->name = d.name;
+            doc->note = d.note;                  // the head frame's note, verbatim: the
+                                                 // Inspector's source row is a property
+                                                 // of the STACK, so it never appears or
+                                                 // vanishes as the user steps frames
             FrameSource& S = *doc->src;          // fresh source (remote: no stat)
             S.path = d.url;
             S.remoteUrl = d.url;
@@ -2665,7 +3149,11 @@ static void pumpRemoteFetch() {
 }
 
 static void stopRemoteFetcher() {
-    app.rfStop = true;
+    {
+        std::lock_guard<std::mutex> lk(app.rfMtx);
+        app.rfStop = true;
+    }
+    app.rfCv.notify_all();
     if (app.rfThread.joinable()) app.rfThread.join();
 }
 
@@ -2679,13 +3167,21 @@ static void mWorker() {
     int sesPort = -1;
     while (!app.mStop) {
         App::MJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(app.mMtx);
-            if (!app.mQueue.empty()) { job = std::move(app.mQueue.front());
-                                       app.mQueue.erase(app.mQueue.begin()); have = true; }
+            std::unique_lock<std::mutex> lk(app.mMtx);
+            app.mCv.wait(lk, []{ return app.mStop || !app.mQueue.empty(); });
+            // Stop wins over pending work - the third time this exact line has
+            // arrived, after rbWorker and rfWorker (3a5f724). The loop it
+            // replaces checked the flag BEFORE dequeuing, so a stop abandoned
+            // the queue; asking for the queue to be empty as well lets a worker
+            // that was notified with a job and stopped before it could reacquire
+            // the mutex run one more measurement inside stopMeasureWorker's
+            // join(), with the UI thread waiting on it. The predicate already
+            // guarantees the queue is non-empty whenever the flag is false.
+            if (app.mStop) break;
+            job = std::move(app.mQueue.front());
+            app.mQueue.erase(app.mQueue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         App::MDone d;
         d.token = job.token;
         std::string host, rpath, err;
@@ -2693,10 +3189,7 @@ static void mWorker() {
         if (!remote::parseUrl(job.url, host, rpath, &port)) { d.err = "bad remote url"; }
         else {
             d.host = host;
-            if (!ses.alive() || sesHost != host || sesPort != port) {
-                if (!ses.startOn(host, port, job.exe, err)) d.err = err;
-                else { sesHost = host; sesPort = port; }
-            }
+            ensureSession(ses, sesHost, sesPort, host, port, job.exe, d.err);
             if (d.err.empty()) {
                 remote::MeasureReq q;
                 q.op = job.op;
@@ -2731,11 +3224,16 @@ static void mEnqueue(App::MJob job) {
         app.mPending++;
         app.mQueue.push_back(std::move(job));
     }
+    app.mCv.notify_one();
     if (!app.mThread.joinable()) app.mThread = std::thread(mWorker);
 }
 
 static void stopMeasureWorker() {
-    app.mStop = true;
+    {
+        std::lock_guard<std::mutex> lk(app.mMtx);
+        app.mStop = true;
+    }
+    app.mCv.notify_all();
     if (app.mThread.joinable()) app.mThread.join();
 }
 
@@ -3232,24 +3730,12 @@ static void closeCurrent(bool frameOnly = false) {
     // §4 for the two one-frame closes (Ctrl+W on a loose frame, Ctrl+Alt+W):
     // one membership goes here without passing closeStack, and pixels that
     // live on elsewhere must still be said to - a silent close reads as freed.
+    // Said BEFORE closeImages: the notice reads the doc it is about.
     sayCloseNotice({ app.current }, {}, "\"" + im->name + "\"");
-    forgetImage(im);
-    if (im->tex) glDeleteTextures(1, &im->tex);
-    app.images.erase(app.images.begin() + app.current);
-    app.current = app.images.empty() ? -1 : std::min(app.current, (int)app.images.size() - 1);
-    app.fitRequested = true;
-    app.imagesRev++;
-    // Same rule as closeImages: a dangling B must not re-latch by NAME onto a
-    // same-named frame of another stack (every stack has a frame_001.npy).
-    // ensureCompareB keeps B != cur() so the UI cannot reach this today, but
-    // this path duplicates closeImages' body and inherited the omission.
-    if (!resolveB()) {
-        app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
-    }
+    closeImages({ app.current });
     // the escape hatch emptied the stack: drop the SeqInfo and its bookkeeping
     // too, or a zero-frame stack haunts the linearity table
     if (seqId != 0 && framesOfSeq(seqId).empty()) closeStack(seqId);
-    pruneEmptyBatches();
 }
 
 // Drop batches nothing references anymore: no image, no queued group, no
@@ -3434,6 +3920,8 @@ static void closeAll() {
     app.seqLoadingId = 0;
     app.seqQueue.clear();
     app.seqRestore.clear();
+    app.pendingAvg.clear();           // they name stacks being thrown away...
+    app.avgRestore.clear();           // ...and paths that will not be open either
     app.rbOpenQueue.clear();
     for (auto& bp : app.browsePanels) bp->pendingOpen.clear();
     app.ana.img = nullptr;
@@ -3442,6 +3930,9 @@ static void closeAll() {
         app.proj[k] = App::ProjState{};
         app.temporal[k] = App::TemporalState{};
     }
+    app.histExtra.clear();            // ...and every lettered one
+    app.projExtra.clear();
+    app.temporalExtra.clear();
     app.abSlot1Live = false;
     app.texLru.clear();
     app.imagesRev++;
@@ -3467,6 +3958,12 @@ static void closeAll() {
     app.previewFiles.clear();
     app.previewFrames = 0;
     app.previewLabel.clear();
+    // ...and the three this used to leave standing. dropPreview() clears all
+    // seven; Close All cleared four, so the machine and port of a preview that
+    // no longer exists survived a Close All and were handed to the next step.
+    app.previewIndex = 0;
+    app.previewHost.clear();
+    app.previewPort = 0;
     app.current = -1;
     // compare state refers to docs that no longer exist; leaving it would let a
     // later file with the same name silently become B again
@@ -3814,17 +4311,332 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
 // ---------------------------------------------------------------- .npz (zip)
 // Minimal zip reader for npz: central-directory walk, stored (0) and deflate (8),
 // with zip64 sizes. Inflate comes from miniz.
-// axisOverride: -1 = decide the ambiguous small-leading-axis case by the live
-// app.npyAxis pref (first decode); 0/1 = replay a RECORDED decision
-// (FrameSource::frameAxis) - reload must reproduce the interpretation the
-// pixels were born under, not whatever the global happens to be today.
+// npyRead: the recorded reading declaration (FrameSource::npyRead, §3.3) -
+// reload must reproduce the interpretation the pixels were born under, which
+// is why it is threaded through rather than read from any global.
 static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf,
                                                  const std::string& path,
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
                                                  int& framesOut, int64_t& frameStrideOut,
-                                                 int axisOverride = -1);
+                                                 int npyRead = 0 /*NR_NATIVE*/);
 struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
+
+// ---- the .npy header, parsed ONCE -------------------------------------------
+// shape is the shape AS WRITTEN: a scalar is 0-D and stays 0-D here, because
+// "() versus (1,) versus (1,1)" is the whole question the .npz classifier asks.
+// esize 0 = a dtype this viewer cannot read as pixels (strings, object arrays);
+// that is a fact about the member, not an error, so the peek still succeeds and
+// the caller decides. The decoder and the classifier share this function so
+// what the picker promises and what actually opens cannot drift apart.
+struct NpyHead {
+    std::vector<int64_t> shape;
+    std::string descr;                // raw, e.g. "<u2" / "<U8" / "|O"
+    std::string code;                 // descr without the byte-order character
+    std::string dtypeName;            // "u16" ... empty when esize == 0
+    int esize = 0;
+    bool fortran = false, be = false;
+    size_t dataOff = 0;
+};
+static bool npyPeekHeader(const std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
+    auto fail = [&](const char* m) { err = m; return false; };
+    if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
+        return fail("not a .npy file (bad magic)");
+    int major = buf[6];
+    size_t hlen, hoff;
+    if (major >= 2) {
+        if (buf.size() < 12) return fail("corrupt npy header");
+        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
+    } else {
+        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
+    }
+    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
+    std::string hdr((char*)&buf[hoff], hlen);
+    auto findQuoted = [&](const char* key) -> std::string {
+        size_t k = hdr.find(key);
+        if (k == std::string::npos) return {};
+        size_t q1 = hdr.find('\'', hdr.find(':', k));
+        if (q1 == std::string::npos) return {};
+        size_t q2 = hdr.find('\'', q1 + 1);
+        return hdr.substr(q1 + 1, q2 - q1 - 1);
+    };
+    H.descr = findQuoted("'descr'");
+    if (H.descr.empty()) return fail("cannot parse descr");
+    H.fortran = hdr.find("'fortran_order': True") != std::string::npos;
+    size_t sp = hdr.find("'shape'");
+    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
+    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
+    H.shape.clear();
+    {
+        std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t c = s.find(',', pos);
+            std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+            if (tok.find_first_of("0123456789") != std::string::npos)
+                H.shape.push_back(std::stoll(tok));
+            if (c == std::string::npos) break;
+            pos = c + 1;
+        }
+    }
+    char bo = '<';
+    H.code = H.descr;
+    if (!H.code.empty() && (H.code[0] == '<' || H.code[0] == '>' ||
+                            H.code[0] == '|' || H.code[0] == '=')) {
+        bo = H.code[0]; H.code = H.code.substr(1);
+    }
+    H.be = (bo == '>');
+    H.esize = 0;
+    H.dtypeName.clear();
+    if      (H.code == "u1") { H.esize = 1; H.dtypeName = "u8"; }
+    else if (H.code == "i1") { H.esize = 1; H.dtypeName = "i8"; }
+    else if (H.code == "b1") { H.esize = 1; H.dtypeName = "bool"; }
+    else if (H.code == "u2") { H.esize = 2; H.dtypeName = "u16"; }
+    else if (H.code == "i2") { H.esize = 2; H.dtypeName = "i16"; }
+    else if (H.code == "u4") { H.esize = 4; H.dtypeName = "u32"; }
+    else if (H.code == "i4") { H.esize = 4; H.dtypeName = "i32"; }
+    else if (H.code == "f4") { H.esize = 4; H.dtypeName = "f32"; }
+    else if (H.code == "f8") { H.esize = 8; H.dtypeName = "f64"; }
+    H.dataOff = hoff + hlen;
+    return true;
+}
+
+// "(24, 480, 640)" / "scalar" - the shape a human recognises from the script
+// that wrote it, printed from the header and never from what we made of it.
+static std::string npyShapeText(const std::vector<int64_t>& shape) {
+    if (shape.empty()) return "scalar";
+    std::string s = "(";
+    for (size_t i = 0; i < shape.size(); i++) {
+        s += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s += ", ";
+        else if (shape.size() == 1) s += ",";
+    }
+    return s + ")";
+}
+
+// One .npy FILE on disk from a shape, a dtype and its bytes. v1.0 header, C
+// order, padded to the 64-byte boundary numpy itself pads to.
+//
+// Shared rather than written twice: two selftests need fixtures of an exactly
+// named shape, and both are testing the rule that reads the shape back - so a
+// second copy of the header spelling would be a second thing that can be wrong
+// in the direction that hides the fault. Returns the path it was handed.
+static std::string npyWriteFile(const std::string& path, const char* descr,
+                                const std::vector<int64_t>& shape,
+                                const void* data, size_t nbytes) {
+    std::string sh;
+    if (shape.empty()) sh = "()";
+    else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+    else {
+        sh = "(";
+        for (size_t i = 0; i < shape.size(); i++)
+            sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+        sh += ")";
+    }
+    std::string hdr = std::string("{'descr': '") + descr +
+                      "', 'fortran_order': False, 'shape': " + sh + ", }";
+    hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+    hdr += '\n';
+    std::vector<uint8_t> out;
+    const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+    out.insert(out.end(), magic, magic + 8);
+    out.push_back((uint8_t)(hdr.size() & 0xff));
+    out.push_back((uint8_t)(hdr.size() >> 8));
+    out.insert(out.end(), hdr.begin(), hdr.end());
+    const uint8_t* p = (const uint8_t*)data;
+    out.insert(out.end(), p, p + nbytes);
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    f.write((const char*)out.data(), (std::streamsize)out.size());
+    return path;
+}
+
+// ---- which axis is what -----------------------------------------------------
+// docs/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
+// name. The decision is RANK and the LAST AXIS, and never the first axis's
+// size. "A leading axis of 4 or less must be channels" is the guess that read
+// (3,H,W) - three frames, an ordinary thing to save - as one 3-channel picture,
+// and it could not be right in both of the two cases that actually occur. On
+// the last axis the collision does not arise: an image three pixels wide is not
+// a thing. THE EXCEPTION IS THE ONE WRITTEN DOWN, and there is only one.
+//
+// What a user cannot get from the shape, they SAY (§3.3, NpyRead below). That
+// is a declaration, per file and visible on screen - which is what --npy-axis,
+// one global flag for a whole run, could never be.
+
+// A reading of an array. Never inferred beyond NR_NATIVE; the others exist only
+// because someone chose them in the Inspector. VALUES ARE WRITTEN TO SESSIONS:
+// append, never renumber.
+enum NpyRead {
+    NR_NATIVE = 0,   // no choice recorded: §3.1 decides from rank + last axis
+    NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
+    NR_HWC    = 2,   // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
+    NR_CHW    = 3,   // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
+};
+
+// The four forms, spelled the way §3.2 spells them to a user.
+//
+// "C<=4", not "3|4": the rule is a CEILING (§3.1's table, and issue #71), and a
+// refusal that still quotes 3|4 once (H,W,1) opens sends the next reader looking
+// for a rule nobody implements. Spelled in ASCII on purpose - §4.13.0 draws it
+// with U+2264, but this string is printed to a console whose codepage may be
+// cp932 (which cannot encode that character at all) and is quoted back verbatim
+// by tools/import/run_adapter.py through a pipe.
+static const char* NPY_NATIVE_FORMS = "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)";
+
+// Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
+// -1 = "this reading has no such axis". False = r does not apply to this rank,
+// which is how impossible readings are kept off the menu (§3.3).
+static bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) {
+    iF = iH = iW = iC = -1;
+    switch (r) {
+    case NR_STACK:
+        if (rank == 3) { iF = 0; iH = 1; iW = 2;           return true; }
+        if (rank == 4) { iF = 0; iH = 1; iW = 2; iC = 3;   return true; }
+        return false;
+    case NR_HWC: if (rank == 3) { iH = 0; iW = 1; iC = 2; return true; } return false;
+    case NR_CHW: if (rank == 3) { iC = 0; iH = 1; iW = 2; return true; } return false;
+    }
+    return false;
+}
+
+// §3.1, entire: rank, then the last axis, then stop. NR_NATIVE for a rank that
+// has no reading at all (1-D, 5-D and up) - the caller refuses those by name.
+//
+// The last axis is CHANNELS when it is 4 OR FEWER - not "3 or 4" (issue #71).
+// This line used to test ==3||==4 while core/serve.cpp tested <=4, so the same
+// file read one way through File > Open and another way through a peer: a mono
+// (480,640,1) capture - which is just what img[:, :, None] and np.expand_dims
+// produce - opened locally as 480 frames of 1x640, and remotely as one 640x480
+// picture. The stack reading is the dangerous one, because inventing a frame
+// axis invents a TIME axis: Temporal reported sigma_t = 36.2 DN for a frame
+// whose real read noise was 5.0 DN, and the number came from the scene's
+// vertical structure rather than the sensor. docs/terminology.md is the canon
+// that settles it ("a frame has no time axis", and "if the implementation
+// disagrees with this table it is a bug"), and every downstream ceiling in this
+// codebase is already 1..4 rather than {3,4}. What this costs is a stack of
+// frames 1 to 4 pixels wide, which §3.1 wrote off as not a real thing, and
+// which §3.3 can say again per file anyway.
+static int npyNativeRead(const std::vector<int64_t>& shape) {
+    if (shape.size() == 3) return shape[2] <= 4 ? NR_HWC : NR_STACK;
+    if (shape.size() == 4) return NR_STACK;
+    return NR_NATIVE;
+}
+
+// Registry identity (§6.2, declared above srcIdentityKey): the reading that
+// actually decoded these pixels, with every spelling of "what native does"
+// folded onto NR_NATIVE. A declaration that does not fit the shape decoded
+// natively (npyLayout's fallback), so it keys natively too.
+static int npyKeyRead(const std::vector<int64_t>& shape, int npyRead) {
+    if (npyRead == NR_NATIVE) return NR_NATIVE;
+    int iF, iH, iW, iC;
+    if (!npyReadAxes(shape.size(), npyRead, iF, iH, iW, iC)) return NR_NATIVE;
+    return npyRead == npyNativeRead(shape) ? NR_NATIVE : npyRead;
+}
+
+// §3.2: name the shape that arrived, and name what native DOES read. A refusal
+// that says only "cannot open" sends the reader nowhere, which is how a 1-D
+// exposure vector stayed a one-pixel-tall image for as long as it did.
+//
+// §4.13, now attached: the third line of §3.2 is "choose a reader...", and THIS
+// is the single place it hangs from - the same message that said no. The
+// destination exists (openReaderPicker), and openPath raises it with this very
+// text as the reason, so the refusal is the affordance rather than a dead end
+// the user has to leave in order to act on.
+static std::string npyNotNative(const std::vector<int64_t>& shape) {
+    // npyShapeText says "scalar" for a 0-D array, and "shape scalar" is not a
+    // sentence; everything else is a shape and is named as one.
+    return (shape.empty() ? std::string("a scalar")
+                          : "shape " + npyShapeText(shape)) +
+           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS) +
+           "\n  choose a reader to read it another way";
+}
+
+// The layout decision, lifted out of the decoder so the .npz picker can promise
+// exactly what will happen. On success F/H/W/C and their strides describe the
+// frame to read. npyRead is the user's declaration or NR_NATIVE.
+static bool npyLayout(const std::vector<int64_t>& shape, const std::vector<int64_t>& strides,
+                      int npyRead, int64_t& F, int64_t& sf,
+                      int64_t& H, int64_t& W, int64_t& C,
+                      int64_t& sh, int64_t& sw, int64_t& sc,
+                      std::string& note, std::string& err) {
+    F = 1; sf = 0; H = W = C = 1; sh = sw = sc = 0;
+    const size_t rank = shape.size();
+    auto addNote = [&](const std::string& s) { note = note.empty() ? s : note + ", " + s; };
+    if (rank == 2) {                    // (H,W): one frame, one channel, no choice
+        H = shape[0]; sh = strides[0];
+        W = shape[1]; sw = strides[1];
+    } else if (rank == 3 || rank == 4) {
+        int iF, iH, iW, iC;
+        int r = npyRead;
+        // A remembered choice that no longer fits (the file was rewritten with a
+        // different rank) falls back to native and SAYS it did - restoring a
+        // session must not quietly apply a reading to an array it cannot mean.
+        if (r != NR_NATIVE && !npyReadAxes(rank, r, iF, iH, iW, iC)) {
+            addNote("re-read choice does not fit " + npyShapeText(shape) + "; read natively");
+            r = NR_NATIVE;
+        }
+        if (r == NR_NATIVE) r = npyNativeRead(shape);
+        npyReadAxes(rank, r, iF, iH, iW, iC);
+        if (iF >= 0) { F = shape[iF]; sf = strides[iF]; }
+        H = shape[iH]; sh = strides[iH];
+        W = shape[iW]; sw = strides[iW];
+        if (iC >= 0) { C = shape[iC]; sc = strides[iC]; }
+        // The transposed reading is never native (§3.4 deleted the implicit
+        // CHW->HWC), so when it happens it happened because someone asked.
+        if (r == NR_CHW) addNote("planes first (C,H,W), as asked");
+    } else {                            // 0-D, 1-D, 5-D and up: not a picture
+        err = npyNotNative(shape);
+        return false;
+    }
+    // EVERY axis has to be a real extent. W and H were bounded and F and C were
+    // not, so (8,8,0) built an ImageDoc with ch=0 and (0,8,8,3) read H*W*C
+    // values out of a payload holding none. A zero-length axis is not an image.
+    if (F < 1 || H < 1 || W < 1 || C < 1) {
+        err = "a zero-length axis in " + npyShapeText(shape) + ": no pixels in it";
+        return false;
+    }
+    if (W > 32768 || H > 32768) { err = "unsupported image size"; return false; }
+    // (F,H,W,C) is a native FORM; C > 4 is this viewer's own ceiling, so it is
+    // said as a ceiling and not as "not a native form" - a different sentence
+    // because it is a different refusal.
+    if (C > 4) {
+        err = npyShapeText(shape) + " would be " + std::to_string(C) +
+              " channels: this viewer shows up to 4";
+        return false;
+    }
+    if (F > 1) addNote("frame axis");
+    return true;
+}
+
+// "3 frames x 1 ch  (F,H,W)" - what a reading MAKES of this shape, in the
+// wording §3.3 uses. Computed, so the menu can never offer a reading that this
+// array cannot support.
+static std::string npyReadLabel(const std::vector<int64_t>& shape, int r) {
+    std::vector<int64_t> st(shape.size(), 1);       // strides are irrelevant here
+    int64_t F, sf, H, W, C, sh, sw, sc;
+    std::string note, err;
+    if (!npyLayout(shape, st, r, F, sf, H, W, C, sh, sw, sc, note, err)) return {};
+    const char* form = r == NR_HWC ? "(H,W,C)" : r == NR_CHW ? "(C,H,W)"
+                     : shape.size() == 4 ? "(F,H,W,C)" : shape.size() == 3 ? "(F,H,W)" : "(H,W)";
+    return std::to_string((int)F) + (F == 1 ? " frame x " : " frames x ") +
+           std::to_string((int)C) + " ch  " + form;
+}
+
+// Every reading this shape permits, native first. One entry means there is
+// nothing to choose and the Inspector shows no control (§3.3: impossible
+// readings are not offered, and neither is a menu of one).
+static std::vector<int> npyReadOptions(const std::vector<int64_t>& shape) {
+    std::vector<int> out;
+    int nat = npyNativeRead(shape);
+    if (nat == NR_NATIVE) return out;               // a refused shape reads no way
+    for (int r : { nat, (int)NR_STACK, (int)NR_HWC, (int)NR_CHW }) {
+        bool dup = false;
+        for (int o : out) if (o == r) dup = true;
+        if (dup || npyReadLabel(shape, r).empty()) continue;
+        out.push_back(r);
+    }
+    return out;
+}
 
 static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
     auto rd16 = [&](size_t o) { return (uint16_t)(buf[o] | buf[o + 1] << 8); };
@@ -3908,20 +4720,58 @@ static bool npzExtract(const std::vector<uint8_t>& zip, const NpzEntry& e,
     return true;
 }
 
+// Just enough bytes to read a .npy HEADER out of a member. The classifier looks
+// at ~128 bytes of each member, and inflating every member in FULL to see them
+// meant opening a multi-GB .npz decompressed the whole file on the UI thread
+// before the dialog appeared - and a session restore paid it again, per member.
+// Deflate is streamed into a fixed buffer and stopped when that buffer is full:
+// HAS_MORE_OUTPUT is the expected outcome here, not a failure.
+static bool npzExtractPrefix(const std::vector<uint8_t>& zip, const NpzEntry& e,
+                             size_t want, std::vector<uint8_t>& out, std::string& err) {
+    if (e.localOff + 30 > zip.size()) { err = "corrupt local header"; return false; }
+    auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
+    size_t nlen = rd16(e.localOff + 26), elen = rd16(e.localOff + 28);
+    size_t data = e.localOff + 30 + nlen + elen;
+    if (data + e.csize > zip.size()) { err = "truncated zip member"; return false; }
+    size_t cap = std::min(want, e.usize);
+    if (e.method == 0) {                                     // stored
+        size_t nCopy = std::min(cap, e.csize);
+        out.assign(zip.begin() + data, zip.begin() + data + nCopy);
+        return true;
+    }
+    if (e.method != 8) { err = "unsupported zip compression method"; return false; }
+    out.assign(cap, 0);
+    if (cap == 0) return true;
+    auto inf = std::make_unique<tinfl_decompressor>();   // ~11 KB: not a stack object
+    tinfl_init(inf.get());
+    size_t inBytes = e.csize, outBytes = cap;
+    tinfl_status st = tinfl_decompress(inf.get(), zip.data() + data, &inBytes,
+                                       out.data(), out.data(), &outBytes,
+                                       TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if (st != TINFL_STATUS_DONE && st != TINFL_STATUS_HAS_MORE_OUTPUT) {
+        err = "inflate failed";
+        return false;
+    }
+    out.resize(outBytes);
+    return true;
+}
+
 // Load a .npy; an array with a frame axis becomes one stack (塊), which is what
 // the temporal analysis operates on.
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
-                                                int64_t& frameStrideOut);   // defined below
+                                                int64_t& frameStrideOut,
+                                                int npyRead = 0 /*NR_NATIVE*/);   // defined below
 
 // Shared by .npy files and .npz members: build a stack when the array has a
-// frame axis, otherwise a single image.
+// frame axis, otherwise a single image. npyRead is the user's declaration
+// (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
 static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
-                                 const std::string& displayName) {
+                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/) {
     std::string err;
     int frames = 1;
     int64_t fstride = 0;
-    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride);
+    auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
     if (!first) return err.empty() ? "decode failed" : err;
     std::string label = first->name;
     if (frames <= 1) { addImage(std::move(first)); return {}; }
@@ -3938,12 +4788,17 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     for (int f = 1; f < frames; f++) {
         std::string e2;
         int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs);
+        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
         if (!doc) { toast(label + ": frame " + std::to_string(f) + ": " + e2, true); break; }
         doc->seqId = info.id;
         doc->seqIndex = f;
         computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        // ...and the batch, which addImage assigns to the HEAD frame only: these
+        // go straight into app.images, so a stack built inside one file used to
+        // have frame 0 in a batch and frames 1..N-1 in none (the folder path
+        // already does this, in pumpSequence). A stack is in ONE batch.
+        doc->batchId = ref->batchId;
         doc->texDirty = true;
         doc->uid = app.nextUid++;
         app.imagesRev++;
@@ -3953,15 +4808,892 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
         if (s.id == info.id) s.lastImageIdx = firstIdx;
     int got = 0;
     for (const auto& d : app.images) if (d->seqId == info.id) got++;
-    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", label.c_str(), got,
-            ref->w, ref->h, ref->ch);
+    // n of N, both numbers, when the frame loop broke early: the stack's NAME
+    // still says "(N frames)" and the stack holds fewer, and a partially loaded
+    // stack that does not say so is the silent lie docs/terminology.md forbids.
+    if (got < frames) {
+        for (auto& s : app.seqs)
+            if (s.id == info.id)
+                s.name = label + "  (" + std::to_string(got) + " of " +
+                         std::to_string(frames) + " frames)";
+        toast(label + ": " + std::to_string(got) + " of " + std::to_string(frames) +
+              " frames loaded - the rest could not be decoded", true);
+    }
+    fprintf(stderr, "npy stack: %s - %d of %d frames (%dx%d %dch)\n", label.c_str(), got,
+            frames, ref->w, ref->h, ref->ch);
     return {};
 }
 
-// onlyMember != "" restores a single array (sessions record which one).
-static std::string loadNpz(const std::string& path, const std::string& onlyMember = "") {
+// ---- classifying an .npz's members (docs/npz-design.md §2.1) ----------------
+// One element as a DOUBLE. An axis is the quantity data is plotted against, so
+// it never passes through float on the way in: the pixel path's getVal returns
+// float and that is right for pixels, but it is not right for 12345.678901234567.
+static double npyElem(const std::vector<uint8_t>& buf, const NpyHead& H, size_t i) {
+    const uint8_t* p = buf.data() + H.dataOff + i * (size_t)H.esize;
+    auto bswap = [](uint64_t v, int n) {
+        uint64_t r = 0;
+        for (int k = 0; k < n; k++) r = (r << 8) | ((v >> (8 * k)) & 0xff);
+        return r;
+    };
+    switch (H.esize) {
+    case 1: return H.code == "i1" ? (double)*(const int8_t*)p : (double)*p;
+    case 2: { uint16_t u; memcpy(&u, p, 2); if (H.be) u = (uint16_t)bswap(u, 2);
+              return H.code == "i2" ? (double)(int16_t)u : (double)u; }
+    case 4: { uint32_t u; memcpy(&u, p, 4); if (H.be) u = (uint32_t)bswap(u, 4);
+              if (H.code == "f4") { float f; memcpy(&f, &u, 4); return (double)f; }
+              return H.code == "i4" ? (double)(int32_t)u : (double)u; }
+    case 8: { uint64_t u; memcpy(&u, p, 8); if (H.be) u = bswap(u, 8);
+              double d; memcpy(&d, &u, 8); return d; }
+    }
+    return 0;
+}
+
+// A string member's value, so a "note" key can be SHOWN and not merely counted.
+// numpy writes <U as UCS-4 and |S as bytes. Anything else is left empty, which
+// reads as "not shown" - never as a guess at what the bytes meant.
+static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& H) {
+    if (H.code.empty() || H.dataOff >= buf.size()) return {};
+    // ONE element wide, not "to the end of the member". "<U8" and "|S8" carry
+    // their item size in the descr, and reading past it walked into the next
+    // element - so a (5,) array of strings printed element 0 with its neighbour
+    // glued on, presented as if it were the whole array.
+    size_t item = 0;
+    for (size_t i = 1; i < H.code.size(); i++)
+        if (H.code[i] >= '0' && H.code[i] <= '9') item = item * 10 + (size_t)(H.code[i] - '0');
+    if (H.code[0] == 'U') item *= 4;                  // UCS-4
+    size_t avail = buf.size() - H.dataOff;
+    if (item && item < avail) avail = item;
+    const uint8_t* p = buf.data() + H.dataOff;
+    std::string s;
+    if (H.code[0] == 'S') {
+        for (size_t i = 0; i < avail && p[i]; i++) s += (char)p[i];
+    } else if (H.code[0] == 'U') {
+        for (size_t i = 0; i + 4 <= avail; i += 4) {
+            uint32_t c; memcpy(&c, p + i, 4);
+            if (H.be) c = ((c & 0xffu) << 24) | ((c & 0xff00u) << 8) |
+                          ((c >> 8) & 0xff00u) | (c >> 24);
+            if (!c) break;
+            if (c < 0x80) s += (char)c;                       // UTF-8, so a
+            else if (c < 0x800) { s += (char)(0xc0 | (c >> 6));       // non-ASCII
+                                  s += (char)(0x80 | (c & 0x3f)); }   // note is
+            else if (c < 0x10000) { s += (char)(0xe0 | (c >> 12));    // readable
+                                    s += (char)(0x80 | ((c >> 6) & 0x3f));
+                                    s += (char)(0x80 | (c & 0x3f)); }
+            else { s += (char)(0xf0 | (c >> 18));
+                   s += (char)(0x80 | ((c >> 12) & 0x3f));
+                   s += (char)(0x80 | ((c >> 6) & 0x3f));
+                   s += (char)(0x80 | (c & 0x3f)); }
+        }
+    }
+    if (s.size() > 120) s = s.substr(0, 117) + "...";
+    return s;
+}
+
+// Every member, classified BY SHAPE, before anything is opened. This is the
+// whole fix: the decision "is this pixels?" is made from the header, once, and
+// a member that is not pixels can no longer become pixels by falling through
+// into the image path.
+static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
+                                      const std::vector<NpzEntry>& entries) {
+    std::vector<NpzMember> out;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const NpzEntry& e = entries[i];
+        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
+        NpzMember m;
+        m.entry = i;
+        m.name = e.name.substr(0, e.name.size() - 4);
+        m.shapeText = "?";
+        m.dtype = "?";
+        // Header only: an image member is never inflated here, however big it is.
+        // 64 KiB covers every .npy header (v1 caps the length at 65535 and the
+        // dict is padded to a 64-byte multiple); a v2 header longer than that
+        // falls back to a full read rather than being called corrupt.
+        std::vector<uint8_t> buf;
+        std::string err;
+        NpyHead H;
+        bool got = npzExtractPrefix(zip, e, 64 * 1024, buf, err) &&
+                   npyPeekHeader(buf, H, err);
+        if (!got && buf.size() < e.usize)
+            got = npzExtract(zip, e, buf, err) && npyPeekHeader(buf, H, err);
+        if (!got) {
+            m.role = NpzMember::RBad;
+            m.becomes = "not opened";
+            m.why = err;
+            out.push_back(std::move(m));
+            continue;
+        }
+        m.shapeText = npyShapeText(H.shape);
+        m.dtype = H.dtypeName.empty() ? H.descr : H.dtypeName;
+        // The element COUNT is a product of numbers a header can declare freely.
+        // (2305843009213693952,) wraps a size_t product to 0, which then passed
+        // the "fits in the buffer" guard and reached reserve() as an uncaught
+        // length_error. Every dim is checked, the product is checked, and the
+        // result is checked against the bytes the ZIP DIRECTORY says are there -
+        // so a truncated member is refused in the scan and never promised.
+        size_t n = 1;
+        bool sane = true;
+        for (int64_t d : H.shape) {
+            if (d < 0) { sane = false; break; }
+            if (d != 0 && n > (size_t)-1 / (size_t)d) { sane = false; break; }
+            n *= (size_t)d;
+        }
+        size_t payload = 0;
+        if (sane && H.esize > 0) {
+            if (n > ((size_t)-1 - H.dataOff) / (size_t)H.esize) sane = false;
+            else payload = n * (size_t)H.esize;
+        }
+        if (!sane || H.dataOff + payload > e.usize) {
+            m.role = NpzMember::RBad;
+            m.becomes = "not an image: truncated or impossible";
+            m.why = "shape " + m.shapeText + " needs more bytes than the member holds";
+            out.push_back(std::move(m));
+            continue;
+        }
+        // values live at the far end of the member, so anything that needs them
+        // (metadata and axis candidates only - never an image) reads it in full
+        auto fullBuf = [&]() -> bool {
+            if (buf.size() >= H.dataOff + payload) return true;
+            std::string e2;
+            return npzExtract(zip, e, buf, e2);
+        };
+        if (H.esize == 0) {                       // strings, object arrays, ...
+            m.role = NpzMember::RMeta;
+            m.becomes = "metadata";
+            m.why = "dtype " + H.descr + " is not pixels";
+            if (fullBuf()) {
+                m.text = npzTextValue(buf, H);
+                // an ARRAY of strings is not its first element: say which one
+                // this is rather than passing element 0 off as the whole thing
+                if (!m.text.empty() && n > 1)
+                    m.text = "\"" + m.text + "\" (first of " + std::to_string(n) + ")";
+                else if (!m.text.empty())
+                    m.text = "\"" + m.text + "\"";
+            }
+            out.push_back(std::move(m));
+            continue;
+        }
+        if (H.shape.empty()) {                    // a 0-D scalar is a number, not a picture
+            m.role = NpzMember::RMeta;
+            m.becomes = "metadata";
+            m.why = "a scalar is not pixels";
+            if (fullBuf() && H.dataOff + (size_t)H.esize <= buf.size())
+                m.text = fmtExact(npyElem(buf, H, 0));
+            out.push_back(std::move(m));
+            continue;
+        }
+        if (H.shape.size() == 1) {                // THE defect: (N,) used to be H=1,W=N
+            m.role = NpzMember::RAxis;
+            m.becomes = "metadata";               // upgraded to "x axis" when a
+            m.why = "a 1-D array is not pixels";  // stack of the same length opens
+            // an axis has one value per frame; something with millions of them
+            // is not one, and is not worth inflating to find out
+            if (n > (1u << 24)) {
+                m.role = NpzMember::RMeta;
+                m.why = "a 1-D array of " + std::to_string(n) + " values is not a frame axis";
+            } else if (fullBuf() && H.dataOff + payload <= buf.size()) {
+                m.vals.reserve(n);
+                for (size_t k = 0; k < n; k++) m.vals.push_back(npyElem(buf, H, k));
+            }
+            out.push_back(std::move(m));
+            continue;
+        }
+        std::vector<int64_t> shape = H.shape, strides(shape.size());
+        if (H.fortran) { int64_t s = 1; for (size_t k = 0; k < shape.size(); k++) { strides[k] = s; s *= shape[k]; } }
+        else           { int64_t s = 1; for (int k = (int)shape.size() - 1; k >= 0; k--) { strides[k] = s; s *= shape[k]; } }
+        std::string note, lerr;
+        int64_t F, sf, Hh, Ww, Cc, sh, sw, sc;
+        // NR_NATIVE: the picker predicts what an Open will do, and an Open of a
+        // member has no re-read declaration behind it yet (§3.3 restates a doc
+        // that is already open, from the Inspector).
+        if (!npyLayout(shape, strides, NR_NATIVE, F, sf, Hh, Ww, Cc, sh, sw, sc, note, lerr)) {
+            // Named in one line, not merely counted: "not opened" tells a reader
+            // nothing, and this member is the one that used to become a picture
+            // by having its leading axes quietly thrown away.
+            m.role = H.shape.size() > 4 ? NpzMember::RAmbig : NpzMember::RBad;
+            m.becomes = H.shape.size() > 4
+                            ? "not a native form: native reads " + std::string(NPY_NATIVE_FORMS)
+                            : "not an image: " + lerr;
+            m.why = lerr;
+            out.push_back(std::move(m));
+            continue;
+        }
+        m.role = NpzMember::RImage;
+        m.frames = (int)F;
+        m.w = (int)Ww; m.h = (int)Hh; m.ch = (int)Cc;
+        m.selected = true;                       // pixels are what an Open is for
+        m.becomes = F > 1 ? "stack of " + std::to_string((int)F) + " frames" : "frame";
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+// Open ONE image-shaped member: the stack (or the frame) it makes, tagged with
+// the array name so a session can come back to exactly this member.
+// zipStat is the CALLER's stat of the zip, taken BEFORE its bytes were read:
+// the multi-second member decode below is exactly the window an overwrite
+// would exploit, and identity-before-bytes binds the OLD tuple to the OLD
+// pixels - the safe direction (§6.2). Required, not defaulted: a zero stat
+// would silently keep the member out of the registry.
+static std::string npzOpenMember(const std::string& path, const std::vector<uint8_t>& zip,
+                                 const NpzEntry& e, const std::string& arrayName,
+                                 int npyRead /*NR_NATIVE = 0*/,
+                                 const FrameSource& zipStat) {
+    std::vector<uint8_t> member;
+    std::string mErr;
+    if (!npzExtract(zip, e, member, mErr)) return mErr;
+    size_t before = app.images.size();
+    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead);
+    if (!lErr.empty()) return lErr;
+    for (size_t k = before; k < app.images.size(); k++) {
+        app.images[k]->src->npzMember = arrayName;   // identity for session restore
+        // Watch baseline (§2.1): the npz FILE is the local file these pixels
+        // came from - src->path already names it; npzMember keeps members
+        // distinct in the registry tuple (§6.2). Identity is complete only
+        // HERE (loadNpyBuffer knows no member name), so this is where the
+        // member either joins a resident source or registers its own.
+        // (Measured before registering: addImage inside loadNpyBuffer ran
+        // computeMinMax while the source was still private.)
+        app.images[k]->src->mtime = zipStat.mtime;   // the PRE-read stat:
+        app.images[k]->src->fsize = zipStat.fsize;   // identity binds those bytes
+        shareOrRegisterSource(*app.images[k]);
+    }
+    return {};
+}
+
+// Members that are not pixels, kept against the FILE so the Inspector can show
+// them beside the frame that did open (docs/npz-design.md §4 item 3 - metadata
+// は Inspector の Image 節に、開いた frame の隣。専用パネルは作らない).
+static void npzRememberMeta(const std::string& path, const std::vector<NpzMember>& mem) {
+    std::vector<std::pair<std::string, std::string>> items;
+    for (const auto& m : mem) {
+        if (m.role == NpzMember::RImage) continue;
+        std::string v = m.text;
+        if (v.empty() && m.role == NpzMember::RAxis)
+            v = std::to_string(m.vals.size()) + " value(s)";
+        items.emplace_back(m.name, m.shapeText + "  " + m.dtype + (v.empty() ? "" : "  = " + v));
+    }
+    for (auto& e : app.npzMeta)
+        if (e.path == path) { e.items = std::move(items); return; }
+    if (!items.empty()) app.npzMeta.push_back({ path, std::move(items) });
+}
+
+// What opened and what did not, BY NAME, in one line. Never silent in either
+// direction: "3 member(s) skipped" without their names is how the one-pixel-tall
+// exposure vector went unnoticed for as long as it did.
+static std::string npzSummary(const std::string& path, const std::vector<NpzMember>& mem,
+                              const std::vector<std::string>& openedNames,
+                              int stacks, int stackFrames, int loneFrames,
+                              const std::string& axisNote) {
+    std::string s = baseName(path) + ": ";
+    if (stacks || loneFrames) {
+        s += "opened ";
+        if (stacks) s += std::to_string(stacks) + " stack" + (stacks > 1 ? "s" : "") +
+                         " (" + std::to_string(stackFrames) + " frames)";
+        if (stacks && loneFrames) s += " + ";
+        if (loneFrames) s += std::to_string(loneFrames) + " frame" + (loneFrames > 1 ? "s" : "");
+    } else s += "opened nothing";
+    if (!axisNote.empty()) s += ", " + axisNote;
+    std::string notImg, notSel;
+    int nNotImg = 0, nNotSel = 0;
+    for (const auto& m : mem) {
+        bool wasOpened = false;
+        for (const auto& o : openedNames) if (o == m.name) { wasOpened = true; break; }
+        if (wasOpened) continue;
+        if (m.role == NpzMember::RImage) {
+            nNotSel++;
+            if (!notSel.empty()) notSel += ", ";
+            notSel += m.name + " " + m.shapeText;
+        } else {
+            nNotImg++;
+            if (!notImg.empty()) notImg += ", ";
+            notImg += m.name + " " + m.shapeText + " -> " + m.becomes;
+        }
+    }
+    if (nNotImg) s += ", " + std::to_string(nNotImg) + " member(s) not images: " + notImg;
+    if (nNotSel) s += ", " + std::to_string(nNotSel) + " image member(s) not opened: " + notSel;
+    return s;
+}
+
+// ---- the viewer container: an npz that declares its own layers ---------------
+// docs/input-adapters.md §4.11. This is the ONE npz that does not have to be
+// guessed at: the reserved members name the layer of every node, so the file
+// answers the question §1 says a file normally cannot answer about itself.
+//
+// The discriminator is `__viewer` and nothing else (§4.11.1). Without it the
+// file is an ordinary npz and the shape classifier owns it exactly as before -
+// the two readings never overlap, so npz-design.md §2.5's human-written form is
+// untouched by anything here.
+static const int VIEWER_NPZ_VERSION = 1;
+static std::string readerFileOf(const std::string& spec);   // fwd (§4.12, below)
+static std::string readerFuncOf(const std::string& spec);
+
+struct VnzNode {
+    std::string layer;                 // "frame" "stack" "series" "batch"
+    int parent = -1;
+    std::string name, note, cfa;
+    bool hasPixels = false;
+    size_t pixelEntry = 0;
+    std::vector<double> condVals, tsVals, range;
+    std::vector<int64_t> rangeShape;
+    std::string condName, condUnit, tsName, tsUnit;
+    bool hasCond = false, hasTs = false;
+    // filled while building
+    int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
+};
+
+// One reserved member, by name. Everything the container says about itself is
+// small (a word, a number, a vector) except the pixels, which are handed to the
+// same decoder a plain member uses rather than being re-implemented here.
+static bool vnzRead(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                    const std::map<std::string, size_t>& byName, const std::string& name,
+                    std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
+    auto it = byName.find(name);
+    if (it == byName.end()) { err = "missing member " + name; return false; }
+    if (!npzExtract(zip, entries[it->second], buf, err)) return false;
+    if (!npyPeekHeader(buf, H, err)) { err = name + ": " + err; return false; }
+    return true;
+}
+
+static std::string vnzStr(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                          const std::map<std::string, size_t>& byName, const std::string& name) {
+    std::vector<uint8_t> buf; NpyHead H; std::string e;
+    if (!vnzRead(zip, entries, byName, name, buf, H, e)) return {};
+    return npzTextValue(buf, H);
+}
+
+static bool vnzNum(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                   const std::map<std::string, size_t>& byName, const std::string& name,
+                   double& out, std::string& err) {
+    std::vector<uint8_t> buf; NpyHead H;
+    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (H.esize == 0) { err = name + " is not a number"; return false; }
+    out = npyElem(buf, H, 0);
+    return true;
+}
+
+static bool vnzVec(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                   const std::map<std::string, size_t>& byName, const std::string& name,
+                   std::vector<double>& out, std::vector<int64_t>& shape, std::string& err) {
+    std::vector<uint8_t> buf; NpyHead H;
+    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (H.esize == 0) { err = name + " is not numeric"; return false; }
+    size_t n = 1;
+    for (int64_t d : H.shape) {
+        if (d < 0 || (d && n > (size_t)-1 / (size_t)d)) { err = name + " has an impossible shape"; return false; }
+        n *= (size_t)d;
+    }
+    if (H.dataOff + n * (size_t)H.esize > buf.size()) { err = name + " is truncated"; return false; }
+    out.clear();
+    out.reserve(n);
+    // Values at FULL precision: conditions and timestamps are DATA and are
+    // plotted and exported, so they never pass through float on the way in.
+    for (size_t i = 0; i < n; i++) out.push_back(npyElem(buf, H, i));
+    shape = H.shape;
+    return true;
+}
+
+// Is this npz a viewer container? Only `__viewer` answers, and a version from
+// the future is refused by name rather than read with today's meanings.
+static bool vnzIsContainer(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                           int& version) {
+    for (const auto& e : entries)
+        if (e.name == "__viewer.npy") {
+            std::vector<uint8_t> buf; NpyHead H; std::string err;
+            if (!npzExtract(zip, e, buf, err) || !npyPeekHeader(buf, H, err)) return false;
+            version = H.esize ? (int)npyElem(buf, H, 0) : 0;
+            return true;
+        }
+    return false;
+}
+
+static int vnzCfaPattern(const std::string& cfa, int& kind) {
+    std::string p = cfa;
+    kind = 1;
+    if (p.compare(0, 5, "quad:") == 0) { kind = 2; p = p.substr(5); }
+    for (int i = 0; i < 4; i++) if (p == CFA_PATTERNS[i]) return i;
+    kind = 0;
+    return -1;
+}
+
+// Build the layers a container declares. Refusals name the member at fault:
+// stage 6's rule is that a malformed container says WHAT is wrong, and "this
+// npz is invalid" would send the reader back to a hex editor.
+// `origin` is the file the USER opened, which is not always the file these bytes
+// came out of: when a reader produced this container, the bytes live in the
+// cache under a hash. Everything the user sees or that identifies these pixels
+// later - the batch name, the frame labels, FrameSource::path, the key the
+// reader memory and Watch are looked up under - names `origin`. Getting this
+// wrong labelled every frame with a hash and left the Inspector's own reader row
+// unable to find the reader that had just run.
+// How the build phase gets one node's pixels. The tree, the names, the axes and
+// the layer rules are the same whether the container arrived as an npz or down a
+// pipe; only the fetch differs, and it differs in exactly one line. Passing it in
+// is what keeps there from being two copies of the layer rules to drift apart.
+using VnzFetch = std::function<bool(int i, const VnzNode& v,
+                                    std::vector<uint8_t>& out, std::string& err)>;
+static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
+                            const std::string& readerSpec, const VnzFetch& fetch,
+                            const std::vector<std::pair<std::string, std::string>>& metaIn);
+
+// ---- the framed stream ------------------------------------------------------
+// What the harness writes with --stream: a line-based header, then the pixel
+// blobs raw and in the order their `pixels` lines named them. An npz cannot be
+// streamed - its directory is at the END, so reading one means holding all of
+// it, which is the buffer this exists to remove.
+//
+// Header rules are the session file's: one key per line, the value is the rest
+// of the line, and a key this build does not know is skipped rather than
+// refused, so an older viewer still reads what it does understand.
+static const int VIEWER_STREAM_VERSION = 1;
+
+// A .npy header for a blob the stream described, written into space reserved at
+// the front of the SAME buffer the bytes are read into. That is what lets the
+// existing decoder be used unchanged and without a second copy of the pixels:
+// the read lands directly where the decoder will look for it.
+static size_t writeNpyHeaderFor(std::vector<uint8_t>& buf, const std::string& dtype,
+                                const std::vector<int64_t>& shape) {
+    std::string d = "{'descr': '<" + dtype + "', 'fortran_order': False, 'shape': (";
+    for (size_t i = 0; i < shape.size(); i++) {
+        d += std::to_string(shape[i]);
+        if (i + 1 < shape.size() || shape.size() == 1) d += ",";
+        if (i + 1 < shape.size()) d += " ";
+    }
+    d += "), }";
+    size_t pre = 10;                       // magic(6) + version(2) + len(2)
+    while ((pre + d.size() + 1) % 64) d += ' ';
+    d += '\n';
+    buf.resize(pre + d.size());
+    const char magic[] = "\x93NUMPY";
+    memcpy(buf.data(), magic, 6);
+    buf[6] = 1; buf[7] = 0;
+    uint16_t hlen = (uint16_t)d.size();
+    buf[8] = (uint8_t)(hlen & 0xff);
+    buf[9] = (uint8_t)(hlen >> 8);
+    memcpy(buf.data() + pre, d.data(), d.size());
+    return buf.size();
+}
+
+struct VnzBlob { int node = 0; std::string dtype; std::vector<int64_t> shape; uint64_t nbytes = 0; };
+
+static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
+                                    const std::string& origin) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote: " + path;
+    std::string line;
+    if (!std::getline(f, line)) return "the reader produced nothing";
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    int ver = 0;
+    if (sscanf(line.c_str(), "VIEWERSTREAM %d", &ver) != 1)
+        return "not a viewer stream: first line is \"" + line.substr(0, 60) + "\"";
+    if (ver > VIEWER_STREAM_VERSION)
+        return "this stream is version " + std::to_string(ver) + " and this viewer reads " +
+               std::to_string(VIEWER_STREAM_VERSION);
+
+    std::vector<VnzNode> nodes;
+    std::vector<VnzBlob> blobs;
+    std::vector<std::pair<std::string, std::string>> meta;
+    int n = -1;
+    auto need = [&](int i) -> VnzNode* {
+        if (i < 0 || i >= n) return nullptr;
+        return &nodes[(size_t)i];
+    };
+    bool sawEnd = false;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "end") { sawEnd = true; break; }
+        size_t sp = line.find(' ');
+        std::string key = sp == std::string::npos ? line : line.substr(0, sp);
+        std::string rest = sp == std::string::npos ? std::string() : line.substr(sp + 1);
+        if (key == "n") {
+            n = atoi(rest.c_str());
+            if (n <= 0 || n > 100000) return "n is " + rest + ": not a node count";
+            nodes.assign((size_t)n, VnzNode{});
+            continue;
+        }
+        if (n < 0) return "the stream declares its nodes before it describes them (n is missing)";
+        size_t sp2 = rest.find(' ');
+        int idx = atoi(rest.c_str());
+        std::string val = sp2 == std::string::npos ? std::string() : rest.substr(sp2 + 1);
+        VnzNode* v = need(idx);
+        if (!v) continue;                       // a node this build does not have
+        auto nums = [&](const std::string& s, std::vector<double>& out) {
+            std::istringstream is(s);
+            size_t cnt = 0;
+            is >> cnt;
+            out.clear();
+            double d;
+            while (out.size() < cnt && is >> d) out.push_back(d);
+        };
+        if      (key == "layer")  v->layer = val;
+        else if (key == "parent") v->parent = atoi(val.c_str());
+        else if (key == "name")   v->name = val;
+        else if (key == "note")   v->note = val;
+        else if (key == "cfa")    v->cfa = val;
+        else if (key == "range")  nums(val, v->range);
+        else if (key == "timestamps") { nums(val, v->tsVals);   v->hasTs = true; }
+        else if (key == "conditions") { nums(val, v->condVals); v->hasCond = true; }
+        else if (key == "timestamps_name") v->tsName = val;
+        else if (key == "timestamps_unit") v->tsUnit = val;
+        else if (key == "conditions_name") v->condName = val;
+        else if (key == "conditions_unit") v->condUnit = val;
+        else if (key == "meta") {
+            size_t s3 = val.find(' ');
+            if (s3 != std::string::npos)
+                meta.emplace_back(val.substr(0, s3), val.substr(s3 + 1));
+        }
+        else if (key == "pixels") {
+            VnzBlob b;
+            b.node = idx;
+            std::istringstream is(val);
+            int ndim = 0;
+            is >> b.dtype >> ndim;
+            for (int k = 0; k < ndim; k++) { int64_t d = 0; is >> d; b.shape.push_back(d); }
+            is >> b.nbytes;
+            v->hasPixels = true;
+            v->pixelEntry = blobs.size();
+            blobs.push_back(b);
+        }
+        // any other key: skipped on purpose, see the header comment
+    }
+    if (!sawEnd) return "the stream stopped before its header ended - the reader was cut short";
+    if (n < 0) return "the stream never said how many nodes it has";
+
+    // The blobs follow, in order. Read one, hand it to the same decoder a loose
+    // .npy goes through, move on: only one blob is in memory at a time.
+    size_t next = 0;
+    return vnzBuild(nodes, n, origin, readerSpec,
+                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
+                        std::string& e) -> bool {
+                        if (v.pixelEntry != next) {
+                            e = "the stream's blobs are out of order";
+                            return false;
+                        }
+                        const VnzBlob& b = blobs[v.pixelEntry];
+                        size_t pre = writeNpyHeaderFor(out, b.dtype, b.shape);
+                        out.resize(pre + (size_t)b.nbytes);
+                        f.read((char*)out.data() + pre, (std::streamsize)b.nbytes);
+                        if ((uint64_t)f.gcount() != b.nbytes) {
+                            e = "the stream ended " +
+                                std::to_string(b.nbytes - (uint64_t)f.gcount()) +
+                                " byte(s) short of what it declared";
+                            return false;
+                        }
+                        next++;
+                        return true;
+                    },
+                    meta);
+}
+
+static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
+                                 const std::vector<NpzEntry>& entries, int version,
+                                 const std::string& readerSpec, const std::string& origin) {
+    if (version > VIEWER_NPZ_VERSION) {
+        char b[192];
+        snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
+                              "(this one reads %d) - the layer meanings may have changed",
+                 version, VIEWER_NPZ_VERSION);
+        return b;
+    }
+    std::map<std::string, size_t> byName;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const std::string& n = entries[i].name;
+        if (n.size() > 4 && n.compare(n.size() - 4, 4, ".npy") == 0)
+            byName[n.substr(0, n.size() - 4)] = i;
+    }
+    std::string err;
+    double nd = 0;
+    if (!vnzNum(zip, entries, byName, "__n", nd, err))
+        return "not a usable container: " + err + " (a container declares __n, the node count)";
+    int n = (int)nd;
+    if (n <= 0 || n > 100000) return "__n is " + std::to_string(n) + ": not a node count";
+
+    std::vector<VnzNode> nodes((size_t)n);
+    for (int i = 0; i < n; i++) {
+        VnzNode& nd2 = nodes[(size_t)i];
+        std::string si = std::to_string(i);
+        if (byName.find("__layer_" + si) == byName.end())
+            return "__layer_" + si + " is missing: every node declares its layer "
+                   "(frame / stack / series / batch)";
+        nd2.layer = vnzStr(zip, entries, byName, "__layer_" + si);
+        if (nd2.layer != "frame" && nd2.layer != "stack" && nd2.layer != "series" &&
+            nd2.layer != "batch")
+            return "__layer_" + si + " is \"" + nd2.layer + "\": not a layer "
+                   "(frame / stack / series / batch)";
+        double pv = -1;
+        if (byName.count("__parent_" + si)) {
+            if (!vnzNum(zip, entries, byName, "__parent_" + si, pv, err)) return err;
+        } else if (i != 0) {
+            return "__parent_" + si + " is missing: a node that is not the root names its parent";
+        }
+        nd2.parent = (int)pv;
+        if (i == 0 && nd2.parent != -1)
+            return "__parent_0 is " + std::to_string(nd2.parent) + ": node 0 is the root (-1)";
+        if (i != 0 && (nd2.parent < 0 || nd2.parent >= i))
+            return "__parent_" + si + " is " + std::to_string(nd2.parent) +
+                   ": a parent must be an earlier node (depth first, root 0)";
+        nd2.name = vnzStr(zip, entries, byName, "__name_" + si);
+        nd2.note = vnzStr(zip, entries, byName, "__note_" + si);
+        nd2.cfa  = vnzStr(zip, entries, byName, "__cfa_" + si);
+        auto px = byName.find("__pixels_" + si);
+        if (px != byName.end()) { nd2.hasPixels = true; nd2.pixelEntry = px->second; }
+        if ((nd2.layer == "frame" || nd2.layer == "stack") && !nd2.hasPixels)
+            return "__pixels_" + si + " is missing: a " + nd2.layer + " is pixels";
+        if (byName.count("__range_" + si) &&
+            !vnzVec(zip, entries, byName, "__range_" + si, nd2.range, nd2.rangeShape, err))
+            return err;
+        for (int f = 0; f < 2; f++) {
+            const char* field = f == 0 ? "timestamps" : "conditions";
+            std::string base = std::string("__") + field + "_values_" + si;
+            if (!byName.count(base)) continue;
+            std::vector<double> vals; std::vector<int64_t> shp;
+            if (!vnzVec(zip, entries, byName, base, vals, shp, err)) return err;
+            if (shp.size() != 1)
+                return base + " is not a 1-D vector: one value per " +
+                       (f == 0 ? "frame" : "stack");
+            std::string nm = vnzStr(zip, entries, byName,
+                                    std::string("__") + field + "_name_" + si);
+            std::string un = vnzStr(zip, entries, byName,
+                                    std::string("__") + field + "_unit_" + si);
+            if (f == 0) { nd2.tsVals = std::move(vals); nd2.tsName = nm; nd2.tsUnit = un; nd2.hasTs = true; }
+            else        { nd2.condVals = std::move(vals); nd2.condName = nm; nd2.condUnit = un; nd2.hasCond = true; }
+        }
+    }
+    // Structure, before anything is opened: a tree that cannot hold is refused
+    // whole rather than half-built into the session.
+    std::vector<int> kids((size_t)n, 0);
+    for (int i = 1; i < n; i++) {
+        const VnzNode& c = nodes[(size_t)i];
+        const VnzNode& p = nodes[(size_t)c.parent];
+        kids[(size_t)c.parent]++;
+        if (p.layer == "frame" || p.layer == "stack")
+            return "__parent_" + std::to_string(i) + " is a " + p.layer +
+                   ": only a series or a batch holds other layers";
+        if (p.layer == "series" && c.layer != "stack" && c.layer != "frame")
+            return "node " + std::to_string(i) + " is a " + c.layer +
+                   " inside a series: a series holds stacks or frames (§4.4)";
+        if (c.layer == "batch")
+            return "__layer_" + std::to_string(i) + " is a batch: a batch does not nest";
+    }
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        if (v.layer == "series") {
+            if (!kids[(size_t)i])
+                return "node " + std::to_string(i) + " is a series with no stacks";
+            if (v.hasCond && (int)v.condVals.size() != kids[(size_t)i]) {
+                char b[192];
+                snprintf(b, sizeof b, "__conditions_values_%d has %d value(s) but the series "
+                                      "holds %d stack(s) - one condition per stack, and a "
+                                      "partial mapping would lie about the rest",
+                         i, (int)v.condVals.size(), kids[(size_t)i]);
+                return b;
+            }
+        }
+    }
+
+    // __meta_* lives in the zip, so it is read here where the zip is.
+    std::vector<std::pair<std::string, std::string>> meta;
+    for (const auto& kv : byName) {
+        if (kv.first.compare(0, 7, "__meta_") != 0) continue;
+        std::vector<uint8_t> b; NpyHead H; std::string e;
+        if (!vnzRead(zip, entries, byName, kv.first, b, H, e)) continue;
+        meta.emplace_back(kv.first.substr(7), npzTextValue(b, H));
+    }
+    return vnzBuild(nodes, n, origin, readerSpec,
+                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
+                        std::string& e) { return npzExtract(zip, entries[v.pixelEntry], out, e); },
+                    meta);
+}
+
+// ---- build ---------------------------------------------------------------
+// Shared by both carriers (see VnzFetch). Everything here reads `nodes`; the one
+// thing that knew where the bytes live is now the callback.
+static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
+                            const std::string& readerSpec, const VnzFetch& fetch,
+                            const std::vector<std::pair<std::string, std::string>>& metaIn) {
+    int prevBatch = app.loadBatchId;
+    std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
+                                ? nodes[0].name : baseName(origin);
+    app.loadBatchId = newBatch(uniqueBatchName(batchName));
+    int batchId = app.loadBatchId;
+    int frames = 0, stacks = 0, seriesN = 0;
+    std::string firstErr;
+
+    for (int i = 0; i < n; i++) {
+        VnzNode& v = nodes[(size_t)i];
+        if (v.layer == "batch") continue;
+        if (v.layer == "series") {
+            v.seriesId = newSeries(batchId, v.name);
+            seriesN++;
+            for (auto& s : app.series)
+                if (s.id == v.seriesId) {
+                    // §4.5: the condition belongs to the SERIES. Putting it on the
+                    // stacks is exactly what lets sigma_t be computed across a
+                    // sweep, which is the failure the layer split exists to stop.
+                    s.paramName = v.condName;
+                    // An empty unit is a REAL state here, not a missing one:
+                    // Series::unit is documented empty-means-unset and the panel
+                    // lets the user type it in. §4.3.2 - the values stay either way.
+                    snprintf(s.unit, sizeof s.unit, "%s", v.condUnit.c_str());
+                }
+            continue;
+        }
+        // frame / stack: the pixels go through the SAME decoder a plain member
+        // uses, so a container and a loose .npy of the same array cannot drift.
+        std::vector<uint8_t> member;
+        std::string mErr;
+        if (!fetch(i, v, member, mErr)) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+            break;
+        }
+        size_t before = app.images.size();
+        // The fallback name counts POSITION AMONG SIBLINGS, from zero - so the
+        // first stack of a series is ":0" and lines up with stacks[0] in the
+        // Python that produced it. It used to be the container's flat node
+        // index, which counts the batch and the series nodes too: the first
+        // stack of a plain sweep came out ":2" and matched nothing the author
+        // could point at.
+        int ord = 0;
+        for (int k = 0; k < i; k++)
+            if (nodes[(size_t)k].parent == v.parent &&
+                nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series")
+                ord++;
+        std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(ord) : v.name;
+        std::string lErr = loadNpyBuffer(member, origin, label);
+        if (!lErr.empty()) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + lErr;
+            break;
+        }
+        v.docFirst = (int)before;
+        v.docCount = (int)(app.images.size() - before);
+        if (v.docCount <= 0) { firstErr = "__pixels_" + std::to_string(i) + ": nothing decoded"; break; }
+        v.seqId = app.images[before]->seqId;
+        frames += v.docCount;
+        if (v.layer == "stack") stacks++;
+
+        int cfaKind = 0;
+        int cfaPat = v.cfa.empty() ? -1 : vnzCfaPattern(v.cfa, cfaKind);
+        for (int k = 0; k < v.docCount; k++) {
+            ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+            d->src->npzMember = "__pixels_" + std::to_string(i);
+            statSourceFile(*d->src);
+            if (!v.note.empty())
+                d->note = d->note.empty() ? v.note : d->note + ", " + v.note;
+            if (cfaPat >= 0) { d->cfa = cfaKind; d->cfaPattern = cfaPat; d->texDirty = true; }
+            else if (!v.cfa.empty())
+                d->note += (d->note.empty() ? "" : ", ") + std::string("cfa \"") + v.cfa +
+                           "\" is not a known pattern";
+        }
+        // range: (2,) for the whole node, (F,2) one per frame (§4.3.3)
+        if (v.rangeShape.size() == 1 && v.range.size() == 2) {
+            for (int k = 0; k < v.docCount; k++) {
+                app.images[(size_t)v.docFirst + (size_t)k]->black = (float)v.range[0];
+                app.images[(size_t)v.docFirst + (size_t)k]->white = (float)v.range[1];
+                app.images[(size_t)v.docFirst + (size_t)k]->texDirty = true;
+            }
+        } else if (v.rangeShape.size() == 2 && v.rangeShape[1] == 2 &&
+                   (int)v.rangeShape[0] == v.docCount) {
+            for (int k = 0; k < v.docCount; k++) {
+                ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+                d->black = (float)v.range[(size_t)k * 2];
+                d->white = (float)v.range[(size_t)k * 2 + 1];
+                d->texDirty = true;
+            }
+            // The same warning montage's per-frame range carries: two frames that
+            // look alike may have been stretched differently. Measurements are
+            // untouched; only the display is.
+            for (int k = 0; k < v.docCount; k++) {
+                ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+                d->note += (d->note.empty() ? "" : ", ") + std::string("display range varies per frame");
+            }
+        } else if (!v.range.empty()) {
+            for (int k = 0; k < v.docCount; k++)
+                app.images[(size_t)v.docFirst + (size_t)k]->note +=
+                    (app.images[(size_t)v.docFirst + (size_t)k]->note.empty() ? "" : ", ") +
+                    std::string("__range_") + std::to_string(i) + " does not fit this layer - not applied";
+        }
+        // timestamps: the stack's own frame axis, landing in the very field the
+        // paste path and the .npz picker write, so the panels need no new case.
+        if (v.hasTs && v.seqId) {
+            App::SeqInfo* si = seqInfo(v.seqId);
+            if (si) {
+                if ((int)v.tsVals.size() != v.docCount) {
+                    for (int k = 0; k < v.docCount; k++)
+                        app.images[(size_t)v.docFirst + (size_t)k]->note +=
+                            ", timestamps do not cover every frame - not applied";
+                } else {
+                    // Set directly rather than through applyFrameAxisVals: that
+                    // one requires a unit, and §4.3.2 is explicit that a missing
+                    // unit must not cost the user the numbers. Unit empty = not
+                    // applied as a label; the values are here and the x-axis
+                    // popup is already seeded from them, so typing the unit
+                    // finishes the job instead of retyping the measurements.
+                    si->axisName = v.tsName.empty() ? "time" : v.tsName;
+                    si->axisUnit = v.tsUnit;
+                    si->axisVals = v.tsVals;
+                }
+            }
+        }
+        // join the parent series, in declaration order
+        if (v.parent >= 0 && nodes[(size_t)v.parent].layer == "series") {
+            VnzNode& par = nodes[(size_t)v.parent];
+            int slot = par.memberSeen++;
+            for (auto& s : app.series)
+                if (s.id == par.seriesId && v.seqId) {
+                    App::Series::Member m;
+                    m.seqId = v.seqId;
+                    // No unit does NOT mean no value (§4.3.2): Member::value is
+                    // NaN when unset, and these are set.
+                    if (par.hasCond && slot < (int)par.condVals.size())
+                        m.value = par.condVals[(size_t)slot];
+                    s.members.push_back(m);
+                }
+        }
+    }
+    app.loadBatchId = prevBatch;
+
+    // metadata: __meta_<k> at the root, __meta_<i>_<k> below it. The viewer
+    // CARRIES meta and never rewrites it (§4.3.1), so it lands beside the frame
+    // as provenance rather than becoming a panel of its own. Collected by
+    // whoever parsed the container, because that is the half that knows how the
+    // members are stored.
+    std::vector<std::pair<std::string, std::string>> meta = metaIn;
+    if (!readerSpec.empty()) meta.emplace_back("reader", readerSpec);
+    if (!meta.empty()) {
+        bool replaced = false;
+        for (auto& e : app.npzMeta)
+            if (e.path == origin) { e.items = meta; replaced = true; break; }
+        if (!replaced) app.npzMeta.push_back({ origin, meta });
+    }
+
+    if (!firstErr.empty()) return firstErr;
+    if (!frames) return "the container declares no pixels";
+    app.imagesRev++;
+    char say[320];
+    snprintf(say, sizeof say, "%s: %d frame(s), %d stack(s), %d series%s",
+             baseName(origin).c_str(), frames, stacks, seriesN,
+             readerSpec.empty() ? ""
+                 : (" via " + baseName(readerFileOf(readerSpec)) + ":" +
+                    readerFuncOf(readerSpec)).c_str());
+    fprintf(stderr, "viewer npz: %s\n", say);
+    toast(say);
+    return {};
+}
+
+// An .npz is a CONTAINER, not a picture (docs/npz-design.md §2): the FILE is a
+// batch and each member is a stack or a frame. Members are classified by shape
+// first, and nothing that is not an image is opened as one - the (N,) exposure
+// vector that used to arrive as a one-pixel-tall picture is offered as the
+// stack's x axis instead, and scalars / strings stay metadata.
+//
+// onlyMember != "" restores a single array (sessions record which one): no
+// picker and no batch of its own, because the session owns both.
+static std::string loadNpz(const std::string& path, const std::string& onlyMember = "",
+                           int npyRead = 0 /*NR_NATIVE*/,
+                           const std::string& readerSpec = std::string(),
+                           const std::string& origin = std::string()) {
     // identity BEFORE the bytes: see decodeNpyFrame - the multi-second member
-    // decode below is exactly the window an overwrite would exploit
+    // decode below is exactly the window an overwrite would exploit. Every
+    // member opened from THIS zip binds to this stat (npzOpenMember).
     FrameSource zipStat;
     zipStat.path = path;
     statSourceFile(zipStat);
@@ -3970,86 +5702,286 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
     std::vector<NpzEntry> entries;
     std::string err;
     if (!npzList(zip, entries, err)) return err;
-    int loaded = 0, stored = 0, deflated = 0;
-    for (const auto& e : entries) {
-        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
-        std::string arrayName = e.name.substr(0, e.name.size() - 4);
-        if (!onlyMember.empty() && arrayName != onlyMember) continue;
-        std::vector<uint8_t> member;
-        std::string mErr;
-        if (!npzExtract(zip, e, member, mErr)) { toast(e.name + ": " + mErr, true); continue; }
-        std::string label = baseName(path) + ":" + arrayName;
-        size_t before = app.images.size();
-        std::string lErr = loadNpyBuffer(member, path, label);
-        if (!lErr.empty()) { toast(label + ": " + lErr, true); continue; }
-        for (size_t k = before; k < app.images.size(); k++) {
-            app.images[k]->src->npzMember = arrayName;   // identity for session restore
-            // Watch baseline (§2.1): the npz FILE is the local file these pixels
-            // came from - src->path already names it; npzMember keeps members
-            // distinct in the registry tuple (§6.2). Identity is complete only
-            // HERE (loadNpyBuffer knows no member name), so this is where the
-            // member either joins a resident source or registers its own.
-            // (Measured before publishing: addImage inside loadNpyBuffer ran
-            // computeMinMax while the source was still private.)
-            app.images[k]->src->mtime = zipStat.mtime;   // the PRE-read stat:
-            app.images[k]->src->fsize = zipStat.fsize;   // identity binds those bytes
-            shareOrRegisterSource(*app.images[k]);
+    // §4.11.1: `__viewer` and nothing else decides which of the two readings
+    // this file gets. Checked before the members are classified, because a
+    // container's reserved members would otherwise be offered as pictures.
+    int vver = 0;
+    if (vnzIsContainer(zip, entries, vver)) {
+        // The file the user opened, which is this one unless a cache artifact
+        // is standing in for it.
+        const std::string& src = origin.empty() ? path : origin;
+        if (!onlyMember.empty()) {
+            // A session records one line per doc, but a container is ONE unit and
+            // rebuilds every doc at once: the second line onward would duplicate
+            // the whole tree. Already-here is the signal, so no state is carried
+            // between the calls.
+            for (const auto& d : app.images)
+                if (d->src->path == src &&
+                    d->src->npzMember.compare(0, 9, "__pixels_") == 0)
+                    return {};
         }
-        loaded++;
-        (e.method == 0 ? stored : deflated)++;
+        return loadViewerNpz(zip, entries, vver, readerSpec, src);
     }
-    if (!loaded) return "no readable arrays in npz";
-    fprintf(stderr, "npz: %s - %d array(s) (%d stored, %d deflate)\n",
-            baseName(path).c_str(), loaded, stored, deflated);
+    std::vector<NpzMember> mem = npzScan(zip, entries);
+    if (mem.empty()) return "no arrays in npz";
+    if (!onlyMember.empty()) {
+        for (const auto& m : mem) {
+            if (m.name != onlyMember) continue;
+            if (m.role != NpzMember::RImage)
+                return "member " + onlyMember + " " + m.shapeText + " is not an image (" +
+                       m.why + ")";
+            npzRememberMeta(path, mem);
+            // npyRead rides along: a session restoring a member, and a §3.3
+            // re-read of one, both come through here and both must land on the
+            // reading the user declared rather than on the native one.
+            return npzOpenMember(path, zip, entries[m.entry], m.name, npyRead, zipStat);
+        }
+        return "no member named " + onlyMember + " in this npz";
+    }
+    int images = 0, axes = 0;
+    for (const auto& m : mem) if (m.role == NpzMember::RImage) images++;
+    // An axis CANDIDATE is a 1-D numeric member exactly as long as some image
+    // member's frame count. Anything else 1-D stays metadata - and either way
+    // it is never pixels.
+    for (const auto& m : mem) {
+        if (m.role != NpzMember::RAxis || m.vals.empty()) continue;
+        for (const auto& im : mem)
+            if (im.role == NpzMember::RImage && im.frames > 1 &&
+                (size_t)im.frames == m.vals.size()) { axes++; break; }
+    }
+    // Nothing in here is pixels. Say what IS in here - a dialog whose only live
+    // button is Cancel answers a question nobody can act on.
+    if (images == 0) {
+        std::string what;
+        for (const auto& m : mem)
+            what += (what.empty() ? "" : ", ") + m.name + " " + m.shapeText + " " + m.dtype;
+        npzRememberMeta(path, mem);
+        return "no image-shaped arrays in this npz (" + what + ")";
+    }
+    // ONE image and nothing to decide: open it, no dialog. That is what an .npz
+    // holding a single array has always done and it must keep doing it.
+    if (images == 1 && axes == 0) {
+        npzRememberMeta(path, mem);
+        for (const auto& m : mem) {
+            if (m.role != NpzMember::RImage) continue;
+            // the file is the batch here too, so the two ways in agree
+            int prevBatch = app.loadBatchId;
+            app.loadBatchId = newBatch(uniqueBatchName(baseName(path)));
+            std::string oErr = npzOpenMember(path, zip, entries[m.entry], m.name,
+                                             0 /*NR_NATIVE*/, zipStat);
+            app.loadBatchId = prevBatch;
+            if (!oErr.empty()) return baseName(path) + ":" + m.name + ": " + oErr;
+            std::string say = npzSummary(path, mem, { m.name }, m.frames > 1 ? 1 : 0,
+                                         m.frames > 1 ? m.frames : 0, m.frames > 1 ? 0 : 1,
+                                         "");
+            fprintf(stderr, "npz: %s\n", say.c_str());
+            toast(say);
+            return {};
+        }
+    }
+    // More than one picture, or a 1-D key that could be this stack's axis:
+    // ask, in the folder picker's words. One dialog at a time - a drop of three
+    // .npz files used to leave only the last one's members on screen, with the
+    // other two dropped in silence.
+    if (app.npzPickOpen) {
+        app.npzPickQueue.push_back(path);
+        toast(baseName(path) + ": waiting its turn - choose arrays for " +
+              baseName(app.npzPickPath) + " first (" +
+              std::to_string(app.npzPickQueue.size()) + " file(s) waiting)");
+        return {};
+    }
+    app.npzPick = std::move(mem);
+    app.npzPickPath = path;
+    app.npzAxisName[0] = '\0';        // the key name is offered when one is
+    app.npzAxisUnit[0] = '\0';        // ticked; the unit is NEVER pre-filled
+    app.npzPickOpen = true;
     return {};
 }
 
-static std::string loadNpy(const std::string& path) {
-    std::string err;
-    int frames = 1;
-    int64_t fstride = 0;
-    auto first = decodeNpyFrame(path, err, 0, frames, fstride);
-    if (!first) return err.empty() ? "decode failed" : err;
-    computeMinMax(*first);              // measure BEFORE publishing: no source
-                                        // in the registry ever shows the
-                                        // default 0/1 range to an adopter
-    shareOrRegisterSource(*first);      // §6.2: same file already resident ->
-                                        // share (adoption re-syncs the mirrors;
-                                        // either way the source is measured)
-    if (frames <= 1) { addImage(std::move(first), true); return {}; }
-
-    App::SeqInfo info;
-    info.id = app.nextSeqId++;
-    info.name = baseName(path) + "  (" + std::to_string(frames) + " frames)";
-    app.seqs.push_back(info);
-    first->seqId = info.id;
-    first->seqIndex = 0;
-    int firstIdx = (int)app.images.size();
-    addImage(std::move(first), true);
-    info.lastImageIdx = firstIdx;
-    const ImageDoc* ref = app.images[firstIdx].get();
-    for (int f = 1; f < frames; f++) {
-        std::string e2;
-        int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyFrame(path, e2, f, fr, fs);
-        if (!doc) { toast(baseName(path) + ": frame " + std::to_string(f) + ": " + e2, true); break; }
-        doc->seqId = info.id;
-        doc->seqIndex = f;
-        computeMinMax(*doc);            // measure BEFORE publishing, as above
-        shareOrRegisterSource(*doc);    // §6.2
-        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
-        doc->texDirty = true;
-        doc->uid = app.nextUid++;
-        app.imagesRev++;
-        app.images.push_back(std::move(doc));
-    }
-    for (auto& s : app.seqs)
-        if (s.id == info.id) s.lastImageIdx = firstIdx;
-    int got = 0;
-    for (const auto& d : app.images) if (d->seqId == info.id) got++;
-    fprintf(stderr, "npy stack: %s - %d frames (%dx%d %dch)\n", baseName(path).c_str(), got,
-            ref->w, ref->h, ref->ch);
+// A .npy FILE. The frame loop lives in loadNpyBuffer, which the .npz members
+// have used all along; this reads the bytes and hands them over.
+//
+// It used to have its own copy of that loop calling decodeNpyFrame per frame -
+// and decodeNpyFrame reads the WHOLE FILE every time it is called. A 120-frame
+// 1024x1024 u16 stack (252 MB) was therefore read 120 times, 30 GB through the
+// page cache to open one file: 12.2 s measured, against 0.35 s reading it once.
+// The duplicated loop is also how the two doors drifted apart - 452c62a taught
+// the .npz copy to say "n of N" on a partial load and this one kept claiming
+// the full count, which docs/terminology.md 実装上の不変条件 forbids.
+static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/) {
+    // identity BEFORE the bytes (§6.2): an overwrite completing during the
+    // read binds the OLD tuple to the OLD pixels - the safe direction
+    FrameSource preStat;
+    preStat.path = path;
+    statSourceFile(preStat);
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) return "cannot read file";
+    size_t before = app.images.size();
+    std::string err = loadNpyBuffer(buf, path, "", npyRead);
+    if (!err.empty()) return err;
+    // The Watch baseline, stamped from the PRE-read stat. decodeNpyBuffer
+    // cannot: for an .npz member the file on disk is the CONTAINER, not the
+    // array, so the buffer path deliberately leaves the source alone. Here the
+    // file on disk IS the array. Identity is complete only now, so this is
+    // also where each frame either joins a resident source or registers its
+    // own (§6.2 - addImage inside loadNpyBuffer already ran computeMinMax, so
+    // no source enters the registry showing the default 0/1 range).
+    for (size_t i = before; i < app.images.size(); i++)
+        if (app.images[i]->src) {
+            app.images[i]->src->mtime = preStat.mtime;
+            app.images[i]->src->fsize = preStat.fsize;
+            shareOrRegisterSource(*app.images[i]);
+        }
     return {};
+}
+
+// A PICTURE FILE: PNG, JPEG - and TIFF, which refuses by name in this build.
+// The decoding is behind core/imagefile.h so that the library can be replaced
+// without this file learning its name; what comes back is the same Image the
+// .npy door produces, so everything downstream is unchanged.
+//
+// It sits HERE, next to loadNpy, deliberately. The alternative - a second
+// "open a picture" path with its own document creation, its own note and its
+// own error wording - is how two doors to the same room drift apart, which
+// this file has already paid for once (loadNpy and the .npz member loop said
+// different things about a partial stack until they were made one function).
+static std::string loadImageFile(const std::string& path) {
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) return "cannot read file";
+    imagefile::Image img;
+    std::string err;
+    if (!imagefile::decode(path, buf, img, err)) return err;
+
+    auto im = std::make_unique<ImageDoc>();
+    im->name = baseName(path);
+    FrameSource& S = *im->src;
+    S.path = path;
+    S.w = img.w; S.h = img.h; S.ch = img.ch;
+    S.dtype = img.dtype;
+    S.data = std::move(img.data);
+    // npyShape stays empty on purpose: these formats declare their own axes, so
+    // there is no second reading of them to offer (§3.3's menu is computed from
+    // that shape, and an empty one means "no other reading exists").
+    im->note = img.note;
+    // Only what the decoder READ. No format here can be relied on to declare a
+    // CFA pattern, so none of them claims one - and --cfa still applies in
+    // addImage, because that is the user declaring it rather than us guessing.
+    im->cfa = img.cfa;
+    im->cfaPattern = img.cfaPattern & 3;
+    im->syncMirrors();
+    statSourceFile(S);              // the file on disk IS these pixels: Watch baseline
+    addImage(std::move(im));
+    return {};
+}
+
+// ---- §3.3: say it again, and mean it ----------------------------------------
+// The successor to --npy-axis. Not one guess corrected by another: the reading
+// is a DECLARATION, so it is remembered on the source, saved with the session,
+// and applied to every frame of the stack it rebuilds.
+
+// What re-reading COSTS, named before it happens (§3.3 requires this said in
+// advance). Re-reading builds a new document with a new identity, so anything
+// that pointed at the old one by identity - a compare slot pinned to it, a
+// frame number that other state refers to - points at nothing afterwards.
+// Empty = nothing is riding on this document and the re-read costs nothing.
+static std::string npyReReadLoss(const ImageDoc* d) {
+    if (!d) return {};
+    std::vector<std::string> lost;
+    std::string slots;
+    for (const auto& q : app.images) {
+        if (q->seqId != 0 ? q->seqId != d->seqId : q.get() != d) continue;
+        if (app.compareBUid == q->uid) slots += slots.empty() ? "B" : ", B";
+        for (size_t i = 0; i < app.cmpExtra.size(); i++)
+            if (app.cmpExtra[i] == q->uid) {
+                if (!slots.empty()) slots += ", ";
+                slots += slotName(i);
+            }
+    }
+    if (!slots.empty()) lost.push_back("compare slot " + slots + " unpins");
+    // A crop is a rectangle in a grid the new reading may not even have, so it
+    // is dropped rather than carried onto pixels it no longer describes.
+    if (d->src->srcW > 0 && (d->w != d->src->srcW || d->h != d->src->srcH))
+        lost.push_back("the crop is dropped (the new reading is a different grid)");
+    int frames = d->seqId != 0 ? (int)framesOfSeq(d->seqId).size() : 1;
+    if (frames > 1)
+        lost.push_back("the stack's " + std::to_string(frames) +
+                       " frames are rebuilt, so anything keyed to a frame NUMBER "
+                       "(follow-frame pairing, a pinned frame) is re-established");
+    if (lost.empty()) return {};
+    std::string s = "re-reading rebuilds this document: ";
+    for (size_t i = 0; i < lost.size(); i++) {
+        if (i > 0) s += "; ";
+        s += lost[i];
+    }
+    return s;
+}
+
+// Read the SAME file again under reading r. The old document is dropped only
+// after the new one exists, so a re-read that cannot happen leaves what was on
+// screen exactly where it was.
+static std::string npyReReadAs(ImageDoc* d, int r) {
+    if (!d || !d->src) return "no image";
+    const std::string path = d->src->path, member = d->src->npzMember;
+    if (path.empty()) return "these pixels have no file to read again";
+    if (d->src->npyShape.empty()) return "not a .npy: there is no other reading of it";
+    if (npyReadLabel(d->src->npyShape, r).empty())
+        return npyShapeText(d->src->npyShape) + " cannot be read that way";
+    // What belongs to the FILE and not to the reading travels across; the range
+    // does not, because a different reading is a different set of pixels.
+    const int cfa = d->cfa, pat = d->cfaPattern, lut = d->displayLut, batch = d->batchId;
+    const bool col = d->cfaColorize;
+    const int oldSeq = d->seqId;
+    const uint64_t oldUid = d->uid;
+
+    const size_t before = app.images.size();
+    const int prevBatch = app.loadBatchId;
+    app.loadBatchId = batch;              // a re-read stays in the batch it was in
+    const bool quietWas = g_quietLoad;
+    g_quietLoad = true;                   // selection is set below, once
+    std::string err = member.empty() ? loadNpy(path, r) : loadNpz(path, member, r);
+    g_quietLoad = quietWas;
+    app.loadBatchId = prevBatch;
+    if (err.empty() && app.images.size() == before) err = "nothing opened";
+    if (!err.empty()) return err;         // nothing was closed: the old doc stands
+
+    std::vector<ImageDoc*> made;
+    for (size_t k = before; k < app.images.size(); k++) made.push_back(app.images[k].get());
+    // now, and only now, the reading it replaces goes
+    if (oldSeq != 0) closeStack(oldSeq);
+    else {
+        for (size_t k = 0; k < app.images.size(); k++)
+            if (app.images[k]->uid == oldUid) { closeImages({ (int)k }); break; }
+    }
+    for (ImageDoc* m : made) {
+        m->cfa = cfa; m->cfaPattern = pat; m->cfaColorize = col;
+        m->displayLut = lut;
+        m->texDirty = true;
+    }
+    for (size_t k = 0; k < app.images.size(); k++)
+        if (app.images[k].get() == made[0]) { app.current = (int)k; break; }
+    app.imagesRev++;
+    return {};
+}
+
+// The Inspector ASKS; the work happens here, between frames. Re-reading
+// destroys the very document whose panel requested it, so running it inside the
+// draw would pull the ground out from under the rest of that panel.
+static uint64_t g_reReadAsk  = 0;            // uid whose confirm popup is up
+static int      g_reReadWant = NR_NATIVE;    // the reading it is asking about
+static uint64_t g_reReadGo   = 0;            // uid confirmed; runs next frame
+static void pumpReRead() {
+    if (!g_reReadGo) return;
+    const uint64_t uid = g_reReadGo;
+    const int want = g_reReadWant;
+    g_reReadGo = 0; g_reReadAsk = 0; g_reReadWant = NR_NATIVE;
+    ImageDoc* d = nullptr;
+    for (const auto& q : app.images) if (q->uid == uid) { d = q.get(); break; }
+    if (!d) return;                          // closed while the popup was up
+    const std::string label = npyReadLabel(d->src->npyShape, want);
+    const std::string name = baseName(d->src->path);
+    std::string e = npyReReadAs(d, want);
+    if (!e.empty()) toast(name + ": " + e, true);
+    else            toast(name + ": read as " + label);
 }
 
 static void runProcessor(int idx) {
@@ -4100,76 +6032,33 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  const std::string& displayName,
                                                  std::string& errOut, int frameIdx,
                                                  int& framesOut, int64_t& frameStrideOut,
-                                                 int axisOverride) {
+                                                 int npyRead) {
     auto fail = [&](const char* m) { errOut = m; return std::unique_ptr<ImageDoc>(); };
     framesOut = 1;
     frameStrideOut = 0;
-    if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
-        return fail("not a .npy file (bad magic)");
-    int major = buf[6];
-    size_t hlen, hoff;
-    if (major >= 2) {
-        if (buf.size() < 12) return fail("corrupt npy header");
-        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
-    } else {
-        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
-    }
-    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
-    std::string hdr((char*)&buf[hoff], hlen);
-
-    auto findQuoted = [&](const char* key) -> std::string {
-        size_t k = hdr.find(key);
-        if (k == std::string::npos) return {};
-        size_t q1 = hdr.find('\'', hdr.find(':', k));
-        if (q1 == std::string::npos) return {};
-        size_t q2 = hdr.find('\'', q1 + 1);
-        return hdr.substr(q1 + 1, q2 - q1 - 1);
-    };
-    std::string descr = findQuoted("'descr'");
-    if (descr.empty()) return fail("cannot parse descr");
-    bool fortran = hdr.find("'fortran_order': True") != std::string::npos;
-
-    size_t sp = hdr.find("'shape'");
-    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
-    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
-    std::vector<int64_t> shape;
-    {
-        std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
-        size_t pos = 0;
-        while (pos < s.size()) {
-            size_t c = s.find(',', pos);
-            std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
-            if (tok.find_first_of("0123456789") != std::string::npos)
-                shape.push_back(std::stoll(tok));
-            if (c == std::string::npos) break;
-            pos = c + 1;
-        }
-    }
-    if (shape.empty()) shape.push_back(1);
-
-    char bo = '<';
-    std::string code = descr;
-    if (!code.empty() && (code[0] == '<' || code[0] == '>' || code[0] == '|' || code[0] == '=')) {
-        bo = code[0]; code = code.substr(1);
-    }
-    bool be = (bo == '>');
-    int esize = 0;
-    std::string dtypeName;
-    if      (code == "u1") { esize = 1; dtypeName = "u8"; }
-    else if (code == "i1") { esize = 1; dtypeName = "i8"; }
-    else if (code == "b1") { esize = 1; dtypeName = "bool"; }
-    else if (code == "u2") { esize = 2; dtypeName = "u16"; }
-    else if (code == "i2") { esize = 2; dtypeName = "i16"; }
-    else if (code == "u4") { esize = 4; dtypeName = "u32"; }
-    else if (code == "i4") { esize = 4; dtypeName = "i32"; }
-    else if (code == "f4") { esize = 4; dtypeName = "f32"; }
-    else if (code == "f8") { esize = 8; dtypeName = "f64"; }
-    else { errOut = "unsupported dtype: " + descr; return {}; }
+    // Header parsing lives in npyPeekHeader, which the .npz classifier also
+    // calls, so both read the SHAPE the same way. That is as far as the promise
+    // goes: the scan also checks the declared payload against the size the zip
+    // directory reports, but neither one verifies the bytes are decodable, so a
+    // corrupt member can still be offered and then fail - and when it fails
+    // part-way through a stack, loadNpyBuffer says n of N rather than pretending.
+    NpyHead Hd;
+    if (!npyPeekHeader(buf, Hd, errOut)) return {};
+    const std::string& descr = Hd.descr;
+    const std::string& code = Hd.code;
+    const std::string& dtypeName = Hd.dtypeName;
+    const bool fortran = Hd.fortran, be = Hd.be;
+    const int esize = Hd.esize;
+    if (esize == 0) { errOut = "unsupported dtype: " + descr; return {}; }
+    // The shape the FILE declared, unedited. A 0-D scalar used to be padded to
+    // (1,) here and then read as a 1x1 picture; §3.1 refuses it, like every
+    // other rank that is not 2, 3 or 4, and npyLayout is the one place that says so.
+    const std::vector<int64_t> shape = Hd.shape;
 
     size_t count = 1;
     for (int64_t d : shape) count *= (size_t)d;
-    if (hoff + hlen + count * esize > buf.size()) return fail("file too small for shape");
-    const uint8_t* raw = &buf[hoff + hlen];
+    if (Hd.dataOff + count * esize > buf.size()) return fail("file too small for shape");
+    const uint8_t* raw = &buf[Hd.dataOff];
 
     auto bswap = [&](uint64_t v, int n) -> uint64_t {
         uint64_t r = 0;
@@ -4207,50 +6096,21 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     if (fortran) { int64_t s = 1; for (size_t i = 0; i < shape.size(); i++) { strides[i] = s; s *= shape[i]; } }
     else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
 
-    // Layout decision. A leading axis that is not a plausible channel count is a
-    // FRAME axis: (F,H,W) / (F,H,W,1) / (F,H,W,C) load as a stack, not as one
-    // image. app.npyAxis can force the ambiguous small-leading-axis case.
-    std::string note;
-    int64_t F = 1, sf = 0;
-    bool tookFrameAxis = false;         // the decision actually used - recorded
-                                        // on the source as frameAxis
-    while (shape.size() > 4) {          // deeper than (F,H,W,C): take [0]
-        if (shape[0] != 1) note = "showing [0] of leading axis";
-        shape.erase(shape.begin());
-        strides.erase(strides.begin());
+    // Layout decision, in npyLayout so the .npz picker predicts with the same
+    // rule (§3.1): rank and the LAST axis decide, the leading axis is never
+    // consulted, and every other rank is refused by name. npyRead carries the
+    // user's re-read declaration when there is one (§3.3) - it is threaded in
+    // rather than read from app state so the sequence loader thread and the
+    // Inspector reach the same answer for the same file.
+    std::string note, lerr;
+    int64_t F = 1, sf = 0, H, W, C, sh, sw, sc;
+    if (!npyLayout(shape, strides, npyRead, F, sf, H, W, C, sh, sw, sc, note, lerr)) {
+        errOut = lerr;
+        return {};
     }
-    if (shape.size() == 4) {            // (F,H,W,C) or (F,C,H,W)
-        F = shape[0]; sf = strides[0];
-        shape.erase(shape.begin());
-        strides.erase(strides.begin());
-        tookFrameAxis = true;
-    } else if (shape.size() == 3) {
-        int ax = axisOverride >= 0 ? axisOverride : app.npyAxis;
-        bool lastIsChannels = shape[2] <= 4;
-        bool firstIsChannels = shape[0] <= 4;
-        bool asFrames = !lastIsChannels &&
-                        (!firstIsChannels || ax == 1);   // 1 = force frames
-        if (asFrames || (firstIsChannels && ax == 1)) {
-            F = shape[0]; sf = strides[0];
-            shape.erase(shape.begin());
-            strides.erase(strides.begin());
-            tookFrameAxis = true;
-        }
-    }
-    int64_t H, W, C, sh, sw, sc;
-    if (shape.size() == 1) { H = 1; W = shape[0]; C = 1; sh = 0; sw = strides[0]; sc = 0; }
-    else if (shape.size() == 2) { H = shape[0]; W = shape[1]; C = 1; sh = strides[0]; sw = strides[1]; sc = 0; }
-    else {
-        if (shape[2] <= 4)      { H = shape[0]; W = shape[1]; C = shape[2]; sh = strides[0]; sw = strides[1]; sc = strides[2]; }
-        else if (shape[0] <= 4) { C = shape[0]; H = shape[1]; W = shape[2]; sc = strides[0]; sh = strides[1]; sw = strides[2];
-                                  note = note.empty() ? "CHW->HWC" : note + ", CHW->HWC"; }
-        else return fail("shape not interpretable as image");
-    }
-    if (W < 1 || H < 1 || W > 32768 || H > 32768) return fail("unsupported image size");
     if (F > 1) {                        // multi-frame: caller turns this into a stack
         framesOut = (int)F;
         frameStrideOut = sf;
-        note = note.empty() ? "frame axis" : note + ", frame axis";
     }
 
     auto im = std::make_unique<ImageDoc>();
@@ -4258,9 +6118,10 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     FrameSource& S = *im->src;
     S.path = path;
     S.fileFrame = frameIdx;           // which frame of the FILE: registry identity (§6.2) and reload provenance
-    S.frameAxis = tookFrameAxis ? 1 : 0;   // the layout decision, same two roles
     S.w = (int)W; S.h = (int)H; S.ch = (int)C;
     S.dtype = dtypeName;
+    S.npyShape = shape;                 // what the file said, for §3.3's menu
+    S.npyRead = npyRead;                // and how it was read, for the session
     im->note = note;
     S.data.resize((size_t)W * H * C);
     size_t di = 0;
@@ -4274,7 +6135,7 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
 
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
                                                 int frameIdx, int& framesOut,
-                                                int64_t& frameStrideOut) {
+                                                int64_t& frameStrideOut, int npyRead) {
     // identity BEFORE the bytes: an overwrite completing during the read binds
     // the OLD tuple to the OLD pixels - the safe direction, the next open of
     // the NEW tuple misses the registry and re-decodes what is on disk
@@ -4283,7 +6144,7 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
     statSourceFile(st);
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
-    auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut);
+    auto im = decodeNpyBuffer(buf, path, "", errOut, frameIdx, framesOut, frameStrideOut, npyRead);
     if (im) {                              // a local file: the Watch baseline
         im->src->mtime = st.mtime;
         im->src->fsize = st.fsize;
@@ -4576,7 +6437,12 @@ static void restoreFull() {
         if (!err.empty()) { toast("restore failed: " + err, true); return; }
     } else if (!im->src->path.empty()) {
         int before = (int)app.images.size();
-        std::string err = loadNpy(im->src->path);
+        // the reading is part of what "the same file" means: restoring the full
+        // frame must not quietly hand back the native reading of a file the user
+        // has already said is read some other way (§3.3)
+        std::string err = imagefile::forPath(im->src->path)
+                        ? loadImageFile(im->src->path)
+                        : loadNpy(im->src->path, im->src->npyRead);
         if (!err.empty() || (int)app.images.size() == before) {
             toast("restore failed: " + (err.empty() ? std::string("reload error") : err), true);
             return;
@@ -4633,6 +6499,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // ordinal of the line that carries the current image instead.
     // A stack contributes exactly one line: the frame it was left on.
     auto isSavedLine = [&](const ImageDoc* d) {
+        // A preview is a look, not an open: it is not in the session, and
+        // writing one must not turn it into an open. The autosave runs a few
+        // seconds after any change and used to promote the preview first, so a
+        // frame the user had merely clicked appeared under the batch by itself.
+        if (d->preview) return false;
         if (d->src->path.empty()) return false;
         if (d->seqId == 0) return true;
         int rep = -1;
@@ -4679,8 +6550,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
       << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
-    // must precede the image lines: it decides whether (F,H,W) reloads as a stack
-    f << "npyaxis " << app.npyAxis << "\n";
+    // "npyaxis" used to sit here: one global reading for a whole session
+    // (§3.4). Its successor is the per-image "npyread" line below, so nothing
+    // global is written any more. An OLD session's npyaxis is skipped like any
+    // unknown key - and lands on the same pixels, because the reading it used
+    // to force for (F,H,W) is now what native does anyway.
     f << "compare " << app.compareMode << " " << app.wipeFrac << " " << app.splitFrac << " "
       << app.diffGain << " " << (app.diffAbs ? 1 : 0) << " "
       << (app.flipAuto ? 1 : 0) << " " << app.flipPeriod << "\n";
@@ -4721,17 +6595,24 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // A derived image (a ROI montage) has no file behind it, so isSavedLine
     // drops it - correctly, since nothing could reload it. But dropping it in
     // silence is the one thing this format does not do: say how many.
-    int derived = 0;
+    int derived = 0, avgs = 0;
     for (auto& d : app.images)
-        if (d->src->path.empty()) derived++;
+        if (d->src->path.empty()) { derived++; if (!d->avgOfPath.empty()) avgs++; }
     if (derived)
-        fprintf(stderr, "session: %d derived image(s) not saved "
-                        "(no file to reload them from)\n", derived);
+        fprintf(stderr, "session: %d derived image(s) not saved (no file to reload "
+                        "them from); %d of those are frame averages, whose RECIPE "
+                        "is saved instead\n", derived, avgs);
     for (auto& d : app.images) {
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
         if (!d->src->npzMember.empty()) f << "member " << d->src->npzMember << "\n";
+        // §3.3: the reading is the user's declaration and it sticks across
+        // sessions. ADDITIVE, and written only when there IS a declaration - an
+        // older viewer skips the unknown key and reloads natively, which is
+        // exactly what it would have done with no key at all. It precedes the
+        // image line because it decides how that line's file is decoded.
+        if (d->src->npyRead != NR_NATIVE) f << "npyread " << d->src->npyRead << "\n";
         f << "lut " << d->displayLut << "\n";
         f << "image " << d->black << " " << d->white << " ";
         if (d->src->rawDtype >= 0) {
@@ -4799,6 +6680,32 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 if (r.uid == d->uid) { f << "seqload 1\n"; break; }
         }
     }
+    // ---- computed frames: the RECIPE, never the pixels ----------------------
+    // A frame average has no file, so isSavedLine dropped it above - correctly,
+    // nothing could reload those pixels. What survives instead is the
+    // derivation: the stack it averaged, named by the path of that stack's FIRST
+    // FRAME (the key series members already travel by, for the same reasons -
+    // ids do not survive a session and names are renameable and not unique), and
+    // the mean is taken again on restore.
+    //
+    // The alternative was to give the frame its source's path so an ordinary
+    // `image` line would carry it. That is what materializeDerivedFrame does and
+    // it is why a derived stack comes back as its whole source; here it would be
+    // worse still - the session would reload frame 0 from disk and hand it back
+    // under the name "frame average", with the note that said otherwise gone.
+    // A computed frame either comes back computed or does not come back.
+    int avgLost = 0;
+    for (auto& d : app.images) {
+        if (d->avgOfPath.empty()) continue;
+        bool live = false;                    // its stack must still be open, or
+        for (auto& o : app.images)            // there is nothing left to average
+            if (o->seqId != 0 && o->src->path == d->avgOfPath) { live = true; break; }
+        if (!live) { avgLost++; continue; }
+        f << "stackavg " << d->avgOfPath << "\n";   // path last: may contain spaces
+    }
+    if (avgLost)
+        fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
+                        "not saved, because the frames they averaged are gone\n", avgLost);
     // ---- series (系列), after the image lines -------------------------------
     // A FLAT block with unique keys, on purpose: an older viewer skips every
     // line it does not know and still opens the session, and this one opens a
@@ -4900,8 +6807,9 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
 }
 
 static void saveSession(std::string path, bool quiet = false) {
-    for (auto& d : app.images)                  // a saved session has no transients
-        if (d->preview) promotePreview(d.get());
+    // A saved session has no transients - but the way to honour that is to
+    // leave the preview OUT of the file (isSavedLine), not to promote it into
+    // a real open behind the user's back.
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
@@ -4916,7 +6824,7 @@ static void saveSession(std::string path, bool quiet = false) {
     toast(msg, lostSeries > 0 || lostMembers > 0);
 }
 
-static std::string loadNpy(const std::string& path);   // fwd (defined above, decl for clarity)
+static std::string loadNpy(const std::string& path, int npyRead);   // fwd (defined above)
 
 // ---- instance identity (Open in new window, todo-open item 28 / A7) ---------
 // Two viewers used to share ONE autosave file: whichever exited last overwrote
@@ -5080,6 +6988,81 @@ static std::string prefsPath() {
     return p.substr(0, slash == std::string::npos ? 0 : slash + 1) + "prefs.txt";
 }
 
+// ---- the window's own geometry ----------------------------------------------
+// The panels remember where they are (layout.ini); the window around them did
+// not, so every start began by dragging it back to the size it had yesterday.
+// It goes in prefs.txt with everything else that answers "how does this app
+// come up" - one file, one writer, one place to look.
+//
+// UNITS, because the two disagree exactly when it matters. The SIZE is stored
+// in LOGICAL pixels: screen coordinates divided by the same uiScale startup
+// derives from the monitor's content scale (1.0 on macOS, where Cocoa's
+// coordinates are already points). What the user chose when they sized the
+// window is an amount of CONTENT - this many rows of the Files list beside a
+// canvas this wide - and holding that same content at 200 % takes twice the
+// physical pixels. Storing logical is what makes a size chosen on the 4K dock
+// still mean the same window on the laptop panel. The POSITION is stored raw:
+// desktop coordinates are a single global space, and scaling a location in it
+// would only move the window somewhere nobody asked for.
+struct WinRect { int x = 0, y = 0, w = 0, h = 0; };
+
+static const int WIN_DEF_W  = 1600, WIN_DEF_H  = 1000;  // the size before any of this
+static const int WIN_MIN_W  = 640,  WIN_MIN_H  = 400;   // a saved 1x1 is not a window
+static const int WIN_GRAB_W = 160,  WIN_GRAB_H = 32;    // the strip you drag it by
+
+static long long rectOverlap(const WinRect& a, const WinRect& b) {
+    long long w = std::min(a.x + a.w, b.x + b.w) - std::max(a.x, b.x);
+    long long h = std::min(a.y + a.h, b.y + b.h) - std::max(a.y, b.y);
+    return w > 0 && h > 0 ? w * h : 0;
+}
+
+// Monitors get unplugged. A window restored onto a screen that is no longer
+// there cannot be reached with a mouse, and that is strictly worse than
+// forgetting where it was - the user who hits it has no way back except editing
+// prefs.txt by hand. So the saved rectangle has to earn its position:
+//
+//   * the monitor whose work area holds the most of it decides everything (work
+//     area, so the taskbar or dock is already out of the way);
+//   * the POSITION is kept only if at least a quarter of the window lands in
+//     that work area AND a 160x32 strip along its top edge - the part you grab
+//     to drag it - is inside as well. The strip is measured downwards from the
+//     window's CONTENT top, which is what GLFW reports and sets; a system title
+//     bar sits in the frame just above it, so "content top at or below the work
+//     area top" is the honest form of "the title bar is reachable";
+//   * failing either test the position is dropped and the window manager places
+//     the window as it would on a first run. The SIZE still comes back: it is
+//     what the user actually complained about, and a size cannot be off-screen;
+//   * the size is clamped to that work area either way, so a window sized on a
+//     4K screen never comes up larger than the panel it is restored onto.
+//
+// Returns true when the caller should apply r.x/r.y as well as r.w/r.h. Pure,
+// and tested that way (--newwin-selftest N8): a monitor set that no longer
+// contains the saved rectangle is the case nobody can reproduce by hand later.
+static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work) {
+    r.w = std::max(r.w, WIN_MIN_W);
+    r.h = std::max(r.h, WIN_MIN_H);
+    if (work.empty()) return false;          // nothing answered: keep the size, place it nowhere
+    size_t best = 0;
+    long long bestOv = 0;
+    for (size_t i = 0; i < work.size(); i++) {
+        long long ov = rectOverlap(r, work[i]);
+        if (ov > bestOv) { bestOv = ov; best = i; }
+    }
+    // No overlap anywhere: the primary still gets to bound the size.
+    const WinRect& wa = work[bestOv > 0 ? best : 0];
+    long long area = (long long)r.w * r.h;
+    int grabW = std::min(r.x + r.w, wa.x + wa.w) - std::max(r.x, wa.x);
+    int grabH = std::min(r.y + WIN_GRAB_H, wa.y + wa.h) - std::max(r.y, wa.y);
+    bool keep = bestOv * 4 >= area && grabW >= WIN_GRAB_W && grabH >= WIN_GRAB_H;
+    r.w = std::min(r.w, wa.w);
+    r.h = std::min(r.h, wa.h);
+    if (!keep) return false;
+    // Kept, but not allowed to hang off the screen it was kept for.
+    r.x = std::clamp(r.x, wa.x, wa.x + wa.w - r.w);
+    r.y = std::clamp(r.y, wa.y, wa.y + wa.h - r.h);
+    return true;
+}
+
 static void savePrefs() {
     if (g_secondary) {
         // Secondary windows read prefs but never write them: prefs.txt is one
@@ -5089,7 +7072,7 @@ static void savePrefs() {
         static bool said = false;
         if (!said) {
             said = true;
-            app.msgLog.push_back({ "prefs are read-only in a secondary window", false });
+            logMsg("prefs are read-only in a secondary window");
         }
         return;
     }
@@ -5112,14 +7095,29 @@ static void savePrefs() {
     f << "gamma " << app.dispGamma << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "frame " << app.frameMode << "\n";
+    // The window: logical size, raw position, then the maximized flag (see
+    // fitSavedWindow). Written only once a real window has reported a geometry,
+    // so a run that never samples one - every scripted run - hands back exactly
+    // the bytes it read.
+    if (app.winW > 0 && app.winH > 0)
+        f << "window " << app.winX << " " << app.winY << " "
+          << app.winW << " " << app.winH << " " << (app.winMax ? 1 : 0) << "\n";
     f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
-    f << "rbadv " << (app.rbAdvanced ? 1 : 0) << "\n";
+    // ("rbadv" - the Browse drawer's open/closed state - is no longer written.
+    //  A prefs file that still carries one is read and ignored, below.)
     f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
+    f << "rbnatural " << (app.rbNatural ? 1 : 0) << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
     for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
     for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
+    if (!app.pythonExe.empty()) f << "pythonexe " << app.pythonExe << "\n";
+    if (app.readerLocalDir[0]) f << "readerdir " << app.readerLocalDir << "\n";
+    // §4.12: path -> reader, most recent first. A TAB separates them because
+    // both halves can contain spaces and only one of them can contain a tab
+    // (no filesystem this tool runs on puts one in a path).
+    for (const auto& m : app.readerMemo) f << "readerfor " << m.path << "\t" << m.spec << "\n";
 }
 
 static void loadPrefs() {
@@ -5153,11 +7151,30 @@ static void loadPrefs() {
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;
                                          app.frameMode = std::clamp(app.frameMode, 0, 1); }
+        else if (key == "window")      {
+            // All five or none: a truncated or hand-edited line means "nothing
+            // saved", not a 0x0 window at wherever the reads gave up. The upper
+            // bound is not a display size, it is the point past which the value
+            // is certainly garbage - fitSavedWindow does the real clamping, and
+            // it needs a monitor list this path does not have.
+            int mx = 0;
+            ls >> app.winX >> app.winY >> app.winW >> app.winH >> mx;
+            app.winMax = mx != 0;
+            if (ls.fail() || app.winW <= 0 || app.winH <= 0 ||
+                app.winW > 32767 || app.winH > 32767) {
+                app.winW = app.winH = 0;
+                app.winMax = false;
+            }
+        }
         else if (key == "rbflat")      { ls >> v; app.rbFlat = v != 0; }
-        else if (key == "rbadv")       { ls >> v; app.rbAdvanced = v != 0; }
+        else if (key == "rbadv")       { ls >> v; }   // the drawer is gone: read, drop
         else if (key == "rbtree")      { ls >> v; app.rbTree = v != 0; }
+        // absent from a prefs file written before the toggle existed, which is
+        // exactly right: the default this initialises to IS natural
+        else if (key == "rbnatural")   { ls >> v; app.rbNatural = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
-                 key == "rbookmark" || key == "rbrecent") {
+                 key == "rbookmark" || key == "rbrecent" ||
+                 key == "pythonexe" || key == "readerfor" || key == "readerdir") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
@@ -5166,6 +7183,17 @@ static void loadPrefs() {
             if      (key == "remoteexe") app.remoteExe = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
+            else if (key == "pythonexe") app.pythonExe = s;
+            else if (key == "readerdir")
+                snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", s.c_str());
+            else if (key == "readerfor") {
+                // The cap is enforced on the way IN as well as on the way out:
+                // a prefs file edited by hand (or written by a future version
+                // with a larger cap) must not grow this list without bound.
+                size_t tab = s.find('\t');
+                if (tab == std::string::npos || app.readerMemo.size() >= 64) continue;
+                app.readerMemo.push_back({ s.substr(0, tab), s.substr(tab + 1) });
+            }
             else if (app.rbRecents.size() < 10) app.rbRecents.push_back(s);
         }
     }
@@ -5173,6 +7201,353 @@ static void loadPrefs() {
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
     app.seqLoadMode = std::clamp(app.seqLoadMode, 0, 2);
     app.dispGamma = app.dispGamma > 1.5f ? 2.2f : 1.0f;
+}
+
+// ---- input adapters: running one, and remembering which one ------------------
+// docs/input-adapters.md §4.12 / §4.13. The viewer never goes looking for an
+// adapter and never applies one it was not told to apply: everything below
+// starts from a spec the user chose, or from the record of a choice they made
+// earlier. That is the whole trust model, and it is why there is no search path.
+static const size_t READER_MEMO_MAX = 64;      // §4.12: bounded, LRU
+static std::string selfExePath();              // fwd: the harness sits beside the binary
+
+// How many times Python was actually started for a load. The cache's promise is
+// "a second open does not re-run it", and a promise about a thing that does not
+// happen can only be tested by counting it.
+static int g_adapterRuns = 0;
+
+static std::string readerFileOf(const std::string& spec) {
+    size_t c = spec.rfind(':');
+    return c == std::string::npos ? spec : spec.substr(0, c);
+}
+static std::string readerFuncOf(const std::string& spec) {
+    size_t c = spec.rfind(':');
+    return c == std::string::npos ? std::string("load") : spec.substr(c + 1);
+}
+
+static std::string readerFor(const std::string& path) {
+    for (const auto& m : app.readerMemo) if (m.path == path) return m.spec;
+    return {};
+}
+
+static void rememberReader(const std::string& path, const std::string& spec) {
+    for (size_t i = 0; i < app.readerMemo.size(); i++)
+        if (app.readerMemo[i].path == path) { app.readerMemo.erase(app.readerMemo.begin() + (long)i); break; }
+    app.readerMemo.insert(app.readerMemo.begin(), { path, spec });   // most recent first
+    if (app.readerMemo.size() > READER_MEMO_MAX) app.readerMemo.resize(READER_MEMO_MAX);
+    savePrefs();
+}
+
+static void forgetReader(const std::string& path) {
+    for (size_t i = 0; i < app.readerMemo.size(); i++)
+        if (app.readerMemo[i].path == path) {
+            app.readerMemo.erase(app.readerMemo.begin() + (long)i);
+            savePrefs();
+            return;
+        }
+}
+
+// The harness that runs adapters. Searched relative to the binary and the
+// working directory - never guessed at, and its absence is reported as itself.
+static std::string runAdapterScript() {
+    std::error_code ec;
+    std::vector<std::filesystem::path> roots;
+    std::filesystem::path exe = pathFromUtf8(selfExePath());
+    if (!exe.empty()) {
+        std::filesystem::path d = exe.parent_path();
+        for (int i = 0; i < 3 && !d.empty(); i++) { roots.push_back(d); d = d.parent_path(); }
+    }
+    roots.push_back(std::filesystem::current_path(ec));
+    for (const auto& r : roots) {
+        std::filesystem::path p = r / "tools" / "import" / "run_adapter.py";
+        if (std::filesystem::exists(p, ec)) return p.u8string();
+    }
+    return {};
+}
+
+static uint64_t adapterHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// §4.12's cache key, in full: the source and the adapter, each by identity AND
+// by mtime, plus the function and the module's VERSION. Editing the adapter
+// changes its mtime, so the next open re-runs it; nothing else has to be
+// remembered to notice, and no timestamp comparison decides anything on its own.
+static std::string adapterCacheKey(const std::string& src, const std::string& spec) {
+    std::error_code ec;
+    std::filesystem::path sp = pathFromUtf8(src);
+    uint64_t srcMtime = 0, srcSize = 0;
+    auto t = std::filesystem::last_write_time(sp, ec);
+    if (!ec) srcMtime = (uint64_t)t.time_since_epoch().count();
+    // A folder is a legal source (§4.1). Its size is meaningless, but adding or
+    // removing a file inside it moves the directory's own mtime, which is the
+    // signal that matters here.
+    if (!std::filesystem::is_directory(sp, ec)) {
+        auto s = std::filesystem::file_size(sp, ec);
+        if (!ec) srcSize = (uint64_t)s;
+    }
+    std::string af = readerFileOf(spec);
+    uint64_t adMtime = 0;
+    auto at = std::filesystem::last_write_time(pathFromUtf8(af), ec);
+    if (!ec) adMtime = (uint64_t)at.time_since_epoch().count();
+    std::string key = src + "|" + std::to_string(srcMtime) + "|" + std::to_string(srcSize) +
+                      "|" + af + "|" + std::to_string(adMtime) + "|" + readerFuncOf(spec) +
+                      "|" + adapter::moduleVersion(af);
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)adapterHash(key));
+    return hex;
+}
+
+static std::string adapterCacheDir() {
+    std::string cfg = viewerConfigDir();
+    if (cfg.empty()) return {};
+    std::error_code ec;
+    std::filesystem::path d = pathFromUtf8(cfg) / "adapter-cache";
+    std::filesystem::create_directories(d, ec);
+    return d.u8string();
+}
+
+// Run `spec` over `src` and open what it wrote. Returns "" on success; on
+// failure the string is the adapter's OWN message wherever there is one (§4.9),
+// because a message we invent in its place is a message the author cannot fix.
+static std::string readerFinish(const std::string& src, const std::string& spec,
+                                const std::string& out,
+                                const std::vector<std::string>& argv,
+                                const adapter::Run& r);   // fwd: the tail, shared
+static std::string openWithReader(const std::string& src, const std::string& spec,
+                                  bool allowCache = true,
+                                  App::ReaderJob* job = nullptr) {
+    // Whatever happens, the panel gets the whole of it (§4.13.0).
+    app.readerRan = true;
+    app.readerLastOk = false;
+    app.readerLastSpec = spec;
+    app.readerLastOut.clear();
+    std::string script = runAdapterScript();
+    if (script.empty())
+        return "cannot find tools/import/run_adapter.py - the adapter harness ships "
+               "with the viewer and this build cannot see it";
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    if (py.empty())
+        return "no Python to run the reader with: " + why +
+               " (set one in Settings, or install numpy for the one you have)";
+
+    std::string cacheDir = adapterCacheDir();
+    std::string cached;
+    if (!cacheDir.empty())
+        // .vstream, not .npz: the cache now holds the framed stream, and an npz
+        // left by an older build must not be handed to the stream reader. A
+        // stale one is simply not found, so the reader runs again.
+        cached = (pathFromUtf8(cacheDir) / (adapterCacheKey(src, spec) + ".vstream")).u8string();
+    std::error_code ec;
+    if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
+        // §7 stage 5: the second open does not start Python. The key already
+        // covers the adapter's mtime, so "cached" cannot mean "stale".
+        std::string lerr = loadViewerStream(cached, spec, src);
+        if (lerr.empty()) {
+            rememberReader(src, spec);
+            app.readerLastOk = true;
+            app.readerLastOut = "read from cache - the reader was not re-run.\n"
+                                "Edit the reader and press Load again to re-run it.";
+            return {};
+        }
+        std::filesystem::remove(pathFromUtf8(cached), ec);   // unreadable: earn it again
+    }
+
+    std::string out = cached;
+    if (out.empty()) {
+        std::filesystem::path t = std::filesystem::temp_directory_path(ec);
+        char nm[64];
+        snprintf(nm, sizeof nm, "viewer_adapter_%llx.vstream",
+                 (unsigned long long)adapterHash(src + spec));
+        out = (t / nm).u8string();
+    }
+    // -u: unbuffered. Without it Python holds print() in a buffer until it
+    // exits, so a reader that reports its progress reports all of it at the end,
+    // which is the one moment the progress is worthless.
+    // --stream: the result comes back on stdout, framed, and the run captures
+    // stdout straight to `out`. No npz is written and none is read: the zip
+    // container cost 1.45 ms per MB of pixels for nothing.
+    std::vector<std::string> argv = { py, "-u", script, spec, src, "--stream" };
+    // §4.13: the exact command, before it runs - every time, not only the first.
+    // The picker shows it in front of the user for a reader they have not used
+    // before; this is the durable record, so "what did it actually start?" is
+    // answerable after the fact as well as before it.
+    logMsg("reader: " + adapter::showCommand(argv));
+    g_adapterRuns++;
+    std::error_code tec;
+    std::filesystem::path td = std::filesystem::temp_directory_path(tec);
+    char sn[64];
+    snprintf(sn, sizeof sn, "viewer_reader_%llx", (unsigned long long)adapterHash(src + spec));
+    // stdout IS the payload now, so it goes straight to `out` -- the cache
+    // path when there is one, a temp otherwise. Nothing reads it back as text:
+    // that would be the 755 MB std::string captureStdout=false exists to avoid.
+    // stderr still lands in a file, because that is the summary and the
+    // reader's own prints, which the panel shows and tails while it runs.
+    const std::string& outFile = out;
+    std::string errFile = (td / (std::string(sn) + ".err")).u8string();
+    if (job) {
+        // Asynchronous: the window keeps drawing and pollReader() picks this up.
+        // Only the wait is off-thread - readerFinish touches images and GL.
+        job->src = src; job->spec = spec; job->out = out; job->argv = argv;
+        job->outFile = outFile; job->errFile = errFile;
+        job->startedAt = nowSec();
+        app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
+        App::ReaderJob* j = job;
+        j->th = std::thread([j]() {
+            j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile, false);
+            j->done.store(true);
+        });
+        return {};
+    }
+    adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile, false);
+    std::string fin = readerFinish(src, spec, out, argv, r);
+    std::filesystem::remove(pathFromUtf8(errFile), tec);
+    return fin;
+}
+
+// Everything after the process has run. Shared by the synchronous path
+// (selftests, session restore) and the asynchronous one the UI uses, so the two
+// cannot drift into reporting the same failure differently.
+static std::string readerFinish(const std::string& src, const std::string& spec,
+                                const std::string& out,
+                                const std::vector<std::string>& argv,
+                                const adapter::Run& r) {
+    if (r.cancelled) {
+        app.readerLastOut += "\nstopped.\n";
+        return "the reader was stopped";
+    }
+    if (!r.started) {
+        app.readerLastOut = "could not start the reader: " + r.fail + "\n" +
+                            adapter::showCommand(argv);
+        return "could not start the reader: " + r.fail + "\n  " + adapter::showCommand(argv);
+    }
+    if (r.timedOut) {
+        app.readerLastOut = "the reader did not finish (stopped after 5 minutes)\n" +
+                            adapter::showCommand(argv) + "\n" + r.err;
+        return "the reader did not finish (stopped after 5 minutes)\n  " +
+               adapter::showCommand(argv);
+    }
+    if (r.exit != 0) {
+        // The adapter's exception message, unchanged. run_adapter.py has already
+        // printed the traceback with the failing line; passing it through is the
+        // entire point of §4.9, and summarising it would remove the only part
+        // that says which line of their file was wrong.
+        std::string msg = r.err.empty() ? r.out : r.err;
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+        if (msg.empty()) msg = "the reader exited with status " + std::to_string(r.exit) +
+                               " and said nothing";
+        // The panel gets it WHOLE - every frame of the traceback, with the file
+        // and line that raised. The toast gets the same string, but the panel is
+        // where it can be read, and that is the point of §4.13.0.
+        app.readerLastOut = msg;
+        return msg;
+    }
+    std::string lerr = loadViewerStream(out, spec, src);
+    if (!lerr.empty()) {
+        // The one failure that used to leave the panel EMPTY. The reader ran and
+        // exited 0, so it is not the reader's traceback that is wrong - what it
+        // returned is something this viewer cannot read. Every other failure
+        // above fills readerLastOut; this one returned without doing it, so the
+        // panel said "refused it" over a blank box and Copy copied nothing.
+        // That is also the path a first reader most often takes.
+        app.readerLastOut = "the reader ran and returned, but the viewer could not read "
+                            "what it produced:\n\n" + lerr +
+                            "\n\nthe reader itself did not fail - check what load() returns "
+                            "(the layer type, the shape, the dtype).\n" +
+                            adapter::showCommand(argv);
+        return lerr;
+    }
+    rememberReader(src, spec);
+    app.readerLastOk = true;
+    // §4.11: the harness writes one line to stderr counting what it read and
+    // what it skipped, and the viewer relays it VERBATIM. It counts both
+    // directions, so paraphrasing it is how a skipped axis becomes invisible.
+    std::string sum = r.err;
+    while (!sum.empty() && (sum.back() == '\n' || sum.back() == '\r')) sum.pop_back();
+    // What the reader PRINTED, kept on a success as well as on a failure. print()
+    // goes to stdout, which used to be read and then dropped whenever the run
+    // worked - so the one thing an author adds to see what their reader is doing
+    // was visible only when it crashed.
+    std::string said = r.out;
+    while (!said.empty() && (said.back() == '\n' || said.back() == '\r')) said.pop_back();
+    app.readerLastOut = sum.empty() ? std::string("the reader wrote no summary") : sum;
+    if (!said.empty())
+        app.readerLastOut += "\n\n--- the reader printed ---\n" + said;
+    size_t lastLine = sum.find_last_of('\n');
+    if (lastLine != std::string::npos) sum = sum.substr(lastLine + 1);
+    if (!sum.empty()) {
+        fprintf(stderr, "adapter: %s\n", sum.c_str());
+        toast(sum);
+    }
+    return {};
+}
+
+// Whatever is in the file now. The child is still writing it, so a short read
+// is normal and not an error - this is a tail, not a load.
+static std::string readerTail(const std::string& path) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return {};
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return s;
+}
+
+// Start a reader without waiting for it. The panel shows how long it has been
+// running, what it has printed so far, and a Stop.
+static void startReader(const std::string& src, const std::string& spec) {
+    if (app.rdJob) { toast("a reader is already running", true); return; }
+    app.rdJob.reset(new App::ReaderJob());
+    std::string e = openWithReader(src, spec, true, app.rdJob.get());
+    // A cache hit, or a failure before Python was reached, finishes with no
+    // thread: there is nothing to wait for and nothing to stop.
+    if (!app.rdJob->th.joinable()) {
+        app.rdJob.reset();
+        if (!e.empty()) toast(e, true);
+    }
+}
+
+// Called once per frame. Until the child exits this only refreshes what it has
+// printed; the loading itself happens here, on the UI thread, when it is done.
+static void pollReader() {
+    if (!app.rdJob) return;
+    App::ReaderJob* j = app.rdJob.get();
+    if (!j->done.load()) {
+        // errFile only: outFile is the payload, and tailing binary into a
+        // text panel would show the pixels as mojibake.
+        std::string live = readerTail(j->errFile);
+        if (live.size() != j->shown) {
+            j->shown = live.size();
+            app.readerLastOut = live.empty()
+                ? ("running " + baseName(readerFileOf(j->spec)) + " ...\n") : live;
+        }
+        return;
+    }
+    j->th.join();
+    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r);
+    std::error_code ec;
+    std::filesystem::remove(pathFromUtf8(j->errFile), ec);
+    app.rdJob.reset();
+    if (!e.empty()) toast(e, true);
+}
+
+// §4.13: only an explicitly chosen adapter runs, and the first time a given one
+// is used the user sees the EXACT command. Not a paraphrase - the thing that
+// will be executed, so that "what is this about to run?" has a real answer.
+static bool readerNeedsConfirming(const std::string& spec) {
+    for (const auto& s : app.readerShown) if (s == spec) return false;
+    return true;
+}
+static void readerConfirmed(const std::string& spec) {
+    if (readerNeedsConfirming(spec)) app.readerShown.push_back(spec);
+}
+static std::string readerCommandLine(const std::string& src, const std::string& spec) {
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    std::string script = runAdapterScript();
+    if (py.empty()) return "(no Python found: " + why + ")";
+    if (script.empty()) return "(run_adapter.py not found next to this build)";
+    return adapter::showCommand({ py, script, spec, src, "-o", "<cache>.npz" });
 }
 
 // ---- Open in new window (todo-open item 28) ---------------------------------
@@ -5194,10 +7569,10 @@ static std::string selfExePath() {
 }
 
 // The command line that makes "the same image look the same" in the child:
-// - a stack passes its HEAD file, and --sequence always regroups the numbered
+// - a stack passes its HEAD file, and --stack always regroups the numbered
 //   siblings there without the picker;
-// - the CFA interpretation rides along when one is set (--bayer-pattern first:
-//   --cfa captures the pattern seen so far, see parseCli);
+// - the CFA interpretation rides along when one is set (pattern before --cfa,
+//   which reads best; parseCli accepts either order);
 // - --window-offset 40,40 cascades the child off its parent;
 // - --secondary makes the child's prefs read-only (see savePrefs).
 // Remote docs pass their ssh:// url - the CLI already parses it. Pure on
@@ -5213,7 +7588,7 @@ static std::vector<std::string> newWindowArgv(const ImageDoc* d) {
     if (target.empty()) return {};     // nothing on disk behind this row
     std::vector<std::string> av{ selfExePath(), "--secondary",
                                  "--window-offset", "40,40" };
-    if (d->seqId != 0) { av.push_back("--sequence"); av.push_back("always"); }
+    if (d->seqId != 0) { av.push_back("--stack"); av.push_back("always"); }
     if (d->cfa != 0) {
         av.push_back("--bayer-pattern");
         av.push_back(CFA_PATTERNS[d->cfaPattern & 3]);
@@ -5383,6 +7758,7 @@ static std::string loadSession(const std::string& path) {
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     int pendingLut = -1;
     std::string pendingMember;         // .npz array name for the next image line
+    int pendingRead = NR_NATIVE;       // §3.3 reading for the next image line
     bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
     // "current" is an ordinal over saved image lines; a line can expand into a
@@ -5443,7 +7819,9 @@ static std::string loadSession(const std::string& path) {
             if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
         }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
-        else if (key == "npyaxis") { ls >> app.npyAxis; app.npyAxis = std::clamp(app.npyAxis, 0, 1); }
+        // "npyaxis" is deliberately NOT parsed any more (§3.4): the flag it
+        // restored no longer exists, and an old session's value falls through
+        // the chain like any unknown key rather than being half-honoured.
         else if (key == "compare") { int ab = 0, fa = 0;
                                      ls >> app.compareMode >> app.wipeFrac >> app.splitFrac;
                                      if (ls >> app.diffGain >> ab) app.diffAbs = ab != 0;  // v2
@@ -5498,6 +7876,11 @@ static std::string loadSession(const std::string& path) {
         }
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
+        else if (key == "npyread") {              // §3.3, applies to the next image line
+            int r = NR_NATIVE;
+            ls >> r;
+            pendingRead = (r >= NR_NATIVE && r <= NR_CHW) ? r : NR_NATIVE;
+        }
         else if (key == "selann") ls >> selAnnIndex;
         else if (key == "imgbatch") {   // batch of the image above, by name
             std::string nm = restOfLine(ls);
@@ -5579,6 +7962,11 @@ static std::string loadSession(const std::string& path) {
             if (lastImageOk && cur() && !cur()->src->path.empty() && std::isfinite(lv))
                 app.seqLevelLegacy.push_back({ cur()->src->path, lv });
         }
+        // A computed frame's RECIPE: "the mean of the stack whose first frame is
+        // this path". Collected here and resolved after everything is open, for
+        // exactly the reason the series block gives below - and taken again
+        // rather than reloaded, because there is no file holding the answer.
+        else if (key == "stackavg") app.avgRestore.push_back(restOfLine(ls));
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
         // with a queued rescan behind it. See resolveSeriesRestore.
@@ -5719,7 +8107,31 @@ static std::string loadSession(const std::string& path) {
                     openRemote(p);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
-                    err = isNpz ? loadNpz(p, pendingMember) : loadNpy(p);
+                    // §4.12: a file that was read by an adapter is read by that
+                    // adapter again when the session comes back. Without this
+                    // the restore reaches for a member (__pixels_1) that only
+                    // exists in the container the reader produces, and a session
+                    // that cannot reopen what it saved is not a session.
+                    std::string rspec = readerFor(p);
+                    if (!rspec.empty()) {
+                        // ONE reader run rebuilds every doc that file produced,
+                        // but the session carries one line per doc. Run it for
+                        // the first line and let the rest recognise their own
+                        // pixels as already present - otherwise a six-frame
+                        // series comes back six times over.
+                        bool already = false;
+                        for (const auto& d : app.images)
+                            if (d->src->path == p) { already = true; break; }
+                        err = already ? std::string() : openWithReader(p, rspec);
+                    } else if (isNpz)
+                        err = loadNpz(p, pendingMember, pendingRead);
+                    else if (imagefile::forPath(p))
+                        // a session that saved a .png must reopen a .png:
+                        // loadNpy would fail its magic check and the document
+                        // would come back as "cannot open", not as pixels
+                        err = loadImageFile(p);
+                    else
+                        err = loadNpy(p, pendingRead);
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
@@ -5733,6 +8145,7 @@ static std::string loadSession(const std::string& path) {
                 err = loadNpy(p);
             }
             pendingMember.clear();
+            pendingRead = NR_NATIVE;      // must not leak onto the next image
             if (!err.empty()) {
                 failures.push_back(err);
                 lastImageOk = false;
@@ -5818,6 +8231,93 @@ static size_t residentImageBytes() {
 // alone lets N overlapping opens each claim the whole budget.
 static size_t claimedImageBytes() {
     return residentImageBytes() + app.rfBytesInFlight.load();
+}
+
+// ---- the source map: which documents are holding which pixels ---------------
+// Sharing is invisible from outside this process. srcId is read in exactly one
+// place (residentImageBytes' dedupe, just above), use_count() in exactly one
+// (the crop CoW), rev in none at all, and none of the three has a printing
+// path - so "these two stacks are one source" cannot be asserted from a CLI,
+// which is why docs/verify-functional.md D-1/D-2/D-7 stand at 要probe and A-12
+// could be settled only by reading the code. This writes down what the
+// documents ACTUALLY point at, one line per membership.
+//
+// Two decisions, both of them about being readable back:
+//   - the source is named by a DENSE ordinal, not by srcId. srcId is a global
+//     counter, so its value depends on how many frames were decoded before
+//     this one and differs between runs; nothing can assert on it. "Shared"
+//     means two documents print the SAME ordinal, and that is stable.
+//   - the rows are sorted by (stack, position, uid). app.images is in arrival
+//     order, and a background loader does not promise one.
+// Like g_tilePanesDrawn and g_filesBadgeProbe, this records what IS, never
+// what ought to be: refs is use_count() as it stands, and mtime/fsize are
+// whatever statSourceFile left there, 0 included.
+struct SrcMapRow {
+    uint64_t uid = 0;
+    int seqId = 0, seqIndex = 0;
+    int src = 0;              // dense source ordinal: equal ordinal = shared
+    long refs = 0;            // src.use_count()
+    int rev = 0, dataRev = 0;
+    int64_t mtime = 0;
+    uint64_t fsize = 0;
+    size_t bytes = 0;
+    int w = 0, h = 0, ch = 1;
+    bool preview = false;
+    std::string name, member, path;
+};
+static std::vector<SrcMapRow> srcMapRows() {
+    std::vector<const ImageDoc*> ds;
+    ds.reserve(app.images.size());
+    for (const auto& d : app.images) if (d) ds.push_back(d.get());
+    std::stable_sort(ds.begin(), ds.end(), [](const ImageDoc* a, const ImageDoc* b) {
+        if (a->seqId != b->seqId) return a->seqId < b->seqId;
+        if (a->seqIndex != b->seqIndex) return a->seqIndex < b->seqIndex;
+        return a->uid < b->uid;
+    });
+    std::vector<SrcMapRow> rows;
+    std::unordered_map<uint64_t, int> dense;
+    for (const ImageDoc* d : ds) {
+        const FrameSource& S = *d->src;
+        auto it = dense.find(S.srcId);
+        if (it == dense.end()) it = dense.emplace(S.srcId, (int)dense.size()).first;
+        SrcMapRow r;
+        r.uid = d->uid; r.seqId = d->seqId; r.seqIndex = d->seqIndex;
+        r.src = it->second;
+        r.refs = d->src.use_count();
+        r.rev = S.rev; r.dataRev = d->dataRev;
+        r.mtime = S.mtime; r.fsize = S.fsize;
+        r.bytes = S.data.size() * sizeof(float);
+        r.w = S.w; r.h = S.h; r.ch = S.ch;
+        r.preview = d->preview;
+        r.name = d->name; r.member = S.npzMember; r.path = S.path;
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+// How many distinct sources the open documents hold between them.
+static int srcMapSources() {
+    std::unordered_set<uint64_t> seen;
+    for (const auto& d : app.images) if (d) seen.insert(d->src->srcId);
+    return (int)seen.size();
+}
+// The map as stderr lines. <tag> names the moment, because the interesting
+// question is always "the same map before and after WHAT".
+static void srcMapDump(const std::string& tag) {
+    std::vector<SrcMapRow> rows = srcMapRows();
+    for (const SrcMapRow& r : rows) {
+        std::string tail = " name='" + r.name + "'";
+        if (!r.member.empty()) tail += " member='" + r.member + "'";
+        if (!r.path.empty())   tail += " path='" + r.path + "'";
+        fprintf(stderr, "srcmap: %s uid=%llu seq=%d idx=%d src=#%d refs=%ld rev=%d "
+                        "datarev=%d %dx%dx%d bytes=%zu mtime=%lld fsize=%llu%s%s\n",
+                tag.c_str(), (unsigned long long)r.uid, r.seqId, r.seqIndex, r.src,
+                r.refs, r.rev, r.dataRev, r.w, r.h, r.ch, r.bytes,
+                (long long)r.mtime, (unsigned long long)r.fsize,
+                r.preview ? " preview" : "", tail.c_str());
+    }
+    fprintf(stderr, "srcmap: %s %zu doc(s), %d source(s), %zu resident byte(s)\n",
+            tag.c_str(), rows.size(), srcMapSources(), residentImageBytes());
+    fflush(stderr);
 }
 
 // split a stem into alternating text / digit segments: "flat_0007_640x480" ->
@@ -6046,7 +8546,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
         app.seqErr.clear();
     }
     app.seqNote.clear();
-    fprintf(stderr, "sequence: %s - %d files (%s)\n", info.name.c_str(),
+    fprintf(stderr, "stack: %s - %d files (%s)\n", info.name.c_str(),
             (int)files.size(), isRaw ? "raw recipe" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
@@ -6072,10 +8572,11 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                     probe.rawOffset = recipe.offset; probe.rawLE = recipe.littleEndian;
                     probe.srcW = recipe.w;           probe.srcH = recipe.h;
                 } else {
-                    probe.frameAxis = 0;   // folder members decode as single
-                                           // 2-D frames; a frame-axis file keys
-                                           // ax=1, misses here and self-heals
-                                           // at the adopt-on-collision add below
+                    // folder members decode natively: npyRead stays NR_NATIVE
+                    // (0), which is what npyKeyRead maps every native decode
+                    // to, shape known or not. A DECLARED-reading resident keys
+                    // nr!=0, misses here and self-heals at the
+                    // adopt-on-collision add below.
                 }
                 statSourceFile(probe);
                 if (probe.mtime || probe.fsize) {
@@ -6142,7 +8643,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             app.seqDone++;
             // wake the UI at most ~10 Hz: one post per decoded frame would defeat
             // the idle throttle on a fast disk
-            double now = glfwGetTime();
+            double now = nowSec();
             if (now - lastPost > 0.1) { lastPost = now; glfwPostEmptyEvent(); }
             if (bytes > budget) {
                 // say what stopped it, with the numbers: silently loading 60 of
@@ -6150,7 +8651,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 char m[192];
                 snprintf(m, sizeof m,
                          "memory budget %.1f GB reached - stopped after %d of %d frames\n"
-                         "(File > Sequence loading > Memory budget)\n",
+                         "(File > Stack loading > Memory budget)\n",
                          budget / 1073741824.0, app.seqDone.load(), (int)jobs.size());
                 fputs(m, stderr);
                 std::lock_guard<std::mutex> lk(app.seqMtx);
@@ -6221,7 +8722,7 @@ static void pumpSequence() {
     }
     // invalidating per pump made this O(frames^2) over a load; refresh at ~2 Hz
     static double lastTemporalInvalidate = 0;
-    double nowT = glfwGetTime();
+    double nowT = nowSec();
     if (!app.seqRunning || nowT - lastTemporalInvalidate > 0.5) {
         lastTemporalInvalidate = nowT;
         app.temporal[0].seqId = app.temporal[1].seqId = -1;
@@ -6237,7 +8738,7 @@ static void pumpSequence() {
         app.seqThread.join();
         int n = 0;
         for (const auto& d : app.images) if (d->seqId == app.seqLoadingId) n++;
-        fprintf(stderr, "sequence: loaded %d frames\n", n);
+        fprintf(stderr, "stack: loaded %d frames\n", n);
     }
 }
 
@@ -6496,6 +8997,7 @@ static void resolvePendingSeries() {
 }
 
 // called once per frame: integrate decoded frames, then chain the next stack
+static void pumpStackAverages();   // fwd: it needs computeStackStats, defined below
 static void pumpSequenceAndQueue() {
     pumpSequence();
     // one restore at a time, matched by uid: indices shift as frames land
@@ -6532,6 +9034,12 @@ static void pumpSequenceAndQueue() {
         if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
         if (!app.seriesPending.empty()) resolvePendingSeries();
     }
+    // Parked frame averages last, and behind the same "everything has landed"
+    // gate: a mean taken while the stack is still filling would be a mean of
+    // however many frames happened to have arrived by then. It rides here so
+    // every selftest's drain loop drives it too, without a second pump to keep
+    // in step.
+    pumpStackAverages();
 }
 
 // ---- stacks & navigation ------------------------------------------------------
@@ -6577,9 +9085,10 @@ static void selectImage(int idx) {
     // Walking A onto the image pinned as B used to SWAP them, so that looking
     // at B stopped it from being B and rewrote the pin to whatever A had been.
     // B is something the user pinned deliberately; navigating must not rewrite
-    // it. Nothing is needed here: resolveB already answers null while A sits on
-    // B, so the comparison goes quiet for exactly as long as you are standing
-    // on it and comes back, still pinned, when you step away. Shift+\ (or the
+    // it. Nothing is needed here: the pin is a uid and this function does not
+    // touch it. Standing on B is not a state that needs handling either - both
+    // sides simply resolve to the one document and are drawn coinciding, which
+    // is a comparison people set up ON PURPOSE (see resolveB). Shift+\ (or the
     // status bar's "swap A/B") is how you swap - on purpose.
     ImageDoc* prev = cur();
     if (prev && app.images[idx].get() != prev) app.prevImageUid = prev->uid;
@@ -6590,7 +9099,7 @@ static void selectImage(int idx) {
     // so, and refresh once the stepping stops. Same shape as annBusy.
     {
         static double lastSwitch = -1e9;
-        double now = glfwGetTime();
+        double now = nowSec();
         if (now - lastSwitch < 0.30) app.abStepBusyUntil = now + 0.30;
         lastSwitch = now;
     }
@@ -6706,6 +9215,7 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         std::string rel = d.first.u8string();
         if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
         else rel.clear();
+        std::replace(rel.begin(), rel.end(), '\\', '/');
         auto push = [&](std::vector<std::string> fs, std::string pattern) {
             if (groups.size() >= MAX_GROUPS) return;
             App::PendingGroup g;
@@ -7023,7 +9533,7 @@ static void openFolder(const std::string& path) {
     std::vector<App::PendingGroup> groups = scanFolderGroups(path);
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
-        toast("scan stopped at 256 sequences - narrow the folder or use the filter", true);
+        toast("scan stopped at 256 stacks - narrow the folder or use the filter", true);
     // ALWAYS ask, one group included - same rule the remote scan follows. The
     // picker is where the file filter lives (UC3: "open only the *_dark*
     // frames of this folder" needs the dialog even when the folder groups into
@@ -7197,8 +9707,120 @@ static void pickerAccept() {
     }
 }
 
+// ---- the .npz member picker's answer (docs/npz-design.md §2.3) --------------
+// The same shape as pickerAccept above, one layer down: no ImGui, so the
+// headless selftests and every auto-accept go through this exact function.
+//
+// The file is the BATCH (frame ⊂ stack ⊂ series ⊂ batch: an .npz is "what was
+// opened together", which is precisely a batch and nothing more). Members of
+// different shapes coexist inside it as separate stacks - that is the whole
+// point of a container.
+static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
+                               std::vector<double> vals, std::string& err);   // fwd
+static std::string trimAxisLabel(const std::string& s);                       // fwd
+// The next .npz that was dropped while this picker was up. Draining here and on
+// Cancel is what makes the queue a queue rather than a place files go to die.
+static void npzPickNext() {
+    if (app.npzPickOpen || app.npzPickQueue.empty()) return;
+    std::string next = app.npzPickQueue.front();
+    app.npzPickQueue.erase(app.npzPickQueue.begin());
+    std::string err = loadNpz(next);
+    if (!err.empty()) toast(baseName(next) + ": " + err, true);
+}
+static void npzPickAccept() {
+    std::vector<NpzMember> mem = std::move(app.npzPick);
+    std::string path = app.npzPickPath;
+    // trimmed HERE too, so the message says the unit that was actually stored
+    std::string axName = trimAxisLabel(app.npzAxisName), axUnit = trimAxisLabel(app.npzAxisUnit);
+    app.npzPick.clear();
+    app.npzPickOpen = false;
+    app.npzPickPath.clear();
+    if (path.empty() || mem.empty()) return;
+    // identity BEFORE the bytes (§6.2), same as loadNpz: the dialog may have
+    // stood open across an overwrite, and the members below bind to THIS stat
+    FrameSource zipStat;
+    zipStat.path = path;
+    statSourceFile(zipStat);
+    std::vector<uint8_t> zip;
+    std::vector<NpzEntry> entries;
+    std::string err;
+    if (!readFileBytes(path, zip) || !npzList(zip, entries, err)) {
+        toast(baseName(path) + ": " + (err.empty() ? std::string("cannot read file") : err), true);
+        return;
+    }
+    npzRememberMeta(path, mem);
+    int prevBatch = app.loadBatchId;
+    app.loadBatchId = newBatch(uniqueBatchName(baseName(path)));
+    std::vector<std::string> openedNames;
+    std::vector<int> openedSeqs;
+    int stacks = 0, stackFrames = 0, loneFrames = 0;
+    for (const auto& m : mem) {
+        if (!m.selected || m.role != NpzMember::RImage) continue;
+        // by NAME, not by the index the scan recorded: the file could have been
+        // rewritten while the dialog stood open, and opening whatever now sits
+        // at that index under the old member's name is the quiet lie again
+        size_t at = entries.size();
+        for (size_t k = 0; k < entries.size(); k++)
+            if (entries[k].name == m.name + ".npy") { at = k; break; }
+        if (at == entries.size()) {
+            toast(baseName(path) + ": " + m.name + " is no longer in this file", true);
+            continue;
+        }
+        size_t before = app.images.size();
+        std::string oErr = npzOpenMember(path, zip, entries[at], m.name,
+                                         0 /*NR_NATIVE*/, zipStat);
+        if (!oErr.empty()) { toast(baseName(path) + ":" + m.name + ": " + oErr, true); continue; }
+        openedNames.push_back(m.name);
+        int sid = 0;
+        for (size_t k = before; k < app.images.size(); k++)
+            if (app.images[k]->seqId) sid = app.images[k]->seqId;
+        if (sid) { stacks++; stackFrames += (int)framesOfSeq(sid).size(); openedSeqs.push_back(sid); }
+        else loneFrames += (int)(app.images.size() - before);
+    }
+    app.loadBatchId = prevBatch;
+    // ...and the axis, through the SAME call the Temporal panel's pasted axis
+    // makes. The values came out of the file at full precision; the NAME and the
+    // UNIT came from the human, which is the only way either of them is allowed
+    // to be set (a key called "exposure_ms" does not prove milliseconds).
+    std::string axisNote;
+    for (auto& m : mem) {
+        if (!m.selected || m.role != NpzMember::RAxis) continue;
+        int applied = 0;
+        std::string lastErr;
+        for (int sid : openedSeqs) {
+            if (framesOfSeq(sid).size() != m.vals.size()) continue;
+            std::string aerr;
+            if (applyFrameAxisVals(sid, axName.empty() ? m.name : axName, axUnit,
+                                   m.vals, aerr)) applied++;
+            else lastErr = aerr;
+        }
+        if (applied) {
+            axisNote = "x axis " + (axName.empty() ? m.name : axName) + " [" + axUnit +
+                       "] from " + m.name + " on " + std::to_string(applied) + " stack(s)";
+            // it is still not an image, and the summary still names it - but it
+            // says what the member BECAME rather than what it was declined for
+            m.becomes = "x axis [" + axUnit + "]";
+        } else {
+            axisNote = "x axis " + m.name + " NOT applied: " +
+                       (lastErr.empty() ? "no opened stack has " +
+                                          std::to_string(m.vals.size()) + " frames" : lastErr);
+        }
+        break;                     // one axis per Open: one name, one unit
+    }
+    // The batch is minted before it is known whether anything will open, so a
+    // file whose every member failed left an empty heading standing in Files -
+    // exactly the "lie about what is open" that made batches be created at
+    // ACCEPT time in the first place.
+    if (openedNames.empty()) pruneEmptyBatches();
+    std::string say = npzSummary(path, mem, openedNames, stacks, stackFrames,
+                                 loneFrames, axisNote);
+    fprintf(stderr, "npz: %s\n", say.c_str());
+    toast(say, stacks == 0 && loneFrames == 0);
+    npzPickNext();                 // whatever was dropped alongside this file
+}
+
 // Tree of what the scan found. One live filter narrows FILES as you type;
-// checkboxes choose groups; the footer picks between "one stack per sequence"
+// checkboxes choose groups; the footer picks between "one stack per group"
 // and "everything as ONE stack". Group count is capped at 256 by the scans, so
 // the tree needs no clipper - the per-group FILE lists (unbounded) get one.
 static void drawFolderPickModal() {
@@ -7216,14 +9838,14 @@ static void drawFolderPickModal() {
                 : app.folderPickHost.empty() ? "peer on " PEER_HERE
                                              : app.folderPickHost.c_str(),
                 (int)app.folderPick.size());
-        ImGui::OpenPopup("Select sequences");
+        ImGui::OpenPopup("Select stacks");
     }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 520 * app.uiScale), ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 18),
                                         ImVec2(FLT_MAX, FLT_MAX));
-    if (!ImGui::BeginPopupModal("Select sequences", nullptr)) return;
+    if (!ImGui::BeginPopupModal("Select stacks", nullptr)) return;
 
     ImGui::TextDisabled("%s", dispPath(app.folderPickRoot).c_str());
     int totalFiles = 0, matchFiles = 0, selGroups = 0, selFiles = 0;
@@ -7247,14 +9869,14 @@ static void drawFolderPickModal() {
             ImGui::SetTooltip(
                 "Narrows WHICH FILES will load, as you type.\n"
                 "Each word is looked for anywhere in a file's \"folder/filename\"\n"
-                "(shown when you expand a sequence below). All words must match.\n"
+                "(shown when you expand a stack below). All words must match.\n"
                 "    dark          keep files whose folder or name contains \"dark\"\n"
                 "    !ng           drop files matching \"ng\"\n"
                 "    10lx *_A.npy  words combine; * and ? wildcards work anywhere\n"
-                "Sequences show \"kept / total\"; only the kept files are loaded.");
+                "Stacks show \"kept / total\"; only the kept files are loaded.");
         ImGui::SameLine();
         if (app.pickFilter[0]) ImGui::Text("%d / %d files match", matchFiles, totalFiles);
-        else ImGui::TextDisabled("%d sequence(s), %d files", (int)app.folderPick.size(), totalFiles);
+        else ImGui::TextDisabled("%d stack(s), %d files", (int)app.folderPick.size(), totalFiles);
     }
     if (ImGui::SmallButton("All")) { for (auto& e : app.folderPick) if (e.nMatch) e.selected = true; }
     ImGui::SameLine();
@@ -7397,7 +10019,7 @@ static void drawFolderPickModal() {
         snprintf(m1, sizeof m1, "ONE stack of %d file(s)###mode1", selFiles);
         ImGui::RadioButton(m0, &app.pickMerge, 0);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("each checked sequence becomes its own stack");
+            ImGui::SetTooltip("each checked group of numbered files becomes its own stack");
         ImGui::SameLine();
         ImGui::RadioButton(m1, &app.pickMerge, 1);
         if (ImGui::IsItemHovered())
@@ -7450,7 +10072,7 @@ static void drawFolderPickModal() {
     if (sweepRow) {
         ImGui::Checkbox("open as a sweep (creates a series)", &app.pickSweep);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The %d selected sequences become one SERIES: each stack keeps\n"
+            ImGui::SetTooltip("The %d selected stacks become one SERIES: each stack keeps\n"
                               "the value read from its name, and linearity / PTC measure the\n"
                               "series as a whole.\n"
                               "Nothing is created unless this is ticked.", selGroups);
@@ -7508,9 +10130,9 @@ static void drawFolderPickModal() {
                            "shapes differ (%s vs %s) - mismatched frames are skipped at load",
                            shapes[0].c_str(), shapes[1].c_str());
     else
-        ImGui::Text("selected: %d sequence(s), %d files", selGroups, selFiles);
+        ImGui::Text("selected: %d stack(s), %d files", selGroups, selFiles);
     if (mergeWarn && app.pickMerge == 1 && shapes.size() > 1 && !mixedRawNpy)
-        ImGui::TextDisabled("check the shape column above to see which sequences differ");
+        ImGui::TextDisabled("check the shape column above to see which stacks differ");
     ImGui::BeginDisabled(!loadable);
     bool load = ImGui::Button(app.pickMerge == 1 ? "Load as ONE stack"
                               : app.pickSweep   ? "Load as a sweep"
@@ -7531,6 +10153,488 @@ static void drawFolderPickModal() {
     ImGui::EndPopup();
 }
 
+// ---- the Reader panel (docs/input-adapters.md §4.13.0) -----------------------
+// Three entrances, one destination, and IT DOES NOT CLOSE. Writing an adapter is
+// a loop - write, load, read the failure, fix, load again - and the first design
+// here was a modal, which cut that loop every time the author went to their
+// editor. A panel that stays put lets the loop run: press Load, alt-tab, fix the
+// line the traceback named, press Load again.
+static void openReaderPicker(const std::string& path, const std::string& why) {
+    app.readerPickPath = path;
+    app.readerPickWhy = why;
+    app.readerPanelOpen = true;
+    app.readerPanelRaise = true;
+    // The previous run belonged to the previous file: showing its traceback
+    // beside a new path would blame this file for that file's problem.
+    app.readerRan = false;
+    app.readerLastOut.clear();
+    std::string spec = readerFor(path);
+    if (!spec.empty()) {
+        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", readerFileOf(spec).c_str());
+        snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s", readerFuncOf(spec).c_str());
+    } else if (app.readerPickFile[0] == '\0' && !app.readerMemo.empty()) {
+        // Nothing chosen for this path yet: start from the one most recently
+        // used. Applying a reader to several files in a row is the common case,
+        // and retyping the same path each time is the friction that shape has.
+        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                 readerFileOf(app.readerMemo.front().spec).c_str());
+        snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s",
+                 readerFuncOf(app.readerMemo.front().spec).c_str());
+    }
+}
+
+// The adapters that ship with the viewer, beside the harness that runs them.
+static std::vector<std::string> shippedReaders() {
+    std::vector<std::string> out;
+    std::string script = runAdapterScript();
+    if (script.empty()) return out;
+    std::error_code ec;
+    std::filesystem::path d = pathFromUtf8(script).parent_path() / "adapters";
+    if (!std::filesystem::is_directory(d, ec)) return out;
+    for (const auto& e : std::filesystem::directory_iterator(d, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        std::filesystem::path p = e.path();
+        if (p.extension() != ".py") continue;
+        out.push_back(p.u8string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Write the starting template to `dest` and open it. Every failure here used to
+// come out as "could not write the template to <dest>", which names the
+// destination even when the destination is fine and the SOURCE is what is
+// missing - the case that actually happens, because a packaged build ships no
+// tools/import at all. Say which of the three things went wrong.
+static void newReaderFrom(const std::string& dest) {
+    if (dest.empty()) return;
+    std::string script = runAdapterScript();
+    if (script.empty()) {
+        toast("no reader harness found: this build has no tools/import/run_adapter.py "
+              "beside it, so readers cannot run at all", true);
+        return;
+    }
+    std::filesystem::path tmpl = pathFromUtf8(script).parent_path() / "adapters" / "template.py";
+    std::error_code ec;
+    if (!std::filesystem::exists(tmpl, ec)) {
+        toast("the template is missing: " + tmpl.u8string(), true);
+        return;
+    }
+    if (!std::filesystem::copy_file(tmpl, pathFromUtf8(dest),
+                                    std::filesystem::copy_options::overwrite_existing, ec)) {
+        toast("could not write " + dest + ": " +
+              (ec ? ec.message() : std::string("copy refused without saying why")), true);
+        return;
+    }
+    snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", dest.c_str());
+    snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "load");
+    std::string how;
+    if (adapter::openInEditor(dest, how)) toast("opened in " + how + ": " + baseName(dest));
+    else toast(how, true);
+}
+
+static void drawReaderPanel() {
+    if (!app.readerPanelOpen) return;
+    if (app.readerPanelRaise) {                 // an entrance asked for it
+        ImGui::SetNextWindowFocus();
+        app.readerPanelRaise = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 42, ImGui::GetFontSize() * 30),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Reader", &app.readerPanelOpen)) { ImGui::End(); return; }
+    if (app.readerPickPath.empty()) {
+        ImGui::TextDisabled("No file yet. Open one that the viewer cannot read, or use\n"
+                            "File > Open With a Reader...");
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("%s", app.readerPickPath.c_str());
+    std::error_code dec;
+    if (std::filesystem::is_directory(pathFromUtf8(app.readerPickPath), dec))
+        ImGui::TextDisabled("this is a folder - a reader may take one (§4.1)");
+    if (!app.readerPickWhy.empty()) {
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 38);
+        ImGui::TextColored(ImVec4(1, 0.65f, 0.4f, 1), "%s", app.readerPickWhy.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("A reader is a Python function you write. It is handed this "
+                        "path and returns pixels, or Frame / Stack / Series / Batch.");
+
+    std::vector<std::string> shipped = shippedReaders();
+    if (!shipped.empty() && ImGui::TreeNodeEx("##shipped", ImGuiTreeNodeFlags_SpanAvailWidth,
+                                              "shipped with the viewer (%d)",
+                                              (int)shipped.size())) {
+        for (const auto& s : shipped) {
+            if (ImGui::Selectable(baseName(s).c_str()))
+                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", s.c_str());
+        }
+        ImGui::TreePop();
+    }
+    // A folder of the user's own readers (§4.13.0 "ローカル"). Remembered in
+    // prefs, because the second reader someone writes lives beside the first.
+    if (ImGui::TreeNodeEx("##local", ImGuiTreeNodeFlags_SpanAvailWidth, "your readers%s",
+                          app.readerLocalDir[0] ? "" : " (no folder chosen)")) {
+        if (ImGui::SmallButton("Choose folder...") && !app.rdFolderDlg) {
+            app.rdFolderMode = 0;
+            app.rdFolderDlg = std::make_unique<pfd::select_folder>("Folder of readers", ".");
+        }
+        if (app.readerLocalDir[0]) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", app.readerLocalDir);
+            std::error_code lec;
+            std::filesystem::path ld = pathFromUtf8(app.readerLocalDir);
+            int shown = 0;
+            if (std::filesystem::is_directory(ld, lec))
+                for (const auto& e : std::filesystem::directory_iterator(ld, lec)) {
+                    if (!e.is_regular_file(lec) || e.path().extension() != ".py") continue;
+                    shown++;
+                    if (ImGui::Selectable(e.path().filename().u8string().c_str()))
+                        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                                 e.path().u8string().c_str());
+                }
+            if (!shown) ImGui::TextDisabled("no .py files in that folder");
+        }
+        ImGui::TreePop();
+    }
+    // What has been used before: applying one reader to a run of files is the
+    // common case, so the last choices are one click away rather than retyped.
+    if (!app.readerMemo.empty() &&
+        ImGui::TreeNodeEx("##used", ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "used before (%d)", (int)app.readerMemo.size())) {
+        std::vector<std::string> seen;
+        for (const auto& m : app.readerMemo) {
+            bool dup = false;
+            for (const auto& s : seen) if (s == m.spec) dup = true;
+            if (dup) continue;
+            seen.push_back(m.spec);
+            if (ImGui::Selectable(m.spec.c_str())) {
+                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
+                         readerFileOf(m.spec).c_str());
+                snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s",
+                         readerFuncOf(m.spec).c_str());
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26);
+    ImGui::InputText("file", app.readerPickFile, sizeof app.readerPickFile);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...") && !app.rdOpenDlg) {
+        app.rdOpenMode = 0;
+        app.rdOpenDlg = std::make_unique<pfd::open_file>(
+            "Reader (.py)", ".", std::vector<std::string>{ "Python", "*.py" });
+    }
+    // The functions the file actually defines. Read out of the text, so the list
+    // is what is there rather than what someone hoped was there.
+    std::vector<std::string> funcs = adapter::moduleFunctions(app.readerPickFile);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    ImGui::InputText("function", app.readerPickFunc, sizeof app.readerPickFunc);
+    if (!funcs.empty()) {
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##funcs", "defined", ImGuiComboFlags_NoPreview |
+                                                    ImGuiComboFlags_PopupAlignLeft)) {
+            for (const auto& f : funcs)
+                if (ImGui::Selectable(f.c_str()))
+                    snprintf(app.readerPickFunc, sizeof app.readerPickFunc, "%s", f.c_str());
+            ImGui::EndCombo();
+        }
+    }
+
+    // §4.13: no built-in editor. New writes the template out and opens it; Edit
+    // opens the one named above. $EDITOR, then `code -g`, then the OS.
+    if (ImGui::Button("New reader...") && !app.rdNewDlg) {
+        app.rdNewDlg = std::make_unique<pfd::save_file>(
+            "New reader", "reader.py", std::vector<std::string>{ "Python", "*.py" });
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(app.readerPickFile[0] == '\0');
+    if (ImGui::Button("Edit reader")) {
+        std::string how;
+        if (adapter::openInEditor(app.readerPickFile, how))
+            toast("opened in " + how + ": " + baseName(app.readerPickFile));
+        else toast(how, true);
+    }
+    ImGui::EndDisabled();
+
+    std::string spec = std::string(app.readerPickFile) + ":" + app.readerPickFunc;
+    bool haveFile = app.readerPickFile[0] != '\0' && app.readerPickFunc[0] != '\0';
+    ImGui::Separator();
+    // §4.13: show the EXACT command before running it, the first time this
+    // reader is used. Not a paraphrase - an external program is about to start.
+    if (haveFile && readerNeedsConfirming(spec)) {
+        ImGui::TextDisabled("this will run:");
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 38);
+        ImGui::TextWrapped("%s", readerCommandLine(app.readerPickPath, spec).c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::BeginDisabled(!haveFile || app.rdJob != nullptr);
+    // §4.13.0: pressable as many times as you like. The cache key carries the
+    // adapter's mtime, so editing the file and pressing this again ALWAYS
+    // re-runs it - a cache that defeated the edit loop would kill the feature.
+    if (ImGui::Button("Load", ImVec2(ImGui::GetFontSize() * 8, 0))) {
+        readerConfirmed(spec);
+        // Started, not waited for. The panel stays open - applying a reader to
+        // several files in a row is the common case, and this is also where the
+        // traceback lands - and the window keeps answering while Python runs.
+        startReader(app.readerPickPath, spec);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (app.rdJob) {
+        // Something turning, how long it has been turning, and a way out. A
+        // reader takes as long as the user's data takes, and a window that only
+        // stops answering does not say whether it is working or wedged.
+        double el = nowSec() - app.rdJob->startedAt;
+        const char* spin = "|/-\\";
+        ImGui::Text("%c  running  %.1f s", spin[(int)(nowSec() * 8) & 3], el);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop")) {
+            app.rdJob->cancel.store(true);
+            toast("stopping the reader...");
+        }
+    } else {
+        ImGui::TextDisabled("re-runs whenever the reader file has changed");
+    }
+
+    // ---- what the last run said, WHOLE -------------------------------------
+    // The only debugging surface an adapter author has. A traceback folded into
+    // "could not open" would make this feature useless to the people it is for,
+    // so it is shown in full, selectable, and scrolls rather than truncating.
+    ImGui::Separator();
+    if (!app.readerRan) {
+        ImGui::TextDisabled("no run yet");
+    } else {
+        if (app.readerLastOk)
+            ImGui::TextColored(ImVec4(0.5f, 0.85f, 0.5f, 1), "%s read it",
+                               app.readerLastSpec.c_str());
+        else
+            ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s refused it",
+                               app.readerLastSpec.c_str());
+        ImGui::SameLine();
+        // Say it copied. Without this a Copy that worked and a Copy that had
+        // nothing to copy look identical, and the user reports the button as
+        // broken - which is how the empty-panel defect above was found.
+        ImGui::BeginDisabled(app.readerLastOut.empty());
+        if (ImGui::SmallButton("Copy")) {
+            ImGui::SetClipboardText(app.readerLastOut.c_str());
+            toast("copied");
+        }
+        ImGui::EndDisabled();
+        ImGui::BeginChild("##readerout", ImVec2(0, 0), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        // Unwrapped and monospaced-ish: a traceback's indentation is how you
+        // read which frame is which, and wrapping destroys it.
+        ImGui::TextUnformatted(app.readerLastOut.c_str());
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+// §4.12: visible and removable. "Why does this one file open differently?" has
+// to have an answer that does not involve reading prefs.txt in a text editor.
+static void drawReaderList() {
+    if (!app.readerListOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 44, ImGui::GetFontSize() * 20),
+                             ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Readers", &app.readerListOpen)) {
+        ImGui::TextDisabled("Files this viewer opens with a reader instead of natively. "
+                            "%d of %d remembered (oldest is dropped first).",
+                            (int)app.readerMemo.size(), (int)READER_MEMO_MAX);
+        std::string why;
+        std::string py = adapter::findPython(app.pythonExe, why);
+        ImGui::TextDisabled("python: %s", py.empty() ? why.c_str() : py.c_str());
+        ImGui::Separator();
+        if (app.readerMemo.empty()) {
+            ImGui::TextDisabled("nothing remembered yet");
+        }
+        int remove = -1;
+        for (size_t i = 0; i < app.readerMemo.size(); i++) {
+            ImGui::PushID((int)i);
+            if (ImGui::SmallButton("Forget")) remove = (int)i;
+            ImGui::SameLine();
+            ImGui::Text("%s", app.readerMemo[i].spec.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", app.readerMemo[i].path.c_str());
+            ImGui::PopID();
+        }
+        if (remove >= 0) {
+            app.readerMemo.erase(app.readerMemo.begin() + remove);
+            savePrefs();
+        }
+    }
+    ImGui::End();
+}
+
+static void drawNpzPickModal() {
+    if (app.npzPickOpen && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        fprintf(stderr, "npz picker: OpenPopup (%s, %d members)\n",
+                baseName(app.npzPickPath).c_str(), (int)app.npzPick.size());
+        ImGui::OpenPopup("Select arrays");
+    }
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620 * app.uiScale, 420 * app.uiScale), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 26, ImGui::GetFontSize() * 14),
+                                        ImVec2(FLT_MAX, FLT_MAX));
+    if (!ImGui::BeginPopupModal("Select arrays", nullptr)) return;
+
+    ImGui::TextDisabled("%s", dispPath(app.npzPickPath).c_str());
+    int selImages = 0, nImages = 0, selFrames = 0, axisRow = -1;
+    for (size_t i = 0; i < app.npzPick.size(); i++) {
+        const NpzMember& m = app.npzPick[i];
+        if (m.role == NpzMember::RImage) {
+            nImages++;
+            if (m.selected) { selImages++; selFrames += m.frames; }
+        } else if (m.role == NpzMember::RAxis && m.selected) axisRow = (int)i;
+    }
+    // does the ticked axis have a ticked stack of its length to belong to?
+    // the unit as it will actually be STORED: " " is not a unit
+    std::string axUnitNow = trimAxisLabel(app.npzAxisUnit);
+    bool axisFits = false;
+    if (axisRow >= 0)
+        for (const auto& m : app.npzPick)
+            if (m.role == NpzMember::RImage && m.selected && m.frames > 1 &&
+                (size_t)m.frames == app.npzPick[axisRow].vals.size()) axisFits = true;
+    ImGui::TextDisabled("%d member(s), %d of them image-shaped",
+                        (int)app.npzPick.size(), nImages);
+    if (ImGui::SmallButton("All")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Invert")) {
+        for (auto& m : app.npzPick) if (m.role == NpzMember::RImage) m.selected = !m.selected;
+    }
+    ImGui::Separator();
+
+    float footer = ImGui::GetFrameHeightWithSpacing() * (axisRow >= 0 ? 3 : 2) +
+                   ImGui::GetTextLineHeightWithSpacing() * 2;
+    ImGui::BeginChild("npztree", ImVec2(0, -footer), ImGuiChildFlags_Borders);
+    if (ImGui::BeginTable("npzmembers", 4,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("array", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+        ImGui::TableSetupColumn("shape", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+        ImGui::TableSetupColumn("dtype", ImGuiTableColumnFlags_WidthStretch, 0.12f);
+        ImGui::TableSetupColumn("becomes", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < app.npzPick.size(); i++) {
+            NpzMember& m = app.npzPick[i];
+            ImGui::TableNextRow();
+            ImGui::PushID((int)i);
+            ImGui::TableSetColumnIndex(0);
+            bool pickable = m.role == NpzMember::RImage || m.role == NpzMember::RAxis;
+            ImGui::BeginDisabled(!pickable);
+            bool wasSel = m.selected;
+            if (ImGui::Checkbox("##sel", &m.selected) && m.role == NpzMember::RAxis) {
+                // ONE axis per Open: one name, one unit. Ticking a second one
+                // would silently relabel the first with the second's name.
+                if (!wasSel) {
+                    for (size_t k = 0; k < app.npzPick.size(); k++)
+                        if (k != i && app.npzPick[k].role == NpzMember::RAxis)
+                            app.npzPick[k].selected = false;
+                    snprintf(app.npzAxisName, sizeof app.npzAxisName, "%s", m.name.c_str());
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextUnformatted(m.name.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(m.shapeText.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextDisabled("%s", m.dtype.c_str());
+            ImGui::TableSetColumnIndex(3);
+            if (m.role == NpzMember::RImage) {
+                ImGui::TextUnformatted(m.becomes.c_str());
+            } else if (m.role == NpzMember::RAxis) {
+                bool fits = false;
+                for (const auto& o : app.npzPick)
+                    if (o.role == NpzMember::RImage && o.selected && o.frames > 1 &&
+                        (size_t)o.frames == m.vals.size()) fits = true;
+                if (!fits)
+                    ImGui::TextDisabled("metadata (no %d-frame stack ticked)", (int)m.vals.size());
+                else if (m.selected && axUnitNow.empty())
+                    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1), "x axis - needs a unit");
+                else if (m.selected)
+                    ImGui::Text("x axis in %s", axUnitNow.c_str());
+                else
+                    ImGui::TextDisabled("could be the x axis");
+            } else {
+                ImGui::TextDisabled("%s", m.becomes.c_str());
+            }
+            if (!m.why.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", m.why.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    if (axisRow >= 0) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("x axis:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+        ImGui::InputTextWithHint("##npzaxname", "name", app.npzAxisName, sizeof app.npzAxisName);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("what frame i physically IS: exposure, illuminance,\n"
+                              "elapsed time ... the key's name is only the default");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        ImGui::InputTextWithHint("##npzaxunit", "unit", app.npzAxisUnit, sizeof app.npzAxisUnit);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ms, lx, C ... NOT read from the key name: \"exposure_ms\"\n"
+                              "is a name somebody chose, not a proof of milliseconds.\n"
+                              "No unit, no axis - which is the honest answer.");
+    }
+    // one honesty line, always drawn so the footer height does not jump
+    if (axisRow >= 0 && !axisFits)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                           "no ticked stack has %d frames - the axis will not be applied",
+                           (int)app.npzPick[axisRow].vals.size());
+    else if (axisRow >= 0 && axUnitNow.empty())
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1),
+                           "the axis needs a unit - without one it is not applied "
+                           "(a unit is never assumed)");
+    else if (axisRow >= 0)
+        ImGui::TextDisabled("%d value(s) become the x axis of a %d-frame stack, exactly "
+                            "as pasted values do",
+                            (int)app.npzPick[axisRow].vals.size(),
+                            (int)app.npzPick[axisRow].vals.size());
+    else
+        ImGui::NewLine();
+    ImGui::Text("selected: %d array(s), %d frame(s)", selImages, selFrames);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("batch:");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(baseName(app.npzPickPath).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the file is the batch: everything opened from it lands\n"
+                          "under ONE heading in Files, named after the file");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(selImages == 0);
+    bool open = ImGui::Button("Load selected", ImVec2(150 * app.uiScale, 0));
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
+        app.npzPick.clear();
+        app.npzPickOpen = false;
+        app.npzPickPath.clear();
+        ImGui::CloseCurrentPopup();
+        npzPickNext();             // cancelling THIS file does not cancel the rest
+    }
+    if (open) {
+        ImGui::CloseCurrentPopup();
+        npzPickAccept();               // same call the headless selftests make
+    }
+    ImGui::EndPopup();
+}
+
 // After a single file is opened: offer (or silently start) loading its siblings.
 static void maybeOfferSequence(int imageIdx) {
     if (app.seqLoadMode == 2) return;                 // never
@@ -7542,7 +10646,7 @@ static void maybeOfferSequence(int imageIdx) {
     if ((int)files.size() < 2) return;
     if (app.seqLoadMode == 1) {                       // always
         startSequenceLoad(imageIdx, files, pattern);
-        toast("loading sequence: " + pattern + " (" + std::to_string(files.size()) + " files)");
+        toast("loading stack: " + pattern + " (" + std::to_string(files.size()) + " files)");
         return;
     }
     app.seqAskImage = imageIdx;                       // ask
@@ -7733,6 +10837,18 @@ static void openRawDialogFor(const std::string& path) {
 // time axis. Shared by the browser and anything else that builds a stack.
 // Frames need not be a strict counter pattern to stack in the order a human
 // expects - rp::naturalLess (shared with the peer) is the contract.
+//
+// THIS ONE TAKES NO SETTING, AND MUST NOT GROW ONE. The Browse listing can be
+// asked to show names in plain lexicographic order (rbNameCmp / the panel's
+// "..." menu), and the temptation is to thread that flag through to here "for
+// consistency". It is the opposite of consistent: for a STACK the order of the
+// frames is a measurement property - sigma_t, the drift, the whole temporal
+// axis are computed over the frames in the order they were stacked, so a
+// different order is a different number - while for a LISTING it is a display
+// preference, like which column you sorted by. Keeping the two comparators
+// apart is what makes it structurally impossible for a display toggle to move
+// a measurement: there is no code path from the menu item to this function.
+// (user decision, 2026-08-05: "stack を積むときは natural のみ")
 static void sortFramesNumerically(std::vector<std::string>& files) {
     std::sort(files.begin(), files.end(), rp::naturalLess);
 }
@@ -8107,6 +11223,15 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     if (!src->remoteUrl.empty() && !localUrl) { errOut = "remote-backed"; return false; }
     const std::string fpath = localUrl ? src->remoteUrl.substr(8) : src->path;
     if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
+    // PNG/JPEG stay out of the reload walk for now, BY NAME: these sources do
+    // not participate in the registry either (see the integration order in
+    // #63), and without this line their bytes would fall through to the npy
+    // decoder below and the toast would blame a "decode failure" that never
+    // happened. Re-opening the file is the working path today.
+    if (const imagefile::Backend* fmt = imagefile::forPath(fpath)) {
+        errOut = std::string(fmt->format) + " reload is not wired yet: re-open the file";
+        return false;
+    }
     std::unique_ptr<ImageDoc> nd;
     std::string err;
     if (src->rawDtype >= 0) {
@@ -8152,11 +11277,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         }
         int frames = 1;
         int64_t fs = 0;
-        // re-decode under the RECORDED axis interpretation (frameAxis), never
-        // the live global pref: these pixels were born under that decision,
-        // and `frames` below is the file's frame count under it - so the
-        // refusal message states a true count
-        nd = decodeNpyBuffer(npy, fpath, "", err, 0, frames, fs, src->frameAxis);
+        // re-decode under the RECORDED reading declaration (npyRead, §3.3),
+        // never a guess made today: these pixels were born under that
+        // declaration, and `frames` below is the file's frame count under it -
+        // so the refusal message states a true count. (A declaration the new
+        // shape cannot mean falls back to native and SAYS so - npyLayout.)
+        nd = decodeNpyBuffer(npy, fpath, "", err, 0, frames, fs, src->npyRead);
         if (nd && src->fileFrame > 0) {    // frame-axis member: decode ITS frame
             if (src->fileFrame >= frames) {
                 errOut = "file now has " + std::to_string(frames) + " frame(s); frame " +
@@ -8164,7 +11290,7 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                 return false;
             }
             nd = decodeNpyBuffer(npy, fpath, "", err, src->fileFrame, frames, fs,
-                                 src->frameAxis);
+                                 src->npyRead);
         }
         if (nd) { nd->src->mtime = st.mtime; nd->src->fsize = st.fsize; }
         // a crop made after load re-scoped this frame; the reload keeps that scope
@@ -8196,7 +11322,11 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         idNew.rawDtype = src->rawDtype; idNew.rawInterp = src->rawInterp;
         idNew.rawOffset = src->rawOffset; idNew.rawLE = src->rawLE;
         idNew.srcW = N.srcW; idNew.srcH = N.srcH;
-        idNew.frameAxis = N.frameAxis >= 0 ? N.frameAxis : src->frameAxis;
+        // the fresh decode's shape with the declaration it replayed (N.npyRead
+        // == src->npyRead: decodeNpyBuffer records what it was handed) - the
+        // key normalizes them together (npyKeyRead), so a declaration the new
+        // shape absorbed into native keys natively
+        idNew.npyShape = N.npyShape; idNew.npyRead = N.npyRead;
         idNew.mtime = N.mtime; idNew.fsize = N.fsize;
         newKey = srcIdentityKey(idNew);
     }
@@ -8219,9 +11349,10 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         src->w = N.w; src->h = N.h; src->ch = N.ch;
         src->dtype = N.dtype; src->vmin = N.vmin; src->vmax = N.vmax;
         src->srcW = N.srcW; src->srcH = N.srcH; src->cropX = N.cropX; src->cropY = N.cropY;
-        if (N.frameAxis >= 0) src->frameAxis = N.frameAxis;   // the decision, replayed
-                                                              // (or forced by a now-
-                                                              // unambiguous new shape)
+        src->npyShape = N.npyShape;   // the DISK's new shape: §3.3's menu must
+                                      // offer what the file now permits.
+                                      // npyRead stays: the declaration was
+                                      // replayed, not re-chosen.
         src->rev++;
         src->mtime = N.mtime;
         src->fsize = N.fsize;
@@ -8372,16 +11503,20 @@ static void rbWorker(App::BrowseInstance* ip) {
     App::BrowseInstance& I = *ip;
     while (!I.stop) {
         App::RbJob job;
-        bool have = false;
         {
-            std::lock_guard<std::mutex> lk(I.mtx);
-            if (!I.queue.empty()) {
-                job = std::move(I.queue.front());
-                I.queue.erase(I.queue.begin());
-                have = true;
-            }
+            std::unique_lock<std::mutex> lk(I.mtx);
+            I.cv.wait(lk, [&I] { return !I.queue.empty() || I.stop; });
+            // Stop wins over pending work - see the same line in rfWorker. It
+            // matters more here: the extra job can be a connect to a host that
+            // has no peer installed, which falls into deployPeer, which takes no
+            // abort pointer and which the comment there calls minutes of ssh.
+            // Quitting, or closing the panel, would freeze for that long with no
+            // window drawn. Session::setAbort cannot help - it only gates the
+            // read loop.
+            if (I.stop) break;
+            job = std::move(I.queue.front());
+            I.queue.erase(I.queue.begin());
         }
-        if (!have) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
         I.busy = true;
         App::RbResult r;
         r.kind = job.kind;
@@ -8493,6 +11628,7 @@ static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
         std::lock_guard<std::mutex> lk(I.mtx);
         I.queue.push_back(std::move(job));
     }
+    I.cv.notify_one();
     if (!I.thread.joinable()) I.thread = std::thread(rbWorker, &I);
 }
 
@@ -8500,7 +11636,11 @@ static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
 // this thread is the Session's only toucher, so letting the unique_ptr destroy
 // it later is single-threaded by construction.
 static void rbStopWorkerOf(App::BrowseInstance& I) {
-    I.stop = true;
+    {
+        std::lock_guard<std::mutex> lk(I.mtx);
+        I.stop = true;
+    }
+    I.cv.notify_all();
     if (I.thread.joinable()) I.thread.join();
 }
 static void stopRbWorker() {          // shutdown: every instance's worker
@@ -8868,15 +12008,45 @@ static void pumpRemoteOpenQueue() {
 // File > Start Remote: connect (installing the peer if needed), then browse -
 // in the given instance. Everything slow happens on the instance's worker;
 // this returns immediately.
-static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
-    std::string host = hostSpec, dir = "~";
-    int port = 0;
+// Where a spec points, without connecting to it. startRemote used to be the only
+// thing that knew, which is why the caller could not tell whether it was about to
+// replace the panel the user was reading.
+static void rbParseSpec(const std::string& hostSpec, std::string& host, int& port,
+                        std::string& dir) {
+    host = hostSpec; dir = "~"; port = 0;
     // accept a full url here too, so a pasted path still works
     if (hostSpec.find("://") != std::string::npos || hostSpec.find(':') != std::string::npos) {
         std::string h, p;
         if (remote::parseUrl(hostSpec, h, p, &port)) { host = h; dir = p; }
     }
     while (host.size() > 1 && host.back() == '/') host.pop_back();
+}
+
+// Which panel a new place should land in. Connecting somewhere else must NOT
+// take over the panel already showing something: Browse is instanced exactly so
+// a local listing and a machine can sit side by side, and startRemote clears the
+// instance it is given, so reusing the active one made the local view disappear
+// - which reads as the panel having closed (user report, 2026-08-04).
+//
+// Reuse when there is nothing to lose (never connected) or when it is the same
+// place (reconnect, not a second window). Otherwise: a panel already on that
+// place if there is one, else a new one.
+static App::BrowseInstance& rbInstanceFor(const std::string& hostSpec) {
+    std::string host, dir;
+    int port = 0;
+    rbParseSpec(hostSpec, host, port, dir);
+    App::BrowseInstance& cur = rbActive();
+    if (!cur.b.connected && cur.b.host.empty() && cur.b.dir == "~") return cur;
+    if (cur.b.host == host && cur.b.port == port) return cur;
+    for (auto& p : app.browsePanels)
+        if (p->b.connected && p->b.host == host && p->b.port == port) return *p;
+    return rbNewInstance();
+}
+
+static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
+    std::string host, dir;
+    int port = 0;
+    rbParseSpec(hostSpec, host, port, dir);
     if (dir.size() > 4 && isNpyName(dir)) {          // a pasted file path: open it
         size_t s = dir.find_last_of('/');
         std::string parent = s == std::string::npos ? "~" : dir.substr(0, s);
@@ -8959,11 +12129,66 @@ static void stepPreviewFrame(int delta) {
         for (const auto& d : app.images)
             if (d->uid == app.previewUid && d->preview) {
                 std::string url = d->src->remoteUrl;   // openRemote frees the doc
-                openRemote(url, true, want);
+                // Same guard the file-stack branch above carries. openRemote
+                // calls dropPreview() before it can fail, so a discarded return
+                // leaves previewIndex and previewFrames describing a preview
+                // that is no longer there - and the scrub bar keeps re-running
+                // the failing open, one toast per press.
+                if (!openRemote(url, true, want)) {
+                    app.previewIndex = 0;
+                    app.previewFrames = 0;
+                }
                 return;
             }
     }
 }
+
+// ---- TIME THE USER DID NOT GET BACK ---------------------------------------
+// A remote open BLOCKS the UI thread: ensureUiSession may start a whole peer,
+// and meta+tile are round trips read to completion inside the frame ("the
+// window is not repainting while this session reads", ensureUiSession). Nothing
+// is drawn and no input is processed for as long as that takes.
+//
+// ImGui decides whether a press is the second half of a double-click by
+// comparing g.Time against the previous press - and g.Time advances by the REAL
+// duration of every frame, blocked or not (UpdateMouseInputs: is_repeated_click
+// needs g.Time - MouseClickedTime < MouseDoubleClickTime, 0.30 s by default).
+// So a first click that fetches something spends, from its own frame, the whole
+// window its second click needs to arrive in.
+//
+// That is the report「ダブルクリックすると一回目はダブルクリック判定されずに
+// previewで表示されてしまう」. Click one previews (that is its job); click two
+// is handed to ImGui a second later, counts as a FIRST click, so
+// IsMouseDoubleClicked is false, rbOpenRow never runs, and what stays on screen
+// is the preview - the Open silently missing. Measured on a peer answering
+// meta/tile with 400 ms of latency: press one at t=0.794, press two seen at
+// t=1.740, MouseClickedCount 1 - and the same gesture against the same peer
+// with no latency reports count 2 and opens the file.
+//
+// The user pressed twice in their own time; the clock ran in ours. So the time
+// the UI thread spends BLOCKED is given back to every button's click clock -
+// the interval is measured in time the user could actually see and act in.
+// MouseClickedPos is deliberately untouched: a click that moved still starts a
+// new gesture, and the pointer is the half of the rule that stayed honest.
+//
+// It cannot manufacture a double-click out of two separate ones: after the
+// credit the clock runs normally again, so a second click that really arrives
+// seconds later is still seconds later.
+struct UiThreadStall {
+    double t0 = nowSec();
+    static int depth;
+    UiThreadStall() { depth++; }
+    ~UiThreadStall() {
+        double d = nowSec() - t0;
+        if (--depth != 0 || d <= 0 || !ImGui::GetCurrentContext()) return;
+        ImGuiIO& io = ImGui::GetIO();
+        for (int i = 0; i < IM_ARRAYSIZE(io.MouseClickedTime); i++) {
+            io.MouseClickedTime[i] += d;
+            io.MouseReleasedTime[i] += d;
+        }
+    }
+};
+int UiThreadStall::depth = 0;
 
 // Returns false when nothing was opened. It has four failure returns AFTER
 // dropPreview() has already cleared the preview state, and its callers used to
@@ -8972,6 +12197,7 @@ static void stepPreviewFrame(int delta) {
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
 static bool openRemote(const std::string& url, bool asPreview, int frame) {
+    UiThreadStall stallCredit;      // see above: a blocked frame is not the user's
     std::string host, rpath;
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) {
@@ -9010,8 +12236,21 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     S.dtype = dt;
     S.w = tw; S.h = th; S.ch = tch;
     S.data = std::move(px);
-    doc->note = "remote " + host + "  -  " + std::to_string(m.w) + "x" + std::to_string(m.h) +
-                (m.frames > 1 ? "  " + std::to_string(m.frames) + " frames" : "");
+    // The Inspector prints a non-empty note as a LINE OF ITS OWN, directly above
+    // the Interpret combo. A note the head frame carries and its siblings do not
+    // makes that line appear and vanish as the user steps the stack, and every
+    // control under it moves - so the note has to be stack-constant, exactly as
+    // derived stacks decided it (materializeDerivedFrame: "the SAME note on every
+    // frame"). The sibling frames are minted by pumpRemoteFetch, so this string
+    // travels to them through RFetchJob::note.
+    // Two things are deliberately NOT in it. The SIZE: the row immediately above
+    // already prints "%dx%d %dch %s", and docs/todo-open.md item 11 asked for the
+    // duplicate to go. The HOST when there is none: a local:// peer serves files
+    // off this disk and was not fetched "from" anywhere, which is the same call
+    // the "opened X" toast at the end of this function makes.
+    doc->note = "remote";
+    if (!host.empty()) doc->note += " " + host;
+    if (m.frames > 1) doc->note += "  -  " + std::to_string(m.frames) + " frames";
     doc->uid = app.nextUid++;
     S.remoteUrl = url;
     S.remoteFrame = frame;
@@ -9107,6 +12346,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             App::RFetchJob j;
             j.url = url;
             j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.note = first->note;     // one note, every frame: see where it is built
             j.frame = i;
             j.seqId = si.id;
             j.seqIndex = i;
@@ -9117,7 +12357,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             char msg[160];
             snprintf(msg, sizeof msg,
                      "memory budget: fetching %d of %d frames\n"
-                     "(File > Sequence loading > Memory budget)", fit + 1, m.frames);
+                     "(File > Stack loading > Memory budget)", fit + 1, m.frames);
             app.seqNote = msg;
         }
     }
@@ -9175,6 +12415,8 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         App::RFetchJob j;
         j.url = makeRemoteUrl(host, files[i], port);
         j.name = baseName(files[i]);
+        j.note = first->note;         // every file of the folder came from the same
+                                      // peer, so they say so identically or not at all
         j.seqId = si.id;
         j.seqIndex = i;
         j.bytes = perFrame;
@@ -9184,9 +12426,37 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         char msg[160];
         snprintf(msg, sizeof msg,
                  "memory budget: fetching %d of %d frames\n"
-                 "(File > Sequence loading > Memory budget)", fit + 1, (int)files.size());
+                 "(File > Stack loading > Memory budget)", fit + 1, (int)files.size());
         app.seqNote = msg;
     }
+}
+
+static void requestStackAverage(int seqId);   // fwd: needs computeStackStats, defined below
+// "Open as frame average" from Browse: open the stack exactly as "Open as
+// stack" does, and park the mean until its frames are here. Browse opens are
+// asynchronous by design (first frame now, the rest in the background), so
+// there is no seqId to hand back at click time and nothing to average yet.
+//
+// The stack really is OPENED - this is not a way of computing a mean without
+// paying for the frames. It cannot be: the mean is over the pixels, so the
+// pixels have to arrive. What the user gets is both, which is also what makes
+// the result checkable against its own source.
+static void openStackForAverage(const std::string& host, const std::vector<std::string>& files,
+                                const std::string& name, int port = 0) {
+    if (files.empty()) return;
+    const int firstNewSeq = app.nextSeqId;
+    openRemoteStack(host, files, name, port);
+    int got = 0;
+    for (const auto& s : app.seqs)
+        if (s.id >= firstNewSeq) { got = s.id; break; }
+    // ...or an existing stack was reused: openRemote builds the SeqInfo itself
+    // for a frame-axis file, and takes an early return through openRemoteStack.
+    if (!got && !app.images.empty()) got = app.images.back()->seqId;
+    if (!got) {
+        toast("frame average: that did not open as a stack (a mean needs a time axis)", true);
+        return;
+    }
+    requestStackAverage(got);
 }
 
 // A preview becomes a registered open the moment it is USED: double-click,
@@ -9256,6 +12526,8 @@ static void promotePreview(ImageDoc* d) {
             App::RFetchJob j;
             j.url = d->src->remoteUrl;
             j.name = baseName(rpath) + " #" + std::to_string(i);
+            j.note = d->note;         // promoting a preview mints the same stack the
+                                      // other two paths do, and it says the same thing
             j.seqId = si.id;
             j.seqIndex = i;
             j.frame = i;
@@ -9275,9 +12547,27 @@ static void openPath(const std::string& path) {
         // File > Start Remote does - which is what a desktop shortcut to a
         // machine passes, and what a half-remembered path pasted on the command
         // line usually is. startRemote keeps the ssh handshake off this thread.
-        if (isNpyName(path)) openRemote(path);
-        else                 startRemote(rbActive(), path);
+        if (isNpyName(path)) {
+            openRemote(path);
+        } else {
+            App::BrowseInstance& I = rbInstanceFor(path);   // never take an open listing
+            startRemote(I, path);
+            rbShowInstance(I);
+        }
         return;
+    }
+    // §4.12: a reader chosen for this path earlier is applied again, before the
+    // extension is consulted at all - that is the point of remembering, and it
+    // is what lets a .dat or a folder open at all. It is a RECORD OF A CHOICE,
+    // never a discovery: nothing puts an entry here except the user picking one.
+    {
+        std::string spec = readerFor(path);
+        if (!spec.empty()) {
+            std::string err = openWithReader(path, spec);
+            if (err.empty()) return;
+            toast(baseName(path) + " via " + spec + ": " + err, true);
+            return;
+        }
     }
     std::string low = path;
     std::transform(low.begin(), low.end(), low.begin(),
@@ -9288,16 +12578,30 @@ static void openPath(const std::string& path) {
     };
     if (ends(".npy")) {
         std::string err = loadNpy(path);
-        if (!err.empty()) toast(baseName(path) + ": " + err, true);
+        // §3.2's third line, attached: the refusal that named the shape is the
+        // same place the way out is offered. Nothing runs yet - the picker is a
+        // question, and only what the user then chooses is ever executed.
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
         else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
     } else if (ends(".npz")) {
+        // loadNpz says what it did (or raises the member picker, which says it
+        // after): a blanket "loaded x.npz" over a dialog would be a lie about
+        // both what happened and when
         std::string err = loadNpz(path);
-        if (!err.empty()) toast(baseName(path) + ": " + err, true);
-        else toast("loaded " + baseName(path));
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else toast("session restored: " + baseName(path));
+    } else if (imagefile::forPath(path)) {
+        // PNG / JPEG / TIFF. The extension only chooses this door; what decodes
+        // is decided by the bytes behind it. A format that is listed but has no
+        // decoder in this build (TIFF) refuses HERE, by name and with a reason,
+        // instead of falling through to the raw dialog and asking a user who
+        // opened a .tif to type in its width.
+        std::string err = loadImageFile(path);
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+        else toast("loaded " + baseName(path));
     } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
         openFolder(path);                     // dropping a folder loads every stack below it
     } else {
@@ -9311,8 +12615,13 @@ static void openFileDialog() {
         return;
     }
     if (app.openDlg) return;             // one dialog at a time
+    // The picture formats come from the format table rather than from a literal
+    // here, so a format gained or lost in core/imagefile.cpp cannot leave the
+    // dialog offering (or hiding) something the viewer no longer does.
+    const std::string media = imagefile::dialogPattern();
+    const std::string pat = "*.npy *.npz *.bin *.raw *.yuv *.dat " + media;
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (*.npy *.npz *.bin *.raw *.yuv *.dat)", "*.npy *.npz *.bin *.raw *.yuv *.dat",
+        std::vector<std::string>{ "Images (" + pat + ")", pat,
           "Session (*.vsession)", "*.vsession",
           "All files", "*" },
         pfd::opt::multiselect);
@@ -9324,7 +12633,7 @@ static void openFolderDialog() {
     }
     if (app.folderDlg) return;
     app.folderDlgMode = 0;
-    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all sequences below it)");
+    app.folderDlg = std::make_unique<pfd::select_folder>("Open folder (all stacks below it)");
 }
 // The dialog's mode-1 action, shared with --localbrowse-selftest: the picked
 // folder opens in the Browse panel through the LOCAL peer - the same listing,
@@ -9333,9 +12642,10 @@ static void browseLocalFolder(std::string p) {
     if (p.empty()) return;
     std::replace(p.begin(), p.end(), '\\', '/');
     while (p.size() > 1 && p.back() == '/') p.pop_back();
-    // the folder lands in the instance the user last worked in - with one
-    // panel open that is exactly the old behaviour
-    App::BrowseInstance& I = rbActive();
+    // Same rule as connecting to a machine: land in the active panel when it
+    // has nothing to lose or is already here, and in its own panel otherwise.
+    // With one panel open that is exactly the old behaviour.
+    App::BrowseInstance& I = rbInstanceFor("local://" + p);
     startRemote(I, "local://" + p);
     rbShowInstance(I);
 }
@@ -9404,6 +12714,30 @@ static void pollFileDialog() {           // called once per frame from the main 
             if (app.folderDlgMode == 1) browseLocalFolder(p);   // Browse panel
             else openFolder(p);                                 // load stacks
         }
+    }
+    if (app.rdOpenDlg && app.rdOpenDlg->ready(0)) {
+        std::vector<std::string> sel = app.rdOpenDlg->result();
+        int mode = app.rdOpenMode;
+        app.rdOpenDlg.reset();
+        if (!sel.empty()) {
+            if (mode == 1) openReaderPicker(sel[0], "");
+            else snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", sel[0].c_str());
+        }
+    }
+    if (app.rdFolderDlg && app.rdFolderDlg->ready(0)) {
+        std::string d = app.rdFolderDlg->result();
+        int mode = app.rdFolderMode;
+        app.rdFolderDlg.reset();
+        if (!d.empty()) {
+            if (mode == 1) openReaderPicker(d, "");
+            else { snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", d.c_str());
+                   savePrefs(); }
+        }
+    }
+    if (app.rdNewDlg && app.rdNewDlg->ready(0)) {
+        std::string dest = app.rdNewDlg->result();
+        app.rdNewDlg.reset();
+        newReaderFrom(dest);
     }
 }
 
@@ -9643,9 +12977,11 @@ static std::vector<TileSlot> tileSlots() {
     out.push_back({ a, "A", false });
     ImageDoc* b = cmpB();                      // sets g_abFollowDiverged
     if (b) out.push_back({ b, "B", g_abFollowDiverged });
+    // One pane per LETTER, not per document. Two letters resolving to one
+    // document get two panes showing the same pixels - which is the point:
+    // side by side is where you SEE that they coincide.
     for (const ResolvedSlot& rs : resolveSlots())
-        if (rs.doc != b)                       // one image, one pane
-            out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
+        out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
     return out;
 }
 // Tiling engages only when there is a third slot to show, and ONLY in Split -
@@ -9672,6 +13008,15 @@ static float g_tileCanvasW = 0;    // what it had to work with, when it refused
 // Same reasoning as g_tilePanesDrawn: this machine cannot screenshot GL, so
 // --tile-selftest T12 asserts the composition as state.
 static std::string g_paneBadgeProbe;
+// What the footer strip under the canvas ACTUALLY said on the last frame
+// drawCanvas drew: "ctx=<batch  >  series>;zoom=<zoom NN%>;name=<file>;count=
+// <n/N>;", empty when there was no image and so no strip. Same reasoning as
+// g_paneBadgeProbe, and the same rule: it records the STRINGS that went to
+// AddText, not the numbers they were built from - the zoom readout has two
+// formats and the one it chose is the thing worth asserting, which a test
+// re-deriving "zoom * 100" would never see. (docs/verify-ui.md E3: the row was
+// moved out of the A section precisely because nothing here was observable.)
+static std::string g_footerProbe;
 static std::string elideFront(const std::string& s, size_t keep);   // fwd
 // The batch a document belongs to - the context line of the two-line identity
 // (the footer already leads with it; the pane badges follow the same rule).
@@ -9682,6 +13027,7 @@ static std::string batchNameOf(const ImageDoc* d) {
 
 static void drawCanvas(ImVec2 avail) {
     g_paneBadgeProbe.clear();
+    g_footerProbe.clear();
     // DPI/font-aware ruler geometry (fixed px constants break on 150-200% Windows scaling)
     const float s = app.uiScale;
     const float RULER_H = ImGui::GetFontSize() + 5.0f * s;
@@ -10338,16 +13684,13 @@ static void drawCanvas(ImVec2 avail) {
                                           IM_COL32(60, 66, 74, 255));
                 }
             } else if (!imB) {
-                // compare is on but B is gone (closed, renamed, never picked)
-                // - or A is STANDING on the pinned B, which pauses the pair
-                // (resolveB answers null, correctly) and used to render exactly
-                // like compare-off: the user read it as leaving the comparison.
+                // compare is on but B is gone (closed, renamed, never picked).
+                // A standing on the pinned B used to land here too, under an
+                // "A = B (paused)" banner; it now resolves as an ordinary B and
+                // draws as one, so the only case left is the honest absence.
                 if (app.compareMode != App::CmpOff) {
-                    const bool paused = app.compareBUid && im &&
-                                        im->uid == app.compareBUid;
-                    const char* msg = paused
-                        ? "A = B (paused): this IS the pinned B - move A, or Shift+\\ swaps"
-                        : "compare is on, but no B image - View > Compare A/B > B image";
+                    const char* msg =
+                        "compare is on, but no B image - View > Compare A/B > B image";
                     ImVec2 ts = ImGui::CalcTextSize(msg);
                     float y = canvasP0.y + 6 * s;
                     dl->AddRectFilled(ImVec2(canvasP0.x + 6 * s, y),
@@ -10600,6 +13943,10 @@ static void drawCanvas(ImVec2 avail) {
             dl->AddText(ImVec2(canvasP0.x, topY), IM_COL32(140, 148, 156, 190), ctx);
             dl->PopClipRect();
         }
+        // ...and as state a selftest can read: the context line is written down
+        // whether or not it was drawn, because "no batch, so no context line"
+        // is itself part of what the strip said.
+        g_footerProbe += std::string("ctx=") + ctx + ";";
         {   // zoom, right end of the context line (C3): the magnification is a
             // property of the pixels being judged, so it lives beside them.
             // Moved here FROM the status bar, not duplicated.
@@ -10608,19 +13955,31 @@ static void drawCanvas(ImVec2 avail) {
             else                         snprintf(zs, sizeof zs, "zoom %.3g%%", app.view.zoom * 100);
             ImVec2 zts = ImGui::CalcTextSize(zs);
             dl->AddText(ImVec2(canvasP1.x - zts.x, topY), IM_COL32(140, 148, 156, 190), zs);
+            g_footerProbe += std::string("zoom=") + zs + ";";
         }
         ImVec2 ts = ImGui::CalcTextSize(name);
         float nameW = std::min(ts.x, canvasSize.x * 0.45f);
         dl->PushClipRect(ImVec2(canvasP0.x, botY), ImVec2(canvasP0.x + nameW, botY + lh), true);
         dl->AddText(ImVec2(canvasP0.x, botY), IM_COL32(175, 183, 191, 200), name);
         dl->PopClipRect();
+        g_footerProbe += std::string("name=") + name + ";";
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
-            char cnt[32];
-            snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
+            // n/N, not n/n. fr.size() is what is RESIDENT; a stack still
+            // loading has fewer frames here than it will have, and printing the
+            // resident count as the total states a stack size that is not true
+            // (docs/terminology.md - a partial load says n/N). The Files rows
+            // already say "8/24f"; this said "3/8" and looked complete.
+            char cnt[48];
+            int expF = si->expectedFrames;
+            if (expF > (int)fr.size())
+                snprintf(cnt, sizeof cnt, "%d/%d of %d", pos + 1, (int)fr.size(), expF);
+            else
+                snprintf(cnt, sizeof cnt, "%d/%d", pos + 1, (int)fr.size());
             ImVec2 cs = ImGui::CalcTextSize(cnt);
             dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
+            g_footerProbe += std::string("count=") + cnt + ";";
             float barH = 5.0f * s;
             ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
             ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
@@ -10629,17 +13988,124 @@ static void drawCanvas(ImVec2 avail) {
                 ImGui::InvisibleButton("scrub", ImVec2(b1.x - b0.x, lh));
                 bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
                 int alpha = sh || sa ? 235 : 150;
+                // The bar spans the stack's TRUE length, not the part of it
+                // that happens to be resident: a 24-frame stack with 8 loaded
+                // used to draw a full bar, so the missing 16 were invisible and
+                // the handle sat at the end of a stack that had barely started.
+                // Three states, and the middle one is the point of the design:
+                //   resident  - the frame is here and can be shown
+                //   loading   - this stack is being read right now
+                //   absent    - not here, and nothing is fetching it
+                int total = std::max((int)fr.size(), si->expectedFrames);
+                bool loadingThis = app.seqRunning && app.seqLoadingId == si->id;
                 dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
-                float fx = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
-                dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha), barH * 0.5f);
+                if (total > (int)fr.size()) {
+                    // Where the resident frames actually ARE, one mark per
+                    // ordinal. Drawn from seqIndex, so a stack that arrived out
+                    // of order says so instead of pretending to be a prefix.
+                    float w = (b1.x - b0.x) / (float)total;
+                    for (int k = 0; k < (int)fr.size(); k++) {
+                        int ord = app.images[fr[k]]->seqIndex;
+                        if (ord < 0 || ord >= total) continue;
+                        float x0 = b0.x + w * (float)ord;
+                        dl->AddRectFilled(ImVec2(x0, b0.y), ImVec2(x0 + std::max(w, 1.0f), b1.y),
+                                          IM_COL32(110, 160, 210, alpha));
+                    }
+                    if (loadingThis) {   // the tail still coming, dimmer than resident
+                        float x0 = b0.x + w * (float)fr.size();
+                        dl->AddRectFilled(ImVec2(x0, b0.y), ImVec2(b1.x, b1.y),
+                                          IM_COL32(110, 160, 210, 70));
+                    }
+                } else {
+                    float fx0 = b0.x + (b1.x - b0.x) * ((float)pos / (float)(fr.size() - 1));
+                    dl->AddRectFilled(b0, ImVec2(fx0, b1.y), IM_COL32(110, 160, 210, alpha),
+                                      barH * 0.5f);
+                }
+                int curOrd = total > (int)fr.size() ? app.images[fr[pos]]->seqIndex : pos;
+                float fx = b0.x + (b1.x - b0.x) *
+                           (total > 1 ? (float)curOrd / (float)(total - 1) : 0.0f);
                 dl->AddCircleFilled(ImVec2(fx, botY + lh * 0.5f), barH * (sh || sa ? 1.4f : 1.0f),
                                     IM_COL32(160, 200, 240, alpha));
                 if (sa) {
                     float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
-                    int want = (int)(t * (float)(fr.size() - 1) + 0.5f);
-                    if (want != pos) selectImage(fr[want]);
+                    // Land on the nearest frame that is HERE. Dragging over a
+                    // gap leaves the picture and the number where they are:
+                    // there is no image to show for an ordinal we do not have,
+                    // and a number that moves without the picture moving is the
+                    // one thing this bar must not do.
+                    int wantOrd = (int)(t * (float)(total - 1) + 0.5f);
+                    int best = pos, bestD = INT_MAX;
+                    for (int k = 0; k < (int)fr.size(); k++) {
+                        int ord = total > (int)fr.size() ? app.images[fr[k]]->seqIndex : k;
+                        int d = std::abs(ord - wantOrd);
+                        if (d < bestD) { bestD = d; best = k; }
+                    }
+                    if (best != pos) selectImage(fr[best]);
                 }
-                if (sh) ImGui::SetTooltip("frame %d / %d  (drag; . and , step)", pos + 1, (int)fr.size());
+                // The keys named here are the ones that work HERE. It used to
+                // say ". and ," - those step the Browse panel's preview, and
+                // have never done anything in this view. Left/Right is what
+                // gotoFrame is bound to.
+                if (sh) {
+                    if (total > (int)fr.size())
+                        ImGui::SetTooltip("frame %d of %d\n"
+                                          "%d loaded - the bar spans all %d, and the gaps "
+                                          "are frames that are not here%s\n"
+                                          "dragging lands on the nearest loaded frame; "
+                                          "Left / Right step",
+                                          curOrd + 1, total, (int)fr.size(), total,
+                                          loadingThis ? " yet (still loading)" : "");
+                    else
+                        ImGui::SetTooltip("frame %d / %d  (drag, or Left / Right)",
+                                          pos + 1, (int)fr.size());
+                }
+            }
+        }
+        // ---- the same bar, for a preview ------------------------------------
+        // A preview is one throwaway doc with seqId 0, so the branch above never
+        // ran for it and the stepping lived in the Browse panel instead: a
+        // second frame-stepping row on screen, under the list rather than under
+        // the picture it steps. The control belongs where the pixels are.
+        //
+        // previewFiles = a stack of numbered files, previewFrames = one file
+        // with a frame axis. Either way the bar walks it one fetched frame at a
+        // time, which is why it steps rather than jumping: each position is a
+        // fetch, and stepPreviewFrame is the one place that knows how.
+        else if (im->preview) {
+            int pvN = app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
+                                                   : app.previewFrames;
+            if (pvN >= 2) {
+                char cnt[48];
+                snprintf(cnt, sizeof cnt, "%d/%d", app.previewIndex + 1, pvN);
+                ImVec2 cs = ImGui::CalcTextSize(cnt);
+                dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
+                g_footerProbe += std::string("previewcount=") + cnt + ";";
+                float barH = 5.0f * s;
+                ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
+                ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
+                if (b1.x > b0.x + 40 * s) {
+                    ImGui::SetCursorScreenPos(ImVec2(b0.x, botY));
+                    ImGui::InvisibleButton("pvscrub", ImVec2(b1.x - b0.x, lh));
+                    bool sh = ImGui::IsItemHovered(), sa = ImGui::IsItemActive();
+                    int alpha = sh || sa ? 235 : 150;
+                    dl->AddRectFilled(b0, b1, IM_COL32(120, 130, 140, 60), barH * 0.5f);
+                    float fx = b0.x + (b1.x - b0.x) *
+                               ((float)app.previewIndex / (float)(pvN - 1));
+                    dl->AddRectFilled(b0, ImVec2(fx, b1.y), IM_COL32(110, 160, 210, alpha),
+                                      barH * 0.5f);
+                    dl->AddCircleFilled(ImVec2(fx, botY + lh * 0.5f),
+                                        barH * (sh || sa ? 1.4f : 1.0f),
+                                        IM_COL32(160, 200, 240, alpha));
+                    if (sa) {
+                        float t = std::clamp((io.MousePos.x - b0.x) / (b1.x - b0.x), 0.0f, 1.0f);
+                        int want = (int)(t * (float)(pvN - 1) + 0.5f);
+                        if (want != app.previewIndex) stepPreviewFrame(want - app.previewIndex);
+                    }
+                    if (sh)
+                        ImGui::SetTooltip("previewing %s\n%d / %d  (drag, or , and .)\n"
+                                          "double-click the row in Browse to open it for real",
+                                          app.previewLabel.c_str(), app.previewIndex + 1, pvN);
+                }
             }
         }
     }
@@ -10842,9 +14308,28 @@ static std::string abDocLabel(const ImageDoc* d) {
 }
 
 static void fmtTick(char* buf, size_t n, double v, bool integer) {
-    if (integer) snprintf(buf, n, "%.0f", v);
-    else if (v != 0 && (fabs(v) >= 1e5 || fabs(v) < 1e-3)) snprintf(buf, n, "%.2e", v);
-    else snprintf(buf, n, "%.4g", v);
+    if (integer) { snprintf(buf, n, "%.0f", v); return; }
+    // Axis labels are read at a glance, and C's scientific notation makes an
+    // ordinary sensor value look like an implementation detail: "2e+04" for
+    // 20000 DN. It is worst on log paper, where several of them sit in a
+    // column. Keep the significand and say the scale once, with the prefix the
+    // reader already uses for it.
+    //
+    // The ladder is closed at both ends on purpose. A suffix is only a
+    // shorthand while the reader knows it, so it stops at G and at n; outside
+    // that, e-notation is the honest form. Leaving the small end open lets
+    // 1e-15 print as "1e-06n", which is neither.
+    const double a = fabs(v);
+    double scale = 1.0;
+    const char* suffix = "";
+    if      (a >= 1e9  && a < 1e12) { scale = 1e9;  suffix = "G"; }
+    else if (a >= 1e6  && a < 1e9 ) { scale = 1e6;  suffix = "M"; }
+    else if (a >= 1e3  && a < 1e6 ) { scale = 1e3;  suffix = "k"; }
+    else if (a >= 1e-6 && a < 1e-3) { scale = 1e-6; suffix = "u"; }
+    else if (a >= 1e-9 && a < 1e-6) { scale = 1e-9; suffix = "n"; }
+    if (*suffix)                            snprintf(buf, n, "%.4g%s", v / scale, suffix);
+    else if (a != 0 && (a >= 1e12 || a < 1e-9)) snprintf(buf, n, "%.2e", v);
+    else                                    snprintf(buf, n, "%.4g", v);
 }
 
 // xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
@@ -10990,6 +14475,67 @@ static void drawABLegendRow(const std::string& aName, const std::string& bName,
     ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x,
                         one ? ImGui::GetTextLineHeight()
                             : ImGui::GetTextLineHeight() + lineAdvance));
+}
+
+// The ink each compare slot is stroked in when they share one plot - Temporal's
+// chart and the Histogram overlay both. A, B and
+// the extras are SLOTS, not CFA planes, so hue is free here - the iron rule is
+// about mixing planes inside a statistic, and the per-frame mean is a pooled
+// level that says so on its axis. A keeps the neutral green every plot draws
+// in and B keeps the blue the shared legend flies, so nothing that already
+// reads as A or B changes colour when a C appears.
+static ImU32 slotInk(size_t i) {
+    static const ImU32 INK[] = {
+        IM_COL32(105, 220, 130, 255),   // A
+        IM_COL32(120, 190, 255, 230),   // B - AB_B_INK
+        IM_COL32(245, 170,  90, 255),   // C
+        IM_COL32(205, 140, 245, 255),   // D
+        IM_COL32(235, 225, 110, 255),   // E
+        IM_COL32(120, 225, 225, 255),   // F
+        IM_COL32(245, 130, 160, 255),   // G
+    };
+    return INK[i % (sizeof INK / sizeof INK[0])];
+}
+// How many slots the palette can tell APART. The modulo above wraps, so slot H
+// comes back in A's green: two curves the same colour on one chart is the panel
+// omitting a slot again, this time behind a colour instead of an array bound.
+// A caller that overlays slots must cap at this and SAY which letters it left
+// off - never draw past it and let the wrap do the lying.
+static size_t slotInkCount() { return 7; }
+
+// The Temporal chart's legend. drawABLegendRow knows exactly two slots; this
+// one takes as many as the compare slots hold and WRAPS, because C/D/E push a
+// single row off the panel. Measuring and drawing are the same code (draw=false
+// only skips the ink), so the height reserved for the plot above is the height
+// the legend actually takes and adding a slot never moves the plot out from
+// under the cursor.
+struct SlotLegendEntry { std::string text; ImU32 ink; };
+static float slotLegendRow(const std::vector<SlotLegendEntry>& e, bool draw) {
+    if (e.empty()) return 0.0f;
+    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
+    const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
+    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImU32 txt = IM_COL32(215, 222, 228, 255);
+    float x = 0;
+    int row = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        float w = sw + gap + ImGui::CalcTextSize(e[i].text.c_str()).x;
+        if (i && x + sep + w > availW) { row++; x = 0; }
+        else if (i) x += sep;
+        if (draw) {
+            float ex = p.x + x, ey = p.y + row * adv;
+            dl->AddLine(ImVec2(ex, ey + fh * 0.5f), ImVec2(ex + sw, ey + fh * 0.5f),
+                        e[i].ink, 1.6f);
+            dl->AddText(ImVec2(ex + sw + gap, ey), txt, e[i].text.c_str());
+        }
+        x += w;
+    }
+    float h = (row + 1) * adv;
+    // consume exactly h (ImGui adds one ItemSpacing after the Dummy)
+    if (draw) ImGui::Dummy(ImVec2(availW, std::max(h - ImGui::GetStyle().ItemSpacing.y, 1.0f)));
+    return h;
 }
 
 // The heading strip over one half of a side-by-side pair. Neutral colour: which
@@ -11194,6 +14740,22 @@ static void textNumStr(const std::string& s) {
 // content width for a full-precision number; the table adds CellPadding itself
 static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x; }
 
+// What the channels of a ch-channel document are CALLED, at least four entries
+// long whatever ch is, so a caller that indexes 0..3 cannot walk off it.
+//
+// 2ch is usually UV, or a complex pair, and almost never RG - so it is C0/C1
+// rather than the first two of R/G/B/A. That branch was written long ago and
+// was UNREACHABLE for a local .npy until issue #71: (H,W,2) was read as a
+// stack of 1-channel frames, so nothing ever arrived here with ch == 2. Lifted
+// out of drawInspector() so the selftest can assert it is reached now, instead
+// of the rule change quietly landing on a branch nobody has ever seen run.
+static const char* const* channelLabels(int ch) {
+    static const char* const LB1[] = { "V",  "?",  "?", "?" };
+    static const char* const LB2[] = { "C0", "C1", "?", "?" };
+    static const char* const LB3[] = { "R",  "G",  "B", "A" };
+    return ch == 1 ? LB1 : ch == 2 ? LB2 : LB3;
+}
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::SeparatorText("Pixel");
@@ -11209,11 +14771,8 @@ static void drawInspector() {
             ImGui::Text("(%d, %d)", app.hoverX, app.hoverY);
         else
             ImGui::TextDisabled("(-, -)  hover the image");
-        static const char* LB1[] = { "V" };
-        static const char* LB2[] = { "C0", "C1" };            // 2ch is usually UV/complex, not RG
-        static const char* LB3[] = { "R", "G", "B", "A" };
         int nch = im ? im->ch : 1;
-        const char** lb = nch == 1 ? LB1 : nch == 2 ? LB2 : LB3;
+        const char* const* lb = channelLabels(nch);
         float inv = im ? 1.0f / std::max(effWhite(*im) - effBlack(*im), 1e-20f) : 1.0f;
         // With compare on, the same pixel in B (and A-B) is the number the eye
         // cannot read off a wipe: two extra columns, present whenever compare is.
@@ -11281,9 +14840,14 @@ static void drawInspector() {
                 // be the stretch. When it is off, SAY the numbers differ - that
                 // is the case where a reading can mislead.
                 ImGui::SetNextItemWidth(-1);
+                // "both" and "B uses" were true when the comparison was a
+                // pair. The RULE was always N-wide (abRange spans every
+                // compared pane), so at three slots the labels lied about
+                // arity - issue #60 named this one by name. "every side" is
+                // the noun the panels already use, and it is true at two.
                 static const char* AB_RANGE_ITEMS[3] = {
-                    "A/B: each keeps its own", "A/B: B uses A's range",
-                    "A/B: auto over both (union)" };
+                    "A/B: each keeps its own", "A/B: every side uses A's range",
+                    "A/B: auto over every side (union)" };
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::Combo("##abrange", &app.compareRangeMode,
                                  AB_RANGE_ITEMS, 3)) {
@@ -11294,14 +14858,14 @@ static void drawInspector() {
                         "How the compared sides are STRETCHED - every pane, slots\n"
                         "included, not just A and B. Display only - each keeps its own\n"
                         "numbers and gets them back when compare ends.\n"
-                        "  auto over both (union), the default: every compared side\n"
-                        "    re-fits to min/max across A, B and the slots, so no side\n"
-                        "    clips and none is favoured. Two stacks at different\n"
+                        "  auto over every side (union), the default: every compared\n"
+                        "    side re-fits to min/max across A, B and the slots, so no\n"
+                        "    side clips and none is favoured. Two stacks at different\n"
                         "    exposures need this - B against A's range alone saturates\n"
                         "    into a single bin.\n"
-                        "  B uses A's range: one range, A's, for every other letter,\n"
-                        "    and it does not move while you step A. Right when the\n"
-                        "    others really are measured against A.\n"
+                        "  every side uses A's range: one range, A's, for every other\n"
+                        "    letter, and it does not move while you step A. Right when\n"
+                        "    the others really are measured against A.\n"
                         "  each keeps its own: comparing SHAPES at wildly different\n"
                         "    exposures - the one case where the sides are not directly\n"
                         "    comparable, and it says so.");
@@ -11367,6 +14931,105 @@ static void drawInspector() {
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
+        // ---- how this file was read, and how to read it differently ----------
+        // docs/input-adapters.md §4.13. Every file answers this, including the
+        // ones read natively: "reader native" is a fact about this file, and a
+        // row that only appeared for adapter-read files would leave the user
+        // guessing whether the question even applies to the others.
+        if (!im->src->path.empty() && im->src->remoteUrl.empty()) {
+            std::string spec = readerFor(im->src->path);
+            ImGui::TextDisabled("reader    %s", spec.empty() ? "native" : spec.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("change...")) openReaderPicker(im->src->path, "");
+            if (!spec.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("edit")) {
+                    std::string how;
+                    if (adapter::openInEditor(readerFileOf(spec), how))
+                        toast("opened in " + how + ": " + baseName(readerFileOf(spec)));
+                    else toast(how, true);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("native")) {
+                    // Back to native for this file, and said out loud: the
+                    // memory is a record of a choice, so unmaking it is a choice
+                    // too and must be as reachable as making it was.
+                    forgetReader(im->src->path);
+                    toast(baseName(im->src->path) + ": reader forgotten - opens natively next time");
+                }
+            }
+        }
+        // Where these pixels came from inside their container, and what else the
+        // container held. An .npz member's provenance is the file PLUS the array
+        // name, and the members that are not pixels (exposure, gain, a note) are
+        // the reason the file was written that way - so they belong beside it
+        // rather than in a panel of their own (docs/npz-design.md §4 item 3).
+        if (!im->src->npzMember.empty()) {
+            ImGui::TextDisabled("npz member  %s", im->src->npzMember.c_str());
+            for (const auto& e : app.npzMeta) {
+                if (e.path != im->src->path) continue;
+                if (e.items.empty()) break;
+                if (ImGui::TreeNodeEx("##npzmeta", ImGuiTreeNodeFlags_SpanAvailWidth,
+                                      "other members (%d)", (int)e.items.size())) {
+                    for (const auto& kv : e.items)
+                        ImGui::TextDisabled("%s   %s", kv.first.c_str(), kv.second.c_str());
+                    ImGui::TreePop();
+                }
+                break;
+            }
+        }
+        // ---- how this array was read, and how else this SHAPE could be read --
+        // docs/input-adapters.md §3.3. The successor to --npy-axis: what the
+        // viewer decided is on screen, and the ways out are computed from the
+        // actual shape, so a reading this array cannot support is never offered.
+        if (!im->src->npyShape.empty()) {
+            const std::vector<int64_t>& shp = im->src->npyShape;
+            const int nowRead = im->src->npyRead != NR_NATIVE ? im->src->npyRead
+                                                             : npyNativeRead(shp);
+            ImGui::TextDisabled("read as   %s", npyReadLabel(shp, nowRead).c_str());
+            std::vector<int> opts = npyReadOptions(shp);
+            if (opts.size() > 1) {
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.75f);
+                if (ImGui::BeginCombo("##reread", "re-read as...",
+                                      ImGuiComboFlags_NoArrowButton)) {
+                    for (int r : opts) {
+                        if (r == nowRead) continue;
+                        if (ImGui::Selectable(npyReadLabel(shp, r).c_str())) {
+                            g_reReadAsk = im->uid;      // confirm first: §3.3 says
+                            g_reReadWant = r;           // what is lost, BEFORE
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (g_reReadAsk == im->uid && !ImGui::IsPopupOpen("Re-read"))
+                    ImGui::OpenPopup("Re-read");
+                if (ImGui::BeginPopupModal("Re-read", nullptr,
+                                           ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::Text("%s  %s", baseName(im->src->path).c_str(),
+                                npyShapeText(shp).c_str());
+                    ImGui::Text("read as   %s", npyReadLabel(shp, nowRead).c_str());
+                    ImGui::Text("re-read as   %s", npyReadLabel(shp, g_reReadWant).c_str());
+                    std::string loss = npyReReadLoss(im);
+                    if (!loss.empty()) {
+                        ImGui::Separator();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+                        ImGui::TextWrapped("%s", loss.c_str());
+                        ImGui::PopTextWrapPos();
+                    }
+                    ImGui::Separator();
+                    if (ImGui::Button("Re-read")) {
+                        g_reReadGo = im->uid;           // pumpReRead runs it next frame
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) {
+                        g_reReadAsk = 0; g_reReadWant = NR_NATIVE;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+        }
         if (im->ch == 1) {
             // interpretation axis: change what the 1ch data means AFTER opening
             const char* modes[3] = { "Gray", "Bayer", "Quad Bayer" };
@@ -11460,13 +15123,7 @@ static void drawInspector() {
             ImGui::SetNextItemWidth(-1);
             if (ImGui::Combo("##rangemode", &mode,
                              "Auto per frame\0Per stack (default)\0Linked across all images\0")) {
-                bool wasLinked = app.linkRange;
-                app.linkRange = mode == 2;
-                app.rangeScope = mode == 0 ? 0 : 1;
-                if (app.linkRange && !wasLinked) {      // seed from what is on screen
-                    app.linkBlack = im->black; app.linkWhite = im->white;
-                }
-                if (app.linkRange != wasLinked) markAllTexDirty();
+                applyRangeMode(mode, im);
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
@@ -11572,7 +15229,7 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
     const std::string xu = abValueUnit(a->dtype);
     const char* xr = abRangeSaid(b != nullptr);
     if (b && b->dtype != a->dtype)
-        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins both sides)"
+        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins every side)"
                                 "  -  A %s / B %s, DTYPE MISMATCH",
                  xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str());
     else
@@ -11580,8 +15237,8 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
     return xl;
 }
 
-// Is the B histogram slot describing something other than the picture in front
-// of the reader? TWO keys, not one. The image is the obvious half. The other is
+// Is a histogram slot describing something other than the picture it is named
+// against? TWO keys, not one. The image is the obvious half. The other is
 // the RANGE the bins were built on: in the union default the bin range is the
 // min/max of the two CURRENT frames, so it moves every time A steps, and A's
 // histogram re-bins each step because its cache keys include black/white while
@@ -11592,30 +15249,98 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
 // so it never fired for the case that needs it most, a B pinned with Shift+B
 // (an advertised workflow: its uid never moves). Once the stepping stops the
 // recompute runs and both comparisons go back to equal.
-static bool abHistBStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
+// It asks the question for ANY side, not only B - every lettered slot is
+// binned on A's black/white and skipped by the same stepping throttle, so it
+// goes stale for the same two reasons and has to say so in the same words.
+static bool abHistSideStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
     if (!a || !b) return false;
     return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a);
 }
 
+// One side of the Statistics panel: A, B, or a lettered slot. It is built ONCE,
+// at the top, and the table, the plot, the legend and the footer all walk this
+// same list - so the table can never name a slot the footer forgets. That is
+// the defect this change exists to remove (issue #60): the cache held two
+// sides, so the panel drew the two it held and said nothing about C onwards.
+struct HistSide {
+    const App::HistState* H;
+    std::string letter;               // "A", "B", "C", ... - the POSITION
+    std::string label;                // the stack this side is looking at
+    bool stale = false;
+    ImU32 ink = 0;
+    double sc = 1;                    // share of THIS side's own sampled pixels
+};
+
+// What the Statistics/Histogram panel ACTUALLY said about the slots on the last
+// frame it drew - the same reasoning as g_filesBadgeProbe and g_paneBadgeProbe:
+// this machine cannot screenshot GL, so the panel writes down the letters it
+// named instead of a test trusting that it did. The bug being guarded is
+// SILENCE, so every field records what the panel SAYS, never what a cache
+// holds:
+//   "rows=ABCD;"        the sides the statistics table gave rows to
+//   "curves=ABC;"       the sides that got a curve on the plot
+//   "said-no-curve=D;"  the sides left OFF the plot AND named on screen for it
+// A letter in `rows` but in neither of the other two would be the old defect
+// back again, which is what the N group of --abstats-selftest asserts.
+static std::string g_histSideProbe;
+
 static void drawPanelHistogram() {
+    g_histSideProbe.clear();
     ImageDoc* im = cur();
     if (im && im->w > 0 && im->h > 0) {
         ImageDoc* Bim = abStatsB();
+        pumpCompareSlotRestore();
+        // The lettered slots resolve exactly as B does, follow-frame included,
+        // and rs.idx IS the letter - it travels with the resolved document
+        // because after a follow the document is no longer the pinned uid and a
+        // uid lookup would lose the letter. A slot that resolves to the same
+        // document as B keeps its own side: two letters landing on one document
+        // is a COINCIDENCE, and folding it away leaves no way to tell "C agrees
+        // with B" from "C was dropped".
+        std::vector<ResolvedSlot> xslots = resolveSlots();
+        // resolveSlots() prunes closed slots first, so this is the pruned size.
+        // NOTHING below resizes histExtra again: the sides hold pointers into
+        // it, and a growth under them would dangle exactly the way seqInfo()'s
+        // pointers into app.seqs did (cc1ee8b) - on MSVC and not here.
+        app.histExtra.resize(app.cmpExtra.size());
         recomputeHistogramIfNeeded(im, app.hist[0]);
-        // B is binned on A's black/white: one x axis, one bin grid, or the two
-        // curves are not comparable. Sizes may differ freely - the y axis below
-        // normalises that away. Skipped while frames are being stepped: an
-        // empty slot is always filled, a filled one waits for the stepping to
-        // stop and is labelled stale until then.
+        // Every other side is binned on A's black/white: one x axis, one bin
+        // grid, or the curves are not comparable. Sizes may differ freely - the
+        // y axis below normalises that away. Skipped while frames are being
+        // stepped: an empty slot is always filled, a filled one waits for the
+        // stepping to stop and is labelled stale until then. The slots take
+        // B's rule unchanged, so N of them cannot turn a held arrow key into N
+        // full passes over N images.
         if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
             recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
+        for (const ResolvedSlot& rs : xslots)
+            if (rs.idx < app.histExtra.size() &&
+                (!abStepBusy() || app.histExtra[rs.idx].uid == 0))
+                recomputeHistogramIfNeeded(rs.doc, app.histExtra[rs.idx],
+                                           effBlack(*im), effWhite(*im));
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         // ...or B is not A's partner at all: follow-frame found no frame of
         // B's stack carrying A's number, so what is drawn is the last latched
         // one. Same amber token, because it is the same statement.
-        const bool bStale = abHistBStale(im, Bim, HB) || (Bim && g_abFollowDiverged);
+        const bool bStale = abHistSideStale(im, Bim, HB) || (Bim && g_abFollowDiverged);
         const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
+        auto shareScale = [](const App::HistState& S) {
+            return 100.0 / (double)std::max<size_t>(S.sampled, 1);
+        };
+        std::vector<HistSide> sides;
+        sides.push_back({ &H, "A", abDocLabel(im), false, slotInk(0), shareScale(H) });
+        if (Bim) sides.push_back({ &HB, "B", bLabel, bStale, slotInk(1), shareScale(HB) });
+        for (const ResolvedSlot& rs : xslots) {
+            if (rs.idx >= app.histExtra.size()) continue;
+            const App::HistState& HX = app.histExtra[rs.idx];
+            // slotInk counts A and B first, so a slot's ink is its letter's
+            // ink on the Temporal chart too - one colour per slot across the
+            // application, not one per panel.
+            sides.push_back({ &HX, slotName(rs.idx), abDocLabel(rs.doc),
+                              rs.diverged || abHistSideStale(im, rs.doc, HX),
+                              slotInk(rs.idx + 2), shareScale(HX) });
+        }
         ImGui::Text("Statistics");
         ImGui::SameLine();
         // with a B on screen, an unlabelled table of numbers is ambiguous:
@@ -11625,19 +15350,49 @@ static void drawPanelHistogram() {
         else     ImGui::TextDisabled("(%s)", H.roiUsed ? "selected ROI" : "whole image");
         ImGui::Separator();
         // fixed widths + right-aligned numbers: columns must not reflow while
-        // stepping through frames, otherwise values are impossible to compare
-        if (ImGui::BeginTable("quickstats", 4, ImGuiTableFlags_SizingFixedFit)) {
+        // stepping through frames, otherwise values are impossible to compare.
+        // The SIDE is a row, never a column pair: a column pair has exactly two
+        // operands - which is what a delta needs and what A|B|delta is - and
+        // there are N sides. The Projection table settled this axis already
+        // (docs/ab-stats-plan.md 4); the rows are the axis that grows.
+        const bool anySide = sides.size() > 1;
+        if (ImGui::BeginTable("quickstats", anySide ? 5 : 4,
+                              ImGuiTableFlags_SizingFixedFit |
+                              (anySide ? ImGuiTableFlags_RowBg : 0))) {
+            if (anySide)
+                ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
+                                        ImGui::GetFontSize() * 1.8f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
             ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableSetupColumn("var", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
-            for (int s = 0; s < H.nSeries; s++) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", H.seriesNames[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.mean[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s]);
-                ImGui::TableNextColumn(); textNum("%.6g", H.sd[s] * H.sd[s]);
+            // EVERY side, always - the table has no readability limit a plot
+            // has, so whatever the chart below cannot draw is still numbers
+            // here. Side major: one capture's planes stay together.
+            for (const HistSide& sd : sides) {
+                g_histSideProbe += "row" + sd.letter + ";";
+                // A lagging side may lag if it is VISIBLY not current (the A4
+                // ruling): its cells dim, the same way the Projection table
+                // dims a stale side's.
+                if (sd.stale)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+                for (int s = 0; s < sd.H->nSeries; s++) {
+                    ImGui::TableNextRow();
+                    if (anySide) {
+                        // the letter in the slot's OWN ink, so the row and the
+                        // curve carrying the same numbers are the same colour
+                        ImGui::TableNextColumn();
+                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(sd.ink),
+                                           "%s", sd.letter.c_str());
+                    }
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sd.H->seriesNames[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->mean[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->sd[s]);
+                    ImGui::TableNextColumn(); textNum("%.6g", sd.H->sd[s] * sd.H->sd[s]);
+                }
+                if (sd.stale) ImGui::PopStyleColor();
             }
             ImGui::EndTable();
         }
@@ -11680,24 +15435,72 @@ static void drawPanelHistogram() {
         int nDrawn = 0;
         for (int s = 0; s < H.nSeries; s++) if (drawn(s)) nDrawn++;
 
-        // ---- y axis. Without a B: pixel counts, exactly as before. With a B:
-        // a share of each side's OWN sampled pixels, because two images of
-        // different size put incomparable bar heights on one axis.
-        const bool norm = Bim != nullptr;
-        const double scA = 100.0 / (double)std::max<size_t>(H.sampled, 1);
-        const double scB = 100.0 / (double)std::max<size_t>(HB.sampled, 1);
-        double yTop = 0;
-        for (int s = 0; s < H.nSeries; s++) {
-            if (!drawn(s)) continue;
-            for (int b = 0; b < 256; b++)
-                yTop = std::max(yTop, H.bins[s][b] * (norm ? scA : 1.0));
+        // ---- the layout question, asked BEFORE anything is sized, because the
+        // answer decides how many footer lines and how tall a legend the plot
+        // has to leave room for. Side by side stays strictly the A|B pair: two
+        // halves hold two sides, and a grid that holds N is the image-side
+        // layout job (docs/compare-n.md 10 「表示レイアウト」), not something
+        // to fake here.
+        const float minSide = AB_MIN_SIDE * app.uiScale;
+        bool side = Bim && abSideBySide();
+        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+        if (tooNarrow) side = false;
+
+        // ---- how many sides the PLOT can take. The table above always takes
+        // all of them; a chart has two hard limits and both of them have to be
+        // SPOKEN, never applied in silence:
+        //   - PLANES. Four CFA planes times five slots is twenty curves, which
+        //     is not a comparison, it is a texture. So slots overlay when ONE
+        //     plane is on the axis (docs/compare-n.md 4 - the general form of
+        //     ab-stats-plan 2's "eight curves are unreadable"), and the plane
+        //     selector above is how you get there.
+        //   - INK. slotInk can tell slotInkCount() slots apart and then wraps;
+        //     drawing past that would put two slots in one colour, which is
+        //     this panel omitting a slot again with a different mechanism.
+        // Whatever is left off is named on screen, right under the plot.
+        const size_t nSides = sides.size();
+        const bool onePlane = nDrawn <= 1;
+        size_t nPlot;
+        const char* offWhy = nullptr;
+        if (side || (!xslots.empty() && !onePlane)) {
+            nPlot = Bim ? 2 : 1;           // the A|B pair the two-image modes mean
+            offWhy = side ? "side by side has two halves - set the A/B layout to "
+                            "overlay and every slot goes on one plot"
+                          : "pick ONE plane above and every slot overlays on it";
+        } else if (nSides > slotInkCount()) {
+            nPlot = slotInkCount();
+            offWhy = "the palette runs out - these would repeat a colour already "
+                     "on the plot, and two slots in one ink is not a comparison";
+        } else {
+            nPlot = nSides;
         }
-        if (norm)
-            for (int s = 0; s < HB.nSeries; s++) {
-                int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
+        std::string offPlot;              // the letters that get no curve
+        for (size_t i = nPlot; i < nSides; i++) {
+            if (!offPlot.empty()) offPlot += ", ";
+            offPlot += sides[i].letter;
+        }
+        std::string offMsg;
+        if (!offPlot.empty())
+            offMsg = "slot " + offPlot + ": no curve - " + offWhy +
+                     ". Their numbers are in the table above.";
+
+        // ---- y axis. One side: pixel counts, exactly as before. More than
+        // one: a share of each side's OWN sampled pixels, because images of
+        // different size put incomparable bar heights on one axis.
+        const bool norm = nSides > 1;
+        double yTop = 0;
+        for (size_t i = 0; i < nPlot; i++) {
+            const HistSide& sd = sides[i];
+            for (int s = 0; s < sd.H->nSeries; s++) {
+                // every side's planes are matched to A's BY NAME (R <-> R):
+                // the canon forbids mixing planes, and ch0 is not R
+                int a = i == 0 ? s : abSeriesMatch(H.seriesNames, H.nSeries,
+                                                   sd.H->seriesNames[s]);
                 if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                for (int b = 0; b < 256; b++) yTop = std::max(yTop, HB.bins[s][b] * scB);
+                for (int b = 0; b < 256; b++)
+                    yTop = std::max(yTop, sd.H->bins[s][b] * (norm ? sd.sc : 1.0));
             }
+        }
         if (!(yTop > 0)) yTop = 1;
         const double logTop = log1p(yTop);
         char yl[96];
@@ -11743,69 +15546,108 @@ static void drawPanelHistogram() {
             else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, 1.4f,
                                    5 * app.uiScale, 4 * app.uiScale);
         };
-        // Four CFA planes (or three RGB ones) as eight filled areas is unreadable,
-        // so at three drawn curves or more BOTH sides become outlines. Below that
-        // A keeps its fill and only B is an outline.
-        const bool outlineA = Bim && nDrawn >= 3;
-        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantB) {
+        // Once SLOTS share the plot, the colour has to say which SLOT. With one
+        // plane on the axis (the condition for putting them there at all) the
+        // plane is fixed and named on the axis, so hue is free to carry the
+        // letter - and it carries the SAME letter the Temporal chart, the
+        // statistics rows and the tile badges use, because slotInk is asked
+        // once per slot and every panel asks it. A palette invented here would
+        // be a second, unrelated naming of a thing that already has a name.
+        //
+        // A and B alone keep exactly the colours they had: A's planes in the
+        // plane colours, B lifted from the same hue so R stays R.
+        const bool bySlotInk = nPlot > 2;
+        // Four CFA planes (or three RGB ones) as eight filled areas is
+        // unreadable, so at three drawn curves or more BOTH sides become
+        // outlines. Below that A keeps its fill and only B is an outline.
+        // Slot ink means outlines throughout: N filled areas hide each other,
+        // and the fill was only ever how "this one is A" got said when there
+        // were two. With a legend and one hue per letter, the hue says it.
+        const bool outlineA = (nSides > 1 && nDrawn >= 3) || bySlotInk;
+        auto drawSide = [&](const PlotRect& pr, size_t i) {
+            const HistSide& sd = sides[i];
+            for (int s = 0; s < sd.H->nSeries; s++) {
+                // matched by NAME; a series only this side has is drawn neutral,
+                // and never coloured as if it were one of A's planes
+                int a = i == 0 ? s : abSeriesMatch(H.seriesNames, H.nSeries,
+                                                   sd.H->seriesNames[s]);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                // A single grey series gave B the SAME colour as A's fill,
+                // leaving a 1.4 px dashed line at ~30/255 contrast wherever
+                // it crossed that fill - the dash pattern was B's only cue.
+                // Mono B gets a cool tint so it reads against A's grey; the
+                // coloured cases already differ by hue per plane.
+                //
+                // ...and every side past A is drawn SOLID, like the profile and
+                // temporal curves. A dash reads as a broken curve rather than
+                // as "this one is B", and a histogram is dense enough that the
+                // dashes close up at one zoom and open at the next.
+                ImU32 col;
+                if (bySlotInk)           col = sd.ink;
+                else if (a < 0)          col = ODD_COL;
+                else if (cfaHist)        col = CFA_COLS[a];
+                else if (H.nSeries == 1) col = i == 0 ? IM_COL32(200, 205, 210, 200) : AB_B_INK;
+                else                     col = i == 0 ? RGB_COLS[a]
+                                                      : abLiftInk(RGB_COLS[a], 0.45f);
+                plotSeries(pr, sd.H->bins[s], norm ? sd.sc : 1.0, col,
+                           i == 0 && !outlineA ? 0 : 1);
+            }
+        };
+        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantRest) {
             if (!pr.ok) return;
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(pr.p0, pr.p1, true);
-            if (wantA)
-                for (int s = 0; s < H.nSeries; s++) {
-                    if (!drawn(s)) continue;
-                    ImU32 col = cfaHist ? CFA_COLS[s]
-                              : (H.nSeries == 1 ? IM_COL32(200, 205, 210, 200) : RGB_COLS[s]);
-                    plotSeries(pr, H.bins[s], norm ? scA : 1.0, col, outlineA ? 1 : 0);
-                }
-            if (wantB && Bim)
-                for (int s = 0; s < HB.nSeries; s++) {
-                    // matched by NAME; a series only B has is drawn neutral, and
-                    // never coloured as if it were one of A's planes
-                    int a = abSeriesMatch(H.seriesNames, H.nSeries, HB.seriesNames[s]);
-                    if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                    // A single grey series gave B the SAME colour as A's fill,
-                    // leaving a 1.4 px dashed line at ~30/255 contrast wherever
-                    // it crossed that fill - the dash pattern was B's only cue.
-                    // Mono B gets a cool tint so it reads against A's grey; the
-                    // coloured cases already differ by hue per plane.
-                    //
-                    // ...and B is drawn SOLID, like the profile and temporal
-                    // curves. A dash reads as a broken curve rather than as
-                    // "this one is B", and a histogram is dense enough that the
-                    // dashes close up at one zoom and open at the next. A is a
-                    // filled bar, B is an outline in its own ink: the fill and
-                    // the hue already carry the distinction the dash was for.
-                    ImU32 col = a < 0 ? ODD_COL
-                              : (cfaHist ? CFA_COLS[a]
-                                         : (H.nSeries == 1 ? AB_B_INK
-                                                           : abLiftInk(RGB_COLS[a], 0.45f)));
-                    plotSeries(pr, HB.bins[s], norm ? scB : 1.0, col, 1);
-                }
+            for (size_t i = 0; i < nPlot; i++) {
+                if (i == 0 ? !wantA : !wantRest) continue;
+                drawSide(pr, i);
+            }
             dl->PopClipRect();
         };
 
-        const float minSide = AB_MIN_SIDE * app.uiScale;
-        bool side = Bim && abSideBySide();
-        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
-        if (tooNarrow) side = false;
+        // The legend names every side that got a curve. Two sides keep the
+        // fixed A/B row; three or more fly the wrapping N-slot legend, because
+        // C/D/E push a single row off the panel. Both are MEASURED before the
+        // plot is sized, so adding a slot never moves the plot out from under
+        // the cursor.
+        std::vector<SlotLegendEntry> leg;
+        if (!side && bySlotInk)
+            for (size_t i = 0; i < nPlot; i++)
+                leg.push_back({ abLegendText(sides[i].letter.c_str(), sides[i].label) +
+                                (sides[i].stale ? std::string("  ") + AB_STALE_TOKEN
+                                                : std::string()),
+                                sides[i].ink });
         // fill the rest of the panel: a fixed height overflowed the bottom dock
-        float footerH = ImGui::GetTextLineHeightWithSpacing() * (Bim ? 2.0f : 1.0f)
-                      + (tooNarrow ? abNarrowNoteH() : 0.0f);
+        float offMsgH = offMsg.empty() ? 0.0f
+                      : ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
+                                            ImGui::GetContentRegionAvail().x).y +
+                        ImGui::GetStyle().ItemSpacing.y;
+        float footerH = ImGui::GetTextLineHeightWithSpacing() * (float)nSides
+                      + (tooNarrow ? abNarrowNoteH() : 0.0f) + offMsgH;
         // the legend row lives under the overlaid plot, and its height comes off
         // the plot BEFORE the plot is laid out
-        float legendH = Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f;
+        float legendH = !leg.empty() ? slotLegendRow(leg, false)
+                      : (Bim && !side ? abLegendH(abDocLabel(im), bLabel, bStale) : 0.0f);
         float hAvail = ImGui::GetContentRegionAvail().y
                      - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)   // axes + footer
                      - footerH - legendH;
         if (side) hAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // heading band
         float plotH = std::max(hAvail, 70.0f * app.uiScale);
 
+        {   // what the plot took, and what it left - as the panel says it, so a
+            // letter that is in neither list is a silent omission by definition
+            std::string got, off;
+            for (size_t i = 0; i < nSides; i++)
+                (i < nPlot ? got : off) += sides[i].letter;
+            g_histSideProbe += "curves=" + got + ";";
+            if (!off.empty()) g_histSideProbe += "said-no-curve=" + off + ";";
+        }
+
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
-            if (Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
+            if (!leg.empty())  slotLegendRow(leg, true);
+            else if (Bim)      drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
             // Always 50/50, never splitFrac: comparing two shapes needs two
             // plots of the SAME width. What the layout copies from the image is
@@ -11830,15 +15672,34 @@ static void drawPanelHistogram() {
             ImGui::EndChild();
         }
         if (tooNarrow) abNarrowNote();
-        // the real pixel counts survive the normalised axis
-        ImGui::TextDisabled("A  %zu px | <black %.2f%%  >white %.2f%%%s", H.sampled,
-                            H.clipLo * 100.0, H.clipHi * 100.0,
-                            cfaHist ? " | R/Gr/Gb/B" : "");
-        if (Bim) {
-            ImGui::TextDisabled("B  %zu px | <black %.2f%%  >white %.2f%%  | %s",
-                                HB.sampled, HB.clipLo * 100.0, HB.clipHi * 100.0,
-                                bLabel.c_str());
-            if (bStale) {   // never inside the disabled string: it must stand out
+        // A slot the plot could not take is named HERE, in the panel, next to
+        // the plot that does not have it. This is the whole point of the
+        // change: the failure being removed is a panel that shows a subset and
+        // says nothing, and a limit that is spoken is not that failure.
+        if (!offMsg.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(offMsg.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+        // the real pixel counts survive the normalised axis - one line per
+        // side, including the ones with no curve: the counts and the clipping
+        // are what the table cannot show, and they are per side too
+        for (size_t i = 0; i < nSides; i++) {
+            const HistSide& sd = sides[i];
+            std::string tail;
+            if (i > 0) {
+                tail = "  | " + sd.label;
+                // a side stored differently from A is worth saying so where the
+                // numbers are: the x-axis label only ever names A against B
+                if (i >= 2 && sd.H->img && sd.H->img->dtype != im->dtype)
+                    tail += "  [" + sd.H->img->dtype + " vs A " + im->dtype + "]";
+            } else if (cfaHist) tail = " | R/Gr/Gb/B";
+            ImGui::TextDisabled("%s  %zu px | <black %.2f%%  >white %.2f%%%s",
+                                sd.letter.c_str(), sd.H->sampled,
+                                sd.H->clipLo * 100.0, sd.H->clipHi * 100.0, tail.c_str());
+            if (sd.stale) {   // never inside the disabled string: it must stand out
                 ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
                 ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
             }
@@ -12006,7 +15867,17 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     }
 }
 
+// What the Projection panel SAID about the slots on the last frame it drew -
+// the same grammar as g_histSideProbe ("rowX;" per table side, "curves=",
+// "said-no-curve="), because it guards the same equation:
+// rows ⊆ curves ∪ said-no-curve. The projection was the panel issue #60 caught
+// giving slots table rows while the plots drew A and B and said NOTHING about
+// the letters they left off - the exact silence the histogram had already been
+// cured of, unguarded here because no probe existed to assert it.
+static std::string g_projSideProbe;
+
 static void drawPanelProjection() {
+    g_projSideProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -12023,10 +15894,8 @@ static void drawPanelProjection() {
     // The slots resolve exactly as B does - follow-frame included - and the
     // cache is per SLOT, indexed by the letter (= position in cmpExtra), so a
     // followed sibling recomputes into ITS slot and a slot A stands on keeps
-    // its cache. A slot that is also B draws as B alone: one image, one column.
-    std::vector<ResolvedSlot> xslots;
-    for (const ResolvedSlot& rs : resolveSlots())
-        if (rs.doc != Bim) xslots.push_back(rs);
+    // its cache. A slot that is also B keeps its own column: see the histogram.
+    std::vector<ResolvedSlot> xslots = resolveSlots();
     app.projExtra.resize(app.cmpExtra.size());
     recomputeProjectionIfNeeded(im, app.proj[0]);
     // The extras follow B's rule exactly: skipped while frames are being
@@ -12297,6 +16166,31 @@ static void drawPanelProjection() {
                            P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
                            PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
     if (tooNarrow) abNarrowNote();
+    {   // What the plots took and what they left, as the panel says it. The
+        // profile plots still draw only A and B: the lettered slots are fed
+        // (projExtra recomputes above) and the table below gives them rows,
+        // and until the N overlay lands (docs/compare-n.md §12) the plots
+        // cannot take them - which must be SAID, right here under the plots,
+        // or a slot's absence reads as the slot having been lost. Same rule,
+        // same wording shape and same amber as the histogram's off-plot note.
+        g_projSideProbe += std::string("curves=A") + (Bim ? "B" : "") + ";";
+        if (!xslots.empty()) {
+            std::string off;
+            for (const ResolvedSlot& rs : xslots) {
+                if (!off.empty()) off += ", ";
+                off += slotName(rs.idx);
+            }
+            std::string offLetters;
+            for (const ResolvedSlot& rs : xslots) offLetters += slotName(rs.idx);
+            g_projSideProbe += "said-no-curve=" + offLetters + ";";
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                               "slot %s: no curve here yet - the profile plots draw "
+                               "only A and B. The table below has every slot's numbers.",
+                               off.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    }
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
@@ -12328,6 +16222,8 @@ static void drawPanelProjection() {
         if (rs.idx < app.projExtra.size())
             sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx),
                               slotFollowDiverged(rs.idx) || abStepBusy() });
+    // every side the table is about to give numbers to, for the equation
+    for (const SideRef& sr : sides) g_projSideProbe += "row" + sr.name + ";";
     {   // a diverged slot's rows are the last frame its stack had - say so with
         // the same sentence the B side gets (g_abFollowDiverged, above)
         std::string div;
@@ -12688,13 +16584,25 @@ struct StackStats {
     double mean[4] = {}, sigmaT[4] = {};
     uint64_t nonFinite = 0;       // samples EXCLUDED, reported not hidden
     size_t dropped = 0;           // pixels with fewer than 2 valid frames
+    size_t unknown = 0;           // samples with NO valid frame: the mean does not exist
     std::string err;
 };
 
 // Per-plane mean and temporal sigma of one stack's resident frames, over the
 // given ROI. The same statistic the server aggregate computes, evaluated on
 // whatever is local - which covers NAS data and fully fetched remote stacks.
-static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
+//
+// meanOut (optional): the PER-PIXEL temporal mean over the ROI, interleaved
+// exactly like a frame's pixels (rw*rh*C floats). This is the picture "Open as
+// frame average" opens, and it comes out of THIS accumulator on purpose - the
+// mean drawn on screen and the mean printed in the Temporal table are then the
+// same number by construction, not by two functions agreeing today. (Doing it
+// twice is the defect this codebase keeps finding: PRNU twice, naturalLess
+// versus compare, the channel rule in three places.) A sample no frame had a
+// finite value for is NaN there - unknown, and said so, rather than 0, which
+// would be a measurement.
+static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
+                                    std::vector<float>* meanOut = nullptr) {
     StackStats out;
     std::vector<int> fr = framesOfSeq(seqId);
     const ImageDoc* first = nullptr;
@@ -12734,6 +16642,18 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
                 s1[i] += v; s2[i] += v * v; cn[i]++;
             }
         }
+    if (meanOut) {
+        // float32 out, DOUBLE all the way in. sum[] is double for exactly this
+        // reason: adding hundreds of float32 samples in float32 loses low bits
+        // at up to half a ULP per add, and a dark-current map IS its low bits -
+        // the whole point of averaging N frames is to see what one frame's noise
+        // buries. A pixel no frame had a finite value for comes out NaN, which
+        // every panel already reads as "not measured"; 0 would be a measurement.
+        meanOut->resize(samples);
+        for (size_t i = 0; i < samples; i++)
+            (*meanOut)[i] = cnt[i] ? (float)(sum[i] / (double)cnt[i])
+                                   : std::numeric_limits<float>::quiet_NaN();
+    }
     out.nPl = first->cfa ? 4 : 1;
     double plM[4] = {}, plV[4] = {};
     size_t plC[4] = {};
@@ -12743,6 +16663,7 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
             for (int c = 0; c < C; c++) {
                 size_t i = ((size_t)y * rw + x) * C + c;
                 double nI = (double)cnt[i];
+                if (nI < 1) out.unknown++;                 // and no mean either
                 if (nI < 2) { out.dropped++; continue; }   // no variance to speak of
                 double m = sum[i] / nI;
                 double var = std::max(0.0, sum2[i] / nI - m * m) * (nI / (nI - 1.0));
@@ -12757,6 +16678,199 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh) {
     out.frames = (int)use.size();
     out.valid = true;
     return out;
+}
+
+// ---- frame average: a stack's per-pixel mean, opened as ONE frame ----------
+// One tooltip for every door into it: the five Browse entry points and the
+// Files panel item must not describe the same operation five different ways.
+static const char* AVG_TIP =
+    "Open the stack's PER-PIXEL MEAN across frames as one frame -\n"
+    "a dark-current map, a flat field, the level sigma_t is the noise\n"
+    "around. Accumulated in double; non-finite samples are excluded\n"
+    "per pixel and counted. A mosaic stays a mosaic. The result is a\n"
+    "computed frame, not a capture, and says so in its name and note;\n"
+    "the stack itself stays open beside it.";
+
+// A STACK-level operation whose VALUE is a FRAME. docs/terminology.md makes that
+// an ordinary frame hanging straight off the source's batch ("単発 frame は stack
+// を経由せず batch に直接ぶら下がってよい"), seqId 0 - so Histogram, Projection
+// and ROIs work on it because there is nothing here for them to special-case.
+// The picture is the point: a dark-current map, a flat field, the thing sigma_t
+// is the noise AROUND. Getting it today means opening N frames and leaving.
+//
+// PROVENANCE IS THE HARD PART. This image looks exactly like a capture and will
+// end up in a report as one if it does not keep saying otherwise. So it says it
+//   - in its NAME, which is what the Files panel and every title bar show,
+//   - in its NOTE, which is what the Inspector shows (and the Files tooltip,
+//     which now falls back to the note when there is no path to print),
+//   - and through a session, by avgOfPath below.
+// src->path stays EMPTY - deliberately, and this is the load-bearing line. Give
+// it the source file's path, the way materializeDerivedFrame does, and
+// isSavedLine writes an ordinary `image` line; the next session then reloads
+// frame 0 from disk and presents ONE CAPTURE as the mean, under this name, with
+// no note left to contradict it. Empty path means the session cannot save the
+// pixels, so it saves the RECIPE instead and takes the mean again.
+//
+// THE SOURCE STACK STAYS OPEN. Averaging reads every frame to yield one, so
+// closing the source afterwards would look like a saving. It is not: the note
+// names that stack, and provenance pointing at something the program silently
+// destroyed is worth less than the memory. Close stack is one click away in the
+// same menu, and there the user can see what they are closing.
+static bool stackAverageFrame(int seqId, std::string& err) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) { err = "that stack is not open"; return false; }
+    const std::string srcName = si->name;
+    const int expected = si->expectedFrames;
+    std::vector<int> fr = framesOfSeq(seqId);
+    // The reference frame is the first RESIDENT full-resolution one - the same
+    // frame computeStackStats measures against, since a remote preview is a
+    // decimated stand-in and its pixels are not this stack's pixels.
+    const ImageDoc* ref = nullptr;
+    for (int idx : fr) {
+        const ImageDoc* d = app.images[idx].get();
+        if (d->src->remoteStep > 1 || d->px().empty()) continue;
+        ref = d;
+        break;
+    }
+    if (!ref) { err = "no frame of \"" + srcName + "\" is loaded yet"; return false; }
+    // Everything read off ref or si must be COPIED OUT before addImage: the
+    // push_back below can reallocate app.images and both pointers dangle.
+    const int W = ref->w, H = ref->h, C = ref->ch;
+    const int refCfa = ref->cfa, refCfaPat = ref->cfaPattern, refLut = ref->displayLut;
+    const bool refColorize = ref->cfaColorize;
+    const float refBlack = ref->black, refWhite = ref->white;
+    const int refBatch = ref->batchId;
+    // The stack's FIRST frame names it for the session, resident or not - the
+    // same key Series members travel by, for the same reason (paths round-trip;
+    // ids do not survive a session and names are renameable and not unique).
+    const std::string firstPath = app.images[fr.front()]->src->path;
+    std::vector<float> mean;
+    // ONE averaging in the program. This is the accumulator the Temporal panel's
+    // mean and sigma_t come out of, so the number under the picture and the
+    // number in the table cannot disagree - see computeStackStats.
+    StackStats st = computeStackStats(seqId, 0, 0, W, H, &mean);
+    if (!st.valid) { err = "frame average of \"" + srcName + "\": " + st.err; return false; }
+    const int n = st.frames;
+    const int N = std::max(expected, n);
+
+    auto out = std::make_unique<ImageDoc>();
+    FrameSource& S = *out->src;
+    S.w = W; S.h = H; S.ch = C;
+    // NOT the source dtype. The mean of N integers is not an integer, and
+    // labelling fractional DN "u16" would misdescribe every number printed off
+    // this frame. Same call montageROI makes when its values stop being DN.
+    S.dtype = "f32";
+    S.data = std::move(mean);
+    // The mean is PER PIXEL: nothing moves, nothing resamples, every pixel keeps
+    // its coordinate and therefore its Bayer phase. So a Bayer stack's mean IS
+    // still Bayer and the declaration travels verbatim - per-plane statistics on
+    // the result are the per-plane statistics of the stack, which is the whole
+    // reason a mosaic must never be silently dropped here.
+    out->cfa = refCfa; out->cfaPattern = refCfaPat; out->cfaColorize = refColorize;
+    out->displayLut = refLut;
+    out->syncMirrors();
+    out->batchId = refBatch;
+    const std::string ofN = n < N ? std::to_string(n) + " of " + std::to_string(N)
+                                  : std::to_string(n);
+    out->name = srcName + "  frame average (" + ofN + " frames)";
+    // docs/terminology.md, 実装上の不変条件: "部分ロードされた stack の集計は
+    // 「何枚中何枚か」を必ず併記する". The canon says STATE the ratio, not refuse
+    // the aggregate - every other stack-level statistic in the program (montage,
+    // Temporal, the linearity rows) already reads that way, and a mean over 8 of
+    // 24 frames is a real measurement of 8 frames. What it must never do is call
+    // itself "the average", so the count is in the name, in the note, and in a
+    // warning toast; and the count is of frames actually AVERAGED (st.frames),
+    // not of frames present, so a ragged or preview frame cannot inflate it.
+    std::string note = "frame average of \"" + srcName + "\": per-pixel mean over " +
+                       ofN + " frame(s), accumulated in double";
+    if (st.nonFinite)
+        note += "; " + std::to_string((unsigned long long)st.nonFinite) +
+                " non-finite sample(s) EXCLUDED - each pixel's own denominator";
+    if (st.unknown)
+        note += "; " + std::to_string((unsigned long long)st.unknown) +
+                " sample(s) had no finite frame at all and are NaN here";
+    if (n < N)
+        note += "; the stack is PARTLY LOADED - this is the mean of the " +
+                std::to_string(n) + " frame(s) present, not of all " + std::to_string(N);
+    if (firstPath.empty())
+        note += "; no file path behind the source stack, so a session cannot "
+                "recompute this frame";
+    out->note = note;
+    out->avgOfPath = firstPath;
+    out->texDirty = true;
+    fprintf(stderr, "frame average: %s - %d of %d frame(s), %dx%d %dch, cfa=%d, "
+                    "%llu excluded, %llu unknown\n", srcName.c_str(), n, N, W, H, C,
+            refCfa, (unsigned long long)st.nonFinite, (unsigned long long)st.unknown);
+    addImage(std::move(out));
+    // addImage runs defaultRange, which is right for a file just opened and
+    // wrong here. Averaging suppresses exactly the spread an auto-range keys
+    // off, so the mean would come back stretched to full contrast over its own
+    // residue and look nothing like the frames it summarises. It inherits the
+    // source's display range instead, and is directly comparable with them.
+    ImageDoc* made = app.images.back().get();
+    made->black = refBlack; made->white = refWhite;
+    if (n < N)
+        toast("frame average: " + std::to_string(n) + " of " + std::to_string(N) +
+              " frames are loaded - the result says so", true);
+    else
+        toast("frame average of \"" + srcName + "\": " + std::to_string(n) + " frames");
+    return true;
+}
+
+// Everything settled: no local loader running, no decoded frame waiting to be
+// integrated, no queued open and no remote fetch outstanding anywhere. This is
+// the same predicate every selftest's drain loop waits on, and it is the gate a
+// parked frame average fires behind - a stack that is still filling has a
+// different mean every second, and taking one mid-flight would silently answer
+// a question about however many frames happened to have landed.
+static bool loadingSettled() {
+    return !app.seqRunning && !seqReadyPending() && app.seqQueue.empty() &&
+           app.seqRestore.empty() && app.rbOpenQueue.empty() && app.rfPending <= 0;
+}
+
+// The ONE door every menu item goes through, so that all of them mean the same
+// thing. If everything has landed, the mean is taken now; if anything is still
+// arriving, the request waits. That distinction is not about WHERE it was asked
+// from - a stack half-open in the Files panel is as unfinished as one Browse has
+// only just started fetching, and averaging either of them early would answer a
+// question about "however many frames had arrived by the time you clicked".
+// n of N therefore appears only when the load really did stop short (the memory
+// budget did), which is a fact about the stack rather than about timing.
+static void requestStackAverage(int seqId) {
+    if (!seqId) return;
+    if (!loadingSettled()) {
+        app.pendingAvg.push_back(seqId);
+        const App::SeqInfo* si = seqInfo(seqId);
+        toast("frame average: \"" + (si ? si->name : std::string("stack")) +
+              "\" will be averaged once its frames are here");
+        return;
+    }
+    std::string err;
+    if (!stackAverageFrame(seqId, err)) toast(err, true);
+}
+
+// The parked "Open as frame average" requests, from Browse and from a session.
+static void pumpStackAverages() {
+    if (app.pendingAvg.empty() && app.avgRestore.empty()) return;
+    if (!loadingSettled()) return;
+    // A session's recipes name their stack by path; resolve them the moment
+    // everything is open, exactly as resolvePendingSeries does with members.
+    for (const auto& p : app.avgRestore) {
+        int found = 0;
+        for (const auto& d : app.images)
+            if (d->seqId != 0 && d->src->path == p) { found = d->seqId; break; }
+        if (found) app.pendingAvg.push_back(found);
+        else fprintf(stderr, "session: a frame average named \"%s\", which is not "
+                             "open - not recomputed\n", p.c_str());
+    }
+    app.avgRestore.clear();
+    std::vector<int> todo;
+    todo.swap(app.pendingAvg);
+    for (int id : todo) {
+        if (!seqInfo(id)) continue;              // closed while it was waiting
+        std::string err;
+        if (!stackAverageFrame(id, err)) toast(err, true);
+    }
 }
 
 // least squares y = a*x + b; returns false with fewer than 2 distinct points
@@ -13789,7 +17903,7 @@ struct FrameAxis {
 };
 static FrameAxis frameAxisOf(int seqId) {
     FrameAxis a;
-    a.label = "frame number (index in sequence)";
+    a.label = "frame number (index in stack)";
     App::SeqInfo* si = seqInfo(seqId);
     if (!si || si->axisVals.empty()) return a;
     int n = (int)framesOfSeq(seqId).size();
@@ -13938,6 +18052,17 @@ static void drawBrowseTemporal() {
         ImGui::SetTooltip("open %s for real (frames transfer in the background)",
                           S.label.c_str());
     ImGui::SameLine();
+    // The server just measured this stack's mean as a NUMBER; this opens the
+    // same mean as a PICTURE. Same copy-first rule as the button beside it -
+    // openRemoteStack fires its own server temporal, which resets S under us.
+    if (ImGui::SmallButton("Open as frame average")) {
+        std::string host = S.host, label = S.label;
+        std::vector<std::string> files = S.files;
+        openStackForAverage(host, files, label);
+        return;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", AVG_TIP);
+    ImGui::SameLine();
     if (ImGui::SmallButton("x##srvtdrop")) { S = App::ServerTemporal{}; return; }
     ImGui::Separator();
     // cfaType was 0 by design (no open file to read a mosaic from): say so,
@@ -14028,24 +18153,28 @@ static bool parseAxisValues(const std::string& text, std::vector<double>& out,
 // must equal the stack's frame count - against the EXPECTED total for a
 // partially loaded stack. A mismatch refuses with both numbers: a partial
 // mapping silently truncating either side is the classic quiet lie.
-static bool applyFrameAxis(int seqId, const char* name, const char* unit,
-                           const std::string& text, std::string& err) {
+// The axis itself, once the values exist. Both ways of giving them - pasting a
+// column into the Temporal panel and ticking a 1-D key in the .npz picker -
+// land HERE, so the two cannot drift into two different ideas of what an axis
+// is (and a key read out of a file gets no relaxation of the rules a pasted
+// column obeys: the unit is required of both).
+static std::string trimAxisLabel(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+
+static bool applyFrameAxisVals(int seqId, const std::string& nameIn, const std::string& unitIn,
+                               std::vector<double> vals, std::string& err) {
     App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "not a stack"; return false; }
-    auto trim = [](std::string s) {
-        size_t a = s.find_first_not_of(" \t\r\n");
-        size_t b = s.find_last_not_of(" \t\r\n");
-        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-    };
-    std::string nm = trim(name ? name : ""), un = trim(unit ? unit : "");
-    if (nm.empty() || un.empty()) {
+    // The trim lives HERE, not in one caller: a unit of " " is not a unit, and
+    // it was refused from the pasted path and accepted from the .npz picker,
+    // which rendered "x axis in  " - one rule promised, two rules enforced.
+    std::string name = trimAxisLabel(nameIn), unit = trimAxisLabel(unitIn);
+    if (name.empty() || unit.empty()) {
         err = "the axis needs a NAME and a UNIT - a bare list of numbers "
               "cannot label an axis (the unit is never assumed)";
-        return false;
-    }
-    std::vector<double> vals;
-    if (!parseAxisValues(text, vals, err)) {
-        if (err.empty()) err = "no values";
         return false;
     }
     int n = (int)framesOfSeq(seqId).size();
@@ -14059,10 +18188,30 @@ static bool applyFrameAxis(int seqId, const char* name, const char* unit,
         err = b;
         return false;
     }
-    si->axisName = nm;
-    si->axisUnit = un;
+    si->axisName = name;
+    si->axisUnit = unit;
     si->axisVals = std::move(vals);
     return true;
+}
+
+static bool applyFrameAxis(int seqId, const char* name, const char* unit,
+                           const std::string& text, std::string& err) {
+    App::SeqInfo* si = seqInfo(seqId);
+    if (!si) { err = "not a stack"; return false; }
+    std::string nm = trimAxisLabel(name ? name : ""), un = trimAxisLabel(unit ? unit : "");
+    // name and unit are checked BEFORE the values are parsed: an unlabelled
+    // paste is refused for what it is, not for the first bad token in it
+    if (nm.empty() || un.empty()) {
+        err = "the axis needs a NAME and a UNIT - a bare list of numbers "
+              "cannot label an axis (the unit is never assumed)";
+        return false;
+    }
+    std::vector<double> vals;
+    if (!parseAxisValues(text, vals, err)) {
+        if (err.empty()) err = "no values";
+        return false;
+    }
+    return applyFrameAxisVals(seqId, nm, un, std::move(vals), err);
 }
 
 // ---- frame-wise linearity (interim) -----------------------------------------
@@ -14642,7 +18791,6 @@ static std::vector<TExpSide> temporalExportSides() {
     app.projExtra.resize(app.cmpExtra.size());
     static const App::ServerTemporal NO_SERVER;   // extras are local-only
     for (const ResolvedSlot& rs : resolveSlots()) {
-        if (rs.doc == Bim) continue;
         if (rs.idx >= app.temporalExtra.size()) continue;
         recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
         recomputeProjectionIfNeeded(rs.doc, app.projExtra[rs.idx]);
@@ -14695,7 +18843,7 @@ static std::string buildTemporalExport(char delim) {
         char ts[32] = "";
         time_t now = time(nullptr);
         if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
-        doc.comment(std::string("app: viewer 0.1  |  generated: ") + ts);
+        doc.comment(std::string("app: viewer ") + viewerVersion() + "  |  generated: " + ts);
     }
     {
         std::string s = "sides: ";
@@ -15012,60 +19160,6 @@ static bool temporalChartVisible() {
     return g_tchart.plotted && g_tchart.plotBot <= g_tchart.winBot + 1.0f;
 }
 
-// The ink each compare slot is stroked in when they share one plot. A, B and
-// the extras are SLOTS, not CFA planes, so hue is free here - the iron rule is
-// about mixing planes inside a statistic, and the per-frame mean is a pooled
-// level that says so on its axis. A keeps the neutral green every plot draws
-// in and B keeps the blue the shared legend flies, so nothing that already
-// reads as A or B changes colour when a C appears.
-static ImU32 temporalSlotInk(size_t i) {
-    static const ImU32 INK[] = {
-        IM_COL32(105, 220, 130, 255),   // A
-        IM_COL32(120, 190, 255, 230),   // B - AB_B_INK
-        IM_COL32(245, 170,  90, 255),   // C
-        IM_COL32(205, 140, 245, 255),   // D
-        IM_COL32(235, 225, 110, 255),   // E
-        IM_COL32(120, 225, 225, 255),   // F
-        IM_COL32(245, 130, 160, 255),   // G
-    };
-    return INK[i % (sizeof INK / sizeof INK[0])];
-}
-
-// The Temporal chart's legend. drawABLegendRow knows exactly two slots; this
-// one takes as many as the compare slots hold and WRAPS, because C/D/E push a
-// single row off the panel. Measuring and drawing are the same code (draw=false
-// only skips the ink), so the height reserved for the plot above is the height
-// the legend actually takes and adding a slot never moves the plot out from
-// under the cursor.
-struct TemporalLegendEntry { std::string text; ImU32 ink; };
-static float temporalLegendRow(const std::vector<TemporalLegendEntry>& e, bool draw) {
-    if (e.empty()) return 0.0f;
-    const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
-    const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
-    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
-    ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImU32 txt = IM_COL32(215, 222, 228, 255);
-    float x = 0;
-    int row = 0;
-    for (size_t i = 0; i < e.size(); i++) {
-        float w = sw + gap + ImGui::CalcTextSize(e[i].text.c_str()).x;
-        if (i && x + sep + w > availW) { row++; x = 0; }
-        else if (i) x += sep;
-        if (draw) {
-            float ex = p.x + x, ey = p.y + row * adv;
-            dl->AddLine(ImVec2(ex, ey + fh * 0.5f), ImVec2(ex + sw, ey + fh * 0.5f),
-                        e[i].ink, 1.6f);
-            dl->AddText(ImVec2(ex + sw + gap, ey), txt, e[i].text.c_str());
-        }
-        x += w;
-    }
-    float h = (row + 1) * adv;
-    // consume exactly h (ImGui adds one ItemSpacing after the Dummy)
-    if (draw) ImGui::Dummy(ImVec2(availW, std::max(h - ImGui::GetStyle().ItemSpacing.y, 1.0f)));
-    return h;
-}
-
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
 // (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
@@ -15089,7 +19183,6 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         app.temporalExtra.resize(app.cmpExtra.size());
         static const App::ServerTemporal NO_SERVER;        // extras are local-only
         for (const ResolvedSlot& rs : resolveSlots()) {
-            if (rs.doc == Bim) continue; // B may also hold a numbered slot: one curve
             if (rs.idx >= app.temporalExtra.size()) continue;
             recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
             XS.push_back({ rs.doc, slotName(rs.idx),
@@ -15385,7 +19478,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                        const ImageDoc* d, size_t inkIdx, bool stale) {
         TSlot s;
         s.letter = letter; s.label = abDocLabel(d); s.t = &t; s.doc = d;
-        s.ink = temporalSlotInk(inkIdx);
+        s.ink = slotInk(inkIdx);
         s.stale = stale;
         s.has = t.mean && t.idx && t.mean->size() >= 2 && t.idx->size() >= 2;
         if (!s.has)
@@ -15490,7 +19583,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     };
     // the legend names only the curves that exist; the slots that have none are
     // named in their own line under the plot, with the reason
-    std::vector<TemporalLegendEntry> leg;
+    std::vector<SlotLegendEntry> leg;
     for (const TSlot& s : slots) {
         if (!s.has) continue;
         std::string t = s.letter + ": " + elideFront(s.label, 22);
@@ -15514,11 +19607,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     float tAvail = ImGui::GetContentRegionAvail().y
                  - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
                  - (tooNarrow ? abNarrowNoteH() : 0.0f)
-                 - (side ? 0.0f : temporalLegendRow(leg, false))
+                 - (side ? 0.0f : slotLegendRow(leg, false))
                  - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
     if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
     float plotH = std::max(tAvail, 70.0f * app.uiScale);
-    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in sequence)";
+    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in stack)";
     // Box-zoom. Drag a rectangle on the chart to narrow both ranges to it;
     // double-click resets. The state is keyed to WHAT is on the axes (A's
     // document and the x label): a zoom in seconds must not survive a switch
@@ -15580,7 +19673,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             dl->PopClipRect();
             zoomUI(tp);
         }
-        temporalLegendRow(leg, true);
+        slotLegendRow(leg, true);
     } else {
         g_tchart.sideBySide = true;
         float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
@@ -15601,7 +19694,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                     g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     dl->PushClipRect(tp.p0, tp.p1, true);
-                    curve(tp, i, temporalSlotInk(0));   // its own panel: A's stroke
+                    curve(tp, i, slotInk(0));   // its own panel: A's stroke
                     marker(tp, slots[i].doc, i);
                     dl->PopClipRect();
                     zoomUI(tp);         // shared limits: a zoom in one panel zooms all
@@ -16062,15 +20155,18 @@ static void drawPanelTemporal() {
     ImGui::Text("Temporal");
     ImGui::Separator();
     ImGui::TextDisabled("%s is a single frame: no time axis.", im->name.c_str());
-    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open a "
-                        "sequence, or set a stack as compare B.");
+    ImGui::TextDisabled("Temporal noise (sigma_t) is a property of a STACK. Open one, "
+                        "or set a stack as compare B.");
 }
 
 // Basic per-ROI statistics (host-computed, always on). Detailed measurements
 // live in the Analysis window; this is the "at a glance" layer.
-struct RoiStat { double mean, sd, mn, mx; size_t n; bool valid; };
+// step: the row stride the sampler used (1 = every row). It rides along in the
+// result because a sigma whose sample count nobody can see is not a measurement
+// - the panel has to be able to say what n it rests on, and why n < the rect.
+struct RoiStat { double mean, sd, mn, mx; size_t n, step; bool valid; };
 static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw, int rh, int chSel) {
-    RoiStat s{ 0, 0, 0, 0, 0, false };
+    RoiStat s{ 0, 0, 0, 0, 0, 0, false };
     rx = std::clamp(rx, 0, im.w); ry = std::clamp(ry, 0, im.h);
     rw = std::clamp(rw, 0, im.w - rx); rh = std::clamp(rh, 0, im.h - ry);
     if (rw < 1 || rh < 1) return s;
@@ -16113,8 +20209,61 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
     s.mean = sum / n;
     double var = sum2 / n - s.mean * s.mean;
     s.sd = sqrt(var > 0 ? var : 0);
-    s.mn = mn; s.mx = mx; s.n = n; s.valid = true;
+    s.mn = mn; s.mx = mx; s.n = n; s.step = step; s.valid = true;
     return s;
+}
+
+// The "PRNU [sigma %]" column: this row's own sd over this row's own mean.
+// DERIVED, not measured, and deliberately not a field of RoiStat - it is the
+// two numbers the row already prints, divided, so it cannot drift from them
+// (which also settles the decimated case for free: the sample the sd describes
+// is the sample the ratio describes) and it cannot be pooled by averaging the
+// planes' values, because the pooled row divides the POOLED sd by the POOLED
+// mean and that is a different quantity.
+// mean <= 0 has no answer: a ratio to a level needs a level, and zero is not
+// one. So the column prints "-" rather than a nan or an inf - these numbers get
+// pasted into reports, and a blank that means "not stated" is recoverable where
+// an inf that means "we divided by zero" is not. It is also the same guard
+// plugins/analyzer_prnu.c already applies before it divides.
+static bool roiPrnuPct(const RoiStat& s, double* out) {
+    if (!s.valid || !(s.mean > 0)) return false;
+    double v = s.sd / s.mean * 100.0;
+    if (!std::isfinite(v)) return false;         // sd finite, mean denormal
+    *out = v;
+    return true;
+}
+
+// What the table cannot show in six characters. Full precision lives here; the
+// columns format at the edge. n both directions: past ~200k samples the sampler
+// reads whole rows at a stride, and n = 1 (a 1x1 ROI) makes sd exactly 0 - the
+// single most confusing number this panel can print, so it says why.
+// PRNU gets the longest note in this panel because its NAME claims more than
+// one frame can deliver: what is on screen is the spatial spread of one region
+// as displayed, so the tooltip has to hand back the conditions the name implies
+// and this layer does not have (docs/flat-field-stats.md).
+// planesMixed: channel = "all" on a multi-plane frame pools planes into one
+// population, so the plane LEVELS are inside that sd - the ratio then measures
+// the mosaic more than the sensor, and it must say so where it is read.
+static void roiStatTooltip(const RoiStat& s, bool planesMixed) {
+    if (!s.valid || !ImGui::IsItemHovered()) return;
+    ImGui::BeginTooltip();
+    ImGui::Text("mean %.10g    sd %.10g   [DN]", s.mean, s.sd);
+    ImGui::Text("min  %.10g    max %.10g   [DN]", s.mn, s.mx);
+    double pr = 0;
+    if (roiPrnuPct(s, &pr)) ImGui::Text("PRNU %.10g   [σ %%]  = sd / mean * 100", pr);
+    else ImGui::TextDisabled("PRNU: mean is not above 0, so sd / mean states nothing");
+    ImGui::TextDisabled("PRNU here is THIS ROI's sd over its own mean, as displayed:\n"
+                        "one frame, no dark subtraction, no flat-field correction.\n"
+                        "Temporal noise is inside it, so it bounds the fixed pattern\n"
+                        "from above and is not a measurement of it. A PRNU that means\n"
+                        "what EMVA means needs a layer above the frame - a flat stack\n"
+                        "and a dark stack (docs/flat-field-stats.md).");
+    if (planesMixed)
+        ImGui::TextDisabled("channel = all: the planes' level differences are in this sd.");
+    if (s.step > 1) ImGui::Text("n = %zu (sampled 1 row in %zu)", s.n, s.step);
+    else            ImGui::Text("n = %zu (every row)", s.n);
+    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition, so PRNU is 0");
+    ImGui::EndTooltip();
 }
 
 // The ROI table is drawn every frame; recomputing hundreds of thousands of
@@ -16150,7 +20299,19 @@ static RoiStat roiBasicStats(const ImageDoc& im, int rx, int ry, int rw, int rh,
     return s;
 }
 
+// Selftest probe: the numbers this table actually printed, and where each row's
+// delete button landed on screen. The panel's own call path - roiBasicStats
+// through the cache, inside the clipper, with the button under a span-all-columns
+// Selectable - had no coverage; asserts that call the stats function directly
+// cannot see any of it. id 0 = the "All (whole image)" row (no delete button).
+// prnu/prnuOk are what the PRNU cell PRINTED, taken at the cell: asserting on
+// roiPrnuPct() from the test would only re-run the test's own arithmetic.
+struct RoiRowProbe { int id; RoiStat s; ImVec2 del, lbl; double prnu; bool prnuOk; };
+static std::vector<RoiRowProbe> g_roiRowProbe;
+static bool g_roiRowProbeOn = false;
+
 static void drawPanelRois() {
+    if (g_roiRowProbeOn) g_roiRowProbe.clear();
     ImageDoc* im = cur();
     if (!im) { ImGui::TextDisabled("no image"); return; }
 
@@ -16159,7 +20320,11 @@ static void drawPanelRois() {
     static const char* CFA_SEL[5] = { "all", "R", "Gr", "Gb", "B" };
     static const char* CH_SEL[5] = { "all", "ch0", "ch1", "ch2", "ch3" };
     int maxSel = cfa ? 4 : std::min(im->ch, 4);
-    app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - (cfa ? 0 : 1));
+    // maxSel - 1 on BOTH sides: the CFA arm used to clamp to maxSel, so a
+    // restored roichannel of 4 stuck at 4 - one past the last plane. That reads
+    // CFA_SEL[5] off the end of the array and matches no plane, so every row in
+    // the table would print "-" with nothing saying why.
+    app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - 1);
     const char* curSel = app.roiChannel < 0 ? "all"
                                             : (cfa ? CFA_SEL[app.roiChannel + 1] : CH_SEL[app.roiChannel + 1]);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
@@ -16182,7 +20347,10 @@ static void drawPanelRois() {
     // fill the window instead of a fixed 9-text-line box: rows are frame-height,
     // so the old constant showed 4 ROIs no matter how large the window was
     const float editH = ImGui::GetFrameHeight() * 2 + ImGui::GetStyle().ItemSpacing.y;
-    if (ImGui::BeginTable("roitable", 8, TF,
+    // channel = "all" over more than one plane pools them: the plane levels are
+    // then part of every sd this table prints, and the tooltip has to say so.
+    const bool planesMixed = app.roiChannel < 0 && (cfa || im->ch > 1);
+    if (ImGui::BeginTable("roitable", 9, TF,
                           ImVec2(0, -(editH + ImGui::GetStyle().ItemSpacing.y * 2 + 1.0f)))) {
         // stretch weights, not fixed widths: four fixed numeric columns would eat
         // the whole table and collapse name/region to a few pixels
@@ -16192,6 +20360,12 @@ static void drawPanelRois() {
         ImGui::TableSetupColumn("region", ImGuiTableColumnFlags_WidthStretch, 1.7f);
         ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        // Next to the two numbers it is made of, and wider than them: the unit
+        // is part of the name, the way the Analysis grid carries a unit column
+        // rather than leaving a reader to guess what a figure is measured in -
+        // and a header clipped to "PRNU [..." would be the one column nobody
+        // could identify from a screenshot.
+        ImGui::TableSetupColumn("PRNU [σ %]", ImGuiTableColumnFlags_WidthStretch, 1.5f);
         ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
@@ -16202,18 +20376,24 @@ static void drawPanelRois() {
         // measurement target is always explicit
         {
             RoiStat s = roiBasicStats(*im, 0, 0, im->w, im->h, app.roiChannel);
+            double pr = 0;
+            const bool prOk = roiPrnuPct(s, &pr);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TableNextColumn();
             if (ImGui::Selectable("All (whole image)", app.selectedAnn <= 0,
                                   ImGuiSelectableFlags_SpanAllColumns))
                 app.selectedAnn = 0;
+            roiStatTooltip(s, planesMixed);
             ImGui::TableNextColumn(); ImGui::Text("%dx%d", im->w, im->h);
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); prOk ? ImGui::Text("%.6g", pr) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
+            if (g_roiRowProbeOn)
+                g_roiRowProbe.push_back({ 0, s, ImVec2(-1, -1), ImVec2(-1, -1), pr, prOk });
         }
         int removeId = -1;
         // Only the rows you can see. Submitting all of them cost 1.35 ms/frame at
@@ -16225,27 +20405,44 @@ static void drawPanelRois() {
         for (int ai = clipper.DisplayStart; ai < clipper.DisplayEnd; ai++) {
             App::Ann& a = app.anns[ai];
             ImGui::PushID(a.id);
+            // measured before the row is drawn, so the row label can carry the
+            // tooltip that says what n these numbers rest on
+            RoiStat s{ 0, 0, 0, 0, 0, 0, false };
+            if (a.type == 0) s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
+            double pr = 0;
+            const bool prOk = roiPrnuPct(s, &pr);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("##vis", &a.visible)) app.annRev++;
             ImGui::TableNextColumn();
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ANN_COLORS[a.color & 7]));
             bool sel = app.selectedAnn == a.id;
-            if (ImGui::Selectable(a.label.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns))
+            // AllowOverlap: this Selectable is submitted first and its rect covers
+            // the whole row, the delete button in the last column included. Without
+            // it ImGui hands the row's hover to the Selectable and every later item
+            // in the row is unreachable - the x button never saw a click.
+            if (ImGui::Selectable(a.label.c_str(), sel,
+                                  ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowOverlap))
                 app.selectedAnn = a.id;
+            ImVec2 lblC((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                        (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
             ImGui::PopStyleColor();
+            roiStatTooltip(s, planesMixed);
             ImGui::TableNextColumn();
             if (a.type == 0) ImGui::Text("%dx%d @%d,%d", a.w, a.h, a.x, a.y);
             else if (im->cfa && a.x < im->w && a.y < im->h)
                 ImGui::Text("%d,%d [%s]", a.x, a.y, CFA_CH_NAMES[cfaChannelAt(*im, a.x, a.y)]);
             else ImGui::Text("%d,%d", a.x, a.y);
             if (a.type == 0) {                          // ROI: area statistics
-                RoiStat s = roiBasicStats(*im, a.x, a.y, a.w, a.h, app.roiChannel);
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mean) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.sd) : ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); prOk ? ImGui::Text("%.6g", pr) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mn) : ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); s.valid ? ImGui::Text("%.6g", s.mx) : ImGui::TextDisabled("-");
             } else {                                     // POI: the pixel value itself
+                // one pixel has no spread, so std, PRNU, min and max are all
+                // "-" here: a POI row is a VALUE, not a population
                 bool inside = a.x >= 0 && a.y >= 0 && a.x < im->w && a.y < im->h;
                 int c0 = app.roiChannel < 0 ? 0 : std::min(app.roiChannel, im->ch - 1);
                 ImGui::TableNextColumn();
@@ -16254,9 +20451,15 @@ static void drawPanelRois() {
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
             }
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("x")) removeId = a.id;
+            if (g_roiRowProbeOn)
+                g_roiRowProbe.push_back({ a.id, s,
+                    ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                           (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f),
+                    lblC, pr, prOk });
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -16430,7 +20633,7 @@ static void drawPanelAnalysis() {
                      ana.cfaPattern != im->cfaPattern;
         bool ranNow = runClicked || (app.anaAuto && stale && !app.annBusy);
         if (ranNow) {
-            double runT0 = glfwGetTime();
+            double runT0 = nowSec();
             ana.cols.clear(); ana.keys.clear(); ana.vals.clear(); ana.series.clear(); ana.err.clear();
             ana.colColor.clear(); ana.units.clear(); ana.headline.clear();
             if (im->preview) promotePreview(im);   // measuring it = keeping it
@@ -16490,7 +20693,7 @@ static void drawPanelAnalysis() {
                     runOne(&rr, a->label, a->color & 7);
                 }
             }
-            ana.runMs = (float)((glfwGetTime() - runT0) * 1000.0);
+            ana.runMs = (float)((nowSec() - runT0) * 1000.0);
             // per-row presentation, derived once here so the draw loop below
             // only reads cached strings (no per-frame string building)
             {
@@ -16806,6 +21009,40 @@ struct RbRow {
 // earlier). A sort change therefore lands on the next frame - invisible, and
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+
+// RB_COL_NAME's comparator, and the ONE place both listing shapes ask for it.
+// There are two sorts - the flat listing sorts row indices in rbSortShown, the
+// tree sorts each LEVEL inside rbAddRows - and a comparator written out twice
+// is how a listing comes to disagree with itself. It is written once here.
+//
+// NATURAL is the default (rp::naturalLess, remote_proto.h - the same function
+// the peer sorts a group's members with, so a local listing and a remote one
+// of the same folder read identically). Digit runs compare by value, so
+// frame_2 comes before frame_10; letters compare case-insensitively.
+//
+// Plain lexicographic is what std::string::compare gives, what this listing
+// did unconditionally until 2026-08-05, and what the panel menu can still ask
+// for - per panel. It was the wrong default because the stack you open FROM
+// the listing is built with naturalLess (sortFramesNumerically), so the order
+// on screen was not the order sigma_t was computed over, and a tooltip in the
+// same panel already told the user frames stack in numeric name order.
+//
+// Only NAMES. RB_COL_SIZE and RB_COL_MTIME are numbers and have exactly one
+// order; this cannot reach them. And it cannot reach a stack either - see the
+// comment on sortFramesNumerically, which is the half of this that has no
+// setting on purpose.
+//
+// Returns <0 / 0 / >0, not a bool, because the callers negate it for a
+// descending sort. Two naturalLess calls rather than one: names that are equal
+// BY VALUE but different as text ("img01" vs "img1") must come out 0 here, so
+// that the callers' stable_sort leaves them in the order the peer sent them -
+// which is deterministic, where picking either one arbitrarily would not be.
+static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
+    if (!natural) return a.compare(b);
+    if (rp::naturalLess(a, b)) return -1;
+    if (rp::naturalLess(b, a)) return 1;
+    return 0;
+}
 // (The keyboard cursor and the stashed sort spec were file-scope singletons
 // here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
 // BrowseInstance::cursor / sortCol / sortDesc.)
@@ -16856,6 +21093,8 @@ static void rbAddRows(const App::BrowseInstance& I,
     if (tree) {
         // Per LEVEL: a global sort over a flattened tree would tear children
         // away from their parents. Directories first, as in the flat listing.
+        // Same name comparator as the flat listing (rbNameCmp), or the two
+        // shapes of the same panel would put the same folder in two orders.
         std::stable_sort(order.begin(), order.end(), [&](int ia, int ib) {
             const remote::Entry& a = ents[ia];
             const remote::Entry& b = ents[ib];
@@ -16864,7 +21103,7 @@ static void rbAddRows(const App::BrowseInstance& I,
             switch (I.sortCol) {
                 case RB_COL_SIZE:  cmp = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
                 case RB_COL_MTIME: cmp = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
-                default:           cmp = a.name.compare(b.name); break;
+                default:           cmp = rbNameCmp(a.name, b.name, I.nameNatural); break;
             }
             return I.sortDesc ? cmp > 0 : cmp < 0;
         });
@@ -16893,6 +21132,83 @@ static void rbAddRows(const App::BrowseInstance& I,
               out.push_back(r); }
         }
     }
+}
+
+// The listing's own sort: `shown` holds row indices into `view` and comes back
+// in SCREEN order. A free function for the same reason rbBuildView is one -
+// the headless selftest sorts exactly what the panel sorts, rather than a
+// second copy of the rules that can drift from it.
+//
+// TREE mode never comes here. Its levels were sorted inside the builder, one
+// frame earlier (the sort spec is stashed in I.sortCol because
+// TableGetSortSpecs only exists between Begin/EndTable), and sorting the
+// flattened tree would tear children away from their parents.
+//
+// Directories sort before files under every key: this is a browser, not a
+// table of numbers.
+static void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
+                        std::vector<int>& shown) {
+    std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
+        const RbRow& a = view[ia];
+        const RbRow& b = view[ib];
+        if (a.up != b.up) return a.up;      // ".." is row 0 under every sort
+        if (a.isDir() != b.isDir()) return a.isDir();
+        // an expanded frame has no size / mtime of its own: it sorts as
+        // unknown (0) rather than borrowing the group's totals
+        uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
+        int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
+        int cmp = 0;
+        switch (I.sortCol) {
+            case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
+            case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
+            default:           cmp = rbNameCmp(a.name(), b.name(), I.nameNatural); break;
+        }
+        return I.sortDesc ? cmp > 0 : cmp < 0;
+    });
+}
+
+// ---- the ancestors of the first visible row ---------------------------------
+// Scrolling a tree used to carry its own context off the top of the panel: six
+// rows down inside scanroot/40lx there was nothing on screen saying you were in
+// scanroot, or in 40lx, and the only way to find out was to scroll back. The
+// levels above the reader stay put now - every one of them, no depth limit -
+// and this function is which rows those are.
+//
+// It takes the position ON SCREEN of the first row the clipper will submit and
+// gives back the screen positions of that row's ancestors, outermost first.
+//
+// Why it is written against `shown` and not against the drawn rows: the listing
+// is virtualised. Everything above DisplayStart is never submitted, so there is
+// no row object to ask "who is your parent" - and there is no parent POINTER on
+// an RbRow either, because rbAddRows flattens the tree into a depth-tagged run.
+// That flattening is what makes this cheap: in a run where a child always
+// follows its parent, the ancestors of row f are exactly the rows you meet
+// walking BACKWARDS from f while taking each one whose depth is lower than the
+// last one taken. It reads only the rows it takes plus the ones it steps over,
+// touches no ImGui state, and needs no row to have been drawn - which is what
+// lets the whole rule be tested without a GL context.
+//
+// ".." is excluded by construction, not by a special case: it sits at depth 0
+// as row 0 and the walk stops the moment it takes a depth-0 row, which for any
+// row inside a tree is that row's real top-level folder. The `up` test is there
+// for the one listing where ".." is the ONLY depth-0 row - a flat listing has
+// no depth at all, and then this correctly returns nothing.
+//
+// The returned values index `shown`, i.e. they are ROW POSITIONS, not view
+// indices: a pinned row is drawn by the same code, from the same index, as the
+// row it is a copy of, so there is nothing about it that can behave differently.
+static void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
+                           int firstRow, std::vector<int>& out) {
+    out.clear();
+    if (firstRow <= 0 || firstRow >= (int)shown.size()) return;
+    int want = view[shown[firstRow]].depth;      // an ancestor is strictly shallower
+    for (int r = firstRow - 1; r >= 0 && want > 0; r--) {
+        const RbRow& c = view[shown[r]];
+        if (c.up || c.depth >= want) continue;
+        out.push_back(r);
+        want = c.depth;
+    }
+    std::reverse(out.begin(), out.end());        // outermost first, as drawn
 }
 
 // ---- deferred panel actions -------------------------------------------------
@@ -16950,7 +21266,17 @@ struct RbDeferredActions {
 // so this changes nothing that can be seen - it makes "the panel never
 // navigates mid-draw" true by construction rather than by inspection.
 static void rbGoTo(App::BrowseInstance& I, const std::string& dir) {
-    rbDefer([&I, dir] { remoteBrowseTo(I, dir); });
+    rbDefer([&I, dir] {
+        // Going somewhere leaves no cursor behind. The rows this index named are
+        // about to be replaced, and row 1 of the old place is a different row -
+        // or no row - in the new one. This used to be inferred one frame later,
+        // from the listing signature changing, which is true but late: anything
+        // that writes the cursor between the click and that frame wins. Two
+        // attempts to guard the individual writers both missed one. The rule
+        // belongs to the navigation, which is the thing that makes it true.
+        I.cursor = -1;
+        remoteBrowseTo(I, dir);
+    });
 }
 
 // Bookmarks + recents. The ITEMS are their own function because they live in
@@ -17000,6 +21326,20 @@ static void drawRemotePlacesCombo(App::BrowseInstance& I) {
 
 // (RbToolbarGeom is defined next to ViewState now - each instance carries one.)
 static float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
+// ...and its HEIGHT, which the pinned-ancestor checks need and the width sweep
+// does not: a band only exists once the listing is too long for the panel, and
+// a test that waits for a fixture big enough to overflow whatever height the
+// screen happens to give is a test that passes for the wrong reason on a big
+// monitor. 0 = the old behaviour (80% of the work area).
+static float g_rbForceH = 0;
+// "marklist" / "starmark": the baselines the drawer-removal checks compare
+// against. The list's top y proves an error does not open a band above the rows
+// (it changes the status line and nothing else), and the star's baseline makes
+// the bookmark check a FLIP rather than an absolute - a scripted run inherits
+// the user's real bookmark list and must not care what is already in it.
+static float g_rbListTopY0 = 0;
+static int   g_rbStar0 = -1;
+static int   g_rbPeerV0 = -1;     // "setpv" saves the real one; "pvback" restores
 // --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
 // frame, after the GLFW backend has had its say: the backend overwrites the
 // mouse position from the OS cursor whenever the window counts as focused, and
@@ -17016,14 +21356,79 @@ static App::BrowseInstance& rbKeysT() {
     return rbMain();
 }
 
-// The "+" affordance: one more Browse, docked nowhere in particular - the
-// same command View > New Browse Panel runs. Deferred: creating an instance
-// grows app.browsePanels, and the window loop is iterating it.
+// The "+" affordance: one more Browse, as a TAB beside this one. It used to
+// make a panel docked nowhere in particular, which is a different promise from
+// the one a "+" makes anywhere else on a computer - next to tabs it means "one
+// more of these, here", and a window appearing somewhere else reads as a bug.
+// Docking is on (ImGuiConfigFlags_DockingEnable), and ImGui already draws
+// co-docked windows as a tab bar, so the tab strip is not something to build:
+// it is what happens once the new panel lands in the same node.
+//
+// Deferred: creating an instance grows app.browsePanels, and the window loop is
+// iterating it. The dock id has to be read HERE, inside the panel's own window.
 static void rbPlusButton() {
-    if (ImGui::SmallButton("+##rbnew")) rbDefer([] { rbNewInstance(); });
+    if (ImGui::SmallButton("+##rbnew")) {
+        ImGuiID here = ImGui::GetWindowDockID();
+        rbDefer([here] { rbNewInstance().dockInto = (unsigned)here; });
+    }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("new Browse panel - another view onto another place\n"
+        ImGui::SetTooltip("one more Browse, as a tab beside this one\n"
                           "(View > New Browse Panel)");
+}
+
+// The protocol-mismatch sentence, in BOTH directions, for the bottom status
+// line. It used to be a conditional orange row above the listing; the fact is
+// worth keeping and the row was not (a warning that shoves every file down one
+// line the moment an old peer answers). Empty = the versions agree, and
+// agreement is silent.
+static std::string rbProtocolNote(int pv) {
+    char t[192];
+    if (pv > 0 && pv < 3)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "shape and date need an update (File > Update remote peer)",
+                 pv, (int)rp::VERSION);
+    else if (pv > 0 && pv < (int)rp::VERSION)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "File > Update remote peer", pv, (int)rp::VERSION);
+    else if (pv > (int)rp::VERSION)
+        snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
+                              "listings may group differently from a local open; "
+                              "update the viewer", pv, (int)rp::VERSION);
+    else return std::string();
+    return t;
+}
+
+// Middle-out elision to a PIXEL width, for the status line. Middle-out and not
+// front or back because both ends of that line carry a fact: the machine is at
+// the head and the counts are at the tail, and dropping either answers a
+// question the reader did not ask. Binary search on how many bytes survive -
+// width is monotone in that - so a long failure message costs a dozen
+// CalcTextSize calls, not one per character.
+static std::string rbElideMiddle(const std::string& s, float maxW) {
+    if (s.empty()) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    // Not even the marker fits: print NOTHING. Returning "..." here would draw
+    // wider than the room it was given, which is the one thing this function
+    // exists to prevent - and three dots that overflow say less than nothing.
+    if (ImGui::CalcTextSize("...").x > maxW) return std::string();
+    auto onBoundary = [&s](size_t i) {         // never cut a UTF-8 sequence
+        return i == 0 || i >= s.size() || (s[i] & 0xC0) != 0x80;
+    };
+    auto build = [&](size_t keep) {
+        size_t head = (keep + 1) / 2;
+        while (head > 0 && !onBoundary(head)) head--;
+        size_t tstart = s.size() - (keep - (keep + 1) / 2);
+        while (tstart < s.size() && !onBoundary(tstart)) tstart++;
+        if (tstart < head) tstart = head;
+        return s.substr(0, head) + "..." + s.substr(tstart);
+    };
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (ImGui::CalcTextSize(build(mid).c_str()).x <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    return build(lo);
 }
 
 static void drawPanelRemote(App::BrowseInstance& I) {
@@ -17033,6 +21438,41 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree
     // next frame" deferral that covered the tree cache and nothing else.)
     RbDeferredActions rbActions(I);
+    // ---- A GESTURE THAT NAVIGATES OWNS THE WHOLE GESTURE --------------------
+    // A folder row is entered on ONE click in a list now, and the pointer does
+    // not move afterwards. Two decades of "a folder takes two clicks" say the
+    // second click is coming anyway; it arrives one or two frames later, by
+    // which time the listing it was aimed at has been replaced under it, and
+    // without this it lands on whatever row now occupies that pixel - opening
+    // it, previewing it, or dragging the keyboard cursor onto it.
+    //
+    // That is not a hypothesis. browse-keys' instance segment double-clicks
+    // scanroot/10lx in panel 2, and on the ubuntu runner (where a local listing
+    // of eight files lands inside the ~8 ms frame budget the selftest runs at,
+    // which it does not on Windows) the log reads
+    //     185 dbl        dir=.../rb/scanroot rows=3 imgs=44
+    //     186 waitdir:10lx dir=.../rb/scanroot/10lx rows=1 imgs=52
+    // - eight images and a fifth stack that nobody asked for, because click two
+    // landed on 10lx's own frame_000..007 group, plus cursor=1 written by that
+    // click's release. Three earlier fixes all guarded the row that navigated;
+    // the write to stop belongs to a legitimate click on a DIFFERENT listing,
+    // so none of them could see it.
+    //
+    // The chain is ImGui's own: MouseClickedLastCount counts the clicks of one
+    // gesture and resets to 1 when the next press is too late or too far to
+    // chain. So "still the same gesture" is exactly "the count went up", and
+    // the first press that does not is the listing becoming live again.
+    // (".." is deliberately NOT latched: it is row 0 of every listing, so a
+    // repeat click there is a repeat of the same control - the toolbar's "up"
+    // button case - not a click that landed on something else.)
+    {
+        const ImGuiIO& nio = ImGui::GetIO();
+        if (I.navChain > 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            int n = nio.MouseClickedLastCount[ImGuiMouseButton_Left];
+            I.navChain = n > I.navChain ? n : 0;
+        }
+    }
+    const bool rbNavGesture = I.navChain > 0;
     // the focused panel is the one the File menu's remote commands aim at
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
         g_rbActiveNum = I.num;
@@ -17085,53 +21525,57 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     }
     // The panel used to stack FIVE things above the listing: a host row with
     // three buttons, the breadcrumb bar, the filter, the server-search row, and
-    // (when a preview was alive) the scrub bar. Four of them were there for the
-    // rare case. What is left permanently on screen is what browsing actually
-    // needs - where am I (breadcrumbs) and narrow it down (toolbar + filter) -
-    // and everything else is one click away under "more", with nothing removed.
-    bool& rbAdvanced = I.advanced;
+    // (when a preview was alive) the scrub bar - plus an error band and a
+    // protocol warning that appeared and vanished, moving every file row under
+    // the cursor. What is above the listing now is TWO rows that never change
+    // count: where am I (the path, with the bookmark star at its end) and
+    // narrow it down (the filter, the count, the "..." menu). Everything that
+    // is state rather than navigation reports on the bottom status line, and
+    // the "more" drawer is gone - see docs/browse-topbar-design.md 10.2/10.3.
     // Server-side search: a different thing from the filter (which only narrows
     // what is already listed). Referenced up here because the path bar's context
-    // menu can aim it at a folder. (These were function-local statics - one
-    // search box shared by every panel; per instance now.)
-    char* rbSearchBuf = I.searchBuf;
-    bool& rbSearchFocus = I.searchFocus;
+    // menu can aim it at a folder.
     // set by "Search under here"; empty = this folder. On App::RemoteBrowse, so
     // it dies with the connection - see the field.
     std::string& rbSearchRoot = B.searchRoot;
     // where we are, and how to leave
-    bool atRoot = B.dir == "~" || B.dir == "/";
+    const std::string rbRoot = pathRootOf(B.dir);
+    bool atRoot = B.dir == rbRoot || B.dir == "~" || B.dir == "/";
     auto rbGoParent = [&]() {
         if (atRoot) return;
         std::string d = B.dir;
         size_t s = d.find_last_of('/');
-        rbGoTo(I, s == std::string::npos || s == 0 ? (d[0] == '~' ? "~" : "/")
-                                                   : d.substr(0, s));
+        std::string up = s == std::string::npos || s == 0 ? rbRoot : d.substr(0, s);
+        // never step above the volume: the parent of "C:/data" is "C:/", not
+        // "C:" (a different place on Windows), and a UNC share has no parent
+        if (up.size() < rbRoot.size()) up = rbRoot;
+        rbGoTo(I, up);
+    };
+    // Leaving the place. One verb, two entrances - the bottom status line (next
+    // to the host it acts on) and the root crumb's menu (the crumb that NAMES
+    // the host). It was in the "more" drawer, where nobody could see the thing
+    // it disconnects from either. Deferred: it replaces the state every row on
+    // screen is pointing into, so it runs after the panel is done drawing.
+    // There is nothing to disconnect FROM when the peer runs on this machine,
+    // so the local wording is "close browse" - the panel never claims a network
+    // connection it does not have.
+    const bool rbLocalPeer = B.host.empty();
+    auto rbDisconnect = [&I] {
+        rbDefer([&I] {                   // another machine, other children
+            app.uiSession.stop();        // ours to stop; the worker's is a job
+            App::RbJob j;
+            j.kind = App::RbDisconnect;
+            rbEnqueue(I, std::move(j));
+            I.b = App::RemoteBrowse{};
+            rbTreeForget(I);
+        });
     };
     // ---- row 1: path bar - breadcrumbs, or one text field while editing ----
     char* rbPathEdit = I.pathEdit;
     bool& rbPathEditing = I.pathEditing;
     bool& rbPathFocus = I.pathFocus;
     if (!rbPathEditing) {
-        struct Seg { std::string label, path; };
-        std::vector<Seg> segs;
-        const std::string& d = B.dir;
-        size_t i = 0;
-        if (!d.empty() && d[0] == '/')      { segs.push_back({ "/", "/" }); i = 1; }
-        else if (!d.empty() && d[0] == '~') { segs.push_back({ "~", "~" });
-                                              i = d.size() > 1 && d[1] == '/' ? 2 : 1; }
-        while (i < d.size()) {
-            size_t s = d.find('/', i);
-            std::string part = d.substr(i, s == std::string::npos ? std::string::npos : s - i);
-            if (!part.empty()) {
-                std::string prefix = segs.empty() ? part
-                                   : segs.back().path == "/" ? "/" + part
-                                   : segs.back().path + "/" + part;
-                segs.push_back({ part, prefix });
-            }
-            if (s == std::string::npos) break;
-            i = s + 1;
-        }
+        std::vector<PathSeg> segs = pathSegments(B.dir);
         bool editReq = false;
         // The places dropdown sits at the LEFT EDGE of the path bar - a file
         // manager's address-bar chevron - instead of being a band of its own.
@@ -17175,8 +21619,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     remoteScanFolder(I, target);
                 if (ImGui::MenuItem("Search under here")) {
                     rbSearchRoot = target;
-                    rbSearchFocus = true;
-                    rbAdvanced = true;          // the search row lives under "more"
+                    I.searchOpen = true;        // aim the root, then focus the box
                 }
                 if (ImGui::MenuItem("Bookmark")) {
                     std::string u = placeUrl(B.host, B.port, target);
@@ -17187,6 +21630,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         savePrefs();
                     }
                     toast("bookmarked " + u);
+                }
+                // The ROOT crumb is the one that stands for the machine, so it
+                // is the one that can leave it. Deeper crumbs are folders and
+                // have no opinion about the connection.
+                if (k == 0) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(rbLocalPeer ? "Close this browse"
+                                                    : "Disconnect")) rbDisconnect();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(rbLocalPeer
+                            ? "stop listing this machine and empty the panel"
+                            : "drop the ssh session to %s and empty the panel",
+                            peerLabel(B.host).c_str());
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Copy path")) {
@@ -17206,11 +21662,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         // itself is the affordance, not another button in the row
         if (!segs.empty()) ImGui::SameLine(0, 4);
         {
-            // the "+" (one more Browse) holds the bar's right edge - the
-            // click-to-edit run pays for it
-            const float plusW = ImGui::CalcTextSize("+").x +
-                                ImGui::GetStyle().FramePadding.x * 2 + 6;
-            float editW = std::max(ImGui::GetContentRegionAvail().x - plusW -
+            // the star and the "+" (one more Browse) hold the bar's right edge -
+            // the click-to-edit run pays for both
+            const float oneBtnW = ImGui::CalcTextSize("+").x +
+                                  ImGui::GetStyle().FramePadding.x * 2 + 6;
+            float editW = std::max(ImGui::GetContentRegionAvail().x - oneBtnW * 2 -
                                    (I.busy ? ImGui::CalcTextSize("(listing...)").x + 8 : 0),
                                    ImGui::GetFontSize() * 1.5f);
             if (ImGui::InvisibleButton("##pathedit", ImVec2(editW, ImGui::GetTextLineHeight())))
@@ -17222,10 +21678,43 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
         }
         if (I.busy) { ImGui::SameLine(); ImGui::TextDisabled("(listing...)"); }
+        // The star ends the PATH line because it is about the path: lit means
+        // this place is bookmarked, so it reads as a state before it is used as
+        // a verb. In the drawer it could be neither - a bookmark indicator that
+        // is only visible after you open a fold indicates nothing.
+        ImGui::SameLine(0, 4);
+        {
+            std::string curUrl = placeUrl(B.host, B.port, B.dir);
+            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
+                                     curUrl) != app.rbBookmarks.end();
+            I.toolbar.starLit = starred ? 1 : 0;
+            // lit = gold, unlit = the dimmed text colour. The star is always
+            // THERE (an affordance that appears only once used cannot be found
+            // the first time); what changes is whether it is on.
+            ImGui::PushStyleColor(ImGuiCol_Text, starred
+                ? ImVec4(0.98f, 0.83f, 0.35f, 1)
+                : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            if (ImGui::SmallButton("*##rbstar")) {
+                if (starred)
+                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
+                                                      app.rbBookmarks.end(), curUrl),
+                                          app.rbBookmarks.end());
+                else
+                    app.rbBookmarks.push_back(curUrl);
+                app.prefsDirty = true;
+                savePrefs();
+            }
+            ImGui::PopStyleColor();
+            I.toolbar.starCentre = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                                          (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(starred ? "bookmarked - click to forget:\n%s"
+                                          : "bookmark this place:\n%s", curUrl.c_str());
+        }
         ImGui::SameLine(0, 4);
         rbPlusButton();
         if (editReq) {
-            snprintf(rbPathEdit, sizeof I.pathEdit, "%s", d.c_str());
+            snprintf(rbPathEdit, sizeof I.pathEdit, "%s", B.dir.c_str());
             rbPathEditing = true;
             rbPathFocus = true;
         }
@@ -17247,18 +21736,11 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SameLine();
         if (ImGui::SmallButton("cancel##path")) rbPathEditing = false;
     }
-    if (!B.err.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.55f, 0.4f, 1));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextUnformatted(B.err.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("copy##rberr")) {
-            ImGui::SetClipboardText(B.err.c_str());
-            toast("copied");
-        }
-    }
+    // (The full-width orange error band used to be here. A wrapped band above
+    // the listing took one to three ROWS and shoved every file down by them -
+    // the appearing-and-vanishing rows this redesign is against - and it said
+    // the failure in the one place the failure did not happen. The text lives
+    // on the bottom status line now, at the end of this function.)
     // The listing as ROWS: grouped (one row per sequence) or flat (one row per
     // frame), listing or tree. Rebuilt every frame - see rbBuildView.
     std::vector<RbRow> view = rbBuildView(I, &B.dir, B.entries, I.flat, I.tree);
@@ -17291,6 +21773,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         rbSelFlat = I.flat;
         rbSelTree = I.tree;
         // an expand or a collapse moved every row below it: start clean
+        // Going somewhere ends the selection too, and this used to be inferred
+        // from the row COUNT changing - so walking into a different folder with
+        // the same number of rows carried the ticks across, pointing at files
+        // that were no longer listed. The listing's identity is the signature,
+        // not its length.
+        {
+            // I.selSig, not a function-local static: this file already learned
+            // that lesson once - one search box was shared by every panel - and
+            // a shared signature would clear panel 2's selection whenever panel
+            // 1 navigated.
+            std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
+            if (sig != I.selSig) { I.selSig = sig; rbSel.assign(view.size(), 0); }
+        }
         if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
     }
     // What a plain click does: show a throwaway PREVIEW of a file / of a
@@ -17303,13 +21798,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }     // dead at the root, by rbGoParent
         if (r.isDir()) {
-            // Selection only, in BOTH shapes. The tree's expand/collapse
-            // belongs to the CHEVRON hit zone (and to Right/Left) - the name
-            // has no click-time side effect, so the first click of a
-            // double-click changes nothing on screen. Its predecessor toggled
-            // here and CANCELLED on the second click (the ce02f12 latch):
-            // state-correct at the end, but the expand was rendered between
-            // the clicks, and a flash the eye sees is a flash however it ends.
+            // Nothing, and the MOUSE no longer arrives here for a folder: the
+            // click handler does the folder's verb itself (enter in the list,
+            // expand in the tree) because it needs to know whether the chevron
+            // was hit, which this cannot see. What still reaches this branch is
+            // the keyboard walking the listing, and moving a cursor over a
+            // folder must not open it.
             return;
         }
         if (!isNpyName(r.name())) return;
@@ -17389,8 +21883,9 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         dropPreview();                       // a stale preview is not this row's
         openRemote(u, false);
     };
-    // ---- row 2: the toolbar. Move, refresh, choose the shape of the listing,
-    // narrow it down. Everything else is behind "more".
+    // ---- row 2: the toolbar. Narrow the listing down, and say so when the
+    // listing's shape is not the default. Everything else is in the "..." menu
+    // at the end of the row - there is no drawer any more.
     //
     // The row FLOWS. It used to be one fixed SameLine chain, and at the panel's
     // own default docked width (0.17 of the window - 271 px on a 1600 px screen)
@@ -17410,105 +21905,75 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::GetContentRegionAvail().x < need) ImGui::NewLine();
     };
     // Measured, not guessed: what has to survive to the right of the filter.
-    // The WIDER of the two labels the fold button wears, so clicking it cannot
-    // reflow the row it sits in ("more" is 12 px wider than "less").
-    const float rbAdvW = std::max(rbBtnW("more##rbadv"), rbBtnW("less##rbadv"));
+    // That used to be the fold button, measured at the WIDER of its two labels
+    // so a click could not reflow its own row; the fold is gone and the fixed
+    // label "..." cannot change width at all.
+    const float rbMenuW = rbBtnW("...##rbmenu");
     auto rbFilterTailW = [&](bool counted) {
-        float w = rbAdvW + rbStyle.ItemSpacing.x;
+        float w = rbMenuW + rbStyle.ItemSpacing.x;
         if (counted) w += ImGui::CalcTextSize("9999/9999").x + rbStyle.ItemSpacing.x;
+        // Stop and the search root sit between the box and the count, and both
+        // appear WHILE the box is in use. Not reserving them is how a control
+        // that only exists during a search ends up off the right edge exactly
+        // when it is the one control that matters.
+        if (I.search.running) w += rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
+        if (!B.searchRoot.empty()) w += rbBtnW("under: x") + rbStyle.ItemSpacing.x;
         return w;
     };
     char* rbFilter = I.filter;
+    // Refresh lost its button to F5 and the "..." menu; both call this, so it
+    // is declared before either of them.
+    auto rbRefresh = [&I, &B] {
+        rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
+        rbGoTo(I, B.dir);
+    };
     {
-        // One toolbar row: navigation first (back / forward / up / home /
-        // refresh, compact), then the two view toggles, then the filter. The
-        // half of a two-state toggle that is ON wears the active fill, so the
-        // pair never changes width when clicked (a swapping label reflowed the
-        // row it sat in - same defect family as the more/less fold button).
-        auto rbSegBtn = [&](const char* lb, bool on) {
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button,
-                                          ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
-            bool clicked = ImGui::SmallButton(lb);
-            if (on) ImGui::PopStyleColor();
-            return clicked;
+        // One toolbar row: the chips that name a non-default listing shape,
+        // then the filter, then the count, then the "..." menu.
+        // Navigation has no buttons: back / forward are mouse 4 / 5 and
+        // Alt+Left / Alt+Right, the parent is the ".." row and Backspace, home
+        // is a place in the places popup. Five buttons that answered no
+        // question were charging every glance (docs/browse-topbar-design.md
+        // 10.2). Refresh and the two view modes moved into the menu below, and
+        // a mode that is NOT the default says so with a chip instead - a
+        // setting that changes what you see must name itself when it is on.
+        auto rbModeChip = [&](const char* text, const char* why) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            ImGui::SmallButton(text);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", why);
         };
-        ImGui::BeginDisabled(I.histBack.empty());
-        if (ImGui::SmallButton("<##rbback")) rbDefer([&I] { rbHistGo(I, true); });
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("back (Alt+Left, mouse button 4)");
-        rbFlow(rbBtnW(">"));
-        ImGui::BeginDisabled(I.histFwd.empty());
-        if (ImGui::SmallButton(">##rbfwd")) rbDefer([&I] { rbHistGo(I, false); });
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("forward (Alt+Right, mouse button 5)");
-        rbFlow(rbBtnW("up"));
-        ImGui::BeginDisabled(atRoot);
-        if (ImGui::SmallButton("up")) rbGoParent();
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("parent folder (Backspace)");
-        rbFlow(rbBtnW("~"));
-        if (ImGui::SmallButton("~##rbhome")) rbGoTo(I, "~");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the login home directory");
-        rbFlow(rbBtnW("refresh"));
-        if (ImGui::SmallButton("refresh")) {
-            rbDefer([&I] { rbTreeForget(I); });        // in order: forget, then list
-            rbGoTo(I, B.dir);
+        if (I.flat) {
+            rbModeChip("flat##rbchip", "every frame is its own row - the default is "
+                                       "grouped (one row per numbered stack).\n"
+                                       "change it in the panel menu");
+            rbFlow(rbBtnW("tree##rbchip"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("list this folder again (and forget the tree's cached children)");
-        // Grouped <-> flat. No round trip: the peer already sent every member.
-        rbFlow(rbBtnW("grp") + rbBtnW("flat") + 1);
-        if (rbSegBtn("grp##rbview", !I.flat) && I.flat) {
-            I.flat = app.rbFlat = false;   // this panel now; the pref = the default
-            app.prefsDirty = true;
-            savePrefs();
+        if (I.tree) {
+            rbModeChip("tree##rbchip", "folders open in place - the default is a "
+                                       "list, one folder at a time.\n"
+                                       "change it in the panel menu");
+            rbFlow(rbBtnW("a-z##rbchip"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("grouped: a numbered sequence is ONE row");
-        ImGui::SameLine(0, 1);
-        if (rbSegBtn("flat##rbview", I.flat) && !I.flat) {
-            I.flat = app.rbFlat = true;
-            app.prefsDirty = true;
-            savePrefs();
+        if (!I.nameNatural) {
+            // The order the rows are IN is the least visible setting on this
+            // panel - nothing on screen says which of two plausible orders you
+            // are reading - so the chip names it rather than merely marking it
+            // non-default. It also says what did NOT change, because that is
+            // the question this toggle raises.
+            rbModeChip("a-z##rbchip", "names sort as text: frame_10 before frame_2.\n"
+                                      "the default is natural order (frame_2 first, "
+                                      "digits by value).\n"
+                                      "frames still STACK in natural order - that one "
+                                      "is not a setting.\n"
+                                      "change it in the panel menu");
+            rbFlow(rbBtnW("filter"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("flat: every frame is its own row\n(per-frame size and "
-                              "date are not in the listing reply - those cells stay blank)");
-        // List <-> tree. Expanding a node costs ONE list, once.
-        rbFlow(rbBtnW("list") + rbBtnW("tree") + 1);
-        if (rbSegBtn("list##rblist", !I.tree) && I.tree) {
-            // Leaving the tree with something under the cursor: the listing
-            // opens on THAT folder. Walking down a tree is how you got to a
-            // folder five levels deep; dropping back to the root on the way out
-            // throws away the only thing the trip was for. A file under the
-            // cursor means the folder holding it.
-            if (I.cursor >= 0 && I.cursor < (int)view.size()) {
-                const RbRow& r = view[I.cursor];
-                std::string want = r.ph || r.up ? std::string()
-                                 : r.isDir()    ? r.full() : *r.dir;
-                if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
-            }
-            I.tree = app.rbTree = false;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("list: one folder at a time\n(a double-click or Enter "
-                              "enters a folder; a click selects it)");
-        ImGui::SameLine(0, 1);
-        if (rbSegBtn("tree##rbtree", I.tree) && !I.tree) {
-            I.tree = app.rbTree = true;
-            app.prefsDirty = true;
-            savePrefs();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("tree: a folder opens IN PLACE (click it; Right/Left "
-                              "also do).\ndouble-click or Enter goes INTO it.\neach "
-                              "node is listed once and kept - collapsing costs "
-                              "nothing to undo.");
+        // F5 is the refresh that lost its button; the panel must be the one
+        // holding focus, or a second browser would reload on the first one's key
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_F5, false))
+            rbRefresh();
         // Filter what is already listed - no round trip. Substring by default,
         // glob when * or ? appears (globListMatch's contract), because a capture
         // dump directory holds hundreds of entries and one condition matters.
@@ -17519,21 +21984,76 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         const float tailW = rbFilterTailW(rbFilter[0] != 0);
         const float filterMin = ImGui::GetFontSize() * 8;
         rbFlow(filterMin + tailW);
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+        // Ctrl+F, the "..." menu's "Search below...", and a crumb or folder's
+        // "Search under here" all land in the same place: this box, with the
+        // caret in it. They differ only in whether they also aim the root.
+        if (I.searchOpen ||
+            (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+             ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))) {
             ImGui::SetKeyboardFocusHere();
+            I.searchOpen = false;
+        }
         // below the floor the tail wraps instead (rbFlow, further down), so a
         // panel too narrow for both still shows a usable filter
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - tailW,
                                          ImGui::GetFontSize() * 4));
-        ImGui::InputTextWithHint("##rbfilter", "filter (Ctrl+F), * ? glob",
-                                 rbFilter, sizeof I.filter);
+        // ONE box, two depths. Typing narrows the rows that are already here,
+        // instantly and without asking anyone. Enter commits the SAME text as a
+        // recursive walk below this folder.
+        //
+        // There used to be a second text box, identical in appearance, in a
+        // popup off the "..." menu - so the panel asked the user to choose an
+        // engine before they were allowed to state the question, and the two
+        // doors were told apart only by which menu you came through. The
+        // question is the same one either way; only how far it reaches differs,
+        // and "how far" is a key, not a place.
+        //
+        // Local panels get the same Enter. A local Browse is served by a peer
+        // session exactly as a remote one is (an empty host means the local://
+        // peer, not a different code path), so glob works there too - and a rule
+        // that means something different depending on where you are is a rule
+        // nobody remembers.
+        bool goSearch = ImGui::InputTextWithHint(
+            "##rbfilter", "filter (Ctrl+F); Enter searches below",
+            rbFilter, sizeof I.filter, ImGuiInputTextFlags_EnterReturnsTrue);
         I.toolbar.filterL = ImGui::GetItemRectMin().x;
         I.toolbar.filterR = ImGui::GetItemRectMax().x;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("filters the listing below without asking the server\n"
+            ImGui::SetTooltip("typing narrows the rows below, without asking anyone;\n"
                               "bare text matches anywhere; * and ? make it a glob;\n"
-                              "comma separates alternatives");
+                              "comma separates alternatives\n"
+                              "\n"
+                              "Enter walks BELOW %s instead (depth 6, first 2000\n"
+                              "hits) - * and ? cross '/' there",
+                              rbSearchRoot.empty() ? B.dir.c_str() : rbSearchRoot.c_str());
+        // Stop, beside the box that started it. A recursive walk is the one verb
+        // in this panel that costs a round trip, and Enter is now an easy way to
+        // start one: it must stay as easy to call off.
+        if (I.search.running) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Stop##rbsearch")) {
+                I.search.gen++;               // the in-flight result becomes stale
+                I.search.running = false;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("stop walking; what has arrived stays listed");
+        }
+        // The root, and the way out of it. "Search under here" aims the next
+        // Enter at a folder that is not the one on screen; without somewhere to
+        // say so AND somewhere to undo it, that is a one-way door whose effect
+        // is invisible until the answers are wrong.
+        if (!rbSearchRoot.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton((std::string("under: ") + baseName(rbSearchRoot) +
+                                    " x##sroot").c_str()))
+                rbSearchRoot.clear();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enter searches under\n%s\nclick to search from "
+                                  "the folder being browsed instead",
+                                  rbSearchRoot.c_str());
+        }
+        if (goSearch && rbFilter[0])
+            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbFilter);
     }
     // filtered view, by row index (the clipper needs random access)
     std::vector<int> shown;
@@ -17565,263 +22085,172 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     // than the one the cursor was on and SetScrollHereY never fired. The spec
     // itself is stashed from the table one frame earlier (I.sortCol), exactly
     // as the tree builder needs it - see RB_COL_NAME.
-    // Directories sort before files no matter the key: this is a browser, not a
-    // table of numbers. In TREE mode the sort has already happened per level,
-    // inside the builder; sorting the flattened tree here would tear children
-    // away from their parents.
-    if (!I.tree)
-        std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
-            const RbRow& a = view[ia];
-            const RbRow& b = view[ib];
-            if (a.up != b.up) return a.up;      // ".." is row 0 under every sort
-            if (a.isDir() != b.isDir()) return a.isDir();
-            // an expanded frame has no size / mtime of its own: it sorts as
-            // unknown (0) rather than borrowing the group's totals
-            uint64_t sa = a.ownFile() ? a.e->size : 0, sb = b.ownFile() ? b.e->size : 0;
-            int64_t ma = a.ownFile() ? a.e->mtime : 0, mb = b.ownFile() ? b.e->mtime : 0;
-            int cmp = 0;
-            switch (I.sortCol) {
-                case RB_COL_SIZE:  cmp = sa < sb ? -1 : sa > sb ? 1 : 0; break;
-                case RB_COL_MTIME: cmp = ma < mb ? -1 : ma > mb ? 1 : 0; break;
-                default:           cmp = a.name().compare(b.name()); break;
-            }
-            return I.sortDesc ? cmp > 0 : cmp < 0;
-        });
+    if (!I.tree) rbSortShown(I, view, shown);
     if (rbFilter[0]) {
         rbFlow(ImGui::CalcTextSize("9999/9999").x);
         ImGui::TextDisabled("%d/%d", (int)shown.size(), (int)view.size());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("rows shown of rows listed");
     }
-    rbFlow(rbAdvW);
-    if (ImGui::SmallButton(rbAdvanced ? "less##rbadv" : "more##rbadv")) {
-        rbAdvanced = !rbAdvanced;
-        app.rbAdvanced = rbAdvanced;   // the pref is the next panel's default
-        app.prefsDirty = true;
-        savePrefs();
-    }
-    I.toolbar.moreR = ImGui::GetItemRectMax().x;
+    // The panel's own menu ENDS the toolbar row: the verbs that are real but
+    // rare. They used to be buttons charging every glance - and behind them sat
+    // the "more" drawer, whose contents have all gone to the place each one
+    // belongs (docs/browse-topbar-design.md 10.2): the host to the title,
+    // disconnect to the status line and the root crumb, the star to the path
+    // line, open folder to File, and the server search to the popup below.
+    rbFlow(rbMenuW);
+    if (ImGui::SmallButton("...##rbmenu")) ImGui::OpenPopup("rbpanelmenu");
+    I.toolbar.menuR = ImGui::GetItemRectMax().x;
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("the connection, the places list and the server-side\n"
-                          "recursive search - the things a browse does not need\n"
-                          "every minute");
-    // ---- row 3, on request: the connection and the server-side search ----
-    if (rbAdvanced) {
-        ImGui::TextUnformatted(peerLabel(B.host).c_str());
-        // there is nothing to disconnect FROM when the peer runs here
-        const char* rbEndLbl = B.host.empty() ? "close browse##rbdisc" : "disconnect##rbdisc";
-        rbFlow(rbBtnW(rbEndLbl));        // same flow rule as row 2: never clipped
-        if (ImGui::SmallButton(rbEndLbl)) {
-            rbDefer([&I] {               // another machine, other children
-                app.uiSession.stop();    // ours to stop; the worker's is a job
-                App::RbJob j;
-                j.kind = App::RbDisconnect;
-                rbEnqueue(I, std::move(j));
-                I.b = App::RemoteBrowse{};
-                rbTreeForget(I);
-            });
-            ImGui::PopID();
-            return;
+        ImGui::SetTooltip("this panel: refresh, how it lists, search the server");
+    if (ImGui::BeginPopup("rbpanelmenu")) {
+        if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
+        ImGui::Separator();
+        // Radio pairs, not toggles: the state is visible without clicking.
+        if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
+            && I.flat) {
+            I.flat = app.rbFlat = false;   // this panel now; the pref = the default
+            app.prefsDirty = true;
+            savePrefs();
         }
-        rbFlow(rbBtnW("*"));
-        {   // star = bookmark the place being looked at; the combo recalls them
-            std::string curUrl = placeUrl(B.host, B.port, B.dir);
-            bool starred = std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(),
-                                     curUrl) != app.rbBookmarks.end();
-            if (starred) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.83f, 0.35f, 1));
-            if (ImGui::SmallButton("*")) {
-                if (starred)
-                    app.rbBookmarks.erase(std::remove(app.rbBookmarks.begin(),
-                                                      app.rbBookmarks.end(), curUrl),
-                                          app.rbBookmarks.end());
-                else
-                    app.rbBookmarks.push_back(curUrl);
+        if (ImGui::MenuItem("Flat (every frame is its own row)", nullptr, I.flat)
+            && !I.flat) {
+            I.flat = app.rbFlat = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("List (one folder at a time)", nullptr, !I.tree) && I.tree) {
+            // Leaving the tree with something under the cursor: the listing
+            // opens on THAT folder. Walking down a tree is how you got to a
+            // folder five levels deep; dropping back to the root on the way
+            // out throws away the only thing the trip was for. A file under
+            // the cursor means the folder holding it.
+            if (I.cursor >= 0 && I.cursor < (int)view.size()) {
+                const RbRow& r = view[I.cursor];
+                std::string want = r.ph || r.up ? std::string()
+                                 : r.isDir()    ? r.full() : *r.dir;
+                if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
+            }
+            I.tree = app.rbTree = false;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        if (ImGui::MenuItem("Tree (folders open in place)", nullptr, I.tree) && !I.tree) {
+            I.tree = app.rbTree = true;
+            app.prefsDirty = true;
+            savePrefs();
+        }
+        ImGui::Separator();
+        // The third thing that changes the LISTING's shape, so it sits with
+        // the other two - one place for everything that changes what the rows
+        // look like (there is no Preferences panel yet, issue #50).
+        //
+        // Each item names the order it IS, with the example that distinguishes
+        // them, because a listing whose order you cannot name is how the
+        // listing and the stack came to disagree without anyone noticing. And
+        // it says NAMES: the size and modified columns are numbers with one
+        // order each, and this cannot touch them.
+        auto rbOrderItem = [&](const char* label, bool wantNatural) {
+            if (ImGui::MenuItem(label, nullptr, I.nameNatural == wantNatural) &&
+                I.nameNatural != wantNatural) {
+                I.nameNatural = app.rbNatural = wantNatural;   // this panel; the pref = the default
                 app.prefsDirty = true;
                 savePrefs();
             }
-            if (starred) ImGui::PopStyleColor();
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(starred ? "remove bookmark:\n%s" : "bookmark this place:\n%s",
-                                  curUrl.c_str());
-            // Open Folder for the folder you are IN. Neither navigation nor
-            // narrowing, so it lives here with the other on-request tools.
-            // (It used to exist only on a folder ROW, so opening the directory
-            // being browsed meant going up a level to find its own name.)
-            rbFlow(rbBtnW("open folder"));
-            if (ImGui::SmallButton("open folder")) remoteScanFolder(I, B.dir);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
-                                  "which stacks to open:\n%s", B.dir.c_str());
-        }
-        if (rbSearchFocus) { ImGui::SetKeyboardFocusHere(); rbSearchFocus = false; }
-        const float srchTailW = rbBtnW("Stop##rbsearch") + rbStyle.ItemSpacing.x;
-        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - srchTailW,
-                                         ImGui::GetFontSize() * 4));
-        bool go = ImGui::InputTextWithHint("##rbsearch",
-                                           "search server (recursive): frame_* or **/dark.npy",
-                                           rbSearchBuf, sizeof I.searchBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SetTooltip("the NAME column only - size and modified are numbers.\n"
+                                  "frames always STACK in natural order whatever this "
+                                  "says: for a stack the order is part of the "
+                                  "measurement, not a way of looking at it");
+        };
+        rbOrderItem("Names in natural order (frame_2 before frame_10)", true);
+        rbOrderItem("Names in text order (frame_10 before frame_2)", false);
+        ImGui::Separator();
+        // The two doors are one door now. This entry does not open anything -
+        // it puts the caret in the box that is already on the toolbar, which is
+        // the whole point: there is one place to state the question and the only
+        // choice left is how far Enter reaches.
+        if (ImGui::MenuItem("Search below...", "Ctrl+F")) I.searchOpen = true;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("the server walks below the folder (depth 6, first 2000 hits);\n"
-                              "bare text matches anywhere in the relative path;\n"
-                              "* and ? glob across '/'");
-        rbFlow(rbBtnW("Stop##rbsearch"));
-        if (I.search.running) {
-            if (ImGui::SmallButton("Stop##rbsearch")) {
-                I.search.gen++;               // in-flight result becomes stale
-                I.search.running = false;
-            }
-        } else if ((ImGui::SmallButton("Search") || go) && rbSearchBuf[0]) {
-            remoteStartSearch(I, rbSearchRoot.empty() ? B.dir : rbSearchRoot, rbSearchBuf);
-        }
-        if (!rbSearchRoot.empty()) {
-            ImGui::TextDisabled("search under: %s", rbSearchRoot.c_str());
-            rbFlow(rbBtnW("x##sroot"));
-            if (ImGui::SmallButton("x##sroot")) rbSearchRoot.clear();
-        }
-    } else if (!rbSearchRoot.empty() || I.search.running) {
-        // a search aimed or running is state the user set: never silently
-        // hidden by a fold, even though the row that made it is folded away
-        if (I.search.running) ImGui::TextDisabled("searching... (\"more\" to stop)");
-        else ImGui::TextDisabled("search aimed at: %s  (\"more\")", rbSearchRoot.c_str());
+            ImGui::SetTooltip("type in the filter box, then press Enter:\n"
+                              "it walks below %s (depth 6, first 2000 hits)",
+                              B.dir.c_str());
+        if (ImGui::MenuItem("Open folder (all stacks below)")) remoteScanFolder(I, B.dir);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("scan THIS folder and everything below it, then pick\n"
+                              "which stacks to open:\n%s", B.dir.c_str());
+        ImGui::EndPopup();
     }
-    {   // "Open N selected as stack" - enabled only when the v3 metadata proves
-        // the frames can actually stack, BEFORE any pixel is transferred
-        int nSel = 0;
+    // (The server-search popup used to be here: a second text box, identical in
+    // appearance to the filter, reached from the menu above or from a crumb's
+    // "Search under here". It is gone - the filter IS the search box now, and
+    // Enter is how far it reaches. Everything it carried survived: Stop and the
+    // root chip sit beside the box, and the depth and hit limits moved into the
+    // box's own tooltip.)
+    // How many rows are selected: counted once, here, because two places need
+    // it - the action row below and the bottom status line at the end.
+    int rbNSel = 0;
+    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) if (rbSel[i]) rbNSel++;
+    // (The selection action row lived here: "Open N selected as stack",
+    // "Temporal stats (server)", "Copy paths" and "clear". All four moved into
+    // the row right-click menu, which now acts on the SELECTION when the row
+    // under the pointer is part of it - the way a file manager does. Four
+    // controls charging every glance, to say what a right-click already says.
+    //
+    // The move is only safe because of that rule: right-click used to target
+    // the one row it hit, so deleting the buttons without it would have deleted
+    // the only path for "pick several, then act".)
+    // Everything the selection verbs need, computed once: the files behind the
+    // ticked rows (a group row means the frames it stands for), and whether
+    // those files can actually stack - answered from the v3 metadata BEFORE any
+    // pixel is transferred.
+    auto rbSelFiles = [&]() {
+        std::vector<std::string> files;
+        for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+            if (!rbSel[i]) continue;
+            if (view[i].isGroup())
+                for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
+            else files.push_back(view[i].full());
+        }
+        return files;
+    };
+    std::string rbSelStackWhyNot;        // empty = the selection can stack
+    bool rbSelTemporalOk = B.peerVersion >= 2;
+    {
         const remote::Entry* first = nullptr;
-        std::string reason;
         for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
             if (!rbSel[i]) continue;
             const remote::Entry& e = *view[i].e;
-            nSel++;
-            if (!isNpyName(view[i].name())) { reason = "only .npy files can form a stack"; continue; }
+            if (!isNpyName(view[i].name())) {
+                rbSelStackWhyNot = "only .npy files can form a stack";
+                rbSelTemporalOk = false;     // MEASURE is npy-only too
+                continue;
+            }
             if (!e.hasMeta) {
-                reason = "shape unknown - the peer is protocol 2 (File > Update remote peer)";
+                rbSelStackWhyNot = "shape unknown - the peer is protocol 2 "
+                                   "(File > Update remote peer)";
                 continue;
             }
             if (!first) { first = &e; continue; }
             if (e.ndim != first->ndim || e.dtype != first->dtype ||
                 memcmp(e.dims, first->dims, sizeof e.dims) != 0)
-                reason = "selected files differ: " + fmtEntryShape(*first) + " vs " +
-                         fmtEntryShape(e);
+                rbSelStackWhyNot = "selected files differ: " + fmtEntryShape(*first) +
+                                   " vs " + fmtEntryShape(e);
         }
-        {   // ALWAYS submitted, disabled below two selections. The panel's own
-            // rule, written for the scrub bar: "footer space RESERVED even when
-            // no preview is alive, so starting one never shifts the rows under
-            // the cursor". This row appearing at nSel == 2 pushed the whole
-            // listing down one button height on the frame AFTER the second
-            // Ctrl+click - so the third click of a rapid multi-select landed on
-            // the row above the one under the cursor and toggled the wrong file
-            // into the selection that then feeds "Open N selected as stack".
-            char lb[64];
-            if (nSel >= 2) snprintf(lb, sizeof lb, "Open %d selected as stack", nSel);
-            else           snprintf(lb, sizeof lb, "Open selected as stack");
-            bool few = nSel < 2;
-            if (few) reason = "select two or more files (Ctrl / Shift + click)";
-            if (!reason.empty()) ImGui::BeginDisabled();
-            if (ImGui::Button(lb)) {
-                std::vector<std::string> files;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    if (view[i].isGroup())
-                        for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
-                    else files.push_back(view[i].full());
-                }
-                sortFramesNumerically(files);
-                std::vector<std::string> bases;
-                for (const auto& f : files) bases.push_back(baseName(f));
-                openRemoteStack(B.host, files,
-                                stackNameFor(B.dir, patternOfNames(bases)), B.port);
-                rbSel.assign(view.size(), 0);
-            }
-            if (!reason.empty()) ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", reason.empty()
-                    ? "frames stack in numeric name order" : reason.c_str());
-            ImGui::SameLine();
-            {   // the server aggregate for the selection, without opening it.
-                // MEASURE exists from protocol 2, but v2 has no hasMeta to
-                // pre-validate shapes - a mismatch falls to [server failed].
-                int pv2 = B.peerVersion;      // published by the worker; no lock
-                bool tempOk = pv2 >= 2;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
-                    if (rbSel[i] && !isNpyName(view[i].name())) tempOk = false;
-                ImGui::BeginDisabled(!tempOk);
-                if (ImGui::Button("Temporal stats (server)")) {
-                    std::vector<std::string> files;
-                    for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                        if (!rbSel[i]) continue;
-                        if (view[i].isGroup())
-                            for (const auto& m : view[i].e->members) files.push_back(view[i].join(m));
-                        else files.push_back(view[i].full());
-                    }
-                    std::string leaf = B.dir;
-                    size_t sl2 = leaf.find_last_of('/');
-                    if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
-                        leaf = leaf.substr(sl2 + 1);
-                    requestBrowseTemporal(B.host, files,
-                                          leaf + " (" + std::to_string(files.size()) +
-                                          " selected)", B.port);
-                }
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(tempOk
-                        ? "sigma_t / sigma_fpn computed on the server over the\n"
-                          "selected files, shown in the Temporal panel - nothing\n"
-                          "opens, no pixel transfers. plane=all (no CFA split)."
-                        : pv2 < 2 ? "needs a protocol 2+ peer (File > Update remote peer)"
-                                  : "only .npy files can form a stack");
-            }
-            ImGui::SameLine();
-            // A selection you can open but cannot NAME is half a selection: the
-            // paths are what goes into a script, a ticket or a message. The
-            // single-row context menu has had "Copy path" all along; the
-            // multi-select row simply never grew one.
-            if (ImGui::SmallButton("Copy paths##sel")) {
-                std::string all;
-                int nf = 0;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    if (view[i].isGroup())            // a group row means its frames
-                        for (const auto& m : view[i].e->members) {
-                            all += view[i].join(m); all += "\n"; nf++;
-                        }
-                    else { all += view[i].full(); all += "\n"; nf++; }
-                }
-                ImGui::SetClipboardText(all.c_str());
-                toast("copied " + std::to_string(nf) + " path(s)");
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("one absolute path per line; a numbered group\n"
-                                  "expands to the frames it stands for");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("clear##sel")) rbSel.assign(view.size(), 0);
-        }
+        if (rbNSel < 2) rbSelStackWhyNot = "select two or more files (Ctrl / Shift + click)";
     }
     
-    // The metadata columns exist from protocol 3 on. Say so once, up here - a
-    // "-" in every row of every column explains nothing.
-    {
-        int pv = B.peerVersion;              // published by the worker; no lock
-        // Both directions. Downward the update can fix it, so name the fix;
-        // upward it cannot, and the honest statement is that the listing may
-        // not match what a local open produces (the peer gates the v5 pattern
-        // text on the client version now, but v4 grouping cannot be un-applied
-        // without keeping dead code).
-        if (pv > 0 && pv < 3)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer is protocol %d - File > Update remote peer "
-                               "enables shape / date columns", pv);
-        else if (pv > 0 && pv < (int)rp::VERSION)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer is protocol %d, this viewer speaks %d - "
-                               "File > Update remote peer", pv, (int)rp::VERSION);
-        else if (pv > (int)rp::VERSION)
-            ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "peer speaks protocol %d, this viewer speaks %d - "
-                               "listings may group differently from a local open; "
-                               "update the viewer", pv, (int)rp::VERSION);
-    }
+    // (The protocol-mismatch warning was a conditional full-width orange row
+    // here. It is a FACT about the connection that is rarely true and never
+    // urgent - exactly the kind of thing the bottom status line was added to
+    // carry - and as a row it moved the whole listing the moment a peer of the
+    // wrong version answered. rbProtocolNote() below builds the same sentence,
+    // in both directions, for the status line.)
     ImGui::Separator();
+    // Where the listing begins. A selftest reads this to prove that a failure
+    // does NOT open a band above the rows: the error changes the status line's
+    // text and leaves this number alone.
+    I.toolbar.listTopY = ImGui::GetCursorScreenPos().y;
     if (I.search.active) {         // search results stand in for the listing
         App::RemoteSearch& S = I.search;
         auto joinS = [&S](const std::string& rel) {
@@ -17940,8 +22369,12 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // folders would then dive into the first one and never come back
             if (!view[rbCursor].isDir()) rbActivateRow(view[rbCursor]);
         }
+        // Cmd/Ctrl+O rides with Enter (2026-08-03, user): on macOS that chord
+        // means "open what is selected", which is this, and never "show me a
+        // file dialog". Same code path, so the two cannot come to differ.
         if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+            ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) {
             int nSel = 0;
             for (size_t i = 0; i < view.size() && i < rbSel.size(); i++)
                 if (rbSel[i]) nSel++;
@@ -18013,10 +22446,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     std::string& rbPropsPath = I.propsPath;
     bool& rbPropsOpen = I.propsOpen;
     bool& rbPropsNoSize = I.propsNoSize; // an expanded frame: no size/mtime of its own
-    // footer space for the preview scrub bar: RESERVED even when no preview is
-    // alive, so starting one never shifts the rows under the cursor (a bar
-    // that appeared above the list moved every row mid-double-click)
-    float rbFootH = ImGui::GetFrameHeightWithSpacing();
+    // A row used to be reserved here for the preview scrub bar, held even when
+    // no preview was alive so that starting one never shifted the rows under
+    // the cursor (a bar that appeared above the list moved every row
+    // mid-double-click). The scrub bar moved to the Image View footer on
+    // 2026-08-04, so the reservation goes with it: an empty row kept against
+    // the return of something that is no longer here is just a lost row, and
+    // this panel works down to 300 px.
+    //
+    // What stays is the bottom status line, which is permanent: its separator
+    // and its one text row come out of the table's height so the listing stops
+    // above it instead of scrolling underneath it.
+    float rbFootH = ImGui::GetTextLineHeightWithSpacing() +
+                    ImGui::GetStyle().ItemSpacing.y * 2 + 1;
     // Column widths, measured from the widest thing each column actually
     // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
     // SCROLLING table auto-fits over its first frames, which for this table are
@@ -18056,11 +22498,66 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     auto tHide = [](bool show) {
         return show ? ImGuiTableColumnFlags_None : ImGuiTableColumnFlags_Disabled;
     };
+    const float rbTableH = ImGui::GetContentRegionAvail().y - rbFootH;
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_ScrollY |
                                        ImGuiTableFlags_SortTristate,
                                        ImVec2(0, -rbFootH))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
+        // ---- the levels above the reader, held at the top ---------------------
+        // A tree that scrolls loses the folder you are in: it is above
+        // DisplayStart, so it is never submitted, and the panel goes on showing
+        // eight files with nothing on screen saying which of six folders they
+        // came from. Every ancestor stays instead - all of them, at any depth.
+        //
+        // FROZEN ROWS, not an overlay. ImGui's own ScrollFreeze puts the rows it
+        // is given ABOVE the scrolling region and shortens that region by their
+        // height, which is the difference between a band that occupies space and
+        // one that covers the first real row. It is normally used for a fixed
+        // count (this table already froze the header with it); what is new is
+        // that the count is recomputed every frame from where the scroll is.
+        //
+        // The columns, the row background, the selection fill, the cursor
+        // outline and the horizontal position of every cell therefore come out
+        // right for free: a pinned row is the same table's row, drawn by the
+        // same code from the same index. It is not a picture of a row.
+        //
+        // Vendored ImGui is NOT patched for this. It arrives through
+        // FetchContent and a local patch is a cost at every version bump, and
+        // nothing here needed one: TableSetupScrollFreeze takes its row count as
+        // an ordinary per-frame argument, and ImGui already stops freezing
+        // entirely at scroll 0 (imgui_tables.cpp: FreezeRowsCount is zeroed when
+        // Scroll.y == 0), which is exactly the "no band at the top of the list"
+        // behaviour this wants.
+        //
+        // Why the scroll offset and not clipper.DisplayStart: the freeze count
+        // has to be set before the first row, and the clipper does not run until
+        // after it. Dividing the scroll by the measured row pitch is the same
+        // arithmetic the clipper itself does, one step earlier - so the band and
+        // the clipper agree on which row is at the top, in the same frame, with
+        // no state carried over from the last one.
+        std::vector<int> rbPins;
+        {
+            const float sy = ImGui::GetScrollY();   // the inner window's, this frame
+            const float rh = I.listRowH;
+            if (sy > 0 && rh > 0) {
+                int first = std::min((int)(sy / rh), (int)shown.size() - 1);
+                rbAncestorRows(view, shown, first, rbPins);
+                // A guard on the WIDGET, not on the depth. There is no depth
+                // limit here on purpose - Browse moves its current directory
+                // with a double-click, so a listing is rarely more than a few
+                // levels below where it stands - and this only ever bites when
+                // the panel is dragged so short that the ancestors would leave
+                // NO scrollable row at all, which is a table that cannot be
+                // used rather than a policy about hierarchies. One row is
+                // enough for it to be a listing again; the deepest levels are
+                // what give way, because the outermost is the one that says
+                // most about where you are.
+                int room = (int)(rbTableH / rh) - 1;
+                if (room < 0) room = 0;
+                if ((int)rbPins.size() > room) rbPins.resize((size_t)room);
+            }
+        }
+        ImGui::TableSetupScrollFreeze(0, 1 + (int)rbPins.size());
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
         ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
@@ -18090,18 +22587,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 I.sortDesc = false;
             }
         }
-        ImGuiListClipper clip;
-        clip.Begin((int)shown.size());
-        // The cursor row must be SUBMITTED even when it is scrolled out, or
-        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
-        // clipper allocates its range list there, and IncludeItemByIndex writes
-        // straight through the null TempData pointer otherwise - the two
-        // IM_ASSERTs that say so are compiled out of a release build, so a
-        // single Down arrow segfaulted the process before any handler ran.
-        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
-            clip.IncludeItemByIndex(rbCursorPos);
-        while (clip.Step())
-        for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+        // ONE row, drawn one way. `pinned` says only that this copy is being
+        // held at the top of the listing by the frozen-row band above; it
+        // changes nothing about what the row is or what clicking it does, and
+        // the three things it does suppress are all recordings of "where is
+        // this on screen" that belong to the row in its own place:
+        //   - SetScrollHereY, which would scroll the listing to the band;
+        //   - toolbar.rowX/rowY, the first LISTED row a selftest right-clicks;
+        //   - cursorRect/cursorChev, which aim injected clicks.
+        // A pinned copy shares its index with the row it copies, so it also
+        // shares its ImGui ID - and the cursor row is force-submitted by the
+        // clipper even when scrolled out, so the two really can meet. The band
+        // is pushed into its own ID scope below to keep them apart.
+        auto rbDrawRow = [&](int row, bool pinned) {
             const RbRow& r = view[shown[row]];
             const remote::Entry& e = *r.e;
             const std::string& rname = r.name();
@@ -18143,24 +22641,39 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // context menu (a placeholder "(listing...)" row has none, the ".."
             // row has none, and a tree still fetching a node can put one at the
             // top)
-            if (!r.ph && !r.up && I.toolbar.rowY <= 0) {
+            if (pinned && I.toolbar.pinCentre.x < 0)      // the outermost, for a click
+                I.toolbar.pinCentre =
+                    ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                           (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
+            if (!r.ph && !r.up && !pinned && I.toolbar.rowY <= 0) {
                 I.toolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
                 I.toolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
             }
             if (shown[row] == rbCursor) {
                 // the keyboard cursor: an outline, not a fill - the fill means
                 // "selected for a multi-file action" and the two are not the same
-                if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                //
+                // Drawn on the pinned copy too. Wheeling a tree can leave the
+                // cursor on a folder that is now being held at the top, and a
+                // cursor that vanishes because its row moved is a cursor the
+                // user has to go and find.
                 ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
                                                     ImGui::GetItemRectMax(),
                                                     IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
-                I.cursorRect[0] = ImGui::GetItemRectMin();
-                I.cursorRect[1] = ImGui::GetItemRectMax();
-                I.cursorName = rname;
-                I.cursorChev = chevRow
-                    ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
-                             (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
-                    : ImVec2(-1.0f, -1.0f);
+                // WHERE it is, though, is recorded off the row in its own place
+                // only: this drives SetScrollHereY and the coordinates injected
+                // clicks are aimed at, and both mean the row's real position.
+                if (!pinned) {
+                    if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                    I.cursorRect[0] = ImGui::GetItemRectMin();
+                    I.cursorRect[1] = ImGui::GetItemRectMax();
+                    I.cursorName = rname;
+                    I.cursorFull = r.full();   // the key `expanded` is written in
+                    I.cursorChev = chevRow
+                        ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
+                                 (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
+                        : ImVec2(-1.0f, -1.0f);
+                }
             }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
@@ -18200,14 +22713,16 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // now. There is no double-click meaning on this zone (a fast pair
             // is two toggles), so nothing here is ever optimistic and nothing
             // ever needs cancelling - the anti-flash guarantee is structural.
-            if (chevHit && !r.ph && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (chevHit && !r.ph && !rbNavGesture &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 std::string full = r.full();
                 if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                 else rbTreeExpand(I, full);
                 rbCursor = ei;          // the mouse also places the keyboard
             }
-            if (rowClicked && servable) {
+            if (rowClicked && servable && !rbNavGesture) {
                 ImGuiIO& sio = ImGui::GetIO();
+                bool rbLeaving = false;      // this click navigates away
                 bool canSel = !r.up && ei < (int)rbSel.size();
                 if (sio.KeyCtrl && canSel) {
                     rbSel[ei] ^= 1;                    // toggle, plain click still opens
@@ -18223,6 +22738,15 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                             rbSel[shown[k]] = 1;
                 } else if (!sio.KeyCtrl && !sio.KeyShift &&
                            sio.MouseClickedLastCount[ImGuiMouseButton_Left] < 2) {
+                    // A plain click ENDS the selection. Everywhere else a list
+                    // works this way - Ctrl and Shift build a selection, a bare
+                    // click replaces it - and here it did not, so ticks made
+                    // three folders ago were still armed and still feeding
+                    // "Open N selected", with nothing on screen tying them to
+                    // what the user was now looking at. Clearing rather than
+                    // selecting this row: in this panel a bare click PREVIEWS,
+                    // and a preview is not a selection.
+                    if (rbNSel > 0) rbSel.assign(view.size(), 0);
                     // (Ctrl / Shift on a row that cannot join the selection -
                     // ".." - must not fall through and act as a plain click:
                     // Ctrl+clicking the exit walked up a directory.)
@@ -18234,31 +22758,184 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // stack ("一枚目とStackが2つFilesに登録される"), or a
                     // second copy of the file just promoted. Only a first
                     // click previews.
-                    rbActivateRow(r);
+                    // A FOLDER is navigation, not a document. One click goes in,
+                    // in whichever way "in" is drawn in this mode: the tree
+                    // expands it in place, the list moves to it. Files keep the
+                    // old contract - click selects, double-click commits -
+                    // because a file is a thing you compare and open on purpose,
+                    // and opening one by brushing past it is expensive.
+                    //
+                    // This is safe now only because folders lose their
+                    // double-click verb below. Its predecessor toggled here and
+                    // CANCELLED on the second click of a double-click: correct
+                    // at rest, but the expand was rendered between the clicks,
+                    // and a flash the eye sees is a flash however it ends. With
+                    // one gesture owning the verb there is nothing to cancel.
+                    // !chevHit: the chevron already toggled on the PRESS, and
+                    // this runs on the release - both firing would toggle twice.
+                    if (r.isDir() && !r.up && !chevHit) {
+                        std::string full = r.full();
+                        if (!I.tree) { rbGoTo(I, full); rbLeaving = true; }
+                        else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
+                        else rbTreeExpand(I, full);
+                    } else {
+                        rbActivateRow(r);
+                    }
                     rbSelAnchor = ei;
                 }
-                rbCursor = ei;          // the keyboard picks up where the mouse left off
+                // A click that LEAVES this listing leaves no cursor behind: the
+                // rows it indexed are about to be replaced, and index 1 of the
+                // old place is a different row - or no row - in the new one.
+                // Said here rather than left to the sig-change reset at the top
+                // of the next frame, so that nothing can write it back in
+                // between. (The thing that used to write it back was the second
+                // half of the same double-click; that is handled one level up
+                // now - see rbNavGesture - because it was never only the cursor
+                // it wrote.)
+                rbCursor = rbLeaving ? -1 : ei;
+                // ...and the rest of THIS gesture belongs to the navigation.
+                if (rbLeaving) I.navChain = sio.MouseClickedLastCount[ImGuiMouseButton_Left];
             }
             // Double-click = a registered open (the VSCode pinning gesture):
             // a stack row opens the whole stack, a frame promotes the preview
-            // its first click just made - and a FOLDER is entered, in the
-            // listing and in the tree alike (the single click only selects,
-            // so the two gestures finally mean different things).
-            // ".." stays single-click: it is the exit, not a folder row.
-            // !chevHit: on the chevron a fast pair is two toggles, never a
-            // navigation - the zones split the verbs.
-            if (servable && !r.up && !chevHit && ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            // its first click just made.
+            //
+            // For a FOLDER the two gestures split by mode, because the modes
+            // have different numbers of verbs to give away:
+            //
+            //   tree - a folder has TWO things you can do to it. Open it where
+            //          it is (single click, and the chevron) or go to it and
+            //          make it the listing (double click). Both are useful and
+            //          they are not the same, so both gestures are spoken for.
+            //   list - a folder has ONE. There is no "in place" in a list, so
+            //          the single click is the whole vocabulary and a double
+            //          click is just a click that arrived twice.
+            //
+            // ".." is single-click in both: it is the exit, not a folder row.
+            if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
+                !rbNavGesture && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 rbOpenRow(r);
+                // the tree's double-click navigates on the PRESS, so the same
+                // rule applies to it: the release is one frame behind, and one
+                // frame is enough for the new listing to be under the pointer
+                if (r.isDir())
+                    I.navChain = ImGui::GetIO().MouseClickedLastCount[ImGuiMouseButton_Left];
+            }
+            // §4.13.0's first entrance: double-clicking something the viewer
+            // cannot read opens the Reader panel on it, instead of the row being
+            // simply inert. A dimmed row that does nothing when you double-click
+            // it is the tool saying "no" with no way forward, which is the exact
+            // dead end §3.2 set out to remove.
+            // Local only: running the adapter on the peer is §4.13.1, and
+            // pretending a remote path is a local one would hand the reader a
+            // path that does not exist on this machine.
+            if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
+                ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (B.host.empty())
+                    openReaderPicker(r.full(), "the viewer has no native reading for this file");
+                else
+                    toast("readers run on this machine only for now - copy the file over, "
+                          "or open it from a local folder", true);
+            }
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 std::string full = r.full();
+                // Right-clicking a row that is PART of a multi-row selection acts
+                // on the whole selection, the way every file manager does. This
+                // is what replaced the four buttons that used to sit above the
+                // listing: the verbs did not go away, they stopped charging rent.
+                // Right-clicking a row that is NOT selected still means that row
+                // alone - the pointer beats the ticks, or a menu would act on
+                // something the user is not pointing at.
+                if (isSel && rbNSel >= 2) {
+                    char lb[64];
+                    snprintf(lb, sizeof lb, "Open %d selected as stack", rbNSel);
+                    if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        sortFramesNumerically(files);
+                        std::vector<std::string> bases;
+                        for (const auto& f : files) bases.push_back(baseName(f));
+                        openRemoteStack(B.host, files,
+                                        stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        rbSel.assign(view.size(), 0);
+                    }
+                    if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
+                    // This line has always claimed numeric name order, and
+                    // until the listing was natural too it was the only place
+                    // saying so while the rows above it said otherwise. Now it
+                    // can say which of the two it is - and when the panel is
+                    // in text order it names the disagreement instead of
+                    // leaving the user to find it in the frame numbers.
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", !rbSelStackWhyNot.empty()
+                            ? rbSelStackWhyNot.c_str()
+                            : I.nameNatural
+                            ? "frames stack in natural name order - the order this "
+                              "listing is showing them in"
+                            : "frames stack in natural name order (frame_2 before "
+                              "frame_10), NOT the text order this listing is showing");
+
+                    // the same selection as ONE frame - the same gate, because
+                    // it is the same open followed by a mean over it
+                    snprintf(lb, sizeof lb, "Open %d selected as frame average", rbNSel);
+                    if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        sortFramesNumerically(files);
+                        std::vector<std::string> bases;
+                        for (const auto& f : files) bases.push_back(baseName(f));
+                        openStackForAverage(B.host, files,
+                                            stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        rbSel.assign(view.size(), 0);
+                    }
+                    if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", rbSelStackWhyNot.empty()
+                            ? AVG_TIP : rbSelStackWhyNot.c_str());
+
+                    snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
+                    ImGui::BeginDisabled(!rbSelTemporalOk);
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        // baseName("/") is empty; the folder at the root of a
+                        // filesystem is still called "/" on screen
+                        std::string leaf = baseName(B.dir);
+                        if (leaf.empty()) leaf = B.dir;
+                        requestBrowseTemporal(B.host, files,
+                                              leaf + " (" + std::to_string(files.size()) +
+                                              " selected)", B.port);
+                    }
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(rbSelTemporalOk
+                            ? "sigma_t / sigma_fpn computed on the server over the\n"
+                              "selected files, shown in the Temporal panel - nothing\n"
+                              "opens and no pixel transfers"
+                            : "needs a protocol 2+ peer and .npy files only");
+
+                    snprintf(lb, sizeof lb, "Copy %d path(s)", rbNSel);
+                    if (ImGui::MenuItem(lb)) {
+                        std::vector<std::string> files = rbSelFiles();
+                        std::string all;
+                        for (const auto& f : files) { all += f; all += "\n"; }
+                        ImGui::SetClipboardText(all.c_str());
+                        toast("copied " + std::to_string(files.size()) + " path(s)");
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("one absolute path per line; a numbered group\n"
+                                          "expands to the frames it stands for");
+                    if (ImGui::MenuItem("Clear selection")) rbSel.assign(view.size(), 0);
+                    ImGui::Separator();
+                }
                 if (r.isDir()) {
                     if (ImGui::MenuItem("Open folder (all stacks below)"))
                         remoteScanFolder(I, full);
                     if (ImGui::MenuItem("Search under here")) {
-                        rbSearchRoot = full;      // the search row shows and clears it
-                        rbSearchFocus = true;
+                        rbSearchRoot = full;   // the chip beside the box shows and clears it
+                        I.searchOpen = true;   // ...and the caret goes in the box
                     }
                     if (ImGui::MenuItem("Bookmark")) {
                         std::string u = placeUrl(B.host, B.port, full);
@@ -18277,6 +22954,17 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                     }
+                    // ...and the same stack as ONE frame: its per-pixel mean
+                    // across the frame axis. Beside "Open as stack" because it
+                    // is the same subject and the same click, answering the
+                    // other question you open a dark or flat set to ask.
+                    if (ImGui::MenuItem("Open as frame average")) {
+                        std::vector<std::string> files;
+                        for (const auto& m : e.members) files.push_back(r.join(m));
+                        openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", AVG_TIP);
                     // the server aggregates WITHOUT opening: "is this set even
                     // worth transferring?" costs zero pixels this way. Group
                     // rows only exist from protocol 3 on, so no version gate.
@@ -18300,15 +22988,28 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     // one file as a stack: a frame-axis file becomes its frames
                     if (ImGui::MenuItem("Open as stack"))
                         openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
+                    if (ImGui::MenuItem("Open as frame average"))
+                        openStackForAverage(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", AVG_TIP);
                     // an expanded frame still knows the sequence it came from
                     if (r.member >= 0) {
                         char sl[64];
-                        snprintf(sl, sizeof sl, "Open the whole sequence (%u frames)", e.frames);
+                        snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
                             openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
                         }
+                        snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
+                                 e.frames);
+                        if (ImGui::MenuItem(sl)) {
+                            std::vector<std::string> files;
+                            for (const auto& m : e.members) files.push_back(r.join(m));
+                            openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", AVG_TIP);
                     }
                     ImGui::Separator();
                 }
@@ -18358,38 +23059,179 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
             else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
+        };
+        // The band. Submitted FIRST and nowhere else: ImGui hands the frozen
+        // rows to whatever comes immediately after the header, so these rows
+        // and TableSetupScrollFreeze's count above have to agree exactly or the
+        // listing's first ordinary row is frozen instead.
+        I.toolbar.pinnedRows = (int)rbPins.size();
+        I.toolbar.pinnedNames.clear();
+        I.toolbar.pinCentre = ImVec2(-1, -1);
+        if (!rbPins.empty()) {
+            ImGui::PushID("pinned");        // see rbDrawRow: IDs must not collide
+            for (int p : rbPins) {
+                I.toolbar.pinnedNames += view[shown[p]].name();
+                I.toolbar.pinnedNames += ";";
+                rbDrawRow(p, true);
+            }
+            ImGui::PopID();
+        }
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        // The cursor row must be SUBMITTED even when it is scrolled out, or
+        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
+        // clipper allocates its range list there, and IncludeItemByIndex writes
+        // straight through the null TempData pointer otherwise - the two
+        // IM_ASSERTs that say so are compiled out of a release build, so a
+        // single Down arrow segfaulted the process before any handler ran.
+        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
+            clip.IncludeItemByIndex(rbCursorPos);
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++)
+                rbDrawRow(row, false);
+            // what the band divides the scroll offset by NEXT frame - see the
+            // freeze block above. ImGui measures it off the first row it laid
+            // out, which is the same pitch every row here has.
+            if (clip.ItemsHeight > 0) I.listRowH = clip.ItemsHeight;
         }
         ImGui::EndTable();
     }
-    // Preview scrub bar lives BELOW the listing, in space reserved above:
-    // appearing must never move the rows (double-click depends on it).
-    // previewFiles = a stack of numbered files; previewFrames = one file with
-    // a frame axis. Either way the bar walks it, one fetched frame at a time.
+    // The preview's scrub WIDGETS are gone from here (2026-08-04): they now sit
+    // in the Image View footer, under the picture they step, which is where the
+    // stack scrub bar already was. Two frame-stepping rows on screen at once
+    // was the whole of the "スクラブ2重" complaint.
+    //
+    // The KEYS stay. They cost no space, and reaching them without moving your
+    // hand off the list is the reason to have them at all - the duplication
+    // that mattered was two widgets, not two ways to press a key. They only
+    // fire while this panel has focus, so they never race the Image View's.
     int pvN = app.previewFiles.size() >= 2 ? (int)app.previewFiles.size()
                                            : app.previewFrames;
-    if (pvN >= 2) {
-        int n = pvN;
-        ImGui::PushID("pvstep");
-        if (ImGui::SmallButton("<")) stepPreviewFrame(-1);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(">")) stepPreviewFrame(+1);
-        ImGui::SameLine();
-        int slider = app.previewIndex;
-        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
-        if (ImGui::SliderInt("##pv", &slider, 0, n - 1, "frame %d") && slider != app.previewIndex)
-            stepPreviewFrame(slider - app.previewIndex);
-        ImGui::SameLine();
-        ImGui::TextDisabled("%d/%d", app.previewIndex + 1, n);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("previewing %s\n(, and . step too; double-click the row to open it)",
-                              app.previewLabel.c_str());
-        // , and . while the browser has focus: the same keys the image view uses
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            !ImGui::IsAnyItemActive()) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+    if (pvN >= 2 && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+    }
+    // ---- the bottom status line (docs/browse-topbar-design.md 10.3) --------
+    // One permanent thin row under the listing, carrying the facts that are
+    // rarely true and had no home: which machine this panel stands on, how much
+    // is in front of you, how much of it you have picked - and, only when they
+    // are true, what the connection is doing, what a scan or a search is doing,
+    // which protocol the peer speaks, and what failed.
+    //
+    // PERMANENT, not conditional (10.7). Every one of the rows this replaces
+    // appeared and vanished, and each time it did it moved every file row under
+    // the reader's eye. A line that is always there costs one line and moves
+    // nothing.
+    //
+    // It is NOT an action bar. The single verb on it is disconnect, and it is
+    // allowed because it acts on the host named at the other end of the same
+    // line. Everything else the drawer used to hold is a menu item now.
+    {
+        ImGui::Separator();
+        // counted over REAL rows: ".." is the way out, not an item in the
+        // folder, and a tree's placeholder rows are not files either
+        int total = 0, shownN = 0;
+        for (const RbRow& r : view) if (!r.up && !r.ph) total++;
+        for (int i : shown) if (!view[i].up && !view[i].ph) shownN++;
+        I.toolbar.statusTotal = total;
+        I.toolbar.statusShown = shownN;
+        I.toolbar.statusSel   = rbNSel;
+
+        std::string line = "";
+        const char* DOT = " \xC2\xB7 ";              // U+00B7, in the font's Latin-1
+        char cnt[96];
+        // Counts BOTH directions. While a filter is narrowing, "34 items" alone
+        // would be a false statement about the folder, so the line says what is
+        // in front of you and what it was narrowed from. (This absorbs the
+        // toolbar's old shown/total, which stays on the toolbar next to the
+        // filter that causes it - the two agree by construction, both being
+        // this same pair of numbers.)
+        if (shownN != total)
+            snprintf(cnt, sizeof cnt, "%d of %d items", shownN, total);
+        else
+            snprintf(cnt, sizeof cnt, "%d item%s", total, total == 1 ? "" : "s");
+        line += cnt;
+        // Selection, and only when there IS one: "0 selected" is noise on every
+        // glance to report a state whose absence is already obvious.
+        if (rbNSel > 0) {
+            snprintf(cnt, sizeof cnt, "%d of %d selected", rbNSel, total);
+            line += DOT;
+            line += cnt;
+            // ...and what those rows STAND FOR. A grouped row is one row and
+            // four hundred frames, and "2 selected" just before pressing "Open
+            // selected as stack" is the row count answering a question nobody
+            // asked. Said only when the two numbers differ - otherwise it would
+            // print "3 selected, 3 frames" on every ordinary file selection.
+            int frames = 0;
+            for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
+                if (!rbSel[i]) continue;
+                frames += view[i].isGroup() && !view[i].e->members.empty()
+                        ? (int)view[i].e->members.size() : 1;
+            }
+            if (frames != rbNSel) {
+                snprintf(cnt, sizeof cnt, "%d frames", frames);
+                line += DOT;
+                line += cnt;
+            }
         }
-        ImGui::PopID();
+        // ---- and now the things that are usually not true. Connection OK is
+        // SILENT: the host's name above is the whole report. Only work in
+        // progress, a version disagreement and a failure get words.
+        bool warn = false;
+        if (I.busy) {
+            // I.phase belongs to the worker thread (BrowseInstance::mtx guards
+            // queue / done / phase): copy it, never read it in place.
+            std::string phase;
+            { std::lock_guard<std::mutex> lk(I.mtx); phase = I.phase; }
+            line += DOT;
+            line += phase.empty() ? std::string("listing...") : phase;
+        }
+        if (I.search.running) {
+            line += DOT;
+            line += "searching " + std::string(I.search.pattern) + " under " + I.search.root;
+        } else if (!B.searchRoot.empty()) {
+            line += DOT;
+            line += "search aimed at " + B.searchRoot;
+        }
+        if (std::string pn = rbProtocolNote(B.peerVersion); !pn.empty()) {
+            line += DOT;
+            line += pn;
+            warn = true;
+        }
+        // The error band's content, in the line rather than in a band. First
+        // line only: the rest is in the details dialog, one click away, which
+        // is where a stack trace belonged all along.
+        if (!B.err.empty()) {
+            std::string first = B.err.substr(0, B.err.find('\n'));
+            line += DOT;
+            line += "failed: " + first;
+            warn = true;
+        }
+        I.toolbar.statusFull = line;
+        // One row, always - the line elides, it does not wrap (300 px is a width
+        // this panel has to work at, and a status line that becomes two lines is
+        // another moving row).
+        const float avail = ImGui::GetContentRegionAvail().x;
+        float textW = avail;
+        std::string shownLine = rbElideMiddle(line, textW);
+        I.toolbar.statusText  = shownLine;
+        I.toolbar.statusAvailW = textW;
+        I.toolbar.statusTextW  = ImGui::CalcTextSize(shownLine.c_str()).x;
+        if (warn) ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+        else      ImGui::PushStyleColor(ImGuiCol_Text,
+                                        ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextUnformatted(shownLine.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            // the untruncated sentence, plus the way to the full failure text -
+            // the old band carried a "copy" button, and a second verb is
+            // exactly what this line must not grow
+            ImGui::SetTooltip("%s%s", line.c_str(),
+                              B.err.empty() ? "" : "\n\nclick for the full failure text");
+            if (!B.err.empty() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                app.showRemoteError = true;
+        }
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }
     if (ImGui::BeginPopup("Remote properties")) {
@@ -18409,8 +23251,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (rbPropsNoSize) {
             // Never invent one: the listing reply carries the group's total
             // bytes and its newest mtime, and no per-member breakdown.
-            ImGui::TextDisabled("size      -   (not in the sequence listing)");
-            ImGui::TextDisabled("modified  -   (not in the sequence listing)");
+            ImGui::TextDisabled("size      -   (not in the stack listing)");
+            ImGui::TextDisabled("modified  -   (not in the stack listing)");
         } else {
         ImGui::Text("size      %s (%llu bytes)%s", fmtBytesHuman(e.size).c_str(),
                     (unsigned long long)e.size, e.group ? "  - all frames" : "");
@@ -18995,11 +23837,108 @@ static std::string filesShareSentence(const std::vector<const ImageDoc*>& shared
     return s;
 }
 
+// The ink for one layer of the canon, in whichever theme is on. Wrapped so the
+// Files rows read as "this row is a series" rather than as a colour lookup.
+static ImVec4 inkOf(int layer) { return ui_theme::layerInk(app.themeVariant, layer); }
+
+// One condition, printed to the format the WHOLE series shares, so the values
+// read as a column. Formatting each on its own with %g gives 1, 2, 5, 10, 20
+// four different widths and nothing lines up. The digits of the UI font are
+// tabular, so a shared width and a shared number of decimals really do align -
+// padding with spaces would not, the font being proportional.
+//
+// The decimals are the fewest that still say every member exactly: a sweep of
+// whole milliseconds stays whole, and one member of 2.5 gives the column one
+// decimal rather than giving 2.5 six.
+static std::string conditionText(const App::Series& S, double v) {
+    if (!std::isfinite(v)) return "value unset";
+    int dec = 0;
+    for (const auto& m : S.members) {
+        if (!std::isfinite(m.value)) continue;
+        int d = 0;
+        for (; d < 6; d++) {
+            char t[64];
+            snprintf(t, sizeof t, "%.*f", d, m.value);
+            double back = atof(t);
+            if (std::fabs(back - m.value) <= 1e-9 * std::max(1.0, std::fabs(m.value))) break;
+        }
+        dec = std::max(dec, d);
+    }
+    int w = 0;
+    for (const auto& m : S.members) {
+        if (!std::isfinite(m.value)) continue;
+        char t[64];
+        snprintf(t, sizeof t, "%.*f", dec, m.value);
+        w = std::max(w, (int)strlen(t));
+    }
+    char b[96];
+    snprintf(b, sizeof b, "%*.*f", w, dec, v);
+    return b;
+}
+
+// The stack name as a SERIES MEMBER row prints it.
+//
+// Opening a container names its stacks after their position inside it -
+// "sweep.vnz:0", "sweep.vnz:1" (loadVnzNodes) - and that compound is why a
+// member row could be read at all when the series it belongs to had scrolled
+// off the top: the row had to say which sweep it came from, because nothing
+// above it was still on screen to say so. The heading is held there now, and
+// the row leads with its own [n], so the ":n" is the same fact printed twice.
+// What is left is the file name, which goes to the END of the row - where a
+// narrowing panel drops it first and the index and the condition survive.
+//
+// DISPLAY ONLY, and only here. The name itself is unchanged: it is what the
+// Linearity table's stack column, the Series menu, "Move to batch" and every
+// tooltip print, and in those places there is no [n] beside it and no pinned
+// heading above it - three stacks all reading "sweep.vnz" would be a real loss
+// of information. This is the one row that has somewhere else to put it.
+//
+// A DIGIT tail only. An .npz member builds the same shape out of the array's
+// NAME (loadNpzMembers: "data.npz:arr_0"), and that is not a position - the
+// row's [n] does not repeat it, so it stays.
+static std::string filesMemberName(const std::string& name) {
+    size_t c = name.find_last_of(':');
+    if (c == std::string::npos || c == 0 || c + 1 >= name.size()) return name;
+    for (size_t i = c + 1; i < name.size(); i++)
+        if (name[i] < '0' || name[i] > '9') return name;
+    return name.substr(0, c);
+}
+
+// ---- what the Files panel holds at the top while it scrolls ------------------
+// One level of the hierarchy and the rows it owns, in the list's own content
+// coordinates (scroll-independent: ImGui::GetCursorPos, not GetCursorScreenPos).
+// Recorded by the walk that draws the list and read at the top of the NEXT
+// frame, which is where the band has to be submitted.
+//
+// Files needs a different mechanism from Browse and it is worth saying why,
+// because they look like the same feature: Browse's rows are virtualised, so
+// the only thing it can reason about is row INDICES, and it hands its band to
+// the table's own frozen-row machinery. Files has no clipper - every row is
+// submitted, every frame - so here the exact geometry is already known and the
+// band is simply drawn above the scrolling region, which is the plainest way
+// there is to make it occupy space rather than cover the first row.
+struct FilesSpan {
+    int batch = 0;             // the batch this level belongs to
+    int series = 0;            // 0 = the batch's own heading, else the series'
+    float y0 = 0;              // top of the heading row
+    float hy = 0;              // ...and its bottom: above this it is still visible
+    float y1 = 0;              // bottom of the last row under it
+};
+static std::vector<FilesSpan> g_filesSpans;
+static float g_filesScrollY = 0;        // where the list was scrolled to, last frame
+// What the band actually held, outermost first, ";"-joined - the same shape of
+// probe as RbToolbarGeom::pinnedNames and read for the same reason: the claim
+// is about what is on screen.
+static std::string g_filesPinProbe;
+
 static void drawFileList() {
     g_filesBadgeProbe.clear();
-    if (ImGui::Button("Open (O)")) openFileDialog();
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) closeCurrent();
+    // No Open / Close buttons here (2026-08-03). Browse is how a file is found
+    // and opened, and it reaches remote machines as well, which the OS dialog
+    // never did. Close was the worse of the two: it silently escalated from the
+    // frame to the whole stack, and it was the ONLY Close that did not name the
+    // layer it closes -- the row menus say Close batch / Close stack / Close
+    // series, and the File menu says Close Frame / Close Batch / Close All.
     if (app.seqRunning || !app.seqQueue.empty()) {
         int done = app.seqDone, total = app.seqTotal;
         if (app.seqRunning) ImGui::TextDisabled("loading %d/%d", done, total);
@@ -19061,6 +24000,9 @@ static void drawFileList() {
     // Reload from disk, deferred like the rest: reloadSource's walk calls
     // forgetImage while the row loop still holds this frame's cached indices.
     int pendingReloadImg = -1, pendingReloadSeq = 0;
+    int pendingAvgSeq = 0;      // ...and the frame average, for the same reason:
+                                // it appends to app.images, which this walk is
+                                // iterating over
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -19099,27 +24041,30 @@ static void drawFileList() {
     // contains is invisible until someone tells you about it, and the letter in
     // the label ("Add as compare slot D") says what will happen before it does.
     auto compareSlotItem = [](ImageDoc* pick) {
-        if (!pick || pick == cur()) return;
-        std::string held = slotOf(pick);
-        if (!held.empty()) {
-            if (ImGui::MenuItem(("Remove from compare slot " + held).c_str()))
+        // the current row gets it too, like every other; the decision of WHAT
+        // to offer lives in slotRowItem, where a selftest can reach it
+        std::string letter;
+        SlotRowItem it = slotRowItem(pick, letter);
+        if (it == SlotRowNone) return;
+        if (it == SlotRowRemove) {
+            if (ImGui::MenuItem(("Remove from compare slot " + letter).c_str()))
                 removeCompareSlot(pick);
             return;
         }
-        // the pinned B holds a letter already - the row's B items say so, and
-        // offering a slot on top would put one image in two panes
-        if (pick->uid == app.compareBUid) return;
-        std::string next = slotName(app.cmpExtra.size());
-        if (ImGui::MenuItem(("Add as compare slot " + next).c_str()))
+        if (ImGui::MenuItem(("Add as compare slot " + letter).c_str()))
             addCompareSlot(pick);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("slots beyond B show up in the statistics tables and\n"
-                              "side by side. Wipe, split, difference and blink stay\n"
-                              "A against B - those only mean two.");
+            // Split is NOT in the two-only list: it is precisely the mode that
+            // tiles every letter (tileSlots engages there and only there), and
+            // saying it "stays A against B" contradicted the sentence before it.
+            ImGui::SetTooltip("slots beyond B show up in the statistics tables and,\n"
+                              "in Split, as side-by-side panes. Wipe, difference and\n"
+                              "blink stay A against B - those only mean two.");
     };
     // Returns whether it put anything in the menu, so a caller can skip the
-    // separator that would otherwise lead an empty group: the CURRENT row -
-    // A itself - contributes no compare items at all (see abRowItem).
+    // separator that would otherwise lead an empty group. Every row with a
+    // document contributes now, the current one included (see abRowItem); the
+    // false return is left for a row that has no document at all.
     auto compareBItem = [&compareSlotItem](ImageDoc* pick) -> bool {
         if (abRowItem(pick) != AbSetB) return false;
         if (ImGui::MenuItem("Set as compare B")) {
@@ -19153,43 +24098,212 @@ static void drawFileList() {
     // materialise above rows that had none - and a batch you can rename and
     // move things into cannot be a thing that exists only sometimes.
     const bool showHeaders = !groups.empty();
+    // ---- one heading, drawn one way -----------------------------------------
+    // `pinned` says only that this copy is the one being held above the
+    // scrolling list. It is the same widget, with the same ink, the same
+    // tooltip and the same context menu, and clicking it collapses the same
+    // thing - a row that changed meaning because of where it happened to be
+    // drawn would be worse than one that scrolled away.
+    //
+    // A pinned heading is OPEN by definition: what put it in the band is that
+    // its rows are the ones on screen. So its state is forced rather than
+    // stored, and a click on it is routed to the real node, which is drawn
+    // later in the same frame - no second copy of the open/closed state exists
+    // to fall out of step with the first.
+    int collapseBatch = 0, collapseSeries = 0;      // written by the band, read by the walk
+    auto drawBatchHead = [&](const FileGroup& group, bool pinned) -> bool {
+        bool isPreview = group.label == "preview";
+        // The batch ink, unless this is the preview batch - "transient" is
+        // what that row has to say first, and dim already says it.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              isPreview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
+                                        : inkOf(ui_theme::LayerBatch));
+        if (pinned) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        else if (collapseBatch == group.batch) ImGui::SetNextItemOpen(false);
+        bool open = isPreview
+            ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                         ImGuiTreeNodeFlags_SpanAvailWidth,
+                                "preview (transient)   (%d)", (int)group.stacks.size())
+            : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                         ImGuiTreeNodeFlags_SpanAvailWidth,
+                                "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+        ImGui::PopStyleColor();
+        if (pinned && ImGui::IsItemClicked()) collapseBatch = group.batch;
+        if (ImGui::IsItemHovered() && !group.dir.empty())
+            ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
+                              dispPath(group.dir).c_str());
+        // the batch is the user's grouping, so its name is theirs to change
+        if (ImGui::BeginPopupContextItem("batchctx")) {
+            static char nameBuf[256];
+            if (ImGui::IsWindowAppearing())
+                snprintf(nameBuf, sizeof nameBuf, "%s", group.label.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+            bool done = ImGui::InputText("##bname", nameBuf, sizeof nameBuf,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            done |= ImGui::SmallButton("rename");
+            if (done && nameBuf[0]) {
+                renameBatch(group.batch, nameBuf);   // uniquified: names restore sessions
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
+                pendingCloseBatch = group.batch;
+            ImGui::EndPopup();
+        }
+        return open;
+    };
+    auto drawSeriesHead = [&](const App::Series& S, bool pinned) -> bool {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        char smeta[96];
+        // the unit is the series', and "not set" is a state to read, not a
+        // blank to guess at (the panel says the same thing the same way)
+        if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
+                                (int)S.members.size());
+        else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
+        float avail = ImGui::GetContentRegionAvail().x;
+        float mw = ImGui::CalcTextSize(smeta).x;
+        bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        // same rule as the stack rows: ONE item spanning the row, the unit
+        // and the count PAINTED on it. A second widget on the right is what
+        // made a context menu unreachable on the name once already.
+        if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
+                                                 p0.y + ImGui::GetFrameHeight()), true);
+        ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerSeries));
+        if (pinned) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        else if (collapseSeries == S.id) ImGui::SetNextItemOpen(false);
+        bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
+                                                ImGuiTreeNodeFlags_SpanAvailWidth,
+                                       "%s", S.name.c_str());
+        ImGui::PopStyleColor();
+        if (room) ImGui::PopClipRect();
+        if (pinned && ImGui::IsItemClicked()) collapseSeries = S.id;
+        if (room) {
+            ImVec2 m = ImGui::GetItemRectMin();
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
+                                                ImGui::GetTextLineHeight()) * 0.5f),
+                S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                          : IM_COL32(255, 184, 90, 255), smeta);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+                              "(right-click: rename, edit, move, ungroup, close)",
+                              (int)S.members.size(),
+                              S.paramName.empty() ? "parameter" : S.paramName.c_str());
+        if (ImGui::BeginPopupContextItem("serctx")) {
+            static char sbuf[256];
+            if (ImGui::IsWindowAppearing())
+                snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+            bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            done |= ImGui::SmallButton("rename");
+            if (done && sbuf[0]) {
+                pendingSerRename = S.id;
+                pendingSerName = sbuf;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            // the same modal creation uses: members, values, order, unit
+            if (ImGui::MenuItem("Edit series...")) {
+                pendingSerEdit = S.id;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            {   // the SERIES moves - every member with it, so that
+                // series ⊂ batch never stops being true on the way
+                int t = moveToBatchMenu(S.batchId);
+                if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
+                ImGui::TextDisabled("   (all %d member(s) move with it)",
+                                    (int)S.members.size());
+            }
+            ImGui::Separator();
+            // Two DIFFERENT operations, spelled out rather than one word
+            // with a modifier: one keeps the data, the other destroys it.
+            if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                                  "exactly where they are - they just stop being a sweep.",
+                                  (int)S.members.size());
+            if (ImGui::MenuItem("Close series (discard its stacks)"))
+                pendingSerClose = S.id;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                                  (int)S.members.size());
+            ImGui::EndPopup();
+        }
+        return sopen;
+    };
+    // ---- the band: every level the list has scrolled past --------------------
+    // Drawn ABOVE the scrolling region, so it takes its height out of the list
+    // rather than painting over the list's first row. The levels it holds come
+    // from the spans the walk recorded last frame against the scroll offset it
+    // ended on, which is the only place either number exists: ImGui applies a
+    // wheel event inside BeginChild, and the band has to be submitted before
+    // that. One frame of lag while the wheel is actually turning, and none at
+    // rest - the same settling every layout-dependent probe in this file has.
+    g_filesPinProbe.clear();
+    int pinPushed = 0;
+    {
+        // Its OWN ID scope, and not a detail. Without it the pinned copy and
+        // the real heading are one ImGui id, which means one open/closed state
+        // between them - and the copy forces that state open every frame,
+        // because being open is what put it in the band. Collapsing the real
+        // heading would be undone by its own reflection on the next frame.
+        // Separate ids, one direction: the copy is forced open, a click on it
+        // sets collapseBatch / collapseSeries, and the real node reads that.
+        ImGui::PushID("filespin");
+        std::vector<const FilesSpan*> pins;
+        for (const auto& s : g_filesSpans)
+            if (s.hy <= g_filesScrollY && g_filesScrollY < s.y1) pins.push_back(&s);
+        // outermost first: a batch's span opens before the span of any series
+        // inside it, so top-of-list order IS ancestor order
+        std::sort(pins.begin(), pins.end(),
+                  [](const FilesSpan* a, const FilesSpan* b) { return a->y0 < b->y0; });
+        for (const FilesSpan* p : pins) {
+            if (p->series == 0) {
+                const FileGroup* g = nullptr;
+                for (const auto& q : groups) if (q.batch == p->batch) g = &q;
+                if (!g) continue;
+                ImGui::PushID(g->batch);
+                g_filesPinProbe += g->label + ";";
+                // left pushed on purpose: TreeNodeEx indents what follows it,
+                // and the band has to reproduce the indentation of the rows it
+                // stands in for. Unwound below, innermost first.
+                drawBatchHead(*g, true);
+                pinPushed++;
+            } else {
+                const App::Series* S = nullptr;
+                for (const auto& s : app.series) if (s.id == p->series) S = &s;
+                if (!S) continue;
+                ImGui::PushID(S->id);
+                g_filesPinProbe += S->name + ";";
+                drawSeriesHead(*S, true);
+                pinPushed++;
+            }
+        }
+        for (int i = 0; i < pinPushed; i++) { ImGui::TreePop(); ImGui::PopID(); }
+        ImGui::PopID();
+        if (pinPushed) ImGui::Separator();
+    }
+    // The list scrolls on its own now. It has to: a band that is part of the
+    // scrolling content is a band that scrolls away, which is the entire
+    // complaint. Everything above - the load progress, the stop buttons, the
+    // note - stays outside it, where it was already behaving as a header.
+    bool listOpen = ImGui::BeginChild("fileslist", ImVec2(0, 0), ImGuiChildFlags_None);
+    if (listOpen) {
+    g_filesSpans.clear();
     for (const auto& group : groups) {
+      float gy0 = ImGui::GetCursorPos().y;
       ImGui::PushID(group.batch);
       bool open = true;
+      float ghy = gy0;
       if (showHeaders) {
-          bool isPreview = group.label == "preview";
-          if (isPreview) ImGui::PushStyleColor(ImGuiCol_Text,
-                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-          open = isPreview
-              ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                           ImGuiTreeNodeFlags_SpanAvailWidth,
-                                  "preview (transient)   (%d)", (int)group.stacks.size())
-              : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                           ImGuiTreeNodeFlags_SpanAvailWidth,
-                                  "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
-          if (isPreview) ImGui::PopStyleColor();
-          if (ImGui::IsItemHovered() && !group.dir.empty())
-              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
-                                dispPath(group.dir).c_str());
-          // the batch is the user's grouping, so its name is theirs to change
-          if (ImGui::BeginPopupContextItem("batchctx")) {
-              static char nameBuf[256];
-              if (ImGui::IsWindowAppearing())
-                  snprintf(nameBuf, sizeof nameBuf, "%s", group.label.c_str());
-              ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
-              bool done = ImGui::InputText("##bname", nameBuf, sizeof nameBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-              ImGui::SameLine();
-              done |= ImGui::SmallButton("rename");
-              if (done && nameBuf[0]) {
-                  renameBatch(group.batch, nameBuf);   // uniquified: names restore sessions
-                  ImGui::CloseCurrentPopup();
-              }
-              ImGui::Separator();
-              if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
-                  pendingCloseBatch = group.batch;
-              ImGui::EndPopup();
-          }
+          open = drawBatchHead(group, false);
+          ghy = ImGui::GetCursorPos().y;
       }
       if (open) {
         // name and format share one row: the dim/format part is right-aligned and dimmed.
@@ -19255,12 +24369,19 @@ static void drawFileList() {
                                                        ImGui::GetTextLineHeight()) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
             }
+            // A COMPUTED frame has no path, so this tooltip led with a blank
+            // line and told the reader nothing at all - and the Files panel is
+            // where a frame average sits beside the captures it will be
+            // confused with. Its provenance note takes the path's place, which
+            // is what the note is for. The share sentence (§4) follows either
+            // lead: whose pixels these also are is true of computed frames too.
             if (hov) {
+                const std::string lead = d.src->path.empty() && !d.note.empty()
+                                       ? d.note : dispPath(d.src->path);
                 if (share.empty())
-                    ImGui::SetTooltip("%s\n%s", dispPath(d.src->path).c_str(), meta);
+                    ImGui::SetTooltip("%s\n%s", lead.c_str(), meta);
                 else
-                    ImGui::SetTooltip("%s\n%s\n\n%s", dispPath(d.src->path).c_str(),
-                                      meta, share.c_str());
+                    ImGui::SetTooltip("%s\n%s\n\n%s", lead.c_str(), meta, share.c_str());
             }
             return clicked;
         };
@@ -19269,7 +24390,7 @@ static void drawFileList() {
         // label. Everything else about the row is identical - a member is not
         // a different kind of stack, it is a stack that is also in a sweep.
         auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
-                                const App::Series::Member* mem) {
+                                const App::Series::Member* mem, int memIdx) {
           const ImageDoc& head = *app.images[stack.front()];
           if (head.seqId == 0) {
             int i = stack.front();
@@ -19306,11 +24427,14 @@ static void drawFileList() {
                 if (sh != srcOwners.end() && sh->second > 1)
                     share = filesShareSentence({ &head });
             }
-            if (head.preview) ImGui::PushStyleColor(ImGuiCol_Text,
-                                                    ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            // A loose image is a frame. Preview keeps the dim ink: "transient"
+            // outranks "which layer" on that one row.
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  head.preview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
+                                               : inkOf(ui_theme::LayerFrame));
             bool rowHit = rowWithMeta(head, lb, i == app.current, nullptr, badge, !cmpOn,
                                       share);
-            if (head.preview) ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
             if (head.preview && ImGui::IsItemHovered())
                 ImGui::SetTooltip("a throwaway preview - the one slot the Browse panel\n"
                                   "reuses; the next click there replaces it. Double-click /\n"
@@ -19333,15 +24457,25 @@ static void drawFileList() {
                     // remote schemes (the peer holds the bytes) refuse.
                     const bool remote = !S.remoteUrl.empty() &&
                                         S.remoteUrl.rfind("local://", 0) != 0;
-                    const bool canReload = !remote && !S.path.empty();
+                    // PNG/JPEG: reloadSource refuses these by name (they are
+                    // outside the registry too) - grey the item rather than
+                    // offer a click that only ever toasts a refusal
+                    const imagefile::Backend* pic = S.path.empty() ? nullptr
+                                                  : imagefile::forPath(S.path);
+                    const bool canReload = !remote && !S.path.empty() && !pic;
                     if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
                         pendingReloadImg = i;
-                    if (!canReload && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(remote
-                            ? "remote-backed: these pixels come from the peer,\n"
-                              "not from a local file."
-                            : "no file behind these pixels - they were composed\n"
-                              "here (montage / plugin result).");
+                    if (!canReload && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        if (remote)
+                            ImGui::SetTooltip("remote-backed: these pixels come from the peer,\n"
+                                              "not from a local file.");
+                        else if (pic)
+                            ImGui::SetTooltip("%s reload is not wired yet: re-open the file.",
+                                              pic->format);
+                        else
+                            ImGui::SetTooltip("no file behind these pixels - they were composed\n"
+                                              "here (montage / plugin result).");
+                    }
                 }
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
@@ -19384,24 +24518,40 @@ static void drawFileList() {
               for (int idx : stack)
                   if (app.images[idx]->uid == app.cmpExtra[k]) { badge += slotName(k); break; }
           char lb[600];
-          const char* sname = si ? si->name.c_str() : "sequence";
+          const char* sname = si ? si->name.c_str() : "stack";
           if (mem) {
-              // The value LEADS the label. It is the reason the row is in this
-              // series at all, and it is not metadata: an unset one has to be
-              // readable as unset, not inferable from a blank column at the
-              // right edge. The "##m<seqId>" suffix is the row's ID, so renaming
-              // the stack does not reset its widget state - it does NOT protect
-              // the text: ImGui cuts a label at the FIRST "##", so a stack the
-              // user renames to "a##b" renders as "a" in either shape of row.
+              // Reading order: [n], then the condition, then the file name.
+              //
+              // The value used to LEAD, because it is the reason the row is in
+              // this series at all - and it still comes before the name, for
+              // exactly that reason. What is new in front of it is the member's
+              // position in the series, and what moved behind it is the file.
+              //
+              // The order IS the feature. A Files panel dragged narrow drops
+              // what is on its right, so this row loses the file name first and
+              // keeps the two things that say where the row sits in the sweep -
+              // while the pinned heading above it, which no width can push off,
+              // keeps saying which sweep that is. That is the whole reason there
+              // is no setting for any of this: the columns already do the work
+              // an option would have to be asked for.
+              //
+              // An unset value has to be readable as unset, not inferable from a
+              // blank at the right edge - conditionText prints the words.
+              //
+              // The "##m<seqId>" suffix is the row's ID, so renaming the stack
+              // does not reset its widget state. It does NOT protect the text:
+              // ImGui cuts a label at the FIRST "##", so a stack the user
+              // renames to "a##b" renders as "a" in either shape of row.
               char vb[64];
-              if (std::isfinite(mem->value)) {
-                  if (ser->unit[0]) snprintf(vb, sizeof vb, "%.6g %s", mem->value, ser->unit);
-                  else snprintf(vb, sizeof vb, "%.6g", mem->value);
-              } else {
-                  snprintf(vb, sizeof vb, "value unset");
+              {
+                  std::string vs = conditionText(*ser, mem->value);
+                  if (std::isfinite(mem->value) && ser->unit[0])
+                      snprintf(vb, sizeof vb, "%s %s", vs.c_str(), ser->unit);
+                  else
+                      snprintf(vb, sizeof vb, "%s", vs.c_str());
               }
-              snprintf(lb, sizeof lb, "%*s%s · %s##m%d", (int)(badge.size() * 2), "",
-                       vb, sname, head.seqId);
+              snprintf(lb, sizeof lb, "%*s[%d]  %s  %s##m%d", (int)(badge.size() * 2), "",
+                       memIdx, vb, filesMemberName(sname).c_str(), head.seqId);
           } else {
               snprintf(lb, sizeof lb, "%*s%s", (int)std::max<size_t>(badge.size() * 2, 2),
                        "", sname);
@@ -19427,7 +24577,10 @@ static void drawFileList() {
               }
               if (!sharedFrames.empty()) share = filesShareSentence(sharedFrames);
           }
-          if (rowWithMeta(head, lb, active, frames, badge, !cmpOn, share)) {
+          ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
+          bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn, share);
+          ImGui::PopStyleColor();
+          if (stackHit) {
               selectImage(stack[pos]);
               if (app.fitOnSwitch) app.fitRequested = true;
           }
@@ -19451,8 +24604,9 @@ static void drawFileList() {
             }
             ImGui::Separator();
             {   // B = the frame this stack is showing; with "B follows A's
-                // frame number" on, it tracks A from there anyway. The stack
-                // A stands in gets no compare group (and no stray separator).
+                // frame number" on, it tracks A from there anyway. The stack A
+                // stands in gets the group too - setting it as B is how you put
+                // one document on both sides and see that they agree.
                 ImageDoc* bpick = app.images[stack.front()].get();
                 if (si->lastImageIdx >= 0 && si->lastImageIdx < (int)app.images.size() &&
                     app.images[si->lastImageIdx]->seqId == si->id)
@@ -19465,12 +24619,15 @@ static void drawFileList() {
                 openInNewWindow(app.images[stack.front()].get());
             {   // manual reload (reference-design §3.2 / §8 row 5): every
                 // member's file re-read, pixels swapped in place
-                bool anyLocal = false, anyRemote = false;
+                bool anyLocal = false, anyRemote = false, anyPic = false;
                 for (int idx : stack) {
                     const FrameSource& S = *app.images[idx]->src;
                     // local:// embeds a path on this disk - that member reloads
                     if (!S.remoteUrl.empty() &&
                         S.remoteUrl.rfind("local://", 0) != 0) anyRemote = true;
+                    // PNG/JPEG members: reloadSource refuses them by name -
+                    // they do not make the stack reloadable on their own
+                    else if (!S.path.empty() && imagefile::forPath(S.path)) anyPic = true;
                     else if (!S.path.empty() || !S.remoteUrl.empty()) anyLocal = true;
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
@@ -19479,6 +24636,8 @@ static void drawFileList() {
                     ImGui::SetTooltip(anyRemote
                         ? "remote-backed: these pixels come from the peer,\n"
                           "not from local files."
+                        : anyPic
+                        ? "PNG/JPEG reload is not wired yet: re-open the file."
                         : "no files behind these pixels - they were composed\n"
                           "here (montage / plugin result).");
             }
@@ -19528,6 +24687,13 @@ static void drawFileList() {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
+            // A stack that is ALREADY open gets the same operation Browse
+            // offers at open time - one item, one meaning, one code path
+            // (requestStackAverage). Sitting beside Derive is deliberate: both
+            // make a NEW thing out of this stack and leave this stack alone,
+            // and this is the one that crosses a layer (stack -> frame).
+            if (ImGui::MenuItem("Open frame average")) pendingAvgSeq = si->id;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", AVG_TIP);
             // A NEW stack from a subset of this one - the dialog offers the
             // matching rules (same names / numbers as another stack, a range,
             // hand-picked). References frames; this stack is not touched.
@@ -19577,101 +24743,36 @@ static void drawFileList() {
         // sweep appearing must not push everything else down a level.
         for (const auto& S : app.series) {
             if (S.batchId != group.batch) continue;
+            float sy0 = ImGui::GetCursorPos().y;
             ImGui::PushID(S.id);
-            const ImGuiStyle& st = ImGui::GetStyle();
-            char smeta[96];
-            // the unit is the series', and "not set" is a state to read, not a
-            // blank to guess at (the panel says the same thing the same way)
-            if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
-                                    (int)S.members.size());
-            else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
-            float avail = ImGui::GetContentRegionAvail().x;
-            float mw = ImGui::CalcTextSize(smeta).x;
-            bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
-            ImVec2 p0 = ImGui::GetCursorScreenPos();
-            // same rule as the stack rows: ONE item spanning the row, the unit
-            // and the count PAINTED on it. A second widget on the right is what
-            // made a context menu unreachable on the name once already.
-            if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
-                                                     p0.y + ImGui::GetFrameHeight()), true);
-            bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
-                                                    ImGuiTreeNodeFlags_SpanAvailWidth,
-                                           "%s", S.name.c_str());
-            if (room) ImGui::PopClipRect();
-            if (room) {
-                ImVec2 m = ImGui::GetItemRectMin();
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
-                                                    ImGui::GetTextLineHeight()) * 0.5f),
-                    S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
-                              : IM_COL32(255, 184, 90, 255), smeta);
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
-                                  "(right-click: rename, edit, move, ungroup, close)",
-                                  (int)S.members.size(),
-                                  S.paramName.empty() ? "parameter" : S.paramName.c_str());
-            if (ImGui::BeginPopupContextItem("serctx")) {
-                static char sbuf[256];
-                if (ImGui::IsWindowAppearing())
-                    snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
-                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
-                bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
-                                             ImGuiInputTextFlags_EnterReturnsTrue);
-                ImGui::SameLine();
-                done |= ImGui::SmallButton("rename");
-                if (done && sbuf[0]) {
-                    pendingSerRename = S.id;
-                    pendingSerName = sbuf;
-                    ImGui::CloseCurrentPopup();
-                }
-                ImGui::Separator();
-                // the same modal creation uses: members, values, order, unit
-                if (ImGui::MenuItem("Edit series...")) {
-                    pendingSerEdit = S.id;
-                    ImGui::CloseCurrentPopup();
-                }
-                ImGui::Separator();
-                {   // the SERIES moves - every member with it, so that
-                    // series ⊂ batch never stops being true on the way
-                    int t = moveToBatchMenu(S.batchId);
-                    if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
-                    ImGui::TextDisabled("   (all %d member(s) move with it)",
-                                        (int)S.members.size());
-                }
-                ImGui::Separator();
-                // Two DIFFERENT operations, spelled out rather than one word
-                // with a modifier: one keeps the data, the other destroys it.
-                if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
-                                      "exactly where they are - they just stop being a sweep.",
-                                      (int)S.members.size());
-                if (ImGui::MenuItem("Close series (discard its stacks)"))
-                    pendingSerClose = S.id;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
-                                      (int)S.members.size());
-                ImGui::EndPopup();
-            }
+            bool sopen = drawSeriesHead(S, false);
+            float shy = ImGui::GetCursorPos().y;
             if (sopen) {
-                for (const auto& m : S.members)
-                    if (const std::vector<int>* sp = stackOfSeq(m.seqId))
-                        drawStackRow(*sp, &S, &m);
+                // memIdx is the member's place in the series, and it is the
+                // row's leading column - see the label built in drawStackRow.
+                for (int mi = 0; mi < (int)S.members.size(); mi++)
+                    if (const std::vector<int>* sp = stackOfSeq(S.members[mi].seqId))
+                        drawStackRow(*sp, &S, &S.members[mi], mi);
                 ImGui::TreePop();
             }
             ImGui::PopID();
+            g_filesSpans.push_back({ group.batch, S.id, sy0, shy, ImGui::GetCursorPos().y });
         }
         // ---- then everything this batch holds that is NOT in a series -------
         for (const auto& stackPtr : group.stacks) {
             const ImageDoc& head = *app.images[stackPtr->front()];
             if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
-            drawStackRow(*stackPtr, nullptr, nullptr);
+            drawStackRow(*stackPtr, nullptr, nullptr, -1);
         }
       }
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
+      if (showHeaders)
+          g_filesSpans.push_back({ group.batch, 0, gy0, ghy, ImGui::GetCursorPos().y });
     }
+    g_filesScrollY = ImGui::GetScrollY();
+    }
+    ImGui::EndChild();
     if (pendingCloseSeq) closeStack(pendingCloseSeq);
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
@@ -19691,6 +24792,7 @@ static void drawFileList() {
         std::string msg = reloadStackFromDisk(pendingReloadSeq, &failed);
         toast(msg, failed > 0);
     }
+    if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {
@@ -19724,10 +24826,10 @@ static void drawFileList() {
 
 static void drawSequenceModal() {
     if (app.seqAskImage >= 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
-        ImGui::OpenPopup("Load sequence?");
+        ImGui::OpenPopup("Load stack?");
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal("Load sequence?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal("Load stack?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
     ImGui::Text("%d files match %s", (int)app.seqAskFiles.size(),
                 dispPath(app.seqAskPattern).c_str());
@@ -19735,8 +24837,8 @@ static void drawSequenceModal() {
     ImGui::TextDisabled("Frames decode in the background; you can keep working.");
     ImGui::Separator();
     static bool remember = false;
-    ImGui::Checkbox("remember my choice (File > Sequence loading)", &remember);
-    if (ImGui::Button("Load sequence", ImVec2(150 * app.uiScale, 0))) {
+    ImGui::Checkbox("remember my choice (File > Stack loading)", &remember);
+    if (ImGui::Button("Load stack", ImVec2(150 * app.uiScale, 0))) {
         startSequenceLoad(app.seqAskImage, app.seqAskFiles, app.seqAskPattern);
         if (remember) app.seqLoadMode = 1;
         app.seqAskImage = -1; app.seqAskFiles.clear();
@@ -19752,11 +24854,6 @@ static void drawSequenceModal() {
 }
 
 // ---------------------------------------------------------------- menu bar / dialogs
-#if defined(__APPLE__)
-  #define SC_MOD "Cmd"
-#else
-  #define SC_MOD "Ctrl"
-#endif
 
 // Is what we are looking at somewhere else? A session being up counts (any
 // Browse instance), and so does an image that came from one: a dropped
@@ -19792,7 +24889,7 @@ static std::string viewingHost() {
 // button, and the integrated title bar this app draws for itself.
 static std::string windowTitleText() {
     const ImageDoc* im = cur();
-    std::string t = im ? im->name + " - viewer" : "viewer v0.1";
+    std::string t = im ? im->name + " - viewer" : std::string("viewer  ") + viewerVersion();
     // The bracket answers "which machine are these pixels on?". A local browse
     // goes through the peer protocol but the file is on this disk, so there is
     // no other machine to name - and "[local peer]" named one, which is how a
@@ -19897,8 +24994,20 @@ static void drawTitleBarExtras() {
 static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open...", SC_MOD "+O")) openFileDialog();
+        if (ImGui::MenuItem("Open...")) openFileDialog();
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
+        // §4.1: a reader must be reachable for a FOLDER as well as a file -
+        // "one condition per folder" is a common way to store a sweep, so the
+        // folder is often the thing that needs reading, not any file in it.
+        if (ImGui::MenuItem("Open With a Reader...") && !app.rdOpenDlg) {
+            app.rdOpenMode = 1;
+            app.rdOpenDlg = std::make_unique<pfd::open_file>(
+                "Open with a reader", ".", std::vector<std::string>{ "All files", "*" });
+        }
+        if (ImGui::MenuItem("Open Folder With a Reader...") && !app.rdFolderDlg) {
+            app.rdFolderMode = 1;
+            app.rdFolderDlg = std::make_unique<pfd::select_folder>("Open folder with a reader", ".");
+        }
         // The local mirror of browsing a server: look around, preview, use the
         // server-side stats - without loading anything. Same Browse panel, the
         // peer just runs on this machine.
@@ -19906,6 +25015,23 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("open a folder in the Browse panel: list, preview\n"
                               "and measure without loading anything");
+        // "open folder" was a button in the Browse panel's "more" drawer. It is
+        // a verb about a WHOLE folder, not about the panel's chrome, so it
+        // belongs on the menu bar with the other openers (10.3). The crumb's
+        // right-click keeps its own copy: there the subject is the folder the
+        // crumb names, which is the more precise aim of the two.
+        {
+            App::BrowseInstance& I = rbActive();
+            if (ImGui::MenuItem("Open Folder (all stacks below)...", nullptr, false,
+                                I.b.connected))
+                remoteScanFolder(I, I.b.dir);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(I.b.connected
+                    ? "scan the folder the Browse panel is in and everything\n"
+                      "below it, then pick which stacks to open:\n%s"
+                    : "the Browse panel is not standing anywhere yet%s",
+                    I.b.connected ? I.b.dir.c_str() : "");
+        }
         // The OS dialog can only show THIS machine's disks (the NAS included,
         // since it is mounted). Files on a server need the ssh:// path, so they
         // need a place to type it.
@@ -19957,7 +25083,7 @@ static void drawMenuBar(GLFWwindow* win) {
         }
         if (ImGui::MenuItem("Close All", nullptr, false, !app.images.empty())) closeAll();
         ImGui::Separator();
-        if (ImGui::BeginMenu("Sequence loading")) {
+        if (ImGui::BeginMenu("Stack loading")) {
             if (ImGui::MenuItem("Ask each time", nullptr, app.seqLoadMode == 0)) app.seqLoadMode = 0;
             if (ImGui::MenuItem("Always load folder", nullptr, app.seqLoadMode == 1)) app.seqLoadMode = 1;
             if (ImGui::MenuItem("Never (single file)", nullptr, app.seqLoadMode == 2)) app.seqLoadMode = 2;
@@ -19986,7 +25112,7 @@ static void drawMenuBar(GLFWwindow* win) {
                     app.procPolicy = App::PolLocalFetch;
                 ImGui::Separator();
             }
-            if (ImGui::MenuItem("Load sequence for current image", nullptr, false,
+            if (ImGui::MenuItem("Load stack for current image", nullptr, false,
                                 cur() && cur()->seqId == 0 && !cur()->src->path.empty())) {
                 std::string pat;
                 std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
@@ -20042,8 +25168,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 app.compareFollowFrame = !app.compareFollowFrame;
             {   // the display range relationship, where the compare modes live
                 static const char* RN[3] = { "  each side keeps its own range",
-                                             "  B uses A's range",
-                                             "  auto over both (union)" };
+                                             "  every side uses A's range",
+                                             "  auto over every side (union)" };
                 ImGui::TextDisabled("Display range");
                 for (int r = 0; r < 3; r++)
                     if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
@@ -20076,7 +25202,10 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("Side by side images (split) -> side by side plots.\n"
                                   "Wipe / blink / difference have one image area,\n"
                                   "so their plots overlay.");
-            if (ImGui::MenuItem("  Overlay (A solid, B dashed)", nullptr,
+            // "(A solid, B dashed)" described a stroke style that no longer
+            // exists - every side past A draws SOLID in its own ink, and at N
+            // the parenthetical also implied a pair. Say what the mode does.
+            if (ImGui::MenuItem("  Overlay (every side on one plot)", nullptr,
                                 app.abStatsLayout == App::AbOverlay))
                 app.abStatsLayout = App::AbOverlay;
             if (ImGui::MenuItem("  Side by side (A on the left)", nullptr,
@@ -20091,9 +25220,11 @@ static void drawMenuBar(GLFWwindow* win) {
             // one row per stack (its frame in view), not one per frame: a
             // 120-frame stack must not produce a 120-row menu
             int shown = 0;
+            // A itself is on the list: setting B to the document already on the
+            // A side is a supported comparison (both sides draw, coinciding),
+            // and leaving it out was the same omission resolveB used to make.
             for (int i = 0; i < (int)app.images.size(); i++) {
                 ImageDoc* d = app.images[i].get();
-                if (d == cur()) continue;
                 if (d->seqId != 0) {
                     App::SeqInfo* si = seqInfo(d->seqId);
                     int rep = si && si->lastImageIdx >= 0 ? si->lastImageIdx : -1;
@@ -20166,6 +25297,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("another Browse window with its own place -\n"
                                   "browse two folders or two machines side by side");
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
+            ImGui::MenuItem("Reader", nullptr, &app.readerPanelOpen);
+            ImGui::MenuItem("Readers (remembered)", nullptr, &app.readerListOpen);
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
@@ -20272,7 +25405,7 @@ static void drawMenuBar(GLFWwindow* win) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip(inStack
                         ? "sigma_t / sigma_fpn over the loaded stack (whole frames or the selected ROI)"
-                        : "needs a stack: load a numbered sequence first");
+                        : "needs a stack: load numbered files as a stack first");
             }
         }
         ImGui::EndMenu();
@@ -20355,9 +25488,12 @@ static void drawRemoteOpenModal() {
         app.prefsDirty = true;
         savePrefs();
         ImGui::CloseCurrentPopup();
-        // errors arrive as toasts and inline in the instance that connects -
-        // the one the user was last working in
-        startRemote(rbActive(), hostbuf);
+        // errors arrive as toasts and inline in the instance that connects.
+        // Which instance that is: not blindly the active one -- connecting to a
+        // machine while a local listing is open used to replace it.
+        App::BrowseInstance& I = rbInstanceFor(hostbuf);
+        startRemote(I, hostbuf);
+        rbShowInstance(I);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
@@ -20397,9 +25533,13 @@ static void drawRemoteErrorWindow() {
 // InputTextMultiline is what makes an error message quotable.
 static void drawMessagesPanel() {
     static std::string flat;          // rebuilt only when the log changes
+    // Keyed on msgSeq, not msgLog.size(): the log is capped at 300, so past the
+    // cap the size is 300 for every subsequent message and a size-keyed cache
+    // never rebuilds again - the panel went blind exactly when messages were
+    // arriving fastest, which is when it is being read.
     static size_t builtFrom = (size_t)-1;
-    if (builtFrom != app.msgLog.size()) {
-        builtFrom = app.msgLog.size();
+    if (builtFrom != app.msgSeq) {
+        builtFrom = app.msgSeq;
         flat.clear();
         for (const auto& m : app.msgLog) {
             flat += m.err ? "[error] " : "        ";
@@ -20409,7 +25549,7 @@ static void drawMessagesPanel() {
     }
     if (ImGui::Button("copy all")) { ImGui::SetClipboardText(flat.c_str()); toast("copied"); }
     ImGui::SameLine();
-    if (ImGui::Button("clear")) { app.msgLog.clear(); builtFrom = (size_t)-1; }
+    if (ImGui::Button("clear")) { app.msgLog.clear(); app.msgSeq++; }
     ImGui::SameLine();
     ImGui::TextDisabled("select any part and press %s+C", SC_MOD);
     ImGui::InputTextMultiline("##msgs", flat.data(), flat.size() + 1,
@@ -20427,11 +25567,12 @@ static void drawHelpAbout() {
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", d);
                 };
                 row("Right / Left",  "next / previous frame (time axis)");
-                row("Down / Up",     "next / previous stack (sequence)");
+                row("Down / Up",     "next / previous stack");
                 row("Ctrl+F / Ctrl+B", "next / previous frame (Emacs style)");
                 row("Ctrl+N / Ctrl+P", "next / previous stack");
                 row("Ctrl+A / Ctrl+E", "first / last frame");
-                row(SC_MOD "+O / O", "open files");
+                row(SC_MOD "+O",       "open what is selected in Browse (or go there)");
+                row(SC_MOD "+Shift+O", "open a folder");
                 row(SC_MOD "+S",     "save session (view state + images)");
                 row(SC_MOD "+W",     "close current image");
                 row("F / double-click", "fit to window");
@@ -20447,7 +25588,8 @@ static void drawHelpAbout() {
                 row("X / Y",         "select the row / column: through the selected pin, the "
                                      "cursor, or widen the selected ROI (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
-                row("\\ or C",       "A/B compare: off -> wipe -> side by side");
+                row("\\ or C",       "A/B compare: off -> wipe -> side by side -> "
+                                     "difference -> blink");
                 row("Shift+\\",       "swap A and B (also the status bar button)");
                 row("Shift+C",       "side by side with the slots past B (C, D, ...)");
                 row("B (hold)",      "show B full-frame while held");
@@ -20466,7 +25608,7 @@ static void drawHelpAbout() {
                 row("right / left",  "tree mode: expand / collapse the folder under the cursor");
                 row("Backspace",     "up to the parent folder");
                 row(SC_MOD "+F",     "focus the filter box");
-                row(", / .",         "step the previewed sequence");
+                row(", / .",         "step the previewed stack");
                 ImGui::EndTable();
             }
         }
@@ -20475,7 +25617,7 @@ static void drawHelpAbout() {
     if (app.showAbout) {
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         if (ImGui::Begin("About viewer", &app.showAbout, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("viewer v0.1");
+            ImGui::Text("viewer  %s", viewerVersion());
             ImGui::TextDisabled("cross-platform image viewer for engineering data");
             ImGui::Separator();
             ImGui::TextDisabled("Dear ImGui %s  |  GLFW %s", IMGUI_VERSION, glfwGetVersionString());
@@ -20498,6 +25640,7 @@ static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Brows
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack from stack, exit
+static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean as a frame, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -20507,6 +25650,18 @@ static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise line
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
+static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
+static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
+// --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
+// window. It takes no directory because it needs no file: every fixture it
+// measures is analytic and built in memory (see roiStatsSelftest()).
+static bool g_roiStatsSelftest = false;
+
+// --abeq-selftest: A and B (and a letter past B) on ONE document - the
+// comparison people set up on purpose, to confirm the two sides agree. Takes no
+// directory for the same reason as --roistats-selftest, and is windowless for
+// the same reason: see abEqSelftest().
+static bool g_abEqSelftest = false;
 
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
@@ -20516,14 +25671,27 @@ static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk 
 // LOCAL peer to <dir> in a hidden window and replays real UI actions into the
 // real input queue, one per script slot: the panel cannot tell them from a
 // human. Actions (--browse-keys overrides the canned list): focus, down, up,
-// left, right, enter, home, end, back, flat, tree, more, disc, fmenu, rctx,
+// left, right, enter, home, end, back, flat, tree, disc, fmenu, rctx,
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
-// img0 (select the first image); click / ctrlclick / dbl (real mouse clicks on
-// the cursor's row - a double-click only exists as clicks); chevclick (a click
+// img0 (select the first image); natorder (flip the NAME column between
+// natural and text order - relative, like flat / tree, and pinned back by
+// viewreset); click / ctrlclick / dbl (real mouse clicks on
+// the cursor's row - a double-click only exists as clicks); clickoff:N /
+// dbloff:N (the same two, N rows BELOW the cursor - the only aim the keyboard
+// has not already previewed, and so the only one where click one pays for the
+// fetch, as a human's first click on a row always does); idle:N (hold N frames
+// - a delay knob, so "two clicks a second apart" can be said); chevclick (a click
 // on the cursor row's tree chevron, asserting the toggle landed at once);
-// mback / mfwd
+// starclick (a click on the bookmark star at the end of the path line);
+// pinclick (a click on the OUTERMOST row the pinned-ancestor band is holding,
+// with chkpin:SPEC reading that band back as text - ";"-terminated names,
+// outermost first, "-" for nothing pinned - and h<px> forcing the panel's
+// height so the listing is short enough to have scrolled at all);
+// marklist / starmark / seterr / clrerr (baselines and a fake failure for the
+// drawer-removal checks below); mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
-// viewreset (absolute grouped+list+folded state - the toggles are relative);
+// viewreset (absolute grouped+list+folded+natural-name state - the toggles are
+// relative);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
 // leaf is LEAF); and the assertions chkimg:N (count + NAMES), chkpv:N,
 // chkidx:K, chkopen:S, chkcur, chkcurn:NAME, chknames:SPEC, chkdir:LEAF,
@@ -20531,6 +25699,16 @@ static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk 
 // chkfwd:N, chkexp:N, exparm / chkexpn:0 (a per-frame watch: the armed path
 // was never expanded on ANY frame in between), chkfocus:0|1 - any FAIL fails
 // the run.
+//
+// The "more" drawer's removal (docs/browse-topbar-design.md 10.2/10.3) is
+// asserted by chktitle (the panel is named after its machine, both directions,
+// with the ### id untouched), chkstat:N (the bottom status line's item and
+// selected counts, both directions, and one line only), chkstar:0|1 (the star
+// flipped from starmark and agrees with the bookmark list), chkerr:0|1 (a
+// failure is IN the status line and the listing did not move - marklist is the
+// baseline) and setpv:N / pvback / chkproto:0|1 (the same two claims for the
+// protocol-mismatch notice, the other orange row that is gone). "more" is gone
+// as an action along with the drawer it folded.
 //
 // INSTANCES (item 17): every stateful action and check drives the TARGET
 // instance (target:N switches it; 1 = the primordial panel). newpanel creates
@@ -20542,10 +25720,12 @@ static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk 
 // (windows visible), chksel:N (rows selected in the target).
 //
 // w<px> floats the panel at an exact width and then asserts what a human would
-// otherwise have to read off a screenshot: that the filter box and the "more"
-// button are still INSIDE the panel, and that the filter is wide enough to type
-// a glob into. 271 is the panel's own default docked width on a 1600 px screen,
-// which is where the fixed SameLine chain used to push both of them off-screen.
+// otherwise have to read off a screenshot: that the filter box and the item
+// that ENDS the toolbar row are still INSIDE the panel, and that the filter is
+// wide enough to type a glob into. 271 is the panel's own default docked width
+// on a 1600 px screen, which is where the fixed SameLine chain used to push
+// both of them off-screen. (That last item was the "more" fold button and is
+// the "..." panel menu now - same contract, different button.)
 static int g_abRangeDefault = -1;      // App's compareRangeMode before loadPrefs
 static std::string g_browseKeys;        // <dir>, empty = not running
 // Key-routing evidence for --browse-keys-selftest: how many times the MAIN
@@ -20571,9 +25751,15 @@ static int g_expNeverHits = 0;          // frames rbHas(expanded, path) was true
 static int g_expNeverFrames = 0;        // frames watched
 static int g_chevPreExp = -1;           // "chevclick": expanded count pre-press
 static bool g_browseKeysBlur = false;   // "blur" action: drop panel focus
+// "imgmark" / "chkimgmark": how many documents were open before a gesture, and
+// the assertion that the gesture opened none. An absolute chkimg:N says the
+// same thing only as long as every count before it holds, which is a
+// maintenance tax on a 258-action list; this pair says "this gesture opened
+// nothing" in the two actions it takes to say it.
+static int g_rbImgMark = -1;
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
-    "left,end,home,up,down,more,down,back,"
+    "left,end,home,up,down,down,back,"
     // ---- what PREVIEW means for a stack row (docs/todo-open.md items 1/26).
     // Floated first (w400): the click actions aim real mouse events at the
     // cursor row's rectangle, and the user's saved layout must not decide
@@ -20583,7 +25769,7 @@ static std::string g_browseKeysActs =
     // scrub going dead right after asking for stats was defect 1).
     // (waitdir first: the prefix ends on "back", and keys fired before that
     // listing lands would walk the OLD rows and be reset mid-sequence.)
-    "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,"
+    "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,down,"
     "chkimg:1,chkpv:24,chkidx:0,period,chkidx:1,chknames:frame_001.npy[pv],"
     "comma,chkidx:0,svtemp,chkfocus:1,period,chkidx:1,comma,chkidx:0,"
     // Double-click = the stack opens exactly ONCE, poster dropped, nothing
@@ -20594,7 +25780,7 @@ static std::string g_browseKeysActs =
     // ...same overlap on a single-file row: promote once, no duplicate
     // preview, and Enter afterwards re-shows the open file instead of doing
     // nothing (the old final branch) or opening a second copy.
-    "home,down,down,down,down,down,down,chkpv:0,dbl,chkimg:25,"
+    "home,down,down,down,down,down,down,down,chkpv:0,dbl,chkimg:25,"
     "chknames:frame_###.npy*24+dark.npy,enter,chkimg:25,chkcurn:dark.npy,"
     // ...and a group whose numbering starts at 9 (padset): grouping, preview
     // scrub and the double-click open all work by POSITION, not by the
@@ -20603,26 +25789,75 @@ static std::string g_browseKeysActs =
     "period,chkidx:1,dbl,waitimg:28,chkopen:2,chkimg:28,"
     "chknames:frame_###.npy*24+dark.npy+f_9.npy+f_10.npy+f_11.npy,"
     "back,waitdir:rb,"
-    // ---- folder rows: click SELECTS (cursor moves, nothing opens),
-    // double-click ENTERS; mouse back/forward and Alt+Left/Right walk the
-    // history; a fresh navigation truncates the forward branch.
-    "home,down,chkatrow:digitset,click,chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkback:5,"
+    // ---- folder rows in a LIST: one click ENTERS. A list has no "open it
+    // where it is", so the single click is the folder's whole vocabulary and
+    // there is no double-click meaning left to give it. Mouse back/forward and
+    // Alt+Left/Right walk the history; a fresh navigation truncates forward.
+    "home,down,chkatrow:digitset,click,waitdir:digitset,chkback:5,"
     "chkfwd:0,mback,waitdir:rb,chkfwd:1,mfwd,waitdir:digitset,chkfwd:0,"
     "altleft,waitdir:rb,chkfwd:1,altright,waitdir:digitset,altleft,waitdir:rb,"
-    "home,down,down,dbl,waitdir:expset,chkfwd:0,back,waitdir:rb,"
-    // ...in a TREE the verbs have hit ZONES (Explorer's pane): the NAME
-    // never expands - not even between the two clicks of a double-click.
-    // exparm / chkexpn:0 probe EVERY frame of the gesture: the ce02f12 latch
-    // (expand on click one, cancel on click two) ended state-correct but
-    // RENDERED the expand mid-gesture, and this is the check it cannot pass.
-    "tree,home,down,chkatrow:digitset,exparm,dbl,waitdir:digitset,"
-    "chkexpn:0,chkexp:0,back,waitdir:rb,"
-    // ...the CHEVRON is the expand verb: one click toggles in place, at once
-    // (chevclick itself asserts the toggle beat the double-click window), a
-    // second collapses; a NAME click is selection only - cursor placed,
-    // nothing toggled, nowhere navigated.
-    "home,down,chkatrow:digitset,chevclick,chkexp:1,chevclick,chkexp:0,"
-    "click,chkexp:0,chkdir:rb,chkatrow:digitset,tree,"
+    // ---- THE ORDER THE ROWS ARE IN (user decision 2026-08-05: natural).
+    // rb/unpadded is the one fixture whose names are not zero-padded, so it is
+    // the only one where the two candidate orders differ at all: read as TEXT,
+    // lv10 falls between lv1 and lv2. Walking down with the arrow keys asserts
+    // the order the panel actually laid out, through the real sort - and the
+    // group row below the folders makes the same claim about the file names,
+    // because the peer's extent spans frame_1 to frame_10 only if the run was
+    // read by value.
+    //
+    // Placed after the history checks and before the next chkfwd: entering a
+    // folder and backing out costs two history entries (chkback above counts
+    // them) and truncates the forward stack (the double-click below sets it
+    // back to 0 itself).
+    //
+    // This is the on-screen half. --browse-selftest owns the other half: that
+    // this is also the order the stack is BUILT in.
+    "home,down,down,down,down,down,down,enter,waitdir:unpadded,"
+    "home,down,chkatrow:lv1,down,chkatrow:lv2,down,chkatrow:lv10,"
+    "down,chkatrow:frame_1\xE2\x80\xA5" "10.npy,"
+    "back,waitdir:rb,"
+    // ...and a folder that is DOUBLE-clicked is entered ONCE, and opens
+    // NOTHING. The habit is older than this panel, so the second click will
+    // arrive whatever the list mode means by one click; it lands a frame or
+    // two after rbGoTo, by which time the row it was aimed at has been
+    // replaced under a pointer that never moved. This is the assertion the
+    // one-click design lives or dies on, and it is the one CI produced the
+    // counter-example for: imgs 44 -> 52 between "dbl" and the listing
+    // landing - eight frames of the folder just entered, opened by a click
+    // aimed at the folder. Checked twice, because an open is asynchronous and
+    // one check right after the navigation could beat it.
+    "home,down,chkatrow:digitset,imgmark,dbl,waitdir:digitset,chkimgmark,"
+    "chkfwd:0,back,waitdir:rb,chkimgmark,"
+    "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
+    // the name toggles it in place, a double-click goes to it. That is not the
+    // ce02f12 latch this file used to forbid - THAT expanded on click one and
+    // CANCELLED on click two, so the expand was rendered and then undone. Here
+    // click one expands and it STAYS expanded; the double-click adds a
+    // navigation on top. Nothing is undone, so there is nothing to flash.
+    //
+    // The toggles are asserted on THIS ROW now (chkrowexp), which is what the
+    // gap named here used to be: chkexp counts every expanded folder in the
+    // panel, so "the name-click toggled this row" was only expressible when
+    // the panel started fully collapsed - and the keyboard section far above
+    // leaves one open with Right, so it was not expressible at all. cursorFull
+    // is the exact key `expanded` is written in, so the question is asked
+    // directly.
+    //
+    // The two toggles ALTERNATE name / chevron on purpose: two clicks at the
+    // same pixel inside ImGui's double-click window are one gesture with a
+    // count of two, not two gestures, and the second would be read as a
+    // double-click. The name (row centre + 40 px) and the chevron (the left
+    // gutter) are far enough apart that each press starts a fresh chain, so
+    // this reads the same at any frame rate.
+    "tree,home,down,chkatrow:digitset,chkrowexp:0,"
+    "click,chkrowexp:1,chevclick,chkrowexp:0,"
+    "click,chkrowexp:1,chevclick,chkrowexp:0,"
+    // ...and the OTHER verb, on the same row: a double-click navigates, once,
+    // and opens nothing on the way (the tree's navigation happens on the
+    // second PRESS, so its release is one frame behind - the same window the
+    // list's is two frames behind).
+    "imgmark,dbl,waitdir:digitset,chkimgmark,back,waitdir:rb,tree,"
     // ---- Enter on a multi-selection opens EVERY selected row, each group
     // as its own stack (the action-row button is the MERGE; this is the other
     // one - only the cursor's row used to open).
@@ -20637,8 +25872,14 @@ static std::string g_browseKeysActs =
     "blur,down,up,end,home,"
     // ...then the panel geometry sweep: the toolbar must stay inside the panel
     // at every docked width, and Escape must close a menu and a context popup.
-    "w271,w200,w180,w420,w700,w1150,more,w271,w700,w180,w0,"
-    "rctx,esc,fmenu,esc,disc,"
+    // Swept with EVERY chip lit (viewreset pins the absolute state first, then
+    // one toggle each): a chip only appears when its setting is off the
+    // default, so the widest the toolbar can ever be is the case no default
+    // run would ever draw - which is exactly the one where the filter box gets
+    // pushed off the right edge.
+    "viewreset,flat,tree,natorder,"
+    "w271,w200,w180,w420,w700,w1150,w271,w700,w180,w0,"
+    "viewreset,rctx,esc,fmenu,esc,disc,"
     // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
     // singleton). Reconnect the primordial panel, then open a SECOND Browse
     // standing in a DIFFERENT place at the same moment - the one sentence a
@@ -20654,7 +25895,7 @@ static std::string g_browseKeysActs =
     // selection is per instance too
     "ctrlclick,chksel:1,target:1,chksel:0,target:2,"
     // ...and so is the history: navigating panel 2 records nothing in panel 1
-    "dbl,waitdir:10lx,chkback:1,target:1,chkback:0,"
+    "imgmark,dbl,waitdir:10lx,chkimgmark,chkback:1,target:1,chkback:0,"
     // focus back on panel 1: the same keys now move ITS cursor, and panel 2's
     // (reset to -1 by its own navigation) stays put
     "focus,chkfocus:1,down,chkcursor:0,target:2,chkcursor:-1,"
@@ -20668,6 +25909,61 @@ static std::string g_browseKeysActs =
     // ...and the LAST one closing only hides: View > Panels > Browse reopens
     // it with its place, listing and cursor intact
     "hidep,chkshown:0,showp,chkshown:1,chkdir:rb,focus,up,chkatrow:..,"
+    // ---- THE DRAWER IS GONE (docs/browse-topbar-design.md 10.2/10.3). Each
+    // of these asserts one of its contents in the place it moved to, which is
+    // the only way to tell "rehomed" from "deleted". Floated first so the path
+    // line has room for the star and the click can be aimed at it.
+    // The title names the machine; the status line counts what is in front of
+    // you in both directions; the star is lit iff the place is bookmarked and
+    // survives a real click at the end of the path line; and a failure speaks
+    // ON the status line without opening a band that moves the listing.
+    // (the filter from the instance segment is still on here, so the first
+    // chkstat reads the narrowed form "N of M items"; clearing it reads the
+    // plain "M items" - the count in both directions)
+    "w400,chktitle,chkstat:0,"
+    // ...a GROUPED row: one row, twenty-four frames, and the line says both
+    // (the filter from the instance segment leaves exactly that row showing)
+    "home,down,chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    "ctrlclick,chkstat:1,chkframes:24,ctrlclick,chkstat:0,"
+    "filt:,marklist,chkstat:0,"
+    "starmark,starclick,chkstar:1,starclick,chkstar:0,"
+    "seterr,chkerr:1,clrerr,chkerr:0,"
+    "setpv:2,chkproto:1,setpv:99,chkproto:1,pvback,chkproto:0,"
+    // ...and a plain row: one row, one thing, no second count. Placed from
+    // "home" because clearing the filter above rebuilt the shown set and reset
+    // the cursor - a bare "down" would land on ".." , which selects nothing.
+    "home,down,chkatrow:digitset,ctrlclick,chkstat:1,chkframes:0,w0,"
+    // ---- the levels above the reader do not scroll away -------------------
+    // 「階層表示で下にスクロールすると上層の階層が上に行って消える」. Every
+    // ancestor of the row at the top of the viewport is held above it now, at
+    // any depth, with no setting - so this asserts the two things a setting
+    // would otherwise have to be trusted for.
+    //
+    // FIRST, that they are on screen. chkpin reads the band back as text,
+    // outermost first, which is the same order and the same words a human
+    // reads off the panel - not a flag saying the feature is on.
+    // rb/expset/zdeep exists for exactly this shape of question: its last
+    // sixty rows are all three levels down, so scrolling to the end is
+    // guaranteed to leave the reader inside a/b/c. The panel is floated SHORT
+    // (h360) as well, because "the fixture was longer than this screen" is not
+    // a thing a gate should rest on - on a taller monitor the same script
+    // would pass by never scrolling at all.
+    //
+    // SECOND, that a pinned row is the row and not a picture of it. pinclick
+    // aims a real mouse click at the outermost pinned rectangle; what answers
+    // is the verb a folder row has always had in a tree - collapse it - and
+    // the proof is that one action later its whole subtree, and the band with
+    // it, is gone. imgmark/chkimgmark says the same click opened nothing,
+    // which is also what clicking a folder has always not done.
+    "viewreset,w400,h360,waitdir:rb,home,"
+    "down,down,chkatrow:expset,enter,waitdir:expset,"
+    "home,down,chkatrow:zdeep,enter,waitdir:zdeep,"
+    "tree,home,down,chkatrow:a,chkpin:-,right,idle:10,"
+    "down,chkatrow:b,right,idle:10,"
+    "down,chkatrow:c,right,idle:20,"
+    "end,chkpin:a;b;c;,"
+    "imgmark,pinclick,chkimgmark,chkpin:-,"
+    "h0,w0,viewreset,back,waitdir:expset,back,waitdir:rb,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -20679,8 +25975,9 @@ static std::string g_browseKeysActs =
 static void printUsage() {
     printf(
         "usage: viewer [options] [files or folders...]\n"
-        "  files:  .npy, .npz, .vsession (saved session), or raw binaries (.bin/.raw/...)\n"
-        "  folder: loads every numbered sequence below it, one stack per group\n"
+        "  files:  .npy, .npz, .png, .jpg, .vsession (saved session),\n"
+        "          or raw binaries (.bin/.raw/...)\n"
+        "  folder: loads the numbered files below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"
         "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
@@ -20693,14 +25990,25 @@ static void printUsage() {
         "  --bayer-pattern <p>         RGGB|BGGR|GRBG|GBRG (default RGGB)\n"
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
-        "  --sequence <mode>           numbered siblings: ask (default) | always | never\n"
-        "  --npy-axis <auto|frames>    (N,H,W) with N<=4: channels (auto) or frames\n"
+        "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
+        "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
+        "                              60%% of physical RAM)\n"
+        // %s, not a copy: this line said "(H,W,3|4)" while the refusal it is
+        // describing said something else, which is exactly the drift issue #71
+        // was. There is now one spelling and it lives in one place.
+        "  .npy shapes read natively:  %s\n"
+        "                              any other shape is refused by name; to read one\n"
+        "                              differently, use \"re-read as...\" in the Inspector\n"
         "  ssh://user@host/path.npy    view a file on another machine: the UI stays\n"
         "                              here, only the visible region is fetched\n"
         "  ssh://user@host/~/dir       connect and browse there instead (a host on\n"
         "                              its own works too) - what a desktop shortcut\n"
         "                              made by tools/install_shortcut.* passes\n"
-        "  --remote-exe <path>         how to start the peer there (default: viewer)\n"
+        "  --remote-exe <path>         how to start the peer there (default:\n"
+        "                              ~/.viewer/viewer-serve, self-installed on the\n"
+        "                              first connection)\n"
+        "  --remote-policy <p>         where a measurement runs: auto (default, on the\n"
+        "                              server) | local-fetch (pull tiles, measure here)\n"
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
         "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
@@ -20708,24 +26016,61 @@ static void printUsage() {
         "                              side, and report the panes the canvas drew\n"
         "  --bench-step                ...and step A one frame per bench frame (A/B\n"
         "                              follow-frame cost: both sides recompute)\n"
+        "  --bench-panels              ...with Projection, Histogram and Temporal side\n"
+        "                              by side rather than tabbed, so all three draw\n"
         "  --no-ab-throttle            do NOT hold the B statistics while stepping\n"
-        "  --lin-selftest              load, fit linearity over the stacks, print, exit\n"
+        "  --gl-probe                  can this machine make the GL context the viewer\n"
+        "                              needs? name it and exit (0 yes, 3 no + why)\n"
+        "  --no-window                 start WITHOUT a window or a GL context, for the\n"
+        "                              selftests that never draw (nothing else runs)\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
-        "  --abstats-selftest <dir>    A/B statistics caches: two slots, print, exit\n"
-        "  --tile-selftest <dir>       side-by-side compare panes: geometry, print, exit\n"
-        "  --series-selftest <dir>     series (系列) model + invariants, print, exit\n"
-        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit, exit\n"
-        "  --frame-lin-selftest        frame-wise linearity (Temporal section): synthetic\n"
-        "                              stacks with exact means, both fit methods, exit\n"
-        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow, exit\n"
-        "  --newwin-selftest <dir>     instance autosave slots + spawn line, print, exit\n"
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
-        "  -h, --help                  show this help\n");
+        "  -h, --help                  show this help\n"
+        // All of them, always. docs/manual.md 9 promises this list is the canon,
+        // and it said 8 of 22 for long enough that --verify-selftest could be
+        // believed not to exist. Adding a flag means adding its line here.
+        "self-tests (load, check, print, exit; 0 = pass). ctest runs all 22:\n"
+        "  --lin-selftest              linearity fit over the stacks given\n"
+        "  --frame-lin-selftest        frame-wise linearity (Temporal section):\n"
+        "                              synthetic stacks with exact means, both methods\n"
+        "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit\n"
+        "  --series-selftest <dir>     series (系列) model + invariants\n"
+        "  --range-selftest <dir>      every A/B display-range combination (2 stacks)\n"
+        "  --framestats-selftest       per-frame statistics, TSV to stdout\n"
+        "  --abstats-selftest <dir>    A/B statistics caches: two slots\n"
+        "  --tile-selftest <dir>       side-by-side compare panes: geometry\n"
+        "  --export-selftest <dir>     PNG export + montage\n"
+        "  --export-tsv-selftest <dir> the Temporal export document\n"
+        "  --picker-selftest <dir>     stack picker: filter cut + merge\n"
+        "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
+        "  --close-selftest <dir>      closing, per stack\n"
+        "  --batch-selftest <dir>      move-to-batch + session round trip\n"
+        "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
+        "  --roistats-selftest         the ROI table's numbers and its PRNU column,\n"
+        "                              through the real panel, on analytic fixtures\n"
+        "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
+        "                              coinciding, through the real panel\n"
+        "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
+        "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
+        "                              value, NaN exclusion, CFA planes, provenance\n"
+        "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
+        "                              refcounts, Watch baselines\n"
+        "  --media-selftest <dir>      PNG/JPEG bit depth, channels and notes; TIFF's refusal\n"
+        "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
+        "  --browse-selftest <dir>     Browse panel behaviour\n"
+        "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
+        "  --browse-keys-selftest <dir>  the Browse panel's KEYBOARD, replayed as real\n"
+        "                              input into real frames (--browse-keys <script>\n"
+        "                              overrides the canned action list)\n"
+        "  --rtemporal-selftest <dir>  temporal analysis driven from the browser\n"
+        "  --remote-selftest <file>    remote round trip against a peer started here;\n"
+        "                              pass --remote-exe to test viewer-serve itself\n",
+        NPY_NATIVE_FORMS);
 }
 
 static void parseCli(int argc, char** argv) {
@@ -20785,24 +26130,38 @@ static void parseCli(int argc, char** argv) {
                            [](unsigned char c) { return (char)std::toupper(c); });
             for (int p = 0; p < 4; p++)
                 if (v == CFA_PATTERNS[p]) d.cfaPattern = p;
+            // ...and forward it to --cfa NOW, so the two can be given in either
+            // order. Only --cfa used to publish the pattern, which made
+            // "--cfa bayer --bayer-pattern GRBG" demosaic as RGGB without a word
+            // - the CMake tests write exactly that order and only escape it
+            // because RGGB is index 0. Nothing reads forceCfaPattern unless
+            // --cfa was given (addImage tests forceCfa >= 0 first).
+            app.forceCfaPattern = d.cfaPattern;
         } else if (a == "--quad-bayer") {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
         } else if (a == "--npy-axis") {
-            std::string v = next();
-            if (v == "frames") app.npyAxis = 1;
-            else if (v == "auto" || v == "channels") app.npyAxis = 0;
-            else fprintf(stderr, "--npy-axis expects auto|frames\n");
-        } else if (a == "--sequence") {            // ask | always | never
+            // docs/input-adapters.md §3.4. One global flag decided the meaning
+            // of every 3-D array in a run, so a session holding one file to read
+            // as a stack and another to read as colour could not be expressed at
+            // all. Say so and carry on - silence would leave the user believing
+            // the old meaning still applied.
+            next();                                // swallow its value, not a path
+            fprintf(stderr, "--npy-axis is gone: (F,H,W) is F frames and (H,W,C<=4) is one "
+                            "frame of C channels, always. To read one file differently, open "
+                            "it and use \"re-read as...\" in the Inspector - it is per file "
+                            "and it is remembered.\n");
+        } else if (a == "--stack") {               // ask | always | never
             std::string v = next();
             if (v == "always") app.seqLoadMode = 1;
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
-            else fprintf(stderr, "--sequence expects ask|always|never\n");
+            else fprintf(stderr, "--stack expects ask|always|never\n");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
-        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--secondary") {
+        } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--bench-panels" ||
+                   a == "--secondary" || a == "--no-window") {
             /* consumed in main(): no value */
         } else if (a == "--no-ab-throttle") {
             g_abNoThrottle = true;     // measure what the B-slot throttle saves
@@ -20811,7 +26170,7 @@ static void parseCli(int argc, char** argv) {
             app.forceCfa = v == "bayer" ? 1 : v == "quad" || v == "quad-bayer" ? 2
                          : v == "none" ? 0 : -1;
             if (app.forceCfa < 0) fprintf(stderr, "--cfa expects none|bayer|quad\n");
-            app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern, if it came first
+            app.forceCfaPattern = d.cfaPattern;    // --bayer-pattern seen so far, if any
         } else if (a == "--lin-selftest") {
             g_linSelftest = true;                  // handled in main() after loading
         } else if (a == "--range-selftest") {
@@ -20822,6 +26181,10 @@ static void parseCli(int argc, char** argv) {
             g_exportTsvSelftest = next();          // handled in main()
         } else if (a == "--frame-lin-selftest") {
             g_frameLinSelftest = true;             // handled in main()
+        } else if (a == "--roistats-selftest") {
+            g_roiStatsSelftest = true;             // handled in main()
+        } else if (a == "--abeq-selftest") {
+            g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
@@ -20844,6 +26207,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--derive-selftest") {
             g_deriveSelftest = next();             // handled in main()
+        } else if (a == "--stackavg-selftest") {
+            g_stackAvgSelftest = next();           // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {
@@ -20858,6 +26223,10 @@ static void parseCli(int argc, char** argv) {
             g_newwinSelftest = next();             // handled in main()
         } else if (a == "--reload-selftest") {
             g_reloadSelftest = next();             // handled in main()
+        } else if (a == "--srcmap-selftest") {
+            g_srcmapSelftest = next();             // handled in main()
+        } else if (a == "--media-selftest") {
+            g_mediaSelftest = next();              // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--remote-policy") {        // auto | local-fetch
@@ -20872,7 +26241,7 @@ static void parseCli(int argc, char** argv) {
             else fprintf(stderr, "--remote-policy expects auto|local-fetch\n");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
-        } else if (a == "--mem-budget") {          // GB the sequence loader may use
+        } else if (a == "--mem-budget") {          // GB the stack loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {             // off | wipe | split
             std::string v = next();
@@ -20901,7 +26270,11 @@ static void parseCli(int argc, char** argv) {
                            [](unsigned char c) { return (char)std::tolower(c); });
             bool special = (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0) ||
                            (low.size() > 4 && low.compare(low.size() - 4, 4, ".npz") == 0) ||
-                           (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0);
+                           (low.size() > 9 && low.compare(low.size() - 9, 9, ".vsession") == 0) ||
+                           // ...and a picture format, which carries its own
+                           // dimensions and dtype: --raw-* on the same command
+                           // line is for the files that carry none
+                           imagefile::forPath(a) != nullptr;
             if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;
@@ -20913,7 +26286,7 @@ static void parseCli(int argc, char** argv) {
             }
         }
     }
-    // Applied later, not here: with --sequence always the sibling frames are still
+    // Applied later, not here: with --stack always the sibling frames are still
     // arriving on the loader thread, so at this point there may be only one image.
     if (cliCompare >= 0) app.pendingCompare = cliCompare;
     if (haveZoom || haveCenter) {
@@ -21192,8 +26565,10 @@ static int remoteSelfTest(const char* exe, const char* path) {
         if (!s.glob(groot, "**/frame_*.npy", 6, 2000, hits, trunc, skipped, err)) {
             fprintf(stderr, "selftest: GLOB: skipped (%s: %s)\n", groot.c_str(), err.c_str());
         } else {
-            // 24 in rb/ itself + 3 x 8 under scanroot/
-            bool ok = hits.size() == 48 && !trunc;
+            // 24 in rb/ itself + 3 x 8 under scanroot/ + 3 under unpadded/
+            // (frame_1, frame_2, frame_10 - the unpadded names, which is the
+            //  whole of what that fixture contributes here)
+            bool ok = hits.size() == 51 && !trunc;
             for (const auto& h : hits) if (h.dir) ok = false;
             fprintf(stderr, "selftest: GLOB **/frame_*.npy under %s -> %d hit(s), "
                             "truncated=%d: %s\n",
@@ -21265,9 +26640,9 @@ static int remoteSelfTest(const char* exe, const char* path) {
         bool started = s2.startOn("", 0, exe, e2);
         bool listedOk = started && s2.list(dir, ents2, e2);
         stopFlag = true;                       // exactly what stop*() sets
-        double at0 = glfwGetTime();
+        double at0 = nowSec();
         bool listedAfter = s2.list(dir, ents2, e2);
-        double asecs = glfwGetTime() - at0;
+        double asecs = nowSec() - at0;
         bool abortOk = started && listedOk && !listedAfter && asecs < 1.0;
         fprintf(stderr, "selftest: abortable read: LIST before the flag %s, after it %s "
                         "in %.3f s: %s\n",
@@ -21538,6 +26913,114 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 r2.framesUsed, bad4 ? "FAIL" : "ok");
         bad += bad4 ? 1 : 0;
     }
+    {   // ---- the channel rule, through BOTH doors (issue #71) ---------------
+        //
+        // This whole harness exists to compare what the LOCAL decoder makes of
+        // a file against what the PEER makes of it, so it was always the thing
+        // that would catch core/main.cpp and core/serve.cpp disagreeing. It had
+        // simply never been aimed at a shape where they did. main.cpp read the
+        // last axis as channels only when it was exactly 3 or 4; serve.cpp read
+        // it as channels whenever it was 4 or fewer. So (H,W,1) - what
+        // img[:, :, None] produces, and an ordinary way to save one mono
+        // capture - opened here as H frames of 1xW and there as one WxH frame.
+        // Pointed at a (48,640,1) fixture before the rule was unified, this
+        // printed exactly that:
+        //
+        //   selftest: meta 640x48 1ch u16 frames=1        <- the peer: 1 frame
+        //   npy stack: ... 48 of 48 frames (1x640 1ch)    <- here: 48 frames
+        //   selftest: rect 1x640@0,0 step 1 -> 1x48 1ch u16 : FAIL (47 mismatches)
+        //
+        // Aiming an existing test is worth more than writing a new one: this
+        // one was built to catch this class of fault and had been sitting
+        // unused against it.
+        //
+        // The sweep walks the last axis ACROSS the ceiling - 1,2,3,4 are one
+        // frame of C channels, 5 is a stack - because the fault was never
+        // "channels or not", it was the two sides putting the boundary in
+        // different places. A rule that agrees at 3 and 4 and nowhere else is
+        // the bug that was here.
+        //
+        // Fixtures are written here rather than read from tools/testdata for
+        // two reasons: that tree is gitignored and generated, so a machine
+        // without it would silently skip the check; and a fixture that lives
+        // apart from the rule it pins can drift away from it.
+        std::error_code cec;
+        std::filesystem::path cdir =
+            std::filesystem::temp_directory_path(cec) / "viewer_chanrule";
+        std::filesystem::remove_all(cdir, cec);
+        std::filesystem::create_directories(cdir, cec);
+        std::vector<uint16_t> ramp(48 * 40 * 5);
+        for (size_t i = 0; i < ramp.size(); i++) ramp[i] = (uint16_t)(i * 11 + 5);
+        struct Want { int64_t lastAxis; int frames, w, h, ch; const char* why; };
+        const Want SWEEP[] = {
+            { 1, 1, 40, 48, 1, "(H,W,1) is ONE mono frame" },
+            { 2, 1, 40, 48, 2, "(H,W,2) is ONE two-channel frame" },
+            { 3, 1, 40, 48, 3, "(H,W,3) is ONE colour frame" },
+            { 4, 1, 40, 48, 4, "(H,W,4) is ONE RGBA frame" },
+            { 5, 48, 5, 40, 1, "(H,W,5) is past the ceiling: a stack" },
+        };
+        size_t badC = 0;
+        for (const Want& t : SWEEP) {
+            const std::vector<int64_t> shape = { 48, 40, t.lastAxis };
+            std::string p = npyWriteFile(
+                (cdir / ("chan_48x40x" + std::to_string(t.lastAxis) + ".npy")).u8string(),
+                "<u2", shape, ramp.data(), (size_t)48 * 40 * t.lastAxis * 2);
+            remote::Meta cm;
+            std::string cerr;
+            if (!s.meta(p, cm, cerr)) {
+                fprintf(stderr, "selftest CHANNEL META %s: %s\n",
+                        npyShapeText(shape).c_str(), cerr.c_str());
+                badC++;
+                continue;
+            }
+            closeAll();
+            std::string lerr = loadNpy(p);
+            const ImageDoc* lref = cur();
+            if (!lerr.empty() || !lref) {
+                fprintf(stderr, "selftest CHANNEL local %s: %s\n",
+                        npyShapeText(shape).c_str(),
+                        lerr.empty() ? "nothing opened" : lerr.c_str());
+                badC++;
+                continue;
+            }
+            int lframes = (int)app.images.size();
+            // The geometry first: the two doors must MAKE the same thing of the
+            // file before comparing pixels is even a meaningful question.
+            bool geom = lframes == cm.frames && lref->w == cm.w &&
+                        lref->h == cm.h && lref->ch == cm.ch;
+            bool wanted = lframes == t.frames && lref->w == t.w &&
+                          lref->h == t.h && lref->ch == t.ch;
+            // ...then the pixels, which is where a geometry agreement that is
+            // only a coincidence would still come apart.
+            size_t mism = 0;
+            std::vector<float> got;
+            int gw = 0, gh = 0, gch = 0;
+            std::string gdt;
+            if (!s.tile(p, 0, 0, 0, lref->w, lref->h, 1, got, gw, gh, gch, gdt, cerr)) {
+                fprintf(stderr, "selftest CHANNEL TILE %s: %s\n",
+                        npyShapeText(shape).c_str(), cerr.c_str());
+                badC++;
+                continue;
+            }
+            for (int y = 0; y < gh; y++)
+                for (int x = 0; x < gw; x++)
+                    for (int ci = 0; ci < gch; ci++)
+                        if (got[((size_t)y * gw + x) * gch + ci] != lref->sample(x, y, ci))
+                            mism++;
+            bool ok = geom && wanted && mism == 0;
+            fprintf(stderr, "selftest: channel rule %-13s local %d frame(s) %dx%d %dch"
+                            " == peer %d frame(s) %dx%d %dch, %zu pixel mismatch(es)"
+                            " : %s  (%s)\n",
+                    npyShapeText(shape).c_str(), lframes, lref->w, lref->h, lref->ch,
+                    cm.frames, cm.w, cm.h, cm.ch, mism, ok ? "ok" : "FAIL", t.why);
+            badC += ok ? 0 : 1;
+        }
+        closeAll();
+        std::filesystem::remove_all(cdir, cec);          // ours: ours to remove
+        fprintf(stderr, "selftest: channel rule over %d shape(s), both doors: %s\n",
+                (int)(sizeof SWEEP / sizeof SWEEP[0]), badC ? "FAIL" : "ok");
+        bad += badC ? 1 : 0;
+    }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
     return bad ? 1 : 0;
@@ -21572,8 +27055,8 @@ static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
     g_inputSeq++;
-    if (g_lastInputAt == 0) g_lastInputAt = glfwGetTime();   // first of a burst
-    if (!app.lowBandwidth) g_wakeUntil = glfwGetTime() + 0.25;
+    if (g_lastInputAt == 0) g_lastInputAt = nowSec();   // first of a burst
+    if (!app.lowBandwidth) g_wakeUntil = nowSec() + 0.25;
 }
 
 // ---- window / taskbar icon ---------------------------------------------------
@@ -21649,6 +27132,713 @@ static void dropOwnConsole() {
 }
 #endif
 
+// ---- the GL context this binary asks for, and whether the machine has one ---
+//
+// The hints live in one function because the probe below and the real window
+// must ask for exactly the SAME context. A machine that will hand out a context
+// but not a 3.0 (3.2 core on macOS) one is precisely the case the probe exists
+// to catch, and it would miss it the moment the two lists drifted apart.
+// glslVersion travels with them: it is one decision, not two.
+static const char* applyGlContextHints() {
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    return "#version 150";
+#else
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    return "#version 130";
+#endif
+}
+
+// GLFW's own account of the last thing that went wrong. It is only STORED here,
+// never printed on arrival: the failure sites decide what is worth saying, and
+// say it once. Until this existed GLFW's reason was simply discarded, so every
+// failure to make a window said "window creation failed" and nothing more -
+// which is exactly what the Windows and macOS runners printed, once per test,
+// with no way to tell a dead runner from a broken viewer.
+static std::string g_glfwLastError;
+static void glfwErrorSink(int code, const char* desc) {
+    g_glfwLastError = "GLFW error " + std::to_string(code) + ": " +
+                      (desc && *desc ? desc : "(no description)");
+}
+static std::string glfwReasonOr(const char* fallback) {
+    return g_glfwLastError.empty() ? std::string(fallback) : g_glfwLastError;
+}
+
+// --gl-probe: "this machine cannot make a GL context" and "an assert failed"
+// are different events, and until this existed nothing could tell them apart.
+// Startup opens a real 1600x1000 window unconditionally, so every selftest but
+// one dies inside glfwCreateWindow on a runner that has no context, and each of
+// them reads as a broken test - which is how CI stayed red for hours with
+// nothing in the output that said why. Answering it once, out loud, is the fix.
+//
+// The probe does what those tests do in their first moments - glfwInit, the
+// same hints, one window - and when it cannot, it says WHY in GLFW's own words,
+// taken from the error callback rather than guessed at from the failure site.
+// Exit 0: there is a context, run everything. Exit 3: there is not, and
+// tools/run_selftests.sh turns that into a named skip instead of a red matrix.
+// It answers for the harness today; the app can ask it the same question later.
+static int glProbe() {
+    // The no-GL branch of run_selftests.sh has to be provable on a machine that
+    // HAS GL, or nobody watches it work until CI does - and CI is unreadable.
+    if (const char* f = getenv("VIEWER_FORCE_NO_GL"); f && *f && strcmp(f, "0")) {
+        printf("no OpenGL context on this machine: forced by VIEWER_FORCE_NO_GL=%s\n", f);
+        return 3;
+    }
+    glfwSetErrorCallback(glfwErrorSink);
+    if (!glfwInit()) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("glfwInit failed, no GLFW error reported").c_str());
+        return 3;
+    }
+    applyGlContextHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // a probe must never flash a window
+    // This is the call the runners die in - 0.08-0.20 s per test, 21 times a run.
+    GLFWwindow* w = glfwCreateWindow(64, 64, "viewer gl probe", nullptr, nullptr);
+    if (!w) {
+        printf("no OpenGL context on this machine: %s\n",
+               glfwReasonOr("window creation failed, no GLFW error reported").c_str());
+        glfwTerminate();
+        return 3;
+    }
+    glfwMakeContextCurrent(w);
+    // Named, because "which GL did that machine actually get" is the next
+    // question every time a render result differs between a runner and a desk.
+    const char* rend = (const char*)glGetString(GL_RENDERER);
+    const char* ver  = (const char*)glGetString(GL_VERSION);
+    printf("OpenGL context OK: %s / %s\n", rend ? rend : "(no renderer)",
+                                           ver  ? ver  : "(no version)");
+    glfwDestroyWindow(w);
+    glfwTerminate();
+    return 0;
+}
+
+// ---- restoring and remembering the window -----------------------------------
+// The three things fitSavedWindow cannot know on its own, all of them questions
+// about the machine at THIS moment rather than about the saved numbers. They sit
+// here because they need glfwInit() to have happened and nothing else.
+
+// The monitors as they are right now, work areas only. GLFW promises the primary
+// monitor is first, which is what makes work[0] the sane fallback.
+static std::vector<WinRect> monitorWorkAreas() {
+    std::vector<WinRect> out;
+    int n = 0;
+    GLFWmonitor** m = glfwGetMonitors(&n);
+    for (int i = 0; i < n && m; i++) {
+        WinRect r;
+        glfwGetMonitorWorkarea(m[i], &r.x, &r.y, &r.w, &r.h);
+        if (r.w > 0 && r.h > 0) out.push_back(r);
+    }
+    return out;
+}
+
+// The scale to turn the SAVED logical size back into screen coordinates: the
+// content scale of the monitor the saved position falls on, expressed the way
+// startup expresses uiScale so the two can never drift apart. Asked before the
+// window exists, which is the whole reason it goes by position rather than by
+// glfwGetWindowContentScale.
+static float scaleAtPos(int x, int y) {
+#if defined(__APPLE__)
+    (void)x; (void)y;
+    return 1.0f;                     // Cocoa coordinates are points; the backend does the rest
+#else
+    int n = 0;
+    GLFWmonitor** m = glfwGetMonitors(&n);
+    GLFWmonitor* hit = (n > 0 && m) ? m[0] : nullptr;
+    for (int i = 0; i < n && m; i++) {
+        WinRect r;
+        glfwGetMonitorWorkarea(m[i], &r.x, &r.y, &r.w, &r.h);
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) { hit = m[i]; break; }
+    }
+    if (!hit) return 1.0f;
+    float sx = 1, sy = 1;
+    glfwGetMonitorContentScale(hit, &sx, &sy);
+    (void)sy;
+    return sx > 0.1f ? std::max(sx, 1.0f) : 1.0f;
+#endif
+}
+
+// What to remember, read off the live window.
+//
+// Maximized is a STATE, not a size. A maximized window reports the maximized
+// rectangle, and writing that back would mean quitting maximized and coming back
+// to a window that fills the screen but no longer knows how to restore DOWN. So
+// the flag is always sampled and the rectangle only while the window is not
+// maximized: together they say "come up maximized, and this is what the restore
+// button gives back". Fullscreen is NOT in scope - this viewer has no fullscreen
+// mode to be in; window_frame's two modes are System and Integrated, and both
+// are ordinary windows.
+//
+// The divisor is app.uiScale, fixed at startup from the monitor the window was
+// born on. It does not follow the window to a differently scaled screen, and it
+// should not: it is the scale the app is actually DRAWING at, so it is the scale
+// the size on screen actually means.
+// A geometry change that has been seen but not yet written, waiting out the
+// rate limit below. It is at file scope because the IDLE path has to know the
+// loop still owes prefs.txt a write: the frame body is skipped entirely while
+// nothing is happening, and "nothing is happening" is the precise state a
+// window sits in for the two seconds after it was resized. Without this, a
+// resize followed by a kill loses the resize.
+static bool g_geomWriteDue = false;
+
+static void sampleWindowGeometry(GLFWwindow* w) {
+    app.winMax = glfwGetWindowAttrib(w, GLFW_MAXIMIZED) == GLFW_TRUE;
+    if (app.winMax) return;
+    int x = 0, y = 0, ww = 0, hh = 0;
+    glfwGetWindowPos(w, &x, &y);
+    glfwGetWindowSize(w, &ww, &hh);
+    if (ww <= 0 || hh <= 0) return;
+    float s = app.uiScale > 0.1f ? app.uiScale : 1.0f;
+    app.winX = x;
+    app.winY = y;
+    app.winW = (int)lround(ww / s);
+    app.winH = (int)lround(hh / s);
+}
+
+// Did startup make a window? False under --no-window, and nowhere else.
+static bool g_haveWindow = false;
+// The guard on the selftest groups that drive REAL ImGui frames.
+//
+// A frame goes through ImGui_ImplOpenGL3_NewFrame + ImGui_ImplGlfw_NewFrame,
+// and those backends are not initialised when there is no window: calling them
+// is a null device and a crash with nothing in it that names the test. Five
+// groups do it (--tile-selftest T12, --verify-selftest's ROI probe,
+// --abstats-selftest's T chart, --frame-lin-selftest F11, and the whole of
+// --browse-keys-selftest, which runs the real loop), and every one of them is
+// asserting on LAYOUT - which is exactly the thing that cannot be computed
+// without the backend that reports the display.
+//
+// So they are the tests that keep needing a GL context, and this says so by
+// name, with the line to change, if one is ever marked NOGL by mistake.
+static bool needWindow(const char* what) {
+    if (g_haveWindow) return true;
+    fprintf(stderr, "%s drives real ImGui frames and needs a window: it cannot "
+                    "run with --no-window.\n", what);
+    fprintf(stderr, "  remove NOGL from its viewer_selftest() line in "
+                    "CMakeLists.txt - that word is what passed --no-window.\n");
+    // The caller returns from main() straight after this, and an unjoined
+    // std::thread at exit is std::terminate() - "terminate called without an
+    // active exception" printed right under the message above, which reads like
+    // a crash in the thing being reported rather than the orderly refusal it
+    // is. The selftests that exit early shut the same four workers down (see
+    // --scan-selftest); by the time a test is drawing, it has started them.
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return false;
+}
+
+// ---- --roistats-selftest: the ROI table's NUMBERS, anywhere ----------------
+// These assertions used to be the first half of --verify-selftest's V19, and
+// V19 needs a window, so they ran on exactly one runner of the three: Linux,
+// where CI installs xvfb. The PRNU column shipped having been measured on one
+// OS. That is the same shape of mistake as test_prnu labelled `nogl` only and
+// abstats-cfa-bayer measuring the wrong thing, and it is not a property of the
+// arithmetic - it is a property of how the arithmetic was reached.
+//
+// What actually needs the window is LAYOUT: where the delete button landed and
+// whether a click reaches it. That stays in V19. Everything here is a number,
+// and a number does not need a display to be right.
+//
+// It is still the REAL panel, not a second implementation: drawPanelRois() is
+// called, the numbers go through roiBasicStats' hash cache and the clipper, and
+// what is asserted is what the PRNU cell printed, read back through the same
+// g_roiRowProbe V19 uses. The only thing that changes is who supplies the frame.
+//
+// Fixtures are analytic and built in memory, so this test opens no file, needs
+// no fixture directory, and cannot be made to pass by a fixture drifting.
+static int roiStatsSelftest() {
+    bool ok = true;
+    auto check = [&](bool cond, const char* what) {
+        fprintf(stderr, "roistatsselftest: %-46s %s\n", what, cond ? "PASS" : "FAIL");
+        if (!cond) ok = false;
+    };
+    // every row is identical, so whatever rows the stride lands on give exactly
+    // mean=base(+off), sd=amp, min/max=base(+off)-+amp
+    auto mkMono = [](int W2, int H2, double base, double amp, double rightOff) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = "v19mono"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->src->dtype = "u16";
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] =
+                    (float)(base + ((x & 1) ? amp : -amp) + (x >= W2 / 2 ? rightOff : 0));
+        d->syncMirrors();
+        d->uid = app.nextUid++;
+        return d;
+    };
+    // per-plane level plus a within-plane dither, so a plane's sd is NOT zero:
+    // a flat plane would let a broken sd read 0 and look right
+    auto mkCfaD = [](int W2, int H2, double amp) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = "v19cfa"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->cfa = 1; d->cfaPattern = 0; d->src->dtype = "u16";
+        static const double LVL[4] = { 1000, 2000, 3000, 4000 };
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] =
+                    (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] +
+                            (((x >> 1) & 1) ? amp : -amp));
+        d->syncMirrors();
+        d->uid = app.nextUid++;
+        return d;
+    };
+
+    // One frame of the ROI panel, with or without the backends.
+    //
+    // ImGui_ImplGlfw_NewFrame and ImGui_ImplOpenGL3_NewFrame are the only part
+    // of a frame that touches a device, and the only things they contribute
+    // that ImGui cannot proceed without are three values: a display to lay out
+    // in, a delta time, and a font atlas that has actually been rasterised.
+    // Startup builds the ImGui context, the style and the atlas' font list even
+    // under --no-window (it says so at the CreateContext call) - rasterising
+    // the atlas is the RENDERER backend's job, and that is the one thing left
+    // to do by hand. Everything the ROI table is made of downstream of this -
+    // the table, the clipper, every widget's rect, and every number in it - is
+    // pure CPU on both sides of the branch.
+    //
+    // Which is exactly the claim this test would be worthless without, so it is
+    // MEASURED rather than asserted here: run the binary with and without
+    // --no-window and diff the output. See the NOGL comment in CMakeLists.txt.
+    ImGuiIO& io = ImGui::GetIO();
+    auto roiFrame = [&]() {
+        if (g_haveWindow) {
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+        } else {
+            io.DisplaySize = ImVec2(1600, 1000);        // the real window's size
+            io.DisplayFramebufferScale = ImVec2(1, 1);
+            io.DeltaTime = 1.0f / 60.0f;
+            if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+        }
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_Always);
+        ImGui::Begin("RoiStatsProbe", nullptr,
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+        g_roiRowProbeOn = true;
+        drawPanelRois();
+        ImGui::End();
+        ImGui::EndFrame();
+    };
+    auto settle = [&] { for (int f = 0; f < 4; f++) roiFrame(); };
+    auto row = [&](int id) -> const RoiRowProbe* {
+        for (const auto& r : g_roiRowProbe) if (r.id == id) return &r;
+        return nullptr;
+    };
+    // No rect in this dump, deliberately. Where a row landed is a function of
+    // the display the frame was laid out in, and this test's whole point is
+    // that its output does not depend on that: the two runs the NOGL claim
+    // rests on have to be comparable byte for byte.
+    auto dump = [&](const char* what) {
+        for (const auto& r : g_roiRowProbe)
+            fprintf(stderr, "roistatsselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
+                            "min=%.10g max=%.10g prnu=%.10g(ok=%d) n=%zu step=%zu "
+                            "valid=%d\n",
+                    what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
+                    r.prnu, (int)r.prnuOk, r.s.n, r.s.step, (int)r.s.valid);
+    };
+    auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
+
+    closeAll();
+    app.images.push_back(mkMono(1024, 1024, 30000.0, 2.0, 1000.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 100, 100, 256, 256);          // wholly in the left half
+    const int roiId = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("mono left");
+    const RoiRowProbe* ra = row(0);
+    const RoiRowProbe* rr = row(roiId);
+    check(ra && ra->s.valid, "V19 panel prints the All row");
+    check(rr && rr->s.valid, "V19 panel prints a placed ROI row");
+    // sd is the whole point of this panel: assert it is the real sigma, never
+    // 0. All row: values 29998/30002/30998/31002 in equal quarters -> mean
+    // 30500, var = 500^2 + 2^2.
+    if (ra) {
+        check(nearEq(ra->s.mean, 30500.0), "V19 All row mean is the true mean");
+        check(nearEq(ra->s.sd, sqrt(250004.0)), "V19 All row sd is the true sigma");
+        check(nearEq(ra->s.mn, 29998.0) && nearEq(ra->s.mx, 31002.0),
+              "V19 All row min/max are the true extremes");
+        check(ra->s.n > 0 && ra->s.n < (size_t)1024 * 1024,
+              "V19 All row decimates and can say n");
+        // PRNU is those two numbers divided, so it is pinned to them rather
+        // than to a second scan: on a decimated row that is the whole point -
+        // the ratio describes the sample the sd describes
+        check(ra->prnuOk && nearEq(ra->prnu, sqrt(250004.0) / 30500.0 * 100.0),
+              "V19 All row PRNU is the sd and mean it printed, divided");
+    }
+    if (rr) {
+        check(nearEq(rr->s.mean, 30000.0), "V19 ROI row mean is the true mean");
+        check(nearEq(rr->s.sd, 2.0), "V19 ROI row sd is the true sigma");
+        check(nearEq(rr->s.mn, 29998.0) && nearEq(rr->s.mx, 30002.0),
+              "V19 ROI row min/max are the true extremes");
+        check(rr->prnuOk && nearEq(rr->prnu, 2.0 / 30000.0 * 100.0),
+              "V19 ROI row PRNU is sd / mean x 100");
+    }
+    // ...and the cached panel path must FOLLOW the ROI when it moves
+    findAnn(roiId)->x = 600;                 // wholly in the right half
+    app.annRev++;
+    settle();
+    dump("mono right");
+    rr = row(roiId);
+    check(rr && nearEq(rr->s.mean, 31000.0) && nearEq(rr->s.sd, 2.0),
+          "V19 moving the ROI updates the printed numbers");
+    // the same sd over a higher mean is a SMALLER percentage: a PRNU that
+    // stayed at the old row's value would still look plausible
+    check(rr && rr->prnuOk && nearEq(rr->prnu, 2.0 / 31000.0 * 100.0),
+          "V19 PRNU moves with the ROI, not with the cache");
+
+    // sigma at the noise floor, on a large pedestal: the regime this panel
+    // exists for. sum2/n - mean^2 cancels ~10 of double's 16 digits here
+    // (3.6e9 against a variance of 0.25), so if the two-pass form is fragile
+    // for real 16-bit data this is where it shows. It is also the assertion
+    // that most deserved to run on more than one compiler's floating point.
+    closeAll();
+    app.images.push_back(mkMono(1024, 1024, 60000.0, 0.5, 0.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 512, 512);
+    const int floorRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("60000+/-0.5");
+    if (const RoiRowProbe* rf = row(floorRoi)) {
+        fprintf(stderr, "roistatsselftest: V19 noise floor sd err = %.3e (want 0.5)\n",
+                rf->s.sd - 0.5);
+        check(nearEq(rf->s.mean, 60000.0), "V19 noise-floor mean survives the pedestal");
+        check(fabs(rf->s.sd - 0.5) < 1e-9, "V19 sigma 0.5 DN on a 60000 DN pedestal");
+    }
+
+    // channel switching, through the panel, on a Bayer frame: each plane is its
+    // own population and must never be mixed with its neighbours
+    closeAll();
+    app.images.push_back(mkCfaD(1024, 1024, 3.0));
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 512, 512);
+    const int cfaRoi = app.anns.back().id;
+    static const double PLV[4] = { 1000, 2000, 3000, 4000 };
+    bool chOk = true, chSd = true, chPr = true;
+    double pooledPr = -1, planeSumPr = 0;
+    app.roiChannel = -1;
+    settle();
+    dump("cfa all");
+    if (const RoiRowProbe* r0 = row(cfaRoi)) {
+        chOk = chOk && nearEq(r0->s.mean, 2500.0) && nearEq(r0->s.sd, sqrt(1250009.0));
+        if (r0->prnuOk) pooledPr = r0->prnu;
+    }
+    for (int c = 0; c < 4; c++) {
+        app.roiChannel = c;
+        settle();
+        dump(CFA_CH_NAMES[c]);
+        const RoiRowProbe* rc = row(cfaRoi);
+        if (!rc || !rc->s.valid || !nearEq(rc->s.mean, PLV[c])) chOk = false;
+        if (!rc || !nearEq(rc->s.sd, 3.0)) chSd = false;
+        // each plane divides by ITS OWN level, so the same 3 DN of dither is
+        // 0.3% on R and 0.075% on B
+        if (!rc || !rc->prnuOk || !nearEq(rc->prnu, 3.0 / PLV[c] * 100.0)) chPr = false;
+        if (rc && rc->prnuOk) planeSumPr += rc->prnu;
+    }
+    check(chOk, "V19 channel switch repoints the panel's numbers");
+    check(chSd, "V19 per-plane sd is the plane's own sigma");
+    check(chPr, "V19 per-plane PRNU divides by that plane's own mean");
+    // The pooled row is a different measurement, not a summary of the four: its
+    // sd carries the level differences BETWEEN the planes, so its PRNU (~44.7%)
+    // is two orders above the planes' (~0.16% mean). Anyone tempted to average
+    // the plane column would land on the second number and it would look like
+    // the answer.
+    fprintf(stderr, "roistatsselftest: V19 pooled PRNU %.10g %%, planes averaged "
+                    "%.10g %%\n", pooledPr, planeSumPr / 4.0);
+    check(nearEq(pooledPr, sqrt(1250009.0) / 2500.0 * 100.0),
+          "V19 the pooled row's PRNU is pooled sd over pooled mean");
+    check(pooledPr > planeSumPr / 4.0 * 100.0,
+          "V19 the pooled PRNU is not the planes' PRNUs averaged");
+    app.roiChannel = -1;
+
+    // A 1x1 ROI is reachable from the editor's x/y/w/h fields and from a
+    // restored session. n = 1 makes sd exactly 0 and mean = min = max, which
+    // reads exactly like a broken panel - so the panel has to be able to say n.
+    // Pin both the number and the disclosure.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 4, 4, 1, 1);
+    const int oneRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("1x1");
+    if (const RoiRowProbe* r1 = row(oneRoi)) {
+        check(r1->s.valid && r1->s.n == 1, "V19 a 1x1 ROI measures exactly one pixel");
+        check(r1->s.sd == 0.0 && r1->s.mn == r1->s.mx,
+              "V19 n=1 gives sd 0 - the panel's n is what explains it");
+        // no second convention for n=1: PRNU follows sd, which is 0, so the
+        // column reads 0 and the same n line explains both
+        check(r1->prnuOk && r1->prnu == 0.0,
+              "V19 n=1 gives PRNU 0 for the same reason sd is 0");
+        check(r1->s.step >= 1, "V19 the stat carries the stride it sampled at");
+    }
+    // ...and a decimated ROI must report the stride that produced its n
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 1024, 1024);
+    const int bigRoi = app.anns.back().id;
+    settle();
+    dump("full 1024^2");
+    if (const RoiRowProbe* rb = row(bigRoi))
+        check(rb->s.step > 1 && rb->s.n < (size_t)1024 * 1024,
+              "V19 a decimated ROI says both n and its stride");
+
+    // the channel selector's clamp: one past the last plane is not a plane, and
+    // CFA_SEL has no fifth entry
+    app.roiChannel = 99;
+    settle();
+    check(app.roiChannel == 3, "V19 roiChannel clamps to the last CFA plane");
+    app.roiChannel = -1;
+
+    // ---- mean == 0 ---------------------------------------------------------
+    // sd/mean has no value there, and this table's numbers are pasted into
+    // reports: a nan or an inf in a pasted cell is worse than a blank, because
+    // it travels as if it were a measurement. The row still has a real mean and
+    // a real sd - only the ratio is withheld - so the test pins the sd too, or
+    // "-" could mean the row died. A bipolar frame is the everyday way here (a
+    // difference image).
+    closeAll();
+    {
+        auto z = mkMono(256, 256, 0.0, 2.0, 0.0);
+        z->src->dtype = "f32";          // values below zero are not a u16
+        z->syncMirrors();
+        app.images.push_back(std::move(z));
+    }
+    app.current = 0;
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    addAnn(0, 0, 0, 256, 256);
+    const int zeroRoi = app.anns.back().id;
+    app.roiChannel = -1;
+    settle();
+    dump("mean 0");
+    if (const RoiRowProbe* rz = row(zeroRoi)) {
+        check(rz->s.valid && rz->s.mean == 0.0 && nearEq(rz->s.sd, 2.0),
+              "V19 a bipolar ROI measures mean 0 with a real sd");
+        check(!rz->prnuOk, "V19 mean 0 prints no PRNU - not a nan, not an inf");
+    }
+    if (const RoiRowProbe* rz0 = row(0))
+        check(!rz0->prnuOk, "V19 the All row withholds PRNU at mean 0 too");
+
+    g_roiRowProbeOn = false;
+    fprintf(stderr, "roistatsselftest: %s\n", ok ? "ok" : "FAILED");
+    // the same orderly shutdown every early-returning selftest does: an
+    // unjoined worker at exit is std::terminate() under the last line printed
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return ok ? 0 : 1;
+}
+
+// ---- --abeq-selftest: two sides on ONE document ----------------------------
+// Putting the same document on both sides of a comparison is something people
+// do ON PURPOSE - to confirm the two sides agree. The viewer used to treat it
+// as a mistake to be smoothed over: resolveB answered null, so the histogram
+// drew one curve instead of two, the projection and temporal panels lost their
+// B column, the Inspector lost its B and A-B columns, the canvas put up an
+// "A = B (paused)" banner, and the Files row you were standing on would not
+// even offer "Set as compare B". The user's ruling (2026-08-04): 「A/B比較で，
+// A=Bの時，ヒストグラムの表示を切り替えているけど，このケアはかえってみずらい．
+// 比較の際に同じものを選んだ時に，同じことを確認できる方がよいので，こういうの
+// 全般不要です」- the kindness makes it HARDER to read, because a panel that
+// hides B at that moment makes the confirmation impossible: "B is identical to
+// A" and "B is not being drawn" look exactly the same.
+//
+// So what is asserted here is the panel's OUTPUT, never the absence of a
+// branch: with B set to A the Statistics panel reports TWO sides, two rows,
+// two curves, in two different inks - and the numbers behind them coincide,
+// which is the thing the user opened the comparison to see.
+//
+// Windowless, on the roiStatsSelftest() pattern and for the same reason: this
+// is a statement about what a panel puts on screen, not about layout, and a
+// statement that only runs on the one runner with a GL context has been
+// verified on one OS. Fixtures are analytic and built in memory, so this test
+// opens no file and cannot be made to pass by a fixture drifting.
+//
+// And the windowless claim is MEASURED, not asserted, exactly as roistats
+// measures its own: run the binary with and without --no-window and diff the
+// output. 25 lines, byte for byte identical (MinGW, 2026-08-05). Everything the
+// Statistics panel is made of downstream of the backends' NewFrame - the table,
+// the clipper, the bins, and the probe string this reads back - is pure CPU.
+static int abEqSelftest() {
+    bool ok = true;
+    auto check = [&](bool cond, const char* what) {
+        fprintf(stderr, "abeqselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+        if (!cond) ok = false;
+    };
+    auto mk = [](const char* nm, int W2, int H2, double base, double amp) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = nm; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->src->dtype = "u16";
+        d->src->data.resize((size_t)W2 * H2);
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++)
+                d->px()[(size_t)y * W2 + x] = (float)(base + ((x & 1) ? amp : -amp));
+        d->syncMirrors();
+        computeMinMax(*d);
+        defaultRange(*d);
+        d->uid = app.nextUid++;
+        return d;
+    };
+    ImGuiIO& io = ImGui::GetIO();
+    auto histFrame = [&]() {
+        // twice: the first frame sizes the window the table lays out in
+        for (int pass = 0; pass < 2; pass++) {
+            if (g_haveWindow) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+            } else {
+                io.DisplaySize = ImVec2(1600, 1000);
+                io.DisplayFramebufferScale = ImVec2(1, 1);
+                io.DeltaTime = 1.0f / 60.0f;
+                if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+            }
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(560, 720), ImGuiCond_Always);
+            ImGui::Begin("AbEqProbe", nullptr,
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+            abStatsFrame();
+            drawPanelHistogram();
+            ImGui::End();
+            ImGui::EndFrame();
+        }
+    };
+    // "rows=" is written one letter at a time as "rowX;"; the other two fields
+    // are letter sets. Same readers the N group of --abstats-selftest uses.
+    auto field = [](const std::string& probe, const char* key) {
+        size_t k = probe.find(key);
+        if (k == std::string::npos) return std::string();
+        k += strlen(key);
+        size_t e = probe.find(';', k);
+        return probe.substr(k, e == std::string::npos ? e : e - k);
+    };
+    auto rowsOf = [](const std::string& probe) {
+        std::string out;
+        for (size_t k = probe.find("row"); k != std::string::npos;
+             k = probe.find("row", k + 1))
+            if (k + 3 < probe.size() && probe[k + 4] == ';') out += probe[k + 3];
+        return out;
+    };
+
+    closeAll();
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    app.cmpExtra.clear();
+    app.compareFollowFrame = false;
+    app.abStepBusyUntil = 0;
+    app.abStatsLayout = App::AbOverlay;   // one axis, so "on the plot" means all of them
+    app.histPlane = 0;                    // one plane, so the plot is not palette-limited
+    app.images.push_back(mk("abeq_a", 512, 512, 30000.0, 4.0));
+    app.images.push_back(mk("abeq_b", 512, 512, 20000.0, 4.0));
+    app.current = 0;
+
+    // ---- E1: B set to the document A is on -> TWO sides ---------------------
+    app.compareMode = App::CmpWipe;
+    setCompareB(cur());                   // Shift+B on the frame you are looking at
+    check(cmpB() == cur(), "E1 B set to A resolves to A, not to silence");
+    check(abStatsB() == cur(), "E1 ...and the statistics panels are given that B");
+    histFrame();
+    std::string p = g_histSideProbe;
+    fprintf(stderr, "abeqselftest: E1 probe '%s'\n", p.c_str());
+    check(rowsOf(p) == "AB", "E1 the statistics table gives A and B a row each");
+    check(field(p, "curves=") == "AB", "E1 ...and both are drawn on the plot");
+    check(field(p, "said-no-curve=").empty(),
+          "E1 ...with neither side left off and named");
+    // The coincidence has to be LEGIBLE, not merely present: two identical
+    // curves in one colour are one curve. slotInk gives each side its own.
+    check(slotInk(0) != slotInk(1), "E1 A and B are drawn in different inks");
+
+    // ---- E2: and the two sides really do coincide ---------------------------
+    // This is the confirmation the user opened the comparison for, so assert it
+    // as the panel computed it: same document, same bin axis, same bins.
+    {
+        const App::HistState& A = app.hist[0];
+        const App::HistState& B = app.hist[1];
+        check(A.uid == cur()->uid && B.uid == cur()->uid,
+              "E2 both sides measured the same document");
+        check(A.black == B.black && A.white == B.white,
+              "E2 ...on the same bin axis");
+        bool sameBins = A.nSeries == B.nSeries && A.sampled == B.sampled &&
+                        memcmp(A.bins, B.bins, sizeof A.bins) == 0;
+        fprintf(stderr, "abeqselftest: E2 A n=%zu mean=%.10g / B n=%zu mean=%.10g\n",
+                A.sampled, A.mean[0], B.sampled, B.mean[0]);
+        check(sameBins, "E2 ...and the two curves are bin-for-bin identical");
+    }
+
+    // ---- E3: the chip names the pair, with no second vocabulary -------------
+    // "A = B (paused: this image IS the pinned B - move A to resume)" existed
+    // only to explain the silence. There is no silence, so there is nothing to
+    // explain, and a state with its own sentence reads as a state you are stuck
+    // in rather than one you chose.
+    {
+        std::string chip = abStatusChipText();
+        fprintf(stderr, "abeqselftest: E3 chip '%s'\n", chip.c_str());
+        check(chip.find("B:") != std::string::npos, "E3 the chip names B");
+        check(chip.find("paused") == std::string::npos &&
+              chip.find("no B image") == std::string::npos,
+              "E3 ...and has no 'paused' / 'no B image' vocabulary for A == B");
+    }
+
+    // ---- E4: every Files row can be set as B, the current one included ------
+    check(abRowItem(cur()) == AbSetB,
+          "E4 the row you are standing on offers Set as compare B");
+    check(abRowItem(app.images[1].get()) == AbSetB,
+          "E4 ...and so does every other row");
+
+    // ---- E5: a LETTER past B on A's document keeps its own side -------------
+    // Same rule, one seat further out: two letters landing on one document is a
+    // coincidence to be shown, not folded away. A slot standing on A used to
+    // vanish from resolveSlots outright.
+    setCompareB(app.images[1].get());     // B is the other image again
+    addCompareSlot(cur());                // ...and C is the document A is on
+    check(slotOf(cur()) == "C", "E5 the document A is on can hold a letter");
+    check(resolveSlots().size() == 1 && resolveSlots()[0].doc == cur(),
+          "E5 ...and it still resolves");
+    histFrame();
+    p = g_histSideProbe;
+    fprintf(stderr, "abeqselftest: E5 probe '%s'\n", p.c_str());
+    check(rowsOf(p) == "ABC", "E5 A, B and a C that IS A all get a row");
+    check(field(p, "curves=") == "ABC", "E5 ...and all three are on the plot");
+
+    // ---- E6: one pane per LETTER, not per document --------------------------
+    // Side by side is where the coincidence is seen, so a pane is owed to every
+    // seat. Three seats, three panes, even though two of them hold one image.
+    {
+        app.compareMode = App::CmpSplit;
+        std::vector<TileSlot> sl = tileSlots();
+        std::string tags;
+        for (const TileSlot& t : sl) tags += t.tag;
+        fprintf(stderr, "abeqselftest: E6 panes '%s'\n", tags.c_str());
+        check(tags == "ABC", "E6 three seats give three panes, two of them one image");
+        check(sl.size() == 3 && sl[0].doc == sl[2].doc,
+              "E6 ...and A's pane and C's pane really are the same document");
+    }
+
+    app.cmpExtra.clear();
+    app.compareMode = App::CmpOff;
+    app.compareFollowFrame = true;
+    app.abStatsLayout = App::AbAuto;
+    app.histPlane = -1;
+    fprintf(stderr, "abeqselftest: %s\n", ok ? "ok" : "FAILED");
+    stopRbWorker();
+    stopSequenceLoader();
+    stopRemoteFetcher();
+    stopMeasureWorker();
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -21674,6 +27864,51 @@ int main(int argc, char** argv) {
         for (int i = 1; i + 1 < argc; i++)
             if (!strcmp(argv[i], "--remote-selftest"))
                 return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
+    }
+    // Asked before prefs are read and before an autosave slot is claimed: a
+    // question ABOUT the machine must not alter the machine it is asking about.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--gl-probe")) return glProbe();
+    // --no-window: the startup path that makes no window and touches no GL.
+    //
+    // Startup created a window unconditionally, so every selftest but
+    // --remote-selftest died inside glfwCreateWindow on a runner with no GL
+    // context - even though most of them never draw anything. They load data,
+    // call the panels' own helpers and assert on the state that comes back;
+    // the window they were given was pure ceremony. This flag skips the whole
+    // ceremony: no glfwInit, no window, no ImGui backends, no OpenGL symbol
+    // called at any point. Everything else about startup is unchanged - prefs,
+    // plugins, the ImGui context itself and the CLI are all still there,
+    // because those are what the tests are made of.
+    //
+    // Which selftests can take it is declared ONCE, in CMakeLists.txt: the word
+    // NOGL on a viewer_selftest() line both labels the test for
+    // tools/run_selftests.sh and passes this flag. A test that DOES draw and is
+    // marked NOGL by mistake stops at needWindow() below with its name and the
+    // line to fix, rather than dying inside a backend with no device.
+    bool noWindow = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--no-window")) noWindow = true;
+    // Is this run SCRIPTED - a selftest, a bench, or the windowless path? Then
+    // its window is a fixed 1600x1000 and nothing about it is written back.
+    //
+    // ba40ba8 stopped scripted runs reading the user's layout.ini for exactly
+    // this reason, and tonight's benchmark that was silently measuring one panel
+    // of three is what it costs when a measurement inherits geometry instead of
+    // naming it. A remembered WINDOW size is the same hazard with the same
+    // answer: a suite whose window is whatever the developer last dragged is a
+    // suite that measures the developer. Read once, here, from argv, because
+    // that is the only thing that exists this early - the layout.ini guard
+    // below asks parseCli's g_browseKeys instead and is dead for it, which is a
+    // mistake this must not copy.
+    //
+    // --window-offset and g_rbForceW stay exactly as they are: those are
+    // overrides a run asked for BY NAME, which is the opposite of inheriting one.
+    bool scriptedRun = noWindow;
+    for (int i = 1; i < argc; i++) {
+        size_t n = strlen(argv[i]);
+        if (n >= 9 && !strcmp(argv[i] + n - 9, "-selftest")) scriptedRun = true;
+        if (!strncmp(argv[i], "--bench", 7)) scriptedRun = true;
     }
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
@@ -21709,6 +27944,20 @@ int main(int argc, char** argv) {
     bool benchTiles = false;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-tiles")) benchTiles = true;
+    // --bench-panels: dock Projection, Histogram and Temporal side by side for
+    // the bench instead of tabbing them, so all three DRAW. The default layout
+    // puts them in one node, and ImGui::Begin returns false for a tab that is
+    // not selected - so a bench on the default layout pays for exactly one of
+    // the three, whichever happens to lead. docs/ab-stats-plan.md's A/B
+    // measurement is specified with Histogram AND Projection showing, and until
+    // ba40ba8 it got that by accident, from whatever layout.ini the machine
+    // running the bench happened to have. That is why f424dae's numbers could
+    // not be re-taken: a scripted run is now correctly isolated from the user's
+    // layout, which also isolated it from the arrangement being measured. This
+    // flag names the arrangement instead of inheriting it.
+    bool benchPanels = false;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--bench-panels")) benchPanels = true;
     app.exePath = argv[0];
     // the out-of-the-box A/B range mode, read before anything can override it:
     // --range-selftest checks it, and prefs on the machine running the test
@@ -21726,46 +27975,90 @@ int main(int argc, char** argv) {
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
-    if (!glfwInit()) { fprintf(stderr, "glfwInit failed\n"); return 1; }
-#if defined(__APPLE__)
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    const char* glslVersion = "#version 150";
-#else
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    const char* glslVersion = "#version 130";
-#endif
-    if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    // How a Linux desktop matches a window to its launcher: without these the
-    // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
-    // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
-    // generic icon in a second, ungrouped dock entry. Ignored elsewhere.
-    glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
-    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
-    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
-    GLFWwindow* win = glfwCreateWindow(1600, 1000, "viewer v0.1", nullptr, nullptr);
-    if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
-    applyWindowIcon(win, false);
-    // The frame comes up before the first frame is drawn, so the window never
-    // flashes a system title bar it is about to lose. --frame on the command
-    // line wins over the preference for this run and is not written back: it is
-    // the way out if a window manager makes a mess of the integrated one.
-    window_frame::init(win);
-    window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
-    if (winOffX || winOffY) {
-        // "Open in new window" passes --window-offset 40,40: the child must not
-        // land exactly on top of its parent, or nobody can tell it opened
-        int wx = 0, wy = 0;
-        glfwGetWindowPos(win, &wx, &wy);
-        glfwSetWindowPos(win, wx + winOffX, wy + winOffY);
-    }
-    glfwMakeContextCurrent(win);
-    glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
-    installWakeCallbacks(win);        // before ImGui's backend: it chains to these
-    glfwSetDropCallback(win, dropCallback);
+    // Installed before anything can fail, so the two messages below can quote
+    // GLFW instead of shrugging. Storing only - it prints nothing by itself.
+    GLFWwindow* win = nullptr;
+    const char* glslVersion = nullptr;
+    if (!noWindow) {
+        glfwSetErrorCallback(glfwErrorSink);
+        if (!glfwInit()) {
+            fprintf(stderr, "glfwInit failed: %s\n",
+                    glfwReasonOr("no GLFW error reported").c_str());
+            return 1;
+        }
+        glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
+        if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        // How a Linux desktop matches a window to its launcher: without these the
+        // WM_CLASS is GLFW's own "GLFW-Application", the .desktop file written by
+        // tools/install_shortcut.sh cannot claim the window, and GNOME/KDE show a
+        // generic icon in a second, ungrouped dock entry. Ignored elsewhere.
+        glfwWindowHintString(GLFW_X11_CLASS_NAME, "viewer");
+        glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "viewer");
+        glfwWindowHintString(GLFW_WAYLAND_APP_ID, "viewer");
+        // How big, and where. Restored from prefs unless this run has a reason
+        // not to, and there are three:
+        //   * a SCRIPTED run has to be reproducible on any machine (above);
+        //   * a SECONDARY window is placed by the --window-offset cascade it was
+        //     spawned with, and restoring the main window's geometry on top of
+        //     that offset would undo the one thing the offset exists to do -
+        //     it would also come up maximized over the parent that spawned it,
+        //     which is the parent it was meant to sit beside;
+        //   * nothing has been saved yet, which is every first run.
+        // The size is created directly rather than set afterwards, so the window
+        // never flashes at 1600x1000 on its way to the size it is supposed to be.
+        int startW = WIN_DEF_W, startH = WIN_DEF_H;
+        WinRect want;
+        bool wantPos = false, wantMax = false;
+        if (!scriptedRun && !g_secondary && !winOffX && !winOffY && app.winW > 0) {
+            float s = scaleAtPos(app.winX, app.winY);
+            want.x = app.winX;
+            want.y = app.winY;
+            want.w = (int)lround(app.winW * s);
+            want.h = (int)lround(app.winH * s);
+            wantPos = fitSavedWindow(want, monitorWorkAreas());
+            startW = want.w;
+            startH = want.h;
+            wantMax = app.winMax;
+        }
+        win = glfwCreateWindow(startW, startH,
+                               (std::string("viewer  ") + viewerVersion()).c_str(),
+                               nullptr, nullptr);
+        if (!win) {
+            // THE line the Windows and macOS CI runners printed once per selftest,
+            // with no reason attached - which is what made a machine with no GL
+            // indistinguishable from 21 broken tests. GLFW knew why the whole time.
+            fprintf(stderr, "window creation failed: %s\n",
+                    glfwReasonOr("no GLFW error reported").c_str());
+            fprintf(stderr, "  is it this machine or is it this test? "
+                            "`viewer --gl-probe` answers that alone.\n");
+            return 1;
+        }
+        applyWindowIcon(win, false);
+        // The frame comes up before the first frame is drawn, so the window never
+        // flashes a system title bar it is about to lose. --frame on the command
+        // line wins over the preference for this run and is not written back: it is
+        // the way out if a window manager makes a mess of the integrated one.
+        window_frame::init(win);
+        window_frame::setMode(app.frameMode ? window_frame::Integrated : window_frame::System);
+        // After setMode, never before: switching the frame off changes the
+        // decoration, and a window manager is entitled to move the window when
+        // it does. Maximizing last, so the rectangle above stays the one the
+        // restore button gives back.
+        if (wantPos) glfwSetWindowPos(win, want.x, want.y);
+        if (wantMax) glfwMaximizeWindow(win);
+        if (winOffX || winOffY) {
+            // "Open in new window" passes --window-offset 40,40: the child must not
+            // land exactly on top of its parent, or nobody can tell it opened
+            int wx = 0, wy = 0;
+            glfwGetWindowPos(win, &wx, &wy);
+            glfwSetWindowPos(win, wx + winOffX, wy + winOffY);
+        }
+        glfwMakeContextCurrent(win);
+        glfwSwapInterval(benchFrames ? 0 : 1);   // benchmark must not be vsync-limited
+        installWakeCallbacks(win);        // before ImGui's backend: it chains to these
+        glfwSetDropCallback(win, dropCallback);
+        g_haveWindow = true;
+    }   // if (!noWindow)
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -21784,9 +28077,24 @@ int main(int argc, char** argv) {
 #else
         if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
 #endif
-        // scripted runs (bench, browse-keys) must neither read nor write the
-        // user's layout - same rule the exit path applies to autosave/prefs
-        if (benchFrames || !g_browseKeys.empty()) cfg.clear();
+        // scripted runs (bench, browse-keys, --no-window) must neither read nor
+        // write the user's layout - same rule the exit path applies to
+        // autosave/prefs. A run with no window has no layout to remember either.
+        //
+        // NOT switched to scriptedRun, though the window geometry above is, and
+        // it is worth writing down why rather than leaving it to look like an
+        // oversight. `!g_browseKeys.empty()` is set by parseCli - several
+        // hundred lines BELOW this point - so for the keys selftests it is
+        // always false here, and only the APPDATA that CMakeLists.txt pins
+        // keeps ctest off the developer's real layout.ini (docs/verify-ui.md
+        // measured the md5 changing on a run by hand). Closing that hole makes
+        // selftest.browse-dbl fail every time: its scripted double-click is
+        // aimed at a panel whose place currently comes from the layout.ini an
+        // EARLIER test in the same pinned home left behind. That is a real
+        // defect and it is not this change's - a test that only lands its
+        // clicks because of another test's leftovers needs its own geometry
+        // pinned first, the way g_rbForceW already pins the width.
+        if (benchFrames || !g_browseKeys.empty() || noWindow) cfg.clear();
         if (!cfg.empty()) {
             cfg /= "viewer";
             std::filesystem::create_directories(cfg, ec);
@@ -21815,7 +28123,10 @@ int main(int argc, char** argv) {
     }
 
     float xs = 1, ys = 1;
-    glfwGetWindowContentScale(win, &xs, &ys);
+    // 1.0 with no window: the scale is a property of the monitor the window
+    // landed on, and there is neither. Everything downstream (uiScale, the font
+    // size, ui_theme) then reads exactly what a 100% display would give.
+    if (win) glfwGetWindowContentScale(win, &xs, &ys);
 #if defined(__APPLE__)
     float uiScale = 1.0f;                    // Cocoa coords are points; backend handles px
     float fontScale = std::max(xs, 1.0f);    // rasterize glyphs at retina resolution
@@ -21859,8 +28170,15 @@ int main(int argc, char** argv) {
     io.FontGlobalScale = 1.0f / fontScale;
 #endif
 
-    ImGui_ImplGlfw_InitForOpenGL(win, true);
-    ImGui_ImplOpenGL3_Init(glslVersion);
+    // The two BACKENDS - platform and renderer - are the only part of ImGui that
+    // needs the window and the GL context. The context itself, the style, the
+    // font atlas and every panel helper that computes rather than draws are
+    // pure CPU and are set up above regardless, which is what lets a selftest
+    // run with --no-window. Drawing a frame still needs these: see needWindow().
+    if (win) {
+        ImGui_ImplGlfw_InitForOpenGL(win, true);
+        ImGui_ImplOpenGL3_Init(glslVersion);
+    }
 
     // write the session on the way out of any crash, then let it crash normally.
     // The file is opened now, while opening files still works.
@@ -21889,8 +28207,8 @@ int main(int argc, char** argv) {
     // the same numbering in one directory).
     if (!g_pickerSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -22090,8 +28408,8 @@ int main(int argc, char** argv) {
     // panel through the LOCAL peer - connected, empty host, entries listed.
     if (!g_localbrowseSelftest.empty()) {
         browseLocalFolder(g_localbrowseSelftest);   // exactly what the menu does
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 120.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
             if (!rbMain().b.err.empty()) break;
@@ -22125,6 +28443,52 @@ int main(int argc, char** argv) {
                     viewingHost().empty() ? 0 : 1, said ? "ok" : "FAIL");
             if (!said) ok = false;
         }
+        {   // WHICH END DECIDES THE ORDER. The peer sends a LIST in plain
+            // lexicographic order - serve.cpp merges directories, singles and
+            // groups into one row list and sorts it with `<` on the name - and
+            // this end sorts it AGAIN before drawing, with rbSortShown. That
+            // is the reason a local listing and an ssh listing of the same
+            // folder read identically, and the reason the natural default
+            // needed no protocol change and no peer update: the bytes on the
+            // wire are unchanged and the order is decided here.
+            //
+            // rb/unpadded is where the claim is falsifiable, because its names
+            // are not zero-padded: the REPLY arrives lv1, lv10, lv2 and the
+            // SCREEN must read lv1, lv2, lv10. If the client ever stopped
+            // sorting and drew the reply's order, this is the assertion that
+            // notices - on the local door, which is the same LIST path.
+            std::string sub = B.dir + "/unpadded";
+            remoteBrowseTo(rbMain(), sub);
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == sub && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<std::string> wire, screen;
+            for (const auto& e : B.entries)
+                if (e.dir && e.name.rfind("lv", 0) == 0) wire.push_back(e.name);
+            rbMain().nameNatural = true;
+            std::vector<RbRow> v = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+            std::vector<int> idx(v.size());
+            for (int i = 0; i < (int)v.size(); i++) idx[i] = i;
+            rbSortShown(rbMain(), v, idx);
+            for (int i : idx)
+                if (v[i].isDir() && !v[i].up && v[i].name().rfind("lv", 0) == 0)
+                    screen.push_back(v[i].name());
+            auto say = [](const std::vector<std::string>& s) {
+                std::string t;
+                for (const auto& n : s) t += (t.empty() ? "" : " ") + n;
+                return t;
+            };
+            bool ordOk = wire == std::vector<std::string>{ "lv1", "lv10", "lv2" } &&
+                         screen == std::vector<std::string>{ "lv1", "lv2", "lv10" };
+            fprintf(stderr, "localbrowseselftest: order in %s: peer sent [%s], "
+                            "panel lays out [%s]: %s\n",
+                    sub.c_str(), say(wire).c_str(), say(screen).c_str(),
+                    ordOk ? "ok" : "FAIL");
+            if (!ordOk) ok = false;
+        }
         fprintf(stderr, "localbrowseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopRemoteFetcher();
@@ -22140,8 +28504,8 @@ int main(int argc, char** argv) {
         std::replace(dir.begin(), dir.end(), '\\', '/');
         while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 120.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
             if (!rbMain().b.err.empty()) break;
@@ -22193,7 +28557,7 @@ int main(int argc, char** argv) {
             bool same = g && expanded == g->members;
             bool nogroups = true;
             for (const auto& r : fv) if (r.isGroup()) nogroups = false;
-            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d sequence row(s), "
+            fprintf(stderr, "browseselftest: view %s: grouped %d row(s) [%d stack row(s), "
                             "'%s' x%d], flat %d row(s), members match=%d, no group rows "
                             "when flat=%d, member size/mtime blank=%d: %s\n",
                     dir.c_str(), (int)gv.size(), gRows, g ? g->name.c_str() : "?",
@@ -22252,8 +28616,8 @@ int main(int argc, char** argv) {
                 // nothing is listed until it is asked for
                 bool lazy0 = rbMain().treeCache.empty();
                 rbTreeExpand(rbMain(), subPath);
-                double t1 = glfwGetTime();
-                while (glfwGetTime() - t1 < 120.0) {
+                double t1 = nowSec();
+                while (nowSec() - t1 < 120.0) {
                     pumpRemoteBrowse();
                     if (rbMain().treeCache.count(subPath)) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -22296,8 +28660,8 @@ int main(int argc, char** argv) {
                         if (tv[i].isDir()) { atDeep = i; break; }
                 if (atDeep >= 0) {
                     rbTreeExpand(rbMain(), rv[atDeep].full());
-                    double t2 = glfwGetTime();
-                    while (glfwGetTime() - t2 < 120.0) {
+                    double t2 = nowSec();
+                    while (nowSec() - t2 < 120.0) {
                         pumpRemoteBrowse();
                         if (rbMain().treeCache.count(rv[atDeep].full())) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -22349,14 +28713,88 @@ int main(int argc, char** argv) {
                     asDir ? 1 : 0, ups, upOk ? "ok" : "FAIL");
             if (!upOk) ok = false;
         }
+        {   // ---- the ancestors of the row at the top of the viewport --------
+            // The arithmetic half of the pinned band. It belongs here rather
+            // than in --browse-keys-selftest because it needs no frame at all:
+            // rbAncestorRows reads the flattened row run, and the run is what
+            // rbBuildView hands the panel. --browse-keys-selftest owns the
+            // other half - that the rows it names really are laid out at the
+            // top of the panel and really are clickable.
+            //
+            // The claim is not "it returns some earlier rows". It is that for
+            // every row in a tree of any depth, what comes back is EXACTLY that
+            // row's chain of parents: one per level, outermost first, each one
+            // a path prefix of the row - checked against full(), which is built
+            // by the tree walker and not by this function. A depth-0 row has
+            // none, and ".." is never one, at any position.
+            //
+            // rb/expset/zdeep is what makes this worth asserting: five levels,
+            // so a walk that stopped one level short, or one that took a
+            // sibling instead of a parent, is visible here and would not be in
+            // a tree two deep.
+            std::string zroot = dir + "/expset";
+            rbTreeExpand(rbMain(), zroot);
+            {
+                double t0z = nowSec();
+                while (nowSec() - t0z < 120.0) {
+                    pumpRemoteBrowse();
+                    if (rbMain().treeCache.count(zroot)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            zroot += "/zdeep";
+            const char* chain[] = { "", "/a", "/a/b", "/a/b/c" };
+            for (const char* c : chain) {
+                rbTreeExpand(rbMain(), zroot + c);
+                double t1 = nowSec();
+                while (nowSec() - t1 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (rbMain().treeCache.count(zroot + c)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            std::vector<RbRow> tv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
+            std::vector<int> shown((size_t)tv.size());
+            for (int i = 0; i < (int)tv.size(); i++) shown[(size_t)i] = i;   // a tree is not re-sorted
+            int maxDepth = 0, checked = 0, deepRows = 0;   // depth 4 = a shot under c
+            bool chainOk = true, upNever = true, rootNone = true;
+            std::vector<int> anc;
+            for (int f = 0; f < (int)shown.size(); f++) {
+                const RbRow& r = tv[(size_t)shown[(size_t)f]];
+                maxDepth = std::max(maxDepth, r.depth);
+                if (r.depth >= 4) deepRows++;
+                rbAncestorRows(tv, shown, f, anc);
+                for (int p : anc) if (tv[(size_t)shown[(size_t)p]].up) upNever = false;
+                if (r.depth == 0 && !anc.empty()) rootNone = false;
+                if (r.up || r.ph) continue;
+                checked++;
+                // one per level, outermost first, and each really a parent
+                if ((int)anc.size() != r.depth) { chainOk = false; continue; }
+                for (int k = 0; k < (int)anc.size(); k++) {
+                    const RbRow& a2 = tv[(size_t)shown[(size_t)anc[(size_t)k]]];
+                    std::string pre = a2.full() + "/";
+                    if (a2.depth != k || anc[(size_t)k] >= f ||
+                        r.full().compare(0, pre.size(), pre) != 0) chainOk = false;
+                }
+            }
+            bool ancOk = chainOk && upNever && rootNone && maxDepth >= 4 && deepRows > 0;
+            fprintf(stderr, "browseselftest: pinned ancestors: %d row(s) over a tree %d "
+                            "level(s) deep (%d of them at depth 4+), every chain is the "
+                            "row's own parents=%d, \"..\" never pinned=%d, top level pins "
+                            "nothing=%d: %s\n",
+                    checked, maxDepth, deepRows, chainOk ? 1 : 0, upNever ? 1 : 0,
+                    rootNone ? 1 : 0, ancOk ? "ok" : "FAIL");
+            if (!ancOk) ok = false;
+            rbTreeForget(rbMain());
+        }
         {   // "Open folder" on the folder being browsed: the same call the
             // toolbar button and the breadcrumb menu make. The scan must
             // include the CURRENT directory itself (a stack whose name has no
             // folder prefix), which is exactly what the old row-only entry
             // could not reach without first going up a level.
             remoteScanFolder(rbMain(), B.dir);
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 120.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
                 pumpRemoteBrowse();
                 if (app.folderPickOpen) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -22431,8 +28869,8 @@ int main(int argc, char** argv) {
             // parses its first digit run as a LEVEL, and a lit stack gets
             // proposed at 0 - which is the dark-reference value.
             remoteBrowseTo(rbMain(), dir + "/scanroot/10lx");
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 120.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
                 pumpRemoteBrowse();
                 if (B.dir == dir + "/scanroot/10lx" && !B.entries.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -22480,9 +28918,9 @@ int main(int argc, char** argv) {
             remoteScanFolder(rbMain(), B.dir);
             uint32_t genAt = rbMain().b.scanGen;
             rbMain().b.scanGen++;            // exactly what the cancel button does
-            double t3 = glfwGetTime();
+            double t3 = nowSec();
             bool sawScan = false;
-            while (glfwGetTime() - t3 < 60.0) {
+            while (nowSec() - t3 < 60.0) {
                 {   // wait for the worker to actually produce the scan result
                     std::lock_guard<std::mutex> lk(rbMain().mtx);
                     for (const auto& rr : rbMain().done)
@@ -22527,15 +28965,15 @@ int main(int argc, char** argv) {
             }
             std::string bdir = bomb.u8string();
             std::replace(bdir.begin(), bdir.end(), '\\', '/');
-            double bt0 = glfwGetTime();
+            double bt0 = nowSec();
             remoteBrowseTo(rbMain(), bdir);
-            double t2 = glfwGetTime();
-            while (glfwGetTime() - t2 < 120.0) {
+            double t2 = nowSec();
+            while (nowSec() - t2 < 120.0) {
                 pumpRemoteBrowse();
                 if (B.dir == bdir) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
-            double secs = glfwGetTime() - bt0;
+            double secs = nowSec() - bt0;
             int meta = 0, nb = 0;
             for (const auto& e : B.entries) {
                 if (e.name.rfind("bomb", 0) == 0) nb++;
@@ -22550,6 +28988,100 @@ int main(int argc, char** argv) {
                     (int)B.entries.size(), nb, meta, secs, bombOk ? "ok" : "FAIL");
             if (!bombOk) ok = false;
             std::filesystem::remove_all(bomb, bec);
+        }
+        {   // NAME ORDER (user decision, 2026-08-05: the default is natural).
+            //
+            // The listing used to sort names as text while the stack it opened
+            // was built with rp::naturalLess, so the order on screen was not
+            // the order sigma_t is computed over - and a tooltip in the same
+            // panel already claimed numeric name order. rb/unpadded is the one
+            // fixture that can tell the two apart: every other numbered set
+            // here is zero-padded, and for those the two orders agree.
+            //
+            // Asserted, in order: the listing's own sort (rbSortShown, the
+            // exact function the panel calls), the TREE's per-level sort
+            // (inside the builder, a different code path that has to reach the
+            // same comparator), that the toggle actually still reaches text
+            // order - a test that only checks the default cannot tell a
+            // working switch from a hardwired one - and last, the one that
+            // matters: the frames in the order the panel SHOWS them are the
+            // frames in the order the stack is BUILT from.
+            remoteBrowseTo(rbMain(), dir + "/unpadded");
+            double t4 = nowSec();
+            while (nowSec() - t4 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == dir + "/unpadded" && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            // exactly what the panel lays out: build the view, then sort the
+            // shown-index list with the panel's own sort (a tree is sorted per
+            // level while it is built, so it never comes through rbSortShown)
+            auto onScreen = [&](bool natural, bool flat, bool tree) {
+                rbMain().nameNatural = natural;
+                std::vector<RbRow> v = rbBuildView(rbMain(), &B.dir, B.entries, flat, tree);
+                std::vector<int> idx(v.size());
+                for (int i = 0; i < (int)v.size(); i++) idx[i] = i;
+                if (!tree) rbSortShown(rbMain(), v, idx);
+                std::vector<std::string> names;
+                for (int i : idx) names.push_back(v[i].name());
+                return names;
+            };
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : " ") + n;
+                return s;
+            };
+            // the folder rows, which are what a listing sort can be read off:
+            // directories never collapse into a group, so they ARE the rows
+            auto dirsOf = [](const std::vector<std::string>& v) {
+                std::vector<std::string> d;
+                for (const auto& n : v) if (n.rfind("lv", 0) == 0) d.push_back(n);
+                return d;
+            };
+            const std::vector<std::string> wantNat = { "lv1", "lv2", "lv10" };
+            const std::vector<std::string> wantTxt = { "lv1", "lv10", "lv2" };
+            std::vector<std::string> listNat = onScreen(true, false, false);
+            std::vector<std::string> treeNat = onScreen(true, false, true);
+            std::vector<std::string> listTxt = onScreen(false, false, false);
+            std::vector<std::string> treeTxt = onScreen(false, false, true);
+            // ...and the frames, which only exist as rows when the group is
+            // expanded (flat). The natural listing must agree with the stack.
+            rbMain().nameNatural = true;
+            std::vector<RbRow> fv = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
+            std::vector<int> fidx(fv.size());
+            for (int i = 0; i < (int)fv.size(); i++) fidx[i] = i;
+            rbSortShown(rbMain(), fv, fidx);
+            std::vector<std::string> shownFrames;
+            for (int i : fidx) if (fv[i].member >= 0) shownFrames.push_back(fv[i].name());
+            std::vector<std::string> stacked = shownFrames;
+            sortFramesNumerically(stacked);          // what openRemoteStack gets
+            // the same question asked of TEXT order, which must fail it - the
+            // disagreement is the defect this whole change exists to remove,
+            // so a test that cannot still see it is not testing anything
+            std::vector<std::string> txtFrames;
+            {
+                rbMain().nameNatural = false;
+                std::vector<RbRow> tf = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
+                std::vector<int> ti(tf.size());
+                for (int i = 0; i < (int)tf.size(); i++) ti[i] = i;
+                rbSortShown(rbMain(), tf, ti);
+                for (int i : ti) if (tf[i].member >= 0) txtFrames.push_back(tf[i].name());
+            }
+            rbMain().nameNatural = true;             // leave the panel as found
+            bool listOk  = dirsOf(listNat) == wantNat && dirsOf(listTxt) == wantTxt;
+            bool treeOk2 = dirsOf(treeNat) == wantNat && dirsOf(treeTxt) == wantTxt;
+            bool framesOk = shownFrames.size() == 3 && shownFrames == stacked &&
+                            txtFrames != stacked;
+            bool ordOk = listOk && treeOk2 && framesOk;
+            fprintf(stderr, "browseselftest: name order in %s: listing natural [%s] "
+                            "text [%s]; tree natural [%s] text [%s]; frames shown [%s] "
+                            "vs stacked [%s] agree=%d, text order [%s] differs=%d: %s\n",
+                    B.dir.c_str(), say(dirsOf(listNat)).c_str(), say(dirsOf(listTxt)).c_str(),
+                    say(dirsOf(treeNat)).c_str(), say(dirsOf(treeTxt)).c_str(),
+                    say(shownFrames).c_str(), say(stacked).c_str(),
+                    shownFrames == stacked ? 1 : 0, say(txtFrames).c_str(),
+                    txtFrames != stacked ? 1 : 0, ordOk ? "ok" : "FAIL");
+            if (!ordOk) ok = false;
         }
         {   // PORT. A non-default ssh port used to survive only inside the
             // browse worker: makeRemoteUrl dropped it, and that string is what
@@ -22645,9 +29177,9 @@ int main(int argc, char** argv) {
         }
         // connect the browser, then fire the SAME call the group row's menu makes
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool fired = false, ok = true;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpMeasure();
             if (rbMain().b.connected && !fired) {
@@ -22698,8 +29230,8 @@ int main(int argc, char** argv) {
     // name survives a session save/load round-trip (imgbatch travels by name).
     if (!g_batchSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -22887,8 +29419,8 @@ int main(int argc, char** argv) {
             if (!c) ok = false;
         };
         auto drain = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -23028,8 +29560,8 @@ int main(int argc, char** argv) {
 
     if (!g_seriesSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 600.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 600.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -23086,6 +29618,29 @@ int main(int argc, char** argv) {
         check("every member's frames are in the series' batch", batchOk == (int)S->members.size());
         check("default name is \"<batch> 掃引\"", S->name == batchNameOf(b0) + " 掃引");
         check("invariant 1: audit after create", audit());
+        {   // ---- what a member row is allowed to stop saying -----------------
+            // A member row used to be "<condition> · <stack name>", and for a
+            // stack that came out of a container the name was itself a compound
+            // - "sweep.vnz:0" - because the row had to name its own sweep when
+            // the sweep's heading had scrolled off the top of the panel. The
+            // heading is held there now and the row leads with its own [n], so
+            // the ":0" is the same fact twice and the file name goes to the end
+            // of the row, where a narrowing panel drops it first.
+            //
+            // The tail comes off only when it is DIGITS: an .npz member is
+            // "data.npz:arr_0", and an array name is not a position - nothing
+            // else on the row repeats it.
+            check("a container member drops the index the row now carries",
+                  filesMemberName("sweep.vnz:0") == "sweep.vnz" &&
+                  filesMemberName("sweep.vnz:12") == "sweep.vnz");
+            check("an .npz member name is not an index and stays",
+                  filesMemberName("data.npz:arr_0") == "data.npz:arr_0" &&
+                  filesMemberName("data.npz:dark") == "data.npz:dark");
+            check("a plain stack name is untouched",
+                  filesMemberName("40lx") == "40lx" &&
+                  filesMemberName("scanroot/frame_###.npy") == "scanroot/frame_###.npy" &&
+                  filesMemberName("odd:") == "odd:" && filesMemberName(":7") == ":7");
+        }
         check("N members + a unit -> seriesCanFit", seriesCanFit(*S));
         {   // the unit is never assumed: without one there is no fit, ever
             char keep[16];
@@ -23142,8 +29697,8 @@ int main(int argc, char** argv) {
             std::string lerr = loadSession(sess);       // closeAll happens inside
             check("session reloaded", lerr.empty());
             loadAll();                                  // stacks come back first
-            double tr = glfwGetTime();                  // ...the series after them
-            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+            double tr = nowSec();                  // ...the series after them
+            while (nowSec() - tr < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23317,8 +29872,8 @@ int main(int argc, char** argv) {
             std::string lerr = loadSession(legacy);
             check("legacy (seqlevel) session loaded", lerr.empty());
             loadAll();
-            double tm = glfwGetTime();
-            while (glfwGetTime() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm = nowSec();
+            while (nowSec() - tm < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23353,8 +29908,8 @@ int main(int argc, char** argv) {
             }
             loadSession(legacy);
             loadAll();
-            double tm2 = glfwGetTime();
-            while (glfwGetTime() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm2 = nowSec();
+            while (nowSec() - tm2 < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23381,8 +29936,8 @@ int main(int argc, char** argv) {
             }
             loadSession(legacy);
             loadAll();
-            double tm3 = glfwGetTime();
-            while (glfwGetTime() - tm3 < 120.0 && !app.seqLevelLegacy.empty()) {
+            double tm3 = nowSec();
+            while (nowSec() - tm3 < 120.0 && !app.seqLevelLegacy.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23600,8 +30155,8 @@ int main(int argc, char** argv) {
             }
             loadSession(hostile);
             loadAll();
-            double th = glfwGetTime();
-            while (glfwGetTime() - th < 120.0 && !app.seriesRestore.empty()) {
+            double th = nowSec();
+            while (nowSec() - th < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23645,8 +30200,8 @@ int main(int argc, char** argv) {
             saveSession(dup, true);
             loadSession(dup);
             loadAll();
-            double td = glfwGetTime();
-            while (glfwGetTime() - td < 120.0 && !app.seriesRestore.empty()) {
+            double td = nowSec();
+            while (nowSec() - td < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23705,8 +30260,8 @@ int main(int argc, char** argv) {
             saveSession(same, true);
             loadSession(same);
             loadAll();
-            double ts = glfwGetTime();
-            while (glfwGetTime() - ts < 120.0 && !app.seriesRestore.empty()) {
+            double ts = nowSec();
+            while (nowSec() - ts < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23765,8 +30320,8 @@ int main(int argc, char** argv) {
             closeAll();
             loadSession(cut);
             loadAll();
-            double tc = glfwGetTime();
-            while (glfwGetTime() - tc < 120.0 && !app.seriesRestore.empty()) {
+            double tc = nowSec();
+            while (nowSec() - tc < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23799,16 +30354,16 @@ int main(int argc, char** argv) {
                   app.series.empty() && !app.seriesRestore.empty());
             saveSession(mid, true);        // <- the save INSIDE the window
             loadAll();
-            double tw = glfwGetTime();
-            while (glfwGetTime() - tw < 120.0 && !app.seriesRestore.empty()) {
+            double tw = nowSec();
+            while (nowSec() - tw < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             closeAll();
             loadSession(mid);
             loadAll();
-            double tm = glfwGetTime();
-            while (glfwGetTime() - tm < 120.0 && !app.seriesRestore.empty()) {
+            double tm = nowSec();
+            while (nowSec() - tm < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -23850,8 +30405,8 @@ int main(int argc, char** argv) {
             saveSession(rn, true);
             loadSession(rn);
             loadAll();
-            double tr = glfwGetTime();
-            while (glfwGetTime() - tr < 120.0 && !app.seriesRestore.empty()) {
+            double tr = nowSec();
+            while (nowSec() - tr < 120.0 && !app.seriesRestore.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -24005,8 +30560,8 @@ int main(int argc, char** argv) {
             check("closeBatch takes the batch's pending sweep with it",
                   app.seriesPending.empty());
             loadAll();
-            double tb = glfwGetTime();
-            while (glfwGetTime() - tb < 1.0) {
+            double tb = nowSec();
+            while (nowSec() - tb < 1.0) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -24033,8 +30588,8 @@ int main(int argc, char** argv) {
             check("the box is cleared on accept (a sweep is never sticky)",
                   !app.pickSweep);
             loadAll();
-            double t5 = glfwGetTime();
-            while (glfwGetTime() - t5 < 120.0 && !app.seriesPending.empty()) {
+            double t5 = nowSec();
+            while (nowSec() - t5 < 120.0 && !app.seriesPending.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -24089,8 +30644,8 @@ int main(int argc, char** argv) {
             check("the sweep box came up UNTICKED", !app.pickSweep);
             pickerAccept();
             loadAll();
-            double t6 = glfwGetTime();             // give a late resolve every chance
-            while (glfwGetTime() - t6 < 1.0) {
+            double t6 = nowSec();             // give a late resolve every chance
+            while (nowSec() - t6 < 1.0) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -24129,8 +30684,8 @@ int main(int argc, char** argv) {
             check("the second does not overwrite it - both are queued",
                   app.seriesPending.size() == 2);
             loadAll();
-            double t7 = glfwGetTime();
-            while (glfwGetTime() - t7 < 240.0 && !app.seriesPending.empty()) {
+            double t7 = nowSec();
+            while (nowSec() - t7 < 240.0 && !app.seriesPending.empty()) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -24179,8 +30734,8 @@ int main(int argc, char** argv) {
             if (!cond) ok = false;
         };
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen && app.seriesPending.empty()) break;
@@ -24281,8 +30836,8 @@ int main(int argc, char** argv) {
             snprintf(app.pickSweepUnit, sizeof app.pickSweepUnit, "lx");
             pickerAccept();
             int renamed = 0;
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 pumpSequenceAndQueue();
                 if (!renamed && app.seqs.size() == 2) {      // lv000, lv010 are up
                     renamed = app.seqs[1].id;
@@ -24312,9 +30867,9 @@ int main(int argc, char** argv) {
         closeAll();
         startRemote(rbMain(), "local://" + dir);
         {
-            double t0 = glfwGetTime();
+            double t0 = nowSec();
             bool scanSent = false;
-            while (glfwGetTime() - t0 < 300.0) {
+            while (nowSec() - t0 < 300.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -24347,6 +30902,45 @@ int main(int argc, char** argv) {
                 namesOk = nm[i] == std::string(LV[i]) + "/capture.npy";
             check("a remote frame-axis stack keeps it too", namesOk);
         }
+        {   // ---- the Inspector's source row does not come and go mid-stack ----
+            // ImageDoc::note is printed as a LINE OF ITS OWN in the Inspector's
+            // Image section, with the Interpret combo and the rest of the controls
+            // directly below it. openRemote wrote a note on the frame it opened
+            // and pumpRemoteFetch minted the siblings without one, so stepping a
+            // remote stack added and removed a row and everything under it moved
+            // under the pointer. This is --derive-selftest's D4 ("every derived
+            // frame carries the same origin note") for the remote producer, and
+            // it is asserted the same way: EQUAL and non-empty. All-empty would
+            // also hold the row count still, and would also be the regression.
+            int stacks = 0, frames = 0;
+            bool noteConst = true;
+            std::string shown;
+            for (const auto& si : app.seqs) {
+                std::vector<int> fr = framesOfSeq(si.id);
+                if (fr.size() < 2) { noteConst = false; continue; }   // no sibling to differ
+                stacks++;
+                frames += (int)fr.size();
+                const std::string n0 = app.images[fr[0]]->note;
+                if (n0.empty()) noteConst = false;
+                shown = n0;
+                for (int idx : fr)
+                    if (app.images[idx]->note != n0) noteConst = false;
+            }
+            fprintf(stderr, "sweepfile: remote note across %d stack(s) / %d frame(s): "
+                            "\"%s\"\n", stacks, frames, shown.c_str());
+            check("every frame of a remote stack carries the SAME note",
+                  stacks == 7 && noteConst);
+            // ...and it does not repeat the size. docs/todo-open.md item 11 point 3:
+            // the row directly above the note already prints "%dx%d %dch %s", so the
+            // note carrying WxH put the same number twice in two adjacent rows. The
+            // needle is taken from the doc, not typed in, because that is exactly
+            // what the row above formats.
+            char wh[64] = "";
+            if (!app.images.empty())
+                snprintf(wh, sizeof wh, "%dx%d", app.images[0]->w, app.images[0]->h);
+            check("...and it does not repeat the WxH printed one row above",
+                  wh[0] && shown.find(wh) == std::string::npos);
+        }
         checkSeries("remote");
         fprintf(stderr, "sweepfile: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
@@ -24361,8 +30955,8 @@ int main(int argc, char** argv) {
     // it - and a stack closed mid-fetch must not regrow from the prefetch queue.
     if (!g_closeSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -24416,10 +31010,10 @@ int main(int argc, char** argv) {
         }
         int seqsNow = (int)app.seqs.size();
         startRemote(rbMain(), "local://" + scanroot);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool scanSent = false, closed = false;
         int rsid = 0, rfLeft = -1;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
@@ -24451,8 +31045,8 @@ int main(int argc, char** argv) {
         } else {
             // the in-flight job (and the rest of the queue) gets 2 s to land;
             // nothing of the closed stack may grow back
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 2.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 2.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -24486,8 +31080,8 @@ int main(int argc, char** argv) {
             bool stopped = app.seqQueue.empty() && app.seqRestore.empty() &&
                            !app.seqRunning && app.seqLoadingId == 0 &&
                            app.rbOpenQueue.empty();
-            double t2 = glfwGetTime();        // give the producers 2 s to regrow
-            while (glfwGetTime() - t2 < 2.0) {
+            double t2 = nowSec();        // give the producers 2 s to regrow
+            while (nowSec() - t2 < 2.0) {
                 pumpSequenceAndQueue();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -24514,10 +31108,10 @@ int main(int argc, char** argv) {
             closeAll();
             rbMain().b = App::RemoteBrowse{};
             startRemote(rbMain(), "local://" + scanroot);
-            double t3 = glfwGetTime();
+            double t3 = nowSec();
             bool sent = false, caught = false;
             int rq0 = 0;
-            while (glfwGetTime() - t3 < 120.0) {
+            while (nowSec() - t3 < 120.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -24545,8 +31139,8 @@ int main(int argc, char** argv) {
             } else {
                 closeAll();
                 bool emptied = app.rbOpenQueue.empty();
-                double t4 = glfwGetTime();
-                while (glfwGetTime() - t4 < 3.0) {
+                double t4 = nowSec();
+                while (nowSec() - t4 < 3.0) {
                     pumpRemoteBrowse();
                     pumpRemoteFetch();
                     pumpRemoteOpenQueue();
@@ -24733,13 +31327,165 @@ int main(int argc, char** argv) {
                         " --cfa bayer C:/data/flat_003.npy",
                   "N7 CFA frame argv: pattern first, then --cfa");
             check(join(newWindowArgv(tail)) ==
-                  exe + " --secondary --window-offset 40,40 --sequence always"
+                  exe + " --secondary --window-offset 40,40 --stack always"
                         " C:/data/s/frame_000.npy",
-                  "N7 stack argv: HEAD file + --sequence always");
+                  "N7 stack argv: HEAD file + --stack always");
             check(join(newWindowArgv(rem)) ==
                   exe + " --secondary --window-offset 40,40 ssh://user@trc2/data/x.npy",
                   "N7 remote argv passes the ssh url");
             closeAll();
+        }
+
+        // N8: the window's geometry - the clamp against a monitor set, and the
+        // round trip through prefs.txt.
+        //
+        // The clamp is a pure function of the saved rectangle and the screens
+        // that exist NOW, which is the only way to test the case that actually
+        // matters: the screen that is no longer there. Nobody can unplug a
+        // monitor from inside a test, nobody reproduces it by hand a year later,
+        // and the failure it hides is the unrecoverable one - a window restored
+        // where no mouse can reach it and no menu can bring it back.
+        {
+            // Two 1920x1080 screens side by side, taskbar along the bottom of
+            // each, so the work areas are 1040 tall.
+            const std::vector<WinRect> two = { { 0, 0, 1920, 1040 },
+                                               { 1920, 0, 1920, 1040 } };
+            const std::vector<WinRect> one = { { 0, 0, 1920, 1040 } };
+            bool kept = false;
+            auto fit = [&](WinRect r, const std::vector<WinRect>& w) {
+                kept = fitSavedWindow(r, w);
+                return r;
+            };
+
+            WinRect r = fit({ 100, 80, 1600, 900 }, two);
+            check(kept && r.x == 100 && r.y == 80 && r.w == 1600 && r.h == 900,
+                  "N8 a rectangle that still fits comes back untouched");
+
+            r = fit({ 2100, 80, 1600, 900 }, two);
+            check(kept && r.x == 2100 && r.y == 80 && r.w == 1600,
+                  "N8 the second screen is a place a window is allowed to be");
+
+            // The same prefs.txt, opened after the second screen went away.
+            r = fit({ 2100, 80, 1600, 900 }, one);
+            check(!kept && r.w == 1600 && r.h == 900,
+                  "N8 a screen that is gone drops the position and keeps the size");
+
+            // Docked laptop: the window was on a 4K panel and the laptop is
+            // alone now. Position unusable, size larger than the screen.
+            r = fit({ 2400, 1300, 2600, 1600 }, one);
+            check(!kept && r.w == 1920 && r.h == 1040,
+                  "N8 a size larger than the only screen is clamped to it");
+
+            // On screen, but the title bar is above the top of it: nothing left
+            // to grab, so the position goes.
+            r = fit({ 300, -200, 1600, 900 }, one);
+            check(!kept, "N8 a window whose drag strip is above the screen is not restored");
+
+            // Only a corner left on screen - 60x40 of a 1600x900 window.
+            r = fit({ 1860, 1000, 1600, 900 }, one);
+            check(!kept, "N8 a corner peeking onto the screen is not enough to be reachable");
+
+            // Hanging off the right and bottom edges but plainly reachable:
+            // slid back on rather than thrown away.
+            r = fit({ 600, 400, 1600, 900 }, one);
+            check(kept && r.x == 320 && r.y == 140 && r.w == 1600 && r.h == 900,
+                  "N8 a window hanging off the edge is slid back, not forgotten");
+
+            // No monitor answered at all (a headless or mid-hotplug moment):
+            // the size survives, the position does not.
+            r = fit({ 100, 80, 1600, 900 }, {});
+            check(!kept && r.w == 1600 && r.h == 900,
+                  "N8 with no monitors the size still survives");
+
+            r = fit({ 100, 80, 4, 4 }, one);
+            check(r.w == WIN_MIN_W && r.h == WIN_MIN_H,
+                  "N8 a degenerate saved size comes back as a usable window");
+
+            // ---- the round trip, against the real prefs.txt ------------------
+            // The hermetic APPDATA/HOME that CMakeLists.txt pins for every
+            // selftest is what makes this safe; the bytes are put back anyway,
+            // because a test that edits the file it is testing must leave it as
+            // it found it.
+            std::string pp = prefsPath();
+            std::vector<uint8_t> before;
+            bool hadBefore = readFileBytes(pp, before);
+            int sx = app.winX, sy = app.winY, sw = app.winW, sh = app.winH;
+            bool sm = app.winMax;
+            auto bmSnap = app.rbBookmarks;
+            auto rcSnap = app.rbRecents;
+            auto memoSnap = app.readerMemo;
+            auto reload = [&]() {
+                // loadPrefs APPENDS to the list-valued prefs (V25k says so):
+                // clear them first or reading twice doubles them.
+                app.rbBookmarks.clear();
+                app.rbRecents.clear();
+                app.readerMemo.clear();
+                loadPrefs();
+            };
+
+            app.winX = -7; app.winY = 33; app.winW = 1234; app.winH = 777;
+            app.winMax = true;
+            savePrefs();
+            app.winX = app.winY = app.winW = app.winH = 0;
+            app.winMax = false;
+            reload();
+            check(app.winX == -7 && app.winY == 33 && app.winW == 1234 &&
+                  app.winH == 777 && app.winMax,
+                  "N8 position, size and the maximized flag survive prefs.txt");
+
+            // Quitting maximized has to come back maximized WITH a rectangle to
+            // restore down to - the flag alone would leave nothing to restore.
+            std::vector<uint8_t> savedBytes;
+            readFileBytes(pp, savedBytes);
+            std::string txt(savedBytes.begin(), savedBytes.end());
+            check(txt.find("window -7 33 1234 777 1\n") != std::string::npos,
+                  "N8 one line carries both: the rectangle and the state");
+
+            // A hand-edited or truncated line is "nothing saved", not a 0x0
+            // window at whatever the reads gave up on.
+            {
+                std::string bad = txt;
+                size_t p = bad.find("window -7 33 1234 777 1");
+                if (p == std::string::npos) { bad += "window 12 34\n"; p = 0; }
+                else bad.replace(p, strlen("window -7 33 1234 777 1"), "window 12 34");
+                std::ofstream bf(pathFromUtf8(pp), std::ios::binary);
+                bf << bad;
+                bf.close();
+                app.winW = 999;
+                reload();
+                check(app.winW == 0 && app.winH == 0 && !app.winMax,
+                      "N8 a truncated window line means nothing saved");
+            }
+
+            // A run that never samples a window - every scripted run - writes
+            // back exactly what it read. This is the whole reason savePrefs
+            // gates the line on winW > 0 rather than always emitting one.
+            {
+                app.winX = app.winY = app.winW = app.winH = 0;
+                app.winMax = false;
+                savePrefs();
+                std::vector<uint8_t> a1;
+                readFileBytes(pp, a1);
+                reload();
+                savePrefs();
+                std::vector<uint8_t> a2;
+                readFileBytes(pp, a2);
+                check(a1 == a2 && std::string(a1.begin(), a1.end()).find("window ") ==
+                                  std::string::npos,
+                      "N8 a run that saw no window writes no window line");
+            }
+
+            app.winX = sx; app.winY = sy; app.winW = sw; app.winH = sh;
+            app.winMax = sm;
+            app.rbBookmarks = bmSnap;
+            app.rbRecents = rcSnap;
+            app.readerMemo = memoSnap;
+            if (hadBefore) {
+                std::ofstream rf(pathFromUtf8(pp), std::ios::binary);
+                rf.write((const char*)before.data(), (std::streamsize)before.size());
+            } else {
+                std::filesystem::remove(pathFromUtf8(pp), ec);
+            }
         }
 
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
@@ -24747,10 +31493,468 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    if (!g_verifySelftest.empty()) {
+    // ---- who holds which pixels (docs/verify-functional.md D-1/D-2/D-7) ------
+    // The probe this test exists to exercise is srcMapDump(); the asserts below
+    // are what it makes sayable. Every one of them is about a fact that had no
+    // printing path at all before: the number of SOURCES behind N documents,
+    // how many documents hold each one, and the Watch baseline statSourceFile
+    // wrote (A-12 could only be settled by reading the code - the three decode
+    // paths were traced by eye and the values never seen).
+    //
+    // M1 is the stage-1 baseline: nothing shares. It is not a law - stage 2
+    // exists to break it - and it is written so that breaking it is LOUD.
+    // M4/M5 do the sharing by hand (white-box, as S6 sets app.selectedAnn) for
+    // two reasons: a probe that can only ever print refs=1 proves nothing about
+    // the day something shares, and the crop CoW is unreachable in stage 1
+    // (cropInPlace's own comment says so) yet is the whole of C2-3.
+    if (!g_srcmapSelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            while (glfwGetTime() - t0 < 300.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "srcmapselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        openFolder(g_srcmapSelftest);
+        loadAll();
+        if (app.images.size() < 2) {
+            fprintf(stderr, "srcmapselftest: need 2 images under %s\n",
+                    g_srcmapSelftest.c_str());
+            stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
+            return 1;
+        }
+        srcMapDump("M1 after open");
+
+        // ---- M1: one source per membership, and the mirrors agree with it ---
+        {
+            std::vector<SrcMapRow> rows = srcMapRows();
+            bool one = !rows.empty();
+            int shared = 0;
+            for (const SrcMapRow& r : rows) if (r.refs != 1) { one = false; shared++; }
+            check(one && (int)rows.size() == srcMapSources(),
+                  "M1 stage 1: N documents, N sources, one holder each");
+            fprintf(stderr, "srcmapselftest: M1 %zu doc(s) over %d source(s), "
+                            "%d with more than one holder\n",
+                    rows.size(), srcMapSources(), shared);
+            bool mirrors = true;
+            for (const auto& d : app.images)
+                if (d->w != d->src->w || d->h != d->src->h || d->ch != d->src->ch ||
+                    d->dtype != d->src->dtype)
+                    mirrors = false;
+            // §2.1: w/h/ch/dtype are per-doc MIRRORS. Nothing printed them
+            // beside the source they mirror, so a stale one was invisible.
+            check(mirrors, "M1 every mirror field agrees with the source it mirrors");
+        }
+
+        // ---- M2: the Watch baseline is really in there (D-2 / A-12) ---------
+        // A-12 established BY READING that statSourceFile covers npy, npz and
+        // raw. This is the npy path, executed: the values are compared against
+        // the file on disk, so "the baseline is set" cannot pass on a zero.
+        {
+            int withPath = 0, good = 0;
+            std::string firstBad;
+            for (const auto& d : app.images) {
+                const FrameSource& S = *d->src;
+                if (S.path.empty()) continue;
+                std::error_code sec;
+                auto p = pathFromUtf8(S.path);
+                if (!std::filesystem::exists(p, sec)) continue;
+                withPath++;
+                auto t = std::filesystem::last_write_time(p, sec);
+                int64_t wantM = sec ? 0 : (int64_t)t.time_since_epoch().count();
+                auto sz = std::filesystem::file_size(p, sec);
+                uint64_t wantF = sec ? 0 : (uint64_t)sz;
+                if (S.mtime == wantM && S.fsize == wantF && S.mtime != 0 && S.fsize != 0)
+                    good++;
+                else if (firstBad.empty())
+                    firstBad = d->name + " mtime=" + std::to_string(S.mtime) + "/" +
+                               std::to_string(wantM) + " fsize=" +
+                               std::to_string(S.fsize) + "/" + std::to_string(wantF);
+            }
+            fprintf(stderr, "srcmapselftest: M2 npy: %d of %d file-backed frame(s) "
+                            "carry the disk's own mtime+size%s%s\n",
+                    good, withPath, firstBad.empty() ? "" : "; first miss: ",
+                    firstBad.c_str());
+            check(withPath > 0 && good == withPath,
+                  "M2 the npy decode path leaves the Watch baseline on disk's values");
+        }
+
+        // ---- M3: ...and so does the raw decode path -------------------------
+        {
+            std::filesystem::path raw = std::filesystem::path(g_srcmapSelftest).parent_path() /
+                                        "noise_640x480_gray16.raw";
+            std::error_code rec;
+            bool have = std::filesystem::exists(raw, rec);
+            check(have, "M3 fixture: the raw frame is where the generator puts it");
+            if (have) {
+                size_t before = app.images.size();
+                RawDialog rd;
+                rd.path = raw.u8string();
+                rd.w = 640; rd.h = 480;
+                rd.dtype = RD_U16; rd.interp = RI_GRAY;
+                std::string rerr = loadRaw(rd);
+                check(rerr.empty() && app.images.size() == before + 1,
+                      "M3 the raw frame opens");
+                if (app.images.size() == before + 1) {
+                    const FrameSource& S = *app.images[before]->src;
+                    auto sz = std::filesystem::file_size(pathFromUtf8(S.path), rec);
+                    fprintf(stderr, "srcmapselftest: M3 raw: mtime=%lld fsize=%llu "
+                                    "(file %llu)\n", (long long)S.mtime,
+                            (unsigned long long)S.fsize,
+                            (unsigned long long)(rec ? 0 : sz));
+                    check(S.mtime != 0 && !rec && S.fsize == (uint64_t)sz,
+                          "M3 the raw decode path leaves the Watch baseline too");
+                }
+            }
+        }
+
+        // ---- M4: the probe can SEE sharing (its own calibration) ------------
+        // Nothing in stage 1 shares, so M1 would read the same if the probe
+        // printed a constant. Alias two memberships onto one source - which is
+        // what stage 2 will do for real - and the map has to say so, in the
+        // ordinal, in refs, and in the byte accounting (C1-2's 1x).
+        std::vector<int> f0;
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->seqId != 0 && app.images[i]->seqId == app.images[0]->seqId)
+                f0.push_back(i);
+        if (f0.size() < 2) { f0.clear(); f0.push_back(0); f0.push_back(1); }
+        {
+            ImageDoc* a = app.images[f0[0]].get();
+            ImageDoc* b = app.images[f0[1]].get();
+            size_t bytesBefore = residentImageBytes();
+            size_t oneFrame = b->px().size() * sizeof(float);
+            b->src = a->src;                    // stage 2, by hand
+            b->syncMirrors();
+            srcMapDump("M4 two documents, one source");
+            std::vector<SrcMapRow> rows = srcMapRows();
+            int ordA = -1, ordB = -2;
+            long refsA = 0, refsB = 0;
+            for (const SrcMapRow& r : rows) {
+                if (r.uid == a->uid) { ordA = r.src; refsA = r.refs; }
+                if (r.uid == b->uid) { ordB = r.src; refsB = r.refs; }
+            }
+            check(ordA >= 0 && ordB == ordA,
+                  "M4 both memberships print the SAME source ordinal");
+            check(refsA == 2 && refsB == 2,
+                  "M4 ...and both say two holders (use_count is readable at last)");
+            check((int)rows.size() == srcMapSources() + 1,
+                  "M4 one fewer source than documents");
+            fprintf(stderr, "srcmapselftest: M4 resident %zu -> %zu B (one frame is "
+                            "%zu B)\n", bytesBefore, residentImageBytes(), oneFrame);
+            check(residentImageBytes() == bytesBefore - oneFrame,
+                  "M4 shared pixels are counted once, not twice");
+
+            // ---- M5: the crop CoW (C2-3), which stage 1 cannot reach --------
+            // cropInPlace's use_count()>1 branch is dead code until something
+            // shares; with M4's alias in place it is live, and the assert is
+            // the one C2-3 asks for: the OTHER side's pixels do not move.
+            int aw = a->w, ah = a->h;
+            std::vector<float> aPixels = a->px();
+            cropInPlace(*b, 0, 0, std::max(1, b->w / 2), std::max(1, b->h / 2));
+            srcMapDump("M5 after cropping one of them");
+            rows = srcMapRows();
+            long ra = 0, rb = 0; int oa = -1, ob = -1;
+            for (const SrcMapRow& r : rows) {
+                if (r.uid == a->uid) { ra = r.refs; oa = r.src; }
+                if (r.uid == b->uid) { rb = r.refs; ob = r.src; }
+            }
+            check(ra == 1 && rb == 1 && oa != ob,
+                  "M5 the crop CoW split them: one holder each, two sources");
+            check(a->w == aw && a->h == ah && a->px() == aPixels,
+                  "M5 ...and the other side's pixels never moved (C2-3)");
+            check(b->w == std::max(1, aw / 2) && b->dataRev > 0,
+                  "M5 ...while the cropped side really was cropped");
+        }
+
+        // ---- M6: a clone is a new identity, not a second name for one -------
+        {
+            ImageDoc* a = app.images[f0[0]].get();
+            a->src->rev = 7;                    // any non-zero: it must not travel
+            auto fresh = cloneSource(*a->src);
+            check(fresh->srcId != a->src->srcId && fresh->rev == 0 &&
+                  fresh->data == a->src->data,
+                  "M6 cloneSource: same content, own identity, rev back to 0 (D-7)");
+            a->src->rev = 0;
+        }
+
+        srcMapDump("M7 final");
+        fprintf(stderr, "srcmapselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
+    // ---- PNG / JPEG / TIFF, through the format seam (core/imagefile.h) ------
+    // What this test is FOR, in one line: a picture format must arrive as the
+    // same kind of thing a .npy arrives as, with its own numbers intact.
+    //
+    // So the assertions are about meaning, not about "it opened":
+    //   * the 16-bit PNG comes back sample for sample, 0..65535 - not divided
+    //     by anything, not read through an 8-bit door;
+    //   * a greyscale PNG is ONE channel and RGBA is FOUR (the last-axis rule),
+    //     rather than everything being padded to 4 the way a decoder's
+    //     convenience API would have delivered it;
+    //   * where the decoder DID change the scale (a 4-bit PNG, expanded x17)
+    //     the note says so, because the Inspector is where a user finds out
+    //     what happened to their numbers;
+    //   * a refusal names the file and the reason (docs/input-adapters.md
+    //     §3.2) - "unsupported" is not a message, and TIFF being absent from
+    //     this build is a different sentence from a file being corrupt.
+    //
+    // Every case goes through openPath, the door a drop or a command line uses,
+    // so what is asserted is the sentence the user actually gets.
+    if (!g_mediaSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "mediaselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        const std::string root = g_mediaSelftest;
+        auto open1 = [&](const char* name) -> ImageDoc* {
+            closeAll();
+            app.toast.clear();
+            openPath(root + "/" + name);
+            return app.images.empty() ? nullptr : app.images[0].get();
+        };
+        auto has = [](const std::string& hay, const char* needle) {
+            return hay.find(needle) != std::string::npos;
+        };
+
+        // ---- M1: the seam's own contract ------------------------------------
+        // Every row either decodes or explains itself. A row with neither is a
+        // format that would refuse with an empty sentence, which is the exact
+        // failure this table exists to prevent.
+        {
+            bool sound = !imagefile::backends().empty();
+            for (const imagefile::Backend& b : imagefile::backends()) {
+                if (!b.format || !b.exts || !b.sniff) sound = false;
+                if (b.decode && (b.absent || !b.library || !*b.library)) sound = false;
+                if (!b.decode && (!b.absent || !*b.absent)) sound = false;
+            }
+            fprintf(stderr, "mediaselftest: table = %zu format(s), decodable: %s\n",
+                    imagefile::backends().size(), imagefile::decodableFormats().c_str());
+            check(sound, "M1 every format either decodes or says why it does not");
+            check(imagefile::decodableFormats() == "PNG, JPEG",
+                  "M1 this build decodes PNG and JPEG");
+        }
+
+        // ---- M2: 16-bit PNG, sample for sample ------------------------------
+        // The round trip: tools/gen_testdata.py wrote (y*W+x)*21, and that is
+        // what has to come back. A decoder that normalised to 0..1, or that
+        // took the 8-bit path, passes "it opened" and fails here.
+        {
+            ImageDoc* d = open1("gray16.png");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 1;
+            bool exact = shape;
+            if (shape)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)((i * 21) % 65536)) exact = false;
+            fprintf(stderr, "mediaselftest: M2 %s dtype=%s min=%g max=%g white=%g note=\"%s\"\n",
+                    d ? "opened" : "NOT OPENED", d ? d->dtype.c_str() : "",
+                    d ? d->vmin : 0.0f, d ? d->vmax : 0.0f, d ? d->white : 0.0f,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M2 a 16-bit greyscale PNG is one 1-channel frame");
+            check(exact, "M2 every sample survives: (y*W+x)*21, unscaled");
+            check(d && d->dtype == "u16" && d->vmax == 64491,
+                  "M2 the dtype is the FILE's (u16) and the range is 0..65535 DN");
+            check(d && d->white == 65535, "M2 the display range defaults to the u16 full scale");
+            check(d && has(d->note, "16-bit") && has(d->note, "no scaling"),
+                  "M2 the note says what was read and what was NOT done to it");
+            check(d && d->src->fsize > 0, "M2 the Watch baseline is stamped (file, size)");
+        }
+
+        // ---- M3: the channel rule, all four ways ----------------------------
+        // docs/input-adapters.md §3.1: the last axis, four or fewer, is
+        // channels. Greyscale is 1 - asking the decoder for RGBA always (the
+        // usual way to call one) would have made every mono capture 4-channel
+        // and every per-channel statistic meaningless.
+        {
+            ImageDoc* g = open1("gray8.png");
+            bool grey = g && g->ch == 1 && g->dtype == "u8" && g->w == 64 && g->h == 48;
+            bool greyVals = grey;
+            if (grey)
+                for (int y = 0; y < 48 && greyVals; y++)
+                    for (int x = 0; x < 64 && greyVals; x++)
+                        if (g->px()[(size_t)y * 64 + x] != (float)((x * 4 + y) % 256))
+                            greyVals = false;
+            check(grey && greyVals, "M3 8-bit greyscale is 1 channel, values as stored");
+            check(g && g->white == 255, "M3 an 8-bit file's default range is 0..255 DN");
+
+            ImageDoc* c = open1("rgb8.png");
+            bool rgb = c && c->ch == 3 &&
+                       c->sample(0, 0, 0) == 0 && c->sample(0, 0, 2) == 96 &&
+                       c->sample(63, 0, 0) == 255 && c->sample(0, 47, 1) == 255;
+            check(rgb, "M3 RGB is 3 channels, in file order");
+
+            ImageDoc* a = open1("rgba8.png");
+            check(a && a->ch == 4 && a->sample(0, 0, 3) == 200,
+                  "M3 RGBA is 4 channels and alpha is a channel, not applied");
+
+            ImageDoc* p = open1("pal8.png");
+            bool pal = p && p->ch == 3 && p->sample(0, 0, 0) == 0 &&
+                       p->sample(0, 0, 1) == 1 && p->sample(0, 0, 2) == 2;
+            check(pal, "M3 a palette PNG becomes colour samples");
+            check(p && has(p->note, "palette"),
+                  "M3 ...and says so: the numbers are palette entries now");
+        }
+
+        // ---- M4: where the decoder changes the scale, it is declared --------
+        // A 4-bit PNG holds 0..15 and stb hands back 0..255 (x17). That is the
+        // ONE place these formats are rescaled, and an undeclared rescale is
+        // precisely the failure this project refuses to ship.
+        {
+            ImageDoc* d = open1("gray4.png");
+            bool vals = d && d->ch == 1 && d->px()[0] == 0 && d->px()[1] == 17 &&
+                        d->px()[2] == 34 && d->px()[3] == 51;
+            fprintf(stderr, "mediaselftest: M4 note = \"%s\"\n", d ? d->note.c_str() : "");
+            check(vals, "M4 a 4-bit PNG arrives expanded to 0..255");
+            check(d && has(d->note, "4-bit") && has(d->note, "x17"),
+                  "M4 ...and the note names the depth AND the factor");
+        }
+
+        // ---- M5: JPEG - lossy, and honest about the colour transform --------
+        // Structural, never pixel-exact: a different decoder behind this seam
+        // is allowed to differ by a few DN, and a test that forbade that would
+        // be a test of stb_image rather than of the viewer.
+        {
+            ImageDoc* d = open1("gradient.jpg");
+            bool shape = d && d->w == 32 && d->h == 24 && d->ch == 3 && d->dtype == "u8";
+            // (not "near": <windows.h> defines that one away)
+            auto about = [](float v, float want) { return v > want - 12 && v < want + 12; };
+            bool corners = shape &&
+                           about(d->sample(0, 0, 0), 0) && about(d->sample(31, 0, 0), 255) &&
+                           about(d->sample(0, 23, 1), 255) && about(d->sample(0, 0, 2), 96);
+            fprintf(stderr, "mediaselftest: M5 %dx%d %dch corners %g/%g/%g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0,
+                    d ? d->sample(0, 0, 0) : -1.f, d ? d->sample(31, 0, 0) : -1.f,
+                    d ? d->sample(0, 23, 1) : -1.f, d ? d->note.c_str() : "");
+            check(shape, "M5 a baseline JPEG opens as one 3-channel 8-bit frame");
+            check(corners, "M5 the ramp comes back where it was written");
+            check(d && has(d->note, "YCbCr"),
+                  "M5 the note names the codec's colour transform - it happened to the numbers");
+        }
+
+        // ---- M6: the bytes decide, and the disagreement is said out loud ----
+        {
+            ImageDoc* d = open1("mislabelled.png");
+            fprintf(stderr, "mediaselftest: M6 note = \"%s\"\n", d ? d->note.c_str() : "");
+            check(d && d->ch == 3 && d->w == 32,
+                  "M6 a JPEG named .png decodes as the JPEG it is");
+            check(d && has(d->note, "the name says PNG but the bytes are JPEG"),
+                  "M6 ...and the note says the name and the bytes disagreed");
+        }
+
+        // ---- M7: TIFF is absent, and that is a SENTENCE ---------------------
+        // §3.2's register: the file, the reason, and what to do instead. The
+        // fixture is a valid baseline TIFF, so this cannot pass by accident on
+        // a malformed-file path.
+        {
+            ImageDoc* d = open1("gray8.tif");
+            const std::string msg = app.toast;
+            fprintf(stderr, "mediaselftest: M7 toast = \"%s\"\n", msg.c_str());
+            check(!d && app.images.empty(), "M7 a TIFF opens nothing in this build");
+            check(has(msg, "gray8.tif"), "M7 the refusal names the file");
+            check(has(msg, "TIFF is not read by this build") &&
+                  has(msg, "no TIFF decoder is linked"),
+                  "M7 ...and names what is missing, not just 'unsupported'");
+            check(has(msg, "PNG and JPEG are read natively") && has(msg, "choose a reader"),
+                  "M7 ...and says what does work, and where to go next");
+            check(app.readerPanelOpen && app.readerPickPath.find("gray8.tif") != std::string::npos,
+                  "M7 the refusal IS the affordance: the Reader panel is raised on it");
+        }
+
+        // ---- M8: the two other ways to be refused ---------------------------
+        {
+            ImageDoc* d = open1("broken.png");
+            std::string msg = app.toast;
+            fprintf(stderr, "mediaselftest: M8 broken = \"%s\"\n", msg.c_str());
+            check(!d && has(msg, "broken.png") && has(msg, "PNG:"),
+                  "M8 a corrupt PNG is refused, by name, as a PNG");
+            check(has(msg, "stb_image"),
+                  "M8 ...and names the decoder that said so");
+
+            d = open1("notanimage.png");
+            msg = app.toast;
+            fprintf(stderr, "mediaselftest: M8 not-an-image = \"%s\"\n", msg.c_str());
+            check(!d && has(msg, "not a PNG, JPEG or TIFF file") && has(msg, "68 65 6c 6c"),
+                  "M8 a file that is none of them is refused with its first bytes");
+        }
+
+        // ---- M9: a session that saved a .png reopens a .png ------------------
+        // The session file records a path and lets the loader decide what to do
+        // with it, and that loader was loadNpy for everything that was not an
+        // .npz. Without this branch a restored PNG comes back as "not a .npy
+        // file (bad magic)" - a session that cannot reopen what it saved.
+        {
+            ImageDoc* d = open1("gray16.png");
+            const std::string sess =
+                (std::filesystem::temp_directory_path() / "viewer_mediaselftest.vsession").u8string();
+            bool saved = d != nullptr;
+            if (saved) saveSession(sess, true);
+            closeAll();
+            std::string lerr = loadSession(sess);
+            ImageDoc* r = app.images.empty() ? nullptr : app.images[0].get();
+            bool back = lerr.empty() && app.images.size() == 1 && r &&
+                        r->w == 64 && r->h == 48 && r->ch == 1 && r->dtype == "u16" &&
+                        r->px().size() == 64u * 48u && r->px()[7] == (float)(7 * 21);
+            fprintf(stderr, "mediaselftest: M9 restored %zu doc(s) %s err=\"%s\"\n",
+                    app.images.size(), r ? r->dtype.c_str() : "-", lerr.c_str());
+            check(saved && back, "M9 a session that saved a PNG opens the PNG again");
+            std::error_code sec;
+            std::filesystem::remove(pathFromUtf8(sess), sec);
+        }
+
+        // ---- M10: crop, then Restore full, on a picture file -----------------
+        // Restore full re-reads the FILE, and it reached for loadNpy too.
+        {
+            ImageDoc* d = open1("rgb8.png");
+            bool cropped = false, restored = false;
+            if (d) {
+                cropInPlace(*d, 8, 4, 16, 12);
+                cropped = d->w == 16 && d->h == 12;
+                restoreFull();
+                ImageDoc* r = app.images.empty() ? nullptr : app.images[0].get();
+                restored = r && r->w == 64 && r->h == 48 && r->ch == 3 &&
+                           r->sample(63, 0, 0) == 255;
+            }
+            fprintf(stderr, "mediaselftest: M10 cropped=%d restored=%d\n",
+                    (int)cropped, (int)restored);
+            check(cropped && restored, "M10 crop and Restore full re-read the picture file");
+        }
+
+        closeAll();
+        fprintf(stderr, "mediaselftest: %s\n", ok ? "ok" : "FAILED");
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        stopRbWorker();
+        return ok ? 0 : 1;
+    }
+
+    // The ROI table's numbers. Windowless, so it runs on every runner in the
+    // matrix rather than only on the one that has a GL context - see
+    // roiStatsSelftest(), and V19 below for the half of it that does draw.
+    if (g_roiStatsSelftest) return roiStatsSelftest();
+
+    // A and B on one document. Windowless for the same reason - what it asserts
+    // is what the Statistics panel PRINTS, and that is CPU on both sides of the
+    // window branch.
+    if (g_abEqSelftest) return abEqSelftest();
+
+    if (!g_verifySelftest.empty()) {
+        auto loadAll = [&]() {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
                     !app.folderPickOpen) break;
@@ -24928,8 +32132,8 @@ int main(int argc, char** argv) {
             openFolder(g_verifySelftest);
             if (app.folderPickOpen) pickerAccept();
             int movedSeq = 0, target = 0;
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {    // catch it mid-load
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {    // catch it mid-load
                 pumpSequenceAndQueue();
                 if (!movedSeq && app.seqRunning && app.seqLoadingId &&
                     framesOfSeq(app.seqLoadingId).size() >= 1 &&
@@ -24998,10 +32202,10 @@ int main(int argc, char** argv) {
             scanroot = (sl == std::string::npos ? std::string(".")
                                                 : scanroot.substr(0, sl)) + "/rb/scanroot";
             startRemote(rbMain(), "local://" + scanroot);
-            double t0 = glfwGetTime();
+            double t0 = nowSec();
             bool scanSent = false, closed = false;
             int rsid = 0, queuedForSeq = -1, pendingAfter = -1;
-            while (glfwGetTime() - t0 < 120.0) {
+            while (nowSec() - t0 < 120.0) {
                 pumpRemoteBrowse();
                 pumpRemoteFetch();
                 pumpRemoteOpenQueue();
@@ -25035,8 +32239,8 @@ int main(int argc, char** argv) {
                 if (!rbMain().b.err.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            double t1 = glfwGetTime();
-            while (glfwGetTime() - t1 < 3.0) {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 3.0) {
                 pumpRemoteBrowse(); pumpRemoteFetch();
                 pumpRemoteOpenQueue(); pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -25093,6 +32297,85 @@ int main(int argc, char** argv) {
             check(app.previewUid == 0 && app.current >= 0 &&
                   app.current < (int)app.images.size(),
                   "V9 dropping the current preview re-points A in range");
+
+            // ...and so does Ctrl+W on it. A preview is an ordinary entry in
+            // app.images that happens to be current, so the close path the key
+            // takes is closeCurrent, not dropPreview - and the slot is a single
+            // uid, so closing the document that occupies it without releasing
+            // it leaves the app believing a preview is live that no longer
+            // exists. dropPreview() heals it on the next look (it clears the
+            // uid after failing to find it), which is exactly why this went
+            // unnoticed: nothing between the two ever reads it and says so.
+            {
+                mkPreview();
+                app.current = 0;
+                size_t nBefore2 = app.images.size();
+                closeCurrent();                     // Ctrl+W, not dropPreview
+                fprintf(stderr, "verifyselftest: V9d Ctrl+W on the preview: "
+                                "previewUid=%llu, images %zu->%zu\n",
+                        (unsigned long long)app.previewUid, nBefore2, app.images.size());
+                check(app.previewUid == 0 && app.images.size() == nBefore2 - 1,
+                      "V9d closing the preview releases the preview slot");
+            }
+
+            // ---- V9c: a clicked path segment must rebuild a path that EXISTS.
+            // A NAS reported it: clicking the path errored while ".." kept
+            // working, because "//nas/share/x" was split on '/' and rebuilt as
+            // "/nas" - a UNC prefix does not survive being read as two folders.
+            {
+                struct { const char* dir; size_t n; const char* first; const char* last; } CASES[] = {
+                    { "//nas/share/2026/dark", 3, "//nas/share", "//nas/share/2026/dark" },
+                    { "//nas/share",           1, "//nas/share", "//nas/share" },
+                    { "C:/capt/run42",         3, "C:/",         "C:/capt/run42" },
+                    { "/data/run42",           3, "/",           "/data/run42" },
+                    { "~/capt",                2, "~",           "~/capt" },
+                };
+                bool segOk = true;
+                for (const auto& c : CASES) {
+                    std::vector<PathSeg> v = pathSegments(c.dir);
+                    std::string f = v.empty() ? "<none>" : v.front().path;
+                    std::string l = v.empty() ? "<none>" : v.back().path;
+                    fprintf(stderr, "verifyselftest: V9c \"%s\" -> %zu seg(s), first \"%s\", "
+                                    "last \"%s\"\n", c.dir, v.size(), f.c_str(), l.c_str());
+                    if (v.size() != c.n || f != c.first || l != c.last) segOk = false;
+                }
+                check(segOk, "V9c every path segment rebuilds a path that exists");
+            }
+
+            // ...and SAVING a session must not turn the look into an open.
+            // The autosave fires a few seconds after any change and went
+            // through saveSession, which promoted every preview first - so a
+            // frame the user had merely clicked appeared under the batch on
+            // its own, and a double-click then opened the stack NEXT TO it
+            // ("stack と一枚がそれぞれ登録される").
+            mkPreview();
+            for (auto& d : app.images)
+                if (d->uid == app.previewUid) d->src->path = "pv-scratch/preview.npy";
+            uint64_t pvUid = app.previewUid;
+            size_t nBefore = app.images.size();
+            std::error_code sec;
+            std::filesystem::path sdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-session-scratch";
+            std::filesystem::create_directories(sdir, sec);   // ours: ours to remove
+            std::string spath = (sdir / "s.vsession").u8string();
+            saveSession(spath, true);
+            bool stillPreview = false;
+            for (const auto& d : app.images)
+                if (d->uid == pvUid) stillPreview = d->preview;
+            bool named = false;
+            {
+                std::ifstream in(pathFromUtf8(spath), std::ios::binary);
+                for (std::string ln; std::getline(in, ln); )
+                    if (ln.find("preview.npy") != std::string::npos) named = true;
+            }
+            fprintf(stderr, "verifyselftest: V9b autosave with a live preview: "
+                            "still a preview=%d, images %zu->%zu, named in file=%d\n",
+                    (int)stillPreview, nBefore, app.images.size(), (int)named);
+            check(stillPreview, "V9b saving a session leaves the preview a preview");
+            check(app.images.size() == nBefore, "V9b saving a session opens nothing");
+            check(!named, "V9b the preview is not written into the session file");
+            std::filesystem::remove_all(sdir, sec);
+            dropPreview();
         }
 
         // ---- V10: CFA planes are never mixed in a temporal statistic --------
@@ -25176,8 +32459,8 @@ int main(int argc, char** argv) {
             saveSession(sess2, true);
             std::string lerr2 = loadSession(sess2);
             loadAll();
-            double tn = glfwGetTime();
-            while (glfwGetTime() - tn < 60.0 &&
+            double tn = nowSec();
+            while (nowSec() - tn < 60.0 &&
                    (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -25212,8 +32495,8 @@ int main(int argc, char** argv) {
                                                   : scanroot2.substr(0, sl2)) + "/rb/scanroot";
             rbMain().b = App::RemoteBrowse{};
             startRemote(rbMain(), "local://" + scanroot2);
-            double t0b = glfwGetTime();
-            while (glfwGetTime() - t0b < 120.0) {
+            double t0b = nowSec();
+            while (nowSec() - t0b < 120.0) {
                 pumpRemoteBrowse();
                 if (rbMain().b.connected && !rbMain().b.entries.empty()) break;
                 if (!rbMain().b.err.empty()) break;
@@ -25224,8 +32507,8 @@ int main(int argc, char** argv) {
                 if (e.dir && e.name == "10lx") {
                     // list it, then take its frames
                     remoteBrowseTo(rbMain(), scanroot2 + "/10lx");
-                    double t1b = glfwGetTime();
-                    while (glfwGetTime() - t1b < 120.0) {
+                    double t1b = nowSec();
+                    while (nowSec() - t1b < 120.0) {
                         pumpRemoteBrowse();
                         if (rbMain().b.dir == scanroot2 + "/10lx") break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -25253,8 +32536,8 @@ int main(int argc, char** argv) {
                         app.rfPending.load());
                 check(budgetOk, "V14 committed-but-unlanded bytes count against the budget");
                 // ...and they are given back as the frames land
-                double t2b = glfwGetTime();
-                while (glfwGetTime() - t2b < 60.0 && app.rfPending > 0) {
+                double t2b = nowSec();
+                while (nowSec() - t2b < 60.0 && app.rfPending > 0) {
                     pumpRemoteFetch();
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
@@ -25668,7 +32951,1308 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- V19: stage-2 sharing (docs/reference-design.md §6.2/§7/§4/§3.1).
+        {   // ---- V19: the ROI table's LAYOUT, and its delete button ----------
+            // The panel reaches its numbers through a hash cache, prints them
+            // from inside a clipper, and puts its delete button in the last
+            // column of a row whose label Selectable spans ALL columns. None of
+            // those three layers had a test. So drive the real panel in real
+            // frames and read back where the button actually is.
+            //
+            // The NUMBERS moved out, to --roistats-selftest (roiStatsSelftest()).
+            // They are the same panel, the same cache, the same clipper and the
+            // same PRNU cell, read back through this same probe - but a number
+            // is not a rectangle, and asking for a GL context to check one had
+            // the PRNU column measured on one runner of the three. What stays
+            // here is what a display genuinely decides: where the row's delete
+            // button landed, and whether a click reaches it past the Selectable
+            // that covers it.
+            //
+            // Fixture is analytic, so this needs no file: per-plane levels plus
+            // a within-plane dither, on a Bayer frame.
+            auto mkCfaD = [](int W2, int H2, double amp) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "v19cfa"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+                d->cfa = 1; d->cfaPattern = 0; d->src->dtype = "u16";
+                static const double LVL[4] = { 1000, 2000, 3000, 4000 };
+                d->src->data.resize((size_t)W2 * H2);
+                for (int y = 0; y < H2; y++)
+                    for (int x = 0; x < W2; x++)
+                        d->px()[(size_t)y * W2 + x] =
+                            (float)(LVL[CFA_MAP[0][(y & 1) * 2 + (x & 1)]] +
+                                    (((x >> 1) & 1) ? amp : -amp));
+                d->syncMirrors();
+                d->uid = app.nextUid++;
+                return d;
+            };
+
+            if (!needWindow("--verify-selftest (the ROI row probe)")) return 1;
+            ImGuiIO& pio = ImGui::GetIO();
+            int held = -1;
+            auto roiFrame = [&](ImVec2 mouse, int btn) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                // after the backend, before NewFrame: the GLFW backend rewrites
+                // MousePos from the OS cursor every frame (see g_injMouse)
+                if (mouse.x >= 0) pio.AddMousePosEvent(mouse.x, mouse.y);
+                if (held != btn) {
+                    if (held >= 0) pio.AddMouseButtonEvent(held, false);
+                    if (btn >= 0) pio.AddMouseButtonEvent(btn, true);
+                    held = btn;
+                }
+                ImGui::NewFrame();
+                ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_Always);
+                ImGui::Begin("RoiProbe", nullptr,
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+                g_roiRowProbeOn = true;
+                drawPanelRois();
+                ImGui::End();
+                ImGui::EndFrame();
+            };
+            auto settle = [&] { for (int f = 0; f < 4; f++) roiFrame(ImVec2(-1, -1), -1); };
+            auto row = [&](int id) -> const RoiRowProbe* {
+                for (const auto& r : g_roiRowProbe) if (r.id == id) return &r;
+                return nullptr;
+            };
+
+            closeAll();
+            app.images.push_back(mkCfaD(1024, 1024, 3.0));
+            app.current = 0;
+            app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+            addAnn(0, 0, 0, 512, 512);
+            const int cfaRoi2 = app.anns.back().id;
+            app.roiChannel = -1;
+            settle();
+            for (const auto& r : g_roiRowProbe)
+                fprintf(stderr, "verifyselftest: V19 row %-3s valid=%d lbl=%.0f,%.0f "
+                                "del=%.0f,%.0f\n", r.id ? "roi" : "all", (int)r.s.valid,
+                        r.lbl.x, r.lbl.y, r.del.x, r.del.y);
+            check(row(0) && row(0)->s.valid, "V19 panel prints the All row");
+            check(row(cfaRoi2) && row(cfaRoi2)->s.valid, "V19 panel prints a placed ROI row");
+
+            // ...but the row label must STILL select: the button is only reachable
+            // because the Selectable now allows overlap, and that must not cost
+            // the click the Selectable is there for.
+            app.selectedAnn = 0;
+            settle();
+            if (const RoiRowProbe* rl = row(cfaRoi2)) {
+                roiFrame(rl->lbl, -1);
+                roiFrame(rl->lbl, 0);
+                roiFrame(rl->lbl, -1);
+                roiFrame(rl->lbl, -1);
+                fprintf(stderr, "verifyselftest: V19 label click at %.0f,%.0f: sel=%d\n",
+                        rl->lbl.x, rl->lbl.y, app.selectedAnn);
+                check(app.selectedAnn == cfaRoi2, "V19 clicking the row still selects it");
+            }
+
+            // ---- the delete button ------------------------------------------
+            // Its click has to survive the row label's SpanAllColumns Selectable,
+            // which is submitted first and covers the button's rect.
+            settle();
+            const RoiRowProbe* rd = row(cfaRoi2);
+            check(rd && rd->del.x > 0, "V19 the row's delete button is on screen");
+            if (rd) {
+                ImVec2 at = rd->del;
+                size_t before = app.anns.size();
+                roiFrame(at, -1);                    // hover
+                roiFrame(at, 0);                     // press
+                roiFrame(at, -1);                    // release
+                roiFrame(at, -1);
+                fprintf(stderr, "verifyselftest: V19 delete click at %.0f,%.0f: "
+                                "anns %zu -> %zu\n", at.x, at.y, before, app.anns.size());
+                check(app.anns.size() == before - 1, "V19 the x button deletes its ROI");
+            }
+
+            g_roiRowProbeOn = false;
+            held = -1;
+            pio.AddMouseButtonEvent(0, false);
+        }
+
+        // ---- V21: an .npz is a BATCH of members; a 1-D key is not a picture --
+        // docs/npz-design.md §1: loadNpz opened EVERY *.npy member in silence and
+        // decodeNpyBuffer maps a 1-D (N,) array to H=1,W=N - so a per-frame
+        // exposure vector arrived as a one-pixel-tall PICTURE and a scalar as a
+        // 1x1 one. That is fabrication, which this project forbids.
+        //
+        // The fixture is what a capture script actually writes, built HERE so the
+        // test needs no Python (miniz is linked; npzList/npzExtract are the format):
+        //     data        (4,8,8) uint16   -> the stack
+        //     dark        (8,8)   uint16   -> a frame
+        //     exposure_ms (4,)    float64  -> the per-frame x AXIS, not pixels
+        //     gain        scalar  float64  -> metadata
+        // What has to hold: nothing that is not an image becomes an ImageDoc, the
+        // frame-axis member opens as ONE stack of 4, the 1-D member whose length
+        // matches can BECOME that stack's axis at full precision, the counts are
+        // said in both directions by name, and a session round-trip brings back
+        // the same member with its axis.
+        {
+            closeAll();
+            // (4,8,8) used to be the OTHER ambiguity: a leading 4 is as
+            // plausible a channel count as a frame count, and the old heuristic
+            // read it as CHW - so V21 had to set --npy-axis frames to get the
+            // four frames it is about. There is nothing to set now. §3.1 reads
+            // the LAST axis, (4,8,8) ends in 8, and eight is not a channel
+            // count, so it is four frames because that is what native means.
+            std::error_code nec;
+            std::filesystem::path ndir =
+                std::filesystem::path(g_verifySelftest) / "vfy-npz-scratch";
+            std::filesystem::create_directories(ndir, nec);   // ours: ours to remove
+            // one .npy member as bytes
+            auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
+                               const void* data, size_t nbytes) {
+                std::string sh;
+                if (shape.empty()) sh = "()";
+                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+                else {
+                    sh = "(";
+                    for (size_t i = 0; i < shape.size(); i++)
+                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+                    sh += ")";
+                }
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+                out.insert(out.end(), magic, magic + 8);
+                out.push_back((uint8_t)(hdr.size() & 0xff));
+                out.push_back((uint8_t)(hdr.size() >> 8));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                return out;
+            };
+            // a stored (method 0) zip: local headers, central directory, EOCD
+            // One zip member as it will sit in the file: the BYTES to store, the
+            // uncompressed size the directory advertises, and the method. Stored
+            // (0) and deflate (8) both have to work - the classifier reads only
+            // a header-sized prefix now, which is a different code path for each.
+            struct ZipMem {
+                std::string name;
+                std::vector<uint8_t> bytes;
+                size_t usize;
+                uint16_t method;
+                uint32_t crc;
+            };
+            auto writeNpzRaw = [](const std::string& path, std::vector<ZipMem> mem) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff)); z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                std::vector<uint32_t> offs;
+                for (const auto& m : mem) {
+                    offs.push_back((uint32_t)z.size());
+                    p32(0x04034b50); p16(20); p16(0); p16(m.method); p16(0); p16(0);
+                    p32(m.crc); p32((uint32_t)m.bytes.size()); p32((uint32_t)m.usize);
+                    p16((uint32_t)m.name.size()); p16(0);
+                    z.insert(z.end(), m.name.begin(), m.name.end());
+                    z.insert(z.end(), m.bytes.begin(), m.bytes.end());
+                }
+                uint32_t cdOff = (uint32_t)z.size();
+                for (size_t i = 0; i < mem.size(); i++) {
+                    p32(0x02014b50); p16(20); p16(20); p16(0); p16(mem[i].method);
+                    p16(0); p16(0);
+                    p32(mem[i].crc); p32((uint32_t)mem[i].bytes.size());
+                    p32((uint32_t)mem[i].usize);
+                    p16((uint32_t)mem[i].name.size()); p16(0); p16(0);
+                    p16(0); p16(0); p32(0); p32(offs[i]);
+                    z.insert(z.end(), mem[i].name.begin(), mem[i].name.end());
+                }
+                uint32_t cdSize = (uint32_t)z.size() - cdOff;   // before the EOCD
+                p32(0x06054b50); p16(0); p16(0);
+                p16((uint32_t)mem.size()); p16((uint32_t)mem.size());
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            // the common case: every member STORED, straight from its .npy bytes
+            auto writeNpz = [&](const std::string& path,
+                                const std::vector<std::pair<std::string,
+                                                            std::vector<uint8_t>>>& mem) {
+                std::vector<ZipMem> zm;
+                for (const auto& m : mem)
+                    zm.push_back({ m.first, m.second, m.second.size(), 0,
+                                   (uint32_t)mz_crc32(MZ_CRC32_INIT, m.second.data(),
+                                                      m.second.size()) });
+                writeNpzRaw(path, std::move(zm));
+            };
+            std::vector<uint16_t> data((size_t)4 * 8 * 8);
+            for (int f = 0; f < 4; f++)
+                for (int i = 0; i < 64; i++) data[(size_t)f * 64 + i] = (uint16_t)(1000 + f * 100 + i);
+            std::vector<uint16_t> dark(64, 7);
+            // values a float32 round trip would destroy: an axis is DATA
+            const double EXP[4] = { 0.5, 2.5, 12.75, 12345.678901234567 };
+            const double GAIN = 1.5;
+            std::string npzPath = (ndir / "sweep.npz").u8string();
+            writeNpz(npzPath, {
+                { "data.npy",        npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                { "dark.npy",        npyBytes("<u2", { 8, 8 },    dark.data(), dark.size() * 2) },
+                { "exposure_ms.npy", npyBytes("<f8", { 4 },       EXP, sizeof EXP) },
+                { "gain.npy",        npyBytes("<f8", { },         &GAIN, sizeof GAIN) },
+            });
+
+            // Two image-shaped members and a 1-D key as long as one of them:
+            // there is something to decide, so the picker comes up - and it is
+            // driven here through the same call the button makes.
+            std::string oerr = loadNpz(npzPath);
+            check(app.npzPickOpen && app.npzPick.size() == 4,
+                  "V21 a multi-member npz raises the member picker");
+            {
+                std::string roles;
+                for (const auto& m : app.npzPick)
+                    roles += (roles.empty() ? "" : ", ") + m.name + " " + m.shapeText +
+                             " " + m.dtype + " -> " + m.becomes;
+                fprintf(stderr, "verifyselftest: V21 picker: %s\n", roles.c_str());
+            }
+            // one flag per member: an accumulator would have made the result
+            // depend on the order the fixture happened to be written in
+            bool sawStack = false, sawFrame = false, sawAxis = false, sawScalar = false;
+            for (auto& m : app.npzPick) {
+                if (m.name == "data")        sawStack = m.role == NpzMember::RImage && m.frames == 4;
+                if (m.name == "dark")        sawFrame = m.role == NpzMember::RImage && m.frames == 1;
+                if (m.name == "exposure_ms") sawAxis  = m.role == NpzMember::RAxis && m.vals.size() == 4;
+                if (m.name == "gain")        sawScalar = m.role == NpzMember::RMeta;
+            }
+            check(sawStack && sawFrame && sawAxis && sawScalar,
+                  "V21 the picker classifies every member by shape");
+            // tick the axis, name and unit typed by the "user" - never inferred
+            for (auto& m : app.npzPick) if (m.role == NpzMember::RAxis) m.selected = true;
+            snprintf(app.npzAxisName, sizeof app.npzAxisName, "exposure_ms");
+            snprintf(app.npzAxisUnit, sizeof app.npzAxisUnit, "ms");
+            npzPickAccept();
+            // (a) NOTHING that is not an image may become one
+            int fabricated = 0;
+            std::string fabNames;
+            for (const auto& d : app.images)
+                if (d->src->npzMember == "exposure_ms" || d->src->npzMember == "gain") {
+                    fabricated++;
+                    if (fabNames.size() < 90)
+                        fabNames += (fabNames.empty() ? "" : ", ") + d->name +
+                                    " " + std::to_string(d->w) + "x" + std::to_string(d->h);
+                }
+            fprintf(stderr, "verifyselftest: V21 opened %zu image(s), %zu stack(s)%s%s\n",
+                    app.images.size(), app.seqs.size(),
+                    fabricated ? "; FABRICATED: " : "", fabNames.c_str());
+            check(fabricated == 0, "V21 a 1-D / scalar member never becomes an image");
+            // (b) the frame-axis member is ONE stack of 4; dark is the lone frame
+            int v21frames = app.seqs.empty() ? 0 : (int)framesOfSeq(app.seqs.front().id).size();
+            check(app.seqs.size() == 1 && v21frames == 4,
+                  "V21 the frame-axis member opens as ONE stack of 4");
+            check(app.images.size() == 5, "V21 only the image-shaped members opened");
+            // ...and every one of them carries the Watch baseline of the FILE
+            // it came out of. This is the third of statSourceFile's decode
+            // paths; docs/verify-functional.md A-12 traced all three by eye and
+            // recorded 要probe because nothing printed mtime/fsize. srcMapDump
+            // prints them, so the npz path is now checked by execution, against
+            // the container's own size on disk.
+            srcMapDump("V21 npz members");
+            {
+                std::error_code zec;
+                uint64_t zsz = (uint64_t)std::filesystem::file_size(pathFromUtf8(npzPath), zec);
+                bool baseOk = !zec && !app.images.empty();
+                for (const auto& d : app.images)
+                    if (d->src->mtime == 0 || d->src->fsize != zsz) baseOk = false;
+                check(baseOk, "V21 every npz member carries the container's Watch baseline");
+            }
+            // the FILE is the batch: two members of different shapes are two
+            // stacks under one heading, not two unrelated opens
+            {
+                int b0 = app.images.empty() ? 0 : app.images.front()->batchId;
+                bool oneBatch = b0 != 0;
+                for (const auto& d : app.images) if (d->batchId != b0) oneBatch = false;
+                std::string bname;
+                for (const auto& b : app.batches) if (b.id == b0) bname = b.name;
+                fprintf(stderr, "verifyselftest: V21 batch: one=%d name='%s'\n",
+                        (int)oneBatch, bname.c_str());
+                check(oneBatch && bname == "sweep.npz",
+                      "V21 the npz FILE is one batch, named after the file");
+            }
+            // (c) the matching 1-D member becomes the axis, EXACTLY
+            App::SeqInfo* v21si = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
+            bool axOk = v21si && v21si->axisVals.size() == 4 &&
+                        v21si->axisVals[3] == 12345.678901234567 &&
+                        v21si->axisName == "exposure_ms" && v21si->axisUnit == "ms";
+            fprintf(stderr, "verifyselftest: V21 axis: %d value(s) '%s' [%s], last=%s\n",
+                    v21si ? (int)v21si->axisVals.size() : -1,
+                    v21si ? v21si->axisName.c_str() : "-",
+                    v21si ? v21si->axisUnit.c_str() : "-",
+                    v21si && !v21si->axisVals.empty() ? fmtExact(v21si->axisVals.back()).c_str()
+                                                      : "-");
+            check(axOk, "V21 the matching 1-D member lands in axisVals exactly");
+            // (d) counts BOTH directions, by name, never silent
+            std::string v21msg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            bool said = v21msg.find("exposure_ms") != std::string::npos &&
+                        v21msg.find("gain") != std::string::npos &&
+                        v21msg.find("4 frames") != std::string::npos;
+            fprintf(stderr, "verifyselftest: V21 message: \"%s\"%s\n", v21msg.c_str(),
+                    oerr.empty() ? "" : (" err: " + oerr).c_str());
+            check(said, "V21 the open names what opened AND what did not");
+            // (e) the session brings back the same member, with its axis
+            std::string v21sess = (ndir / "npz.vsession").u8string();
+            saveSession(v21sess, true);
+            std::string v21lerr = loadSession(v21sess);
+            loadAll();
+            bool member = false;
+            for (const auto& d : app.images) if (d->src->npzMember == "data") member = true;
+            App::SeqInfo* v21r = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
+            bool raxOk = v21r && v21r->axisVals.size() == 4 &&
+                         v21r->axisVals[3] == 12345.678901234567 &&
+                         v21r->axisName == "exposure_ms" && v21r->axisUnit == "ms";
+            fprintf(stderr, "verifyselftest: V21 after restore: %zu image(s), member=%d, "
+                            "axis=%d%s\n", app.images.size(), (int)member, (int)raxOk,
+                    v21lerr.empty() ? "" : (" load err: " + v21lerr).c_str());
+            check(v21lerr.empty() && app.images.size() == 5 && member,
+                  "V21 the session restores the same member");
+            check(raxOk, "V21 the session restores the axis at full precision");
+
+            // ---- V21b: one image and nothing to decide opens with NO dialog --
+            // The picker exists because a container CAN hold a choice, not
+            // because opening a file should now cost a click.
+            closeAll();
+            std::string oneNpz = (ndir / "one.npz").u8string();
+            writeNpz(oneNpz, {
+                { "data.npy", npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+            });
+            std::string oneErr = loadNpz(oneNpz);
+            fprintf(stderr, "verifyselftest: V21b single-array npz: picker=%d, %zu image(s)"
+                            "%s\n", (int)app.npzPickOpen, app.images.size(),
+                    oneErr.empty() ? "" : (" err: " + oneErr).c_str());
+            check(oneErr.empty() && !app.npzPickOpen && app.images.size() == 4 &&
+                  app.seqs.size() == 1,
+                  "V21b one image-shaped member opens with no picker");
+
+            // ---- V21c: deeper than (F,H,W,C) is refused BY NAME, not sliced --
+            // It used to erase leading axes and take [0] of each in silence.
+            // A string member is metadata and is READ, not merely counted.
+            closeAll();
+            std::vector<uint16_t> cube((size_t)2 * 2 * 4 * 8 * 8, 3);
+            uint32_t note[8] = { 'd', 'a', 'r', 'k', ' ', 'r', 'u', 'n' };
+            std::string oddNpz = (ndir / "odd.npz").u8string();
+            writeNpz(oddNpz, {
+                { "cube.npy", npyBytes("<u2", { 2, 2, 4, 8, 8 }, cube.data(), cube.size() * 2) },
+                { "data.npy", npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                { "note.npy", npyBytes("<U8", { },         note, sizeof note) },
+            });
+            std::string oddErr = loadNpz(oddNpz);
+            std::string oddMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "verifyselftest: V21c \"%s\"\n", oddMsg.c_str());
+            check(oddErr.empty() && app.images.size() == 4,
+                  "V21c a >4-D member is not sliced into a picture");
+            check(oddMsg.find("cube") != std::string::npos &&
+                  oddMsg.find("(2, 2, 4, 8, 8)") != std::string::npos,
+                  "V21c the refusal names the member and its shape");
+            bool sawNote = false;
+            for (const auto& e : app.npzMeta)
+                if (e.path == oddNpz)
+                    for (const auto& kv : e.items)
+                        if (kv.first == "note" && kv.second.find("dark run") != std::string::npos)
+                            sawNote = true;
+            check(sawNote, "V21c a string member is kept as readable metadata");
+
+            // ---- V21d: a unit of " " is not a unit, on EITHER path -----------
+            // applyFrameAxisVals tested unit.empty() and only the pasted caller
+            // trimmed, so a single space was refused from the Temporal panel and
+            // accepted from the .npz picker - rendering "x axis in  ". One rule,
+            // enforced where the rule lives.
+            closeAll();
+            std::string spNpz = (ndir / "space.npz").u8string();
+            writeNpz(spNpz, {
+                { "data.npy",        npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                { "dark.npy",        npyBytes("<u2", { 8, 8 },    dark.data(), dark.size() * 2) },
+                { "exposure_ms.npy", npyBytes("<f8", { 4 },       EXP, sizeof EXP) },
+            });
+            loadNpz(spNpz);
+            for (auto& m : app.npzPick) if (m.role == NpzMember::RAxis) m.selected = true;
+            snprintf(app.npzAxisName, sizeof app.npzAxisName, "exposure_ms");
+            snprintf(app.npzAxisUnit, sizeof app.npzAxisUnit, " ");
+            npzPickAccept();
+            App::SeqInfo* spSi = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
+            std::string spMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "verifyselftest: V21d blank unit: axisVals=%d \"%s\"\n",
+                    spSi ? (int)spSi->axisVals.size() : -1, spMsg.c_str());
+            check(spSi && spSi->axisVals.empty(),
+                  "V21d a whitespace unit is refused from the npz path too");
+            // ...and the pasted path still refuses it, so the two agree
+            {
+                std::string perr;
+                bool pasted = app.seqs.empty() ? true
+                    : applyFrameAxis(app.seqs.front().id, "exposure_ms", "  ",
+                                     "0.5 2.5 12.75 12345.678901234567", perr);
+                check(!pasted, "V21d the pasted path refuses it identically");
+            }
+
+            // ---- V21e: a zero-length axis is not an image --------------------
+            // (8,8,0) and (0,8,8,3) passed: W and H were bounded, F and C were
+            // not, so one built an ImageDoc with ch=0 and the other read H*W*C
+            // values out of a payload holding none.
+            closeAll();
+            std::vector<uint16_t> none16(1, 0);
+            std::string zeroNpz = (ndir / "zero.npz").u8string();
+            writeNpz(zeroNpz, {
+                { "flatc.npy", npyBytes("<u2", { 8, 8, 0 },    none16.data(), 0) },
+                { "flatf.npy", npyBytes("<u2", { 0, 8, 8, 3 }, none16.data(), 0) },
+                { "data.npy",  npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+            });
+            std::string zErr = loadNpz(zeroNpz);
+            std::string zMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            int zeroCh = 0;
+            for (const auto& d : app.images) if (d->ch < 1) zeroCh++;
+            fprintf(stderr, "verifyselftest: V21e \"%s\" (%zu image(s), ch<1: %d)\n",
+                    zMsg.c_str(), app.images.size(), zeroCh);
+            check(zErr.empty() && app.images.size() == 4 && zeroCh == 0,
+                  "V21e a zero-length axis never becomes an ImageDoc");
+            check(zMsg.find("flatc") != std::string::npos &&
+                  zMsg.find("flatf") != std::string::npos,
+                  "V21e both zero-axis members are named in the message");
+
+            // ---- V21f: a deflate member, read header-first --------------------
+            // npzScan reads only the header prefix now; this member is DEFLATED,
+            // so the streamed partial inflate and the full read are both exercised.
+            closeAll();
+            std::vector<uint8_t> rawNpy =
+                npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2);
+            size_t clen = 0;
+            void* comp = tdefl_compress_mem_to_heap(rawNpy.data(), rawNpy.size(), &clen,
+                                                    TDEFL_DEFAULT_MAX_PROBES);
+            check(comp != nullptr && clen > 0, "V21f the fixture really is deflated");
+            if (comp) {
+                std::vector<uint8_t> cbytes((uint8_t*)comp, (uint8_t*)comp + clen);
+                mz_free(comp);
+                std::string defNpz = (ndir / "packed.npz").u8string();
+                writeNpzRaw(defNpz, { { "data.npy", cbytes, rawNpy.size(), 8,
+                                        (uint32_t)mz_crc32(MZ_CRC32_INIT, rawNpy.data(),
+                                                           rawNpy.size()) } });
+                std::string dErr = loadNpz(defNpz);
+                fprintf(stderr, "verifyselftest: V21f deflate member: %zu image(s)%s\n",
+                        app.images.size(), dErr.empty() ? "" : (" err: " + dErr).c_str());
+                check(dErr.empty() && app.images.size() == 4 && app.seqs.size() == 1,
+                      "V21f a deflated member classifies and opens");
+            }
+
+            // ---- V21g: dropping two multi-member .npz files loses neither ----
+            // openPath is called in a LOOP by the drop callback and the file
+            // dialog. One picker can be up at a time, and the second loadNpz
+            // used to overwrite the first one's pending members with nothing
+            // said - so a file the user dropped simply never opened.
+            closeAll();
+            std::string twoA = (ndir / "runA.npz").u8string();
+            std::string twoB = (ndir / "runB.npz").u8string();
+            for (const std::string& p : { twoA, twoB })
+                writeNpz(p, {
+                    { "data.npy", npyBytes("<u2", { 4, 8, 8 }, data.data(), data.size() * 2) },
+                    { "dark.npy", npyBytes("<u2", { 8, 8 },    dark.data(), dark.size() * 2) },
+                });
+            loadNpz(twoA);
+            bool firstUp = app.npzPickOpen && baseName(app.npzPickPath) == "runA.npz";
+            loadNpz(twoB);                      // the loop's second file
+            std::string qMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            bool queued = app.npzPickQueue.size() == 1 &&
+                          baseName(app.npzPickPath) == "runA.npz" &&
+                          qMsg.find("runB.npz") != std::string::npos;
+            fprintf(stderr, "verifyselftest: V21g first=%d queued=%zu \"%s\"\n",
+                    (int)firstUp, app.npzPickQueue.size(), qMsg.c_str());
+            check(firstUp && queued, "V21g the second .npz waits and is NAMED");
+            npzPickAccept();                    // accepting A must raise B
+            bool drained = app.npzPickOpen && baseName(app.npzPickPath) == "runB.npz" &&
+                           app.npzPickQueue.empty();
+            fprintf(stderr, "verifyselftest: V21g after accepting A: picker=%s, queue=%zu\n",
+                    app.npzPickOpen ? baseName(app.npzPickPath).c_str() : "(none)",
+                    app.npzPickQueue.size());
+            check(drained, "V21g accepting the first raises the one that waited");
+            npzPickAccept();
+            check(!app.npzPickOpen && app.npzPickQueue.empty() && app.images.size() == 10,
+                  "V21g both files end up open");
+            app.npzPick.clear();
+            app.npzPickOpen = false;
+            app.npzPickQueue.clear();
+
+            std::filesystem::remove_all(ndir, nec);
+            closeAll();
+        }
+
+        // ---- V22: native reads FOUR shapes, and SAYS SO when it will not -----
+        // docs/input-adapters.md §3.1: the decision is RANK and the LAST AXIS,
+        // and nothing else. The LEADING axis is never consulted - "a small
+        // leading axis must be channels" is the guess that turned three frames
+        // into one 3-channel picture, and a 1-D exposure vector into a
+        // one-pixel-tall image. Both are fabrication, and both flip here.
+        //
+        //   (H,W)        1 frame, 1 ch
+        //   (H,W,C<=4)   1 frame of C channels <- the ONE size-based exception,
+        //                                        and it is on the LAST AXIS
+        //   (F,H,W)      F frames, 1 ch each   <- so (3,H,W) is THREE FRAMES
+        //   (F,H,W,C)    F frames of C channels
+        //
+        // The exception is a CEILING, not the set {3,4} (issue #71). (H,W,1) is
+        // ONE mono frame and (H,W,2) is ONE two-channel frame - the shapes that
+        // img[:, :, None] and np.expand_dims(a, -1) produce every day, and the
+        // shapes this table had no row for, which is why the local reader and
+        // core/serve.cpp were free to disagree about them for as long as they
+        // did. They have rows now.
+        //
+        // Anything else is refused BY NAME and the refusal names what native
+        // does read (§3.2), because "cannot open" sends nobody anywhere.
+        {
+            closeAll();
+            std::error_code vec;
+            std::filesystem::path vdir =
+                std::filesystem::path(g_verifySelftest) / "vfy-native-scratch";
+            std::filesystem::create_directories(vdir, vec);   // ours: ours to remove
+            // one .npy FILE on disk from a shape and its bytes. V21 builds .npy
+            // members inside a zip; these have to be loose files because the
+            // rule under test is the FILE loader's, and loadNpy is its door.
+            auto writeNpy = [&](const std::string& name, const char* descr,
+                                const std::vector<int64_t>& shape,
+                                const void* data, size_t nbytes) {
+                return npyWriteFile((vdir / name).u8string(), descr, shape, data, nbytes);
+            };
+            // every fixture is a slice of ONE ramp, so a re-reading of the same
+            // file is comparable to the reading it replaced pixel for pixel
+            std::vector<uint16_t> pix(4096);
+            for (size_t i = 0; i < pix.size(); i++) pix[i] = (uint16_t)(i * 7 + 3);
+            auto npyOf = [&](const std::string& name, const std::vector<int64_t>& shape) {
+                size_t n = 1;
+                for (int64_t d : shape) n *= (size_t)d;
+                return writeNpy(name, "<u2", shape, pix.data(), n * 2);
+            };
+            struct Opened { std::string err; size_t docs; int w, h, ch; };
+            auto openOne = [&](const std::string& path) {
+                closeAll();
+                Opened o{};
+                o.err = loadNpy(path);
+                o.docs = app.images.size();
+                if (!app.images.empty()) {
+                    o.w = app.images[0]->w; o.h = app.images[0]->h; o.ch = app.images[0]->ch;
+                }
+                return o;
+            };
+
+            // ---- V22a: the four native forms open, and open as themselves ----
+            struct Want { const char* file; std::vector<int64_t> shape;
+                          size_t docs; int w, h, ch; };
+            const Want ACCEPT[] = {
+                { "a_hw.npy",   { 8, 8 },       1, 8, 8, 1 },   // (H,W)
+                // "a_mono"/"a_uv" and not "a_hw1"/"a_hw2": a_hw1..a_hw4 would be
+                // four NUMBERED SIBLINGS, and the sequence loader groups those
+                // into one stack - of four different shapes, which it then reads
+                // through the first member's geometry. This test is about the
+                // shape rule, and it must not manufacture a second subject by
+                // accident. (That the grouper mis-reads a mixed-shape run at all
+                // is its own defect, and not this change's to fix.)
+                { "a_mono.npy", { 8, 8, 1 },    1, 8, 8, 1 },   // (H,W,1)  ONE mono frame
+                { "a_uv.npy",   { 8, 8, 2 },    1, 8, 8, 2 },   // (H,W,2)  ONE 2ch frame
+                { "a_hw3.npy",  { 8, 8, 3 },    1, 8, 8, 3 },   // (H,W,3)  colour
+                { "a_hw4.npy",  { 8, 8, 4 },    1, 8, 8, 4 },   // (H,W,4)  RGBA
+                { "a_fhw.npy",  { 3, 8, 8 },    3, 8, 8, 1 },   // (3,H,W) = 3 FRAMES
+                { "a_fhwc.npy", { 2, 8, 8, 3 }, 2, 8, 8, 3 },   // (F,H,W,C)
+            };
+            for (const auto& t : ACCEPT) {
+                Opened o = openOne(npyOf(t.file, t.shape));
+                bool good = o.err.empty() && o.docs == t.docs &&
+                            o.w == t.w && o.h == t.h && o.ch == t.ch;
+                fprintf(stderr, "verifyselftest: V22a %-14s -> %zu doc(s) %dx%d %dch"
+                                " (want %zu doc(s) %dx%d %dch)%s%s\n",
+                        npyShapeText(t.shape).c_str(), o.docs, o.w, o.h, o.ch,
+                        t.docs, t.w, t.h, t.ch, o.err.empty() ? "" : "  err=", o.err.c_str());
+                check(good, ("V22a native reads " + npyShapeText(t.shape)).c_str());
+            }
+
+            // ---- V22a2: (H,W,2) actually REACHES the 2-channel labels --------
+            // The C0/C1 branch of the Pixel readout exists because "2ch is
+            // usually UV or complex, not RG" - and until issue #71 no local
+            // .npy could reach it, because (H,W,2) was read as a stack of
+            // 1-channel frames. Accepting the shape is only half the change;
+            // asking the SAME function drawInspector asks is what turns "the
+            // branch should now be reachable" into something that is checked.
+            {
+                Opened o = openOne(npyOf("a_uvlabel.npy", { 8, 8, 2 }));
+                const char* const* lb = channelLabels(o.ch);
+                bool two = o.err.empty() && o.ch == 2 &&
+                           !strcmp(lb[0], "C0") && !strcmp(lb[1], "C1");
+                fprintf(stderr, "verifyselftest: V22a (8, 8, 2) -> %d ch, pixel labels "
+                                "%s/%s (2ch is UV/complex, not RG)\n",
+                        o.ch, lb[0], lb[1]);
+                check(two, "V22a (H,W,2) opens 2ch and reads out as C0/C1");
+            }
+
+            // ---- V22b: everything else is REFUSED, and nothing is built ------
+            struct Bad { const char* file; std::vector<int64_t> shape; const char* why; };
+            const Bad REFUSE[] = {
+                { "b_1d.npy",   { 6 },             "1-D is an axis, not a picture" },
+                { "b_0d.npy",   {},                "a scalar is a number" },
+                { "b_5d.npy",   { 2, 2, 4, 4, 3 }, "deeper than four axes" },
+                { "b_fchw.npy", { 2, 3, 8, 8 },    "(F,C,H,W): the last axis is not channels" },
+                { "b_zero.npy", { 0, 8, 8 },       "a zero-length axis" },
+            };
+            for (const auto& t : REFUSE) {
+                Opened o = openOne(npyOf(t.file, t.shape));
+                bool good = !o.err.empty() && o.docs == 0;
+                fprintf(stderr, "verifyselftest: V22b %-16s %-28s -> %zu doc(s) err=\"%s\"\n",
+                        npyShapeText(t.shape).c_str(), t.why, o.docs, o.err.c_str());
+                check(good, ("V22b native refuses " + npyShapeText(t.shape)).c_str());
+            }
+
+            // ---- V22c: the refusal names the shape AND the accepted forms ----
+            // §3.2. A refusal that does not say what WOULD have worked leaves
+            // the reader to guess, which is the habit this whole change ends.
+            {
+                Opened o = openOne(npyOf("c_odd.npy", { 4, 8, 8, 8, 2 }));
+                bool namesShape = o.err.find("(4, 8, 8, 8, 2)") != std::string::npos;
+                bool namesForms = o.err.find("(H,W)") != std::string::npos &&
+                                  o.err.find("(H,W,C<=4)") != std::string::npos &&
+                                  o.err.find("(F,H,W)") != std::string::npos &&
+                                  o.err.find("(F,H,W,C<=4)") != std::string::npos;
+                fprintf(stderr, "verifyselftest: V22c refusal = \"%s\"\n", o.err.c_str());
+                check(namesShape, "V22c the refusal names the shape that arrived");
+                check(namesForms, "V22c the refusal names every form native reads");
+            }
+
+            // ---- V22d: the way out - say it again, per file (§3.3) -----------
+            // (3,8,8) is the shape the old heuristic got wrong, so it is the one
+            // that has to be sayable in BOTH directions. The pixels must be the
+            // same bytes read a different way round: frame c of the stack is
+            // plane c of the colour frame, or one of the two readings is lying.
+            {
+                std::string p = npyOf("d_fhw.npy", { 3, 8, 8 });
+                closeAll();
+                std::string e = loadNpy(p);
+                bool asStack = e.empty() && app.images.size() == 3 &&
+                               app.images[0]->ch == 1 && app.images[0]->w == 8 &&
+                               app.images[0]->h == 8;
+                // the menu offers only what this shape permits: (3,8,8) can be a
+                // 3-frame stack or a plane-first colour frame, but NOT (H,W,C) -
+                // that would be 8 channels, and it must not be on the menu
+                std::vector<int64_t> shp = { 3, 8, 8 };
+                std::vector<int> opts = npyReadOptions(shp);
+                bool hasStack = false, hasChw = false, hasHwc = false;
+                for (int r : opts) {
+                    if (r == NR_STACK) hasStack = true;
+                    if (r == NR_CHW)   hasChw = true;
+                    if (r == NR_HWC)   hasHwc = true;
+                }
+                fprintf(stderr, "verifyselftest: V22d (3, 8, 8) read as \"%s\", %zu option(s):",
+                        npyReadLabel(shp, NR_STACK).c_str(), opts.size());
+                for (int r : opts) fprintf(stderr, " [%s]", npyReadLabel(shp, r).c_str());
+                fprintf(stderr, "\n");
+                check(asStack, "V22d (3,H,W) opens as three frames, not one 3ch image");
+                check(hasStack && hasChw && !hasHwc && opts.size() == 2,
+                      "V22d the menu is computed: (C,H,W) yes, (H,W,C) impossible");
+                // what the three frames hold, to compare against the re-reading
+                std::vector<float> plane[3];
+                for (int f = 0; f < 3 && f < (int)app.images.size(); f++)
+                    plane[f] = app.images[f]->src->data;
+                // ...and what it costs, said BEFORE it happens
+                std::string loss = npyReReadLoss(app.images[0].get());
+                fprintf(stderr, "verifyselftest: V22d loss = \"%s\"\n", loss.c_str());
+                check(loss.find("rebuilds") != std::string::npos &&
+                      loss.find("3 frames") != std::string::npos,
+                      "V22d the cost of re-reading is stated before it runs");
+
+                std::string re = npyReReadAs(app.images[0].get(), NR_CHW);
+                bool oneColour = re.empty() && app.images.size() == 1 &&
+                                 app.images[0]->ch == 3 && app.images[0]->w == 8 &&
+                                 app.images[0]->h == 8;
+                bool samePixels = oneColour;
+                if (oneColour) {
+                    const FrameSource& S = *app.images[0]->src;
+                    for (int c = 0; c < 3 && samePixels; c++)
+                        for (int i = 0; i < 64 && samePixels; i++)
+                            if (S.data[(size_t)i * 3 + c] != plane[c][i]) samePixels = false;
+                }
+                fprintf(stderr, "verifyselftest: V22d re-read as (C,H,W): %zu doc(s) %dch"
+                                " err=\"%s\" samePixels=%d npyRead=%d\n",
+                        app.images.size(), app.images.empty() ? 0 : app.images[0]->ch,
+                        re.c_str(), (int)samePixels,
+                        app.images.empty() ? -1 : app.images[0]->src->npyRead);
+                check(oneColour, "V22d re-read as (C,H,W) gives ONE 3ch frame");
+                check(samePixels, "V22d the re-reading is the same bytes, read round");
+                check(!app.images.empty() && app.images[0]->src->npyRead == NR_CHW,
+                      "V22d the declaration is remembered on the source");
+
+                // ...and back. The reverse must return the stack it came from,
+                // frame for frame - a one-way door is not a way out.
+                std::string back = npyReReadAs(app.images[0].get(), NR_STACK);
+                bool backOk = back.empty() && app.images.size() == 3 &&
+                              app.images[0]->ch == 1;
+                for (int f = 0; f < 3 && backOk; f++)
+                    if (app.images[f]->src->data != plane[f]) backOk = false;
+                fprintf(stderr, "verifyselftest: V22d back to (F,H,W): %zu doc(s) err=\"%s\"\n",
+                        app.images.size(), back.c_str());
+                check(backOk, "V22d re-reading back gives the same three frames");
+            }
+
+            // ---- V22e: the declaration survives a session round trip ---------
+            // §3.3: "saved in the session, and it opens the same way next time".
+            // An ADDITIVE key: a viewer that predates it skips the line and gets
+            // the native reading, which is what it would have done anyway.
+            {
+                std::string p = npyOf("e_fhw.npy", { 3, 8, 8 });
+                closeAll();
+                loadNpy(p);
+                std::string re = npyReReadAs(app.images[0].get(), NR_CHW);
+                std::string sess = (vdir / "reread.vsession").u8string();
+                saveSession(sess, true);
+                std::string body;
+                {
+                    std::ifstream sf(pathFromUtf8(sess));
+                    std::stringstream ss2; ss2 << sf.rdbuf(); body = ss2.str();
+                }
+                bool wrote = body.find("npyread " + std::to_string((int)NR_CHW)) !=
+                             std::string::npos;
+                bool noGlobal = body.find("npyaxis") == std::string::npos;
+                closeAll();
+                std::string lerr2 = loadSession(sess);
+                bool restored = lerr2.empty() && app.images.size() == 1 &&
+                                app.images[0]->ch == 3 &&
+                                app.images[0]->src->npyRead == NR_CHW;
+                fprintf(stderr, "verifyselftest: V22e session: wrote npyread=%d, npyaxis gone=%d,"
+                                " restored %zu doc(s) %dch read=%d err=\"%s\"\n",
+                        (int)wrote, (int)noGlobal, app.images.size(),
+                        app.images.empty() ? 0 : app.images[0]->ch,
+                        app.images.empty() ? -1 : app.images[0]->src->npyRead, lerr2.c_str());
+                check(re.empty() && wrote, "V22e the session records the reading, per image");
+                check(noGlobal, "V22e the global npyaxis line is gone from sessions");
+                check(restored, "V22e reopening reads it the way it was declared");
+            }
+
+            // ---- V22f: opening one .npy file reads it ONCE -------------------
+            // loadNpy used to own a copy of loadNpyBuffer's frame loop calling
+            // decodeNpyFrame, and decodeNpyFrame reads the whole file EVERY time.
+            // Opening a 12-frame file read it 12 times; at 120 frames and 252 MB
+            // that was 12.2 s of pure re-reading. Nothing caught it because the
+            // pictures were right - it was only slow, and slow has no assertion
+            // unless someone writes one.
+            {
+                std::string mpath = npyOf("reads_once.npy", { 12, 8, 8 });
+                closeAll();
+                long long r0 = g_fileReads;
+                std::string merr = loadNpy(mpath);
+                long long reads = g_fileReads - r0;
+                int got = (int)app.images.size();
+                fprintf(stderr, "verifyselftest: V22f (12,8,8): err=\"%s\" %d frame(s),"
+                                " %lld whole-file read(s)\n", merr.c_str(), got, reads);
+                check(merr.empty() && got == 12, "V22f the 12-frame file opens as 12 frames");
+                check(reads == 1, "V22f ...having been read from disk exactly once");
+
+                // The Watch baseline is what decodeNpyFrame used to stamp per
+                // frame. The buffer path cannot stamp it (for an .npz member the
+                // file is the container), so the file path has to, and every
+                // frame needs it - not just the one that opened the stack.
+                int stamped = 0, total = 0;
+                for (const auto& d : app.images)
+                    if (d->src) { total++; if (d->src->fsize > 0) stamped++; }
+                fprintf(stderr, "verifyselftest: V22f Watch baseline on %d of %d frame(s)\n",
+                        stamped, total);
+                check(total == 12 && stamped == total,
+                      "V22f every frame of the stack carries the Watch baseline");
+            }
+
+            std::filesystem::remove_all(vdir, vec);
+            closeAll();
+        }
+
+        // ---- V25: an npz that declares its own layers (docs/input-adapters.md §4.11)
+        // The container is built BY HAND here, with no Python involved, because
+        // what is under test is the READER: given the reserved members, does the
+        // viewer build the layers they declare, and does it put the conditions on
+        // the SERIES rather than on the stacks. Python enters only where the
+        // subject is actually the harness or the cache (V25h/V25i), and those
+        // skip out loud rather than failing when it is absent.
+        {
+            std::error_code aec;
+            std::filesystem::path adir =
+                std::filesystem::path(g_verifySelftest) / "vfy-adapter-scratch";
+            std::filesystem::create_directories(adir, aec);   // ours: ours to remove
+
+            auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
+                               const void* data, size_t nbytes) {
+                std::string sh;
+                if (shape.empty()) sh = "()";
+                else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+                else {
+                    sh = "(";
+                    for (size_t i = 0; i < shape.size(); i++)
+                        sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+                    sh += ")";
+                }
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + sh + ", }";
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+                out.insert(out.end(), magic, magic + 8);
+                out.push_back((uint8_t)(hdr.size() & 0xff));
+                out.push_back((uint8_t)(hdr.size() >> 8));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                return out;
+            };
+            // numpy writes a str_ scalar as <U<n> in UCS-4; the reader has to
+            // take them exactly as numpy lays them down, so the fixture does too.
+            auto strNpy = [&](const std::string& s) {
+                size_t item = s.empty() ? 1 : s.size();
+                std::vector<uint32_t> cps(item, 0);
+                for (size_t i = 0; i < s.size(); i++) cps[i] = (uint32_t)(unsigned char)s[i];
+                return npyBytes(("<U" + std::to_string(item)).c_str(), {},
+                                cps.data(), cps.size() * 4);
+            };
+            auto i32Npy = [&](int32_t v) { return npyBytes("<i4", {}, &v, 4); };
+            auto f64Npy = [&](const std::vector<double>& v) {
+                return npyBytes("<f8", { (int64_t)v.size() }, v.data(), v.size() * 8);
+            };
+            struct ZipMem2 {
+                std::string name; std::vector<uint8_t> bytes;
+                size_t usize; uint16_t method; uint32_t crc;
+            };
+            auto writeZip = [](const std::string& path, std::vector<ZipMem2> mem) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff)); z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                std::vector<uint32_t> offs;
+                for (const auto& m : mem) {
+                    offs.push_back((uint32_t)z.size());
+                    p32(0x04034b50); p16(20); p16(0); p16(m.method); p16(0); p16(0);
+                    p32(m.crc); p32((uint32_t)m.bytes.size()); p32((uint32_t)m.usize);
+                    p16((uint32_t)m.name.size()); p16(0);
+                    z.insert(z.end(), m.name.begin(), m.name.end());
+                    z.insert(z.end(), m.bytes.begin(), m.bytes.end());
+                }
+                uint32_t cdOff = (uint32_t)z.size();
+                for (size_t i = 0; i < mem.size(); i++) {
+                    p32(0x02014b50); p16(20); p16(20); p16(0); p16(mem[i].method);
+                    p16(0); p16(0);
+                    p32(mem[i].crc); p32((uint32_t)mem[i].bytes.size());
+                    p32((uint32_t)mem[i].usize);
+                    p16((uint32_t)mem[i].name.size()); p16(0); p16(0);
+                    p16(0); p16(0); p32(0); p32(offs[i]);
+                    z.insert(z.end(), mem[i].name.begin(), mem[i].name.end());
+                }
+                uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                p32(0x06054b50); p16(0); p16(0);
+                p16((uint32_t)mem.size()); p16((uint32_t)mem.size());
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            auto writeNpz2 = [&](const std::string& path,
+                                 const std::vector<std::pair<std::string,
+                                                             std::vector<uint8_t>>>& mem) {
+                std::vector<ZipMem2> zm;
+                for (const auto& m : mem)
+                    zm.push_back({ m.first + ".npy", m.second, m.second.size(), 0,
+                                   (uint32_t)mz_crc32(MZ_CRC32_INIT, m.second.data(),
+                                                      m.second.size()) });
+                writeZip(path, std::move(zm));
+            };
+
+            // Two stacks of three frames each, swept over exposure. Pixel values
+            // carry their (stack, frame) so a mis-wired tree shows up as numbers.
+            std::vector<uint16_t> pxA((size_t)3 * 8 * 8), pxB((size_t)3 * 8 * 8);
+            for (int f = 0; f < 3; f++)
+                for (int i = 0; i < 64; i++) {
+                    pxA[(size_t)f * 64 + i] = (uint16_t)(100 + f);
+                    pxB[(size_t)f * 64 + i] = (uint16_t)(200 + f);
+                }
+            const double COND[2] = { 1.5, 40.25 };
+            const double TS[3] = { 0.0, 0.5, 1.0 };
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
+                { "__viewer",              i32Npy(1) },
+                { "__n",                   i32Npy(3) },
+                { "__layer_0",             strNpy("series") },
+                { "__parent_0",            i32Npy(-1) },
+                { "__name_0",              strNpy("exposure sweep") },
+                { "__note_0",              strNpy("") },
+                { "__conditions_values_0", f64Npy({ COND[0], COND[1] }) },
+                { "__conditions_name_0",   strNpy("exposure") },
+                { "__conditions_unit_0",   strNpy("ms") },
+                { "__meta_sensor",         strNpy("\"IMX999\"") },
+                { "__layer_1",             strNpy("stack") },
+                { "__parent_1",            i32Npy(0) },
+                { "__name_1",              strNpy("e1") },
+                { "__note_1",              strNpy("first point") },
+                { "__pixels_1",            npyBytes("<u2", { 3, 8, 8 }, pxA.data(), pxA.size() * 2) },
+                { "__cfa_1",               strNpy("RGGB") },
+                { "__timestamps_values_1", f64Npy({ TS[0], TS[1], TS[2] }) },
+                { "__timestamps_name_1",   strNpy("time") },
+                { "__timestamps_unit_1",   strNpy("s") },
+                { "__layer_2",             strNpy("stack") },
+                { "__parent_2",            i32Npy(0) },
+                { "__name_2",              strNpy("e2") },
+                { "__note_2",              strNpy("") },
+                { "__pixels_2",            npyBytes("<u2", { 3, 8, 8 }, pxB.data(), pxB.size() * 2) },
+            };
+            std::string cpath = (adir / "container.npz").u8string();
+            writeNpz2(cpath, cm);
+
+            closeAll();
+            std::string cerr = loadNpz(cpath);
+            int cSeqs = (int)app.seqs.size();
+            int cSeries = (int)app.series.size();
+            fprintf(stderr, "verifyselftest: V25 container: err=\"%s\" %zu doc(s) %d stack(s) "
+                            "%d series picker=%d\n",
+                    cerr.c_str(), app.images.size(), cSeqs, cSeries, (int)app.npzPickOpen);
+            check(cerr.empty() && !app.npzPickOpen,
+                  "V25a a container opens without the member picker");
+            check(app.images.size() == 6 && cSeqs == 2 && cSeries == 1,
+                  "V25a the declared tree becomes 1 series, 2 stacks, 6 frames");
+
+            // §4.5: the condition belongs to the SERIES. If it lands on the
+            // stacks instead, sigma_t across a sweep becomes computable again,
+            // which is the exact failure the layer split exists to prevent.
+            bool condOk = false, condOffStacks = true;
+            if (cSeries == 1) {
+                const App::Series& s = app.series.front();
+                condOk = s.paramName == "exposure" && std::string(s.unit) == "ms" &&
+                         s.members.size() == 2 &&
+                         s.members[0].value == COND[0] && s.members[1].value == COND[1];
+                fprintf(stderr, "verifyselftest: V25 series: param=\"%s\" unit=\"%s\" "
+                                "members=%zu v0=%g v1=%g\n",
+                        s.paramName.c_str(), s.unit, s.members.size(),
+                        s.members.empty() ? -1 : s.members[0].value,
+                        s.members.size() < 2 ? -1 : s.members[1].value);
+            }
+            for (const auto& sq : app.seqs)
+                if (sq.axisName == "exposure") condOffStacks = false;
+            check(condOk, "V25b the conditions land on the series, with name and unit");
+            check(condOffStacks, "V25b the conditions are NOT copied onto the stacks");
+
+            // timestamps are the stack's own axis and must reach the same field
+            // the paste path and the .npz picker write, or the panels see nothing
+            bool tsOk = false;
+            for (const auto& sq : app.seqs)
+                if (sq.axisVals.size() == 3 && sq.axisName == "time" && sq.axisUnit == "s" &&
+                    sq.axisVals[1] == 0.5)
+                    tsOk = true;
+            check(tsOk, "V25c timestamps land on the stack as its frame axis");
+
+            bool cfaOk = false, noteOk = false;
+            for (const auto& d : app.images) {
+                if (d->cfa == 1 && d->cfaPattern == 0) cfaOk = true;
+                if (d->note.find("first point") != std::string::npos) noteOk = true;
+            }
+            check(cfaOk, "V25d the declared CFA reaches the frames");
+            check(noteOk, "V25d the declared note reaches the frames");
+
+            // §4.11.1: without __viewer this is an ordinary npz and the shape
+            // classifier owns it, untouched. Same bytes, one member removed.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> pm;
+                for (const auto& m : cm) if (m.first != "__viewer") pm.push_back(m);
+                std::string ppath = (adir / "plain.npz").u8string();
+                writeNpz2(ppath, pm);
+                closeAll();
+                std::string perr = loadNpz(ppath);
+                bool old = app.npzPickOpen || !perr.empty();
+                fprintf(stderr, "verifyselftest: V25e plain: err=\"%s\" picker=%d series=%zu\n",
+                        perr.c_str(), (int)app.npzPickOpen, app.series.size());
+                check(old && app.series.empty(),
+                      "V25e without __viewer the plain-npz path still owns the file");
+                app.npzPickOpen = false;
+                app.npzPick.clear();
+            }
+
+            // §4.3.2: no unit means not applied - it does NOT mean discarded.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> um;
+                for (const auto& m : cm)
+                    um.push_back(m.first == "__conditions_unit_0"
+                                     ? std::make_pair(m.first, strNpy("")) : m);
+                std::string upath = (adir / "nounit.npz").u8string();
+                writeNpz2(upath, um);
+                closeAll();
+                std::string uerr = loadNpz(upath);
+                bool kept = app.series.size() == 1 &&
+                            app.series.front().members.size() == 2 &&
+                            app.series.front().members[0].value == COND[0] &&
+                            app.series.front().members[1].value == COND[1] &&
+                            std::string(app.series.front().unit).empty();
+                fprintf(stderr, "verifyselftest: V25f no unit: err=\"%s\" series=%zu "
+                                "unit=\"%s\" v0=%g\n",
+                        uerr.c_str(), app.series.size(),
+                        app.series.empty() ? "?" : app.series.front().unit,
+                        app.series.empty() || app.series.front().members.empty()
+                            ? -1 : app.series.front().members[0].value);
+                check(kept, "V25f a unit-less condition keeps its values, unit left empty");
+            }
+
+            // §4.9 / stage 6: a broken container names what is broken. "could not
+            // open" with no reason is the refusal this whole document exists to
+            // stop, and a container is refused by the same standard as an adapter.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> bm;
+                for (const auto& m : cm) if (m.first != "__layer_2") bm.push_back(m);
+                std::string bpath = (adir / "broken.npz").u8string();
+                writeNpz2(bpath, bm);
+                closeAll();
+                std::string berr = loadNpz(bpath);
+                fprintf(stderr, "verifyselftest: V25g broken: err=\"%s\"\n", berr.c_str());
+                check(!berr.empty() && berr.find("__layer_2") != std::string::npos,
+                      "V25g a malformed container names the member that is wrong");
+            }
+
+            // ---- V25h/V25i: the harness, and the cache around it -------------
+            // These are the only parts whose SUBJECT is Python. CI runners
+            // differ, so a missing interpreter skips them out loud rather than
+            // failing: a red line that means "this machine has no numpy" would
+            // train everyone to ignore red lines.
+            // The user's own prefs must survive this: remembering a reader
+            // writes prefs.txt, and these paths are scratch. Snapshot, then put
+            // it back exactly as it was. The bookmark lists come along because
+            // loadPrefs APPENDS to them - reading prefs twice (which V25k does
+            // on purpose) would otherwise write the user's bookmarks back
+            // doubled, and a selftest that corrupts real settings is worse than
+            // no selftest.
+            std::vector<App::ReaderMemo> memoSnapshot = app.readerMemo;
+            std::vector<std::string> bmSnapshot = app.rbBookmarks;
+            std::vector<std::string> rcSnapshot = app.rbRecents;
+            {
+                std::string pyWhy;
+                std::string py = adapter::findPython(app.pythonExe, pyWhy);
+                std::string script = runAdapterScript();
+                if (py.empty() || script.empty()) {
+                    fprintf(stderr, "verifyselftest: V25h SKIPPED - %s\n",
+                            py.empty() ? pyWhy.c_str()
+                                       : "tools/import/run_adapter.py not found");
+                } else {
+                    // a plain npz for the adapter to read, and an adapter to read it
+                    std::vector<uint16_t> raw((size_t)2 * 3 * 8 * 8);
+                    for (size_t i = 0; i < raw.size(); i++) raw[i] = (uint16_t)(i % 500);
+                    const double EXP2[2] = { 10.0, 20.0 };
+                    std::string srcPath = (adir / "sweep_src.npz").u8string();
+                    writeNpz2(srcPath, {
+                        { "data", npyBytes("<u2", { 2, 3, 8, 8 }, raw.data(), raw.size() * 2) },
+                        { "exp",  npyBytes("<f8", { 2 }, EXP2, sizeof EXP2) },
+                    });
+                    std::string pyPath = (adir / "vfy_reader.py").u8string();
+                    auto writeReader = [&](const char* version) {
+                        std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                        pf << "import numpy as np\n"
+                           << "from viewer_import import Series, Stack, Values\n"
+                           << "VERSION = " << version << "\n"
+                           << "def load(path):\n"
+                           << "    z = np.load(path)\n"
+                           << "    return Series([Stack(z['data'][i]) for i in range(2)],\n"
+                           << "                  conditions=Values(z['exp'], 'exposure', 'ms'))\n";
+                    };
+                    writeReader("1");
+                    std::string spec = pyPath + ":load";
+
+                    closeAll();
+                    int before = g_adapterRuns;
+                    std::string herr = openWithReader(srcPath, spec);
+                    int ranFirst = g_adapterRuns - before;
+                    bool built = herr.empty() && app.series.size() == 1 &&
+                                 app.series.front().members.size() == 2 &&
+                                 std::string(app.series.front().unit) == "ms" &&
+                                 app.series.front().members[1].value == EXP2[1] &&
+                                 app.images.size() == 6;
+                    fprintf(stderr, "verifyselftest: V25h harness: err=\"%s\" runs=%d "
+                                    "%zu doc(s) %zu series unit=\"%s\"\n",
+                            herr.c_str(), ranFirst, app.images.size(), app.series.size(),
+                            app.series.empty() ? "?" : app.series.front().unit);
+                    check(built, "V25h the harness's npz becomes the layers it declares");
+                    check(ranFirst == 1, "V25h the reader ran exactly once");
+
+                    // second open: same everything, so Python must NOT start
+                    closeAll();
+                    int before2 = g_adapterRuns;
+                    std::string h2 = openWithReader(srcPath, spec);
+                    int ranSecond = g_adapterRuns - before2;
+                    fprintf(stderr, "verifyselftest: V25i cache: err=\"%s\" runs=%d %zu doc(s)\n",
+                            h2.c_str(), ranSecond, app.images.size());
+                    check(h2.empty() && app.images.size() == 6 && ranSecond == 0,
+                          "V25i a second open is served from cache, Python not started");
+
+                    // edit the adapter: the key carries its mtime, so it re-runs
+                    writeReader("1");
+                    std::error_code tec;
+                    auto now = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                    std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                     now + std::chrono::seconds(5), tec);
+                    closeAll();
+                    int before3 = g_adapterRuns;
+                    std::string h3 = openWithReader(srcPath, spec);
+                    int ranThird = g_adapterRuns - before3;
+                    fprintf(stderr, "verifyselftest: V25i touched: err=\"%s\" runs=%d\n",
+                            h3.c_str(), ranThird);
+                    check(h3.empty() && ranThird == 1,
+                          "V25i editing the reader makes the next open run it again");
+
+                    // §4.9: the adapter's own words reach the user unchanged
+                    {
+                        std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                        pf << "def load(path):\n"
+                           << "    raise ValueError('header says 12 planes but the file holds 9')\n";
+                    }
+                    closeAll();
+                    std::string berr = openWithReader(srcPath, spec);
+                    fprintf(stderr, "verifyselftest: V25j refusal: \"%s\"\n",
+                            berr.substr(0, 200).c_str());
+                    check(berr.find("header says 12 planes but the file holds 9") !=
+                              std::string::npos,
+                          "V25j a failing reader's own message reaches the user");
+                    // §4.13.0: the panel gets the traceback WHOLE. Folding it
+                    // into one line would remove the file and line that raised,
+                    // which is the only thing the author can act on.
+                    int outLines = 1;
+                    for (char c : app.readerLastOut) if (c == '\n') outLines++;
+                    bool whole = app.readerLastOut.find("Traceback") != std::string::npos &&
+                                 app.readerLastOut.find("vfy_reader.py") != std::string::npos &&
+                                 app.readerLastOut.find("header says 12 planes") !=
+                                     std::string::npos &&
+                                 outLines >= 3;
+                    fprintf(stderr, "verifyselftest: V25j panel holds %d line(s), "
+                                    "traceback=%d file=%d\n", outLines,
+                            (int)(app.readerLastOut.find("Traceback") != std::string::npos),
+                            (int)(app.readerLastOut.find("vfy_reader.py") != std::string::npos));
+                    check(whole && !app.readerLastOk,
+                          "V25j the panel keeps the whole traceback, file and line");
+
+                    // ---- V25l: the loop, in one assert -----------------------
+                    // §4.13.0: write, load, read the failure, FIX, load again.
+                    // The third press must actually re-run - a cache that
+                    // served the previous answer here would kill the feature,
+                    // because the author would be staring at a stale traceback
+                    // for a line they already fixed.
+                    writeReader("1");                 // the fix
+                    auto fixedAt = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                    std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                     fixedAt + std::chrono::seconds(11), tec);
+                    closeAll();
+                    int before4 = g_adapterRuns;
+                    std::string h4 = openWithReader(srcPath, spec);
+                    int ranFourth = g_adapterRuns - before4;
+                    fprintf(stderr, "verifyselftest: V25l loop: err=\"%s\" runs=%d ok=%d "
+                                    "%zu doc(s)\n",
+                            h4.c_str(), ranFourth, (int)app.readerLastOk, app.images.size());
+                    check(h4.empty() && ranFourth == 1 && app.readerLastOk &&
+                              app.images.size() == 6,
+                          "V25l fixing the reader and loading again re-runs it and reads");
+
+                    // ---- V25m: an adapter-read file survives a session -------
+                    // The docs are named after the SOURCE, not the cache file,
+                    // so the session records the source - and the restore has to
+                    // route back through the reader, because the member it
+                    // recorded (__pixels_1) exists only in what the reader makes.
+                    {
+                        std::string asess = (adir / "adapter.vsession").u8string();
+                        saveSession(asess, true);
+                        std::string body;
+                        {
+                            std::ifstream sf(pathFromUtf8(asess));
+                            std::stringstream s2; s2 << sf.rdbuf(); body = s2.str();
+                        }
+                        bool namesSource = body.find("sweep_src.npz") != std::string::npos;
+                        closeAll();
+                        std::string serr = loadSession(asess);
+                        loadAll();
+                        bool back = serr.empty() && app.images.size() == 6 &&
+                                    app.series.size() == 1 &&
+                                    app.series.front().members.size() == 2;
+                        fprintf(stderr, "verifyselftest: V25m session: names source=%d "
+                                        "err=\"%s\" %zu doc(s) %zu series\n",
+                                (int)namesSource, serr.c_str(), app.images.size(),
+                                app.series.size());
+                        check(namesSource,
+                              "V25m the session records the source file, not the cache");
+                        check(back, "V25m reopening the session reads it through the reader");
+                    }
+                }
+            }
+
+            // ---- V25k: the memory survives being written and read back -------
+            {
+                std::string fake = (adir / "remembered.dat").u8string();
+                rememberReader(fake, "acme.py:load");
+                bool hasIt = readerFor(fake) == "acme.py:load";
+                app.readerMemo.clear();
+                loadPrefs();
+                bool survived = readerFor(fake) == "acme.py:load";
+                // §4.12: bounded. The cap holds on the way in as well as out.
+                for (int i = 0; i < 80; i++)
+                    rememberReader((adir / ("f" + std::to_string(i) + ".dat")).u8string(),
+                                   "acme.py:load");
+                bool capped = app.readerMemo.size() == READER_MEMO_MAX;
+                // most recent first: the last one added is still known, the
+                // first one added has been dropped
+                bool lru = !readerFor((adir / "f79.dat").u8string()).empty() &&
+                           readerFor((adir / "f0.dat").u8string()).empty();
+                app.readerMemo.clear();
+                loadPrefs();
+                bool cappedOnRead = app.readerMemo.size() <= READER_MEMO_MAX;
+                fprintf(stderr, "verifyselftest: V25k memo: had=%d survived=%d size=%zu "
+                                "capped=%d lru=%d\n",
+                        (int)hasIt, (int)survived, app.readerMemo.size(),
+                        (int)capped, (int)lru);
+                check(hasIt && survived,
+                      "V25k the per-file reader survives a prefs round trip");
+                check(capped && cappedOnRead, "V25k the memory is bounded at 64 (LRU)");
+                check(lru, "V25k the least recently chosen entry is the one dropped");
+            }
+            app.readerMemo = memoSnapshot;      // the user's prefs, as we found them
+            app.rbBookmarks = bmSnapshot;
+            app.rbRecents = rcSnapshot;
+            savePrefs();
+
+            std::filesystem::remove_all(adir, aec);
+            closeAll();
+        }
+
+        // ---- V26: the Messages panel past its own cap -------------------------
+        // msgLog holds 300 and then drops from the front, so its SIZE is 300 for
+        // message 300 and for message 3000 alike. The panel used to key its
+        // rebuilt text on that size, so it stopped updating at the cap - it went
+        // blind precisely when messages were arriving fastest. The probe walks
+        // past the cap and asks whether the newest line is actually reachable.
+        {
+            std::vector<App::Msg> logSnapshot = app.msgLog;
+            size_t seqSnapshot = app.msgSeq;
+            app.msgLog.clear();
+
+            size_t seqAt300 = 0;
+            for (int i = 0; i < 400; i++) {
+                logMsg("probe message " + std::to_string(i));
+                if (i == 299) seqAt300 = app.msgSeq;
+            }
+            check(app.msgLog.size() == 300, "V26 the log is capped at 300");
+            check(app.msgSeq > seqAt300,
+                  "V26 the change counter keeps moving after the cap (size does not)");
+            check(app.msgLog.back().text == "probe message 399",
+                  "V26 the newest message is the one at the back");
+            check(app.msgLog.front().text == "probe message 100",
+                  "V26 the oldest 100 were dropped from the front, in order");
+
+            // The panel's own cache key, exercised the way the panel uses it.
+            size_t builtFrom = app.msgSeq;
+            logMsg("one more");
+            check(builtFrom != app.msgSeq,
+                  "V26 one more message invalidates the panel's cache");
+
+            // Consecutive duplicates collapse; a repeat after something else does not.
+            size_t beforeDup = app.msgSeq;
+            logMsg("one more");
+            check(beforeDup == app.msgSeq, "V26 an immediate repeat is not logged twice");
+            logMsg("something else");
+            logMsg("one more");
+            check(app.msgLog.back().text == "one more" && app.msgSeq > beforeDup,
+                  "V26 the same text after another message is logged again");
+
+            app.msgLog = logSnapshot;
+            app.msgSeq = seqSnapshot + 1;       // the panel must rebuild after all that
+        }
+
+        // ---- V23: stage-2 sharing (docs/reference-design.md §6.2/§7/§4/§3.1).
         // The first real sharing trigger: the SAME folder opened twice maps the
         // same sources - srcId equal, resident bytes 1x, pixels outlive one
         // side's close (and the close says so), Ctrl+Alt+W stays membership-only.
@@ -25705,16 +34289,16 @@ int main(int argc, char** argv) {
                     unshared++;
                 }
             }
-            fprintf(stderr, "verifyselftest: V19 same folder twice: docs %d->%d, "
+            fprintf(stderr, "verifyselftest: V23 same folder twice: docs %d->%d, "
                             "bytes %zu->%zu, shared %d unshared %d, use_count %ld\n",
                     docs1, docs2, bytes1, bytes2, shared, unshared,
                     twin ? (long)twin->src.use_count() : -1L);
-            check(docs2 == 2 * docs1, "V19 second open adds its own memberships");
+            check(docs2 == 2 * docs1, "V23 second open adds its own memberships");
             check(shared == docs1 && unshared == 0,
-                  "V19 every second-open frame shares its source (srcId equal)");
-            check(bytes2 == bytes1, "V19 resident bytes stay 1x, not 2x");
+                  "V23 every second-open frame shares its source (srcId equal)");
+            check(bytes2 == bytes1, "V23 resident bytes stay 1x, not 2x");
             check(twin && twin->src.use_count() == 2,
-                  "V19 a shared source is held by exactly two memberships");
+                  "V23 a shared source is held by exactly two memberships");
 
             // §3.1: A standing on one membership, B pinned to the other - the
             // chip says WHY the difference is all zero
@@ -25737,11 +34321,11 @@ int main(int argc, char** argv) {
                         e->src.get() != twin->src.get()) { other = e.get(); break; }
                 setCompareB(other);
                 std::string chip2 = abStatusChipText();
-                fprintf(stderr, "verifyselftest: V19 chip '%s' | control '%s'\n",
+                fprintf(stderr, "verifyselftest: V23 chip '%s' | control '%s'\n",
                         chip.c_str(), chip2.c_str());
-                check(said, "V19 chip says A and B share the same pixels");
+                check(said, "V23 chip says A and B share the same pixels");
                 check(chip2.find("share the same pixels") == std::string::npos,
-                      "V19 chip stays quiet for different pixels");
+                      "V23 chip stays quiet for different pixels");
                 app.compareMode = App::CmpOff;
                 app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
             }
@@ -25758,15 +34342,15 @@ int main(int argc, char** argv) {
             ImageDoc* keeper = nullptr;
             for (const auto& e : app.images)
                 if (e->src->srcId == closedSrcId) { keeper = e.get(); break; }
-            fprintf(stderr, "verifyselftest: V19 Ctrl+Alt+W on shared frame: stack %d "
+            fprintf(stderr, "verifyselftest: V23 Ctrl+Alt+W on shared frame: stack %d "
                             "%d->%zu members, pixels %s\n",
                     sid2, membersBefore, framesOfSeq(sid2).size(),
                     keeper ? "kept elsewhere" : "GONE");
             check((int)framesOfSeq(sid2).size() == membersBefore - 1,
-                  "V19 Ctrl+Alt+W removes exactly one membership");
+                  "V23 Ctrl+Alt+W removes exactly one membership");
             check(keeper && inFirst(keeper->batchId) && !keeper->px().empty() &&
                   keeper->src.use_count() == 1,
-                  "V19 the other stack keeps the pixels alive");
+                  "V23 the other stack keeps the pixels alive");
 
             // close the whole second open: every frame survives via the first,
             // and the close says so, both directions (§4)
@@ -25778,14 +34362,14 @@ int main(int argc, char** argv) {
                     batches2.push_back(d->batchId);
             for (int b : batches2) closeBatch(b);
             const size_t bytes3 = residentImageBytes();
-            fprintf(stderr, "verifyselftest: V19 closed the second open: docs %d, "
+            fprintf(stderr, "verifyselftest: V23 closed the second open: docs %d, "
                             "bytes %zu, note '%s'\n",
                     (int)app.images.size(), bytes3, g_lastCloseNote.c_str());
             check((int)app.images.size() == docs1 && bytes3 == bytes1,
-                  "V19 closing one side frees no shared pixels");
+                  "V23 closing one side frees no shared pixels");
             check(g_lastCloseNote.find("freed") != std::string::npos &&
                   g_lastCloseNote.find("still referenced by") != std::string::npos,
-                  "V19 the close said what survived, both directions");
+                  "V23 the close said what survived, both directions");
 
             // ---- the same rule INSIDE one file: a frame-axis .npy holds many
             // frames under ONE path+mtime+fsize, so the identity tuple carries
@@ -25838,17 +34422,17 @@ int main(int argc, char** argv) {
                         app.images[i + 1]->src->srcId == a2.src->srcId)
                         neighborsDistinct = false;
                 }
-                fprintf(stderr, "verifyselftest: V19 frame-axis file twice: "
+                fprintf(stderr, "verifyselftest: V23 frame-axis file twice: "
                                 "%d->%d docs, bytes %zu->%zu, kShares=%d "
                                 "neighborsDistinct=%d values=%d\n",
                         n1, n2, fb1, fb2, kShares ? 1 : 0,
                         neighborsDistinct ? 1 : 0, values ? 1 : 0);
                 check(e1.empty() && e2.empty() && n1 == 6 && n2 == 12,
-                      "V19 a frame-axis npy opens as two 6-frame stacks");
+                      "V23 a frame-axis npy opens as two 6-frame stacks");
                 check(kShares && fb2 == fb1,
-                      "V19 frame k of both opens shares ONE source (fileFrame)");
+                      "V23 frame k of both opens shares ONE source (fileFrame)");
                 check(neighborsDistinct && values,
-                      "V19 frames k and k+1 never collapse into one source");
+                      "V23 frames k and k+1 never collapse into one source");
                 closeAll();
                 std::filesystem::remove_all(pathFromUtf8(fxroot), ec);
             }
@@ -25952,10 +34536,13 @@ int main(int argc, char** argv) {
                   "V20c tooltip counts per counterpart stack");
         }
         // (d) the compare chip resolves slots THROUGH follow-frame, exactly as
-        //     the panes do (findings 5/19): a dormant slot (A standing on the
-        //     pin - resolveSlots compares nothing) says nothing, and a pin
-        //     that follow-resolves onto A's twin frame says the share even
-        //     though the PINNED frame's pixels differ from A's.
+        //     the panes do (findings 5/19). Slots have no dormant state any
+        //     more (9c8f7bb abolished the A==B special case: every live slot
+        //     resolves), so a slot pinned to A ITSELF says the share - that is
+        //     the honest sentence, the same pixels really are on both sides -
+        //     and a pin that follow-resolves onto A's twin frame says it too,
+        //     even though the PINNED frame's pixels differ from A's: the chip
+        //     speaks for what the panes show, never for the pinned uid.
         reload();
         {
             openFolder(g_verifySelftest);                  // twins: same folder again
@@ -25981,17 +34568,17 @@ int main(int argc, char** argv) {
             setCompareB(bpick);
             app.compareMode = App::CmpWipe;
             app.cmpExtra.clear();
-            app.cmpExtra.push_back(cur()->uid);            // pin C = A itself: dormant
-            std::string chipDormant = abStatusChipText();
+            app.cmpExtra.push_back(cur()->uid);            // pin C = A itself
+            std::string chipSelf = abStatusChipText();
             app.cmpExtra.clear();
             for (int idx : framesOfSeq(twinSeq))           // pin C = twin frame 3...
                 if (app.images[idx]->seqIndex == 3)
                     app.cmpExtra.push_back(app.images[idx]->uid);
             std::string chipFollow = abStatusChipText();   // ...pane shows twin frame 1
-            fprintf(stderr, "verifyselftest: V20d chip dormant '%s' | followed '%s'\n",
-                    chipDormant.c_str(), chipFollow.c_str());
-            check(chipDormant.find("share the same pixels") == std::string::npos,
-                  "V20d dormant slot says nothing");
+            fprintf(stderr, "verifyselftest: V20d chip self '%s' | followed '%s'\n",
+                    chipSelf.c_str(), chipFollow.c_str());
+            check(chipSelf.find("A and C share the same pixels") != std::string::npos,
+                  "V20d a slot holding A itself says the share (A==B canon)");
             check(chipFollow.find("A and C share the same pixels") != std::string::npos,
                   "V20d chip speaks for the RESOLVED slot frame");
             app.cmpExtra.clear();
@@ -26047,7 +34634,7 @@ int main(int argc, char** argv) {
                 S.remoteUrl = "local://" + a->src->path;
                 S.npzMember = a->src->npzMember;
                 S.fileFrame = a->src->fileFrame; S.remoteFrame = a->src->remoteFrame;
-                S.frameAxis = a->src->frameAxis;
+                S.npyShape = a->src->npyShape; S.npyRead = a->src->npyRead;
                 S.mtime = a->src->mtime; S.fsize = a->src->fsize;
                 S.w = a->w; S.h = a->h; S.ch = a->ch; S.dtype = a->dtype;
                 S.data.assign((size_t)a->w * a->h * a->ch, -7.0f);
@@ -26101,8 +34688,8 @@ int main(int argc, char** argv) {
     //   D8     range + hand-picked rules; new batch on request; no series joined
     if (!g_deriveSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 120.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -26332,6 +34919,19 @@ int main(int argc, char** argv) {
                           app.images[framesOfSeq(nid).front()]->note.find(
                               "not loaded") != std::string::npos;
             check(honest, "D7 the miss is reported in the note, not fetched");
+            // applyDerivePlan() appended a stack, and app.seqs holds SeqInfo BY
+            // VALUE - so that push_back can reallocate, and every SeqInfo* taken
+            // before it (sa, twenty lines up) is dangling afterwards. Ask for it
+            // again rather than reusing the old one.
+            //
+            // This is why the Windows CI job was the only one that failed the
+            // day it first ran these: MSVC's vector grows 1.5x and reallocates
+            // on exactly this push, so the two lines below wrote through freed
+            // memory and the process died with no output. libstdc++ grows 2x and
+            // had spare capacity, so the same write landed on memory that was
+            // still mapped and nothing ever showed. Forcing cap==size here
+            // reproduced it on this box: seqInfo(seqA) != sa.
+            sa = seqInfo(seqA);
             sa->remoteFiles.clear();                 // leave the source honest
             sa->expectedFrames = 8;
         }
@@ -26457,11 +35057,11 @@ int main(int argc, char** argv) {
         writeNpy2(root + "/loose.npy", 4, 4, 7.0f, 0);
         writeNpy3(root + "/c.npy", 5, 8, 8, 50.0f);
         app.seqLoadMode = 1;
-        // R12 shrinks c.npy to (2,8,8), and a leading axis of 2 is ambiguous
-        // (it reads as channels by default). Load under --npy-axis frames;
-        // reload replays the RECORDED interpretation regardless of the live
-        // pref - R18 pins exactly that.
-        app.npyAxis = 1;
+        // c.npy is (5,8,8): §3.1's native rule reads it as frames both before
+        // and after R12 shrinks it to (2,8,8) - the last axis (8) is never a
+        // channel count - so fileFrame keeps its meaning across the shrink.
+        // The RECORDED-reading questions (--npy-axis's successor, §3.3) are
+        // R18's, on a file whose declared reading differs from native.
         closeAll();
         openFolder(stk);
         loadAll();
@@ -26705,23 +35305,50 @@ int main(int argc, char** argv) {
             check(e17b.empty() && r2->src == r1->src,
                   "R17c the tuple's slot was reclaimed: next open shares again");
         }
-        {   // ---- R18: reload under the RECORDED axis interpretation -------------
-            // c.npy is (2,8,8) now; a leading axis of 2 is ambiguous. The fixture
-            // decoded c.npy as frames (npyAxis=1); flip the global pref: reload
-            // must still decode frames - provenance, not the live setting
-            app.npyAxis = 0;
-            ImageDoc* c1 = docOf(seqC, 1);
+        {   // ---- R18: reload replays the RECORDED reading (npyRead, §3.3) ------
+            // d.npy is (5,8,3): native reads it as ONE 5x8 3-channel image
+            // (§3.1: a last axis of 3 is channels). Open it DECLARED as a
+            // stack - (F,H,W): 5 frames of 3x8. The declaration is provenance
+            // (it is what --npy-axis stopped being): reload must replay it,
+            // and must count the file's frames under it, not under native.
+            writeNpy3(root + "/d.npy", 5, 3, 8, 70.0f);    // shape (5, 8, 3)
+            std::string dErr = loadNpy(root + "/d.npy", NR_STACK);
+            int seqD = app.seqs.empty() ? 0 : app.seqs.back().id;
+            ImageDoc* d0 = docOf(seqD, 0);
+            ImageDoc* d1 = docOf(seqD, 1);
+            ImageDoc* d4 = docOf(seqD, 4);
+            check(dErr.empty() && seqD && d0 && d1 && d4 &&
+                  framesOfSeq(seqD).size() == 5 && d0->w == 3 && d0->h == 8 &&
+                  d0->ch == 1 && d1->px()[0] == 80.0f,
+                  "R18a a declared (F,H,W) reading opens 5 frames, not 1 image");
+            {   // ---- R21b: the key embeds the reading - a NATIVE open of the
+                // SAME file (same path, same mtime/fsize, fileFrame 0) is a
+                // DIFFERENT tuple from the declared stack's frame 0: two
+                // readings are two sets of pixels and must never share
+                size_t n0 = app.images.size();
+                std::string nErr = loadNpy(root + "/d.npy");
+                ImageDoc* nat = app.images.empty() ? nullptr : app.images.back().get();
+                fprintf(stderr, "reloadselftest: R21b native beside declared: "
+                                "src %s, %dx%d %dch\n",
+                        (nat && d0 && nat->src == d0->src) ? "ADOPTED" : "own",
+                        nat ? nat->w : -1, nat ? nat->h : -1, nat ? nat->ch : -1);
+                check(nErr.empty() && app.images.size() == n0 + 1 && nat &&
+                      nat->src != d0->src && nat->w == 8 && nat->h == 5 &&
+                      nat->ch == 3,
+                      "R21b two readings of one file are two tuples");
+                closeImages({ (int)app.images.size() - 1 });
+            }
+            writeNpy3(root + "/d.npy", 2, 3, 8, 900.0f);   // shape (2, 8, 3)
             std::string e18;
-            bool r18 = reloadSource(c1->src, e18);
-            check(r18 && c1->px()[0] == 910.0f,
-                  "R18a reload keeps the recorded frame-axis interpretation");
-            ImageDoc* c4 = docOf(seqC, 4);
+            bool r18 = reloadSource(d1->src, e18);
+            check(r18 && d1->px()[0] == 910.0f && d1->w == 3 && d1->h == 8,
+                  "R18b reload keeps the recorded reading (5->2 frames, still 3x8)");
             std::string e18b;
-            bool r18b = reloadSource(c4->src, e18b);
+            bool r18b = reloadSource(d4->src, e18b);
             fprintf(stderr, "reloadselftest: R18 refusal: %s\n", e18b.c_str());
             check(!r18b && e18b.find("file now has 2 frame(s)") != std::string::npos,
-                  "R18b refusal reports the count under the RECORDED interpretation");
-            app.npyAxis = 1;
+                  "R18c refusal counts frames under the RECORDED reading");
+            closeStack(seqD);
         }
         {   // ---- R19: local:// is LOCAL - the url embeds a path on this disk ---
             writeNpy2(root + "/lref.npy", 4, 4, 1.0f, 0);
@@ -26799,6 +35426,339 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // ---- --stackavg-selftest: the frame average's NUMBERS ---------------------
+    // The VALUE, never the menu item. A menu item that opens the wrong image is
+    // a passing test and a wrong measurement, and this image is the one that
+    // ends up in a report as if it had been captured. Every fixture is written
+    // here so CI has seen exactly these numbers: a stack whose mean is known
+    // exactly, a NaN that must be excluded and counted rather than folded into
+    // the divisor, a sample with no finite frame at all, a sum that float32
+    // cannot carry, a mosaic whose four planes must survive per pixel, a partly
+    // loaded stack that must name its count, and a session that must bring the
+    // provenance back rather than a capture wearing its name.
+    if (!g_stackAvgSelftest.empty()) {
+        bool ok = true;
+        auto check = [&](bool cond, const char* what) {
+            fprintf(stderr, "stackavgselftest: %-62s %s\n", what, cond ? "PASS" : "FAIL");
+            if (!cond) ok = false;
+        };
+        auto loadAll = [&]() {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 120.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        // f4 .npy, pixels given: the NaN and the precision fixtures need
+        // per-pixel control, which a constant-fill writer cannot give.
+        auto writeNpy = [](const std::string& path, int w, int h,
+                           const std::vector<float>& px) {
+            char dict[128];
+            snprintf(dict, sizeof dict,
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", h, w);
+            std::string hdr = dict;
+            size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+            hdr.append(pad, ' ');
+            hdr += '\n';
+            std::ofstream f(pathFromUtf8(path), std::ios::binary);
+            uint16_t hl = (uint16_t)hdr.size();
+            f.write("\x93NUMPY\x01\x00", 8);
+            f.write((const char*)&hl, 2);
+            f.write(hdr.data(), (std::streamsize)hdr.size());
+            f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+        };
+        auto flat = [&](int w, int h, float v) { return std::vector<float>((size_t)w * h, v); };
+        // A scratch subdirectory this test CREATES - never the directory it was
+        // handed, which is a shared fixture root (the derive selftest's comment
+        // records what happened the one time that rule was broken).
+        std::string root = g_stackAvgSelftest;
+        std::replace(root.begin(), root.end(), '\\', '/');
+        while (!root.empty() && root.back() == '/') root.pop_back();
+        root += "/stackavg-scratch";
+        std::error_code ec;
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        const std::string dA = root + "/A", dN = root + "/N", dC = root + "/C",
+                          dP = root + "/P";
+        for (const std::string& d : { dA, dN, dC, dP })
+            std::filesystem::create_directories(pathFromUtf8(d), ec);
+        const int W = 4, H = 4;
+        const float NA = std::numeric_limits<float>::quiet_NaN();
+        // A: 100, 200, 300 -> exactly 200, everywhere.
+        writeNpy(dA + "/f_000.npy", W, H, flat(W, H, 100.0f));
+        writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));
+        writeNpy(dA + "/f_002.npy", W, H, flat(W, H, 300.0f));
+        // N: same three levels, but pixel 0 is NaN in the MIDDLE frame (mean of
+        // the other two = 200 - the same answer, which is the point: excluding
+        // must not shift it) and pixel 1 is NaN in ALL THREE (no mean exists).
+        for (int k = 0; k < 3; k++) {
+            std::vector<float> px = flat(W, H, 100.0f * (k + 1));
+            if (k == 1) px[0] = NA;
+            px[1] = NA;
+            char nm[32]; snprintf(nm, sizeof nm, "/f_%03d.npy", k);
+            writeNpy(dN + nm, W, H, px);
+        }
+        // C: a mosaic. Each Bayer plane gets its own level, so mixing planes
+        // anywhere shows up immediately as a wrong per-plane number.
+        const float BASE[4] = { 1000.0f, 2000.0f, 3000.0f, 4000.0f };   // R Gr Gb B
+        for (int k = 0; k < 3; k++) {
+            std::vector<float> px((size_t)W * H);
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
+                    int p = CFA_MAP[0][(y & 1) * 2 + (x & 1)];          // RGGB
+                    px[(size_t)y * W + x] = BASE[p] + 10.0f * k;
+                }
+            char nm[32]; snprintf(nm, sizeof nm, "/f_%03d.npy", k);
+            writeNpy(dC + nm, W, H, px);
+        }
+        // P: a sum float32 cannot carry. 2^24 + 1 + 1 is 2^24 in float32 (both
+        // ones fall off the end of the mantissa) and 16777218 in double, and the
+        // two means differ by more than a float32 ULP at that magnitude - so
+        // this fixture fails if the accumulator is ever narrowed back to float.
+        writeNpy(dP + "/f_000.npy", W, H, flat(W, H, 16777216.0f));
+        writeNpy(dP + "/f_001.npy", W, H, flat(W, H, 1.0f));
+        writeNpy(dP + "/f_002.npy", W, H, flat(W, H, 1.0f));
+
+        app.seqLoadMode = 1;                    // always load numbered runs
+        // Opens the average of the ONE stack the given folder holds, and hands
+        // back the frame it made. Goes through requestStackAverage, the same
+        // door every menu item uses - a test that called stackAverageFrame
+        // directly would not be testing what the menu does.
+        auto averageOf = [&](const std::string& dir, int* seqOut) -> ImageDoc* {
+            closeAll();
+            openFolder(dir);
+            loadAll();
+            int seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            if (seqOut) *seqOut = seq;
+            if (!seq) return nullptr;
+            size_t before = app.images.size();
+            requestStackAverage(seq);
+            loadAll();                          // settled already, but drive the pump
+            if (app.images.size() != before + 1) return nullptr;
+            return app.images.back().get();
+        };
+
+        {   // ---- A1: the mean is the mean, and the source is untouched --------
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "A1 the average opened as exactly one new image");
+            if (m) {
+                bool allTwoHundred = true;
+                for (float v : m->px()) if (v != 200.0f) allTwoHundred = false;
+                fprintf(stderr, "stackavgselftest: A1 100/200/300 -> %.9g (%dx%d %dch), "
+                                "stack still %zu frames\n",
+                        (double)m->px()[0], m->w, m->h, m->ch, framesOfSeq(seq).size());
+                check(allTwoHundred, "A1 frames at 100, 200, 300 average to exactly 200");
+                check(m->w == W && m->h == H && m->ch == 1,
+                      "A1 ...at the source's size, one frame's worth of pixels");
+                // A frame, per docs/terminology.md: the layer below the stack,
+                // hanging off the same batch. Nothing about it needs a special
+                // case for Histogram / Projection / ROIs to work (issue #48).
+                check(m->seqId == 0, "A2 the result is a FRAME, not a stack");
+                check(m->batchId == app.images[framesOfSeq(seq).front()]->batchId,
+                      "A2 ...in the source stack's batch");
+                check(framesOfSeq(seq).size() == 3,
+                      "A2 ...and averaging did NOT close or consume the source stack");
+            }
+            if (m) {   // ---- A3: provenance, in all three places ---------------
+                const std::string fp = app.images[framesOfSeq(seq).front()]->src->path;
+                fprintf(stderr, "stackavgselftest: A3 name='%s'\n  note='%s'\n",
+                        m->name.c_str(), m->note.c_str());
+                check(m->name.find("frame average") != std::string::npos,
+                      "A3 the NAME says it is a frame average");
+                check(m->note.find("frame average of") != std::string::npos &&
+                      m->note.find("3 frame(s)") != std::string::npos,
+                      "A3 the NOTE names the stack and how many frames");
+                check(m->note.find("double") != std::string::npos,
+                      "A3 ...and says the accumulation was in double");
+                // The load-bearing one: an empty path is what keeps the session
+                // from writing an `image` line that would reload frame 0 from
+                // disk and hand it back under this name as a capture.
+                check(m->src->path.empty(),
+                      "A3 no file path: a computed frame is not a file");
+                check(m->avgOfPath == fp && !fp.empty(),
+                      "A3 ...but it records the stack it averaged, for the session");
+            }
+            if (m) {   // ---- A4: ONE averaging, shared with the stack statistic -
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                double pic = 0;
+                for (float v : m->px()) pic += v;
+                pic /= (double)m->px().size();
+                fprintf(stderr, "stackavgselftest: A4 picture mean %.9g, "
+                                "computeStackStats mean %.9g\n", pic, st.mean[0]);
+                check(st.valid && fabs(pic - st.mean[0]) < 1e-9,
+                      "A4 the picture and the Temporal table are the same number");
+            }
+        }
+
+        {   // ---- A5: a NaN is EXCLUDED and COUNTED, never folded into N -------
+            int seq = 0;
+            ImageDoc* m = averageOf(dN, &seq);
+            check(m != nullptr, "A5 the NaN stack averages");
+            if (m) {
+                // pixel 0: NaN in the middle frame only -> mean(100, 300) = 200.
+                // Folding the NaN in as 0 would give 133.33; keeping N = 3 as
+                // the divisor would give the same 133.33 - both plausible, both
+                // wrong, and both invisible without this assert.
+                // pixel 1: NaN in every frame -> no mean exists, so NaN out.
+                fprintf(stderr, "stackavgselftest: A5 px0=%.9g (want 200), px1=%.9g "
+                                "(want NaN), note='%s'\n",
+                        (double)m->px()[0], (double)m->px()[1], m->note.c_str());
+                check(m->px()[0] == 200.0f,
+                      "A5 a pixel's NaN frame leaves the OTHER frames' mean intact");
+                check(std::isnan(m->px()[1]),
+                      "A6 a pixel with no finite frame at all is NaN, not 0");
+                check(m->note.find("4 non-finite sample(s) EXCLUDED") != std::string::npos,
+                      "A6 ...and the note reports how many samples were excluded");
+                check(m->note.find("1 sample(s) had no finite frame") != std::string::npos,
+                      "A6 ...and how many have no mean at all");
+                // the stack statistic counts the same four, off the same pass
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                check(st.valid && st.nonFinite == 4 && st.unknown == 1,
+                      "A6 computeStackStats reports the identical exclusion counts");
+            }
+        }
+
+        {   // ---- A7: double accumulation, which float32 cannot do -------------
+            int seq = 0;
+            ImageDoc* m = averageOf(dP, &seq);
+            check(m != nullptr, "A7 the precision stack averages");
+            if (m) {
+                const float want = (float)((16777216.0 + 1.0 + 1.0) / 3.0);
+                float f32 = 0;                       // what a float32 accumulator
+                f32 += 16777216.0f; f32 += 1.0f; f32 += 1.0f;   // would have got
+                const float got32 = f32 / 3.0f;
+                fprintf(stderr, "stackavgselftest: A7 double %.9g, float32 %.9g, "
+                                "got %.9g\n", (double)want, (double)got32,
+                        (double)m->px()[0]);
+                check(want != got32,
+                      "A7 the fixture really does separate double from float32");
+                check(m->px()[0] == want, "A7 the mean is the DOUBLE sum's mean");
+            }
+        }
+
+        {   // ---- A8: a mosaic stays a mosaic, per plane -----------------------
+            app.forceCfa = 1; app.forceCfaPattern = 0;      // --cfa bayer, RGGB
+            int seq = 0;
+            ImageDoc* m = averageOf(dC, &seq);
+            check(m != nullptr, "A8 the CFA stack averages");
+            if (m) {
+                check(m->cfa == 1 && m->cfaPattern == 0,
+                      "A8 the CFA declaration travels to the result");
+                // The mean is per pixel, so every pixel keeps its Bayer phase
+                // and each plane's mean is that plane's own level + 10.
+                bool planesOk = true;
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++) {
+                        int p = cfaChannelAt(*m, x, y);
+                        if (m->px()[(size_t)y * W + x] != BASE[p] + 10.0f) planesOk = false;
+                    }
+                StackStats st = computeStackStats(seq, 0, 0, W, H);
+                fprintf(stderr, "stackavgselftest: A8 per-plane stack means "
+                                "%.9g %.9g %.9g %.9g (want %.9g %.9g %.9g %.9g), "
+                                "nPl=%d\n", st.mean[0], st.mean[1], st.mean[2], st.mean[3],
+                        BASE[0] + 10.0, BASE[1] + 10.0, BASE[2] + 10.0, BASE[3] + 10.0,
+                        st.nPl);
+                check(planesOk, "A8 every pixel is its OWN plane's mean - no plane mixing");
+                bool statOk = st.valid && st.nPl == 4;
+                for (int p = 0; p < 4 && statOk; p++)
+                    if (fabs(st.mean[p] - (BASE[p] + 10.0)) > 1e-6) statOk = false;
+                check(statOk, "A8 ...and the stack's per-plane statistics agree with it");
+            }
+            app.forceCfa = -1;
+        }
+
+        {   // ---- A9: a partly loaded stack NAMES its count --------------------
+            // What the memory budget leaves behind, reproduced exactly as every
+            // other consumer sees it: more frames expected than are resident.
+            // docs/terminology.md requires the ratio to be STATED, not the
+            // aggregate refused - 8 of 24 frames is a real measurement of 8.
+            int seq = 0;
+            closeAll();
+            openFolder(dA);
+            loadAll();
+            seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            if (App::SeqInfo* si = seqInfo(seq)) si->expectedFrames = 5;
+            size_t before = app.images.size();
+            requestStackAverage(seq);
+            loadAll();
+            check(app.images.size() == before + 1, "A9 the partial stack still averages");
+            if (app.images.size() == before + 1) {
+                ImageDoc* m = app.images.back().get();
+                fprintf(stderr, "stackavgselftest: A9 name='%s'\n  note='%s'\n",
+                        m->name.c_str(), m->note.c_str());
+                check(m->name.find("3 of 5") != std::string::npos,
+                      "A9 the NAME says 3 of 5, so it cannot read as 'the average'");
+                check(m->note.find("PARTLY LOADED") != std::string::npos &&
+                      m->note.find("not of all 5") != std::string::npos,
+                      "A9 ...and the note says which 3 and out of how many");
+                check(m->px()[0] == 200.0f,
+                      "A9 ...over the frames that ARE here, not a different denominator");
+            }
+        }
+
+        {   // ---- A10: through a session, as a RECIPE -------------------------
+            // The pixels cannot be saved (the format is a list of files) and the
+            // note is not a session key, so what has to survive is the
+            // derivation. What must NOT happen is the frame coming back as an
+            // ordinary image line pointing at the source file - a single capture
+            // wearing the name "frame average".
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "A10 an average to round-trip");
+            std::string sess = root + "/stackavg.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            check(txt.find("stackavg ") != std::string::npos,
+                  "A10 the session writes the recipe, not the pixels");
+            std::string lerr = loadSession(sess);      // closeAll happens inside
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int avgs = 0, captures = 0;
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images) {
+                if (!d->avgOfPath.empty()) { avgs++; back = d.get(); }
+                else if (d->seqId == 0) captures++;   // a lone frame that is not one
+            }
+            fprintf(stderr, "stackavgselftest: A10 load='%s', %d average(s), %d loose "
+                            "frame(s), %zu image(s)\n", lerr.c_str(), avgs, captures,
+                    app.images.size());
+            check(lerr.empty() && avgs == 1,
+                  "A10 exactly one frame average comes back");
+            check(captures == 0,
+                  "A10 ...and nothing came back as a loose capture in its place");
+            if (back) {
+                bool same = back->w == W && back->h == H;
+                for (float v : back->px()) if (v != 200.0f) same = false;
+                fprintf(stderr, "stackavgselftest: A10 restored note='%s'\n",
+                        back->note.c_str());
+                check(same, "A10 ...recomputed to the same 200, from the reopened stack");
+                check(back->note.find("frame average of") != std::string::npos,
+                      "A10 ...and it is saying what it came from again");
+                check(back->src->path.empty(),
+                      "A10 ...and it still has no file behind it");
+            }
+        }
+
+        closeAll();
+        std::filesystem::remove_all(pathFromUtf8(root), ec);
+        fprintf(stderr, "stackavgselftest: %s\n", ok ? "ok" : "FAILED");
+        stopRbWorker();
+        stopSequenceLoader();
+        stopRemoteFetcher();
+        stopMeasureWorker();
+        return ok ? 0 : 1;
+    }
+
     // ---- A/B statistics caches (docs/ab-stats-plan.md, section 6) -------------
     // The five statistics panels keep TWO cache slots now: 0 = A (the current
     // frame), 1 = B (the compare side). Headless, what has to hold:
@@ -26813,8 +35773,8 @@ int main(int argc, char** argv) {
     //       dangling ImageDoc* behind in it
     if (!g_abstatsSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -27269,7 +36229,7 @@ int main(int argc, char** argv) {
             abStatsFrame();
             recomputeHistogramIfNeeded(cur(), app.hist[0]);
             recomputeHistogramIfNeeded(cmpB(), app.hist[1], effBlack(*cur()), effWhite(*cur()));
-            bool freshFirst = !abHistBStale(cur(), cmpB(), app.hist[1]);
+            bool freshFirst = !abHistSideStale(cur(), cmpB(), app.hist[1]);
             float binned0 = app.hist[1].black, binned1 = app.hist[1].white;
             gotoFrame(1); gotoFrame(1);            // two switches inside 300 ms
             ImageDoc* Bp = cmpB();
@@ -27278,7 +36238,7 @@ int main(int argc, char** argv) {
             bool uidUnchanged = Bp && app.hist[1].uid == Bp->uid;
             bool rangeMoved = app.hist[1].black != effBlack(*cur()) ||
                               app.hist[1].white != effWhite(*cur());
-            bool flagged = abHistBStale(cur(), Bp, app.hist[1]);
+            bool flagged = abHistSideStale(cur(), Bp, app.hist[1]);
             fprintf(stderr, "abstatsselftest: P2c pinned B: binned on %.6g..%.6g, axis now "
                             "%.6g..%.6g, B uid unchanged=%d, stale=%d\n",
                     binned0, binned1, effBlack(*cur()), effWhite(*cur()),
@@ -27290,7 +36250,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(350));
             if (Bp && (!abStepBusy() || app.hist[1].uid == 0))
                 recomputeHistogramIfNeeded(Bp, app.hist[1], effBlack(*cur()), effWhite(*cur()));
-            check(!abHistBStale(cur(), Bp, app.hist[1]),
+            check(!abHistSideStale(cur(), Bp, app.hist[1]),
                   "P2c ...and is fresh again once the stepping stops");
             app.compareFollowFrame = saveFollow;
             app.compareRangeMode = saveShare;
@@ -27409,6 +36369,7 @@ int main(int argc, char** argv) {
         // client area for OpenGL content, and glReadPixels of a 1600x1000
         // window is not a regression test anyone will keep running.
         {
+            if (!needWindow("--abstats-selftest (the Temporal chart group)")) return 1;
             auto temporalFrame = [&](float w, float h) {
                 // two passes: the first settles the window, the second is the
                 // one whose layout is measured
@@ -27660,11 +36621,14 @@ int main(int argc, char** argv) {
         // ---- A7: the Files row's A/B item is never a dead grey line ----------
         // Reported from the shipped build: "Set as compare B" is greyed out.
         // It was greyed on exactly one row - the CURRENT one, which is the row
-        // you right-click first - and nothing said so. The rule now (user
-        // ruling, 2026-07-30): a row that is not A offers "Set as compare B"
-        // and the slot item, the simple pair; the row that IS A offers
-        // NOTHING - the swap lives on Shift+\ and the status bar, and a menu
-        // line for it was care nobody needed.
+        // you right-click first - and nothing said so. The rule now: EVERY row
+        // offers "Set as compare B" and the slot item, the current one
+        // included. That last row was still withheld until 2026-08-04, on the
+        // reasoning that it IS A; the user threw that reasoning out (「比較の際
+        // に同じものを選んだ時に，同じことを確認できる方がよい」), so setting
+        // this row as B is a supported move and the menu has to offer it.
+        // (The "Swap A and B" line that used to sit here is still gone - a
+        // different ruling, 2026-07-30, and not the one being reversed.)
         {   // A6 closed one stack; multi/ has three, so two are still open
             check(app.seqs.size() >= 2, "A7 fixture: two stacks still open");
             std::vector<int> fa, fb;
@@ -27682,19 +36646,20 @@ int main(int argc, char** argv) {
                         (int)abRowItem(app.images[fb.front()].get()));
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 another row offers Set as compare B");
-                // The current row offers NOTHING, in every mode: it is A -
-                // the cursor - and the swap that used to sit here lives on
-                // Shift+\ and the status bar (user ruling, 2026-07-30).
-                check(abRowItem(app.images[fa.front()].get()) == AbNone,
-                      "A7 compare off: the current row offers no items");
+                // The current row offers it too, in every mode: putting the
+                // document you are looking at on the B side is how you confirm
+                // two sides agree, and it used to be the one row you could not
+                // do it from.
+                check(abRowItem(app.images[fa.front()].get()) == AbSetB,
+                      "A7 compare off: the current row offers Set as compare B");
                 // ...and turning compare on changes NOTHING about another row:
                 // the user read the greying as "compare has to be armed first".
                 app.compareMode = App::CmpWipe;
                 ensureCompareB();
                 check(abRowItem(app.images[fb.front()].get()) == AbSetB,
                       "A7 compare on: another row still offers Set as compare B");
-                check(abRowItem(app.images[fa.front()].get()) == AbNone,
-                      "A7 compare on: the current row STILL offers no items (was Swap)");
+                check(abRowItem(app.images[fa.front()].get()) == AbSetB,
+                      "A7 compare on: the current row offers it here too");
                 // every other frame of A's own stack is still a legal B
                 if (fa.size() > 1)
                     check(abRowItem(app.images[fa[1]].get()) == AbSetB,
@@ -27707,8 +36672,12 @@ int main(int argc, char** argv) {
                       "A7 after the swap the old A is a Set-as-B row again");
                 // A8: B is a PIN. Walking A onto it used to swap the two, so
                 // looking at B stopped it from being B and rewrote the pin to
-                // whatever A had been. Now the comparison goes quiet while A
-                // stands on B, and B is still B when A steps away.
+                // whatever A had been. The pin holding is still the subject
+                // here - but the comparison no longer goes QUIET while A stands
+                // on it. That silence was the "kindness" the user removed on
+                // 2026-08-04: B resolves to the document A is on, both sides
+                // draw, and the panels show them coinciding. The assertion
+                // below therefore reads the opposite of what it used to.
                 {
                     uint64_t pin = app.compareBUid;
                     int bIdx = -1;
@@ -27719,15 +36688,16 @@ int main(int argc, char** argv) {
                         if (app.images[i]->uid != pin && app.images[i]->seqId != 0) { away = i; break; }
                     if (bIdx >= 0 && away >= 0) {
                         selectImage(bIdx);                 // stand on B
-                        bool kept = app.compareBUid == pin, quiet = cmpB() == nullptr;
+                        bool kept = app.compareBUid == pin;
+                        bool live = cmpB() == cur() && abStatsB() == cur();
                         selectImage(away);                 // and step off it
                         bool back = app.compareBUid == pin && cmpB() &&
                                     cmpB()->uid == pin;
                         fprintf(stderr, "abstatsselftest: A8 stand on B: pin kept=%d "
-                                        "compare quiet=%d; step away: B is back=%d\n",
-                                kept ? 1 : 0, quiet ? 1 : 0, back ? 1 : 0);
+                                        "B resolves to A=%d; step away: B is back=%d\n",
+                                kept ? 1 : 0, live ? 1 : 0, back ? 1 : 0);
                         check(kept, "A8 selecting B does not rewrite the pin");
-                        check(quiet, "A8 ...the comparison goes quiet while A stands on it");
+                        check(live, "A8 ...and A standing on it leaves a real B, not silence");
                         check(back, "A8 ...and B is still B when A steps away");
                     }
                 }
@@ -27865,23 +36835,94 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "abstatsselftest: S4 lone-frame check skipped "
                                 "(%s/rgb_u8.npy not there)\n", root.c_str());
 
-            // S5: A standing on the pinned B is a PAUSE, and the chip says so.
-            // resolveB answering null there is correct (A8) - the silence that
-            // read as 「比較を抜けてしまう」 is what has to go.
+            // S4b: the Files panel's own pinned-ancestor band
+            // (「上層の階層は常に表示」). The walk above recorded, in the
+            // list's content coordinates, where every heading starts and where
+            // the rows under it end. Scroll to the middle of a heading's span -
+            // i.e. past the heading itself, but still inside its rows - and
+            // that heading has to be drawn ABOVE the list, by name.
+            //
+            // The scroll is set rather than wheeled because the assertion is
+            // about which levels the band holds at a given offset, and a
+            // wheeled one would only ever reach whatever offset this fixture
+            // and this window size happen to allow. The SPANS are real: they
+            // come from the frame that just drew the panel, in the panel's own
+            // units, and nothing here computes them a second way.
+            //
+            // Then the other direction, which is the half a "does it draw"
+            // check would miss: back at the top there is no band at all. A
+            // heading that is on screen anyway must not also be held above
+            // itself.
+            {
+                // ONE pass per offset, deliberately: the list writes its own
+                // scroll back into g_filesScrollY on its way out, so a second
+                // pass would draw the band at the offset the probe window
+                // really is at (zero) rather than the one being asked about.
+                auto bandAt = [&](float y) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(420.0f, 600.0f), ImGuiCond_Always);
+                    ImGui::Begin("FilesProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    g_filesScrollY = y;
+                    drawFileList();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                    return g_filesPinProbe;
+                };
+                const FilesSpan* deepest = nullptr;
+                for (const auto& s : g_filesSpans)
+                    if (s.y1 - s.hy > 1.0f && (!deepest || s.y0 > deepest->y0)) deepest = &s;
+                std::string want, got;
+                float at = 0;
+                if (deepest) {
+                    for (const auto& b : app.batches)
+                        if (b.id == deepest->batch && deepest->series == 0) want = b.name + ";";
+                    for (const auto& s : app.series)
+                        if (s.id == deepest->series) want = s.name + ";";
+                    at = (deepest->hy + deepest->y1) * 0.5f;
+                    got = bandAt(at);
+                }
+                fprintf(stderr, "abstatsselftest: S4b files band at scroll %.0f "
+                                "holds '%s'  want '%s'\n", at, got.c_str(), want.c_str());
+                check(deepest && !want.empty() && got.find(want) != std::string::npos,
+                      "S4b a heading the list has scrolled past is drawn above it");
+                std::string top = bandAt(0.0f);
+                fprintf(stderr, "abstatsselftest: S4b files band at the top holds '%s'\n",
+                        top.c_str());
+                check(top.empty(),
+                      "S4b nothing is pinned while the list is at the top");
+            }
+
+            // S5: A standing on the pinned B is an ORDINARY comparison, and
+            // the chip names the pair like any other. It used to be a PAUSE,
+            // announced as "A = B (paused)" - the sentence that existed only to
+            // explain why every panel had gone quiet. Nothing goes quiet now
+            // (2026-08-04: 「こういうの全般不要です」), so there is nothing to
+            // explain, and the chip must not have a second vocabulary for it:
+            // the reading BEFORE and AFTER stepping off is the same sentence.
             app.cmpExtra.clear();
             app.compareMode = App::CmpWipe;
             selectImage(f0[0]);
             setCompareB(cur());                  // Shift+B's path: pin THIS frame
             std::string chip = abStatusChipText();
             fprintf(stderr, "abstatsselftest: S5 chip while A==B: '%s'\n", chip.c_str());
-            check(chip.find("A = B") != std::string::npos &&
-                  chip.find("paused") != std::string::npos,
-                  "S5 standing on the pinned B says paused, not 'no B image'");
-            selectImage(f0[1]);                  // step off: the pair resumes
+            check(chip.find("B:") != std::string::npos,
+                  "S5 A standing on the pinned B still names B in the chip");
+            check(chip.find("paused") == std::string::npos &&
+                  chip.find("no B image") == std::string::npos,
+                  "S5 ...with no 'paused' or 'no B image' vocabulary left");
+            check(cmpB() == cur() && abStatsB() == cur(),
+                  "S5 ...and the panels get a B: the same document A is on");
+            selectImage(f0[1]);                  // step off: the pair is unchanged
             chip = abStatusChipText();
             fprintf(stderr, "abstatsselftest: S5 chip after stepping off: '%s'\n", chip.c_str());
             check(chip.find("B:") != std::string::npos,
-                  "S5 ...and stepping off resumes the pair");
+                  "S5 ...and stepping off changes nothing about the chip's shape");
 
             // S6: ESC steps outward one claim per press, and the Files letters
             // are SEATS: full ink while a comparison runs, visible but dimmed
@@ -27914,6 +36955,7 @@ int main(int argc, char** argv) {
                 // ESC with an ROI selected AND compare on: the first press
                 // releases the ROI and ONLY that - one press, one step.
                 app.selectedAnn = 4242;               // white-box: a selected ROI
+                g_escProbe.clear(); g_escProbeN = 0;  // the chain starts here
                 EscTook took = escapePressed();
                 check(took == EscTook::RoiDeselected && app.selectedAnn == 0 &&
                       app.compareMode == App::CmpWipe,
@@ -27927,6 +36969,13 @@ int main(int argc, char** argv) {
                       "S6 ...keeping the B pin and the slot letters (seats survive)");
                 check(escapePressed() == EscTook::Nothing,
                       "S6 a third ESC has nothing left to take");
+                // ...and the three presses as ONE record, which is the form the
+                // rule is written in: each press took exactly one step and they
+                // came in that order. Three separate return values cannot say
+                // "and nothing else happened in between" (E7).
+                fprintf(stderr, "abstatsselftest: S6 esc chain: '%s'\n", g_escProbe.c_str());
+                check(g_escProbe == "roi;compare;nothing;" && g_escProbeN == 3,
+                      "S6 the three presses read as one chain, one step each");
                 // compare OFF: the seats stay visible, dimmed ("armed, not
                 // active"); A is not a seat and is gone entirely
                 filesFrame();
@@ -27954,6 +37003,261 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- N: the panel says something about EVERY slot it holds -----------
+        // The defect (issue #60): with C, D, E armed the Statistics/Histogram
+        // panel drew A and B and said nothing whatever about the rest. The
+        // assertion therefore has to be about what the panel SAYS, not about
+        // what the cache holds - a cache full of correct numbers nobody prints
+        // is precisely the bug. g_histSideProbe records the letters the panel
+        // put on screen: a row in the table, a curve on the plot, or a named
+        // omission under it. The invariant every case below re-checks is that
+        // those last two ACCOUNT FOR the first. A letter with a row and no
+        // curve and no mention is the defect, restated as an equation.
+        {
+            check(app.seqs.size() >= 2, "N fixture: two stacks are open");
+            int sid0 = app.seqs[0].id, sid1 = app.seqs[1].id;
+            std::vector<int> f0 = framesOfSeq(sid0), f1 = framesOfSeq(sid1);
+            check(f0.size() >= 4 && f1.size() >= 4, "N fixture: four frames each");
+            // follow OFF: a pin then stays on the frame it was put on, so the
+            // slots are N DISTINCT documents and the count under test is the
+            // slot count. (Following is S1's subject, not this group's.)
+            app.compareFollowFrame = false;
+            app.compareMode = App::CmpWipe;
+            app.abStepBusyUntil = 0;
+            app.cmpExtra.clear();
+            app.histPlane = 0;          // ONE plane on the axis: the overlay case
+            selectImage(f0[0]);
+            setCompareB(app.images[f1[0]].get());
+            addCompareSlot(app.images[f0[1]].get());     // C
+            addCompareSlot(app.images[f0[2]].get());     // D
+            check(cmpB() != nullptr && app.cmpExtra.size() == 2,
+                  "N fixture: B plus slots C and D are armed");
+
+            auto histFrame = [&]() {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
+                    ImGui::Begin("HistProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawPanelHistogram();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            // "rows=", "curves=" and "said-no-curve=" as letter sets, read back
+            // out of the probe the panel wrote
+            auto field = [](const std::string& probe, const char* key) {
+                size_t k = probe.find(key);
+                if (k == std::string::npos) return std::string();
+                k += strlen(key);
+                size_t e = probe.find(';', k);
+                return probe.substr(k, e == std::string::npos ? e : e - k);
+            };
+            auto rowsOf = [](const std::string& probe) {
+                std::string out;
+                for (size_t k = probe.find("row"); k != std::string::npos;
+                     k = probe.find("row", k + 1))
+                    if (k + 3 < probe.size() && probe[k + 4] == ';') out += probe[k + 3];
+                return out;
+            };
+            // the one sentence this group exists for, asked the same way of
+            // every layout below: is there a letter the panel gave numbers to
+            // and then neither drew nor mentioned?
+            auto accountedFor = [&](const std::string& probe, std::string& unsaidOut) {
+                std::string rows = rowsOf(probe);
+                std::string said = field(probe, "curves=") + field(probe, "said-no-curve=");
+                unsaidOut.clear();
+                for (char c : rows)
+                    if (said.find(c) == std::string::npos) unsaidOut += c;
+                return unsaidOut.empty();
+            };
+
+            // N1: four sides armed, four sides named. This is the assert that
+            // fails against every build before this change: the table stopped
+            // at B because hist[] did.
+            app.abStatsLayout = App::AbOverlay;
+            histFrame();
+            std::string pOver = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N1 overlay probe '%s'\n", pOver.c_str());
+            check(rowsOf(pOver) == "ABCD",
+                  "N1 the statistics table gives A, B, C and D a row each");
+            check(field(pOver, "curves=") == "ABCD",
+                  "N1 ...and one plane on the axis puts all four on the plot");
+            std::string unsaid;
+            check(accountedFor(pOver, unsaid),
+                  "N1 every slot with numbers is drawn or named");
+
+            // N2: the plot cannot take four when four PLANES are on the axis
+            // (four planes times four slots is sixteen curves). It must then
+            // NAME the ones it left off - the table keeps all four either way.
+            app.histPlane = -1;
+            bool multiPlane = app.hist[0].nSeries > 1;
+            histFrame();
+            std::string pAll = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N2 all-planes probe '%s' (nSeries=%d)\n",
+                    pAll.c_str(), app.hist[0].nSeries);
+            check(rowsOf(pAll) == "ABCD",
+                  "N2 the table still holds all four with every plane on the axis");
+            check(accountedFor(pAll, unsaid),
+                  "N2 ...and nothing is dropped in silence");
+            if (multiPlane)
+                check(field(pAll, "said-no-curve=") == "CD",
+                      "N2 ...the slots come off the plot BY NAME, not quietly");
+            else
+                fprintf(stderr, "abstatsselftest: N2 single-plane fixture - the "
+                                "plane limit is not reachable here, invariant only\n");
+            app.histPlane = 0;
+
+            // N3: side by side has two halves, so it holds two sides. The other
+            // two are not on any plot and the panel has to say so.
+            app.abStatsLayout = App::AbSide;
+            histFrame();
+            std::string pSide = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N3 side-by-side probe '%s'\n", pSide.c_str());
+            check(rowsOf(pSide) == "ABCD",
+                  "N3 side by side keeps every slot in the table");
+            check(field(pSide, "curves=") == "AB" &&
+                  field(pSide, "said-no-curve=") == "CD",
+                  "N3 ...and names the two it has no half for");
+            check(accountedFor(pSide, unsaid),
+                  "N3 every slot with numbers is drawn or named");
+            app.abStatsLayout = App::AbOverlay;
+
+            // N4: past the palette. slotInk tells slotInkCount() slots apart
+            // and then its modulo hands slot H back A's green - two slots in
+            // one colour is the same omission wearing a different hat, so the
+            // plot stops at the palette and says which letters it stopped at.
+            {
+                std::vector<ImU32> ink;
+                for (size_t i = 0; i < slotInkCount(); i++) ink.push_back(slotInk(i));
+                std::sort(ink.begin(), ink.end());
+                check(std::adjacent_find(ink.begin(), ink.end()) == ink.end(),
+                      "N4 the palette's own colours are all different");
+            }
+            size_t want = slotInkCount() + 2;     // two more sides than inks
+            for (size_t k = 3; k < f0.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f0[k]].get());
+            for (size_t k = 1; k < f1.size() && app.cmpExtra.size() + 2 < want; k++)
+                addCompareSlot(app.images[f1[k]].get());
+            size_t nSides = app.cmpExtra.size() + 2;
+            if (nSides > slotInkCount()) {
+                histFrame();
+                std::string pMany = g_histSideProbe;
+                fprintf(stderr, "abstatsselftest: N4 %zu sides, %zu inks: '%s'\n",
+                        nSides, slotInkCount(), pMany.c_str());
+                check(rowsOf(pMany).size() == nSides,
+                      "N4 every armed slot has a row, however many there are");
+                check(field(pMany, "curves=").size() == slotInkCount(),
+                      "N4 the plot draws exactly as many as it has colours for");
+                check(field(pMany, "said-no-curve=").size() == nSides - slotInkCount(),
+                      "N4 ...and names every one it could not colour");
+                check(accountedFor(pMany, unsaid),
+                      "N4 no slot is left with numbers and no word about it");
+            } else {
+                fprintf(stderr, "abstatsselftest: N4 skipped - only %zu images to "
+                                "arm, need more than %zu\n", nSides, slotInkCount());
+            }
+            if (!unsaid.empty())
+                fprintf(stderr, "abstatsselftest: N slots with a row and no word: '%s'\n",
+                        unsaid.c_str());
+
+            // N5: the ARMING path - the missing precondition of everything
+            // above. N1-N4 arm their slots by calling addCompareSlot directly,
+            // so they prove the panels can HANDLE N sides and prove nothing
+            // about whether a user can PRODUCE them: the equation
+            // rows ⊆ curves ∪ said-no-curve holds over the empty set, which is
+            // exactly how "histogram とか projection が3個以上にならん" (issue
+            // #60) shipped under a green suite. So walk the path a user walks:
+            // the Files row menu offers what slotRowItem answers (the menu
+            // builds its items from it and nothing else), and clicking the item
+            // fires addCompareSlot. A menu item cannot be scripted (the
+            // browse-keys precedent), so the offer is asserted at the gate and
+            // the click's action is fired directly - the same one line the
+            // MenuItem runs.
+            {
+                app.cmpExtra.clear();
+                selectImage(f0[0]);
+                setCompareB(app.images[f1[0]].get());
+                app.abStepBusyUntil = 0;   // selectImage arms the step throttle
+                std::string L;
+                check(slotRowItem(app.images[f0[1]].get(), L) == SlotRowAdd && L == "C",
+                      "N5 a free row is offered 'Add as compare slot C'");
+                addCompareSlot(app.images[f0[1]].get());        // the item's click
+                check(slotRowItem(app.images[f0[1]].get(), L) == SlotRowRemove && L == "C",
+                      "N5 ...and afterwards the same row offers the remove, by letter");
+                check(slotRowItem(app.images[f1[0]].get(), L) == SlotRowNone,
+                      "N5 the pinned B's row is offered no slot: one image, one letter");
+                check(slotRowItem(app.images[f0[2]].get(), L) == SlotRowAdd && L == "D",
+                      "N5 the next free row is offered D, not C again");
+                addCompareSlot(app.images[f0[2]].get());
+                check(slotRowItem(app.images[f1[1]].get(), L) == SlotRowAdd && L == "E",
+                      "N5 ...and the one after that E");
+                addCompareSlot(app.images[f1[1]].get());
+                check(app.cmpExtra.size() == 3,
+                      "N5 three slots armed through the entry path");
+                histFrame();
+                std::string pArm = g_histSideProbe;
+                fprintf(stderr, "abstatsselftest: N5 armed-path probe '%s'\n",
+                        pArm.c_str());
+                check(rowsOf(pArm) == "ABCDE",
+                      "N5 all five sides appear as rows - the third slot exists on screen");
+                check(field(pArm, "curves=") == "ABCDE",
+                      "N5 ...and one plane on the axis draws every one of them");
+                check(accountedFor(pArm, unsaid),
+                      "N5 every armed slot is drawn or named");
+            }
+
+            // N6: the same equation over the PROJECTION panel, which had no
+            // probe at all - the panel issue #60 actually caught. Its table
+            // went N wide (75e5369) while its plots still draw only A and B,
+            // and nothing on screen said so: rows had letters that were in
+            // neither curves nor any sentence. The plots keeping to A|B is the
+            // pinned CURRENT limit, spoken on screen since this change; when
+            // the N overlay lands (compare-n.md §12) the curves assert below
+            // moves to ABCDE and said-no-curve empties.
+            {
+                auto projFrame = [&]() {
+                    for (int pass = 0; pass < 2; pass++) {
+                        ImGui_ImplOpenGL3_NewFrame();
+                        ImGui_ImplGlfw_NewFrame();
+                        ImGui::NewFrame();
+                        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                        ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
+                        ImGui::Begin("ProjProbe", nullptr,
+                                     ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_NoTitleBar |
+                                     ImGuiWindowFlags_NoDocking);
+                        drawPanelProjection();
+                        ImGui::End();
+                        ImGui::EndFrame();
+                    }
+                };
+                check(app.cmpExtra.size() == 3, "N6 fixture: N5 left C, D, E armed");
+                projFrame();
+                std::string pProj = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N6 projection probe '%s'\n",
+                        pProj.c_str());
+                check(rowsOf(pProj) == "ABCDE",
+                      "N6 the projection table gives every armed side a row");
+                check(field(pProj, "curves=") == "AB",
+                      "N6 the profile plots hold A and B - today's limit, pinned");
+                check(field(pProj, "said-no-curve=") == "CDE",
+                      "N6 ...and the letters off the plots are named on screen");
+                check(accountedFor(pProj, unsaid),
+                      "N6 no slot has numbers and no word about it");
+            }
+
+            app.cmpExtra.clear();
+            app.compareFollowFrame = true;
+            app.abStatsLayout = App::AbAuto;
+            app.histPlane = -1;
+        }
+
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
@@ -27973,8 +37277,8 @@ int main(int argc, char** argv) {
     // and concludes the wrong thing.
     if (!g_tileSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -28019,12 +37323,22 @@ int main(int argc, char** argv) {
         check(sl.size() == 4 && sl[0].doc == cur() && sl[1].doc == cmpB() &&
               sl[2].doc == ex[0] && sl[3].doc == ex[1],
               "T1 the documents are in slot order too");
-        {   // no image may hold two panes: a thing compared with itself is not one
-            bool dup = false;
+        {   // One pane per LETTER. Four distinct documents are armed here, so
+            // four distinct documents is what must come out - but the reason is
+            // that the SEATS are distinct, not that an image may never appear
+            // twice. Two letters resolving onto one document (A walked onto a
+            // slot, or follow-frame landing both on one sibling) now get a pane
+            // each, deliberately: side by side is where you see them coincide.
+            bool dupTag = false;
             for (size_t i = 0; i < sl.size(); i++)
                 for (size_t j = i + 1; j < sl.size(); j++)
-                    if (sl[i].doc == sl[j].doc) dup = true;
-            check(!dup, "T1 no image occupies two panes");
+                    if (sl[i].tag == sl[j].tag) dupTag = true;
+            check(!dupTag, "T1 no letter occupies two panes");
+            bool dupDoc = false;
+            for (size_t i = 0; i < sl.size(); i++)
+                for (size_t j = i + 1; j < sl.size(); j++)
+                    if (sl[i].doc == sl[j].doc) dupDoc = true;
+            check(!dupDoc, "T1 four distinct seats give four distinct documents");
         }
 
         // ---- T2: which modes tile, and which four must not -------------------
@@ -28385,6 +37699,7 @@ int main(int argc, char** argv) {
             setCompareB(tb);
             addCompareSlot(tc);
             app.compareMode = App::CmpSplit;
+            if (!needWindow("--tile-selftest (T12, the canvas probe)")) return 1;
             auto canvasFrame = [&](float w, float h) {
                 for (int pass = 0; pass < 2; pass++) {
                     ImGui_ImplOpenGL3_NewFrame();
@@ -28439,6 +37754,54 @@ int main(int argc, char** argv) {
             check(aline2 != ta->name &&
                   (aline2.empty() || aline2.compare(0, 3, "...") == 0),
                   "T12 narrow: the name elides from the front or drops, never overflows");
+
+            // ---- T13: the footer strip, through the same real frames --------
+            // docs/verify-ui.md E3. Everything here goes straight to AddText
+            // and was kept nowhere, so the whole strip was untestable and the
+            // row had to be moved out of the A section. g_footerProbe records
+            // the strings as drawn, and these are the claims about them.
+            app.compareMode = App::CmpOff;
+            float saveZoom = app.view.zoom;
+            app.view.zoom = 1.0f;
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T13 footer at zoom 1: '%s'\n",
+                    g_footerProbe.c_str());
+            // (a) the two-line identity leads with the CONTEXT - the batch, and
+            // the series when there is one. Same rule the pane badges follow.
+            check(g_footerProbe.find("ctx=" + batchNameOf(cur()) + ";") != std::string::npos,
+                  "T13 the footer's context line names the batch");
+            check(g_footerProbe.find("zoom=zoom 100%;") != std::string::npos,
+                  "T13 zoom 1 reads as 'zoom 100%'");
+            // (b) a magnification below the whole-percent threshold must still
+            // name a magnification. %.0f would print "zoom 0%" here, and 0% is
+            // not small - it is nothing, which is a different claim about the
+            // pixels on screen. This is the reason the readout has two formats
+            // and the only check that can tell them apart.
+            app.view.zoom = 0.005f;
+            canvasFrame(1720.0f, 980.0f);
+            fprintf(stderr, "tileselftest: T13 footer at zoom 0.005: '%s'\n",
+                    g_footerProbe.c_str());
+            check(g_footerProbe.find("zoom=zoom 0.5%;") != std::string::npos &&
+                  g_footerProbe.find("zoom 0%") == std::string::npos,
+                  "T13 a sub-percent zoom says 0.5%, never 0%");
+            app.view.zoom = saveZoom;
+            // (c) a partially loaded stack says n of N (docs/terminology.md).
+            // The counter had no reader at all, so the rule was carried only by
+            // the comment beside it; expectedFrames is forced here the way a
+            // stack still loading would have it.
+            if (App::SeqInfo* t13s = cur() ? seqInfo(cur()->seqId) : nullptr) {
+                int saveExp = t13s->expectedFrames;
+                int resident = (int)framesOfSeq(t13s->id).size();
+                t13s->expectedFrames = resident + 4;
+                canvasFrame(1720.0f, 980.0f);
+                fprintf(stderr, "tileselftest: T13 footer, %d of %d resident: '%s'\n",
+                        resident, t13s->expectedFrames, g_footerProbe.c_str());
+                check(g_footerProbe.find("count=1/" + std::to_string(resident) +
+                                         " of " + std::to_string(resident + 4) + ";")
+                      != std::string::npos,
+                      "T13 a part-loaded stack's counter says n of N, not n of n");
+                t13s->expectedFrames = saveExp;
+            }
             app.compareMode = App::CmpSplit;
             app.compareFollowFrame = saveFollow;
         }
@@ -28455,9 +37818,9 @@ int main(int argc, char** argv) {
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
         startRemote(rbMain(), "local://" + dir);
-        double t0 = glfwGetTime();
+        double t0 = nowSec();
         bool scanSent = false;
-        while (glfwGetTime() - t0 < 120.0) {
+        while (nowSec() - t0 < 120.0) {
             pumpRemoteBrowse();
             pumpRemoteFetch();
             pumpRemoteOpenQueue();
@@ -28497,8 +37860,8 @@ int main(int argc, char** argv) {
         std::replace(dir.begin(), dir.end(), '\\', '/');
         app.seqLoadMode = 1;
         openFolder(dir);
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 300.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 300.0) {
             if (app.folderPickOpen && !app.folderPickRemote) {
                 std::vector<App::PendingGroup> sel;
                 for (auto& e : app.folderPick) sel.push_back(std::move(e.g));
@@ -28613,13 +37976,33 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // Switching TO "auto per frame" must re-fit the frame on screen. The
+        // policy is applied in selectImage, which only runs on a frame change,
+        // so the mode used to look dead until the first step ("選んだ直後は
+        // 画像がかわらず、コマ送りすると反映される").
+        {
+            app.linkRange = false;
+            app.rangeScope = 1;                       // per stack
+            selectImage(fa[1]);                       // a frame that inherited
+            ImageDoc* d = cur();
+            d->black = d->vmin - 1000; d->white = d->vmax + 1000;   // clearly not its own fit
+            float wasB = d->black, wasW = d->white;
+            applyRangeMode(0, d);              // exactly what the combo calls
+            bool refit = d->black != wasB || d->white != wasW;
+            fprintf(stderr, "rangeselftest: auto-per-frame applied on the spot: "
+                            "%.6g..%.6g -> %.6g..%.6g (frame data %.6g..%.6g) %s\n",
+                    wasB, wasW, d->black, d->white, d->vmin, d->vmax,
+                    refit ? "ok" : "WRONG");
+            if (!refit) bad++;
+            app.rangeScope = 1;
+        }
         fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
         if (app.seqThread.joinable()) app.seqThread.join();
         return bad ? 1 : 0;
     }
 
     // The Temporal panel's unified export, verifiable without a human
-    // (docs/export-design.md 8). This machine cannot screenshot GL, so the
+    // (docs/export-design.md 9 「検証」). This machine cannot screenshot GL, so the
     // assertions are on the STRING the buttons put on the clipboard: the
     // provenance fields, the section order, the per-plane rows, the units,
     // n-of-N honesty, the region statements (including the temporal-vs-profile
@@ -28629,8 +38012,8 @@ int main(int argc, char** argv) {
     // chart draws from, the export column and the session round-trip.
     if (!g_exportTsvSelftest.empty()) {
         auto loadAll = [&]() {
-            double t0 = glfwGetTime();
-            while (glfwGetTime() - t0 < 300.0) {
+            double t0 = nowSec();
+            while (nowSec() - t0 < 300.0) {
                 if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
                 pumpSequenceAndQueue();
                 if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -28905,8 +38288,8 @@ int main(int argc, char** argv) {
             saveSession(sess, true);
             std::string lerr = loadSession(sess);
             loadAll();
-            double tn = glfwGetTime();
-            while (glfwGetTime() - tn < 60.0 &&
+            double tn = nowSec();
+            while (nowSec() - tn < 60.0 &&
                    (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
                 pumpSequenceAndQueue();
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -29275,6 +38658,7 @@ int main(int argc, char** argv) {
 
         // ---- F11: the panel section itself, through real ImGui frames ------
         {
+            if (!needWindow("--frame-lin-selftest (F11, the panel section)")) return 1;
             auto temporalFrame = [&](float w, float h) {
                 for (int pass = 0; pass < 2; pass++) {
                     ImGui_ImplOpenGL3_NewFrame();
@@ -29334,8 +38718,8 @@ int main(int argc, char** argv) {
     // the command line, run the exact clipboard path, print the TSV to stdout.
     // An independent numpy implementation must reproduce every number.
     if (g_fstatSelftest) {
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 600.0) {
+        double t0 = nowSec();
+        while (nowSec() - t0 < 600.0) {
             if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();   // headless accept
             pumpSequenceAndQueue();
             if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
@@ -29355,8 +38739,8 @@ int main(int argc, char** argv) {
     // numbers. A synthetic set with a known sensitivity and a known gain has to
     // come back out of this, or the panel is showing decoration.
     if (g_linSelftest) {
-        double t0 = glfwGetTime();
-        while (glfwGetTime() - t0 < 600.0) {       // wall clock: the loader is a thread
+        double t0 = nowSec();
+        while (nowSec() - t0 < 600.0) {       // wall clock: the loader is a thread
             // headless "Load selected": Open Folder ALWAYS shows the picker,
             // so a selftest accepts it the way the Load button would
             if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
@@ -29498,6 +38882,19 @@ int main(int argc, char** argv) {
         return (fitOk && snrOk) ? 0 : 1;
     }
 
+    // Everything past this point draws. Every selftest that can run windowless
+    // has returned above, so reaching here with no window means either
+    // --no-window on a test that needs one (say so, by name) or --no-window on
+    // a normal start, which is a window the user asked for and cannot have.
+    if (!g_haveWindow) {
+        if (!g_browseKeys.empty()) needWindow("--browse-keys-selftest");
+        else if (benchFrames)      needWindow("--bench");
+        else fprintf(stderr, "--no-window: there is nothing to run without a "
+                             "window - it exists for the selftests that never "
+                             "draw, and none was asked for.\n");
+        return 1;
+    }
+
     // --browse-keys-selftest: connect the local peer and open the panel; the
     // action list is replayed inside the loop, below.
     std::vector<std::string> keyActs;
@@ -29512,13 +38909,16 @@ int main(int argc, char** argv) {
         startRemote(rbMain(), "local://" + d);
         app.showRemote = true;
         // Scripted row indices assume the DEFAULT view: the user's real prefs
-        // must not leak a flat/tree/advanced state into what "down,down,down"
-        // lands on. With rbtree left on, a click+double-click pair on a folder
-        // row expanded it in place and its children took over the row indices
+        // must not leak a flat/tree state into what "down,down,down" lands on.
+        // With rbtree left on, a click+double-click pair on a folder row
+        // expanded it in place and its children took over the row indices
         // every later action was aimed at - reproduced, two hours of forensics.
         rbMain().flat = app.rbFlat = false;
         rbMain().tree = app.rbTree = false;
-        rbMain().advanced = app.rbAdvanced = false;
+        // ...and the same for the NAME ORDER, for the same reason: with
+        // rbnatural off in the developer's prefs, rb/unpadded lists lv1, lv10,
+        // lv2 and every chkatrow below it is aimed at the wrong row.
+        rbMain().nameNatural = app.rbNatural = true;
         // Key REPEAT is a human affordance; for injected keys it is a race.
         // Each scripted press is held for ~one frame, but a trickle-delayed
         // release across a slow frame (texture uploads after a stack lands)
@@ -29549,7 +38949,7 @@ int main(int argc, char** argv) {
         app.showHistogram = app.showTemporal = app.showProjection = false;
         app.showLinearity = false;
     }
-    double lastFrameEnd = glfwGetTime();
+    double lastFrameEnd = nowSec();
     // The frame body lives in a callable so it can also run from the window
     // refresh/size callbacks. Win32 runs a MODAL message loop while the user
     // drags a window edge: DispatchMessage never returns until the drag ends, so
@@ -29557,7 +38957,7 @@ int main(int argc, char** argv) {
     // whole resize. GLFW 3.4 sets no timer there, so the repaint has to come from
     // inside the callback.
     g_drawFrame = [&]() {
-        double frameBodyT0 = glfwGetTime();
+        double frameBodyT0 = nowSec();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         if (g_injMouse.x >= 0) {            // see g_injMouse: after the backend
@@ -29583,11 +38983,7 @@ int main(int argc, char** argv) {
 
         // shortcuts
         pollFileDialog();
-#if defined(__APPLE__)
-        const ImGuiKeyChord MODK = ImGuiMod_Super;    // Cmd on macOS
-#else
-        const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
-#endif
+        pollReader();          // a running reader, and what it has printed so far
         // modals (RAW dialog etc.) own the keyboard: no global shortcuts underneath —
         // Ctrl+W during reinterpret would shift the replaceIdx target image
         bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
@@ -29600,8 +38996,15 @@ int main(int argc, char** argv) {
         bool remoteFocused = nav && nav->RootWindow &&
                              rbIsBrowseWindowName(nav->RootWindow->Name);
         if (!io.WantTextInput && !popupOpen) {
+            // Cmd/Ctrl+O means "open what is selected" (2026-08-03, user), the
+            // way it does on macOS - not "show me a file dialog". Inside Browse
+            // it rides with Enter, where the selection is. Outside it, there is
+            // no selection to open, so it goes to the place where there would
+            // be one rather than doing nothing at all.
+            if (!remoteFocused && ImGui::IsKeyChordPressed(MODK | ImGuiKey_O))
+                rbShowInstance(rbActive());
+            // Open Folder keeps its chord: nothing else claims it.
             if (ImGui::IsKeyChordPressed(MODK | ImGuiMod_Shift | ImGuiKey_O)) openFolderDialog();
-            else if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_O)) openFileDialog();
             if (ImGui::IsKeyChordPressed(MODK | ImGuiKey_W)) closeCurrent();
             // the layer variants (docs/terminology.md): frame-only escape hatch
             // and whole-batch close
@@ -29655,7 +39058,7 @@ int main(int argc, char** argv) {
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) fr = std::clamp(fr - 0.01f, 0.03f, 0.97f);
                 if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) fr = std::clamp(fr + 0.01f, 0.03f, 0.97f);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_O, false)) openFileDialog();
+            // bare O is not bound either - same reasoning as the chord above
             if (ImGui::IsKeyPressed(ImGuiKey_H, false)) app.showHelp = !app.showHelp;
             // M = measure again: rerun the selected analyzer on the current
             // image and ROI set, and bring the Analysis panel forward. This is
@@ -29728,6 +39131,8 @@ int main(int argc, char** argv) {
         drawMenuBar(win);
         // before any panel draws: the B cache slots exist only while compare does
         abStatsFrame();
+        // ...and before any panel draws, because it closes documents (§3.3)
+        pumpReRead();
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -29759,9 +39164,18 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Inspector", right);
             // tab order = dock order; Projection leads, and the explicit
             // focus below makes it the SELECTED tab, not merely the leftmost
-            ImGui::DockBuilderDockWindow("Projection", bottom);
-            ImGui::DockBuilderDockWindow("Histogram", bottom);
-            ImGui::DockBuilderDockWindow("Temporal", bottom);
+            if (benchPanels) {          // --bench-panels: all three at once
+                ImGuiID bp1 = bottom, bp2, bp3;
+                bp2 = ImGui::DockBuilderSplitNode(bp1, ImGuiDir_Right, 0.66f, nullptr, &bp1);
+                bp3 = ImGui::DockBuilderSplitNode(bp2, ImGuiDir_Right, 0.50f, nullptr, &bp2);
+                ImGui::DockBuilderDockWindow("Projection", bp1);
+                ImGui::DockBuilderDockWindow("Histogram", bp2);
+                ImGui::DockBuilderDockWindow("Temporal", bp3);
+            } else {
+                ImGui::DockBuilderDockWindow("Projection", bottom);
+                ImGui::DockBuilderDockWindow("Histogram", bottom);
+                ImGui::DockBuilderDockWindow("Temporal", bottom);
+            }
             ImGui::DockBuilderFinish(dockId);
             ImGui::SetWindowFocus("Projection");
             // ROIs and Analysis stay floating (they follow the work, not the frame)
@@ -29807,12 +39221,27 @@ int main(int argc, char** argv) {
                     ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
                     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
                                             ImGuiCond_Always);
-                    ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
+                    ImGui::SetNextWindowSize(ImVec2(g_rbForceW,
+                                                    g_rbForceH > 0 ? g_rbForceH
+                                                                   : vp->WorkSize.y * 0.8f),
                                              ImGuiCond_Always);
                 }
                 if (!primordial)
                     ImGui::SetNextWindowSize(ImVec2(420 * uiScale, 520 * uiScale),
                                              ImGuiCond_FirstUseEver);
+                // The title names the machine (10.3). Recomputed here, every
+                // frame, because connecting and disconnecting change it - and
+                // only the part BEFORE ### changes, so ImGui's identity (and
+                // with it the docking, the layout file and the session) is
+                // exactly what it was when the title was a fixed string.
+                I.wtitle = rbPanelTitle(I.num, I.b.connected ? I.b.host : std::string());
+                // "+" asked for this one to land beside the panel it came from.
+                // Once only: after the first frame the panel is wherever the
+                // user dragged it, and the layout file owns that.
+                if (I.dockInto) {
+                    ImGui::SetNextWindowDockID((ImGuiID)I.dockInto, ImGuiCond_Always);
+                    I.dockInto = 0;
+                }
                 if (ImGui::Begin(I.wtitle.c_str(), &show)) drawPanelRemote(I);
                 ImGui::End();
                 if (!show && !primordial) destroyNum = I.num;
@@ -30108,6 +39537,9 @@ int main(int argc, char** argv) {
         drawSeriesModal();
         drawDeriveModal();
         drawFolderPickModal();
+        drawNpzPickModal();
+        drawReaderPanel();
+        drawReaderList();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
         drawHelpAbout();
@@ -30138,10 +39570,26 @@ int main(int argc, char** argv) {
         //   - an ACTIVE item gets the key first, so Escape in the "New batch"
         //     field inside Move to batch reverts the text instead of throwing
         //     the whole menu away.
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive() &&
-            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
-                                        ImGuiPopupFlags_AnyPopupLevel))
-            ImGui::ClosePopupsExceptModals();
+        {
+            bool escNow = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+            bool anyPopup = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                                        ImGuiPopupFlags_AnyPopupLevel);
+            if (escNow && !ImGui::IsAnyItemActive() && anyPopup) {
+                ImGui::ClosePopupsExceptModals();
+                escProbeNote("popup");                  // step 1
+            } else if (escNow && io.WantTextInput) {
+                // Step 2, and it is ImGui that performs it: an active text item
+                // reverts its own edit. Both steps below are gated on this same
+                // flag, so nothing else has run - which is exactly the claim
+                // that had nowhere to be written down (E7).
+                escProbeNote("textedit");
+            } else if (escNow && g_escProbeFrame != ImGui::GetFrameCount()) {
+                // The press reached no layer at all (a modifier held, say). It
+                // still gets an entry: a chain that silently drops presses
+                // cannot be read as a chain.
+                escProbeNote("unclaimed");
+            }
+        }
         // after every panel has had its say about the mouse: drag, resize and
         // the cursor shape along the window edges
         window_frame::endFrame();
@@ -30156,20 +39604,52 @@ int main(int argc, char** argv) {
         // Split the frame: our drawing versus getting it onto the screen. Over a
         // remote display the second number is the whole story (a full window per
         // frame across the link), and no amount of work on our side moves it.
-        double swapT0 = glfwGetTime();
+        double swapT0 = nowSec();
         glfwSwapBuffers(win);
-        app.swapMs = (float)((glfwGetTime() - swapT0) * 1000.0);
+        app.swapMs = (float)((nowSec() - swapT0) * 1000.0);
         app.cpuMs = (float)((swapT0 - frameBodyT0) * 1000.0);
         if (g_lastInputAt != 0) {      // this frame answered an input: how late was it?
-            float ms = (float)((glfwGetTime() - g_lastInputAt) * 1000.0);
+            float ms = (float)((nowSec() - g_lastInputAt) * 1000.0);
             app.inputLagMs = ms;
             app.inputLagMaxMs = std::max(app.inputLagMaxMs, ms);
             g_lastInputAt = 0;
         }
     };
 
+    // Browse is open when the app comes up, standing where it stood last time
+    // (2026-08-03, user). Until now the ONLY way to get a Browse panel was
+    // File > Browse Folder (Local)..., which opens the OS folder dialog first -
+    // so reaching the tool that replaces the OS dialog required going through
+    // it. The place comes from rbRecents, which prefs.txt already carries: the
+    // session's rbplace cannot serve here, because the autosave is offered by
+    // a menu item and never restored on its own at startup.
+    //
+    // Not for scripted runs: --bench and the keys selftests drive their own
+    // panels, and starting a local peer under them would change what they
+    // measure. A CLI path was an explicit request to look at THAT, so the
+    // panel stays where it is rather than jumping somewhere else.
+    if (!benchFrames && g_browseKeys.empty() && !g_secondary && app.showRemote) {
+        App::BrowseInstance& I = rbMain();
+        if (!I.b.connected && I.b.host.empty() && I.b.dir == "~") {
+            std::string place = app.rbRecents.empty() ? std::string() : app.rbRecents.front();
+            if (place.empty()) {
+#if defined(_WIN32)
+                const char* h = getenv("USERPROFILE");
+#else
+                const char* h = getenv("HOME");
+#endif
+                if (h && *h) {
+                    std::string hp = h;
+                    std::replace(hp.begin(), hp.end(), '\\', '/');
+                    place = "local://" + hp;
+                }
+            }
+            if (!place.empty()) goToPlace(I, place);
+        }
+    }
+
     while (!glfwWindowShouldClose(win)) {
-        double frameT0 = glfwGetTime();
+        double frameT0 = nowSec();
         // work that must keep animating even without input
         // rbBusy / mPending: a connect, a peer install or a server measurement is
         // in flight. Without these the idle path draws NOTHING while they run -
@@ -30177,6 +39657,7 @@ int main(int argc, char** argv) {
         // "not responding", which is exactly what a spinner is supposed to deny.
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
                     rbAnyBusy() || app.mPending > 0 ||
+                    app.rdJob != nullptr ||          // a reader is running
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
@@ -30199,7 +39680,7 @@ int main(int argc, char** argv) {
             benchWarm = (app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
                          app.folderPickOpen || app.rfPending > 0 ||
                          app.pendingCompare >= 0) &&
-                        glfwGetTime() < 600.0;
+                        nowSec() < 600.0;
             // ...and only once the folder HAS loaded can the slots be armed: at
             // setup time app.images is still empty for a folder argument
             if (benchTiles && !benchWarm && app.cmpExtra.empty() && app.images.size() >= 4) {
@@ -30240,7 +39721,7 @@ int main(int argc, char** argv) {
                 // p90) against 1.7 ms without it. That is the difference between
                 // a text field and a teletype.
                 do { glfwWaitEventsTimeout(left);
-                     left = budget - (glfwGetTime() - lastFrameEnd);
+                     left = budget - (nowSec() - lastFrameEnd);
                 } while (left > 0.0005);
             } else {
                 glfwWaitEventsTimeout(left);   // returns at once on input
@@ -30277,22 +39758,27 @@ int main(int argc, char** argv) {
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= app.anyFileDialog();   // pollFileDialog lives in the frame
+                working |= app.rdJob != nullptr;  // and so does pollReader
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
                 // a session's series wait for their stacks, then need one frame
                 working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
                 working |= !app.seriesPending.empty();   // ...and so do the picker's
-                working |= glfwGetTime() < app.abStepBusyUntil;   // B refresh pending
+                working |= nowSec() < app.abStepBusyUntil;   // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
                 working |= rbAnyTreePending();
+                // A window that was just resized owes prefs.txt a write, and it
+                // sits perfectly still until the user does something else. The
+                // write lives in the frame body, so the frame has to happen.
+                working |= g_geomWriteDue;
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
             app.wakeFrames = std::max(app.wakeFrames, 1);   // not wakeUi: no tail
         }
-        lastFrameEnd = glfwGetTime();
+        lastFrameEnd = nowSec();
         if (crashAfter && --crashAfter == 0) raise(SIGSEGV);   // --crash-test
         if (!app.pendingLayout.empty()) {   // between frames: safe point to re-dock
             ImGui::LoadIniSettingsFromMemory(app.pendingLayout.c_str(), app.pendingLayout.size());
@@ -30346,6 +39832,50 @@ int main(int argc, char** argv) {
             if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
             lastPrefs = h;
         }
+        {   // The window's own geometry, on the same cadence but not in the hash
+            // above: a checkbox changes once and is worth a write, whereas a
+            // window changes on every frame of a drag and rewriting prefs.txt
+            // sixty times a second to record a resize in progress is not saving
+            // a preference, it is following a mouse. So the sample is taken
+            // every frame and the WRITE is rate-limited to one every two
+            // seconds, which bounds what a kill can cost to the last two
+            // seconds of dragging. The exit path takes whatever the last change
+            // left dirty, so a clean quit always records the final rectangle.
+            //
+            // Scripted runs and secondary windows never get here at all - the
+            // first must not inherit or leave a geometry, the second must not
+            // write prefs.txt at all (savePrefs says why).
+            static uint64_t lastGeom = 0;
+            static double lastGeomWrite = -1e9;
+            static bool geomPrimed = false;
+            if (win && !g_secondary && !scriptedRun &&
+                !glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {
+                sampleWindowGeometry(win);
+                uint64_t g = (uint64_t)(uint32_t)app.winX * 2654435761ull +
+                             (uint64_t)(uint32_t)app.winY * 40503ull +
+                             (uint64_t)(uint32_t)app.winW * 2246822519ull +
+                             (uint64_t)(uint32_t)app.winH * 3266489917ull +
+                             (app.winMax ? 1u : 0u);
+                double nowG = nowSec();
+                // The first sample is what the restore produced, not a change
+                // the user made, so priming it keeps a launch-and-quit from
+                // rewriting prefs.txt for nothing. It does NOT make a refused
+                // position sticky: once the window settles anywhere the
+                // fallback becomes the new saved position, and the geometry
+                // from the screen that went away is gone. That is the choice
+                // between two imperfect things - the alternative is freezing
+                // the position for the whole run, which would also throw away
+                // a move the user made deliberately on that same run. This one
+                // always converges on where they last put it.
+                if (!geomPrimed) { geomPrimed = true; lastGeom = g; lastGeomWrite = nowG; }
+                else if (g != lastGeom) { lastGeom = g; g_geomWriteDue = true; app.prefsDirty = true; }
+                if (g_geomWriteDue && nowG - lastGeomWrite > 2.0) {
+                    g_geomWriteDue = false;
+                    lastGeomWrite = nowG;
+                    savePrefs();
+                }
+            }
+        }
         {   // Autosave on change, debounced. A hard kill cannot run any handler,
             // so the safety net has to be written while things still work.
             static uint64_t lastState = 0;
@@ -30361,7 +39891,7 @@ int main(int argc, char** argv) {
                              (uint64_t)(app.showFiles + app.showInspector * 2 + app.showRois * 4 +
                                         app.showAnalysis * 8 + app.showHistogram * 16 +
                                         app.showTemporal * 32 + app.showProjection * 64) * 131ull;
-            double nowA = glfwGetTime();
+            double nowA = nowSec();
             static double lastSnap = -1;
             if (state != lastState) { lastState = state; dirtySince = nowA; }
             // Re-render the crash copy far more often than the autosave debounce
@@ -30399,9 +39929,23 @@ int main(int argc, char** argv) {
         // --browse-keys-selftest: one scripted UI action per 8 frames, replayed
         // into the REAL input queue so the panel cannot tell it from a human.
         if (!g_browseKeys.empty()) {
-            static double reproT0 = glfwGetTime();
+            static double reproT0 = nowSec();
             static int reproIdle = 0;
             static bool reproReady = false;
+            static double reproActT0 = 0;      // the ACTION phase's own clock
+            // A wall clock on the action phase, the same shape as the listing
+            // phase's 60 s above. It had none: waitdir/waitimg bound each WAIT
+            // at 60 s, and nothing bounds the run. Measured on this build, a
+            // list with three impossible waits sits for 3m03s (60 s apiece);
+            // the stock list carries fifteen waits, so an abnormal run - A-16's
+            // shape, where a stale layout puts every scripted click somewhere
+            // else and every wait therefore expires - waits about a quarter of
+            // an hour and is then killed by ctest's own 900 s TIMEOUT, which
+            // says only "Timeout" and names no action. This is eight times a
+            // healthy run (~35 s) and comfortably inside that TIMEOUT, so the
+            // test dies by its own hand, names the action it died on, and
+            // FAILS. A suite that waits is a suite nobody runs.
+            const double reproActBudget = 300.0;
             ImGuiIO& rio = ImGui::GetIO();
             auto reproKey = [](const std::string& a) -> ImGuiKey {
                 if (a == "down")  return ImGuiKey_DownArrow;
@@ -30420,14 +39964,26 @@ int main(int argc, char** argv) {
             if (!reproReady) {
                 if (rbKeysT().b.connected && !rbKeysT().b.entries.empty()) {
                     reproReady = true;
+                    reproActT0 = glfwGetTime();  // the actions start HERE, not
+                                                 // at startup: the listing has
+                                                 // its own 60 s below
                     rbMain().focusReq = true;    // = clicking the panel
                     fprintf(stderr, "browsekeys: listing ready, %d entr(ies)\n",
                             (int)rbKeysT().b.entries.size());
-                } else if (glfwGetTime() - reproT0 > 60.0) {
+                } else if (nowSec() - reproT0 > 60.0) {
                     fprintf(stderr, "browsekeys: no listing for %s (%s)\n",
                             g_browseKeys.c_str(), rbKeysT().b.err.c_str());
                     break;
                 }
+            } else if (keyAct < keyActs.size() &&
+                       glfwGetTime() - reproActT0 > reproActBudget) {
+                fprintf(stderr, "browsekeys: action phase gave up after %.0f s at "
+                                "action %d/%d '%s' (phase %d), dir=%s imgs=%d: FAILED\n",
+                        glfwGetTime() - reproActT0, (int)keyAct, (int)keyActs.size(),
+                        keyActs[keyAct].c_str(), keyPhase, rbKeysT().b.dir.c_str(),
+                        (int)app.images.size());
+                fflush(stderr);
+                break;                          // keysOk stays false: rc = 1
             } else if (keyAct < keyActs.size()) {
                 // the armed never-expanded watch (see g_expNeverPath): probed
                 // HERE, once per frame, whatever the current action or phase -
@@ -30481,8 +40037,12 @@ int main(int argc, char** argv) {
                 };
                 bool hold = false;                 // waitimg: stay on this action
                 static size_t klogged = (size_t)-1;
+                static int escProbeAtPress = 0;
                 if (keyPhase == 0 && klogged != keyAct) {
                     klogged = keyAct;
+                    // one press, one layer: the count is taken BEFORE the key
+                    // goes into the queue, and read back at phase 7
+                    if (a == "esc") escProbeAtPress = g_escProbeN;
                     // every action names what the panel is showing when it runs,
                     // so a crash log ends on the action that caused it
                     fprintf(stderr, "browsekeys: %2d %-6s dir=%s rows=%d imgs=%d preview=%s\n",
@@ -30491,8 +40051,10 @@ int main(int argc, char** argv) {
                             app.previewLabel.empty() ? "-" : app.previewLabel.c_str());
                     fflush(stderr);
                 }
-                if (op == "dbl" || op == "click" || op == "ctrlclick" ||
-                    op == "chevclick" || op == "mback" || op == "mfwd") {
+                if (op == "dbl" || op == "dbloff" || op == "click" || op == "clickoff" ||
+                    op == "ctrlclick" ||
+                    op == "chevclick" || op == "starclick" || op == "pinclick" ||
+                    op == "mback" || op == "mfwd") {
                     // A real gesture into the real queue, aimed at the row the
                     // keyboard cursor is on - a double-click only exists as real
                     // clicks. "click" lands 40 px right of "dbl" (same row: rows
@@ -30508,11 +40070,35 @@ int main(int argc, char** argv) {
                     if (keyPhase == 0) {
                         if (op == "chevclick" && rbKeysT().cursorChev.x < 0)
                             chk(false, "cursor row has no chevron");
-                        g_injMouse = op == "chevclick"
-                            ? rbKeysT().cursorChev
+                        // "starclick" is aimed at the bookmark star at the right
+                        // end of the PATH line - not at a row. It is a real
+                        // click because the point of the move is that the star
+                        // is reachable there, which only a real click can show.
+                        if (op == "starclick" && rbKeysT().toolbar.starCentre.x < 0)
+                            chk(false, "no bookmark star on the path line");
+                        // "pinclick" is aimed at the OUTERMOST row the pinned
+                        // band is holding - the folder that has scrolled off
+                        // the top. The whole claim being tested is that it is
+                        // still a row: the click goes to real pixels, and the
+                        // verb that answers is the one that row has always had.
+                        if (op == "pinclick" && rbKeysT().toolbar.pinCentre.x < 0)
+                            chk(false, "nothing is pinned above the listing");
+                        // "dbloff:N" lands N rows BELOW the cursor row - the one
+                        // aim the keyboard cannot pre-warm. Every other click
+                        // action is aimed at the cursor, and the keyboard put
+                        // the cursor there, which on a file row has ALREADY
+                        // previewed it: click one of such a double-click finds
+                        // its preview live and costs nothing. A human's first
+                        // contact with a row is the mouse, and click one then
+                        // pays for the whole fetch - see rbActivateRow.
+                        float rowH = rbKeysT().cursorRect[1].y - rbKeysT().cursorRect[0].y;
+                        g_injMouse = op == "chevclick" ? rbKeysT().cursorChev
+                                   : op == "starclick" ? rbKeysT().toolbar.starCentre
+                                   : op == "pinclick"  ? rbKeysT().toolbar.pinCentre
                             : ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
                                      (op == "click" ? 40.0f : 0.0f),
-                                     (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f);
+                                     (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f +
+                                     ((op == "dbloff" || op == "clickoff") ? rowH * arg : 0.0f));
                     }
                     else if (keyPhase == 1 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, true);
@@ -30521,13 +40107,13 @@ int main(int argc, char** argv) {
                     else if (keyPhase == 2)
                         g_injMouseBtn = op == "mback" ? 3 : op == "mfwd" ? 4 : 0;
                     else if (keyPhase == 3) g_injMouseBtn = -1;
-                    else if (keyPhase == 4 && op == "dbl") g_injMouseBtn = 0;
+                    else if (keyPhase == 4 && (op == "dbl" || op == "dbloff")) g_injMouseBtn = 0;
                     else if (keyPhase == 4 && op == "chevclick")
                         chk((int)rbKeysT().expanded.size() != g_chevPreExp,
                             "expanded " + std::to_string(g_chevPreExp) + " -> " +
                             std::to_string((int)rbKeysT().expanded.size()) +
                             " by two frames after the press");
-                    else if (keyPhase == 5 && op == "dbl") g_injMouseBtn = -1;
+                    else if (keyPhase == 5 && (op == "dbl" || op == "dbloff")) g_injMouseBtn = -1;
                     else if (keyPhase == 5 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, false);
                 } else if (op == "altleft" || op == "altright") {
@@ -30538,16 +40124,18 @@ int main(int argc, char** argv) {
                     else if (keyPhase == 1) { rio.AddKeyEvent(k2, false);
                                               rio.AddKeyEvent(ImGuiMod_Alt, false); }
                 } else if (keyPhase == 0) {
-                    if (a == "more")       rbKeysT().advanced = !rbKeysT().advanced;
-                    else if (a == "flat")  rbKeysT().flat = !rbKeysT().flat;
+                    // ("more" - fold the drawer open - is gone with the drawer.)
+                    if (a == "flat")       rbKeysT().flat = !rbKeysT().flat;
                     else if (a == "tree")  rbKeysT().tree = !rbKeysT().tree;
+                    else if (a == "natorder")
+                        rbKeysT().nameNatural = !rbKeysT().nameNatural;
                     else if (a == "viewreset") {
                         // an ABSOLUTE state pin: the toggles above are relative,
                         // and a segment that assumes grouped+list must not
                         // depend on the parity of every toggle before it
                         rbKeysT().flat = false;
                         rbKeysT().tree = false;
-                        rbKeysT().advanced = false;
+                        rbKeysT().nameNatural = true;
                         rbTreeForget(rbKeysT());
                     }
                     else if (a == "focus") rbShowInstance(rbKeysT());
@@ -30697,15 +40285,21 @@ int main(int argc, char** argv) {
                         size_t sl3 = d3.find_last_of('/');
                         bool at = (sl3 == std::string::npos ? d3 : d3.substr(sl3 + 1)) == sarg;
                         if (at) { chk(true, "dir=" + d3); waitD0 = 0; }
-                        else if (waitD0 == 0) { waitD0 = glfwGetTime(); hold = true; }
-                        else if (glfwGetTime() - waitD0 < 60.0) hold = true;
+                        else if (waitD0 == 0) { waitD0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitD0 < 60.0) hold = true;
                         else { chk(false, "dir=" + d3); waitD0 = 0; }
+                    }
+                    else if (op == "idle") {       // burn N frames: a delay knob
+                        static int idleLeft = -1;
+                        if (idleLeft < 0) idleLeft = arg;
+                        if (idleLeft > 0) { idleLeft--; hold = true; }
+                        else idleLeft = -1;
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
                         if ((int)app.images.size() >= arg) { chk(true); waitT0 = 0; }
-                        else if (waitT0 == 0) { waitT0 = glfwGetTime(); hold = true; }
-                        else if (glfwGetTime() - waitT0 < 60.0) hold = true;
+                        else if (waitT0 == 0) { waitT0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitT0 < 60.0) hold = true;
                         else { chk(false, imgNames()); waitT0 = 0; }   // timed out
                     }
                     else if (op == "chkimg")  chk((int)app.images.size() == arg, imgNames());
@@ -30794,12 +40388,38 @@ int main(int argc, char** argv) {
                                                   "back=" + std::to_string((int)rbKeysT().histBack.size()) +
                                                   " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
                     else if (op == "chkexp")  chk((int)rbKeysT().expanded.size() == arg);
+                    // The band, read as text: every level the listing has
+                    // scrolled past, outermost first, ";"-terminated - "-" for
+                    // "nothing is pinned". This is the whole feature stated the
+                    // way a human would read it off the screen, and it is a
+                    // FRAME check rather than an arithmetic one on purpose: the
+                    // rows have to have been laid out for the string to fill in.
+                    else if (op == "chkpin")
+                        chk(rbKeysT().toolbar.pinnedNames == (sarg == "-" ? std::string() : sarg),
+                            "pinned=\"" + rbKeysT().toolbar.pinnedNames + "\"");
+                    // ...and the one chkexp cannot say: is the row the cursor is
+                    // ON expanded? chkexp counts the whole panel, so "this row
+                    // toggled" was only expressible when nothing else in the
+                    // panel was open - and the keyboard section far above leaves
+                    // one open with Right, so it was not expressible at all.
+                    // cursorFull is the exact key `expanded` is written in, at
+                    // any depth, so this asks the question directly.
+                    else if (op == "chkrowexp")
+                        chk(rbHas(rbKeysT().expanded, rbKeysT().cursorFull) == (arg != 0),
+                            "row \"" + rbKeysT().cursorFull + "\" expanded=" +
+                            std::to_string(rbHas(rbKeysT().expanded, rbKeysT().cursorFull) ? 1 : 0) +
+                            " of " + std::to_string((int)rbKeysT().expanded.size()) +
+                            " expanded in the panel");
+                    else if (a == "imgmark") g_rbImgMark = (int)app.images.size();
+                    else if (a == "chkimgmark")
+                        chk((int)app.images.size() == g_rbImgMark,
+                            "opened " + std::to_string((int)app.images.size() - g_rbImgMark) +
+                            " document(s) since the mark (" +
+                            std::to_string(g_rbImgMark) + ")");
                     else if (a == "exparm") {
                         // arm the per-frame watch on the CURSOR row's path -
                         // the row the next gesture will be aimed at
-                        const std::string& d4 = rbKeysT().b.dir;
-                        g_expNeverPath = (d4 == "/" ? "/" : d4 + "/") +
-                                         rbKeysT().cursorName;
+                        g_expNeverPath = rbKeysT().cursorFull;
                         g_expNeverHits = g_expNeverFrames = 0;
                     }
                     else if (op == "chkexpn") {
@@ -30809,7 +40429,163 @@ int main(int argc, char** argv) {
                             std::to_string(g_expNeverFrames) + " watched frame(s)");
                         g_expNeverPath.clear();
                     }
+                    // ---- the "more" drawer is gone, and each thing it held is
+                    // asserted in its NEW home (docs/browse-topbar-design.md
+                    // 10.3). These are the only checks that can tell "moved"
+                    // from "deleted".
+                    else if (a == "chktitle") {
+                        // The panel is named after the machine it stands on -
+                        // the fact that used to be invisible until you unfolded
+                        // the drawer, so that two panels were pixel-identical.
+                        // BOTH directions, because the wrong one is a lie: a
+                        // local panel must not claim ssh, and a remote one must
+                        // not keep the plain name. And the ### id is untouched
+                        // either way, or saved layouts stop docking the panel.
+                        const App::BrowseInstance& T = rbKeysT();
+                        bool ok = rbPanelTitle(1, "") == "Browse###Remote" &&
+                                  rbPanelTitle(1, "trc2") == "Browse [ssh: trc2]###Remote" &&
+                                  rbPanelTitle(2, "") == "Browse 2###Browse2" &&
+                                  rbPanelTitle(2, "trc2") == "Browse 2 [ssh: trc2]###Browse2" &&
+                                  // ...and the LIVE title of a local panel says
+                                  // nothing about ssh (local:// is not remote)
+                                  T.b.connected && T.b.host.empty() &&
+                                  T.wtitle == rbPanelTitle(T.num, "") &&
+                                  T.wtitle.find("[ssh:") == std::string::npos;
+                        chk(ok, "live=\"" + T.wtitle + "\" ssh form=\"" +
+                                rbPanelTitle(1, "trc2") + "\"");
+                    }
+                    else if (op == "chkstat") {
+                        // The bottom status line, which is where every fact the
+                        // drawer and the two orange bands used to carry now
+                        // lives. Counts BOTH directions: the numbers it prints
+                        // are the numbers the panel holds, and the "selected"
+                        // clause is present exactly when a selection exists.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        int realSel = 0;
+                        for (char c : rbKeysT().sel) if (c) realSel++;
+                        char want[64], wantSel[64];
+                        if (g.statusShown != g.statusTotal)
+                            snprintf(want, sizeof want, "%d of %d items",
+                                     g.statusShown, g.statusTotal);
+                        else
+                            snprintf(want, sizeof want, "%d item%s", g.statusTotal,
+                                     g.statusTotal == 1 ? "" : "s");
+                        snprintf(wantSel, sizeof wantSel, "%d of %d selected",
+                                 g.statusSel, g.statusTotal);
+                        bool says = g.statusFull.find(" selected") != std::string::npos;
+                        bool ok = g.statusSel == arg && realSel == arg &&
+                                  g.statusTotal > 0 &&
+                                  g.statusFull.find(want) != std::string::npos &&
+                                  says == (arg > 0) &&
+                                  (arg == 0 ||
+                                   g.statusFull.find(wantSel) != std::string::npos) &&
+                                  // The host is NOT on this line: the panel
+                                  // title names the machine, and the bottom row
+                                  // says only what nothing else on screen says.
+                                  // Kept as an assert pointing the other way
+                                  // rather than deleted with the text it used
+                                  // to check, or nothing would notice the host
+                                  // coming back.
+                                  g.statusFull.find(peerTag(rbKeysT().b.host)) ==
+                                      std::string::npos &&
+                                  // it is one line
+                                  g.statusText.find('\n') == std::string::npos;
+                        chk(ok, "\"" + g.statusFull + "\"");
+                    }
+                    else if (op == "chkframes") {
+                        // What the selected ROWS stand for. One grouped row is
+                        // one row and N frames, and the row count alone is the
+                        // wrong answer to "am I about to open 24 files or 480".
+                        // Both directions: the clause is absent when the two
+                        // numbers are equal, or every ordinary selection would
+                        // carry a redundant second count.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        char want[48];
+                        snprintf(want, sizeof want, "%d frames", arg);
+                        bool says = g.statusFull.find(" frames") != std::string::npos;
+                        chk(arg == 0 ? !says
+                                     : (says && g.statusFull.find(want) != std::string::npos),
+                            "\"" + g.statusFull + "\"");
+                    }
+                    else if (a == "starmark") g_rbStar0 = rbKeysT().toolbar.starLit;
+                    else if (op == "chkstar") {
+                        // The star is a STATE before it is a verb: lit means
+                        // this place is in the bookmark list. Asserted as a flip
+                        // from the mark, because a scripted run inherits the
+                        // user's real bookmarks and must not assume the test
+                        // folder is absent from them.
+                        const App::BrowseInstance& T = rbKeysT();
+                        std::string u = placeUrl(T.b.host, T.b.port, T.b.dir);
+                        bool listed = std::find(app.rbBookmarks.begin(),
+                                                app.rbBookmarks.end(), u) !=
+                                      app.rbBookmarks.end();
+                        int wantLit = arg ? !g_rbStar0 : g_rbStar0;
+                        bool ok = g_rbStar0 >= 0 &&
+                                  T.toolbar.starLit == wantLit &&
+                                  (T.toolbar.starLit != 0) == listed &&
+                                  T.toolbar.starCentre.x > 0;   // and it is ON the path line
+                        chk(ok, "star lit=" + std::to_string(T.toolbar.starLit) +
+                                " bookmarked=" + std::to_string(listed ? 1 : 0) +
+                                " " + u);
+                    }
+                    else if (a == "marklist") g_rbListTopY0 = rbKeysT().toolbar.listTopY;
+                    else if (a == "seterr")
+                        rbKeysT().b.err = "listing failed: no such file or directory";
+                    else if (a == "clrerr") rbKeysT().b.err.clear();
+                    else if (op == "chkerr") {
+                        // A failure speaks on the status line and NOWHERE else.
+                        // The old shape was a wrapped orange band above the
+                        // listing: it said the failure in the one place the
+                        // failure did not happen, and it pushed every file row
+                        // down by one to three lines on its way in and out.
+                        // listTopY is the proof - the listing does not move.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        bool inLine = g.statusFull.find("failed: ") != std::string::npos;
+                        float moved = g.listTopY - g_rbListTopY0;
+                        if (moved < 0) moved = -moved;
+                        chk(inLine == (arg != 0) && moved <= 1.0f,
+                            "list top " + std::to_string((int)g_rbListTopY0) + " -> " +
+                            std::to_string((int)g.listTopY) + "  line=\"" +
+                            g.statusFull + "\"");
+                    }
+                    else if (op == "setpv") {
+                        if (g_rbPeerV0 < 0) g_rbPeerV0 = rbKeysT().b.peerVersion;
+                        rbKeysT().b.peerVersion = arg;
+                    }
+                    else if (a == "pvback") {
+                        if (g_rbPeerV0 >= 0) rbKeysT().b.peerVersion = g_rbPeerV0;
+                        g_rbPeerV0 = -1;
+                    }
+                    else if (op == "chkproto") {
+                        // The protocol-mismatch notice was the OTHER orange row
+                        // above the listing. Same two claims as chkerr: it is on
+                        // the status line, and it does not take a row from the
+                        // files. The sentence names BOTH versions - a warning
+                        // that says only the peer's leaves the reader guessing
+                        // what it is being compared against.
+                        const RbToolbarGeom& g = rbKeysT().toolbar;
+                        char peer[32], mine[32];
+                        snprintf(peer, sizeof peer, "protocol %d", rbKeysT().b.peerVersion);
+                        snprintf(mine, sizeof mine, "speaks %d", (int)rp::VERSION);
+                        bool said = g.statusFull.find("protocol") != std::string::npos;
+                        bool both = g.statusFull.find(peer) != std::string::npos &&
+                                    g.statusFull.find(mine) != std::string::npos;
+                        float moved = g.listTopY - g_rbListTopY0;
+                        if (moved < 0) moved = -moved;
+                        chk(said == (arg != 0) && (arg == 0 || both) && moved <= 1.0f &&
+                            // ...and the agreeing case is SILENT, which is the
+                            // rule the whole redesign rests on
+                            rbProtocolNote((int)rp::VERSION).empty(),
+                            "peer v" + std::to_string(rbKeysT().b.peerVersion) +
+                            " list top " + std::to_string((int)g.listTopY) +
+                            "  line=\"" + g.statusFull + "\"");
+                    }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
+                    // "h<px>" - a digit is required, or "home" and "hidep" would
+                    // both be read as a height. It only bites while w<px> is on,
+                    // which is where every check that uses it lives.
+                    else if (a[0] == 'h' && a.size() > 1 && a[1] >= '0' && a[1] <= '9')
+                        g_rbForceH = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
@@ -30835,6 +40611,26 @@ int main(int argc, char** argv) {
                             rio.MousePos.x, rio.MousePos.y,
                             up == want ? "ok" : "FAIL");
                     fflush(stderr);
+                    if (a == "esc") {
+                        // ...and it was the POPUP layer that took it, and only
+                        // that layer. "the popup went away" is compatible with
+                        // the same press also reaching escapePressed() and
+                        // dropping an ROI or leaving a comparison underneath -
+                        // the exact failure the one-step-outward rule forbids,
+                        // and the one thing this test could not see before
+                        // g_escProbe existed (docs/verify-ui.md E7).
+                        int took = g_escProbeN - escProbeAtPress;
+                        std::string chain = g_escProbe.size() > 60
+                            ? g_escProbe.substr(g_escProbe.size() - 60) : g_escProbe;
+                        bool escOk = took == 1 &&
+                                     g_escProbe.size() >= 6 &&
+                                     g_escProbe.compare(g_escProbe.size() - 6, 6, "popup;") == 0;
+                        if (!escOk) keysCheckBad++;
+                        fprintf(stderr, "browsekeys: esc consumed by %d layer(s), "
+                                        "chain ...'%s': %s\n",
+                                took, chain.c_str(), escOk ? "ok" : "FAIL");
+                        fflush(stderr);
+                    }
                 } else if (keyPhase == 7 && a == "disc") {
                     // View > Panels > Browse lands here with nothing open, and
                     // it must not be a remote-only dead end: the panel browses
@@ -30846,25 +40642,39 @@ int main(int argc, char** argv) {
                     fflush(stderr);
                 } else if (keyPhase == 7 && g_rbForceW > 0) {
                     // The toolbar's contract at ANY width: the filter box and
-                    // the "more" button are inside the panel, and the filter is
-                    // wide enough to hold a glob. Both used to be submitted past
-                    // the right edge at the panel's default docked width.
+                    // the item that ENDS the row are inside the panel, and the
+                    // filter is wide enough to hold a glob. Both used to be
+                    // submitted past the right edge at the default docked width.
+                    //
+                    // SPEC CHANGE (drawer removal): the row's last item was the
+                    // "more" fold button (g.moreR); it is the "..." panel menu
+                    // now (g.menuR). The button being asserted changed because
+                    // the button changed - the contract, "whatever ends the
+                    // toolbar row is reachable at every width", did not, and it
+                    // is still checked at the same seven widths below.
                     const RbToolbarGeom& g = rbKeysT().toolbar;
                     float slack = 1.0f;             // one pixel of rounding
                     bool inside = g.filterR <= g.x1 + slack && g.filterL >= g.x0 - slack &&
-                                  g.moreR <= g.x1 + slack;
+                                  g.menuR <= g.x1 + slack;
                     bool usable = g.filterR - g.filterL >= ImGui::GetFontSize() * 3.5f;
+                    // ...and the bottom status line, at the same widths: it
+                    // elides middle-out into the room left beside the one verb
+                    // it carries, and it NEVER takes a second row (a status line
+                    // that wraps is one more thing moving the listing).
+                    bool statusOk = g.statusTextW <= g.statusAvailW + slack &&
+                                    g.statusAvailW > 0;
                     // ...and the "modified" column: shown means it FITS. It is
                     // allowed to be absent (a panel too narrow to afford it) and
                     // it is allowed to be short - it is not allowed to print
                     // three characters of a sixteen-character stamp.
                     bool dateOk = g.dateTextW <= 0 || g.dateTextW <= g.dateCellW + slack;
-                    if (!inside || !usable || !dateOk) keysCheckBad++;
+                    if (!inside || !usable || !dateOk || !statusOk) keysCheckBad++;
                     fprintf(stderr, "browsekeys: panel w=%.0f content=[%.0f,%.0f] "
-                                    "filter=[%.0f,%.0f] more_r=%.0f date=%.0f/%.0f: %s\n",
-                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.moreR,
-                            g.dateTextW, g.dateCellW,
-                            (inside && usable && dateOk) ? "ok" : "FAIL");
+                                    "filter=[%.0f,%.0f] menu_r=%.0f date=%.0f/%.0f "
+                                    "status=%.0f/%.0f: %s\n",
+                            g_rbForceW, g.x0, g.x1, g.filterL, g.filterR, g.menuR,
+                            g.dateTextW, g.dateCellW, g.statusTextW, g.statusAvailW,
+                            (inside && usable && dateOk && statusOk) ? "ok" : "FAIL");
                     fflush(stderr);
                 }
                 if (!hold && ++keyPhase >= 8) { keyPhase = 0; keyAct++; }
@@ -30876,14 +40686,29 @@ int main(int argc, char** argv) {
                 // browse cursor and ran gotoStack(1) on the main view - and
                 // with rangeScope = per frame that rewrote the stored
                 // black/white of an image the user never navigated to.
+                // Both of the summary claims below rest on evidence one named
+                // action collects ("blur", "popupcheck"). A --browse-keys list
+                // that does not contain that action is not making the claim, so
+                // it must not be JUDGED on it - without this, every overridden
+                // list failed on two assertions about actions it never ran, and
+                // the override was useful only for reading logs. Asked for by
+                // the list rather than inferred from the counters: dropping
+                // "blur" from the canned list then drops the claim visibly,
+                // instead of turning it green by leaving no evidence.
+                auto listHas = [&](const char* op) {
+                    for (const auto& s2 : keyActs) if (s2 == op) return true;
+                    return false;
+                };
                 int afterBlur = g_navKeyAtBlur < 0 ? -1 : g_navKeyGlobal - g_navKeyAtBlur;
-                bool routeOk = g_navKeyAtBlur == 0 && g_navKeyYieldAtBlur >= 6 &&
-                               afterBlur >= 4;
+                bool routeAsked = listHas("blur");
+                bool routeOk = !routeAsked ||
+                               (g_navKeyAtBlur == 0 && g_navKeyYieldAtBlur >= 6 &&
+                                afterBlur >= 4);
                 fprintf(stderr, "browsekeys: key routing: with the panel focused the "
                                 "main view ran %d nav key(s) and stood down for %d; "
                                 "after blur it ran %d more: %s\n",
                         g_navKeyAtBlur, g_navKeyYieldAtBlur, afterBlur,
-                        routeOk ? "ok" : "FAIL");
+                        !routeAsked ? "not asked for" : routeOk ? "ok" : "FAIL");
                 // POPUP COLLISION. ImGui's OpenPopupEx closes whatever sits at
                 // the current stack LEVEL when a different id opens there. The
                 // RAW dialog used to be one-shot (its flag consumed the frame it
@@ -30891,13 +40716,16 @@ int main(int argc, char** argv) {
                 // good - and with rawDlg.forQueue set, the only code that clears
                 // that flag lives inside the now-unreachable modal, so every
                 // later Open Folder sat at "queued" until restart.
-                bool popOk = g_popupCheck[0] == 1 && g_popupCheck[1] == 1 &&
-                             (!rawDlg.forQueue || rawDlg.open);
+                bool popAsked = listHas("popupcheck");
+                bool popOk = !popAsked ||
+                             (g_popupCheck[0] == 1 && g_popupCheck[1] == 1 &&
+                              (!rawDlg.forQueue || rawDlg.open));
                 fprintf(stderr, "browsekeys: root popup collision: RAW dialog open "
                                 "before the competing modal=%d, after=%d; forQueue "
                                 "implies a live dialog=%d: %s\n",
                         g_popupCheck[0], g_popupCheck[1],
-                        (!rawDlg.forQueue || rawDlg.open) ? 1 : 0, popOk ? "ok" : "FAIL");
+                        (!rawDlg.forQueue || rawDlg.open) ? 1 : 0,
+                        !popAsked ? "not asked for" : popOk ? "ok" : "FAIL");
                 keysOk = routeOk && popOk && keysCheckBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
                                 "no crash, %d panel check(s) failed: %s\n",
@@ -30910,7 +40738,7 @@ int main(int argc, char** argv) {
         redrawNow();
         if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
-            benchMs.push_back((glfwGetTime() - frameT0) * 1000.0);
+            benchMs.push_back((nowSec() - frameT0) * 1000.0);
             if (--benchLeft <= 0) break;
         }
     }
@@ -30939,7 +40767,7 @@ int main(int argc, char** argv) {
     // their preferences (the frameless ones return before ever getting here)
     if (g_browseKeys.empty()) {
         autosaveSession();            // also covers a normal quit
-        // Only what the user changed in this run: a one-off --sequence flag or
+        // Only what the user changed in this run: a one-off --stack flag or
         // the gamma inside a --session must not quietly become the default.
         if (app.prefsDirty) savePrefs();
     }

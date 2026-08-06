@@ -24,9 +24,40 @@ static int cfa_channel(const psFrame* f, uint32_t x, uint32_t y) {
     return CFA_MAP[f->cfa_pattern & 3][cy * 2 + cx];
 }
 
-static int cmpf(const void* a, const void* b) {
-    float x = *(const float*)a, y = *(const float*)b;
-    return (x > y) - (x < y);
+/* Three percentiles do not need the array sorted, only three of its order
+ * statistics in place. A full qsort of 12 M elements to answer p1/p50/p99 is
+ * what made this analyzer look slow next to numpy, which uses partition -- an
+ * algorithm difference, not a language one.
+ *
+ * Lomuto partition with a median-of-three pivot. Worst case is quadratic on an
+ * adversarial ordering; pixel data is not adversarial, and the median-of-three
+ * removes the already-sorted case that would otherwise be the common one here. */
+static size_t partitionAt(float* a, size_t lo, size_t hi) {
+    size_t mid = lo + (hi - lo) / 2, i, store;
+    float pivot, t;
+    if (a[mid] < a[lo])  { t = a[mid]; a[mid] = a[lo];  a[lo]  = t; }
+    if (a[hi]  < a[lo])  { t = a[hi];  a[hi]  = a[lo];  a[lo]  = t; }
+    if (a[hi]  < a[mid]) { t = a[hi];  a[hi]  = a[mid]; a[mid] = t; }
+    t = a[mid]; a[mid] = a[hi]; a[hi] = t;         /* park the median at hi */
+    pivot = a[hi];
+    store = lo;
+    for (i = lo; i < hi; i++)
+        if (a[i] < pivot) { t = a[i]; a[i] = a[store]; a[store] = t; store++; }
+    t = a[store]; a[store] = a[hi]; a[hi] = t;
+    return store;
+}
+
+/* After this a[k] holds what a sorted a[lo..hi] would hold at k, and nothing
+ * before k is greater than it. That second half is what lets the next call
+ * search only the part above k. */
+static void selectNth(float* a, size_t lo, size_t hi, size_t k) {
+    while (lo < hi) {
+        size_t p = partitionAt(a, lo, hi);
+        if (k == p) return;
+        /* k < p implies p > lo, so p - 1 cannot wrap */
+        if (k < p) hi = p - 1;
+        else       lo = p + 1;
+    }
 }
 
 static int32_t analyze(const psFrame* in, const psRect* roi,
@@ -75,6 +106,10 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     for (c = 0; c < (uint32_t)nb; c++) {
         size_t n = 0;
         double sum = 0, sum2 = 0, mean, var;
+        /* min and max come from this pass now. They used to be scratch[0] and
+         * scratch[n-1] of a fully sorted array; a partially selected one has
+         * neither at those ends. */
+        float vmin = 0, vmax = 0;
         uint32_t x, y;
         char key[32];
         for (y = r.y; y < r.y + r.h; y++) {
@@ -83,7 +118,9 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                 float v;
                 if (cfa && (uint32_t)cfa_channel(in, x, y) != c) continue;
                 v = row[(size_t)x * in->ch + (cfa ? 0 : c)];
-                if (!isfinite(v)) continue;   /* NaN/Inf never reach qsort */
+                if (!isfinite(v)) continue;   /* NaN/Inf never reach the select */
+                if (n == 0 || v < vmin) vmin = v;
+                if (n == 0 || v > vmax) vmax = v;
                 scratch[n++] = v;
                 sum += v;
                 sum2 += (double)v * v;
@@ -98,7 +135,6 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
         mean = sum / (double)n;
         var = sum2 / (double)n - mean * mean;
         if (var < 0) var = 0;
-        qsort(scratch, n, sizeof(float), cmpf);
         snprintf(key, sizeof key, "%s.mean", names[c]); sink->emit_number(sink->ctx, key, mean);
         snprintf(key, sizeof key, "%s.var", names[c]);  sink->emit_number(sink->ctx, key, var);
         snprintf(key, sizeof key, "%s.std", names[c]);  sink->emit_number(sink->ctx, key, sqrt(var));
@@ -121,11 +157,31 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                 sink->emit_number(sink->ctx, key, H);
             }
         }
-        snprintf(key, sizeof key, "%s.min", names[c]);  sink->emit_number(sink->ctx, key, scratch[0]);
-        snprintf(key, sizeof key, "%s.max", names[c]);  sink->emit_number(sink->ctx, key, scratch[n - 1]);
-        snprintf(key, sizeof key, "%s.p1", names[c]);   sink->emit_number(sink->ctx, key, scratch[(size_t)((double)(n - 1) * 0.01)]);
-        snprintf(key, sizeof key, "%s.p50", names[c]);  sink->emit_number(sink->ctx, key, scratch[(size_t)((double)(n - 1) * 0.50)]);
-        snprintf(key, sizeof key, "%s.p99", names[c]);  sink->emit_number(sink->ctx, key, scratch[(size_t)((double)(n - 1) * 0.99)]);
+        {   /* The three the array is actually needed for. Each search is bounded
+             * below by the previous one: once p1 sits at its index nothing
+             * before it is larger, so p50 can only be above it.
+             *
+             * Each value is READ AS SOON AS IT IS SELECTED, before the next call
+             * runs. A later selection rearranges a range that still contains the
+             * earlier index, so reading all three at the end depends on the
+             * partition happening to leave that index alone. This one does --
+             * Lomuto keeps a range's minimum at lo -- but that is a property of
+             * this implementation and not of the operation: std::nth_element,
+             * chained the same way, returns the wrong p1 and p50 (measured). A
+             * future change of pivot or partition would break it silently. */
+            size_t k1  = (size_t)((double)(n - 1) * 0.01);
+            size_t k50 = (size_t)((double)(n - 1) * 0.50);
+            size_t k99 = (size_t)((double)(n - 1) * 0.99);
+            float p1, p50, p99;
+            selectNth(scratch, 0,   n - 1, k1);   p1  = scratch[k1];
+            selectNth(scratch, k1,  n - 1, k50);  p50 = scratch[k50];
+            selectNth(scratch, k50, n - 1, k99);  p99 = scratch[k99];
+            snprintf(key, sizeof key, "%s.min", names[c]); sink->emit_number(sink->ctx, key, vmin);
+            snprintf(key, sizeof key, "%s.max", names[c]); sink->emit_number(sink->ctx, key, vmax);
+            snprintf(key, sizeof key, "%s.p1", names[c]);  sink->emit_number(sink->ctx, key, p1);
+            snprintf(key, sizeof key, "%s.p50", names[c]); sink->emit_number(sink->ctx, key, p50);
+            snprintf(key, sizeof key, "%s.p99", names[c]); sink->emit_number(sink->ctx, key, p99);
+        }
     }
     if (npx * in->ch > 0)
         sink->emit_number(sink->ctx, "finite ratio", (double)finiteTotal / ((double)npx * in->ch));

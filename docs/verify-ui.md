@@ -98,10 +98,10 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 | A18 | Temporal パネル: A/B 両方の曲線がパネル内に収まる | abstats T1/T1b/T2/T3 | `ran=1 plotted=1 slots=2`、plot 下端 ≤ window 下端、軸なし側は理由を出す | `T1 overlay 560x440: ran=1 plotted=1 slots=2 A=5 B=5 plot y 222.0..327.0 (window bottom 440.0)` / `T2 …and the panel says B has no time axis PASS` | PASS |
 | A19 | Temporal x軸ペースト解析 (改行・CRLF 含む) | `--export-tsv-selftest …` E7 | カンマ/空白/タブ/改行/CRLF が全て区切りとして通り、非数値は **位置付きで** 拒否 (黙って飛ばさない) | `E7 newline and comma+newline (Excel column paste) parse PASS` / `E7 parse error: value 3 ('x') is not a number;  value 5 ('1e') is not a number` | PASS |
 | A20 | frame-lin パネルの節とスタブ | `--frame-lin-selftest tools/testdata` F10/F11 | 軸未設定なら linearity 節を出さず `set the x axis first` と言う。両プロットがパネル内 | `F11 no axis: the section says 'set the x axis first' PASS` / `F11 both plots laid out INSIDE the panel PASS` | PASS |
-| A21 | ROI montage の命名と per-frame-range 注記 | `--export-selftest … --sequence always` E5/E6/E10/E11 | 名前が `… ROI 9x7 x5 (montage H)`。per-frame 版は `(montage H, per-frame range)` | `montage 45x7 from 5 frame(s), ROI 9x7 (cfa=0), name '00/frame_000‥004.npy  ROI 9x7 x5 (montage H)'` / `E11 per-frame montage is produced PASS` | PASS |
+| A21 | ROI montage の命名と per-frame-range 注記 | `--export-selftest … --stack always` E5/E6/E10/E11 | 名前が `… ROI 9x7 x5 (montage H)`。per-frame 版は `(montage H, per-frame range)` | `montage 45x7 from 5 frame(s), ROI 9x7 (cfa=0), name '00/frame_000‥004.npy  ROI 9x7 x5 (montage H)'` / `E11 per-frame montage is produced PASS` | PASS |
 | A22 | タイル各ペインの同一性表示と狭幅での省略 | `--tile-selftest tools/testdata/multi` T11/T12 | ペインは letter+batch をファイル名より優先。狭くしても A バッジは残り、名前は前方省略/脱落で **溢れない** | `T12 narrow: the A badge itself survives PASS` / `T12 narrow: the name elides from the front or drops, never overflows PASS` | PASS |
 | A23 | Browse インスタンス独立性 (item 17) | 既定列 `newpanel … target:N …` | 2枚目の Browse が別ディレクトリを同時に指し、filter/選択/履歴/focus が各々独立 | `chkpanels:2`、`chkfilt:-`、`chksel:0`、`chkback:0` すべて `ok` | PASS |
-| A24 | 新規ウィンドウの argv 形 (配置自体は D節) | `--newwin-selftest tools/testdata` N7 | stack は HEAD file + `--sequence always`、CFA は pattern が先、remote は ssh url | `N7 stack argv: HEAD file + --sequence always PASS` / `newwinselftest: ALL PASS` | PASS |
+| A24 | 新規ウィンドウの argv 形 (配置自体は D節) | `--newwin-selftest tools/testdata` N7 | stack は HEAD file + `--stack always`、CFA は pattern が先、remote は ssh url | `N7 stack argv: HEAD file + --stack always PASS` / `newwinselftest: ALL PASS` | PASS |
 | A25 | ルート popup 衝突: RAW ダイアログが競合モーダルで消えない | 既定列末尾 `rawopen,popupcheck,seqask,popupcheck` | 前後とも open=1、`forQueue` なら生存 | `root popup collision: RAW dialog open before the competing modal=1, after=1; forQueue implies a live dialog=1: ok` | PASS |
 
 **A節まとめ: 26項目 / 実行 26 / PASS 26 / FAIL 0。**
@@ -144,7 +144,7 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 | C1 | stage2: Files の **⧉ 共有バッジ行** | `--browse-keys-selftest tools/testdata/rb --browse-keys "waitdir:rb,viewreset,w400,home,down,down,down,down,down,down,down,down,dbl,waitimg:24,<共有を作る操作>,chkbadge:⧉"` ※ `chkbadge` 相当が無ければ E1 の probe が要る | 共有元と共有先の **両方** の行に ⧉ が立つ。`g_filesBadgeProbe` 方式なら `name=⧉;` が 2 件 | — | 未実施(未マージ) |
 | C2 | stage2: ⧉ の tooltip が **相手の名前** を言う | 同上 + tooltip 文字列 probe | tooltip に相手側スタック名が含まれる (「誰と共有しているか」が読める) | — | 未実施(未マージ) |
 | C3 | stage2: `closeStack` の生存通知が **双方向の件数** を言う | `--close-selftest tools/testdata/multi` を拡張、または abstats 流に直接 `closeStack()` を呼んで通知文字列を stderr へ | 「N frame(s) は他 M スタックから参照されているため残す」相当が、**両方向の数** を持つ | — | 未実施(未マージ) |
-| C4 | stage2: compare の "A and B share the same pixels" チップ | `--abstats-selftest` の chip 系 (`abStatusChipText()`) に倣う。A と B を同一 source に向けて `abStatusChipText()` を読む | chip が `A and B share the same pixels` を含む (現行 S5 の `A = B` / `paused` と併存すること) | — | 未実施(未マージ) |
+| C4 | stage2: compare の "A and B share the same pixels" チップ | `--abstats-selftest` の chip 系 (`abStatusChipText()`) に倣う。A と B を同一 source に向けて `abStatusChipText()` を読む | chip が `A and B share the same pixels` を含む。**`A = B` / `paused` 語彙とは併存しない —— そちらは 2026-08-04 に撤去済み** (todo-open.md §1)。同じ doc を両側に置いた場合の現行 S5 / `--abeq-selftest` E3 は「チップは普通に B を名乗り、paused も no B image も出さない」なので、この C4 は*別 doc・同 source* のときだけ足す一文であること | — | 未実施(未マージ) |
 | C5 | stage3: derive ダイアログが "will reference … (no pixel copy)" と言う | `--derive-selftest tools/testdata`。現行 D1 が `D1 A vs B by name: … %d to copy` を出しているので、同じ行に参照件数を足す形が自然 | ダイアログ文字列に `will reference` と `(no pixel copy)` が入り、コピー件数と参照件数が別々に出る | — | 未実施(未マージ) |
 | C6 | stage5: Files 右クリックの "Reload from disk" が **frame 行** に出る | `--browse-keys` の `rctx` で右クリック → メニュー項目 probe | frame 行のコンテキストメニューに `Reload from disk` が存在し、活性 | — | 未実施(未マージ) |
 | C7 | stage5: 同項目が **stack ヘッダ行** にも出る | 同上、カーソルを stack ヘッダに置いて `rctx` | stack ヘッダでも同項目が存在し、活性 | — | 未実施(未マージ) |
@@ -193,6 +193,45 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 | E7 | ESC の **テキスト編集段** (入力中の ESC が編集だけを抜ける) | `escapePressed()` は `EscTook{Nothing, RoiDeselected, CompareOff}` の 3 段しか持たない (main.cpp:1715)。テキスト段は ImGui 内部で処理され、こちらの状態には残らない。A14/A14b は ROI/compare 段と popup 段しか押さえていない | `g_escProbe`: 1 回の ESC がどの層に食われたかを層名で 1 行出す (`popup` / `textedit` / `roi` / `compare` / `nothing`)。これがあれば「一段ずつ外へ」を **鎖として** 通しで検証できる |
 
 **E節まとめ: 7項目 / すべて 要probe。**
+
+### E節の更新 (2026-08-04, branch `verify-probes`) — E3 と E7 に probe が入った
+
+どちらも既存の `g_tilePanesDrawn` / `g_filesBadgeProbe` と同じ流儀:
+**描いた文字列をそのまま積む**。計算し直した値ではない。
+
+**E3 → `g_footerProbe`** (`drawCanvas` のフッタ帯、`main.cpp` の footer strip)。
+1フレームぶんを `ctx=<batch  >  series>;zoom=<zoom NN%>;name=<file>;count=<n/N>;`
+で保持し、画像が無いフレームは空 (= 帯が無かった、という事実)。
+`--tile-selftest` の **T13** が実フレーム経由で4件表明する:
+
+| 表明 | 何が言えるようになったか |
+|---|---|
+| ctx 行が batch を名乗る | 2行アイデンティティの規則が**フッタでも**成り立つこと。ペインのバッジ (T12) だけが検査されていた |
+| zoom 1 → `zoom 100%` | 読み値そのもの |
+| zoom 0.005 → `zoom 0.5%` で、`zoom 0%` を**含まない** | **読み値に2書式ある理由そのもの**。`%.0f` だけなら 0.5% は "zoom 0%" になり、0% は「小さい」ではなく「無い」という別の主張になる。値を再計算する検査では絶対に見えない |
+| 部分ロードの counter が `1/4 of 8` | docs/terminology.md の n of N を**フッタで**。この counter には読み手が1人も居らず、規則は隣のコメントだけが担っていた |
+
+**E7 → `g_escProbe`** (`escapePressed()` の隣、`main.cpp`)。ESC 1回を**どの層が
+食ったか**を層名で1件ずつ積む: `popup;textedit;roi;compare;nothing;`。
+4段は4箇所で決まり、うち2箇所 (popup を閉じる末尾の一手と、ImGui 内の text edit) は
+`EscTook` に現れないので、「1回の押下が2段進んでいない」は**表明のしようが無かった**。
+
+- `--abstats-selftest` **S6**: 3回の押下が `roi;compare;nothing;` という**1本の鎖**に
+  なることを表明。戻り値3つでは「その間に他に何も起きていない」が言えない。
+- `--browse-keys-selftest`: `esc` アクションごとに、**消費した層がちょうど1つで、
+  それが `popup` である**ことを表明。既存の A14b は「popup が消えた」しか言えず、
+  同じ押下が下の層 (ROI / compare) にも届いていないことは見えなかった。
+- **校正 (この検査は失敗し得る)**: popup を開かずに `esc` を撃つと、既存の行は
+  `after esc a popup is closed: ok` と**通る**のに、新しい行は
+  `esc consumed by 1 layer(s), chain ...'nothing;': FAIL` になる。実測。
+
+(同じ branch で selftest フラグが1本増えている: `--srcmap-selftest`。冒頭
+「自動化の口」の 22 個は 23 個、スイートは 22 本から 23 本になった。)
+
+**残り**: E1 / E2 / E4 / E5 は未着手、E6 は対象外のまま。
+E7 の `textedit` 段は**記録はされるが実行されていない** — `--browse-keys` に
+テキスト入力を起こすアクションが無く、この機械で ESC をテキスト編集に食わせる
+経路が今日は無い。層名だけが用意されている状態である。
 
 ---
 

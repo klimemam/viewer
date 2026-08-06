@@ -155,12 +155,16 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
   読むので無傷。閉じたピンの剪定 (resolveSlots 1519-1523) も無傷。
 - **`srcId` が frame (画素) の identity。** 使い道は3つ: 会計の重複排除 (§7)、
   Files の共有表示 (§4)、compare の正直さ — A と B が同じ source を映して
-  いるとき (`a->src == b->src`)、compare チップは A=B の「paused」語彙 (1719 系)
-  と同族の一文「A and B share the same pixels」を出す。差分が全ゼロなのは
-  嘘ではないが、なぜかを画面が言うこと。
-- **A==B の禁則は doc 同一性のまま** (`resolveB` の `b == cur()` 1322)。
-  同じ source の別 membership の比較は合法 (禁じる理由がない — フレーム番号を
-  介した並べ直しの確認に実際使える)。
+  いるとき (`a->src == b->src`)、compare チップは一文「A and B share the same
+  pixels」を出す。差分が全ゼロなのは嘘ではないが、なぜかを画面が言うこと。
+  **これは「言う」だけで、何かを隠したり畳んだりはしない** — 隠す方は 2026-08-04
+  に全廃された (下記)。
+- **A==B の禁則は無い** (2026-08-04 ユーザー裁定「こういうの全般不要です」、
+  todo-open.md §1)。`resolveB` は A と同じ doc をそのまま B として返し、
+  両側が普通に描かれて重なって見える。同じものを両側に選ぶのは*意図的な操作*
+  (両側が一致することの確認) なので、そこでパネルが片方を隠すと「一致している」
+  と「描かれていない」が区別できなくなる。同じ source の別 membership の比較が
+  合法なのは従来どおり。検証は `--abeq-selftest`。
 
 ### 3.2 何が無効化されるか — reload の walk (一箇所)
 
@@ -275,10 +279,13 @@ compare のピンは今日 path+frame で復元され (`cmpslot` 4205 /
 
 ### 6.2 開くときの共有 — source registry
 
-source の identity tuple = **(path または url, npzMember, remoteFrame,
-raw レシピ, mtime, fsize)**。ローダ (npy 3850 / npz 3676 / raw 3991 /
-remote 8205・2349) はデコード前に registry を引き、**同じ tuple の source が
-既に居ればデコードせず共有する**。
+source の identity tuple = **(path または url, npzMember, fileFrame,
+remoteFrame, raw レシピ, npy の読み方 npyRead, mtime, fsize)**。ローダ
+(npy / npz / raw / remote) はデコード前に registry を引き、**同じ tuple の
+source が既に居ればデコードせず共有する**。npyRead は §3.3 の宣言
+(input-adapters.md) を正規化して埋める — native と同じ読みを明示しただけの
+宣言は native に畳む (`npyKeyRead`)。**同一ファイルの2つの読みは2つの
+tuple** であり、決して共有しない (reload selftest R21b)。
 
 - **mtime+fsize が tuple に入っているのが要点。** ファイルがディスク上で
   変わっていれば tuple が変わり、別 source として読む — 「再オープンは
@@ -349,7 +356,7 @@ membership を配る形。remote の derive がミスなく効くのはここか
 3. **Files のバイト列** — 出すか、出すなら unique 和で (§7)。
 4. **レンジが等しい共有 frame のテクスチャ共有** — 最適化。必要が示されてから。
 5. **用語** — 本書は正典に従い stack と書いた。UI 文字列の sequence 引退
-   (項目5) は別件のまま。
+   (項目5) も済んだ (issue #58)。
 
 ---
 ## 10. 追補 (2026-08-06) — #82「stack が書き換わった後の平均」は §3.2 が包含するか

@@ -1,156 +1,293 @@
 # viewer
 
-**画質設計のためのエンジニアリング画像ビューワ** — npy / RAW / Bayer を開いて、見て、測る。
+**画像データを開いて、見て、測る道具。** そして**足せる**道具です。
 
 [![build](https://github.com/klimemam/viewer/actions/workflows/build.yml/badge.svg)](https://github.com/klimemam/viewer/actions)
-Windows / Linux / macOS ・ C++17 + Dear ImGui ・ GPU/CUDA 不要 ・ 単体バイナリ + プラグイン
+Windows / Linux / macOS ・ C++17 + Dear ImGui + GLFW ・ GPU 不要 ・ 単体バイナリ
 
-> 「JPEG ビューワでセンサダンプは見られない」——このツールは逆です。
-> `RGGB float32 のベタバイナリ` を開き、画素値を座標付きで読み、ROI を置いて
-> ノイズ・PRNU・SFR をその場で測るための道具です。
+`.npy` / `.npz` / ヘッダ無し raw を、変換も中間ファイルも挟まずにそのまま開きます。
+表示用に丸められた画像ではなく、**元の数値**を扱います。連番は1つの **stack** として
+開き、フレーム間の統計や比較がそのまま効きます。
 
-<!-- TODO: スクリーンショット (docs/img/hero.png) を実機キャプチャ後にここへ -->
+足せる場所が3つあります:
 
-## ハイライト
+- **プラグイン** — 測定を C の共有ライブラリで足す (同梱7本)
+- **リーダ** — 読めない形式を Python の関数1つで読ませる
+- **リモート** — 計算機側に peer を置き、ssh 越しに開く。回線を流れるのは
+  見えている領域と測定結果だけ
+
+---
+
+## インストール
+
+ビルド済みバイナリが `binaries` ブランチにあります。ビルド環境は要りません。
+
+```
+git clone -b binaries --single-branch https://github.com/klimemam/viewer.git viewer-bin
+```
+
+以後の更新は `update.cmd` (Windows) / `./update.sh` (Linux・macOS)。
+このブランチは公開のたびに履歴を差し替えるので、**`git pull` では更新できません**。
 
 | | |
 |---|---|
-| 🔢 **エンジニアリングデータを直接開く** | `.npy`(u8〜f64、CHW/HWC/バッチ、BE/Fortran 可)、ベタ RAW(**画素フォーマット × 解釈の2軸指定**——RGGB float32 も一発)、Bayer / Quad Bayer |
-| 🔍 **ピクセルが見える** | ホバーで座標+ch毎の値(CFA チャンネル名付き)、座標ルーラー、ピクセルグリッド、黒点/白点レンジ、ガンマ、viridis カラーマップ |
-| 📐 **複数 ROI・複数 POI** | モード切替なし(押した場所で決まる)、`X`/`Y` で**行/列の1ライン選択**、選択 ROI から**動的クロップ⇔復元**。ROI ウィンドウに**基本統計(mean/std/min/max)を常時表示** |
-| 🪟 **パネルは自由配置** | ドッキング/タブ/フロート、レイアウトは自動保存。ROI と詳細解析はフローティング既定 |
-| 🎞 **連番は「塊」として扱う** | 1枚開けば同フォルダの連番を裏で一括ロード(検出は"変化する数字フィールド")。**フォルダを開けば `A/00/`, `A/01/` … を複数の塊として一度に**(RAW の書式指定は1回だけ)。`←→`/`C-f C-b` で時間方向、`↑↓`/`C-n C-p` で塊移動 |
-| 🆚 **A/B 比較** | `\` で **ワイプ(真ん中の仕切りをドラッグ)⇔ 並べて ⇔ 差分(A−B)**。ズーム/位置は常に共通、Inspector に **A / B / A−B** の画素値。`B` 長押しで B 全面、`Shift+B` で**同じ塊のフレーム同士**を比較。差分は**符号=色相・大きさ=明るさ**、スケール自動+**はみ出し画素を明示** |
-| 📊 **その場で測る** | 常時表示の mean/std/var + ヒストグラム(CFA 4ch 分離・ROI 追従)、連番なら**時間ノイズ vs 固定パターン**も常時表示。加えて解析プラグイン: ノイズフロア / **PRNU・FPN** / シャープネス / **ISO 12233 e-SFR(カーブ表示)**。結果は **ROI × 指標の比較グリッド** |
-| 🔌 **C ABI プラグインで成長** | 測定は全部プラグイン([include/ps/ps_plugin.h](include/ps/ps_plugin.h))。C ファイル1個+CMake 1行で Measure メニューと UI が自動でついてくる |
-| 💾 **状態を丸ごと持ち運ぶ** | セッション(.vsession): 画像のレシピ(.npz の配列名まで)・塊ごとの表示フレーム・ズーム位置・ROI/ピン・レンジ・**パネル配置**・比較状態を保存/復元。**クラッシュしても直前の状態が残る**。CLI からも `--session` |
+| `win64/viewer.exe` | GUI 本体 |
+| `win64/viewer-serve.exe` | ヘッドレスの peer (計算機側に置くもの) |
+| `win64/plugins/` | 測定プラグイン。**exe の隣に置く** |
+| `linux-x64/` `macos-arm64/` | 同じ一式 |
 
-## クイックスタート
+デスクトップのアイコンから起動したいときは、同梱のスクリプトを1回実行します。
 
-**A. ビルド済みバイナリ**: [Actions](../../actions) の最新 run → Artifacts →
-`viewer-win64` / `viewer-linux-x64` / `viewer-macos-arm64` をダウンロード
-(zip/tgz に `plugins/` 同梱。Linux/macOS は `tar xzf` → `./viewer`)。
-デスクトップ/スタートメニューから起動したい場合は同梱の `install_shortcut.cmd`
-(Linux/macOS は `install_shortcut.sh`)—— [startup.md](docs/startup.md#0-2-デスクトップ--スタートメニューから起動する)。
+```
+win64\install_shortcut.cmd                    Windows
+./linux-x64/install_shortcut.sh               Linux / macOS
+```
 
-**B. ソースから** (VS2022 / MinGW / gcc / clang + CMake 3.21+、依存は自動取得):
-```bash
+`--host user@server` (Windows は `-RemoteHost`) を付けると、**起動時にその計算機へ
+つなぐショートカット**が別に作られます。
+
+**計算機側**には `viewer-serve` だけを置きます。GL も X11 もリンクしていないので、
+画面の無いマシンでも動きます。
+
+---
+
+## 用語 — frame / stack / series / batch
+
+この4語がこの道具の骨格で、パネルもファイルも測定もこの語彙で動きます。
+**包含は厳密**です (frame ⊂ stack ⊂ series ⊂ batch)。
+
+| 語 | 何か | 例 |
+|---|---|---|
+| **frame** | 画面に見えている最小単位。1枚 | `dark_0007.npy` |
+| **stack** | **同一条件で繰り返し**撮った frame の集まり | `dark_0000‥0479` (480枚) |
+| **series** | **条件を振った** stack の集まり。振った量と単位を持つ | 露光 1,2,5,10,20 ms の5つの stack |
+| **batch** | 一緒に開いたもの。構造の主張はしない | あるフォルダを開いた結果 |
+
+この区別が効くのはここです:
+
+- **時間ノイズ σ_t は stack の性質**です。条件の違うものを混ぜて計算すると、
+  「振った条件」を「ノイズ」として報告してしまいます。だから series は stack の
+  集まりで、σ_t を条件またぎでは計算しません
+- **series の値 (露光・照度) と単位は series が持ちます**。stack にもアプリにも
+  持たせません。単位が無ければフィットしません — 単位は推測しないからです
+- **batch は構造を主張しません**。「一緒に開いた」だけなので、閉じる単位に使えます
+
+正典は [docs/terminology.md](docs/terminology.md) です (Close の意味論もそこ)。
+
+---
+
+## 使い方
+
+### 開く
+
+```
+viewer                                  そのまま起動して、あとは画面から
+viewer frame_0000.npy                   1枚
+viewer dark_0000.npy dark_0001.npy      連番は 1 stack にまとまる
+viewer C:\capt\run42                    フォルダ (中身を選ぶ画面が出る)
+viewer session.vsession                 保存したセッション
+viewer ssh://user@host/data/run42       計算機の上のフォルダ
+```
+
+全オプションは `--help`。
+
+### 見る
+
+- **Image View** — 中央。ホイールで拡大、ドラッグで移動。値は [DN] のまま表示され、
+  トーンマップはしません
+- **Files** — 開いているものが frame / stack / series / batch の木で並びます
+- **Browse** — ファイルを探すパネル。ローカルもリモートも同じ形で扱います。
+  **クリックで選択、ダブルクリックで確定** (開く・降りる)
+- **Inspector** — 座標・画素値・そのファイルがどう読まれたか
+
+表示レンジ (black/white) は **stack ごとに揃える**のが既定です。フレームごとに
+自動で合わせたいときは Range を `Auto per frame` に。
+
+### 測る
+
+| パネル | 何が出るか |
+|---|---|
+| **Histogram** | 分布。CFA なら R/Gr/Gb/B を**混ぜずに** |
+| **Projection** | 行・列の平均と σ。行 FPN / 列 FPN が見えます |
+| **Temporal** | stack のフレーム方向。**σ_t** と σ_s、フレームごとの平均の推移 |
+| **ROIs** | 矩形と点。mean / σ / min / max、そして n |
+| **Linearity** | series のフィット。EMVA 方式 (版を選べます) |
+| **Analysis** | プラグインの測定結果 |
+
+数値には**必ず量と単位**が付きます。画素値は保存形式が何であれ [DN] です。
+部分的にしか読めていない stack は **n/N** と言います。
+
+### 比べる
+
+`B` で B を設定して A/B 比較、`C` 以降でスロットを増やせます。比較中は
+**表示レンジを揃えます** (違う伸ばし方をした2枚は比べられないので)。
+`ESC` で一段ずつ外側に戻ります。
+
+### 取り出す
+
+- 表示のとおりの PNG (dot by dot)
+- 測定結果の CSV / TSV。**出所** (どのビルドが・いつ・何を測ったか) が先頭に付きます
+- セッション (`.vsession`) — 開いているもの・レンジ・レイアウトごと
+
+---
+
+## 読める形式
+
+| 形式 | 備考 |
+|---|---|
+| `.npy` | `u1 i1 b1 u2 i2 u4 i4 f4 f8`、ビッグエンディアン、fortran order |
+| `.npz` | zip 内の各メンバ。名前は `file.npz:key`。画像でないメンバは開かず、フレーム数と長さの合う1次元配列は**軸として使えます** ([docs/npz-design.md](docs/npz-design.md)) |
+| `.bin` `.raw` `.yuv` `.dat` `.rggb` | ヘッダ無し。dtype・解釈 (gray/rgb/bayer/quad-bayer)・寸法・オフセット・クロップを指定 |
+| `.vsession` | 保存したセッション |
+
+**配列の形の読み方**:
+
+判定は**次元数と、最後の軸だけ**です。先頭の軸の大きさは見ません。
+
+| shape | 読み方 |
+|---|---|
+| `(H,W)` | 1枚・1ch |
+| `(H,W,C)` C ≤ 4 | **1枚**・C ch (`(H,W,1)` はモノクロ1枚、`(H,W,3)` はカラー) |
+| `(F,H,W)` | **F 枚の stack** (`(3,H,W)` も3枚) |
+| `(F,H,W,C)` C ≤ 4 | F 枚 × C ch |
+| 上記以外 | **読みません。**形と読める形を名指しして断ります |
+
+**取り違えたときは Inspector で言い直せます** — 「read as / re-read as」に、
+その配列の形から計算できる読み方だけが並びます。選んだ読み方は**そのファイルに
+覚えられ**、セッションにも残ります。
+
+CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
+(`--bayer-pattern` を後ろに置くと無視されます)。
+
+**書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
+PNG / JPEG / TIFF の**読み込みはありません**。
+
+### 読めない形式を読ませる — リーダ
+
+**リーダは、あなたが書く Python の関数1つ**です。viewer はそれにパスを渡し、
+返ってきたものを開きます。
+
+```python
+def load(path):
+    z = np.load(path)
+    return Series([Stack(z["data"][i], name=f"{e:g}ms") for i, e in enumerate(z["exp"])],
+                  conditions=Values(z["exp"], "exposure", "ms"))
+```
+
+返り値の**型が層を名乗る**ので、形の推測が要りません (配列をそのまま返すこともできます)。
+
+```
+File > Open With a Reader...        (Browse で読めないファイルをダブルクリックしても同じ)
+[New reader...]                     テンプレートを書き出して、あなたのエディタで開く
+[Load]                              走らせる。失敗すれば traceback がそのままパネルに出る
+```
+
+- 一度読めた **パスと関数の対応は憶えます**。次からは黙って同じリーダで開きます
+- リーダのファイルを編集すると、**次に開くとき自動で走り直します**
+- 結果はキャッシュするので、2回目は Python を起動しません
+- Inspector がそのファイルを「native で読んだか、どのリーダで読んだか」を言い、
+  `[change...]` `[edit]` `[native]` でいつでも変えられます
+
+Python は `numpy` があるものを探して使います。無ければ**どれを試して何が足りなかったか**を
+名指しで言います。仕様は [docs/input-adapters.md](docs/input-adapters.md)。
+
+---
+
+## リモート (ssh)
+
+```
+viewer ssh://user@host/data/10lx/frame_0000.npy    ファイルを開く
+viewer ssh://user@host/~/data                      そこを Browse で見る
+viewer ssh://user@host                             ホームから
+```
+
+- 認証は ssh に任せます (`BatchMode=yes` = 公開鍵のみ)。待ち受けポートも
+  デーモンも増えません — ssh の stdin/stdout がそのまま通信路です
+- **回線を流れるのは、見えている領域と測定結果だけ**です。σ_t のような
+  stack 全体の測定は**計算機側で走り**、返るのは数値です
+- 計算機に `viewer-serve` が無ければ、初回に置きにいきます
+
+詳しくは [docs/remote.md](docs/remote.md)。
+
+---
+
+## プラグイン
+
+`plugins/` に置いた共有ライブラリを起動時に読みます。ABI は
+[include/ps/ps_plugin.h](include/ps/ps_plugin.h) の1ヘッダだけで、C で書けます。
+
+| 種別 | すること | 同梱 |
+|---|---|---|
+| analyzer | 測る (結果は Analysis パネルへ) | stats / noise / prnu / sharpness / esfr |
+| processor | 画素を作る | demosaic |
+| display | 表示のしかたを足す | falsecolor |
+
+analyzer は **peer 側でも同じものが走ります** — リモートの測定がローカルと同じ答えを
+返すのはこのためです。書き方は [docs/analyzers.md](docs/analyzers.md)。
+
+---
+
+## 設定ファイル
+
+| 置き場所 | 中身 |
+|---|---|
+| exe の隣 `prefs.txt` | 振る舞いの好み (既定のレンジ、キー、Browse の見せ方) |
+| `%APPDATA%/viewer/layout.ini` (Linux・macOS は `~/.config/viewer/`) | パネルの配置 |
+| 同 `autosave.vsession` | 落ちても失わないための自動保存 |
+
+セッション形式はキーの**追加のみ**で拡張します。古いビルドは知らないキーを読み飛ばすので、
+新しいセッションも開けます。
+
+---
+
+## セルフテスト
+
+22 本あり、CI が3つの OS で全部走らせます。手元でも同じものが1コマンドで走ります。
+
+```
+tools/run_selftests.sh [build-dir]
+```
+
+GUI を実際に描いてクリックを注入するものも含みます (Browse のキー操作、比較、タイル表示)。
+測定の不変条件 — **σ_t は stack の性質・CFA プレーンを混ぜない・部分ロードは n/N と言う** —
+は、この検査で守られています。
+
+---
+
+## ドキュメント
+
+| | |
+|---|---|
+| [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
+| [docs/manual.md](docs/manual.md) | 操作の手引き |
+| [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
+| [docs/input-adapters.md](docs/input-adapters.md) | リーダの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
+| [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
+| [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
+| [docs/tasks.csv](docs/tasks.csv) | 課題表 (対応済み / 進行中 / 残課題 / 暫定 / 要レビュー) |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | データモデル・フレームループ・不変条件 |
+
+---
+
+## ソースからビルド
+
+**MSVC (Visual Studio 2022)**
+
+```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-./build/viewer                       # Windows: build\Release\viewer.exe
-```
-Linux は `xorg-dev libgl1-mesa-dev` 等が必要([CI 設定](.github/workflows/build.yml)参照)。
-MinGW 同梱 CMake で SSL エラーが出る場合は
-[manual の対処](docs/manual.md#ビルド環境まわり-windows)を参照。
-
-**3分ツアー**:
-```bash
-python tools/gen_testdata.py         # テスト画像生成
-./build/viewer tools/testdata/cfa_rggb_640x480_bayer16.raw
-```
-1. ヒストグラムが **R/Gr/Gb/B の4色**に分かれて表示される(右パネル)
-2. ドラッグで ROI 作成 → Analysis に **noise/floor** の結果が ROI 毎の列で出る
-3. **Process > demosaic (bilinear)** → RGB 画像が新規タブに
-4. `./build/viewer tools/testdata/slant_edge_f32.npy` → エッジに ROI → **Measure > iso12233 > e-sfr** → SFR カーブ+MTF50
-
-## 代表ワークフロー
-
-<details><summary><b>1. センサダンプの検分</b>(フォーマット不明の RAW を開く)</summary>
-
-1. ファイルをウィンドウへドラッグ → RAW ダイアログが開く
-2. **pixel format**(u8/u16/f32/f64 + エンディアン)と **interpretation**(Gray/RGB/.../Bayer)を選ぶ
-   —— サイズはファイルサイズから自動候補、ファイル名の `1920x1080` `rggb` `f32` も自動認識
-3. 開いた後も右パネル **Interpret** で Gray⇔Bayer⇔Quad を即切替、**Reinterpret raw...** で読み直し
-4. 巨大ダンプは **crop on load** か、開いてから ROI →「Crop to selected ROI」(「Restore full」で復帰)
-</details>
-
-<details><summary><b>2. パッチ比較測定</b>(グレーチャート/フラット評価)</summary>
-
-1. 各パッチをドラッグして ROI(注目画素は `P` でピン)
-2. Measure > **stats/moments** または **noise/floor** → 右パネルに ROI × 指標のグリッド
-3. フラット画像なら **uniformity/prnu-fpn** で PRNU% / 行・列バンディング / シェーディング
-4. `Ctrl+S` でセッション保存 → 翌日 `--session` で同じ ROI 配置・ズームから再開
-</details>
-
-<details><summary><b>3. SFR / 解像力測定</b>(ISO 12233 簡易 e-SFR)</summary>
-
-1. スランテッドエッジ(傾き 5〜40°)に ROI(複数可: 中心/周辺の比較など)
-2. Measure > **iso12233 > e-sfr** → SFR カーブが ROI 色で重畳プロット、MTF50/MTF20 がグリッドに
-3. CFA 画像は先に Process > demosaic
-</details>
-
-## チートシート
-
-| 操作 | キー/マウス |
-|---|---|
-| ROI 作成 / 移動 / リサイズ | **ドラッグ**(ROI 内=移動、角=リサイズ)——モード切替なし |
-| ピン追加 | カーソルを合わせて **`P`**(または右クリック→ Add pin here) |
-| その場の操作 | **右クリック**(ピン追加 / 行・列バンド / クロップ / 削除 / フィット) |
-| パン | **中ボタン / Space+ドラッグ**・ホイール=縦 / Shift+ホイール=横 |
-| ズーム | **Ctrl+ホイール**(カーソル中心)・`+`/`-`・`1`=等倍・`F`=フィット |
-| 行・列の選択 | `X` / `Y` ——ピン選択中はその**1ライン**、無選択ならカーソル位置の1ライン、ROI 選択中は全幅/全高トグル(再押下で復元) |
-| アノテーション削除 / 選択解除 | `Del` / `Esc` |
-| フレーム移動(時間方向)/ 塊移動 | `←` `→`・`Ctrl+B` `Ctrl+F` / `↑` `↓`・`Ctrl+P` `Ctrl+N`(先頭末尾: `Home`/`End`) |
-| 開く / セッション保存 / 画像を閉じる | `Ctrl+O` / `Ctrl+S` / `Ctrl+W`(macOS は Cmd) |
-| A/B 比較(ワイプ⇔並べて⇔差分)/ A⇄B 入替 | `\` or `C` / `Shift+\` |
-| B を全面表示 / このフレームを B に固定 / 仕切り移動 | `B` 長押し / `Shift+B` / `[` `]` |
-| ピクセルグリッド / ヘルプ | `G`(8倍以上)/ `H` |
-
-**詳細マニュアル → [docs/manual.md](docs/manual.md)** ・ 測定の中身 → [docs/analyzers.md](docs/analyzers.md)
-
-## 対応フォーマット
-
-| 入力 | 詳細 |
-|---|---|
-| `.npy` | u8/i8/u16/i16/u32/i32/f32/f64/bool。(H,W)・(H,W,C)・(C,H,W)、**(F,H,W[,C]) はフレーム軸として塊に**。BE/Fortran 対応 |
-| `.npz` | `savez`(非圧縮)・`savez_compressed`(deflate)の両対応、zip64 可。全配列を読み込み |
-| `.bin` `.raw` `.yuv` ほか | 2軸指定: {u8,u16,f32,f64}×{Gray,RGB,BGR,RGBA,BGRA,Bayer,Quad Bayer}、オフセット/エンディアン/**crop** |
-| `.vsession` | セッション(画像レシピ+表示状態+アノテーション) |
-
-## アーキテクチャ
-
-```mermaid
-flowchart LR
-    subgraph L3 ["L3: プラグイン (C ABI)"]
-        A["解析系<br/>stats / noise / prnu / sfr ..."]
-        D["描画系<br/>colormap LUT"]
-        PR["Processor<br/>demosaic ..."]
-    end
-    subgraph L2 ["L2: ホストサービス"]
-        G["比較グリッド"]
-        PL["折れ線プロット"]
-        HI["ヒストグラム"]
-    end
-    subgraph L1 ["L1: コア"]
-        C["表示 / ツール / アノテーション<br/>セッション / RAW 2軸ローダ"]
-    end
-    C -->|"Frame + ROI"| A
-    A -->|"emit_number"| G
-    A -->|"emit_series"| PL
-    D -->|LUT| C
-    PR -->|"new Frame"| C
+cmake --build build --config Release -j
 ```
 
-- 契約は [include/ps/ps_plugin.h](include/ps/ps_plugin.h) のみ(v1 プラグインは永久サポート)
-- 設計の全体像・機能追加の建付け → [ARCHITECTURE.md](ARCHITECTURE.md)
+**MinGW + Ninja**
 
-## ロードマップ
-
-1. ~~表示/検査/アノテーション/RAW 2軸/解析基盤~~ ← **いまここ(全部入り)**
-2. 連番・動画(先読み再生、A/B 同期)+ マルチフレーム ABI → **EMVA 1288**
-3. CUDA / NVDEC(ゼロコピー表示。無い環境は CPU に自動フォールバック)
-4. params_schema → 測定パラメータ UI 自動生成、pybind11 埋め込み
-5. WebSocket ブリッジ([pixelscope.html](pixelscope.html) をリモートフロントエンドに)
-
-## UI テーマ("Aurora")
-
-本体には [core/ui_theme.cpp](core/ui_theme.cpp) の "Aurora" テーマが組み込まれており、
-**View > Theme** からダーク/ライトとアクセント5色を実行中に切り替えられます。
-設計値と根拠、「ImGui 感を消す」テクニック集は
-**[docs/imgui_modern_design.md](docs/imgui_modern_design.md)** に。
-色の試行錯誤用に Python 製ライブデモも同梱しています:
-
-```bash
-pip install -r requirements-imgui.txt
-python imgui_demo.py     # Design Lab パネルでダーク/ライト・アクセント色を実機確認
 ```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 8
+```
+
+依存 (GLFW 3.4 / Dear ImGui 1.91.8-docking / miniz / portable-file-dialogs) は CMake が
+取ってきます。初回だけネットワークが要ります。`viewer` と `viewer-serve`、プラグイン、
+アイコンが同時に建ちます。
+
+テスト用の fixture は `python tools/gen_testdata.py` が生成します (numpy が要ります)。

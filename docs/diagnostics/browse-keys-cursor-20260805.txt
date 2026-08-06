@@ -1,0 +1,38 @@
+browse-keys intermittent failure, captured 2026-08-05. A SECOND signature, not
+the one in browse-keys-20260804.txt: that one is two multi-selected stacks where
+the second Open never finishes (imgs=36 of 44, seqs=3 of 4). This one has all 44
+images and all 4 stacks, and fails on the keyboard cursor instead.
+
+Run: tools/run_selftests.sh build-mingw, tree = test-harness @ 9d0cca3 +dirty.
+Not captured by hand: tools/run_selftests.sh filed it into docs/diagnostics/auto/
+by itself, which is what that mechanism is for. This is that file, trimmed.
+
+The failing step: the panel is focused (action 214), `down` is pressed (216), and
+the cursor is still -1 - it never left "no row" for row 0. The very next
+chkcursor:-1, after target:2 moves to another directory, passes, so the panel is
+alive and answering; it is the first `down` after focus that did nothing.
+
+    browsekeys: 211 chkback:1 dir=tools/testdata/rb/scanroot/10lx rows=1 imgs=44 preview=-
+    browsekeys: chkback:1          -> imgs=44 seqs=4 pv=0 scrub=0 idx=0 cur=gain10_000.npy  back=1 fwd=0: ok
+    browsekeys: 212 target:1 dir=tools/testdata/rb/scanroot/10lx rows=1 imgs=44 preview=-
+    browsekeys: 213 chkback:0 dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: chkback:0          -> imgs=44 seqs=4 pv=0 scrub=0 idx=0 cur=gain10_000.npy  back=0 fwd=0: ok
+    browsekeys: 214 focus  dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: 215 chkfocus:1 dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: chkfocus:1         -> imgs=44 seqs=4 pv=0 scrub=0 idx=0 cur=gain10_000.npy  Browse###Remote: ok
+    browsekeys: 216 down   dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: 217 chkcursor:0 dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: chkcursor:0        -> imgs=44 seqs=4 pv=0 scrub=0 idx=0 cur=gain10_000.npy  cursor=-1: FAIL
+    browsekeys: 218 target:2 dir=tools/testdata/rb rows=9 imgs=44 preview=-
+    browsekeys: 219 chkcursor:-1 dir=tools/testdata/rb/scanroot/10lx rows=1 imgs=44 preview=-
+    browsekeys: chkcursor:-1       -> imgs=44 seqs=4 pv=0 scrub=0 idx=0 cur=gain10_000.npy  cursor=-1: ok
+
+    browsekeys: 282 action(s) through real frames, no crash, 1 panel check(s) failed: FAILED
+    browsekeys: FAILED (the action list did not finish)
+
+Note the row count either side: rows=9 at 213, rows=9 at 216. The listing did not
+change under the focus, so this is not the directory arriving late.
+
+Cause NOT investigated - this file exists so that the next person does not have
+to wait for a fifth sighting to see the text. The 57 kB capture it was trimmed
+from is the whole test's output; only the last 20 actions are reproduced here.

@@ -121,8 +121,8 @@ A/B のフレーム追従 (`compareFollowFrame`) は **B の stack に A と同�
 既存の操作語は Close / ungroup / Move to batch / rename。
 新しいのは「**既存の stack から部分集合の stack を作る**」操作なので、
 `Derive stack...` / `Filter stack...` / `Rebuild stack...` あたり。
-**項目5 (sequence と stack の用語混在) と同時に決めること** — ここで
-新しい語を増やすと、混在をもう1つ作ることになる。
+**項目5 (`sequence` の廃止) は済んだ** ので、名前は正典の語彙だけで決まる —— ここで
+新しい語を増やすと、たった今片付けた混在をもう1つ作ることになる。
 
 ### 検証
 
@@ -263,67 +263,47 @@ WM_NCPAINT/UAH/WM_NCACTIVATE を潰す修正を入れている。統合後の ma
 
 ---
 
-## 5. `sequence` と `stack` が混在している — 用語を定義しなおす
+## 5. ~~`sequence` と `stack` が混在している~~ — 済 (issue #58 の決定を適用)
 
 ユーザー指摘 (2026-07-29): 「sequencesとstackという言葉が混在している．terminologyを
 改めて定義しなおしましょう．」
+**決定 (2026-08-04, issue #58)**: 「sequence という言葉は廃止で決定．」
 
-正典 (`docs/terminology.md`) は **stack** を層の名前として定義している
-(`frame ⊂ stack ⊂ series ⊂ batch`)。にもかかわらず UI は今も `sequence` と言う。
-**同じ物を2つの名前で呼んでいる**のが今の状態。
+`docs/terminology.md` に**「使わない語」**の節を足し、そこが正典になった。画面と
+ドキュメントは stack / series で言い切る。言い換えの規則(正典より):
 
-### 実測した混在 (UI 文字列)
+- 読み込まれた連番の並び = **stack**。未オープンのブラウザ行・picker の候補行も含む。
+- ファイルの側だけを指すときは「**連番ファイル (numbered files)**」。層の名前ではない。
+  症状の代表だった `"each checked sequence becomes its own stack"` は
+  `"each checked group of numbered files becomes its own stack"` になった。
+- 時間方向の並びそのものは **時間軸 (time axis)**。stack が持つものであって別の層ではない。
 
-    "Select sequences"            "Load sequence"        "Load sequence?"
-    "Sequence loading"            "which sequences do you want?"
-    "%d sequence(s), %d files"    "selected: %d sequence(s), %d files"
-    "Open folder (all sequences below it)"   "Open the whole sequence (%u frames)"
-    "each checked sequence becomes its own stack"      ← 1文に両方
-    "folder: loads every numbered sequence below it, one stack per group"  ← 同上
-    "step the previewed sequence"  "loading sequence: "  "frame number (index in sequence)"
-    "needs a stack: load a numbered sequence first"    ← 同上
+### やったこと
 
-最後の3つが症状を一番よく表している: **1つの文の中で両方使っている。**
+1. `docs/terminology.md` に「使わない語: `sequence`」。定義があるだけでは混ざる
+   —— `sequence` を**禁じる**記述が無かったのが原因だった、というのが今回の教訓。
+2. `core/main.cpp` の画面文字列 48 箇所(メニュー、モーダル、ツールチップ、`--help`、
+   toast、stderr のログ行)。`File > Sequence loading` → `File > Stack loading` は
+   メニューと、それを引用する 3 つの注記を**同時に**変えた —— 片方だけ変えると
+   注記が存在しないメニューを指す。
+3. docs 8 ファイル(terminology / manual / startup / picker-ux / export-design /
+   verify-ui / reference-design / browse-topbar-design)。
+4. CLI: `--sequence <mode>` → **`--stack <mode>`**。下の選択肢のうち**改名して削除**
+   —— 別名で残すと引退した語が `--help` に永久に生き続ける(手元で `--sequence` を
+   使っていない、と確認済み)。呼び出し側は `CMakeLists.txt` の selftest 4 本、
+   `tools/verify/ab_capture.sh`、`tools/verify/run_ui_matrix.sh`、`newWindowArgv` と
+   その assert (`--newwin-selftest` の N7)。
 
-### まず決めるべきこと (これが設計判断で、だから Fable)
+### 触っていないもの(意図して)
 
-`sequence` は消すべき同義語なのか、それとも**別の物を指しているのか**。
-後者に見える根拠がある:
-
-- **ディスク上の連番ファイル群** (`frame_000.npy … frame_023.npy`) と、
-- **読み込まれて時間軸を持つ計測対象** (`SeqInfo`、σ_t が意味を持つ単位)
-
-は同じものではない。前者はまだ何も開いていない状態でも存在する
-(ブラウザのグループ行、picker の候補)。正典が名前を与えているのは後者 = **stack**。
-
-**推奨**: ディスク側は「連番ファイル (numbered files)」と呼び、`sequence` という
-語を UI から**引退**させる。読み込まれた物は常に **stack**。
-"each checked sequence becomes its own stack" は
-"each checked group of numbered files becomes its own stack" になる。
-ただし最終判断はユーザーに確認すること — 日本語の画面表記も併せて決める。
-
-### 触ってよい範囲と、触ってはいけない範囲
-
-**互換性のある表面** — 変えると既存のセッション/スクリプトが壊れる。改名しない
-(するなら読み込み側で旧キーも受ける移行が要る):
-
-- セッションのキー: `seqload` `seqname` `seqframe` `seqlevel`
-- CLI: `--sequence ask|always|never`
-- selftest 名 (`--lin-selftest` 等の内部名は自由だが、既存スクリプトが叩いている)
-
-**自由に変えてよい**: UI 文字列、`docs/*.md`、トースト、ログ。
-
-**コード識別子** (`SeqInfo` `seqId` `seqQueue` `seqLoadingId` … 約40個) は
-機械的な一括改名になるので**別コミット**にすること。混ぜると意味のある変更が
-レビューで埋もれる。急ぎではない — 画面の言葉が先。
-
-### 成果物
-
-1. `docs/terminology.md` に「`sequence` は使わない。ディスク上の連番ファイル群は
-   〜、読み込まれた物は stack」と**明記**する (今は stack の定義はあるが、
-   `sequence` を禁じる記述がない。だから混ざった)。
-2. UI 文字列の置換。
-3. 回帰: 文字列を assert しているテスト (`--browse-selftest` の row 文言など) の追随。
+- **コード識別子** (`SeqInfo` / `seqId` / `startSequenceLoad` … 1383 箇所)。画面に出ない。
+  改名するなら文言とは別コミット —— 正典にもそう書いた。
+- **セッションのキー** (`seqload` / `seqname` / `seqframe` / `seqlevel`)。改名すると
+  既存セッションが読めなくなる。
+- **`docs/diagnostics/*.txt`** —— 実行の記録。当時そう出力されたという証拠なので
+  書き換えない(いまの版は `stack: loaded N frames` と出る)。
+- **`tools/import/*.py`** の "a series is a sequence of stacks" —— ここの sequence は
+  Python の列 (list / tuple) の意味で、この語彙の sequence ではない。
 
 ---
 
@@ -474,7 +454,7 @@ x 軸ラベルにも、丸めた実効レンジと bin 幅 (DN/bin) を出すこ
 **0 行**。ホスト・ポート・現在のディレクトリはどこにも保存されていない。
 
 保存されているのは **prefs のほう** (`savePrefs`, ~3731):
-`rbflat` / `rbadv` / `rbtree` (表示の形)、`remoteexe`、
+`rbflat` / `rbtree` / `rbnatural` (表示の形)、`remoteexe`、
 `remoteurl` (= `app.lastRemoteUrl`、ただし **Start Remote ダイアログの
 入力欄の初期値としてしか使われていない** — ~14522)、`rbookmark` / `rbrecent`。
 
@@ -1374,22 +1354,37 @@ A,B比較になりますが，選択中のやつをBとしてAも選択中のや
 閉じたときと Close All (~2404 / ~2516 / ~2735)、セッション読み込み (~4289) だけ。
 `lastCompareBUid` が効くのは**その先** (B を閉じた後、比較を組み直すとき)。
 
-### 1. 「無かったら選択のやつ」= A と B が同じ画像 【要決定】
+### 1. 「無かったら選択のやつ」= A と B が同じ画像 【決定済み 2026-08-04 — (a)】
 
-今の作りはこれを**意図的に禁じている**:
+**ユーザー裁定**:「A/B比較で，A=Bの時，ヒストグラムの表示を切り替えているけど，
+このケアはかえってみずらい．比較の際に同じものを選んだ時に，同じことを確認できる
+方がよいので，こういうの全般不要です．」→ 選択肢 **(a) A==B を許す**。しかも
+「全般」— ヒストグラムだけでなく、A と B が同じ doc に解決したときに挙動を変える
+場所すべてが対象。
 
-- `resolveB()` の最後 `return b == cur() ? nullptr : b;` (~1096)
-- `ensureCompareB` の候補走査は全部 `d.get() != cur()` 付き
-- `addCompareSlot` も `if (!d || d == cur()) return;` (~1280)
+禁則は撤去済み (branch `ab-no-special-case`):
 
-理由は `selectImage` (~5272) のコメントに書いてある — 「B はユーザーが意図して
-留めたもの。A がそこへ歩いてきても書き換えない。立っている間だけ比較が黙り、
-離れれば留めたまま戻る」。**A==B で始めるなら、この規律を変えることになる。**
-差分は全ゼロ、ワイプは無意味、統計表は同じ行が2本 — 何を見せるのかまで決めること。
+- `resolveB()` の `return b == cur() ? nullptr : b;` — **撤去**。これが根で、
+  ここが null を返すせいで Histogram / Projection / Temporal / Inspector /
+  キャンバスが「比較していない」状態に落ちていた
+- `resolveSlots()` の `if (d != a)` — **撤去**。A が乗った文字が消えるのは
+  「席を失った」と読める
+- `addCompareSlot` の `d == cur()` と Files 行の A/B 項目 (`abRowItem` /
+  `compareSlotItem` / B 選択メニュー) — **撤去**。同じものを選ぶ入口が無ければ
+  裁定は実現しない
+- 「A = B (paused)」のチップとキャンバス幕 — **撤去**。沈黙を説明するための
+  語彙だったので、沈黙が無くなれば説明する対象も無い
+- パネル側の「B と同じ doc のスロットは1本に畳む」— **撤去**。2つの文字が1つの
+  doc に落ちるのは*偶然*であって、畳むと「C は B と一致」と「C が落ちた」が
+  区別できない
 
-選択肢: (a) A==B を許し「同一」と画面で言う、(b) 「B 未設定」という第3の状態を
-作る (モードには入るが B が空)、(c) 要望を採らず `prevImageUid` の今の挙動を
-維持し、画面で説明する。
+**残したもの**: `ensureCompareB` の候補走査の `d != cur()` は**残す** — これは
+既定の相手を*自動で*選ぶ規則であって、ユーザーが選んだ一致ではない。差分画像の
+全ゼロも**残す** — A−B が恒等的に0なのは正しい算術で、隠しているわけではない。
+
+見せ方: 統計表は同じ行が2本、プロットは同じ曲線が2本、色は `slotInk` が席ごとに
+分けるので重なっていることが読める。これがユーザーの言う「同じことを確認できる」。
+検証は `--abeq-selftest` (NOGL、3 ランナー全部で走る)。
 
 ### 2. 【不具合】Shift+C は書かれたが**永久に到達しない**。しかも二重予約
 

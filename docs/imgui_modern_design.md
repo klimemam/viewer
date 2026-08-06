@@ -1,13 +1,16 @@
 # Dear ImGui モダンデザイン検討 — "Aurora" テーマ
 
 Dear ImGui を「開発のテンションが上がる & 情報が分かりやすい」見た目にするための
-デザイン検討です。構成は3点セット:
+デザイン検討です。構成は2点セット:
 
 1. **C++ 本体への適用済みテーマ** — [core/ui_theme.cpp](../core/ui_theme.cpp)。
    viewer 起動時に適用され、**View > Theme** でダーク/ライトとアクセント5色を
    実行中に切り替えられます。
-2. **Python ライブデモ** — `imgui_theme.py` + `imgui_demo.py`(デザイン実験場)。
-3. このドキュメント(設計値と根拠)。
+2. このドキュメント(設計値と根拠)。
+
+> テーマの出自は Python のデザイン実験場 (`imgui_theme.py` / `imgui_demo.py`) で、
+> 値が C++ に移った時点でそちらは役目を終えたため 2026-08-03 に削除しました。
+> 以下の Python 版に関する記述は、設計値の由来としてそのまま残しています。
 
 ## スクリーンショット(C++ 本体)
 
@@ -22,17 +25,15 @@ Dear ImGui を「開発のテンションが上がる & 情報が分かりやす
 画像キャンバスとルーラーはどちらのテーマでも暗色のまま——計測対象の画像が
 常に主役で、周辺 UI だけが着替える設計です。
 
-## Python デモ(デザイン実験場)
+## Python デモ(デザイン実験場) — 撤去済み
 
-```
-pip install -r requirements-imgui.txt
-python imgui_demo.py
-```
+`imgui_demo.py` / `imgui_theme.py` / `requirements-imgui.txt` は 2026-08-03 の
+9023c64 で削除しました。**もう動かせません**。以下は設計値がどこから来たかの記録で、
+手順として読まないでください。値の正典は [core/ui_theme.cpp](../core/ui_theme.cpp) です。
 
 ギャラリー | ビューア | 統計というレイアウトのモックで、Design Lab パネルから
-ダーク/ライト・アクセント色・角丸を**その場で**動かせます。C++ に反映する前の
-色検討はここでやるのが最速です。画像・サムネイル・ヒストグラムは
-すべて手続き生成なので、アセットなしでどこでも起動します。
+ダーク/ライト・アクセント色・角丸を**その場で**動かせました。画像・サムネイル・
+ヒストグラムはすべて手続き生成でした。
 
 **ダーク**
 
@@ -59,9 +60,9 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 2. **アクセントは1色だけ** — 選択・チェック・スライダー・アクティブタブの
    オーバーラインなど「今どこ/何が選ばれているか」にのみ使う。
    ボタンはニュートラル。色数を絞ることが分かりやすさに直結する。
-3. **角丸と余白** — `FrameRounding 5` / `WindowRounding 8` と、
+3. **角丸と余白** — `FrameRounding 4`(Roomy は 5)/ `WindowRounding 8` と、
    デフォルトより一回り広い `FramePadding` / `ItemSpacing`。
-   ImGui が窮屈に見える最大の原因は余白不足。
+   ImGui が窮屈に見える最大の原因は余白不足。数値は下の表が正典。
 4. **境界線はヘアライン** — 不透明な枠線をやめ、
    `rgba(255,255,255,0.06)`(ライトでは黒の10%)の極薄ラインに。
    区切りは「線」ではなく「明度差」で見せる。
@@ -78,14 +79,13 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 | hairline | `#FFFFFF` @6% | 境界線、セパレータ |
 | accent | `#6B8CFF`(Aurora Blue) | 選択・フォーカスの表示のみ |
 
-アクセントはプリセット5色(`imgui_theme.ACCENTS`)から選択でき、
-カスタム色も指定可能です。ライトバリアントでは同じアクセントを
-自動で 18% 暗くしてコントラストを確保します。
+アクセントはプリセット5色(`ui_theme.cpp` の `ACCENTS`: Aurora Blue / Iris Violet /
+Mint Teal / Sunset Coral / Citrus Lime)から **View > Theme** で選べます。
+ライトバリアントでは同じアクセントを自動で 18% 暗くしてコントラストを確保します
+(`applyLight` の `scaleRgb(accent, 0.82f)`)。
 
 ## 形状・余白の設計値
 
-| パラメータ | 値 | メモ |
-| --- | --- | --- |
 **2系統あります**: 既定は **Compact**(データ表が主役の本体向け)、`View > Compact UI` を
 外すと Roomy(ショーケース向けの余裕ある値)になります。実装は
 [core/ui_theme.cpp](../core/ui_theme.cpp) の `applyShapes(style, compact)`。
@@ -117,11 +117,12 @@ ImGui デフォルトテーマからの脱却ポイントは4つだけです。�
 ## 「ImGui 感」を消す実装テクニック
 
 テーマ(色・角丸・余白)だけでは ImGui 特有の見た目は消えません。
-デモに実装済みの手法を、原因 → 対策で整理します。
+撤去済み Python デモに実装されていた手法を、原因 → 対策で整理した記録です
+(`実装` 列はそのデモの関数名。本体側の該当状況は最後の節)。
 
 | ImGui っぽさの原因 | 対策 | 実装 |
 | --- | --- | --- |
-| デフォルトフォント(ProggyClean)のドット感 | 実フォントを 16px で読み込む(ここでは Roboto、同梱アセット) | `_load_fonts()` |
+| デフォルトフォント(ProggyClean)のドット感 | 実フォントを読み込む(デモは Roboto 16px、**本体は 17px** — 下の「フォントについて」) | `_load_fonts()` |
 | テキストだけのボタン列 | FontAwesome をマージしてアイコンツールバー化、説明はツールチップに逃がす | `icon_button()` |
 | ドッキングのタブバー・×ボタン・▼メニュー | `DockNodeFlagsPrivate_.no_tab_bar` で全ノードのタブバーを消し、代わりに小さな大文字ヘッダを描く | `panel_header()`, `NO_TAB_BAR` |
 | メニューバー("Debug" 的な佇まい) | メニューバー自体を廃止し、操作はツールバーへ | `show_menu_bar = False` |
@@ -135,8 +136,8 @@ ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの
 
 ## ImGui で見づらくなりがちな部分と回避策
 
-- **小さい文字・低コントラスト** → ベース 16px + `push_font(None, size)`
-  (ImGui 1.92 の動的フォント)で見出し 12px などを使い分ける。
+- **小さい文字・低コントラスト** → ベースを十分大きく(デモ 16px / 本体 17px)取り、
+  `push_font(None, size)`(ImGui 1.92 の動的フォント)で見出しを使い分ける。
 - **ボタンの機能が分からない** → アイコン + `set_item_tooltip()`
   にショートカットを併記("Fit to window (F)" など)。
 - **表が詰まって読めない** → テーブルは `cell_padding (10,6)` +
@@ -160,26 +161,28 @@ ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの
 
 ## 実装メモ
 
-- テーマは**素の ImGui スタイル値を設定するだけ**です。C++ 版は
-  [core/ui_theme.cpp](../core/ui_theme.cpp)、Python 版は `imgui_theme.py` で、
-  両者は同じ数値を共有しています(片方を変えたらもう片方へ同期)。
+- テーマは**素の ImGui スタイル値を設定するだけ**です。実装は
+  [core/ui_theme.cpp](../core/ui_theme.cpp) **だけ**で、同期先はもうありません
+  (`imgui_theme.py` は撤去済み)。値を変えるならそこ一箇所。
 - デモは [imgui-bundle](https://github.com/pthom/imgui_bundle) の
   hello_imgui(docking レイアウト)+ immvision(numpy 画像表示)+
   implot(ヒストグラム)を使用。
 - hello_imgui は ini に保存したテーマを起動後に再適用するため、
   デモでは `remember_theme = False` にした上で毎フレーム
   `pre_new_frame` からテーマを適用しています(スタイル値の代入のみで軽量)。
-- Design Lab パネルで ダーク/ライト・アクセント色・角丸を**実行中に変更**
-  できます。デザイン調整の試行錯誤はここで行うのが速いです。
-- スクリーンショットは headless で再生成できます:
-  `xvfb-run python imgui_demo.py --screenshot docs/img/imgui_dark.png [--light|--compare]`
+- デモの Design Lab パネルで ダーク/ライト・アクセント色・角丸を実行中に変更
+  できました。本体で実行中に変えられるのは **View > Theme**(ダーク/ライトと
+  アクセント5色)と **View > Compact UI**(Compact / Roomy)です。
+- `img/imgui_*.png` はそのデモの画面で、再生成する手段はもうありません
+  (`img/viewer_*.png` が本体の画面)。
 
 ## フォントについて
 
-デモは同梱の **Roboto Regular 16px** + FontAwesome(アイコン)を使用しています。
+本体は **17px** で、OS ごとの候補(Windows: Meiryo / Yu Gothic / MS Gothic、
+macOS: ヒラギノ角ゴシック、Linux: Noto Sans CJK)から先に見つかったものを
+`jpFontPath()` が自動検出します(`core/main.cpp`)。撤去済みデモは同梱の
+**Roboto Regular 16px** + FontAwesome(アイコン)でした。
 ImGui 1.92 以降はグリフを動的に読み込むため、グリフ範囲の指定は不要です。
-日本語 UI にする場合は **Noto Sans JP** / **IBM Plex Sans JP** の ttf を
-リポジトリに追加し、`_load_fonts()` の1行を差し替えるだけで済みます。
 
 ## C++ 本体への適用状況
 

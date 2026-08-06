@@ -1,0 +1,149 @@
+plugin loaded: analyzer_esfr.dll (1 plugin(s))
+plugin loaded: analyzer_noise.dll (1 plugin(s))
+plugin loaded: analyzer_prnu.dll (1 plugin(s))
+plugin loaded: analyzer_sharpness.dll (1 plugin(s))
+plugin loaded: analyzer_stats.dll (1 plugin(s))
+plugin loaded: display_falsecolor.dll (1 plugin(s))
+plugin loaded: proc_demosaic.dll (1 plugin(s))
+sequence: 00/frame_000‥004.npy - 5 files (npy)
+sequence: loaded 5 frames
+sequence: 01/frame_000‥004.npy - 5 files (npy)
+sequence: loaded 5 frames
+sequence: 02/frame_000‥004.npy - 5 files (npy)
+sequence: loaded 5 frames
+abstatsselftest: compare OFF, A='frame_000.npy' (stack 1): hist sampled=5120 maxBin=28 mean0=1000.13251, sigma_t=25.3510758
+abstatsselftest: A0 compare off leaves slot 1 empty                     PASS
+abstatsselftest: compare SPLIT+follow, B='frame_000.npy' (stack 2): hist[0].uid=1 (A=1)  hist[1].uid=6 (B=6)  proj[1].uid=6  temporal[1].seqId=2 frames=5
+abstatsselftest: A1 histogram: both slots, own uid                      PASS
+abstatsselftest: A1 projection: both slots, own uid                     PASS
+abstatsselftest: A1 temporal: both slots, own stack                     PASS
+abstatsselftest: A1 slot 1 names B, not A                               PASS
+abstatsselftest: B independent recompute: series=4 sampled=5120/5120  mean0 1201.47802172 vs 1201.47802172  sd0 30.9874946607 vs 30.9874946607  sigma_t 25.0045948567 vs 25.0850055866
+abstatsselftest: A2 B histogram bins match an independent pass exactly  PASS
+abstatsselftest: A2 B mean/sd match within 1e-6 relative                PASS
+abstatsselftest: A2 B sigma_t matches within 1e-6 relative              FAIL
+abstatsselftest: A2 fixture: A and B histograms actually differ         PASS
+abstatsselftest: A3 A histogram byte-identical with B present           PASS
+abstatsselftest: A3 A projection byte-identical with B present          PASS
+abstatsselftest: A3 A temporal byte-identical with B present            PASS
+abstatsselftest: union: A bins 896.436401..1307.37097, B bins 896.436401..1307.37097 | content A 896.436401..1160.44421, B 1087.39697..1307.37097 | A alone 896.436401..1160.44421
+abstatsselftest: A3b union: A is binned on the A-and-B union, not on A alone PASS
+abstatsselftest: A3b union: both sides land on the same bin axis        PASS
+abstatsselftest: A3b back on A's range: A is byte-identical to compare-off again PASS
+abstatsselftest: 5x gotoFrame(1): A frame=4, B frame=4, B uid 6->10, temporal[1].seqId=2 frames=5
+abstatsselftest: A4 both hist slots follow the frame step               PASS
+abstatsselftest: A4 follow-frame put B on A's frame number              PASS
+abstatsselftest: A4 temporal[1] unchanged by a frame step (keyed on the stack) PASS
+abstatsselftest: P1 bin axis: A black/white 896.436/1160.44, B's own 896.436/1160.44, hist[1] binned on 896.436/1160.44
+abstatsselftest: P1 fixture: B's own range really differs               PASS
+abstatsselftest: P1 B is binned on A's black/white, not its own         PASS
+abstatsselftest: P1 plane selector changes nothing that was measured    PASS
+abstatsselftest: P1 layout: auto/split=1 auto/wipe=0 forced-side/wipe=1 forced-overlay/split=0
+abstatsselftest: P1 Auto follows the image layout, explicit overrides it PASS
+abstatsselftest: P2 same-size B shares A's profile axis                 PASS
+abstatsselftest: P2 odd B 'grad_u16.npy' 640x480 vs A 80x64: profile A x 0..79 / B x 0..639, overlayable=0
+abstatsselftest: P2 fixture: the odd B really is a different size       PASS
+abstatsselftest: P2 size-mismatched B is refused the overlay            PASS
+abstatsselftest: P2 series count reflects the channel count             PASS
+abstatsselftest: P2b throttle: armed=1 held uid=6 vs B uid=8, released=1, after release uid=8
+abstatsselftest: P2b rapid stepping arms the B throttle                 PASS
+abstatsselftest: P2b B slot holds its last result while stepping (stale) PASS
+abstatsselftest: P2b B refreshes once the stepping stops                PASS
+abstatsselftest: P2c pinned B: binned on 896.436..1307.37, axis now 873.489..1307.37, B uid unchanged=1, stale=1
+abstatsselftest: P2c a freshly binned B is not stale                    PASS
+abstatsselftest: P2c fixture: stepping A moves the union while B's uid does not PASS
+abstatsselftest: P2c a pinned B binned on the OLD union reads as stale  PASS
+abstatsselftest: P2c ...and is fresh again once the stepping stops      PASS
+abstatsselftest: P3 table inputs: A sigma_t=25.3510758 (n=5/5, server=0), B sigma_t=25.0850056 (n=5/5, server=0), delta A-B=0.266070209, delta=1.04954 %, unit=[DN]
+abstatsselftest: P3 both sides resolve to stack temporal numbers        PASS
+abstatsselftest: P3 local stacks come from the local computation        PASS
+abstatsselftest: P3 delta is A - B (the difference image's sign)        PASS
+abstatsselftest: P3b region: server A roiUsed=0 (rw=0), local B roiUsed=1 (rw=8), same region=0
+abstatsselftest: P3b a server whole-frame A and an ROI B are not one region PASS
+abstatsselftest: P3b with no ROI both sides say whole image             PASS
+abstatsselftest: P3 equal channel counts allow a delta                  PASS
+abstatsselftest: P3 B's server temporal is never fired automatically    PASS
+abstatsselftest: P3 lone B 'rgb_u8.npy' 3ch: isStack=0 valid=0 note='not a stack', delta meaningful=0 (A 1ch)
+abstatsselftest: P3 a B that is not a stack says so instead of a number PASS
+abstatsselftest: P3 different channel counts suppress the delta columns PASS
+abstatsselftest: T1 overlay 560x440: ran=1 plotted=1 slots=2 A=5 B=5 plot y 239.0..344.0 (window bottom 440.0) avail before chart=223.0
+abstatsselftest: T1 A and B both stacks: the chart is drawn             PASS
+abstatsselftest: T1 ...with data for BOTH sides on it                   PASS
+abstatsselftest: T1 ...and it lands inside the panel, not below it      PASS
+abstatsselftest: T1 ...and neither side is reported axis-less           PASS
+abstatsselftest: T1b side-by-side 1080x440 (uiScale 1.50): side=1 A=5 B=5 plot bottom=382.0 window bottom=440.0
+abstatsselftest: T1b side by side: each side gets its own curve         PASS
+abstatsselftest: T1b ...and both plots fit in the panel                 PASS
+abstatsselftest: T2 lone-frame B: plotted=1 A=5 B=0 noAxis=1 ('B')
+abstatsselftest: T2 B a lone frame: A's chart is still drawn            PASS
+abstatsselftest: T2 ...and the panel says B has no time axis            PASS
+abstatsselftest: T2 ...and A's plot fits in the panel                   PASS
+abstatsselftest: T2b lone-frame A: plotted=1 A=0 B=5 noAxis=1
+abstatsselftest: T2b A a lone frame: B's chart is drawn anyway          PASS
+abstatsselftest: T2b ...and the panel says A has no time axis           PASS
+abstatsselftest: T6 two lone frames: ran=1 plotted=0 noAxis=2
+abstatsselftest: T6 no time axis on either side: both say why, no chart PASS
+abstatsselftest: T3 slot C: slots=3 A=5 B=5 C=5
+abstatsselftest: T3 an extra compare slot gets its own curve            PASS
+abstatsselftest: T3 ...without costing A or B theirs                    PASS
+abstatsselftest: T5 short panel 560x300: plotted=1 A=5 B=5 plot y 170.0..275.0 window bottom=300.0
+abstatsselftest: T5 a short panel keeps both curves                     PASS
+abstatsselftest: T5 ...and the chart, not the table, keeps the room     PASS
+abstatsselftest: T4 compare off: plotted=1 A=5 plot bottom=369.0 window bottom=440.0
+abstatsselftest: T4 compare off: the one-sided chart is drawn and fits  PASS
+abstatsselftest: CmpOff: hist[1].uid=0 img=0000000000000000, proj[1].uid=0 img=0000000000000000, temporal[1].seqId=-1, slot1Live=0
+abstatsselftest: A6 CmpOff invalidates slot 1                           PASS
+abstatsselftest: A6 compare-off frames after the first do nothing       PASS
+abstatsselftest: closeStack(B=2): slot 1 held 000002735aa30cc0, now hist[1].img=0000000000000000 uid=0, proj[1].img=0000000000000000, cmpB()=0000000000000000
+abstatsselftest: A6 fixture: slot 1 really held B                       PASS
+abstatsselftest: A6 closing B leaves no dangling pointer in slot 1      PASS
+abstatsselftest: A7 fixture: two stacks still open                      PASS
+abstatsselftest: A7 fixture: two stacks with frames                     PASS
+abstatsselftest: A7 compare off: A-row=1 other-row=0
+abstatsselftest: A7 another row offers Set as compare B                 PASS
+abstatsselftest: A7 compare off: the current row offers no items        PASS
+abstatsselftest: A7 compare on: another row still offers Set as compare B PASS
+abstatsselftest: A7 compare on: the current row STILL offers no items (was Swap) PASS
+abstatsselftest: A7 a different frame of A's stack can still be B       PASS
+abstatsselftest: A7 after the swap the old A is a Set-as-B row again    PASS
+abstatsselftest: A8 stand on B: pin kept=1 compare quiet=1; step away: B is back=1
+abstatsselftest: A8 selecting B does not rewrite the pin                PASS
+abstatsselftest: A8 ...the comparison goes quiet while A stands on it   PASS
+abstatsselftest: A8 ...and B is still B when A steps away               PASS
+abstatsselftest: A9 off then on: chose #1, came back #1
+abstatsselftest: A9 compare off and on returns to the same B            PASS
+abstatsselftest: S fixture: two stacks are open                         PASS
+abstatsselftest: S fixture: five frames each                            PASS
+abstatsselftest: S1 A at frame 2: slot C -> frame_002.npy seq=3 idx=2
+abstatsselftest: S1 slot C follows A's frame number, like B             PASS
+abstatsselftest: S2 tiles:  A:frame_002.npy(f2)  C:frame_002.npy(f2)
+abstatsselftest: S2 the tile badge stays C on the followed frame        PASS
+abstatsselftest: S3 A at frame 4: slot C idx=0 diverged=1
+abstatsselftest: S3 a slot past its stack's frames says diverged        PASS
+abstatsselftest: S3 ...showing the pinned frame, flagged, not a fake match PASS
+abstatsselftest: S4 badges '00/frame_000‥004.npy=A;02/frame_000‥004.npy=BC;rgb_u8.npy=D;'  want '02/frame_000‥004.npy=BC;' + rgb_u8.npy=D;
+abstatsselftest: S4 the stack holding B and slot C reads BC             PASS
+abstatsselftest: S4 a standalone frame in slot D reads D                PASS
+abstatsselftest: S5 chip while A==B: 'A = B (paused: this image IS the pinned B - move A to resume)'
+abstatsselftest: S5 standing on the pinned B says paused, not 'no B image' PASS
+abstatsselftest: S5 chip after stepping off: 'A/B wipe 50%  B: 00/frame_000‥004.npy'
+abstatsselftest: S5 ...and stepping off resumes the pair                PASS
+abstatsselftest: S6 badges (comparing): '00/frame_000‥004.npy=A;02/frame_000‥004.npy=B;rgb_u8.npy=C;'
+abstatsselftest: S6 comparing: the current row wears the A badge, full ink PASS
+abstatsselftest: S6 comparing: the B seat reads B, full ink             PASS
+abstatsselftest: S6 comparing: slot C reads C, full ink                 PASS
+abstatsselftest: S6 first ESC deselects the ROI, and nothing else       PASS
+abstatsselftest: S6 second ESC exits compare, and only compare          PASS
+abstatsselftest: S6 ...keeping the B pin and the slot letters (seats survive) PASS
+abstatsselftest: S6 a third ESC has nothing left to take                PASS
+abstatsselftest: S6 esc chain: 'roi;compare;nothing;'
+abstatsselftest: S6 the three presses read as one chain, one step each  PASS
+abstatsselftest: S6 badges (compare off): '02/frame_000‥004.npy=B(dim);rgb_u8.npy=C(dim);'
+abstatsselftest: S6 compare off: the B seat stays visible, dimmed       PASS
+abstatsselftest: S6 compare off: slot C stays visible, dimmed           PASS
+abstatsselftest: S6 compare off: no A badge - the cursor is not a seat  PASS
+abstatsselftest: S6 C resumes the comparison                            PASS
+abstatsselftest: S6 badges (resumed): '00/frame_000‥004.npy=A;02/frame_000‥004.npy=B;rgb_u8.npy=C;'
+abstatsselftest: S6 ...with the same B (A9: the pair returns)           PASS
+abstatsselftest: S6 ...and the letters are back at full ink             PASS
+abstatsselftest: FAILED

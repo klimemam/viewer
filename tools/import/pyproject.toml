@@ -1,0 +1,27 @@
+# Installable so an editor can see the types a reader returns.
+#
+#     pip install -e tools/import
+#
+# The harness puts this directory on sys.path before it runs a reader, so a
+# reader works without installing anything. An editor does not know that, and
+# writing `Stack(arr, timestamps=...)` with no completion and no signature is
+# the difference between the contract being discoverable and being folklore.
+# Installing it is for the person writing the reader, not for running one.
+#
+# Nothing is required to install it: viewer_import imports dataclasses and
+# typing and nothing else. numpy is the reader's business, not this module's.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viewer-import"
+version = "1.0.0"
+description = "The types a viewer reader returns: Frame, Stack, Series, Batch, Values"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "same as viewer" }
+
+[tool.setuptools]
+py-modules = ["viewer_import"]

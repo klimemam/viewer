@@ -50,10 +50,10 @@ item A17  "tile/montage panes: letter+batch identity, union label, narrow elisio
   -- --tile-selftest tools/testdata/multi
 # A18 montage naming + per-frame-range note + n-of-N honesty
 item A18  "ROI montage: name carries (montage H/V[, per-frame range]), n of N" \
-  -- --export-selftest tools/testdata/multi --sequence always
+  -- --export-selftest tools/testdata/multi --stack always
 # A19 Temporal x-axis paste parsing (newline / CRLF / mixed separators)
 item A19  "Temporal x axis paste: comma/space/tab/newline/CRLF, positioned errors" \
-  -- --export-tsv-selftest tools/testdata/multi --sequence always --cfa bayer --bayer-pattern RGGB
+  -- --export-tsv-selftest tools/testdata/multi --stack always --cfa bayer --bayer-pattern RGGB
 # A20 frame-linearity panel sections and their stubs
 item A20  "frame-lin panel: sections, 'set the x axis first' stub, both plots inside" \
   -- --frame-lin-selftest tools/testdata
@@ -71,7 +71,7 @@ item A24  "local browse: title/tag/peer/header identity" \
 
 # ---- section B: 設計正典 expressible as UI state --------------------------
 item B3   "CFA planes never mixed in the UI tables (one row per plane)" \
-  -- --export-tsv-selftest tools/testdata/multi --sequence always --cfa bayer --bayer-pattern RGGB
+  -- --export-tsv-selftest tools/testdata/multi --stack always --cfa bayer --bayer-pattern RGGB
 
 echo
 echo "UI MATRIX pass=$pass fail=$fail   (traces in $OUT)"

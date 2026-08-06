@@ -23,4 +23,19 @@ void apply(int variant, int accentIdx, float uiScale, bool compact = true);
 // darkest layer so letterboxing around the canvas looks intentional.
 ImVec4 clearColor(int variant);
 
+// One ink per layer of the canon (frame ⊂ stack ⊂ series ⊂ batch), so the Files
+// tree says which kind of thing a row is without reading the name.
+//
+// Deliberately LOW chroma. Rule 2 of this theme is that the accent — and only
+// the accent — means "where am I / what is selected", and the accent is one of
+// five the user picks. A layer tint at accent saturation would read as a
+// selection, and would collide with whichever accent they chose. These sit near
+// the body text in lightness and differ in hue alone: enough to tell four
+// labels apart, not enough for any of them to shout.
+//
+// The hues walk in containment order (frame → stack → series → batch), so the
+// sequence itself carries the nesting rather than being four arbitrary colors.
+enum Layer { LayerFrame = 0, LayerStack = 1, LayerSeries = 2, LayerBatch = 3 };
+ImVec4 layerInk(int variant, int layer);
+
 }  // namespace ui_theme

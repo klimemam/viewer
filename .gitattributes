@@ -1,0 +1,6 @@
+# Shell scripts must keep LF even when checked out on Windows (the default
+# there is core.autocrlf=true). tools/run_selftests.sh is executed by the CI
+# job on ubuntu and macos, and a CRLF shebang fails there as
+# "/usr/bin/env: 'bash\r': No such file or directory" - a failure that reads
+# like a missing interpreter and is nothing of the kind.
+*.sh text eol=lf
