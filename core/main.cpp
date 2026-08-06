@@ -9219,10 +9219,18 @@ static void promotePreview(ImageDoc* d) {
     // §6.2: promotion is what makes this a REGISTERED open, so this is where
     // an ex-preview source joins the registry (previews themselves never
     // touch it). A source still at step > 1 is refused by srcShareable and
-    // registers later, when its full-resolution swap lands; a step-1 source
-    // adopting a resident here swaps to pixel-identical bytes (same url+frame,
-    // full resolution), so nothing on screen or in any cache is invalidated.
-    shareOrRegisterSource(*d);
+    // registers later, when its full-resolution swap lands. A step-1 source
+    // may ADOPT a resident here - and a remote tuple carries no mtime/fsize
+    // generation, so the resident can hold an OLDER fetch of the same
+    // url+frame than the preview just displayed. Adoption therefore runs the
+    // same invalidation walk as the full-res swap (mirrors are synced by the
+    // adoption itself): the screen and every cache re-read through the
+    // adopted source instead of keeping the preview generation's numbers.
+    if (shareOrRegisterSource(*d)) {
+        d->dataRev++;
+        d->texDirty = true;
+        forgetImage(d);
+    }
     // the buffering the preview deferred, at REGISTERED priority now
     requestFullRemote(d);
     if (d->remoteFrames > 1 && d->seqId == 0) {
@@ -26018,6 +26026,51 @@ int main(int argc, char** argv) {
             check(note.find("4 frame(s) freed") != std::string::npos &&
                   note.find("1 still referenced by") != std::string::npos,
                   "V20e queued-but-not-landed holder counts as alive");
+        }
+        // (f) promotion that ADOPTS must invalidate. A remote tuple carries no
+        //     mtime/fsize generation, so the resident a promotion adopts can
+        //     hold an OLDER fetch than the preview just displayed - after the
+        //     src swap, the doc's texture and caches still describe the
+        //     preview's bytes. The full-res swap path already runs the
+        //     invalidation walk (dataRev/texDirty/forgetImage) after its
+        //     adoption; promotion must run the same walk.
+        reload();
+        {
+            ImageDoc* a = app.images[framesOfSeq(app.seqs[0].id)[0]].get();
+            auto pv = std::make_unique<ImageDoc>();
+            pv->name = "promoted.npy";
+            {   // same identity tuple as a's registered source, decoded
+                // "independently" (what a preview fetch is) - with DIFFERENT
+                // pixels, so a silent generation swap is observable
+                FrameSource& S = *pv->src;
+                S.path = a->src->path;
+                S.remoteUrl = "local://" + a->src->path;
+                S.npzMember = a->src->npzMember;
+                S.fileFrame = a->src->fileFrame; S.remoteFrame = a->src->remoteFrame;
+                S.frameAxis = a->src->frameAxis;
+                S.mtime = a->src->mtime; S.fsize = a->src->fsize;
+                S.w = a->w; S.h = a->h; S.ch = a->ch; S.dtype = a->dtype;
+                S.data.assign((size_t)a->w * a->h * a->ch, -7.0f);
+                S.vmin = -7.0f; S.vmax = -7.0f;
+            }
+            pv->syncMirrors();
+            pv->preview = true;
+            pv->uid = app.nextUid++;
+            pv->texDirty = false;              // "already drawn" preview
+            ImageDoc* p = pv.get();
+            app.images.push_back(std::move(pv));
+            app.previewUid = p->uid;
+            const int rev0 = p->dataRev;
+            promotePreview(p);
+            fprintf(stderr, "verifyselftest: V20f promote-adopt: src %s, "
+                            "dataRev %d -> %d, texDirty %d\n",
+                    p->src == a->src ? "adopted" : "PRIVATE",
+                    rev0, p->dataRev, (int)p->texDirty);
+            check(p->src == a->src, "V20f promotion adopts the resident tuple");
+            check(p->dataRev > rev0 && p->texDirty,
+                  "V20f promote-adopt invalidates (dataRev + texture)");
+            check(!p->preview && app.previewUid == 0,
+                  "V20f promoted doc has left the preview slot");
         }
 
         fprintf(stderr, "verifyselftest: %s\n", ok ? "ok" : "FAILED");
