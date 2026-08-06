@@ -559,6 +559,13 @@ viewer_selftest(srcmap NOGL --srcmap-selftest tools/testdata/multi)
 # so it gates on all three runners rather than on the one with a GL context.
 viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 
+# The reload walk (docs/reference-design.md §3.2): a frame's FILE rewritten
+# under a live stack. R0-R23 cover the invalidation walk, the temporal key
+# (stackRev), the registry re-key, the recorded npy READING replayed on
+# reload (R18a-c), and two readings of one file staying two tuples (R21b).
+# It writes its own fixtures under a scratch subdirectory of the given dir.
+viewer_selftest(reload NOGL --reload-selftest tools/testdata)
+
 # --remote-selftest returns before startup reaches GLFW at all, so it was the
 # one test carrying NOGL before there was a windowless startup path - and it
 # must be told where the standalone peer is, or it silently tests this binary
