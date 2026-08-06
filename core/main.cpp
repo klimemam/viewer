@@ -284,6 +284,21 @@ static void statSourceFile(FrameSource& s) {
     auto sz = std::filesystem::file_size(p, ec);
     s.fsize = ec ? 0 : (uint64_t)sz;
 }
+// The local:// twin of statSourceFile: the url EMBEDS a path on this disk, so
+// unlike a true remote the disk baseline is knowable - and it has to be known,
+// because a local:// tuple with mtime/fsize 0 never moves: an overwrite on
+// disk followed by a re-open of the same url would ADOPT the stale resident
+// and silently show the old pixels. ssh:// urls stay 0/0 on purpose (a peer's
+// disk cannot be statted from here; change detection there is Watch's).
+static void statLocalUrl(FrameSource& s) {
+    if (s.remoteUrl.rfind("local://", 0) != 0) return;
+    std::error_code ec;
+    auto p = pathFromUtf8(s.remoteUrl.substr(8));
+    auto t = std::filesystem::last_write_time(p, ec);
+    s.mtime = ec ? 0 : (int64_t)t.time_since_epoch().count();
+    auto sz = std::filesystem::file_size(p, ec);
+    s.fsize = ec ? 0 : (uint64_t)sz;
+}
 // A deep copy of s with its own identity: same content, fresh srcId, rev 0.
 // The two callers are the crop CoW (§2.2) and any ImageDoc copy that must not
 // alias a live source.
@@ -376,7 +391,13 @@ static std::string srcIdentityKey(const FrameSource& s) {
 static bool srcShareable(const FrameSource& s) {
     if (s.path.empty() && s.remoteUrl.empty()) return false;   // montage/processed
     if (s.remoteStep > 1 || !s.remoteErr.empty()) return false;
-    if (s.remoteUrl.empty() && s.mtime == 0 && s.fsize == 0) return false;
+    // no disk baseline = no tuple, and local:// counts as disk: its embedded
+    // path is statLocalUrl-able, so a 0/0 local:// source is one that skipped
+    // the stat - refusing it here fails SAFE (no sharing) instead of letting
+    // an overwrite-then-reopen adopt stale pixels under a key that never moves
+    const bool localDisk = s.remoteUrl.empty() ||
+                           s.remoteUrl.rfind("local://", 0) == 0;
+    if (localDisk && s.mtime == 0 && s.fsize == 0) return false;
     if (s.rawDtype >= 0)              // raw decodes always record srcW/srcH
         return s.w == s.srcW && s.h == s.srcH && s.cropX == 0 && s.cropY == 0;
     return s.srcW == 0;               // npy: srcW only appears once cropped
@@ -1330,6 +1351,9 @@ struct App {
                                       // results must not graft onto a new list
         bool low = false;             // preview buffering: yields to registered opens
         size_t bytes = 0;             // what this frame will occupy once resident
+        int64_t mtime = 0;            // local:// only: the disk baseline statted at
+        uint64_t fsize = 0;           // ENQUEUE (identity before bytes) - the minted
+                                      // sibling binds to the OPEN's stat epoch
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -1342,6 +1366,8 @@ struct App {
         int frame = 0, seqId = 0, seqIndex = 0;
         uint32_t gen = 0;
         size_t bytes = 0;             // what was committed for it, to give back
+        int64_t mtime = 0;            // the job's enqueue-time disk baseline
+        uint64_t fsize = 0;           // (local:// only) - see RFetchJob
     };
     std::atomic<uint32_t> rfGen{ 0 };
     std::thread rfThread;
@@ -2936,6 +2962,7 @@ static void rfWorker() {
         d.frame = job.frame; d.seqId = job.seqId; d.seqIndex = job.seqIndex;
         d.gen = job.gen;
         d.bytes = job.bytes;
+        d.mtime = job.mtime; d.fsize = job.fsize;
         std::string host, rpath, err;
         int port = 0;
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
@@ -3063,7 +3090,10 @@ static void pumpRemoteFetch() {
                                                  // Inspector's source row is a property
                                                  // of the STACK, so it never appears or
                                                  // vanishes as the user steps frames
-            FrameSource& S = *doc->src;          // fresh source (remote: no stat)
+            FrameSource& S = *doc->src;
+            S.mtime = d.mtime;                   // the enqueue-time baseline: every
+            S.fsize = d.fsize;                   // frame of one open, one stat epoch
+                                                 // (0/0 for ssh://)
             S.path = d.url;
             S.remoteUrl = d.url;
             S.remoteFrame = d.frame;
@@ -11249,11 +11279,13 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         nd = decodeRawFrame(d, err);       // stats BEFORE reading, like every loader
     } else {
         // identity BEFORE the bytes: an overwrite completing during this read
-        // binds the OLD tuple to the OLD pixels - the safe direction. A
-        // local:// source keeps its url identity (mtime/fsize stay 0, exactly
-        // as the open path left them), so its registry key never moves.
+        // binds the OLD tuple to the OLD pixels - the safe direction.
         FrameSource st;
-        if (!localUrl) { st.path = fpath; statSourceFile(st); }
+        st.path = fpath;
+        statSourceFile(st);                // local:// too: its embedded path IS this
+                                           // disk, and the reloaded tuple must move
+                                           // with it (an unmoved key would let a
+                                           // later open adopt pre-reload pixels)
         std::vector<uint8_t> npy;          // the .npy bytes, plain or extracted
         if (!src->npzMember.empty()) {
             std::vector<uint8_t> zip;
@@ -12205,6 +12237,14 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
         return false;
     }
     if (asPreview) dropPreview();          // ONE slot: the next look replaces it
+    // identity BEFORE the bytes (§6.2), the same discipline as every local
+    // loader: for a local:// url the peer reads THIS disk, so stat it now -
+    // an overwrite completing during the tile reads below binds the OLD tuple
+    // to the OLD pixels, and a later re-open stats fresh and re-decodes.
+    // ssh:// stays 0/0 (a peer's disk cannot be statted from here).
+    FrameSource urlStat;
+    urlStat.remoteUrl = url;
+    statLocalUrl(urlStat);
     std::string err;
     // app.uiSession, never the browse worker's: two threads framing requests
     // into one ssh stdin desynchronise the stream permanently, and the worker's
@@ -12231,7 +12271,9 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     auto doc = std::make_unique<ImageDoc>();
     doc->name = baseName(rpath) + (frame > 0 ? " #" + std::to_string(frame) : "") +
                 (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
-    FrameSource& S = *doc->src;              // remote: no local file to stat
+    FrameSource& S = *doc->src;
+    S.mtime = urlStat.mtime;                 // the PRE-read stat: 0/0 for ssh://,
+    S.fsize = urlStat.fsize;                 // the disk baseline for local://
     S.path = url;
     S.dtype = dt;
     S.w = tw; S.h = th; S.ch = tch;
@@ -12351,6 +12393,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             j.seqId = si.id;
             j.seqIndex = i;
             j.bytes = perFrame;       // committed against the budget until it lands
+            j.mtime = urlStat.mtime;  // the open's stat epoch rides to every frame
+            j.fsize = urlStat.fsize;
             rfEnqueue(std::move(j));
         }
         if (fit < m.frames - 1) {
@@ -12420,6 +12464,13 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         j.seqId = si.id;
         j.seqIndex = i;
         j.bytes = perFrame;
+        {   // per-file baseline: a folder stack's members are separate files,
+            // so each job stats ITS file (identity before bytes; 0/0 for ssh://)
+            FrameSource fs;
+            fs.remoteUrl = j.url;
+            statLocalUrl(fs);
+            j.mtime = fs.mtime; j.fsize = fs.fsize;
+        }
         rfEnqueue(std::move(j));
     }
     if (fit < (int)files.size() - 1) {
@@ -12490,12 +12541,14 @@ static void promotePreview(ImageDoc* d) {
     // an ex-preview source joins the registry (previews themselves never
     // touch it). A source still at step > 1 is refused by srcShareable and
     // registers later, when its full-resolution swap lands. A step-1 source
-    // may ADOPT a resident here - and a remote tuple carries no mtime/fsize
-    // generation, so the resident can hold an OLDER fetch of the same
-    // url+frame than the preview just displayed. Adoption therefore runs the
-    // same invalidation walk as the full-res swap (mirrors are synced by the
-    // adoption itself): the screen and every cache re-read through the
-    // adopted source instead of keeping the preview generation's numbers.
+    // may ADOPT a resident here - and an ssh:// tuple carries no mtime/fsize
+    // generation (a local:// one now does, but the stat's granularity is not
+    // a proof of identical bytes), so the resident can hold an OLDER fetch of
+    // the same url+frame than the preview just displayed. Adoption therefore
+    // runs the same invalidation walk as the full-res swap (mirrors are
+    // synced by the adoption itself): the screen and every cache re-read
+    // through the adopted source instead of keeping the preview generation's
+    // numbers.
     if (shareOrRegisterSource(*d)) {
         d->dataRev++;
         d->texDirty = true;
@@ -12532,6 +12585,8 @@ static void promotePreview(ImageDoc* d) {
             j.seqIndex = i;
             j.frame = i;
             j.bytes = perFrame;
+            j.mtime = d->src->mtime;  // the promoted open's stat epoch (see above)
+            j.fsize = d->src->fsize;
             rfEnqueue(std::move(j));
             q++;
         }
@@ -35362,6 +35417,39 @@ int main(int argc, char** argv) {
             bool r19 = reloadSource(ldoc->src, e19);
             check(r19 && ldoc->src->data[0] == 1.0f,
                   "R19 local:// reloads from the embedded local path");
+        }
+        {   // ---- R19b: a local:// tuple carries the DISK baseline ---------------
+            // The url embeds a path on this disk, so an overwrite must move the
+            // tuple. Without the baseline (mtime/fsize 0) the key never moves,
+            // and a re-open of the same url ADOPTS the stale resident: old
+            // pixels wearing a fresh open's name.
+            writeNpy2(root + "/lb.npy", 4, 4, 5.0f, 0);
+            auto mkLocal = [&]() {
+                auto d = std::make_unique<ImageDoc>();
+                d->src->path = d->src->remoteUrl = "local://" + root + "/lb.npy";
+                d->src->w = 4; d->src->h = 4; d->src->ch = 1;
+                d->src->dtype = "f32";
+                d->src->data.assign(16, -2.0f);
+                statLocalUrl(*d->src);       // what every local:// open path does
+                d->syncMirrors();
+                computeMinMax(*d);
+                d->uid = app.nextUid++;
+                return d;
+            };
+            auto la = mkLocal();
+            shareOrRegisterSource(*la);                   // fresh tuple, registered
+            // dims change too, so the check does not hinge on mtime granularity
+            writeNpy2(root + "/lb.npy", 6, 6, 9.0f, 0);
+            auto lb2 = mkLocal();
+            bool adopted = shareOrRegisterSource(*lb2);
+            fprintf(stderr, "reloadselftest: R19b after overwrite: %s\n",
+                    lb2->src == la->src ? "ADOPTED the stale resident" : "own tuple");
+            check(!adopted && lb2->src != la->src,
+                  "R19b an overwritten local:// file is a NEW tuple, never adopted");
+            auto lc = mkLocal();
+            bool ad2 = shareOrRegisterSource(*lc);
+            check(ad2 && lc->src == lb2->src,
+                  "R19c an unchanged local:// url still adopts (sharing kept)");
         }
         {   // ---- R20: the stack summary states a member's dims change ----------
             writeNpy2(stk + "/b_002.npy", 6, 6, 400.0f, 0);
