@@ -230,6 +230,14 @@ jobs:
   # pulls are small and the source history never carries exe blobs.
   publish-binaries:
     needs: build
+    # One publish at a time, queued not cancelled. Two quick pushes to main run
+    # this job concurrently, both force-push the binaries ref, and the loser
+    # dies with "cannot lock ref" - which reads as a red CI on a commit whose
+    # build was fine. Queueing serializes them; the last one to run publishes
+    # the newest build, which is the outcome the race was fighting over anyway.
+    concurrency:
+      group: publish-binaries
+      cancel-in-progress: false
     # main publishes to `binaries`; any other branch publishes to
     # `binaries-<branch>`. The second one exists because the machine that most
     # needs a build is the one with no build environment - and often no GitHub
