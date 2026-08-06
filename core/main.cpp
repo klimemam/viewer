@@ -1983,6 +1983,30 @@ static void removeCompareSlot(const ImageDoc* d) {
         if (app.cmpExtra[i] == d->uid) { app.cmpExtra.erase(app.cmpExtra.begin() + i); return; }
 }
 
+// What the slot item on a Files row OFFERS for this document - and `letter` is
+// the letter the offer would name ("Add as compare slot D" / "Remove from
+// compare slot C"). Out here rather than in the menu for the same reason
+// abRowItem is: so it can be checked without a frame (--abstats-selftest, N5).
+// Issue #60 established what that costs when it is skipped: every panel could
+// HANDLE letters past B, the selftests proved it - by arming slots with a
+// direct call - and whether the one path a user has to arm them still offered
+// anything was checked by nobody, over an equation that holds on the empty set.
+enum SlotRowItem {
+    SlotRowNone,       // no document, or the pinned B: its row's B items say so,
+                       // and a slot on top would put one image in two panes
+    SlotRowAdd,        // "Add as compare slot <letter>" - the next free letter
+    SlotRowRemove,     // "Remove from compare slot <letter>" - the letter held
+};
+static SlotRowItem slotRowItem(const ImageDoc* pick, std::string& letter) {
+    letter.clear();
+    if (!pick) return SlotRowNone;
+    letter = slotOf(pick);
+    if (!letter.empty()) return SlotRowRemove;
+    if (pick->uid == app.compareBUid) return SlotRowNone;
+    letter = slotName(app.cmpExtra.size());
+    return SlotRowAdd;
+}
+
 // Did slot i's follow-frame land on nothing the last time the slots resolved?
 // The per-slot g_abFollowDiverged (--abstats-selftest S3).
 static bool slotFollowDiverged(size_t i) {
@@ -23140,18 +23164,17 @@ static void drawFileList() {
     // contains is invisible until someone tells you about it, and the letter in
     // the label ("Add as compare slot D") says what will happen before it does.
     auto compareSlotItem = [](ImageDoc* pick) {
-        if (!pick) return;                 // the current row gets it too, like every other
-        std::string held = slotOf(pick);
-        if (!held.empty()) {
-            if (ImGui::MenuItem(("Remove from compare slot " + held).c_str()))
+        // the current row gets it too, like every other; the decision of WHAT
+        // to offer lives in slotRowItem, where a selftest can reach it
+        std::string letter;
+        SlotRowItem it = slotRowItem(pick, letter);
+        if (it == SlotRowNone) return;
+        if (it == SlotRowRemove) {
+            if (ImGui::MenuItem(("Remove from compare slot " + letter).c_str()))
                 removeCompareSlot(pick);
             return;
         }
-        // the pinned B holds a letter already - the row's B items say so, and
-        // offering a slot on top would put one image in two panes
-        if (pick->uid == app.compareBUid) return;
-        std::string next = slotName(app.cmpExtra.size());
-        if (ImGui::MenuItem(("Add as compare slot " + next).c_str()))
+        if (ImGui::MenuItem(("Add as compare slot " + letter).c_str()))
             addCompareSlot(pick);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("slots beyond B show up in the statistics tables and\n"
@@ -35240,6 +35263,53 @@ int main(int argc, char** argv) {
             if (!unsaid.empty())
                 fprintf(stderr, "abstatsselftest: N slots with a row and no word: '%s'\n",
                         unsaid.c_str());
+
+            // N5: the ARMING path - the missing precondition of everything
+            // above. N1-N4 arm their slots by calling addCompareSlot directly,
+            // so they prove the panels can HANDLE N sides and prove nothing
+            // about whether a user can PRODUCE them: the equation
+            // rows ⊆ curves ∪ said-no-curve holds over the empty set, which is
+            // exactly how "histogram とか projection が3個以上にならん" (issue
+            // #60) shipped under a green suite. So walk the path a user walks:
+            // the Files row menu offers what slotRowItem answers (the menu
+            // builds its items from it and nothing else), and clicking the item
+            // fires addCompareSlot. A menu item cannot be scripted (the
+            // browse-keys precedent), so the offer is asserted at the gate and
+            // the click's action is fired directly - the same one line the
+            // MenuItem runs.
+            {
+                app.cmpExtra.clear();
+                selectImage(f0[0]);
+                setCompareB(app.images[f1[0]].get());
+                app.abStepBusyUntil = 0;   // selectImage arms the step throttle
+                std::string L;
+                check(slotRowItem(app.images[f0[1]].get(), L) == SlotRowAdd && L == "C",
+                      "N5 a free row is offered 'Add as compare slot C'");
+                addCompareSlot(app.images[f0[1]].get());        // the item's click
+                check(slotRowItem(app.images[f0[1]].get(), L) == SlotRowRemove && L == "C",
+                      "N5 ...and afterwards the same row offers the remove, by letter");
+                check(slotRowItem(app.images[f1[0]].get(), L) == SlotRowNone,
+                      "N5 the pinned B's row is offered no slot: one image, one letter");
+                check(slotRowItem(app.images[f0[2]].get(), L) == SlotRowAdd && L == "D",
+                      "N5 the next free row is offered D, not C again");
+                addCompareSlot(app.images[f0[2]].get());
+                check(slotRowItem(app.images[f1[1]].get(), L) == SlotRowAdd && L == "E",
+                      "N5 ...and the one after that E");
+                addCompareSlot(app.images[f1[1]].get());
+                check(app.cmpExtra.size() == 3,
+                      "N5 three slots armed through the entry path");
+                histFrame();
+                std::string pArm = g_histSideProbe;
+                fprintf(stderr, "abstatsselftest: N5 armed-path probe '%s'\n",
+                        pArm.c_str());
+                check(rowsOf(pArm) == "ABCDE",
+                      "N5 all five sides appear as rows - the third slot exists on screen");
+                check(field(pArm, "curves=") == "ABCDE",
+                      "N5 ...and one plane on the axis draws every one of them");
+                check(accountedFor(pArm, unsaid),
+                      "N5 every armed slot is drawn or named");
+            }
+
             app.cmpExtra.clear();
             app.compareFollowFrame = true;
             app.abStatsLayout = App::AbAuto;
