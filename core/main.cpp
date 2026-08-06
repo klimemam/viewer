@@ -4043,6 +4043,11 @@ static void closeAll() {
     // later file with the same name silently become B again
     app.compareMode = App::CmpOff;
     app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+    app.cmpSlotRestore.clear();       // the same rule for the SLOT wants: a
+                                      // stale want from a dead session would
+                                      // graft a letter onto whichever open
+                                      // next matches its path (every sibling
+                                      // restore queue is cleared above)
     // in-flight remote fetches belong to the OLD list: bump the generation so
     // their results are dropped instead of grafting orphan frames onto the new one
     app.rfGen++;
