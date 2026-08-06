@@ -218,6 +218,12 @@ static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // *Locked helpers to take it exactly once; never call a function that takes it
 // itself (cropInPlace!) while holding it - reloadSource re-crops its PRIVATE
 // fresh decode BEFORE locking for the swap.
+// And NO IO under it: srcIdentityKey canonicalizes the path (srcKeyPath =
+// weakly_canonical = filesystem round-trips - seconds on a UNC path with a
+// slow or dead server), so every key is computed BEFORE the lock is taken;
+// while it is held, only map and field operations happen. Identity fields are
+// only ever written by the UI thread (load, reload swap, crop) or on a source
+// no other thread can see yet, so a pre-lock read of them is never torn.
 static std::mutex g_srcRegMtx;              // lookups also run on the seq loader thread
 static std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry;
 
@@ -284,9 +290,12 @@ static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key
 // caller ADOPTS it (the seq worker can finish a decode after the UI thread
 // registered the same file: both stacks must end up sharing, not keep twin
 // residents) - and nullptr when s was registered or is not shareable.
-static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s) {
+// `key` is srcIdentityKey(*s), computed by the caller OUTSIDE the lock
+// (srcKeyPath does filesystem IO - see the lock-order note above).
+static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s,
+                                                         const std::string& key) {
     if (!s || !srcShareable(*s)) return nullptr;
-    std::weak_ptr<FrameSource>& slot = g_srcRegistry[srcIdentityKey(*s)];
+    std::weak_ptr<FrameSource>& slot = g_srcRegistry[key];
     if (std::shared_ptr<FrameSource> live = slot.lock()) {
         if (live == s) return nullptr;             // already the registered one
         if (srcShareable(*live)) return live;      // first resident wins: adopt it
@@ -304,8 +313,10 @@ static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<F
     return nullptr;
 }
 static std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
+    if (!s || !srcShareable(*s)) return nullptr;
+    const std::string key = srcIdentityKey(*s);   // IO: before the lock
     std::lock_guard<std::mutex> lk(g_srcRegMtx);
-    return srcRegistryAddLocked(s);
+    return srcRegistryAddLocked(s, key);
 }
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
@@ -356,16 +367,17 @@ struct ImageDoc {
 // shared fields from here would race a loader thread reading them).
 static bool shareOrRegisterSource(ImageDoc& d) {
     if (!srcShareable(*d.src)) return false;
+    const std::string key = srcIdentityKey(*d.src);   // IO: before the lock
     // ONE hold of g_srcRegMtx across find + add + mirror sync: the worker's
     // probe and reloadSource's swap take the same lock, so an adoption can
     // neither interleave with a half-registered tuple nor capture a mid-swap
     // source (see the lock-order note at g_srcRegMtx)
     std::lock_guard<std::mutex> lk(g_srcRegMtx);
-    if (std::shared_ptr<FrameSource> hit = srcRegistryFindLocked(srcIdentityKey(*d.src))) {
+    if (std::shared_ptr<FrameSource> hit = srcRegistryFindLocked(key)) {
         if (hit != d.src) { d.src = std::move(hit); d.syncMirrors(); return true; }
         return false;                 // already the registered one (re-share path)
     }
-    srcRegistryAddLocked(d.src);
+    srcRegistryAddLocked(d.src, key);
     return false;
 }
 
@@ -4478,6 +4490,9 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     // thread under that lock, so a probe either adopts BEFORE this (then
     // use_count > 1 forces the clone) or looks up after and is refused
     // (srcShareable sees the crop) - it can never adopt pixels mid-crop.
+    // The key is computed before the lock (IO - see the g_srcRegMtx note);
+    // identity fields only move on this thread, so it cannot go stale here.
+    const std::string key = srcIdentityKey(*im.src);
     std::lock_guard<std::mutex> regLk(g_srcRegMtx);
     if (im.src.use_count() > 1) {
         im.src = cloneSource(*im.src);
@@ -4489,7 +4504,7 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
         // file could neither be adopted nor re-registered until this doc
         // closed (the crop does not change any key field, so the key still
         // names the slot the full-frame decode registered)
-        auto it = g_srcRegistry.find(srcIdentityKey(*im.src));
+        auto it = g_srcRegistry.find(key);
         if (it != g_srcRegistry.end() && it->second.lock() == im.src)
             g_srcRegistry.erase(it);
     }
@@ -6064,12 +6079,15 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 }
                 statSourceFile(probe);
                 if (probe.mtime || probe.fsize) {
+                    const std::string probeKey = srcIdentityKey(probe);   // IO:
+                                                                          // before
+                                                                          // the lock
                     // ONE continuous hold across find + syncMirrors: the reload
                     // swap and crop hold the same lock for their whole mutation,
                     // so these mirrors can never capture a half-swapped source
                     std::lock_guard<std::mutex> lk(g_srcRegMtx);
                     if (std::shared_ptr<FrameSource> hit =
-                            srcRegistryFindLocked(srcIdentityKey(probe))) {
+                            srcRegistryFindLocked(probeKey)) {
                         doc = std::make_unique<ImageDoc>();
                         doc->src = std::move(hit);
                         doc->name = baseName(j.path);
@@ -6105,8 +6123,10 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 // probe miss and now: the add hands back the live occupant and
                 // this decode is discarded for it - both stacks of one tuple
                 // end up sharing. One hold across add + syncMirrors, as above.
+                const std::string addKey = srcIdentityKey(*doc->src);   // IO: before
+                                                                        // the lock
                 std::lock_guard<std::mutex> lk(g_srcRegMtx);
-                if (std::shared_ptr<FrameSource> live = srcRegistryAddLocked(doc->src)) {
+                if (std::shared_ptr<FrameSource> live = srcRegistryAddLocked(doc->src, addKey)) {
                     doc->src = std::move(live);
                     doc->syncMirrors();
                     adopted = true;   // 0 new bytes (§7): the pixels were
@@ -8161,6 +8181,25 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                  src->dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
         *noteOut = b;
     }
+    // Both keys BEFORE the lock (they canonicalize the path: filesystem IO -
+    // see the g_srcRegMtx note). The old key reads the pre-swap fields; the
+    // new key is the post-swap tuple, composed on an identity probe from
+    // values already in hand - identity fields only move on this thread, so
+    // neither can go stale between here and the hold below.
+    const std::string oldKey = srcIdentityKey(*src);
+    std::string newKey;
+    {
+        FrameSource idNew;            // identity only - no pixels are copied
+        idNew.path = src->path; idNew.remoteUrl = src->remoteUrl;
+        idNew.npzMember = src->npzMember;
+        idNew.fileFrame = src->fileFrame; idNew.remoteFrame = src->remoteFrame;
+        idNew.rawDtype = src->rawDtype; idNew.rawInterp = src->rawInterp;
+        idNew.rawOffset = src->rawOffset; idNew.rawLE = src->rawLE;
+        idNew.srcW = N.srcW; idNew.srcH = N.srcH;
+        idNew.frameAxis = N.frameAxis >= 0 ? N.frameAxis : src->frameAxis;
+        idNew.mtime = N.mtime; idNew.fsize = N.fsize;
+        newKey = srcIdentityKey(idNew);
+    }
     {   // the swap, in ONE hold of g_srcRegMtx: the worker reads a shared
         // source only inside that lock (find + syncMirrors in one section), so
         // no thread can see a half-swapped source. nd is PRIVATE here - its
@@ -8172,7 +8211,7 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         // it, and a restore of the old bytes misses and re-decodes the disk.
         // Without this the stale row could hand post-reload pixels to a tuple
         // that never contained them.
-        auto it = g_srcRegistry.find(srcIdentityKey(*src));
+        auto it = g_srcRegistry.find(oldKey);
         if (it != g_srcRegistry.end() && it->second.lock() == src)
             g_srcRegistry.erase(it);
         // same srcId (identity), new pixels, rev +1, the PRE-read Watch baseline
@@ -8186,10 +8225,11 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         src->rev++;
         src->mtime = N.mtime;
         src->fsize = N.fsize;
-        srcRegistryAddLocked(src);    // the new tuple's slot. A live occupant
-                                      // (the same tuple decoded fresh meanwhile)
-                                      // wins: it already serves future opens,
-                                      // and both hold identical bytes.
+        srcRegistryAddLocked(src, newKey);   // the new tuple's slot. A live
+                                      // occupant (the same tuple decoded fresh
+                                      // meanwhile) wins: it already serves
+                                      // future opens, and both hold identical
+                                      // bytes.
     }
     // ---- the walk (§3.2): every membership sharing this source, in one step ----
     std::vector<int> seqIds;
