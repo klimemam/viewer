@@ -151,7 +151,7 @@ static std::vector<NameSeg> segmentName(const std::string& stem) {
 // peer): the same segment rule findSequenceSiblings and the peer's grouper use,
 // applied to an arbitrary selection. Empty when the names do not share a
 // structure - a caller that cannot name a stack must say so, not invent one.
-static std::string patternOfNames(std::vector<std::string> names) {
+std::string patternOfNames(std::vector<std::string> names) {
     if (names.size() < 2) return {};
     std::sort(names.begin(), names.end());
     std::string ext;
@@ -197,7 +197,7 @@ static std::string patternOfNames(std::vector<std::string> names) {
 // panel, AND extractLevelFromName only strips a frame-axis extent run from a
 // name that HAS a folder part - so a bare member name parses its first digit
 // run as a level, which is how a lit stack ends up proposed at 0.
-static std::string stackNameFor(const std::string& dir, const std::string& pattern) {
+std::string stackNameFor(const std::string& dir, const std::string& pattern) {
     if (pattern.empty()) return {};
     std::string d = dir;
     while (d.size() > 1 && d.back() == '/') d.pop_back();
@@ -1177,7 +1177,7 @@ static bool globMatch(const char* pat, const char* str) {
 }
 // Comma-separated patterns; a bare word is treated as a substring (*word*).
 // Used by the remote listing filter (the picker has its own live filter).
-static bool globListMatch(const char* list, const std::string& subject) {
+bool globListMatch(const char* list, const std::string& subject) {
     if (!list || !*list) return false;
     std::string cur;
     bool any = false;

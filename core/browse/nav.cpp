@@ -1,6 +1,20 @@
-// core/main.cpp から #include される断片。単独ではコンパイルしない。担当: Browse
-// [BrowseHost] = BrowseHost 候補: viewer 側への呼び出し。P7 でコールバック集
-// BrowseHost に束ねる (docs/split-plan.md §3)。
+// core/browse/nav.cpp — Browse 実 TU その 1 (P7, docs/split-plan.md §3/§5)。担当: Browse
+// instance 管理 (instances.inc) + worker / pump / navigation (この下)。
+// viewer への呼び出しは g_browseHost (host.h) 経由のみ — S3 が置いた
+// BrowseHost 注記 15 箇所はここで潰れた。GLFW への依存も一緒に消えている
+// (rbWorker の UI 起こしは host の wakeUi になった)。
+#include "../app/state.h"
+#include "../remote_proto.h"         // rp::VERSION - the protocol both ends speak
+#include "host.h"                    // the browse -> viewer seam (g_browseHost)
+#include "browse.h"                  // ...and the declarations this TU defines
+
+#include <algorithm>
+#include <cstring>                   // strstr (rbIsBrowseWindowName)
+#include <string>
+#include <vector>
+
+#include "instances.inc"
+
 // ---- the connect/browse worker: ONE per Browse instance ------------------------
 // The instance's Session belongs to the instance's worker thread and to nobody
 // else - the singleton's "one Session, one owning thread" rule (1ac211e), now
@@ -126,12 +140,11 @@ static void rbWorker(App::BrowseInstance* ip) {
             I.done.push_back(std::move(r));
         }
         I.busy = false;
-        // [BrowseHost] glfwPostEmptyEvent (UI wake)
-        glfwPostEmptyEvent();
+        g_browseHost.wakeUi();
     }
 }
 
-static void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
+void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
     // how the peer is invoked, frozen NOW on the UI thread that owns the string
     if (job.exe.empty())
         job.exe = app.remoteExe.empty()
@@ -156,7 +169,7 @@ static void rbStopWorkerOf(App::BrowseInstance& I) {
     I.cv.notify_all();
     if (I.thread.joinable()) I.thread.join();
 }
-static void stopRbWorker() {          // shutdown: every instance's worker
+void stopRbWorker() {          // shutdown: every instance's worker
     for (auto& p : app.browsePanels) rbStopWorkerOf(*p);
 }
 
@@ -180,9 +193,8 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
         if (r.kind == App::RbDisconnect) continue;
         if (r.kind == App::RbUpdatePeer) {
             if (!r.info.empty()) g_bootstrapLog = r.info;
-            // [BrowseHost] toast
-            toast(r.ok ? "remote peer updated on " + r.host
-                       : "remote update failed: " + r.err, !r.ok);
+            g_browseHost.toast(r.ok ? "remote peer updated on " + r.host
+                             : "remote update failed: " + r.err, !r.ok);
             // The update stopped the session; reconnect to where the user was,
             // so the listing comes back with the new peer's metadata without
             // another trip through Start Remote.
@@ -198,8 +210,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             App::RemoteSearch& S = I.search;
             if (r.gen != S.gen) continue;          // stopped or superseded: drop
             S.running = false;
-            // [BrowseHost] toast
-            if (!r.ok) { toast("remote search: " + r.err, true); continue; }
+            if (!r.ok) { g_browseHost.toast("remote search: " + r.err, true); continue; }
             S.hits = std::move(r.hits);
             S.truncated = r.truncated;
             S.skippedDirs = r.skippedDirs;
@@ -215,8 +226,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             // re-raises the modal over it. RbGlob has had this guard since it
             // was written; RbScan carried no token at all.
             if (r.gen != B.scanGen) continue;
-            // [BrowseHost] toast
-            if (!r.ok) { toast("remote scan: " + r.err, true); continue; }
+            if (!r.ok) { g_browseHost.toast("remote scan: " + r.err, true); continue; }
             auto joinR = [](const std::string& a, const std::string& b) {
                 if (b.empty()) return a;
                 return a == "/" ? "/" + b : a + "/" + b;
@@ -236,15 +246,12 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
                 }
                 groups.push_back(std::move(pg));
             }
-            // [BrowseHost] toast
             if (r.truncated)
-                toast("scan stopped at 256 stacks - open a narrower folder", true);
-            // [BrowseHost] toast
+                g_browseHost.toast("scan stopped at 256 stacks - open a narrower folder", true);
             if (r.skippedDirs)
-                toast(std::to_string(r.skippedDirs) +
-                      " unreadable folder(s) skipped in the scan", true);
-            // [BrowseHost] toast
-            if (groups.empty()) { toast("no .npy stacks under " + r.dir, true); continue; }
+                g_browseHost.toast(std::to_string(r.skippedDirs) +
+                                   " unreadable folder(s) skipped in the scan", true);
+            if (groups.empty()) { g_browseHost.toast("no .npy stacks under " + r.dir, true); continue; }
             // A remote scan ALWAYS goes through the picker - one group included.
             // Every frame here is a transfer, the modal is where the filters
             // live, and the "1 group -> just open it" shortcut turned every
@@ -260,8 +267,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
                 // told the user a scheme they never chose and a machine they
                 // are not talking to. The url form is unchanged everywhere it
                 // is stored (prefs, bookmarks, Copy path).
-                // [BrowseHost] openPickerWith
-                openPickerWith(std::move(groups),
+                g_browseHost.openPickerWith(std::move(groups),
                                r.host.empty() ? r.dir : makeRemoteUrl(r.host, r.dir, r.port),
                                r.dir, true, r.host, r.port);
             }
@@ -279,8 +285,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
                 I.expanded.erase(std::remove(I.expanded.begin(),
                                              I.expanded.end(), r.dir),
                                  I.expanded.end());
-                // [BrowseHost] toast
-                toast(r.dir + ": " + r.err, true);
+                g_browseHost.toast(r.dir + ": " + r.err, true);
             }
             continue;
         }
@@ -295,8 +300,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
                 // so the failure text has somewhere to live - inline, in THE
                 // instance that failed, never a global dialog
                 rbShowInstance(I);
-                // [BrowseHost] toast
-                toast("remote: " + r.err, true);
+                g_browseHost.toast("remote: " + r.err, true);
             }
             continue;
         }
@@ -320,8 +324,8 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             rbTreeForget(I);              // another machine: other children entirely
             // a listing nobody can see is not a connection anyone believes in
             rbShowInstance(I);
-            // [BrowseHost] toast
-            toast(r.host.empty() ? "browsing " PEER_HERE : "connected to " + r.host);
+            g_browseHost.toast(r.host.empty() ? "browsing " PEER_HERE
+                                              : "connected to " + r.host, false);
         }
         // An outdated peer ANSWERS perfectly well, so the install-on-failure
         // path never runs for it - and every listing would show "-" for shape
@@ -333,9 +337,8 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
         if (r.kind == App::RbConnect && !r.host.empty() && r.peerVersion > 0 &&
             r.peerVersion < (int)rp::VERSION && !B.autoUpdateTried) {
             B.autoUpdateTried = true;
-            // [BrowseHost] toast
-            toast("peer on " + r.host + " is protocol " + std::to_string(r.peerVersion) +
-                  " - updating it now...");
+            g_browseHost.toast("peer on " + r.host + " is protocol " +
+                               std::to_string(r.peerVersion) + " - updating it now...", false);
             App::RbJob j;
             j.kind = App::RbUpdatePeer;
             j.host = r.host; j.port = r.port;
@@ -344,13 +347,12 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
         if (!I.pendingOpen.empty()) {   // a url was pasted with the host
             std::string u = I.pendingOpen;
             I.pendingOpen.clear();
-            // [BrowseHost] openRemote
-            openRemote(u);
+            g_browseHost.openRemote(u, false, 0);
         }
     }
 }
 // ...and every instance, once per UI frame.
-static void pumpRemoteBrowse() {
+void pumpRemoteBrowse() {
     for (size_t i = 0; i < app.browsePanels.size(); i++)
         pumpRemoteBrowseOne(*app.browsePanels[i]);
 }
@@ -360,10 +362,10 @@ static void pumpRemoteBrowse() {
 // the node shows "(listing...)" until the answer lands in the cache. Collapsing
 // keeps the cache, so opening the same node again costs nothing at all - which
 // is the whole reason a tree is usable over ssh.
-static bool rbHas(const std::vector<std::string>& v, const std::string& s) {
+bool rbHas(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
-static void rbTreeExpand(App::BrowseInstance& I, const std::string& dir) {
+void rbTreeExpand(App::BrowseInstance& I, const std::string& dir) {
     if (!rbHas(I.expanded, dir)) I.expanded.push_back(dir);
     if (I.treeCache.count(dir) || rbHas(I.treePending, dir)) return;
     I.treePending.push_back(dir);
@@ -375,12 +377,12 @@ static void rbTreeExpand(App::BrowseInstance& I, const std::string& dir) {
     j.dir = dir;
     rbEnqueue(I, std::move(j));
 }
-static void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir) {
+void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir) {
     I.expanded.erase(std::remove(I.expanded.begin(), I.expanded.end(), dir),
                      I.expanded.end());
 }
 // A different machine, or "list this again": the cached children are stale.
-static void rbTreeForget(App::BrowseInstance& I) {
+void rbTreeForget(App::BrowseInstance& I) {
     I.treeCache.clear();
     I.expanded.clear();
     I.treePending.clear();
@@ -401,7 +403,7 @@ static void rbHistOnNavigate(App::BrowseInstance& I, const std::string& toDir) {
     if (I.histBack.size() > 64) I.histBack.erase(I.histBack.begin());
     I.histFwd.clear();               // a fresh navigation truncates the forward branch
 }
-static void rbHistGo(App::BrowseInstance& I, bool back) {
+void rbHistGo(App::BrowseInstance& I, bool back) {
     std::vector<std::string>& from = back ? I.histBack : I.histFwd;
     std::vector<std::string>& to   = back ? I.histFwd  : I.histBack;
     if (from.empty() || !I.b.connected) return;
@@ -415,7 +417,7 @@ static void rbHistGo(App::BrowseInstance& I, bool back) {
 
 // Browse one directory on the connected server (async: a dead link hangs the
 // worker, never the window).
-static void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir) {
+void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir) {
     // Going anywhere leaves the search results: they stand in for the listing,
     // so a listing that arrives underneath them cannot be seen. Every way of
     // navigating funnels through here, which is why the rule lives here and
@@ -437,19 +439,18 @@ static void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir) {
 // (bookmarks / recents). It IS makeRemoteUrl now: the two differed only in
 // whether they kept the port, and "the one that keeps it" is the only correct
 // answer, so there is one function and no way to pick the lossy one by mistake.
-static std::string placeUrl(const std::string& host, int port, const std::string& path) {
+std::string placeUrl(const std::string& host, int port, const std::string& path) {
     return makeRemoteUrl(host, path, port);
 }
 
 // Navigate to a places url. Same host and a live session: just browse there.
 // Anything else goes through the normal async connect - never a handshake on
 // the UI thread.
-static void goToPlace(App::BrowseInstance& I, const std::string& url) {
+void goToPlace(App::BrowseInstance& I, const std::string& url) {
     std::string host, path;
     int port = 0;
     if (!remote::parseUrl(url, host, path, &port)) {
-        // [BrowseHost] toast
-        toast("cannot parse place: " + url, true);
+        g_browseHost.toast("cannot parse place: " + url, true);
         return;
     }
     if (I.b.connected && I.b.host == host && I.b.port == port) {
@@ -473,7 +474,7 @@ static void goToPlace(App::BrowseInstance& I, const std::string& url) {
 // auto-reconnect, asynchronously; the UI never blocks on ssh, and a failure
 // lands inline in that instance's error band). Shared by the session reader
 // and the keys selftest's round-trip op, so the two cannot drift apart.
-static void sessionRestoreBrowsePlace(int num, const std::string& url) {
+void sessionRestoreBrowsePlace(int num, const std::string& url) {
     if (url.empty()) return;
     App::BrowseInstance* I = num <= 1 ? &rbMain() : rbFindNum(num);
     if (!I) {
@@ -485,7 +486,7 @@ static void sessionRestoreBrowsePlace(int num, const std::string& url) {
 
 // Kick a server-side recursive find; the result lands in I.search through
 // the instance's worker. Any previous search is superseded by the gen bump.
-static void remoteStartSearch(App::BrowseInstance& I,
+void remoteStartSearch(App::BrowseInstance& I,
                               const std::string& root, const std::string& pattern) {
     App::RemoteSearch& S = I.search;
     S.gen++;
@@ -509,7 +510,7 @@ static void remoteStartSearch(App::BrowseInstance& I,
 // The remote openFolder(): the worker asks the server to walk the subtree and
 // report every stack below it; the result feeds the picker / open queue on
 // the UI thread (pumpRemoteBrowse).
-static void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
+void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
     App::RbJob j;
     j.kind = App::RbScan;
     j.host = I.b.host;
@@ -522,14 +523,13 @@ static void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
 // Chained opens from a folder scan: the next stack starts only when the remote
 // fetcher is idle, so the memory budget openRemoteStack applies reflects what
 // the previous stack actually loaded.
-static void pumpRemoteOpenQueue() {
+void pumpRemoteOpenQueue() {
     if (app.rbOpenQueue.empty() || app.rfPending > 0 || app.seqRunning) return;
     App::RemoteOpen ro = std::move(app.rbOpenQueue.front());
     app.rbOpenQueue.erase(app.rbOpenQueue.begin());
     sortFramesNumerically(ro.files);
     app.loadBatchId = ro.batchId;
-    // [BrowseHost] openRemoteStack
-    openRemoteStack(ro.host, ro.files, ro.name, ro.port, ro.token);
+    g_browseHost.openRemoteStack(ro.host, ro.files, ro.name, ro.port, ro.token);
     app.loadBatchId = 0;
 }
 
@@ -559,7 +559,7 @@ static void rbParseSpec(const std::string& hostSpec, std::string& host, int& por
 // Reuse when there is nothing to lose (never connected) or when it is the same
 // place (reconnect, not a second window). Otherwise: a panel already on that
 // place if there is one, else a new one.
-static App::BrowseInstance& rbInstanceFor(const std::string& hostSpec) {
+App::BrowseInstance& rbInstanceFor(const std::string& hostSpec) {
     std::string host, dir;
     int port = 0;
     rbParseSpec(hostSpec, host, port, dir);
@@ -571,7 +571,7 @@ static App::BrowseInstance& rbInstanceFor(const std::string& hostSpec) {
     return rbNewInstance();
 }
 
-static void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
+void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
     std::string host, dir;
     int port = 0;
     rbParseSpec(hostSpec, host, port, dir);

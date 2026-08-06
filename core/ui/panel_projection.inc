@@ -815,7 +815,8 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
 // ---- frame average: a stack's per-pixel mean, opened as ONE frame ----------
 // One tooltip for every door into it: the five Browse entry points and the
 // Files panel item must not describe the same operation five different ways.
-static const char* AVG_TIP =
+// non-static since P7: the Browse ctx menus show the same tooltip (host.h)
+const char* AVG_TIP =
     "Open the stack's PER-PIXEL MEAN across frames as one frame -\n"
     "a dark-current map, a flat field, the level sigma_t is the noise\n"
     "around. Accumulated in double; non-finite samples are excluded\n"

@@ -573,7 +573,7 @@ static void drawMenuBar(GLFWwindow* win) {
 
 // File > Open Remote: the one dialog the OS cannot provide, because the files it
 // lists live on another machine. URL + peer path, both remembered in prefs.
-static bool isNpyName(const std::string& n) {   // FRAME_001.NPY is still a .npy
+bool isNpyName(const std::string& n) {          // FRAME_001.NPY is still a .npy
     if (n.size() < 4) return false;
     std::string ext = n.substr(n.size() - 4);
     std::transform(ext.begin(), ext.end(), ext.begin(),

@@ -1,8 +1,12 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: remote client
-// 前方宣言群(rb/remote の混在ブロック、S3 の判断でこのファイルが丸ごと持つ)と
-// rfWorker/mWorker の間に挟まる節は、元の順序のまま中の #include が運ぶ(§1: 順序を一切変えない)。
+// S3 の前方宣言ブロック(rb/remote 混在)は P7 でほぼ空になった: browse 側の
+// 宣言は browse.h、browse が名前で呼ぶ viewer 側ヘルパは host.h が持つ(両方とも
+// 背骨がこの断片より前に include する)。残るのは背骨内で完結する static だけ。
+// instances.inc もここから出て行った — browse の TU (nav.cpp) が含む。
 // ---- remote viewing: declared here, defined further down ----
-static const char* REMOTE_HOME = "~/.viewer";
+// REMOTE_HOME sheds static: rbEnqueue (nav.cpp) builds the default peer path
+// from it, and a TU-local copy cannot back an extern declaration (host.h).
+const char* REMOTE_HOME = "~/.viewer";
 // Plain ASCII: the bundled font has no icon set. TWO tags, because there are
 // two states. An empty host means the peer runs HERE - the same protocol over a
 // pipe instead of ssh - and a browse of this disk that flies an [ssh] flag,
@@ -10,37 +14,22 @@ static const char* REMOTE_HOME = "~/.viewer";
 // a connection to a machine called "local". Nothing is open. Say so.
 #define ICON_SSH   "[ssh]"
 #define ICON_LOCAL "[local]"
-// what an empty host is CALLED on screen (the url form stays "local://" - it is
-// storage, not language)
-#define PEER_HERE  "this machine"
+// (PEER_HERE - what an empty host is CALLED on screen - moved to
+// core/browse/host.h: nav.cpp's connect toast says it too.)
 static const char* peerTag(const std::string& host) {
     return host.empty() ? ICON_LOCAL : ICON_SSH;
 }
-static std::string peerLabel(const std::string& host) {
+// non-static: the Browse panel's disconnect tooltip names its host through this
+std::string peerLabel(const std::string& host) {
     return host.empty() ? std::string(PEER_HERE) : host;
 }
 static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
-static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port = 0);
 static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
-static void remoteBrowseTo(App::BrowseInstance& I, const std::string& dir);
-static void rbTreeForget(App::BrowseInstance& I);   // drop the tree's cached children
-static std::string placeUrl(const std::string& host, int port, const std::string& path);
-static void rbEnqueue(App::BrowseInstance& I, App::RbJob job);
-static void pumpRemoteBrowse();
-static void stopRbWorker();
 static std::string bootstrapScript();
 static std::string updateScript();
-static void startRemote(App::BrowseInstance& I, const std::string& hostSpec);
-static void sessionRestoreBrowsePlace(int num, const std::string& url);
-static void drawPanelRemote(App::BrowseInstance& I);
-static bool deployPeer(const std::string& host, int port, bool force, std::string& log);
-static bool isNpyName(const std::string& n);
-static void sortFramesNumerically(std::vector<std::string>& files);
-
-#include "../browse/instances.inc"
 
 #include "compare.inc"
 #include "export.inc"

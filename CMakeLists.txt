@@ -88,10 +88,16 @@ endif()
 add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
+# core/browse/*.cpp: Browse as real TUs since P7 (docs/split-plan.md §5 - the
+# two files the plan budgets; instances.inc is #included by nav.cpp). The .inc
+# fragments and headers stay off this list on purpose: the compiler depfile
+# tracks them, so touching state.h or a fragment rebuilds exactly the TUs that
+# include it.
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
                       core/imagefile.cpp core/stb_image_impl.c
+                      core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
 # configure-time hash goes stale the moment you commit, and this string is

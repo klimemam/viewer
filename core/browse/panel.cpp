@@ -1,12 +1,26 @@
-// core/main.cpp から #include される断片。単独ではコンパイルしない。担当: Browse
-// [BrowseHost] = BrowseHost 候補: viewer 側への呼び出し。P7 でコールバック集
-// BrowseHost に束ねる (docs/split-plan.md §3)。
+// core/browse/panel.cpp — Browse 実 TU その 2 (P7, docs/split-plan.md §3/§5)。担当: Browse
+// drawPanelRemote 一式。viewer への呼び出しは g_browseHost (host.h) 経由のみ —
+// S3 が置いた BrowseHost 注記 40 箇所はここで潰れた。RbRow と view builder 群
+// は NOGL selftest が直接叩くので browse.h に出ている。
+#include "imgui.h"
+#include "../app/state.h"
+#include "../remote_proto.h"         // rp::naturalLess / rp::VERSION
+#include "host.h"                    // the browse -> viewer seam (g_browseHost)
+#include "browse.h"                  // ...and the declarations this TU defines
+
+#include <algorithm>
+#include <cfloat>                    // FLT_MIN (the places combo width)
+#include <cstring>                   // memcmp (the stack-shape gate)
+#include <ctime>                     // localtime / strftime (the modified column)
+#include <string>
+#include <vector>
+
 // The connected server, in its own panel. It used to hang off the bottom of
 // Files, but the two do different jobs: Files lists what is already OPEN (and
 // closes it), this one BROWSES a machine and decides what to open next. Sharing
 // a window made both harder to read once a server had more than a few folders.
 // ---- remote listing row formatting ----
-static std::string fmtBytesHuman(uint64_t n) {
+std::string fmtBytesHuman(uint64_t n) {
     char b[32];
     if (n >= (1ull << 30))      snprintf(b, sizeof b, "%.1f GB", n / 1073741824.0);
     else if (n >= (1ull << 20)) snprintf(b, sizeof b, "%.1f MB", n / 1048576.0);
@@ -48,7 +62,7 @@ static std::string fmtUnixTimeShort(int64_t t) {
 }
 // "(3000,4000) u16" - the file's declared shape, so what the browser promises is
 // what META will later confirm.
-static std::string fmtEntryShape(const remote::Entry& e) {
+std::string fmtEntryShape(const remote::Entry& e) {
     if (!e.hasMeta) return "-";
     std::string s = "(";
     for (int i = 0; i < e.ndim; i++)
@@ -58,46 +72,8 @@ static std::string fmtEntryShape(const remote::Entry& e) {
     return s;
 }
 
-// ---- listing view: one row of the Browse table --------------------------------
-// A numbered sequence arrives as ONE synthetic entry carrying `.members`, so
-// "show me the individual frames" is a view over the reply we already have -
-// no LIST, no round trip, nothing to invalidate. `member` picks which face the
-// row wears: -1 = the entry itself (folder, plain file, or the collapsed group
-// row), >= 0 = the n-th frame of a group.
-//
-// What an expanded frame does NOT have is its own size and mtime: the group
-// reply carries the SUM of the members' bytes and the NEWEST member's time,
-// and there is no per-file breakdown in it. Those cells stay blank rather than
-// repeating the group's numbers on 24 rows, which would be a lie 24 times.
-// shape/dtype are shared by construction (the peer only groups files that
-// agree), so they are shown.
-// In TREE mode rows no longer all come from one directory, so a row carries the
-// directory it was listed from. `dir` points at a string that outlives the
-// frame: either App::RemoteBrowse::dir or a key of App::rbTreeCache (std::map
-// nodes do not move).
-struct RbRow {
-    const remote::Entry* e = nullptr;
-    const std::string* dir = nullptr;
-    int member = -1;
-    bool up = false;               // the ".." row (listing only - see rbBuildView)
-    int depth = 0;                 // tree indent level; 0 = the listed folder
-    bool ph = false;               // "(listing...)": a node whose LIST is in flight
-    const std::string& name() const { return member < 0 ? e->name : e->members[member]; }
-    bool isDir()   const { return !ph && member < 0 && e->dir; }
-    bool isGroup() const { return !ph && member < 0 && e->group; }
-    bool ownFile() const { return member < 0; }   // has its own size / mtime
-    // absolute path of this row, and of one of its members
-    std::string join(const std::string& n) const {
-        return *dir == "/" ? "/" + n : *dir + "/" + n;
-    }
-    std::string full() const { return join(name()); }
-};
-// The listing table's columns, and the sort the tree builder has to honour.
-// Stashed from the table (TableGetSortSpecs only exists between Begin/EndTable,
-// and a tree has to be sorted per LEVEL while it is being built, one frame
-// earlier). A sort change therefore lands on the next frame - invisible, and
-// far cheaper than building the view twice.
-enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+// (RbRow and the RB_COL_* column ids live in browse.h now: the headless (NOGL)
+// selftests build and sort views through the same declarations the panel uses.)
 
 // RB_COL_NAME's comparator, and the ONE place both listing shapes ask for it.
 // There are two sorts - the flat listing sorts row indices in rbSortShown, the
@@ -143,10 +119,10 @@ static void rbAddRows(const App::BrowseInstance& I,
 // Grouped or flat, listing or tree, from the same entries. Free function so the
 // headless selftest drives exactly what the panel draws. The instance supplies
 // the tree's expanded set / cache and the per-level sort.
-static std::vector<RbRow> rbBuildView(const App::BrowseInstance& I,
-                                      const std::string* dir,
-                                      const std::vector<remote::Entry>& entries,
-                                      bool flat, bool tree) {
+std::vector<RbRow> rbBuildView(const App::BrowseInstance& I,
+                               const std::string* dir,
+                               const std::vector<remote::Entry>& entries,
+                               bool flat, bool tree) {
     std::vector<RbRow> v;
     v.reserve(entries.size() + 1);
     // "..", in BOTH shapes. The first version of this excluded the tree on the
@@ -235,7 +211,7 @@ static void rbAddRows(const App::BrowseInstance& I,
 //
 // Directories sort before files under every key: this is a browser, not a
 // table of numbers.
-static void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
+void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
                         std::vector<int>& shown) {
     std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
         const RbRow& a = view[ia];
@@ -286,7 +262,7 @@ static void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& 
 // The returned values index `shown`, i.e. they are ROW POSITIONS, not view
 // indices: a pinned row is drawn by the same code, from the same index, as the
 // row it is a copy of, so there is nothing about it that can behave differently.
-static void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
+void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
                            int firstRow, std::vector<int>& out) {
     out.clear();
     if (firstRow <= 0 || firstRow >= (int)shown.size()) return;
@@ -328,29 +304,27 @@ static void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int
 // would still run row-free - the guarantee never rested on which state is
 // replaced, only on when.
 static App::BrowseInstance* g_rbDrawInst = nullptr;   // the instance being drawn
-static void rbDefer(std::function<void()> f) {
+void rbDefer(std::function<void()> f) {
     App::BrowseInstance& I = g_rbDrawInst ? *g_rbDrawInst : rbMain();
     I.deferred.push_back(std::move(f));
 }
-static size_t rbDeferredPending() {
+size_t rbDeferredPending() {
     return (g_rbDrawInst ? *g_rbDrawInst : rbMain()).deferred.size();
 }
 // RAII, so the panel's early returns run the queue too. Declared BEFORE `view`
 // in drawPanelRemote: reverse destruction order is what guarantees the rows are
-// already gone when the queue runs.
-struct RbDeferredActions {
-    App::BrowseInstance& I;
-    App::BrowseInstance* prev;        // draws never nest today; stay honest anyway
-    explicit RbDeferredActions(App::BrowseInstance& i) : I(i), prev(g_rbDrawInst) {
-        g_rbDrawInst = &i;
-    }
-    ~RbDeferredActions() {
-        std::vector<std::function<void()>> q;
-        q.swap(I.deferred);            // an action may queue another...
-        for (auto& f : q) f();         // (...and it lands in I.deferred again:
-        g_rbDrawInst = prev;           // g_rbDrawInst still points here, so a
-    }                                  // re-queued action waits for the next draw)
-};
+// already gone when the queue runs. (The struct is declared in browse.h - the
+// selftests hold one across rbBuildView - and the bodies live here because
+// they touch g_rbDrawInst, which stays this TU's private state.)
+RbDeferredActions::RbDeferredActions(App::BrowseInstance& i) : I(i), prev(g_rbDrawInst) {
+    g_rbDrawInst = &i;
+}
+RbDeferredActions::~RbDeferredActions() {
+    std::vector<std::function<void()>> q;
+    q.swap(I.deferred);            // an action may queue another...
+    for (auto& f : q) f();         // (...and it lands in I.deferred again:
+    g_rbDrawInst = prev;           // g_rbDrawInst still points here, so a
+}                                  // re-queued action waits for the next draw)
 // Every navigation the panel offers. remoteBrowseTo only enqueues a job today,
 // so this changes nothing that can be seen - it makes "the panel never
 // navigates mid-draw" true by construction rather than by inspection.
@@ -391,9 +365,8 @@ static void drawRemotePlacesItems(App::BrowseInstance& I) {
     }
     if (rm >= 0) {
         app.rbBookmarks.erase(app.rbBookmarks.begin() + rm);
-        // [BrowseHost] savePrefs
         app.prefsDirty = true;
-        savePrefs();
+        g_browseHost.savePrefs();
     }
     if (!app.rbRecents.empty()) ImGui::TextDisabled("recent");
     for (int i = 0; i < (int)app.rbRecents.size(); i++) {
@@ -414,34 +387,34 @@ static void drawRemotePlacesCombo(App::BrowseInstance& I) {
     ImGui::EndCombo();
 }
 
-// (RbToolbarGeom is defined next to ViewState now - each instance carries one.)
-static float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
+// (RbToolbarGeom is defined in browse_state.h now - each instance carries one.)
+float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
 // ...and its HEIGHT, which the pinned-ancestor checks need and the width sweep
 // does not: a band only exists once the listing is too long for the panel, and
 // a test that waits for a fixture big enough to overflow whatever height the
 // screen happens to give is a test that passes for the wrong reason on a big
 // monitor. 0 = the old behaviour (80% of the work area).
-static float g_rbForceH = 0;
+float g_rbForceH = 0;
 // "marklist" / "starmark": the baselines the drawer-removal checks compare
 // against. The list's top y proves an error does not open a band above the rows
 // (it changes the status line and nothing else), and the star's baseline makes
 // the bookmark check a FLIP rather than an absolute - a scripted run inherits
 // the user's real bookmark list and must not care what is already in it.
-static float g_rbListTopY0 = 0;
-static int   g_rbStar0 = -1;
-static int   g_rbPeerV0 = -1;     // "setpv" saves the real one; "pvback" restores
+float g_rbListTopY0 = 0;
+int   g_rbStar0 = -1;
+int   g_rbPeerV0 = -1;     // "setpv" saves the real one; "pvback" restores
 // --browse-keys-selftest's injected cursor. It has to be re-asserted INSIDE the
 // frame, after the GLFW backend has had its say: the backend overwrites the
 // mouse position from the OS cursor whenever the window counts as focused, and
 // a HIDDEN window still counts (Win32 GetActiveWindow answers per thread). An
 // event queued between frames therefore lost the race about one run in six.
-static ImVec2 g_injMouse(-1, -1);   // <0: not injecting
-static int    g_injMouseBtn = -1;   // button held, -1 = none
+ImVec2 g_injMouse(-1, -1);   // <0: not injecting
+int    g_injMouseBtn = -1;   // button held, -1 = none
 // (The cursor-row rectangle and name the keys selftest aims at moved into the
 // instance: BrowseInstance::cursorRect / cursorName. The selftest reads them
 // from its TARGET instance - g_rbKeysTarget, actions "target:N".)
-static int g_rbKeysTarget = 1;      // instance NUM the keys selftest drives
-static App::BrowseInstance& rbKeysT() {
+int g_rbKeysTarget = 1;      // instance NUM the keys selftest drives
+App::BrowseInstance& rbKeysT() {
     if (App::BrowseInstance* p = rbFindNum(g_rbKeysTarget)) return *p;
     return rbMain();
 }
@@ -471,7 +444,7 @@ static void rbPlusButton() {
 // worth keeping and the row was not (a warning that shoves every file down one
 // line the moment an old peer answers). Empty = the versions agree, and
 // agreement is silent.
-static std::string rbProtocolNote(int pv) {
+std::string rbProtocolNote(int pv) {
     char t[192];
     if (pv > 0 && pv < 3)
         snprintf(t, sizeof t, "peer speaks protocol %d, this viewer speaks %d - "
@@ -521,7 +494,7 @@ static std::string rbElideMiddle(const std::string& s, float maxW) {
     return build(lo);
 }
 
-static void drawPanelRemote(App::BrowseInstance& I) {
+void drawPanelRemote(App::BrowseInstance& I) {
     App::RemoteBrowse& B = I.b;
     // FIRST, so it is destroyed LAST - after `view` and after every row that
     // points into the browse state. Anything that replaces that state is queued
@@ -581,7 +554,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                            ImGui::GetStyle().FramePadding.x * 2;
         if (ImGui::Button("Browse Local Folder...")) {
             g_rbActiveNum = I.num;     // the dialog's result lands HERE
-            browseFolderDialog();
+            g_browseHost.browseFolderDialog();
         }
         I.toolbar.emptyLocalBtn = 1;
         if (ImGui::IsItemHovered())
@@ -716,12 +689,10 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
                         app.rbBookmarks.end()) {
                         app.rbBookmarks.push_back(u);
-                        // [BrowseHost] savePrefs
                         app.prefsDirty = true;
-                        savePrefs();
+                        g_browseHost.savePrefs();
                     }
-                    // [BrowseHost] toast
-                    toast("bookmarked " + u);
+                    g_browseHost.toast("bookmarked " + u, false);
                 }
                 // The ROOT crumb is the one that stands for the machine, so it
                 // is the one that can leave it. Deeper crumbs are folders and
@@ -739,8 +710,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 ImGui::Separator();
                 if (ImGui::MenuItem("Copy path")) {
                     ImGui::SetClipboardText(target.c_str());
-                    // [BrowseHost] toast
-                    toast("copied " + target);
+                    g_browseHost.toast("copied " + target, false);
                 }
                 if (ImGui::MenuItem("Edit path...")) editReq = true;
                 ImGui::EndPopup();
@@ -794,9 +764,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                                           app.rbBookmarks.end());
                 else
                     app.rbBookmarks.push_back(curUrl);
-                // [BrowseHost] savePrefs
                 app.prefsDirty = true;
-                savePrefs();
+                g_browseHost.savePrefs();
             }
             ImGui::PopStyleColor();
             I.toolbar.starCentre = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
@@ -924,9 +893,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (di->uid == app.previewUid && di->preview) pv = di.get();
         std::string u = makeRemoteUrl(B.host, target, B.port);
         bool live = true;
-        // [BrowseHost] selectImage / openRemote
-        if (pv && pv->src->remoteUrl == u) selectImage(app.current);
-        else live = openRemote(u, true);
+        if (pv && pv->src->remoteUrl == u) g_browseHost.selectImage(app.current);
+        else live = g_browseHost.openRemote(u, true, 0);
         // only when there IS a preview: a scrub bar over nothing re-runs the
         // failing open on every press of its buttons and of , / .
         if (!live) return;
@@ -951,14 +919,13 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         }
         if (!isNpyName(r.name())) return;
         if (r.isGroup()) {
-            // [BrowseHost] dropPreview
-            dropPreview();                   // the poster frame did its job
+            g_browseHost.dropPreview();      // the poster frame did its job
             std::vector<std::string> files;
             for (const auto& m : r.e->members) files.push_back(r.join(m));
             // the canon's `folder/pattern`, built from the SAME text the peer
             // put in the group row (rp::patternWithExtent, shared verbatim)
-            // [BrowseHost] openRemoteStack
-            openRemoteStack(B.host, files, stackNameFor(*r.dir, r.e->name), B.port);
+            g_browseHost.openRemoteStack(B.host, files,
+                                         stackNameFor(*r.dir, r.e->name), B.port, 0);
             return;
         }
         // A single file: promote ITS preview when that is what the slot holds.
@@ -971,17 +938,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImageDoc* pv = nullptr;
         for (const auto& di : app.images)
             if (di->uid == app.previewUid && di->preview) pv = di.get();
-        // [BrowseHost] promotePreview
-        if (pv && pv->src->remoteUrl == u) { promotePreview(pv); return; }
+        if (pv && pv->src->remoteUrl == u) { g_browseHost.promotePreview(pv); return; }
         for (int i = 0; i < (int)app.images.size(); i++)
             if (app.images[i]->src->remoteUrl == u && !app.images[i]->preview) {
-                // [BrowseHost] selectImage
-                selectImage(i);              // already registered: show it
+                g_browseHost.selectImage(i); // already registered: show it
                 return;
             }
-        // [BrowseHost] dropPreview + openRemote
-        dropPreview();                       // a stale preview is not this row's
-        openRemote(u, false);
+        g_browseHost.dropPreview();          // a stale preview is not this row's
+        g_browseHost.openRemote(u, false, 0);
     };
     // ---- row 2: the toolbar. Narrow the listing down, and say so when the
     // listing's shape is not the default. Everything else is in the "..." menu
@@ -1209,16 +1173,14 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
             && I.flat) {
             I.flat = app.rbFlat = false;   // this panel now; the pref = the default
-            // [BrowseHost] savePrefs
             app.prefsDirty = true;
-            savePrefs();
+            g_browseHost.savePrefs();
         }
         if (ImGui::MenuItem("Flat (every frame is its own row)", nullptr, I.flat)
             && !I.flat) {
             I.flat = app.rbFlat = true;
-            // [BrowseHost] savePrefs
             app.prefsDirty = true;
-            savePrefs();
+            g_browseHost.savePrefs();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("List (one folder at a time)", nullptr, !I.tree) && I.tree) {
@@ -1234,15 +1196,13 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 if (!want.empty() && want != B.dir) rbGoTo(I, want);   // deferred
             }
             I.tree = app.rbTree = false;
-            // [BrowseHost] savePrefs
             app.prefsDirty = true;
-            savePrefs();
+            g_browseHost.savePrefs();
         }
         if (ImGui::MenuItem("Tree (folders open in place)", nullptr, I.tree) && !I.tree) {
             I.tree = app.rbTree = true;
-            // [BrowseHost] savePrefs
             app.prefsDirty = true;
-            savePrefs();
+            g_browseHost.savePrefs();
         }
         ImGui::Separator();
         // The third thing that changes the LISTING's shape, so it sits with
@@ -1258,9 +1218,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (ImGui::MenuItem(label, nullptr, I.nameNatural == wantNatural) &&
                 I.nameNatural != wantNatural) {
                 I.nameNatural = app.rbNatural = wantNatural;   // this panel; the pref = the default
-                // [BrowseHost] savePrefs
                 app.prefsDirty = true;
-                savePrefs();
+                g_browseHost.savePrefs();
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("the NAME column only - size and modified are numbers.\n"
@@ -1391,8 +1350,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     if (h.dir) {
                         rbGoTo(I, full);
                     } else if (isNpyName(h.rel)) {
-                        // [BrowseHost] openRemote
-                        openRemote(makeRemoteUrl(B.host, full, B.port));
+                        g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
+                                                false, 0);
                     } else {
                         // not servable: at least go where it lives
                         size_t sl = full.find_last_of('/');
@@ -1409,8 +1368,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     }
                     if (ImGui::MenuItem("Copy path")) {
                         ImGui::SetClipboardText(full.c_str());
-                        // [BrowseHost] toast
-                        toast("copied " + full);
+                        g_browseHost.toast("copied " + full, false);
                     }
                     ImGui::EndPopup();
                 }
@@ -1491,8 +1449,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 // OTHER thing from the action row's "Open N selected as
                 // stack", which MERGES the selection into one stack; opening
                 // three checked groups used to open only the cursor's one.
-                // [BrowseHost] dropPreview
-                dropPreview();               // the posters did their job
+                g_browseHost.dropPreview();  // the posters did their job
                 int skipped = 0;
                 for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                     if (!rbSel[i]) continue;
@@ -1504,18 +1461,16 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     if (r.isGroup()) {
                         std::vector<std::string> files;
                         for (const auto& m : r.e->members) files.push_back(r.join(m));
-                        // [BrowseHost] openRemoteStack
-                        openRemoteStack(B.host, files,
-                                        stackNameFor(*r.dir, r.e->name), B.port);
+                        g_browseHost.openRemoteStack(B.host, files,
+                                        stackNameFor(*r.dir, r.e->name), B.port, 0);
                     } else {
-                        // [BrowseHost] openRemote
-                        openRemote(makeRemoteUrl(B.host, r.full(), B.port));
+                        g_browseHost.openRemote(makeRemoteUrl(B.host, r.full(), B.port),
+                                                false, 0);
                     }
                 }
-                // [BrowseHost] toast
                 if (skipped)
-                    toast(std::to_string(skipped) +
-                          " selected item(s) skipped (folders / not .npy)", true);
+                    g_browseHost.toast(std::to_string(skipped) +
+                                       " selected item(s) skipped (folders / not .npy)", true);
                 rbSel.assign(view.size(), 0);          // the selection is consumed
             } else if (rbCursor >= 0 && rbCursor < (int)view.size()) {
                 rbOpenRow(view[rbCursor]);
@@ -1944,12 +1899,13 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
                 ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                // [BrowseHost] openReaderPicker / toast
                 if (B.host.empty())
-                    openReaderPicker(r.full(), "the viewer has no native reading for this file");
+                    g_browseHost.openReaderPicker(r.full(),
+                        "the viewer has no native reading for this file");
                 else
-                    toast("readers run on this machine only for now - copy the file over, "
-                          "or open it from a local folder", true);
+                    g_browseHost.toast("readers run on this machine only for now - "
+                                       "copy the file over, or open it from a local folder",
+                                       true);
             }
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
@@ -1970,9 +1926,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         sortFramesNumerically(files);
                         std::vector<std::string> bases;
                         for (const auto& f : files) bases.push_back(baseName(f));
-                        // [BrowseHost] openRemoteStack
-                        openRemoteStack(B.host, files,
-                                        stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        g_browseHost.openRemoteStack(B.host, files,
+                                        stackNameFor(B.dir, patternOfNames(bases)), B.port, 0);
                         rbSel.assign(view.size(), 0);
                     }
                     if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
@@ -2000,8 +1955,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         sortFramesNumerically(files);
                         std::vector<std::string> bases;
                         for (const auto& f : files) bases.push_back(baseName(f));
-                        // [BrowseHost] openStackForAverage
-                        openStackForAverage(B.host, files,
+                        g_browseHost.openStackForAverage(B.host, files,
                                             stackNameFor(B.dir, patternOfNames(bases)), B.port);
                         rbSel.assign(view.size(), 0);
                     }
@@ -2018,8 +1972,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         // filesystem is still called "/" on screen
                         std::string leaf = baseName(B.dir);
                         if (leaf.empty()) leaf = B.dir;
-                        // [BrowseHost] requestBrowseTemporal
-                        requestBrowseTemporal(B.host, files,
+                        g_browseHost.requestBrowseTemporal(B.host, files,
                                               leaf + " (" + std::to_string(files.size()) +
                                               " selected)", B.port);
                     }
@@ -2037,8 +1990,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         std::string all;
                         for (const auto& f : files) { all += f; all += "\n"; }
                         ImGui::SetClipboardText(all.c_str());
-                        // [BrowseHost] toast
-                        toast("copied " + std::to_string(files.size()) + " path(s)");
+                        g_browseHost.toast("copied " + std::to_string(files.size()) + " path(s)", false);
                     }
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("one absolute path per line; a numbered group\n"
@@ -2058,20 +2010,18 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
                             app.rbBookmarks.end()) {
                             app.rbBookmarks.push_back(u);
-                            // [BrowseHost] savePrefs
                             app.prefsDirty = true;
-                            savePrefs();
+                            g_browseHost.savePrefs();
                         }
-                        // [BrowseHost] toast
-                        toast("bookmarked " + u);
+                        g_browseHost.toast("bookmarked " + u, false);
                     }
                     ImGui::Separator();
                 } else if (r.isGroup()) {
                     if (ImGui::MenuItem("Open as stack")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
-                        // [BrowseHost] openRemoteStack
-                        openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                        g_browseHost.openRemoteStack(B.host, files,
+                                                     stackNameFor(*r.dir, e.name), B.port, 0);
                     }
                     // ...and the same stack as ONE frame: its per-pixel mean
                     // across the frame axis. Beside "Open as stack" because it
@@ -2080,8 +2030,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                     if (ImGui::MenuItem("Open as frame average")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
-                        // [BrowseHost] openStackForAverage
-                        openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                        g_browseHost.openStackForAverage(B.host, files,
+                                                         stackNameFor(*r.dir, e.name), B.port);
                     }
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", AVG_TIP);
@@ -2095,8 +2045,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         size_t sl2 = leaf.find_last_of('/');
                         if (sl2 != std::string::npos && sl2 + 1 < leaf.size())
                             leaf = leaf.substr(sl2 + 1);
-                        // [BrowseHost] requestBrowseTemporal
-                        requestBrowseTemporal(B.host, files, leaf + "/" + e.name, B.port);
+                        g_browseHost.requestBrowseTemporal(B.host, files,
+                                                           leaf + "/" + e.name, B.port);
                     }
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
@@ -2104,16 +2054,16 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                                           "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
                 } else if (isNpyName(rname)) {
-                    // [BrowseHost] openRemote
                     if (ImGui::MenuItem("Open"))
-                        openRemote(makeRemoteUrl(B.host, full, B.port));
+                        g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
+                                                false, 0);
                     // one file as a stack: a frame-axis file becomes its frames
-                    // [BrowseHost] openRemoteStack
                     if (ImGui::MenuItem("Open as stack"))
-                        openRemoteStack(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
-                    // [BrowseHost] openStackForAverage
+                        g_browseHost.openRemoteStack(B.host, { full },
+                                                     stackNameFor(*r.dir, rname), B.port, 0);
                     if (ImGui::MenuItem("Open as frame average"))
-                        openStackForAverage(B.host, { full }, stackNameFor(*r.dir, rname), B.port);
+                        g_browseHost.openStackForAverage(B.host, { full },
+                                                         stackNameFor(*r.dir, rname), B.port);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", AVG_TIP);
                     // an expanded frame still knows the sequence it came from
@@ -2123,16 +2073,16 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
-                            // [BrowseHost] openRemoteStack
-                            openRemoteStack(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                            g_browseHost.openRemoteStack(B.host, files,
+                                                         stackNameFor(*r.dir, e.name), B.port, 0);
                         }
                         snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
                                  e.frames);
                         if (ImGui::MenuItem(sl)) {
                             std::vector<std::string> files;
                             for (const auto& m : e.members) files.push_back(r.join(m));
-                            // [BrowseHost] openStackForAverage
-                            openStackForAverage(B.host, files, stackNameFor(*r.dir, e.name), B.port);
+                            g_browseHost.openStackForAverage(B.host, files,
+                                                             stackNameFor(*r.dir, e.name), B.port);
                         }
                         if (ImGui::IsItemHovered())
                             ImGui::SetTooltip("%s", AVG_TIP);
@@ -2141,8 +2091,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 }
                 if (ImGui::MenuItem("Copy path")) {
                     ImGui::SetClipboardText(full.c_str());
-                    // [BrowseHost] toast
-                    toast("copied " + full);
+                    g_browseHost.toast("copied " + full, false);
                 }
                 if (!r.isDir() && ImGui::MenuItem("Properties...")) {
                     rbPropsEntry = e;
@@ -2236,9 +2185,8 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                                            : app.previewFrames;
     if (pvN >= 2 && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         !ImGui::IsAnyItemActive()) {
-        // [BrowseHost] stepPreviewFrame
-        if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  stepPreviewFrame(-1);
-        if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) stepPreviewFrame(+1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  g_browseHost.stepPreviewFrame(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) g_browseHost.stepPreviewFrame(+1);
     }
     // ---- the bottom status line (docs/browse-topbar-design.md 10.3) --------
     // One permanent thin row under the listing, carrying the facts that are
@@ -2372,8 +2320,7 @@ static void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SameLine();
         if (ImGui::SmallButton("copy")) {
             ImGui::SetClipboardText(rbPropsPath.c_str());
-            // [BrowseHost] toast
-            toast("copied " + rbPropsPath);
+            g_browseHost.toast("copied " + rbPropsPath, false);
         }
         if (e.group)
             ImGui::Text("stack: %u frames (%s)", e.frames, e.name.c_str());
