@@ -23337,6 +23337,14 @@ static void drawFileList() {
     g_filesPinProbe.clear();
     int pinPushed = 0;
     {
+        // Its OWN ID scope, and not a detail. Without it the pinned copy and
+        // the real heading are one ImGui id, which means one open/closed state
+        // between them - and the copy forces that state open every frame,
+        // because being open is what put it in the band. Collapsing the real
+        // heading would be undone by its own reflection on the next frame.
+        // Separate ids, one direction: the copy is forced open, a click on it
+        // sets collapseBatch / collapseSeries, and the real node reads that.
+        ImGui::PushID("filespin");
         std::vector<const FilesSpan*> pins;
         for (const auto& s : g_filesSpans)
             if (s.hy <= g_filesScrollY && g_filesScrollY < s.y1) pins.push_back(&s);
@@ -23367,6 +23375,7 @@ static void drawFileList() {
             }
         }
         for (int i = 0; i < pinPushed; i++) { ImGui::TreePop(); ImGui::PopID(); }
+        ImGui::PopID();
         if (pinPushed) ImGui::Separator();
     }
     // The list scrolls on its own now. It has to: a band that is part of the
