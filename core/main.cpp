@@ -1403,6 +1403,10 @@ struct App {
     std::mutex rfMtx;
     std::condition_variable rfCv;
     std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
+    std::atomic<uint64_t> rfBusyUid{ 0 };   // the uid the worker is fetching NOW:
+                                      // requestFullRemote's dedupe must see the
+                                      // job that left the queue, or a promote
+                                      // mid-flight enqueues the fetch twice
     std::vector<RFetchDone> rfDone;   // guarded by rfMtx
     // pending "load the rest of the folder?" question
     int seqAskImage = -1;
@@ -2410,19 +2414,18 @@ static std::string abStatusChipText() {
     // still true, and stops pretending otherwise.)
     std::string share;
     if (const ImageDoc* a = cur()) {
-        if (a->src == b->src) {
-            share = "  -  A and B share the same pixels";
-        } else {
-            // The slots the panes actually SHOW: follow-frame-resolved, exactly
-            // as B above (resolveSlots IS that resolution). Testing the pinned
-            // uid instead claimed or withheld the share against a frame nobody
-            // was comparing.
-            for (const ResolvedSlot& rs : resolveSlots())
-                if (rs.doc->src == a->src) {
-                    share = "  -  A and " + slotName(rs.idx) + " share the same pixels";
-                    break;
-                }
-        }
+        // EVERY side sharing A's pixels, by the letters the panes use: B and
+        // the slots, follow-frame-resolved exactly as the panes are
+        // (resolveSlots IS that resolution). Testing the pinned uid instead
+        // claimed or withheld the share against a frame nobody was comparing -
+        // and stopping at the first match hid every sharer past it.
+        std::string letters;
+        if (a->src == b->src) letters = "B";
+        for (const ResolvedSlot& rs : resolveSlots())
+            if (rs.doc->src == a->src)
+                letters += (letters.empty() ? "" : ", ") + slotName(rs.idx);
+        if (!letters.empty())
+            share = "  -  A and " + letters + " share the same pixels";
     }
     if (app.compareMode == App::CmpDiff) {
         snprintf(buf, sizeof buf, "%s +-%g  B: %s", app.diffAbs ? "|A-B|" : "A-B",
@@ -2976,6 +2979,8 @@ static void rfWorker() {
             if (app.rfStop) break;
             job = std::move(app.rfQueue.front());
             app.rfQueue.erase(app.rfQueue.begin());
+            app.rfBusyUid = job.uid;   // inside the lock: the dedupe reads the
+                                       // queue and this uid under the same mtx
         }
         App::RFetchDone d;
         d.uid = job.uid;
@@ -3010,6 +3015,9 @@ static void rfWorker() {
         {
             std::lock_guard<std::mutex> lk(app.rfMtx);
             app.rfDone.push_back(std::move(d));
+            app.rfBusyUid = 0;         // done is QUEUED before busy clears, so a
+                                       // dedupe that misses both still lands
+                                       // behind the result it would duplicate
         }
         glfwPostEmptyEvent();                    // wake the UI to swap it in
     }
@@ -3049,6 +3057,11 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     if (d->src->remoteUrl.empty() || d->src->remoteStep <= 1) return;
     {
         std::lock_guard<std::mutex> lk(app.rfMtx);
+        // the job the worker is running RIGHT NOW left the queue but is still
+        // this uid's fetch: enqueueing another would transfer the frame twice
+        // and land a second in-place swap on a by-then-registered source (the
+        // landing guard drops it, but the transfer is real bytes)
+        if (app.rfBusyUid == d->uid) return;
         for (auto it = app.rfQueue.begin(); it != app.rfQueue.end(); ++it)
             if (it->uid == d->uid) {
                 if (it->low && !low) {         // promotion: same job, real priority
@@ -3149,6 +3162,16 @@ static void pumpRemoteFetch() {
         ImageDoc* im = nullptr;
         for (auto& q : app.images) if (q->uid == d.uid) { im = q.get(); break; }
         if (!im) continue;                       // closed while fetching
+        // A DUPLICATE full-res landing (a promote raced the in-flight fetch:
+        // requestFullRemote's dedupe reads the queue, and a job the worker had
+        // already dequeued was invisible to it). The first landing set step=1
+        // and REGISTERED the source - it may be shared by now - so a second
+        // in-place swap here would mutate a registered source outside the
+        // g_srcRegMtx contract and outside any walk. Drop it, error included
+        // (remoteErr on a registered source would un-share it silently). If
+        // the peer's file changed between the two fetches, that is Watch's to
+        // notice, the same answer as everywhere else.
+        if (im->src->remoteStep <= 1) continue;
         if (!d.err.empty()) {
             im->src->remoteErr = d.err;
             toast("remote: " + d.err, true);
@@ -6403,8 +6426,16 @@ static std::string loadRaw(const RawDialog& d) {
 // ---------------------------------------------------------------- dynamic crop
 // Crop the in-memory data (no file IO); origin snaps to the CFA period so the
 // pattern stays valid. appliedX/Y report the snapped origin.
-static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
+// Returns false when the crop is REFUSED (nothing changed). A decimated remote
+// frame (remoteStep > 1) refuses: the full-resolution fetch is still in flight
+// and its landing replaces data/w/h wholesale, knowing nothing of crop
+// bookkeeping - a crop recorded against the decimated grid would be silently
+// reverted by the swap and leave srcW stamped with preview dimensions: a
+// phantom crop (isCropped forever true), an unshareable source, and a session
+// line carrying garbage rectangles. Crop after the full frame lands.
+static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
                         int* appliedX = nullptr, int* appliedY = nullptr) {
+    if (im.src->remoteStep > 1) return false;
     // CoW (§2.2): a crop re-scopes THIS stack's measurement subject, so pixels
     // shared with another stack must not change under it. Under g_srcRegMtx for
     // the whole mutation: the registry hands sources to the sequence loader
@@ -6451,6 +6482,7 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     im.texDirty = true;
     if (appliedX) *appliedX = x;
     if (appliedY) *appliedY = y;
+    return true;
 }
 
 static void shiftAnnotations(int dx, int dy) {
@@ -6469,7 +6501,10 @@ static void cropCurrentToSelectedRoi() {
     App::Ann* sel = findAnn(app.selectedAnn);
     if (!im || !sel || sel->type != 0) return;
     int ax = 0, ay = 0;
-    cropInPlace(*im, sel->x, sel->y, sel->w, sel->h, &ax, &ay);
+    if (!cropInPlace(*im, sel->x, sel->y, sel->w, sel->h, &ax, &ay)) {
+        toast("still fetching the full frame - crop after it lands", true);
+        return;
+    }
     shiftAnnotations(-ax, -ay);        // annotations follow into the cropped frame
     if (app.ana.img == im) app.ana.img = nullptr;
     app.fitRequested = true;
@@ -11304,6 +11339,15 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         errOut = std::string(fmt->format) + " reload is not wired yet: re-open the file";
         return false;
     }
+    // Container/reader members (__pixels_*) rebuild as a UNIT: one __viewer
+    // line restores the whole tree, and a reader file re-runs its adapter.
+    // A per-member reload is not wired - and without this refusal a reader's
+    // .dat origin would fall into the npz branch below, whose npzList would
+    // then blame "not a zip file" for a failure that never happened.
+    if (src->npzMember.rfind("__pixels_", 0) == 0) {
+        errOut = "container/reader members reload by re-opening the file";
+        return false;
+    }
     std::unique_ptr<ImageDoc> nd;
     std::string err;
     if (src->rawDtype >= 0) {
@@ -12364,14 +12408,19 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
         doc->batchId = batchReuse(leaf.empty() ? host : leaf, host + ":" + dir);
     }
     computeMinMax(*doc);
-    defaultRange(*doc);
     // §6.2: a full-resolution open (step == 1) of an already-resident url+frame
     // shares that source. A PREVIEW never registers OR adopts, whatever its
     // step - it is a throwaway the next Browse click replaces, so it must not
     // become anyone's counterpart in share marks or survival notices, and the
     // in-place preview->full swap relies on ex-preview sources being
     // sole-owned. Promotion runs this again for the doc that stays.
+    // defaultRange AFTER the possible adoption: an ssh:// resident can hold an
+    // OLDER fetch than the bytes this open just measured, and black/white must
+    // describe the pixels the doc will actually show (the adoption resyncs the
+    // mirrors; computeMinMax above measured the private decode BEFORE it could
+    // be registered, per the no-unmeasured-source rule).
     if (!asPreview) shareOrRegisterSource(*doc);
+    defaultRange(*doc);
     doc->texDirty = true;
     app.images.push_back(std::move(doc));
     app.imagesRev++;
@@ -24562,7 +24611,9 @@ static void drawFileList() {
                     // offer a click that only ever toasts a refusal
                     const imagefile::Backend* pic = S.path.empty() ? nullptr
                                                   : imagefile::forPath(S.path);
-                    const bool canReload = !remote && !S.path.empty() && !pic;
+                    // container/reader members reload as a unit - see reloadSource
+                    const bool unit = S.npzMember.rfind("__pixels_", 0) == 0;
+                    const bool canReload = !remote && !S.path.empty() && !pic && !unit;
                     if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
                         pendingReloadImg = i;
                     if (!canReload && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -24572,6 +24623,9 @@ static void drawFileList() {
                         else if (pic)
                             ImGui::SetTooltip("%s reload is not wired yet: re-open the file.",
                                               pic->format);
+                        else if (unit)
+                            ImGui::SetTooltip("a container/reader member: the file rebuilds\n"
+                                              "as a unit - re-open it to reload.");
                         else
                             ImGui::SetTooltip("no file behind these pixels - they were composed\n"
                                               "here (montage / plugin result).");
@@ -24719,7 +24773,7 @@ static void drawFileList() {
                 openInNewWindow(app.images[stack.front()].get());
             {   // manual reload (reference-design §3.2 / §8 row 5): every
                 // member's file re-read, pixels swapped in place
-                bool anyLocal = false, anyRemote = false, anyPic = false;
+                bool anyLocal = false, anyRemote = false, anyPic = false, anyUnit = false;
                 for (int idx : stack) {
                     const FrameSource& S = *app.images[idx]->src;
                     // local:// embeds a path on this disk - that member reloads
@@ -24728,6 +24782,8 @@ static void drawFileList() {
                     // PNG/JPEG members: reloadSource refuses them by name -
                     // they do not make the stack reloadable on their own
                     else if (!S.path.empty() && imagefile::forPath(S.path)) anyPic = true;
+                    // ...and container/reader members reload as a unit
+                    else if (S.npzMember.rfind("__pixels_", 0) == 0) anyUnit = true;
                     else if (!S.path.empty() || !S.remoteUrl.empty()) anyLocal = true;
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
@@ -24736,6 +24792,9 @@ static void drawFileList() {
                     ImGui::SetTooltip(anyRemote
                         ? "remote-backed: these pixels come from the peer,\n"
                           "not from local files."
+                        : anyUnit
+                        ? "a container/reader file rebuilds as a unit -\n"
+                          "re-open it to reload."
                         : anyPic
                         ? "PNG/JPEG reload is not wired yet: re-open the file."
                         : "no files behind these pixels - they were composed\n"
@@ -24881,11 +24940,36 @@ static void drawFileList() {
     if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size()) {
         ImageDoc* d = app.images[pendingReloadImg].get();
         std::string err, note;
-        if (reloadSource(d->src, err, &note))
-            toast("reloaded " + baseName(d->src->path) +
-                  (note.empty() ? "" : " - dimensions changed: " + note));
-        else
+        if (reloadSource(d->src, err, &note)) {
+            std::string msg = "reloaded " + baseName(d->src->path) +
+                              (note.empty() ? "" : " - dimensions changed: " + note);
+            // the §3.2 walk refreshed EVERY membership of this source, not
+            // just this row: numbers moving in a stack the user never touched
+            // need a stated cause - the same clause reloadStackFromDisk earns
+            int sharedN = 0;
+            std::vector<std::string> sharedNames;
+            for (const auto& q : app.images)
+                if (q.get() != d && q->src == d->src) {
+                    sharedN++;
+                    std::string where = q->name;
+                    if (q->seqId != 0)
+                        if (const App::SeqInfo* si2 = seqInfo(q->seqId)) where = si2->name;
+                    if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
+                        sharedNames.end())
+                        sharedNames.push_back(where);
+                }
+            if (sharedN) {
+                char b2[192];
+                snprintf(b2, sizeof b2, " - also refreshed %d shared frame(s) in \"%s\"",
+                         sharedN, sharedNames[0].c_str());
+                msg += b2;
+                if (sharedNames.size() > 1)
+                    msg += " (+" + std::to_string((int)sharedNames.size() - 1) + " more)";
+            }
+            toast(msg);
+        } else {
             toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
+        }
     }
     if (pendingReloadSeq) {
         int failed = 0;
