@@ -1,8 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ハーネス基盤
 // ---------------------------------------------------------------- utilities
-static std::filesystem::path pathFromUtf8(const std::string& s) {
-    return std::filesystem::u8path(s);   // UTF-8 -> native (wide on Windows, bytes on POSIX)
-}
+// (pathFromUtf8 は P6 で app/state.h へ: state.h の自己完結が要求する。この断片は
+//  state.h の後に include されるので、以下の関数からは従来どおり見える。)
 static std::string jpFontPath() {
     static const char* candidates[] = {
 #if defined(_WIN32)
