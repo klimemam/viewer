@@ -10,9 +10,13 @@
 | **frame** | 画素の入った1枚。測定の最小単位 | `ImageDoc` | ファイル名（変更不可） |
 | **stack** | 同一条件で撮られた frame の並び。**時間軸**を持つので σ_t/FPN 分離・per-frame 表が意味を持つ | `SeqInfo` (`ImageDoc::seqId`) | 初期値=フォルダ/パターン、**リネーム可** |
 | **series (系列)** | **条件を1つ振った** stack / frame の並び。**パラメータ軸**を持つのでフィット・カーブが意味を持つ | `App::Series` (`Series::members` が唯一の真実) | 人間が付ける（例「25℃ 照度掃引」）、**リネーム可** |
+| **AnalysisSet** | 解析の**入力の役割**を束ねたもの（例 `{"dark": stack, "image": stack}`）。データが「dark である」のではなく、set の中で dark を**演じる** | 設計: [analysis-layers.md](analysis-layers.md) | 人間が付ける、**リネーム可** |
 | **batch (塊)** | 開いたものを人間が管理するための入れ物。**構造の主張を一切しない** | `App::Batch` (`ImageDoc::batchId`) | 初期値=フォルダ名、**リネーム可** |
 
-包含関係は frame ⊂ stack ⊂ series ⊂ batch。**厳密**で、例外を作らない
+包含関係は frame ⊂ stack ⊂ series ⊂ **AnalysisSet** ⊂ batch。**厳密**で、
+例外は1つだけ: **AnalysisSet のメンバ関係は包含ではなく束縛（参照）**である。
+dark は1回撮って複数の解析で使うのが通常運用なので、同じ stack を複数の set が
+参照してよい。set 自身は1つの batch に属する。それ以外に例外を作らない
 （series が batch をまたぐ、のような抜け道は置かない）。ただし途中の層は
 **省略**できる: 単発 frame は stack を経由せず batch に直接ぶら下がってよいし、
 どの series にも属さない stack があってよい（＝掃引の一部ではない、ただ開いた
@@ -23,6 +27,18 @@ batch）。batch は仮想的な柵にすぎず、移動しても画素のコピ
 正しい帳簿でもある（1つの測定を成すなら、それらは同じ入れ物に属する）。
 これで「series はどこに表示されるか」「batch を閉じたら series はどうなるか」が
 すべて自明になる。
+
+### 解析の4種
+
+解析は4種で、層は**シグネチャ**で宣言する（フィールドは嘘をつけるが、
+シグネチャはつけない）。詳細は [analysis-layers.md](analysis-layers.md)。
+
+| 種 | 入力 | 出すもの |
+|---|---|---|
+| **General Analyzer** | frame / stack / series（Files の選択で層が決まる） | 中立な量（Histogram / Projection / ROIs / Temporal …）。**前処理を含意する有名名は出さない** |
+| **Specific Analyzer** | シグネチャが要求する層 | アナライザ固有の量（proxy は修飾名で自己申告） |
+| **AnalysisPreProcessor** | AnalysisSet | frame / stack / series / batch（中間生成物。ストレージに置いてよい） |
+| **SetAnalyzer** | AnalysisSet | 最終 KPI（dark 減算済み PRNU 等、**有名名はここだけ**が名乗る）。実装は上3種の再利用 |
 
 ### 使わない語: `sequence`
 
@@ -117,6 +133,13 @@ Yes なら series、No なら batch。
 ## 実装上の不変条件
 
 - CFA プレーンは統計で決して混ぜない（R/Gr/Gb/B は常に別系列）。
+- **解析結果は自分の層と（set 解析なら）set を名乗る。** provenance が層・対象・
+  役割を運ぶ。運ばない数値は報告書に引用できない。
+- **前処理・参照を含意する有名名（PRNU / DSNU …）は SetAnalyzer だけが名乗る。**
+  General は中立な量の名前だけを出す — 例外なし（旧 `PRNU [σ %]` は
+  `std / mean [%]` へ改名済み）。
+- **役割の束縛は宣言である。推論しない** — フォルダ名や level 0 から dark を
+  推測して束ねない（「level 0 = dark」は linearity の後方互換に閉じる）。
 - 部分ロードされた stack の集計は「何枚中何枚か」を必ず併記する。
 - **計算で作った frame は、撮ったものの顔をしてはならない。** frame 平均のような
   導出画像は、由来（元 stack・何枚中何枚か・除外した非有限サンプル数）を **名前**と
