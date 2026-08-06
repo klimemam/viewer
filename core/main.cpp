@@ -272,6 +272,14 @@ struct FrameSource {
     int rev = 0;                      // +1 when the pixels are replaced wholesale (preview→full swap; later, reload)
     int64_t mtime = 0;                // Watch baseline: disk state at decode time; 0 = unknown
     uint64_t fsize = 0;
+    // The key this source is REGISTERED under, "" = not registered. Registry
+    // bookkeeping, not identity: srcKeyPath canonicalizes through the live
+    // filesystem, so a key recomputed later (symlink retargeted, share
+    // remounted) can differ from the one the slot was created under - erasing
+    // by a recomputed key would then miss, leaving a stale row whose pixels a
+    // later open could adopt. Erase by what was WRITTEN, not by what would be
+    // written today. Maintained under g_srcRegMtx by the *Locked helpers.
+    std::string regKey;
     FrameSource() : srcId(g_nextSrcId.fetch_add(1)) {}
 };
 // Watch baseline (§2.1): what was on disk when these pixels were decoded.
@@ -306,6 +314,7 @@ static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
     auto ns = std::make_shared<FrameSource>(s);   // same content...
     ns->srcId = g_nextSrcId.fetch_add(1);         // ...own identity
     ns->rev = 0;
+    ns->regKey.clear();               // the clone is NOT the registered occupant
     return ns;
 }
 
@@ -383,7 +392,11 @@ static std::string srcIdentityKey(const FrameSource& s) {
         snprintf(t, sizeof t, "\n%d|%d\nnr%d\n%lld,%llu",
                  s.fileFrame, s.remoteFrame, npyKeyRead(s.npyShape, s.npyRead),
                  (long long)s.mtime, (unsigned long long)s.fsize);
-    return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" + s.npzMember + t;
+    // npzMember is LENGTH-PREFIXED: a zip may name a member anything, newlines
+    // included, and an unescaped name could forge the field boundaries of this
+    // key - two different tuples reading back as one string
+    return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" +
+           std::to_string(s.npzMember.size()) + ":" + s.npzMember + t;
 }
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
@@ -408,6 +421,7 @@ static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key
     std::shared_ptr<FrameSource> sp = it->second.lock();
     if (!sp) { g_srcRegistry.erase(it); return nullptr; }   // died with its last stack
     if (!srcShareable(*sp)) {         // e.g. cropped in place while sole-owned:
+        if (sp->regKey == key) sp->regKey.clear();
         g_srcRegistry.erase(it);      // EVICT - a live occupant that stopped being
         return nullptr;               // the frame must not squat the tuple's slot
     }
@@ -423,14 +437,19 @@ static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key
 // (srcKeyPath does filesystem IO - see the lock-order note above).
 static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s,
                                                          const std::string& key) {
-    if (!s || !srcShareable(*s)) return nullptr;
+    if (!s || !srcShareable(*s)) { if (s) s->regKey.clear(); return nullptr; }
     std::weak_ptr<FrameSource>& slot = g_srcRegistry[key];
     if (std::shared_ptr<FrameSource> live = slot.lock()) {
-        if (live == s) return nullptr;             // already the registered one
-        if (srcShareable(*live)) return live;      // first resident wins: adopt it
+        if (live == s) { s->regKey = key; return nullptr; }   // already the registered one
+        if (srcShareable(*live)) {                 // first resident wins: adopt it
+            s->regKey.clear();                     // s holds no slot
+            return live;
+        }
         // live but no longer the frame (cropped in place): reclaim the slot
+        if (live->regKey == key) live->regKey.clear();
     }
     slot = s;
+    s->regKey = key;
     // dead rows hold no pixels but would pile up over many open/close cycles;
     // sweep amortised, whenever the map has doubled since the last sweep
     static size_t sweepAt = 256;
@@ -1594,6 +1613,8 @@ struct App {
         adapter::Run r;
         double startedAt = 0;
         size_t shown = 0;                  // how much of the live output is on screen
+        int64_t srcMtime = 0;              // the origin's stat, taken BEFORE the
+        uint64_t srcFsize = 0;             // reader ran (identity before bytes)
     };
     std::unique_ptr<ReaderJob> rdJob;
     bool anyFileDialog() const {      // see the note on csvDlg
@@ -5263,7 +5284,8 @@ using VnzFetch = std::function<bool(int i, const VnzNode& v,
                                     std::vector<uint8_t>& out, std::string& err)>;
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
-                            const std::vector<std::pair<std::string, std::string>>& metaIn);
+                            const std::vector<std::pair<std::string, std::string>>& metaIn,
+                            const FrameSource& originStat);
 
 // ---- the framed stream ------------------------------------------------------
 // What the harness writes with --stream: a line-based header, then the pixel
@@ -5306,7 +5328,8 @@ static size_t writeNpyHeaderFor(std::vector<uint8_t>& buf, const std::string& dt
 struct VnzBlob { int node = 0; std::string dtype; std::vector<int64_t> shape; uint64_t nbytes = 0; };
 
 static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
-                                    const std::string& origin) {
+                                    const std::string& origin,
+                                    const FrameSource& originStat) {
     std::ifstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) return "cannot open what the reader wrote: " + path;
     std::string line;
@@ -5411,12 +5434,13 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
                         next++;
                         return true;
                     },
-                    meta);
+                    meta, originStat);
 }
 
 static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
                                  const std::vector<NpzEntry>& entries, int version,
-                                 const std::string& readerSpec, const std::string& origin) {
+                                 const std::string& readerSpec, const std::string& origin,
+                                 const FrameSource& originStat) {
     if (version > VIEWER_NPZ_VERSION) {
         char b[192];
         snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
@@ -5531,7 +5555,7 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
     return vnzBuild(nodes, n, origin, readerSpec,
                     [&](int, const VnzNode& v, std::vector<uint8_t>& out,
                         std::string& e) { return npzExtract(zip, entries[v.pixelEntry], out, e); },
-                    meta);
+                    meta, originStat);
 }
 
 // ---- build ---------------------------------------------------------------
@@ -5539,7 +5563,8 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
 // thing that knew where the bytes live is now the callback.
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
-                            const std::vector<std::pair<std::string, std::string>>& metaIn) {
+                            const std::vector<std::pair<std::string, std::string>>& metaIn,
+                            const FrameSource& originStat) {
     int prevBatch = app.loadBatchId;
     std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
                                 ? nodes[0].name : baseName(origin);
@@ -5605,7 +5630,12 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
         for (int k = 0; k < v.docCount; k++) {
             ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
             d->src->npzMember = "__pixels_" + std::to_string(i);
-            statSourceFile(*d->src);
+            // the CALLER's stat, taken before the origin's bytes were read
+            // (identity before bytes, §6.2): a stat taken here, after the
+            // multi-second container decode, could bind NEW disk state to OLD
+            // pixels and the Watch baseline would never notice the change
+            d->src->mtime = originStat.mtime;
+            d->src->fsize = originStat.fsize;
             if (!v.note.empty())
                 d->note = d->note.empty() ? v.note : d->note + ", " + v.note;
             if (cfaPat >= 0) { d->cfa = cfaKind; d->cfaPattern = cfaPat; d->texDirty = true; }
@@ -5750,7 +5780,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
                     d->src->npzMember.compare(0, 9, "__pixels_") == 0)
                     return {};
         }
-        return loadViewerNpz(zip, entries, vver, readerSpec, src);
+        return loadViewerNpz(zip, entries, vver, readerSpec, src, zipStat);
     }
     std::vector<NpzMember> mem = npzScan(zip, entries);
     if (mem.empty()) return "no arrays in npz";
@@ -6381,9 +6411,6 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     // thread under that lock, so a probe either adopts BEFORE this (then
     // use_count > 1 forces the clone) or looks up after and is refused
     // (srcShareable sees the crop) - it can never adopt pixels mid-crop.
-    // The key is computed before the lock (IO - see the g_srcRegMtx note);
-    // identity fields only move on this thread, so it cannot go stale here.
-    const std::string key = srcIdentityKey(*im.src);
     std::lock_guard<std::mutex> regLk(g_srcRegMtx);
     if (im.src.use_count() > 1) {
         im.src = cloneSource(*im.src);
@@ -6393,11 +6420,14 @@ static void cropInPlace(ImageDoc& im, int x, int y, int w, int h,
         // so it leaves the registry NOW - a live occupant that fails
         // srcShareable would otherwise squat the tuple's slot, and the same
         // file could neither be adopted nor re-registered until this doc
-        // closed (the crop does not change any key field, so the key still
-        // names the slot the full-frame decode registered)
-        auto it = g_srcRegistry.find(key);
-        if (it != g_srcRegistry.end() && it->second.lock() == im.src)
-            g_srcRegistry.erase(it);
+        // closed. Erased by regKey - the key the slot was CREATED under -
+        // which also keeps filesystem IO (key recomputation) out of this lock.
+        if (!im.src->regKey.empty()) {
+            auto it = g_srcRegistry.find(im.src->regKey);
+            if (it != g_srcRegistry.end() && it->second.lock() == im.src)
+                g_srcRegistry.erase(it);
+            im.src->regKey.clear();
+        }
     }
     FrameSource& S = *im.src;
     if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
@@ -7344,7 +7374,8 @@ static std::string adapterCacheDir() {
 static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::string& out,
                                 const std::vector<std::string>& argv,
-                                const adapter::Run& r);   // fwd: the tail, shared
+                                const adapter::Run& r,
+                                const FrameSource& originStat);   // fwd: the tail, shared
 static std::string openWithReader(const std::string& src, const std::string& spec,
                                   bool allowCache = true,
                                   App::ReaderJob* job = nullptr) {
@@ -7353,6 +7384,11 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     app.readerLastOk = false;
     app.readerLastSpec = spec;
     app.readerLastOut.clear();
+    // identity BEFORE the bytes (§6.2): the reader is about to read the origin
+    // file for however long it takes - the docs it produces bind to THIS stat
+    FrameSource originStat;
+    originStat.path = src;
+    statSourceFile(originStat);
     std::string script = runAdapterScript();
     if (script.empty())
         return "cannot find tools/import/run_adapter.py - the adapter harness ships "
@@ -7374,7 +7410,7 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
         // §7 stage 5: the second open does not start Python. The key already
         // covers the adapter's mtime, so "cached" cannot mean "stale".
-        std::string lerr = loadViewerStream(cached, spec, src);
+        std::string lerr = loadViewerStream(cached, spec, src, originStat);
         if (lerr.empty()) {
             rememberReader(src, spec);
             app.readerLastOk = true;
@@ -7423,6 +7459,8 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         job->src = src; job->spec = spec; job->out = out; job->argv = argv;
         job->outFile = outFile; job->errFile = errFile;
         job->startedAt = nowSec();
+        job->srcMtime = originStat.mtime;  // identity before bytes, carried
+        job->srcFsize = originStat.fsize;  // across the asynchronous run
         app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
         App::ReaderJob* j = job;
         j->th = std::thread([j]() {
@@ -7432,7 +7470,7 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         return {};
     }
     adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile, false);
-    std::string fin = readerFinish(src, spec, out, argv, r);
+    std::string fin = readerFinish(src, spec, out, argv, r, originStat);
     std::filesystem::remove(pathFromUtf8(errFile), tec);
     return fin;
 }
@@ -7443,7 +7481,8 @@ static std::string openWithReader(const std::string& src, const std::string& spe
 static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::string& out,
                                 const std::vector<std::string>& argv,
-                                const adapter::Run& r) {
+                                const adapter::Run& r,
+                                const FrameSource& originStat) {
     if (r.cancelled) {
         app.readerLastOut += "\nstopped.\n";
         return "the reader was stopped";
@@ -7474,7 +7513,7 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
         app.readerLastOut = msg;
         return msg;
     }
-    std::string lerr = loadViewerStream(out, spec, src);
+    std::string lerr = loadViewerStream(out, spec, src, originStat);
     if (!lerr.empty()) {
         // The one failure that used to leave the panel EMPTY. The reader ran and
         // exited 0, so it is not the reader's traceback that is wrong - what it
@@ -7554,7 +7593,10 @@ static void pollReader() {
         return;
     }
     j->th.join();
-    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r);
+    FrameSource jStat;                     // the stat openWithReader took at start
+    jStat.mtime = j->srcMtime;
+    jStat.fsize = j->srcFsize;
+    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r, jStat);
     std::error_code ec;
     std::filesystem::remove(pathFromUtf8(j->errFile), ec);
     app.rdJob.reset();
@@ -11339,12 +11381,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                  src->dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
         *noteOut = b;
     }
-    // Both keys BEFORE the lock (they canonicalize the path: filesystem IO -
-    // see the g_srcRegMtx note). The old key reads the pre-swap fields; the
-    // new key is the post-swap tuple, composed on an identity probe from
-    // values already in hand - identity fields only move on this thread, so
-    // neither can go stale between here and the hold below.
-    const std::string oldKey = srcIdentityKey(*src);
+    // The new key BEFORE the lock (it canonicalizes the path: filesystem IO -
+    // see the g_srcRegMtx note), composed on an identity probe from values
+    // already in hand - identity fields only move on this thread, so it
+    // cannot go stale between here and the hold below. The OLD slot is erased
+    // by src->regKey, the key it was actually created under: recomputing it
+    // through today's filesystem could miss (see the note at regKey).
     std::string newKey;
     {
         FrameSource idNew;            // identity only - no pixels are copied
@@ -11373,9 +11415,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         // it, and a restore of the old bytes misses and re-decodes the disk.
         // Without this the stale row could hand post-reload pixels to a tuple
         // that never contained them.
-        auto it = g_srcRegistry.find(oldKey);
-        if (it != g_srcRegistry.end() && it->second.lock() == src)
-            g_srcRegistry.erase(it);
+        if (!src->regKey.empty()) {
+            auto it = g_srcRegistry.find(src->regKey);
+            if (it != g_srcRegistry.end() && it->second.lock() == src)
+                g_srcRegistry.erase(it);
+            src->regKey.clear();
+        }
         // same srcId (identity), new pixels, rev +1, the PRE-read Watch baseline
         src->data = std::move(nd->src->data);
         src->w = N.w; src->h = N.h; src->ch = N.ch;
