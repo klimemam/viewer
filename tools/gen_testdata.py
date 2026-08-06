@@ -201,6 +201,38 @@ for lv in ("10lx", "20lx", "40lx"):
     for k in range(8):
         np.save(d / f"frame_{k:03d}.npy", (rng3.random((32, 32)) * 4095).astype(np.float32))
 
+# expset/zdeep: the one fixture that is DEEP and whose deepest level is also its
+# LAST rows. Everything else under rb/ bottoms out in one or two levels and
+# ends, at every depth, on files that sit at the top level - so scrolling to the
+# end of any of them puts a top-level row at the top of the viewport, and the
+# pinned-ancestor band correctly holds nothing. That is a true answer to the
+# wrong question. Here the tail of the listing is sixty rows that are all three
+# levels down, so scrolling anywhere near the bottom is guaranteed to leave the
+# reader inside a/b/c whatever height the panel happens to have.
+#
+# Under EXPSET, and not at rb's root, which is where it was first written. The
+# --browse-keys script walks rb's root by counting Down presses, and a listing
+# sorts directories before files - so a seventh directory there moves every
+# FILE row down one and quietly re-aims a dozen assertions that were written
+# against row 9. expset is the one rb directory the script enters without
+# asserting anything about the rows inside it (it clicks in, checks the
+# history, and backs straight out), so a child here is invisible to every
+# index that already exists.
+#
+# Three more constraints, each of them another test's:
+#   - no file matches frame_*.npy - --remote-selftest counts those against a
+#     literal 51 over the whole tree, and none of this may reach that number;
+#   - nothing new at rb's root: --browse-selftest asserts rb lists exactly one
+#     group and three plain files;
+#   - the leaf names carry no digits, so the peer's numbered-run grouping folds
+#     none of them together. Sixty rows that collapsed into one group row would
+#     scroll nothing.
+zd = eset / "zdeep" / "a" / "b" / "c"
+zd.mkdir(parents=True, exist_ok=True)
+for hi in "abcde":
+    for lo in "abcdefghijkl":
+        np.save(zd / f"shot_{hi}{lo}.npy", (rng3.random((8, 8)) * 4095).astype(np.float32))
+
 # picker batch-mode fixture (--picker-selftest UC5): three top-level condition
 # folders, each a numbered stack plus a single representative average.npy -
 # "one batch per top folder" must make three batches, stacks intact

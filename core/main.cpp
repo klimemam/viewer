@@ -384,6 +384,16 @@ struct RbToolbarGeom {
                                            // above it would push this down
     ImVec2 starCentre = ImVec2(-1, -1);    // the path line's bookmark star
     int   starLit = 0;                     // 1 = this place is bookmarked
+    // ---- the ancestors held at the top of a scrolled tree -------------------
+    // What the reader can still see of where they are. Recorded rather than
+    // inferred because the whole claim this feature makes is about the SCREEN:
+    // "the folder you are inside is laid out, at the top", and a flag saying
+    // the feature is enabled would not have caught a band that drew nothing.
+    int   pinnedRows = 0;                  // how many levels are held
+    std::string pinnedNames;               // which, outermost first, ";"-joined
+    // ...and where the outermost one landed, so an injected click can be aimed
+    // at it. A pinned row that cannot be clicked would be a picture of a row.
+    ImVec2 pinCentre = ImVec2(-1, -1);
 };
 
 // One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
@@ -946,6 +956,15 @@ struct App {
         // ...and the centre of the cursor row's chevron hit zone (tree dir
         // rows only; x < 0 = the row has no chevron), for "chevclick"
         ImVec2 cursorChev = ImVec2(-1, -1);
+        // The listing's row PITCH, measured from the rows the clipper actually
+        // laid out. The pinned-ancestor band has to know which row is at the
+        // top of the viewport BEFORE it submits anything (ImGui wants the
+        // frozen-row count before the first row), so it divides the scroll
+        // offset by this instead of asking the clipper - which has not run yet.
+        // Measured, not derived: a row is a Selectable inside a table cell, and
+        // reconstructing that height from font size and two paddings is a
+        // second copy of ImGui's arithmetic that would drift from it.
+        float listRowH = 0;
     };
     // Never empty once rbMain() ran; [0] is always the primordial instance.
     std::vector<std::unique_ptr<BrowseInstance>> browsePanels;
@@ -20303,6 +20322,50 @@ static void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& 
     });
 }
 
+// ---- the ancestors of the first visible row ---------------------------------
+// Scrolling a tree used to carry its own context off the top of the panel: six
+// rows down inside scanroot/40lx there was nothing on screen saying you were in
+// scanroot, or in 40lx, and the only way to find out was to scroll back. The
+// levels above the reader stay put now - every one of them, no depth limit -
+// and this function is which rows those are.
+//
+// It takes the position ON SCREEN of the first row the clipper will submit and
+// gives back the screen positions of that row's ancestors, outermost first.
+//
+// Why it is written against `shown` and not against the drawn rows: the listing
+// is virtualised. Everything above DisplayStart is never submitted, so there is
+// no row object to ask "who is your parent" - and there is no parent POINTER on
+// an RbRow either, because rbAddRows flattens the tree into a depth-tagged run.
+// That flattening is what makes this cheap: in a run where a child always
+// follows its parent, the ancestors of row f are exactly the rows you meet
+// walking BACKWARDS from f while taking each one whose depth is lower than the
+// last one taken. It reads only the rows it takes plus the ones it steps over,
+// touches no ImGui state, and needs no row to have been drawn - which is what
+// lets the whole rule be tested without a GL context.
+//
+// ".." is excluded by construction, not by a special case: it sits at depth 0
+// as row 0 and the walk stops the moment it takes a depth-0 row, which for any
+// row inside a tree is that row's real top-level folder. The `up` test is there
+// for the one listing where ".." is the ONLY depth-0 row - a flat listing has
+// no depth at all, and then this correctly returns nothing.
+//
+// The returned values index `shown`, i.e. they are ROW POSITIONS, not view
+// indices: a pinned row is drawn by the same code, from the same index, as the
+// row it is a copy of, so there is nothing about it that can behave differently.
+static void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
+                           int firstRow, std::vector<int>& out) {
+    out.clear();
+    if (firstRow <= 0 || firstRow >= (int)shown.size()) return;
+    int want = view[shown[firstRow]].depth;      // an ancestor is strictly shallower
+    for (int r = firstRow - 1; r >= 0 && want > 0; r--) {
+        const RbRow& c = view[shown[r]];
+        if (c.up || c.depth >= want) continue;
+        out.push_back(r);
+        want = c.depth;
+    }
+    std::reverse(out.begin(), out.end());        // outermost first, as drawn
+}
+
 // ---- deferred panel actions -------------------------------------------------
 // Every row the listing draws is an RbRow: RAW POINTERS into that instance's
 // b.entries and into its tree cache, held in a `view` vector that is rebuilt
@@ -20418,6 +20481,12 @@ static void drawRemotePlacesCombo(App::BrowseInstance& I) {
 
 // (RbToolbarGeom is defined next to ViewState now - each instance carries one.)
 static float g_rbForceW = 0;      // >0: selftest floats instance 1 at this width
+// ...and its HEIGHT, which the pinned-ancestor checks need and the width sweep
+// does not: a band only exists once the listing is too long for the panel, and
+// a test that waits for a fixture big enough to overflow whatever height the
+// screen happens to give is a test that passes for the wrong reason on a big
+// monitor. 0 = the old behaviour (80% of the work area).
+static float g_rbForceH = 0;
 // "marklist" / "starmark": the baselines the drawer-removal checks compare
 // against. The list's top y proves an error does not open a band above the rows
 // (it changes the status line and nothing else), and the star's baseline makes
@@ -21584,11 +21653,66 @@ static void drawPanelRemote(App::BrowseInstance& I) {
     auto tHide = [](bool show) {
         return show ? ImGuiTableColumnFlags_None : ImGuiTableColumnFlags_Disabled;
     };
+    const float rbTableH = ImGui::GetContentRegionAvail().y - rbFootH;
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_ScrollY |
                                        ImGuiTableFlags_SortTristate,
                                        ImVec2(0, -rbFootH))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
+        // ---- the levels above the reader, held at the top ---------------------
+        // A tree that scrolls loses the folder you are in: it is above
+        // DisplayStart, so it is never submitted, and the panel goes on showing
+        // eight files with nothing on screen saying which of six folders they
+        // came from. Every ancestor stays instead - all of them, at any depth.
+        //
+        // FROZEN ROWS, not an overlay. ImGui's own ScrollFreeze puts the rows it
+        // is given ABOVE the scrolling region and shortens that region by their
+        // height, which is the difference between a band that occupies space and
+        // one that covers the first real row. It is normally used for a fixed
+        // count (this table already froze the header with it); what is new is
+        // that the count is recomputed every frame from where the scroll is.
+        //
+        // The columns, the row background, the selection fill, the cursor
+        // outline and the horizontal position of every cell therefore come out
+        // right for free: a pinned row is the same table's row, drawn by the
+        // same code from the same index. It is not a picture of a row.
+        //
+        // Vendored ImGui is NOT patched for this. It arrives through
+        // FetchContent and a local patch is a cost at every version bump, and
+        // nothing here needed one: TableSetupScrollFreeze takes its row count as
+        // an ordinary per-frame argument, and ImGui already stops freezing
+        // entirely at scroll 0 (imgui_tables.cpp: FreezeRowsCount is zeroed when
+        // Scroll.y == 0), which is exactly the "no band at the top of the list"
+        // behaviour this wants.
+        //
+        // Why the scroll offset and not clipper.DisplayStart: the freeze count
+        // has to be set before the first row, and the clipper does not run until
+        // after it. Dividing the scroll by the measured row pitch is the same
+        // arithmetic the clipper itself does, one step earlier - so the band and
+        // the clipper agree on which row is at the top, in the same frame, with
+        // no state carried over from the last one.
+        std::vector<int> rbPins;
+        {
+            const float sy = ImGui::GetScrollY();   // the inner window's, this frame
+            const float rh = I.listRowH;
+            if (sy > 0 && rh > 0) {
+                int first = std::min((int)(sy / rh), (int)shown.size() - 1);
+                rbAncestorRows(view, shown, first, rbPins);
+                // A guard on the WIDGET, not on the depth. There is no depth
+                // limit here on purpose - Browse moves its current directory
+                // with a double-click, so a listing is rarely more than a few
+                // levels below where it stands - and this only ever bites when
+                // the panel is dragged so short that the ancestors would leave
+                // NO scrollable row at all, which is a table that cannot be
+                // used rather than a policy about hierarchies. One row is
+                // enough for it to be a listing again; the deepest levels are
+                // what give way, because the outermost is the one that says
+                // most about where you are.
+                int room = (int)(rbTableH / rh) - 1;
+                if (room < 0) room = 0;
+                if ((int)rbPins.size() > room) rbPins.resize((size_t)room);
+            }
+        }
+        ImGui::TableSetupScrollFreeze(0, 1 + (int)rbPins.size());
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
         ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
@@ -21618,18 +21742,19 @@ static void drawPanelRemote(App::BrowseInstance& I) {
                 I.sortDesc = false;
             }
         }
-        ImGuiListClipper clip;
-        clip.Begin((int)shown.size());
-        // The cursor row must be SUBMITTED even when it is scrolled out, or
-        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
-        // clipper allocates its range list there, and IncludeItemByIndex writes
-        // straight through the null TempData pointer otherwise - the two
-        // IM_ASSERTs that say so are compiled out of a release build, so a
-        // single Down arrow segfaulted the process before any handler ran.
-        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
-            clip.IncludeItemByIndex(rbCursorPos);
-        while (clip.Step())
-        for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+        // ONE row, drawn one way. `pinned` says only that this copy is being
+        // held at the top of the listing by the frozen-row band above; it
+        // changes nothing about what the row is or what clicking it does, and
+        // the three things it does suppress are all recordings of "where is
+        // this on screen" that belong to the row in its own place:
+        //   - SetScrollHereY, which would scroll the listing to the band;
+        //   - toolbar.rowX/rowY, the first LISTED row a selftest right-clicks;
+        //   - cursorRect/cursorChev, which aim injected clicks.
+        // A pinned copy shares its index with the row it copies, so it also
+        // shares its ImGui ID - and the cursor row is force-submitted by the
+        // clipper even when scrolled out, so the two really can meet. The band
+        // is pushed into its own ID scope below to keep them apart.
+        auto rbDrawRow = [&](int row, bool pinned) {
             const RbRow& r = view[shown[row]];
             const remote::Entry& e = *r.e;
             const std::string& rname = r.name();
@@ -21671,25 +21796,39 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             // context menu (a placeholder "(listing...)" row has none, the ".."
             // row has none, and a tree still fetching a node can put one at the
             // top)
-            if (!r.ph && !r.up && I.toolbar.rowY <= 0) {
+            if (pinned && I.toolbar.pinCentre.x < 0)      // the outermost, for a click
+                I.toolbar.pinCentre =
+                    ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+                           (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
+            if (!r.ph && !r.up && !pinned && I.toolbar.rowY <= 0) {
                 I.toolbar.rowX = (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f;
                 I.toolbar.rowY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
             }
             if (shown[row] == rbCursor) {
                 // the keyboard cursor: an outline, not a fill - the fill means
                 // "selected for a multi-file action" and the two are not the same
-                if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                //
+                // Drawn on the pinned copy too. Wheeling a tree can leave the
+                // cursor on a folder that is now being held at the top, and a
+                // cursor that vanishes because its row moved is a cursor the
+                // user has to go and find.
                 ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),
                                                     ImGui::GetItemRectMax(),
                                                     IM_COL32(150, 180, 215, 190), 0.0f, 0, 1.0f);
-                I.cursorRect[0] = ImGui::GetItemRectMin();
-                I.cursorRect[1] = ImGui::GetItemRectMax();
-                I.cursorName = rname;
-                I.cursorFull = r.full();   // the key `expanded` is written in
-                I.cursorChev = chevRow
-                    ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
-                             (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
-                    : ImVec2(-1.0f, -1.0f);
+                // WHERE it is, though, is recorded off the row in its own place
+                // only: this drives SetScrollHereY and the coordinates injected
+                // clicks are aimed at, and both mean the row's real position.
+                if (!pinned) {
+                    if (rbCursorScroll) { ImGui::SetScrollHereY(0.5f); rbCursorScroll = false; }
+                    I.cursorRect[0] = ImGui::GetItemRectMin();
+                    I.cursorRect[1] = ImGui::GetItemRectMax();
+                    I.cursorName = rname;
+                    I.cursorFull = r.full();   // the key `expanded` is written in
+                    I.cursorChev = chevRow
+                        ? ImVec2(rowMin.x + rowInd + rowGut * 0.45f,
+                                 (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f)
+                        : ImVec2(-1.0f, -1.0f);
+                }
             }
             if (r.isDir() || r.isGroup()) {   // inside the two-space gutter the label reserves
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
@@ -22075,6 +22214,40 @@ static void drawPanelRemote(App::BrowseInstance& I) {
             }
             else if (!r.ph && !r.isDir() && r.ownFile()) ImGui::TextDisabled("-");
             ImGui::PopID();
+        };
+        // The band. Submitted FIRST and nowhere else: ImGui hands the frozen
+        // rows to whatever comes immediately after the header, so these rows
+        // and TableSetupScrollFreeze's count above have to agree exactly or the
+        // listing's first ordinary row is frozen instead.
+        I.toolbar.pinnedRows = (int)rbPins.size();
+        I.toolbar.pinnedNames.clear();
+        I.toolbar.pinCentre = ImVec2(-1, -1);
+        if (!rbPins.empty()) {
+            ImGui::PushID("pinned");        // see rbDrawRow: IDs must not collide
+            for (int p : rbPins) {
+                I.toolbar.pinnedNames += view[shown[p]].name();
+                I.toolbar.pinnedNames += ";";
+                rbDrawRow(p, true);
+            }
+            ImGui::PopID();
+        }
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        // The cursor row must be SUBMITTED even when it is scrolled out, or
+        // there is no item for SetScrollHereY to scroll to. AFTER Begin(): the
+        // clipper allocates its range list there, and IncludeItemByIndex writes
+        // straight through the null TempData pointer otherwise - the two
+        // IM_ASSERTs that say so are compiled out of a release build, so a
+        // single Down arrow segfaulted the process before any handler ran.
+        if (rbCursorScroll && rbCursorPos >= 0 && rbCursorPos < (int)shown.size())
+            clip.IncludeItemByIndex(rbCursorPos);
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++)
+                rbDrawRow(row, false);
+            // what the band divides the scroll offset by NEXT frame - see the
+            // freeze block above. ImGui measures it off the first row it laid
+            // out, which is the same pitch every row here has.
+            if (clip.ItemsHeight > 0) I.listRowH = clip.ItemsHeight;
         }
         ImGui::EndTable();
     }
@@ -22805,6 +22978,61 @@ static std::string conditionText(const App::Series& S, double v) {
     return b;
 }
 
+// The stack name as a SERIES MEMBER row prints it.
+//
+// Opening a container names its stacks after their position inside it -
+// "sweep.vnz:0", "sweep.vnz:1" (loadVnzNodes) - and that compound is why a
+// member row could be read at all when the series it belongs to had scrolled
+// off the top: the row had to say which sweep it came from, because nothing
+// above it was still on screen to say so. The heading is held there now, and
+// the row leads with its own [n], so the ":n" is the same fact printed twice.
+// What is left is the file name, which goes to the END of the row - where a
+// narrowing panel drops it first and the index and the condition survive.
+//
+// DISPLAY ONLY, and only here. The name itself is unchanged: it is what the
+// Linearity table's stack column, the Series menu, "Move to batch" and every
+// tooltip print, and in those places there is no [n] beside it and no pinned
+// heading above it - three stacks all reading "sweep.vnz" would be a real loss
+// of information. This is the one row that has somewhere else to put it.
+//
+// A DIGIT tail only. An .npz member builds the same shape out of the array's
+// NAME (loadNpzMembers: "data.npz:arr_0"), and that is not a position - the
+// row's [n] does not repeat it, so it stays.
+static std::string filesMemberName(const std::string& name) {
+    size_t c = name.find_last_of(':');
+    if (c == std::string::npos || c == 0 || c + 1 >= name.size()) return name;
+    for (size_t i = c + 1; i < name.size(); i++)
+        if (name[i] < '0' || name[i] > '9') return name;
+    return name.substr(0, c);
+}
+
+// ---- what the Files panel holds at the top while it scrolls ------------------
+// One level of the hierarchy and the rows it owns, in the list's own content
+// coordinates (scroll-independent: ImGui::GetCursorPos, not GetCursorScreenPos).
+// Recorded by the walk that draws the list and read at the top of the NEXT
+// frame, which is where the band has to be submitted.
+//
+// Files needs a different mechanism from Browse and it is worth saying why,
+// because they look like the same feature: Browse's rows are virtualised, so
+// the only thing it can reason about is row INDICES, and it hands its band to
+// the table's own frozen-row machinery. Files has no clipper - every row is
+// submitted, every frame - so here the exact geometry is already known and the
+// band is simply drawn above the scrolling region, which is the plainest way
+// there is to make it occupy space rather than cover the first row.
+struct FilesSpan {
+    int batch = 0;             // the batch this level belongs to
+    int series = 0;            // 0 = the batch's own heading, else the series'
+    float y0 = 0;              // top of the heading row
+    float hy = 0;              // ...and its bottom: above this it is still visible
+    float y1 = 0;              // bottom of the last row under it
+};
+static std::vector<FilesSpan> g_filesSpans;
+static float g_filesScrollY = 0;        // where the list was scrolled to, last frame
+// What the band actually held, outermost first, ";"-joined - the same shape of
+// probe as RbToolbarGeom::pinnedNames and read for the same reason: the claim
+// is about what is on screen.
+static std::string g_filesPinProbe;
+
 static void drawFileList() {
     g_filesBadgeProbe.clear();
     // No Open / Close buttons here (2026-08-03). Browse is how a file is found
@@ -22959,46 +23187,203 @@ static void drawFileList() {
     // materialise above rows that had none - and a batch you can rename and
     // move things into cannot be a thing that exists only sometimes.
     const bool showHeaders = !groups.empty();
+    // ---- one heading, drawn one way -----------------------------------------
+    // `pinned` says only that this copy is the one being held above the
+    // scrolling list. It is the same widget, with the same ink, the same
+    // tooltip and the same context menu, and clicking it collapses the same
+    // thing - a row that changed meaning because of where it happened to be
+    // drawn would be worse than one that scrolled away.
+    //
+    // A pinned heading is OPEN by definition: what put it in the band is that
+    // its rows are the ones on screen. So its state is forced rather than
+    // stored, and a click on it is routed to the real node, which is drawn
+    // later in the same frame - no second copy of the open/closed state exists
+    // to fall out of step with the first.
+    int collapseBatch = 0, collapseSeries = 0;      // written by the band, read by the walk
+    auto drawBatchHead = [&](const FileGroup& group, bool pinned) -> bool {
+        bool isPreview = group.label == "preview";
+        // The batch ink, unless this is the preview batch - "transient" is
+        // what that row has to say first, and dim already says it.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              isPreview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
+                                        : inkOf(ui_theme::LayerBatch));
+        if (pinned) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        else if (collapseBatch == group.batch) ImGui::SetNextItemOpen(false);
+        bool open = isPreview
+            ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                         ImGuiTreeNodeFlags_SpanAvailWidth,
+                                "preview (transient)   (%d)", (int)group.stacks.size())
+            : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
+                                         ImGuiTreeNodeFlags_SpanAvailWidth,
+                                "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
+        ImGui::PopStyleColor();
+        if (pinned && ImGui::IsItemClicked()) collapseBatch = group.batch;
+        if (ImGui::IsItemHovered() && !group.dir.empty())
+            ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
+                              dispPath(group.dir).c_str());
+        // the batch is the user's grouping, so its name is theirs to change
+        if (ImGui::BeginPopupContextItem("batchctx")) {
+            static char nameBuf[256];
+            if (ImGui::IsWindowAppearing())
+                snprintf(nameBuf, sizeof nameBuf, "%s", group.label.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+            bool done = ImGui::InputText("##bname", nameBuf, sizeof nameBuf,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            done |= ImGui::SmallButton("rename");
+            if (done && nameBuf[0]) {
+                renameBatch(group.batch, nameBuf);   // uniquified: names restore sessions
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
+                pendingCloseBatch = group.batch;
+            ImGui::EndPopup();
+        }
+        return open;
+    };
+    auto drawSeriesHead = [&](const App::Series& S, bool pinned) -> bool {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        char smeta[96];
+        // the unit is the series', and "not set" is a state to read, not a
+        // blank to guess at (the panel says the same thing the same way)
+        if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
+                                (int)S.members.size());
+        else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
+        float avail = ImGui::GetContentRegionAvail().x;
+        float mw = ImGui::CalcTextSize(smeta).x;
+        bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        // same rule as the stack rows: ONE item spanning the row, the unit
+        // and the count PAINTED on it. A second widget on the right is what
+        // made a context menu unreachable on the name once already.
+        if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
+                                                 p0.y + ImGui::GetFrameHeight()), true);
+        ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerSeries));
+        if (pinned) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        else if (collapseSeries == S.id) ImGui::SetNextItemOpen(false);
+        bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
+                                                ImGuiTreeNodeFlags_SpanAvailWidth,
+                                       "%s", S.name.c_str());
+        ImGui::PopStyleColor();
+        if (room) ImGui::PopClipRect();
+        if (pinned && ImGui::IsItemClicked()) collapseSeries = S.id;
+        if (room) {
+            ImVec2 m = ImGui::GetItemRectMin();
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
+                                                ImGui::GetTextLineHeight()) * 0.5f),
+                S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
+                          : IM_COL32(255, 184, 90, 255), smeta);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+                              "(right-click: rename, edit, move, ungroup, close)",
+                              (int)S.members.size(),
+                              S.paramName.empty() ? "parameter" : S.paramName.c_str());
+        if (ImGui::BeginPopupContextItem("serctx")) {
+            static char sbuf[256];
+            if (ImGui::IsWindowAppearing())
+                snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+            bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            done |= ImGui::SmallButton("rename");
+            if (done && sbuf[0]) {
+                pendingSerRename = S.id;
+                pendingSerName = sbuf;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            // the same modal creation uses: members, values, order, unit
+            if (ImGui::MenuItem("Edit series...")) {
+                pendingSerEdit = S.id;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            {   // the SERIES moves - every member with it, so that
+                // series ⊂ batch never stops being true on the way
+                int t = moveToBatchMenu(S.batchId);
+                if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
+                ImGui::TextDisabled("   (all %d member(s) move with it)",
+                                    (int)S.members.size());
+            }
+            ImGui::Separator();
+            // Two DIFFERENT operations, spelled out rather than one word
+            // with a modifier: one keeps the data, the other destroys it.
+            if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                                  "exactly where they are - they just stop being a sweep.",
+                                  (int)S.members.size());
+            if (ImGui::MenuItem("Close series (discard its stacks)"))
+                pendingSerClose = S.id;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                                  (int)S.members.size());
+            ImGui::EndPopup();
+        }
+        return sopen;
+    };
+    // ---- the band: every level the list has scrolled past --------------------
+    // Drawn ABOVE the scrolling region, so it takes its height out of the list
+    // rather than painting over the list's first row. The levels it holds come
+    // from the spans the walk recorded last frame against the scroll offset it
+    // ended on, which is the only place either number exists: ImGui applies a
+    // wheel event inside BeginChild, and the band has to be submitted before
+    // that. One frame of lag while the wheel is actually turning, and none at
+    // rest - the same settling every layout-dependent probe in this file has.
+    g_filesPinProbe.clear();
+    int pinPushed = 0;
+    {
+        std::vector<const FilesSpan*> pins;
+        for (const auto& s : g_filesSpans)
+            if (s.hy <= g_filesScrollY && g_filesScrollY < s.y1) pins.push_back(&s);
+        // outermost first: a batch's span opens before the span of any series
+        // inside it, so top-of-list order IS ancestor order
+        std::sort(pins.begin(), pins.end(),
+                  [](const FilesSpan* a, const FilesSpan* b) { return a->y0 < b->y0; });
+        for (const FilesSpan* p : pins) {
+            if (p->series == 0) {
+                const FileGroup* g = nullptr;
+                for (const auto& q : groups) if (q.batch == p->batch) g = &q;
+                if (!g) continue;
+                ImGui::PushID(g->batch);
+                g_filesPinProbe += g->label + ";";
+                // left pushed on purpose: TreeNodeEx indents what follows it,
+                // and the band has to reproduce the indentation of the rows it
+                // stands in for. Unwound below, innermost first.
+                drawBatchHead(*g, true);
+                pinPushed++;
+            } else {
+                const App::Series* S = nullptr;
+                for (const auto& s : app.series) if (s.id == p->series) S = &s;
+                if (!S) continue;
+                ImGui::PushID(S->id);
+                g_filesPinProbe += S->name + ";";
+                drawSeriesHead(*S, true);
+                pinPushed++;
+            }
+        }
+        for (int i = 0; i < pinPushed; i++) { ImGui::TreePop(); ImGui::PopID(); }
+        if (pinPushed) ImGui::Separator();
+    }
+    // The list scrolls on its own now. It has to: a band that is part of the
+    // scrolling content is a band that scrolls away, which is the entire
+    // complaint. Everything above - the load progress, the stop buttons, the
+    // note - stays outside it, where it was already behaving as a header.
+    bool listOpen = ImGui::BeginChild("fileslist", ImVec2(0, 0), ImGuiChildFlags_None);
+    if (listOpen) {
+    g_filesSpans.clear();
     for (const auto& group : groups) {
+      float gy0 = ImGui::GetCursorPos().y;
       ImGui::PushID(group.batch);
       bool open = true;
+      float ghy = gy0;
       if (showHeaders) {
-          bool isPreview = group.label == "preview";
-          // The batch ink, unless this is the preview batch - "transient" is
-          // what that row has to say first, and dim already says it.
-          ImGui::PushStyleColor(ImGuiCol_Text,
-                                isPreview ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
-                                          : inkOf(ui_theme::LayerBatch));
-          open = isPreview
-              ? ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                           ImGuiTreeNodeFlags_SpanAvailWidth,
-                                  "preview (transient)   (%d)", (int)group.stacks.size())
-              : ImGui::TreeNodeEx("##dir", ImGuiTreeNodeFlags_DefaultOpen |
-                                           ImGuiTreeNodeFlags_SpanAvailWidth,
-                                  "%s   (%d)", group.label.c_str(), (int)group.stacks.size());
-          ImGui::PopStyleColor();
-          if (ImGui::IsItemHovered() && !group.dir.empty())
-              ImGui::SetTooltip("%s\n\n(right-click to rename this batch)",
-                                dispPath(group.dir).c_str());
-          // the batch is the user's grouping, so its name is theirs to change
-          if (ImGui::BeginPopupContextItem("batchctx")) {
-              static char nameBuf[256];
-              if (ImGui::IsWindowAppearing())
-                  snprintf(nameBuf, sizeof nameBuf, "%s", group.label.c_str());
-              ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
-              bool done = ImGui::InputText("##bname", nameBuf, sizeof nameBuf,
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-              ImGui::SameLine();
-              done |= ImGui::SmallButton("rename");
-              if (done && nameBuf[0]) {
-                  renameBatch(group.batch, nameBuf);   // uniquified: names restore sessions
-                  ImGui::CloseCurrentPopup();
-              }
-              ImGui::Separator();
-              if (ImGui::MenuItem("Close batch"))    // the batch layer's Close
-                  pendingCloseBatch = group.batch;
-              ImGui::EndPopup();
-          }
+          open = drawBatchHead(group, false);
+          ghy = ImGui::GetCursorPos().y;
       }
       if (open) {
         // name and format share one row: the dim/format part is right-aligned and dimmed.
@@ -23076,7 +23461,7 @@ static void drawFileList() {
         // label. Everything else about the row is identical - a member is not
         // a different kind of stack, it is a stack that is also in a sweep.
         auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
-                                const App::Series::Member* mem) {
+                                const App::Series::Member* mem, int memIdx) {
           const ImageDoc& head = *app.images[stack.front()];
           if (head.seqId == 0) {
             int i = stack.front();
@@ -23172,13 +23557,28 @@ static void drawFileList() {
           char lb[600];
           const char* sname = si ? si->name.c_str() : "stack";
           if (mem) {
-              // The value LEADS the label. It is the reason the row is in this
-              // series at all, and it is not metadata: an unset one has to be
-              // readable as unset, not inferable from a blank column at the
-              // right edge. The "##m<seqId>" suffix is the row's ID, so renaming
-              // the stack does not reset its widget state - it does NOT protect
-              // the text: ImGui cuts a label at the FIRST "##", so a stack the
-              // user renames to "a##b" renders as "a" in either shape of row.
+              // Reading order: [n], then the condition, then the file name.
+              //
+              // The value used to LEAD, because it is the reason the row is in
+              // this series at all - and it still comes before the name, for
+              // exactly that reason. What is new in front of it is the member's
+              // position in the series, and what moved behind it is the file.
+              //
+              // The order IS the feature. A Files panel dragged narrow drops
+              // what is on its right, so this row loses the file name first and
+              // keeps the two things that say where the row sits in the sweep -
+              // while the pinned heading above it, which no width can push off,
+              // keeps saying which sweep that is. That is the whole reason there
+              // is no setting for any of this: the columns already do the work
+              // an option would have to be asked for.
+              //
+              // An unset value has to be readable as unset, not inferable from a
+              // blank at the right edge - conditionText prints the words.
+              //
+              // The "##m<seqId>" suffix is the row's ID, so renaming the stack
+              // does not reset its widget state. It does NOT protect the text:
+              // ImGui cuts a label at the FIRST "##", so a stack the user
+              // renames to "a##b" renders as "a" in either shape of row.
               char vb[64];
               {
                   std::string vs = conditionText(*ser, mem->value);
@@ -23187,8 +23587,8 @@ static void drawFileList() {
                   else
                       snprintf(vb, sizeof vb, "%s", vs.c_str());
               }
-              snprintf(lb, sizeof lb, "%*s%s · %s##m%d", (int)(badge.size() * 2), "",
-                       vb, sname, head.seqId);
+              snprintf(lb, sizeof lb, "%*s[%d]  %s  %s##m%d", (int)(badge.size() * 2), "",
+                       memIdx, vb, filesMemberName(sname).c_str(), head.seqId);
           } else {
               snprintf(lb, sizeof lb, "%*s%s", (int)std::max<size_t>(badge.size() * 2, 2),
                        "", sname);
@@ -23345,103 +23745,36 @@ static void drawFileList() {
         // sweep appearing must not push everything else down a level.
         for (const auto& S : app.series) {
             if (S.batchId != group.batch) continue;
+            float sy0 = ImGui::GetCursorPos().y;
             ImGui::PushID(S.id);
-            const ImGuiStyle& st = ImGui::GetStyle();
-            char smeta[96];
-            // the unit is the series', and "not set" is a state to read, not a
-            // blank to guess at (the panel says the same thing the same way)
-            if (S.unit[0]) snprintf(smeta, sizeof smeta, "[%s]  (%d)", S.unit,
-                                    (int)S.members.size());
-            else snprintf(smeta, sizeof smeta, "[unit not set]  (%d)", (int)S.members.size());
-            float avail = ImGui::GetContentRegionAvail().x;
-            float mw = ImGui::CalcTextSize(smeta).x;
-            bool room = avail > mw + ImGui::GetFontSize() * 8.0f;
-            ImVec2 p0 = ImGui::GetCursorScreenPos();
-            // same rule as the stack rows: ONE item spanning the row, the unit
-            // and the count PAINTED on it. A second widget on the right is what
-            // made a context menu unreachable on the name once already.
-            if (room) ImGui::PushClipRect(p0, ImVec2(p0.x + avail - mw - st.ItemSpacing.x,
-                                                     p0.y + ImGui::GetFrameHeight()), true);
-            ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerSeries));
-            bool sopen = ImGui::TreeNodeEx("##ser", ImGuiTreeNodeFlags_DefaultOpen |
-                                                    ImGuiTreeNodeFlags_SpanAvailWidth,
-                                           "%s", S.name.c_str());
-            ImGui::PopStyleColor();
-            if (room) ImGui::PopClipRect();
-            if (room) {
-                ImVec2 m = ImGui::GetItemRectMin();
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(m.x + avail - mw, m.y + (ImGui::GetItemRectSize().y -
-                                                    ImGui::GetTextLineHeight()) * 0.5f),
-                    S.unit[0] ? ImGui::GetColorU32(ImGuiCol_TextDisabled)
-                              : IM_COL32(255, 184, 90, 255), smeta);
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
-                                  "(right-click: rename, edit, move, ungroup, close)",
-                                  (int)S.members.size(),
-                                  S.paramName.empty() ? "parameter" : S.paramName.c_str());
-            if (ImGui::BeginPopupContextItem("serctx")) {
-                static char sbuf[256];
-                if (ImGui::IsWindowAppearing())
-                    snprintf(sbuf, sizeof sbuf, "%s", S.name.c_str());
-                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
-                bool done = ImGui::InputText("##sname", sbuf, sizeof sbuf,
-                                             ImGuiInputTextFlags_EnterReturnsTrue);
-                ImGui::SameLine();
-                done |= ImGui::SmallButton("rename");
-                if (done && sbuf[0]) {
-                    pendingSerRename = S.id;
-                    pendingSerName = sbuf;
-                    ImGui::CloseCurrentPopup();
-                }
-                ImGui::Separator();
-                // the same modal creation uses: members, values, order, unit
-                if (ImGui::MenuItem("Edit series...")) {
-                    pendingSerEdit = S.id;
-                    ImGui::CloseCurrentPopup();
-                }
-                ImGui::Separator();
-                {   // the SERIES moves - every member with it, so that
-                    // series ⊂ batch never stops being true on the way
-                    int t = moveToBatchMenu(S.batchId);
-                    if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
-                    ImGui::TextDisabled("   (all %d member(s) move with it)",
-                                        (int)S.members.size());
-                }
-                ImGui::Separator();
-                // Two DIFFERENT operations, spelled out rather than one word
-                // with a modifier: one keeps the data, the other destroys it.
-                if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
-                                      "exactly where they are - they just stop being a sweep.",
-                                      (int)S.members.size());
-                if (ImGui::MenuItem("Close series (discard its stacks)"))
-                    pendingSerClose = S.id;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
-                                      (int)S.members.size());
-                ImGui::EndPopup();
-            }
+            bool sopen = drawSeriesHead(S, false);
+            float shy = ImGui::GetCursorPos().y;
             if (sopen) {
-                for (const auto& m : S.members)
-                    if (const std::vector<int>* sp = stackOfSeq(m.seqId))
-                        drawStackRow(*sp, &S, &m);
+                // memIdx is the member's place in the series, and it is the
+                // row's leading column - see the label built in drawStackRow.
+                for (int mi = 0; mi < (int)S.members.size(); mi++)
+                    if (const std::vector<int>* sp = stackOfSeq(S.members[mi].seqId))
+                        drawStackRow(*sp, &S, &S.members[mi], mi);
                 ImGui::TreePop();
             }
             ImGui::PopID();
+            g_filesSpans.push_back({ group.batch, S.id, sy0, shy, ImGui::GetCursorPos().y });
         }
         // ---- then everything this batch holds that is NOT in a series -------
         for (const auto& stackPtr : group.stacks) {
             const ImageDoc& head = *app.images[stackPtr->front()];
             if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
-            drawStackRow(*stackPtr, nullptr, nullptr);
+            drawStackRow(*stackPtr, nullptr, nullptr, -1);
         }
       }
       if (showHeaders && open) ImGui::TreePop();
       ImGui::PopID();
+      if (showHeaders)
+          g_filesSpans.push_back({ group.batch, 0, gy0, ghy, ImGui::GetCursorPos().y });
     }
+    g_filesScrollY = ImGui::GetScrollY();
+    }
+    ImGui::EndChild();
     if (pendingCloseSeq) closeStack(pendingCloseSeq);
     if (pendingCloseBatch) closeBatch(pendingCloseBatch);
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
@@ -24333,6 +24666,10 @@ static bool g_abEqSelftest = false;
 // - a delay knob, so "two clicks a second apart" can be said); chevclick (a click
 // on the cursor row's tree chevron, asserting the toggle landed at once);
 // starclick (a click on the bookmark star at the end of the path line);
+// pinclick (a click on the OUTERMOST row the pinned-ancestor band is holding,
+// with chkpin:SPEC reading that band back as text - ";"-terminated names,
+// outermost first, "-" for nothing pinned - and h<px> forcing the panel's
+// height so the listing is short enough to have scrolled at all);
 // marklist / starmark / seterr / clrerr (baselines and a fake failure for the
 // drawer-removal checks below); mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
@@ -24579,6 +24916,37 @@ static std::string g_browseKeysActs =
     // "home" because clearing the filter above rebuilt the shown set and reset
     // the cursor - a bare "down" would land on ".." , which selects nothing.
     "home,down,chkatrow:digitset,ctrlclick,chkstat:1,chkframes:0,w0,"
+    // ---- the levels above the reader do not scroll away -------------------
+    // 「階層表示で下にスクロールすると上層の階層が上に行って消える」. Every
+    // ancestor of the row at the top of the viewport is held above it now, at
+    // any depth, with no setting - so this asserts the two things a setting
+    // would otherwise have to be trusted for.
+    //
+    // FIRST, that they are on screen. chkpin reads the band back as text,
+    // outermost first, which is the same order and the same words a human
+    // reads off the panel - not a flag saying the feature is on.
+    // rb/expset/zdeep exists for exactly this shape of question: its last
+    // sixty rows are all three levels down, so scrolling to the end is
+    // guaranteed to leave the reader inside a/b/c. The panel is floated SHORT
+    // (h360) as well, because "the fixture was longer than this screen" is not
+    // a thing a gate should rest on - on a taller monitor the same script
+    // would pass by never scrolling at all.
+    //
+    // SECOND, that a pinned row is the row and not a picture of it. pinclick
+    // aims a real mouse click at the outermost pinned rectangle; what answers
+    // is the verb a folder row has always had in a tree - collapse it - and
+    // the proof is that one action later its whole subtree, and the band with
+    // it, is gone. imgmark/chkimgmark says the same click opened nothing,
+    // which is also what clicking a folder has always not done.
+    "viewreset,w400,h360,waitdir:rb,home,"
+    "down,down,chkatrow:expset,enter,waitdir:expset,"
+    "home,down,chkatrow:zdeep,enter,waitdir:zdeep,"
+    "tree,home,down,chkatrow:a,chkpin:-,right,idle:10,"
+    "down,chkatrow:b,right,idle:10,"
+    "down,chkatrow:c,right,idle:20,"
+    "end,chkpin:a;b;c;,"
+    "imgmark,pinclick,chkimgmark,chkpin:-,"
+    "h0,w0,viewreset,back,waitdir:expset,back,waitdir:rb,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
@@ -27312,6 +27680,80 @@ int main(int argc, char** argv) {
                     asDir ? 1 : 0, ups, upOk ? "ok" : "FAIL");
             if (!upOk) ok = false;
         }
+        {   // ---- the ancestors of the row at the top of the viewport --------
+            // The arithmetic half of the pinned band. It belongs here rather
+            // than in --browse-keys-selftest because it needs no frame at all:
+            // rbAncestorRows reads the flattened row run, and the run is what
+            // rbBuildView hands the panel. --browse-keys-selftest owns the
+            // other half - that the rows it names really are laid out at the
+            // top of the panel and really are clickable.
+            //
+            // The claim is not "it returns some earlier rows". It is that for
+            // every row in a tree of any depth, what comes back is EXACTLY that
+            // row's chain of parents: one per level, outermost first, each one
+            // a path prefix of the row - checked against full(), which is built
+            // by the tree walker and not by this function. A depth-0 row has
+            // none, and ".." is never one, at any position.
+            //
+            // rb/expset/zdeep is what makes this worth asserting: five levels,
+            // so a walk that stopped one level short, or one that took a
+            // sibling instead of a parent, is visible here and would not be in
+            // a tree two deep.
+            std::string zroot = dir + "/expset";
+            rbTreeExpand(rbMain(), zroot);
+            {
+                double t0z = nowSec();
+                while (nowSec() - t0z < 120.0) {
+                    pumpRemoteBrowse();
+                    if (rbMain().treeCache.count(zroot)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            zroot += "/zdeep";
+            const char* chain[] = { "", "/a", "/a/b", "/a/b/c" };
+            for (const char* c : chain) {
+                rbTreeExpand(rbMain(), zroot + c);
+                double t1 = nowSec();
+                while (nowSec() - t1 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (rbMain().treeCache.count(zroot + c)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            std::vector<RbRow> tv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
+            std::vector<int> shown((size_t)tv.size());
+            for (int i = 0; i < (int)tv.size(); i++) shown[(size_t)i] = i;   // a tree is not re-sorted
+            int maxDepth = 0, checked = 0, deepRows = 0;   // depth 4 = a shot under c
+            bool chainOk = true, upNever = true, rootNone = true;
+            std::vector<int> anc;
+            for (int f = 0; f < (int)shown.size(); f++) {
+                const RbRow& r = tv[(size_t)shown[(size_t)f]];
+                maxDepth = std::max(maxDepth, r.depth);
+                if (r.depth >= 4) deepRows++;
+                rbAncestorRows(tv, shown, f, anc);
+                for (int p : anc) if (tv[(size_t)shown[(size_t)p]].up) upNever = false;
+                if (r.depth == 0 && !anc.empty()) rootNone = false;
+                if (r.up || r.ph) continue;
+                checked++;
+                // one per level, outermost first, and each really a parent
+                if ((int)anc.size() != r.depth) { chainOk = false; continue; }
+                for (int k = 0; k < (int)anc.size(); k++) {
+                    const RbRow& a2 = tv[(size_t)shown[(size_t)anc[(size_t)k]]];
+                    std::string pre = a2.full() + "/";
+                    if (a2.depth != k || anc[(size_t)k] >= f ||
+                        r.full().compare(0, pre.size(), pre) != 0) chainOk = false;
+                }
+            }
+            bool ancOk = chainOk && upNever && rootNone && maxDepth >= 4 && deepRows > 0;
+            fprintf(stderr, "browseselftest: pinned ancestors: %d row(s) over a tree %d "
+                            "level(s) deep (%d of them at depth 4+), every chain is the "
+                            "row's own parents=%d, \"..\" never pinned=%d, top level pins "
+                            "nothing=%d: %s\n",
+                    checked, maxDepth, deepRows, chainOk ? 1 : 0, upNever ? 1 : 0,
+                    rootNone ? 1 : 0, ancOk ? "ok" : "FAIL");
+            if (!ancOk) ok = false;
+            rbTreeForget(rbMain());
+        }
         {   // "Open folder" on the folder being browsed: the same call the
             // toolbar button and the breadcrumb menu make. The scan must
             // include the CURRENT directory itself (a stack whose name has no
@@ -28143,6 +28585,29 @@ int main(int argc, char** argv) {
         check("every member's frames are in the series' batch", batchOk == (int)S->members.size());
         check("default name is \"<batch> 掃引\"", S->name == batchNameOf(b0) + " 掃引");
         check("invariant 1: audit after create", audit());
+        {   // ---- what a member row is allowed to stop saying -----------------
+            // A member row used to be "<condition> · <stack name>", and for a
+            // stack that came out of a container the name was itself a compound
+            // - "sweep.vnz:0" - because the row had to name its own sweep when
+            // the sweep's heading had scrolled off the top of the panel. The
+            // heading is held there now and the row leads with its own [n], so
+            // the ":0" is the same fact twice and the file name goes to the end
+            // of the row, where a narrowing panel drops it first.
+            //
+            // The tail comes off only when it is DIGITS: an .npz member is
+            // "data.npz:arr_0", and an array name is not a position - nothing
+            // else on the row repeats it.
+            check("a container member drops the index the row now carries",
+                  filesMemberName("sweep.vnz:0") == "sweep.vnz" &&
+                  filesMemberName("sweep.vnz:12") == "sweep.vnz");
+            check("an .npz member name is not an index and stays",
+                  filesMemberName("data.npz:arr_0") == "data.npz:arr_0" &&
+                  filesMemberName("data.npz:dark") == "data.npz:dark");
+            check("a plain stack name is untouched",
+                  filesMemberName("40lx") == "40lx" &&
+                  filesMemberName("scanroot/frame_###.npy") == "scanroot/frame_###.npy" &&
+                  filesMemberName("odd:") == "odd:" && filesMemberName(":7") == ":7");
+        }
         check("N members + a unit -> seriesCanFit", seriesCanFit(*S));
         {   // the unit is never assumed: without one there is no fit, ever
             char keep[16];
@@ -34436,6 +34901,69 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "abstatsselftest: S4 lone-frame check skipped "
                                 "(%s/rgb_u8.npy not there)\n", root.c_str());
 
+            // S4b: the Files panel's own pinned-ancestor band
+            // (「上層の階層は常に表示」). The walk above recorded, in the
+            // list's content coordinates, where every heading starts and where
+            // the rows under it end. Scroll to the middle of a heading's span -
+            // i.e. past the heading itself, but still inside its rows - and
+            // that heading has to be drawn ABOVE the list, by name.
+            //
+            // The scroll is set rather than wheeled because the assertion is
+            // about which levels the band holds at a given offset, and a
+            // wheeled one would only ever reach whatever offset this fixture
+            // and this window size happen to allow. The SPANS are real: they
+            // come from the frame that just drew the panel, in the panel's own
+            // units, and nothing here computes them a second way.
+            //
+            // Then the other direction, which is the half a "does it draw"
+            // check would miss: back at the top there is no band at all. A
+            // heading that is on screen anyway must not also be held above
+            // itself.
+            {
+                // ONE pass per offset, deliberately: the list writes its own
+                // scroll back into g_filesScrollY on its way out, so a second
+                // pass would draw the band at the offset the probe window
+                // really is at (zero) rather than the one being asked about.
+                auto bandAt = [&](float y) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(420.0f, 600.0f), ImGuiCond_Always);
+                    ImGui::Begin("FilesProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    g_filesScrollY = y;
+                    drawFileList();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                    return g_filesPinProbe;
+                };
+                const FilesSpan* deepest = nullptr;
+                for (const auto& s : g_filesSpans)
+                    if (s.y1 - s.hy > 1.0f && (!deepest || s.y0 > deepest->y0)) deepest = &s;
+                std::string want, got;
+                float at = 0;
+                if (deepest) {
+                    for (const auto& b : app.batches)
+                        if (b.id == deepest->batch && deepest->series == 0) want = b.name + ";";
+                    for (const auto& s : app.series)
+                        if (s.id == deepest->series) want = s.name + ";";
+                    at = (deepest->hy + deepest->y1) * 0.5f;
+                    got = bandAt(at);
+                }
+                fprintf(stderr, "abstatsselftest: S4b files band at scroll %.0f "
+                                "holds '%s'  want '%s'\n", at, got.c_str(), want.c_str());
+                check(deepest && !want.empty() && got.find(want) != std::string::npos,
+                      "S4b a heading the list has scrolled past is drawn above it");
+                std::string top = bandAt(0.0f);
+                fprintf(stderr, "abstatsselftest: S4b files band at the top holds '%s'\n",
+                        top.c_str());
+                check(top.empty(),
+                      "S4b nothing is pinned while the list is at the top");
+            }
+
             // S5: A standing on the pinned B is an ORDINARY comparison, and
             // the chip names the pair like any other. It used to be a PAUSE,
             // announced as "A = B (paused)" - the sentence that existed only to
@@ -36672,7 +37200,9 @@ int main(int argc, char** argv) {
                     ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
                     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8),
                                             ImGuiCond_Always);
-                    ImGui::SetNextWindowSize(ImVec2(g_rbForceW, vp->WorkSize.y * 0.8f),
+                    ImGui::SetNextWindowSize(ImVec2(g_rbForceW,
+                                                    g_rbForceH > 0 ? g_rbForceH
+                                                                   : vp->WorkSize.y * 0.8f),
                                              ImGuiCond_Always);
                 }
                 if (!primordial)
@@ -37502,7 +38032,7 @@ int main(int argc, char** argv) {
                 }
                 if (op == "dbl" || op == "dbloff" || op == "click" || op == "clickoff" ||
                     op == "ctrlclick" ||
-                    op == "chevclick" || op == "starclick" ||
+                    op == "chevclick" || op == "starclick" || op == "pinclick" ||
                     op == "mback" || op == "mfwd") {
                     // A real gesture into the real queue, aimed at the row the
                     // keyboard cursor is on - a double-click only exists as real
@@ -37525,6 +38055,13 @@ int main(int argc, char** argv) {
                         // is reachable there, which only a real click can show.
                         if (op == "starclick" && rbKeysT().toolbar.starCentre.x < 0)
                             chk(false, "no bookmark star on the path line");
+                        // "pinclick" is aimed at the OUTERMOST row the pinned
+                        // band is holding - the folder that has scrolled off
+                        // the top. The whole claim being tested is that it is
+                        // still a row: the click goes to real pixels, and the
+                        // verb that answers is the one that row has always had.
+                        if (op == "pinclick" && rbKeysT().toolbar.pinCentre.x < 0)
+                            chk(false, "nothing is pinned above the listing");
                         // "dbloff:N" lands N rows BELOW the cursor row - the one
                         // aim the keyboard cannot pre-warm. Every other click
                         // action is aimed at the cursor, and the keyboard put
@@ -37536,6 +38073,7 @@ int main(int argc, char** argv) {
                         float rowH = rbKeysT().cursorRect[1].y - rbKeysT().cursorRect[0].y;
                         g_injMouse = op == "chevclick" ? rbKeysT().cursorChev
                                    : op == "starclick" ? rbKeysT().toolbar.starCentre
+                                   : op == "pinclick"  ? rbKeysT().toolbar.pinCentre
                             : ImVec2((rbKeysT().cursorRect[0].x + rbKeysT().cursorRect[1].x) * 0.5f +
                                      (op == "click" ? 40.0f : 0.0f),
                                      (rbKeysT().cursorRect[0].y + rbKeysT().cursorRect[1].y) * 0.5f +
@@ -37829,6 +38367,15 @@ int main(int argc, char** argv) {
                                                   "back=" + std::to_string((int)rbKeysT().histBack.size()) +
                                                   " fwd=" + std::to_string((int)rbKeysT().histFwd.size()));
                     else if (op == "chkexp")  chk((int)rbKeysT().expanded.size() == arg);
+                    // The band, read as text: every level the listing has
+                    // scrolled past, outermost first, ";"-terminated - "-" for
+                    // "nothing is pinned". This is the whole feature stated the
+                    // way a human would read it off the screen, and it is a
+                    // FRAME check rather than an arithmetic one on purpose: the
+                    // rows have to have been laid out for the string to fill in.
+                    else if (op == "chkpin")
+                        chk(rbKeysT().toolbar.pinnedNames == (sarg == "-" ? std::string() : sarg),
+                            "pinned=\"" + rbKeysT().toolbar.pinnedNames + "\"");
                     // ...and the one chkexp cannot say: is the row the cursor is
                     // ON expanded? chkexp counts the whole panel, so "this row
                     // toggled" was only expressible when nothing else in the
@@ -38013,6 +38560,11 @@ int main(int argc, char** argv) {
                             "  line=\"" + g.statusFull + "\"");
                     }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
+                    // "h<px>" - a digit is required, or "home" and "hidep" would
+                    // both be read as a height. It only bites while w<px> is on,
+                    // which is where every check that uses it lives.
+                    else if (a[0] == 'h' && a.size() > 1 && a[1] >= '0' && a[1] <= '9')
+                        g_rbForceH = (float)atof(a.c_str() + 1);
                     else if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), true);
                 } else if (keyPhase == 1) {
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
