@@ -1,0 +1,1519 @@
+// core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 全テーマ共有
+// P6 でこのファイルが自己完結の core/app/state.h になる(docs/split-plan.md §1)。App app の定義は §6 により背骨(main.cpp)に残っている。
+// ---------------------------------------------------------------- image model
+// Per-FRAME state: the pixels and their provenance (docs/reference-design.md
+// §2.1). Held by ImageDoc through a shared_ptr so one frame can belong to
+// several stacks from stage 2 on; in stage 1 every source has exactly one
+// owner (use_count == 1) and behaviour is identical to the pre-split code.
+// The platform's shortcut modifier, spelled two ways: SC_MOD for the label a
+// menu shows, MODK for the chord a key test compares. They are declared
+// together because a build where they disagree advertises one key and answers
+// to another, and Browse needs MODK long before the menu bar is written.
+#if defined(__APPLE__)
+  #define SC_MOD "Cmd"
+  static const ImGuiKeyChord MODK = ImGuiMod_Super;
+#else
+  #define SC_MOD "Ctrl"
+  static const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
+#endif
+
+static std::atomic<uint64_t> g_nextSrcId{ 1 };
+struct FrameSource {
+    std::vector<float> data;          // raw values, size w*h*ch
+    int w = 0, h = 0, ch = 1;
+    std::string dtype;
+    float vmin = 0, vmax = 1;         // data min/max
+    std::string path;
+    std::string npzMember;            // array name when this came from a .npz
+    int fileFrame = 0;                // frame index within a multi-frame LOCAL file
+                                      // (npy frame axis; npz members too). With path +
+                                      // npzMember it completes the provenance a reload
+                                      // re-decodes - remoteFrame is the remote twin
+    // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
+    // the shape the FILE declared, kept so the Inspector can compute which
+    // other readings that shape permits instead of offering a fixed list; empty
+    // = these pixels did not come from a .npy. npyRead is NR_NATIVE until a
+    // user says otherwise, and then it is a DECLARATION, not a guess: it
+    // survives reload and session, and it is what --npy-axis stopped being.
+    // It is also registry identity (srcIdentityKey embeds the EFFECTIVE
+    // reading), so two readings of one file are two tuples and never
+    // silently share pixels.
+    std::vector<int64_t> npyShape;
+    int npyRead = 0;                  // NpyRead; 0 = NR_NATIVE
+    // remote frames: opened as a decimated preview, replaced in place by the full
+    // frame when the background fetch lands - after that, indistinguishable from
+    // a local image. remoteStep > 1 means "still the preview".
+    std::string remoteUrl;
+    int remoteFrame = 0;
+    int remoteStep = 1;
+    std::string remoteErr;            // background fetch failed; preview is all we have
+    // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
+    int rawDtype = -1, rawInterp = 0, rawOffset = 0;
+    bool rawLE = true;
+    // crop bookkeeping: srcW/srcH = full source dims (0 = unknown), cropX/Y = origin in source
+    int srcW = 0, srcH = 0, cropX = 0, cropY = 0;
+    uint64_t srcId;                   // frame identity: accounting dedupe (§7)
+    int rev = 0;                      // +1 when the pixels are replaced wholesale (preview→full swap; later, reload)
+    int64_t mtime = 0;                // Watch baseline: disk state at decode time; 0 = unknown
+    uint64_t fsize = 0;
+    // The key this source is REGISTERED under, "" = not registered. Registry
+    // bookkeeping, not identity: srcKeyPath canonicalizes through the live
+    // filesystem, so a key recomputed later (symlink retargeted, share
+    // remounted) can differ from the one the slot was created under - erasing
+    // by a recomputed key would then miss, leaving a stale row whose pixels a
+    // later open could adopt. Erase by what was WRITTEN, not by what would be
+    // written today. Maintained under g_srcRegMtx by the *Locked helpers.
+    std::string regKey;
+    FrameSource() : srcId(g_nextSrcId.fetch_add(1)) {}
+};
+// Watch baseline (§2.1): what was on disk when these pixels were decoded.
+// Any failure (missing file, remote path) leaves 0 = unknown.
+static void statSourceFile(FrameSource& s) {
+    std::error_code ec;
+    auto p = pathFromUtf8(s.path);
+    auto t = std::filesystem::last_write_time(p, ec);
+    s.mtime = ec ? 0 : (int64_t)t.time_since_epoch().count();
+    auto sz = std::filesystem::file_size(p, ec);
+    s.fsize = ec ? 0 : (uint64_t)sz;
+}
+// The local:// twin of statSourceFile: the url EMBEDS a path on this disk, so
+// unlike a true remote the disk baseline is knowable - and it has to be known,
+// because a local:// tuple with mtime/fsize 0 never moves: an overwrite on
+// disk followed by a re-open of the same url would ADOPT the stale resident
+// and silently show the old pixels. ssh:// urls stay 0/0 on purpose (a peer's
+// disk cannot be statted from here; change detection there is Watch's).
+static void statLocalUrl(FrameSource& s) {
+    if (s.remoteUrl.rfind("local://", 0) != 0) return;
+    std::error_code ec;
+    auto p = pathFromUtf8(s.remoteUrl.substr(8));
+    auto t = std::filesystem::last_write_time(p, ec);
+    s.mtime = ec ? 0 : (int64_t)t.time_since_epoch().count();
+    auto sz = std::filesystem::file_size(p, ec);
+    s.fsize = ec ? 0 : (uint64_t)sz;
+}
+// A deep copy of s with its own identity: same content, fresh srcId, rev 0.
+// The two callers are the crop CoW (§2.2) and any ImageDoc copy that must not
+// alias a live source.
+static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
+    auto ns = std::make_shared<FrameSource>(s);   // same content...
+    ns->srcId = g_nextSrcId.fetch_add(1);         // ...own identity
+    ns->rev = 0;
+    ns->regKey.clear();               // the clone is NOT the registered occupant
+    return ns;
+}
+
+// ------------------------------------------------------------ source registry
+// §6.2: one identity tuple -> at most one resident FrameSource. Loaders consult
+// it before decoding; the same tuple already resident means share, not decode.
+// Entries are weak: a source whose last membership closes disappears from here
+// by itself, so the registry never keeps pixels alive.
+//
+// The tuple is (path-or-url, npzMember, frame-within-file, raw recipe, npy
+// reading, mtime, fsize). mtime+fsize are the point: a file that changed on
+// disk is a DIFFERENT tuple, so re-opening still reads the new bytes - sharing
+// never overrides "re-open reads the disk". The npy reading (§3.3, normalized
+// by npyKeyRead) keeps two READINGS of one file apart the same way. Remote
+// sources carry mtime/fsize 0 and rely on the url; server-side change
+// detection is Watch's (stage 6).
+// Lock order: g_srcRegMtx is a LEAF lock - nothing else is ever acquired while
+// it is held. It serializes (a) the map itself and (b) every cross-thread read
+// or write of a REGISTERED source's shared fields: writers hold it across the
+// whole mutation (reloadSource's field swap + rekey, cropInPlace), and the seq
+// loader thread holds ONE continuous section from lookup through syncMirrors,
+// so no reader can ever see a half-swapped source. Compound steps use the
+// *Locked helpers to take it exactly once; never call a function that takes it
+// itself (cropInPlace!) while holding it - reloadSource re-crops its PRIVATE
+// fresh decode BEFORE locking for the swap.
+// And NO IO under it: srcIdentityKey canonicalizes the path (srcKeyPath =
+// weakly_canonical = filesystem round-trips - seconds on a UNC path with a
+// slow or dead server), so every key is computed BEFORE the lock is taken;
+// while it is held, only map and field operations happen. Identity fields are
+// only ever written by the UI thread (load, reload swap, crop) or on a source
+// no other thread can see yet, so a pre-lock read of them is never torn.
+static std::mutex g_srcRegMtx;              // lookups also run on the seq loader thread
+static std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry;
+
+// The same file reached as "C:\data\F.npy" and "c:/data/f.npy" is ONE tuple:
+// canonicalize exactly once, HERE, where the key is built. The stored path is
+// provenance (reload and sessions read it verbatim) and is never rewritten.
+// URLs (ssh://, local://) pass through - they are not filesystem paths.
+static std::string srcKeyPath(const std::string& p) {
+    if (p.empty() || p.find("://") != std::string::npos) return p;
+    std::error_code ec;
+    std::filesystem::path c = std::filesystem::weakly_canonical(pathFromUtf8(p), ec);
+    if (ec) return p;
+    std::string s = c.make_preferred().u8string();
+#ifdef _WIN32
+    for (char& ch : s)      // Windows filesystems compare case-insensitively.
+                            // ASCII fold only: it covers the drive letter and
+                            // spelling divergences real callers produce, and
+                            // identical non-ASCII bytes still fold identically.
+        ch = (char)tolower((unsigned char)ch);
+#endif
+    return s;
+}
+
+// The reading that names this source's tuple (defined by npyLayout's §3.1
+// machinery, below): NR_NATIVE stays 0 whatever the shape - a pre-decode
+// probe knows no shape, and a native open must still find a native resident -
+// and a DECLARATION that merely spells out what native would do anyway
+// collapses onto 0 too, so "read as (H,W,C)" on a natively-HWC file and a
+// plain open are ONE tuple. Only a declaration that actually changes the
+// reading keys its own tuple.
+static int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);
+
+static std::string srcIdentityKey(const FrameSource& s) {
+    char t[160];
+    if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
+        snprintf(t, sizeof t, "\n%d|%d\nraw%d,%d,%d,%d,%dx%d\n%lld,%llu",
+                 s.fileFrame, s.remoteFrame, s.rawDtype, s.rawInterp, s.rawOffset,
+                 (int)s.rawLE, s.srcW, s.srcH,
+                 (long long)s.mtime, (unsigned long long)s.fsize);
+    else                    // npy/npz: the file bytes decide, mtime+fsize name
+                            // them; npyRead (§3.3) keeps two READINGS of one
+                            // file from collapsing onto one key - two readings
+                            // are two different sets of pixels
+        snprintf(t, sizeof t, "\n%d|%d\nnr%d\n%lld,%llu",
+                 s.fileFrame, s.remoteFrame, npyKeyRead(s.npyShape, s.npyRead),
+                 (long long)s.mtime, (unsigned long long)s.fsize);
+    // npzMember is LENGTH-PREFIXED: a zip may name a member anything, newlines
+    // included, and an unescaped name could forge the field boundaries of this
+    // key - two different tuples reading back as one string
+    return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" +
+           std::to_string(s.npzMember.size()) + ":" + s.npzMember + t;
+}
+// What may satisfy (or seed) a lookup: full-frame pixels that still mirror
+// their origin. A crop re-scoped them; a decimated remote preview and a failed
+// fetch are not the frame; no identity or no disk baseline means no tuple.
+static bool srcShareable(const FrameSource& s) {
+    if (s.path.empty() && s.remoteUrl.empty()) return false;   // montage/processed
+    if (s.remoteStep > 1 || !s.remoteErr.empty()) return false;
+    // no disk baseline = no tuple, and local:// counts as disk: its embedded
+    // path is statLocalUrl-able, so a 0/0 local:// source is one that skipped
+    // the stat - refusing it here fails SAFE (no sharing) instead of letting
+    // an overwrite-then-reopen adopt stale pixels under a key that never moves
+    const bool localDisk = s.remoteUrl.empty() ||
+                           s.remoteUrl.rfind("local://", 0) == 0;
+    if (localDisk && s.mtime == 0 && s.fsize == 0) return false;
+    if (s.rawDtype >= 0)              // raw decodes always record srcW/srcH
+        return s.w == s.srcW && s.h == s.srcH && s.cropX == 0 && s.cropY == 0;
+    return s.srcW == 0;               // npy: srcW only appears once cropped
+}
+static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key) {
+    auto it = g_srcRegistry.find(key);
+    if (it == g_srcRegistry.end()) return nullptr;
+    std::shared_ptr<FrameSource> sp = it->second.lock();
+    if (!sp) { g_srcRegistry.erase(it); return nullptr; }   // died with its last stack
+    if (!srcShareable(*sp)) {         // e.g. cropped in place while sole-owned:
+        if (sp->regKey == key) sp->regKey.clear();
+        g_srcRegistry.erase(it);      // EVICT - a live occupant that stopped being
+        return nullptr;               // the frame must not squat the tuple's slot
+    }
+    return sp;
+}
+// (no unlocked find wrapper on purpose: every reader needs more than the bare
+// lookup - mirrors, or an add - inside the SAME hold, per the note above)
+// Returns the live occupant when the tuple's slot is already taken - the
+// caller ADOPTS it (the seq worker can finish a decode after the UI thread
+// registered the same file: both stacks must end up sharing, not keep twin
+// residents) - and nullptr when s was registered or is not shareable.
+// `key` is srcIdentityKey(*s), computed by the caller OUTSIDE the lock
+// (srcKeyPath does filesystem IO - see the lock-order note above).
+static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s,
+                                                         const std::string& key) {
+    if (!s || !srcShareable(*s)) { if (s) s->regKey.clear(); return nullptr; }
+    std::weak_ptr<FrameSource>& slot = g_srcRegistry[key];
+    if (std::shared_ptr<FrameSource> live = slot.lock()) {
+        if (live == s) { s->regKey = key; return nullptr; }   // already the registered one
+        if (srcShareable(*live)) {                 // first resident wins: adopt it
+            s->regKey.clear();                     // s holds no slot
+            return live;
+        }
+        // live but no longer the frame (cropped in place): reclaim the slot
+        if (live->regKey == key) live->regKey.clear();
+    }
+    slot = s;
+    s->regKey = key;
+    // dead rows hold no pixels but would pile up over many open/close cycles;
+    // sweep amortised, whenever the map has doubled since the last sweep
+    static size_t sweepAt = 256;
+    if (g_srcRegistry.size() >= sweepAt) {
+        for (auto q = g_srcRegistry.begin(); q != g_srcRegistry.end();)
+            q = q->second.expired() ? g_srcRegistry.erase(q) : std::next(q);
+        sweepAt = std::max<size_t>(256, g_srcRegistry.size() * 2);
+    }
+    return nullptr;
+}
+static std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
+    if (!s || !srcShareable(*s)) return nullptr;
+    const std::string key = srcIdentityKey(*s);   // IO: before the lock
+    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+    return srcRegistryAddLocked(s, key);
+}
+// One membership: "this frame as seen by this stack". Pixels and provenance
+// live in *src; what stays here is per-membership (identity, position, display
+// range, interpretation) and per-view (texture) state.
+struct ImageDoc {
+    std::string name, dtype, note;
+    int w = 0, h = 0, ch = 1;
+    float vmin = 0, vmax = 1;         // data min/max
+    float black = 0, white = 255;     // display range
+    GLuint tex = 0;
+    bool texDirty = true;
+    float texBlack = 0, texWhite = 0;   // the range this texture was built with
+    bool texNearest = true;
+    // CFA (Bayer) metadata
+    int batchId = 0;                  // which 塊 (Files header) this belongs to
+    bool preview = false;             // transient: not yet a registered open
+    int remoteFrames = 1;             // frame-axis count, kept for promotion
+    int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
+    int cfaPattern = 0;               // index into CFA_PATTERNS
+    bool cfaColorize = false;
+    int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
+    int dataRev = 0;                  // bumped on in-place pixel changes (crop)
+    uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
+    int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
+    int seqIndex = 0;                 // position within the sequence (file number order)
+    float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
+    // A COMPUTED frame - today only a stack's frame average - has no file behind
+    // it, so the session cannot round-trip it the way it round-trips an open.
+    // What it CAN round-trip is the RECIPE: this holds the first-frame path of
+    // the stack that was averaged (the key Series members already travel by,
+    // for the same reason - paths round-trip, ids and names do not), and the
+    // restore recomputes the mean once that stack is back. Empty on every frame
+    // that came from a file, which is every other frame in the program.
+    std::string avgOfPath;
+
+    // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
+    // fields because they are read on 240+ lines (docs/reference-design.md
+    // §2.1). Only code that creates or mutates a source may write them, and it
+    // must set both sides - normally by filling the source and calling this.
+    // NB: copying an ImageDoc copies this POINTER - the copy ALIASES the same
+    // source. A copy that must own its pixels takes cloneSource() (§2.2).
+    std::shared_ptr<FrameSource> src = std::make_shared<FrameSource>();
+    void syncMirrors() {
+        w = src->w; h = src->h; ch = src->ch;
+        dtype = src->dtype; vmin = src->vmin; vmax = src->vmax;
+    }
+    std::vector<float>&       px()       { return src->data; }
+    const std::vector<float>& px() const { return src->data; }
+    float sample(int x, int y, int c) const { return src->data[((size_t)y * w + x) * ch + c]; }
+};
+
+// §6.2, the UI-thread half: a freshly decoded doc either surrenders its pixels
+// for the already-resident source with the same identity, or registers its own
+// for the next open to find. Returns true when it adopted - callers then skip
+// their computeMinMax (the resident source is already measured, and rewriting
+// shared fields from here would race a loader thread reading them).
+static bool shareOrRegisterSource(ImageDoc& d) {
+    if (!srcShareable(*d.src)) return false;
+    const std::string key = srcIdentityKey(*d.src);   // IO: before the lock
+    // ONE hold of g_srcRegMtx across find + add + mirror sync: the worker's
+    // probe and reloadSource's swap take the same lock, so an adoption can
+    // neither interleave with a half-registered tuple nor capture a mid-swap
+    // source (see the lock-order note at g_srcRegMtx)
+    std::lock_guard<std::mutex> lk(g_srcRegMtx);
+    if (std::shared_ptr<FrameSource> hit = srcRegistryFindLocked(key)) {
+        if (hit != d.src) { d.src = std::move(hit); d.syncMirrors(); return true; }
+        return false;                 // already the registered one (re-share path)
+    }
+    srcRegistryAddLocked(d.src, key);
+    return false;
+}
+
+// CFA pattern tables: channel of each 2x2 cell position (cy*2+cx); 0=R 1=Gr 2=Gb 3=B
+static const char* CFA_PATTERNS[] = { "RGGB", "BGGR", "GRBG", "GBRG" };
+static const char* CFA_CH_NAMES[] = { "R", "Gr", "Gb", "B" };
+static const int CFA_MAP[4][4] = {
+    { 0, 1, 2, 3 },   // RGGB
+    { 3, 2, 1, 0 },   // BGGR
+    { 1, 0, 3, 2 },   // GRBG
+    { 2, 3, 0, 1 },   // GBRG
+};
+static int cfaChannelAt(const ImageDoc& im, int x, int y) {
+    if (im.cfa == 0) return -1;
+    int cx = im.cfa == 2 ? (x >> 1) & 1 : x & 1;   // Quad Bayer: 2x2 blocks share a color
+    int cy = im.cfa == 2 ? (y >> 1) & 1 : y & 1;
+    return CFA_MAP[im.cfaPattern & 3][cy * 2 + cx];
+}
+
+struct ViewState {
+    float zoom = 1.0f;
+    ImVec2 center = ImVec2(0, 0);     // image px at canvas center
+};
+
+// Where the Browse toolbar's two width-critical controls ended up, in screen x,
+// against the panel's own content edges. Recorded every frame so a selftest can
+// assert the thing a human reads off a screenshot: "the filter is on screen".
+// (Defined up here because every Browse INSTANCE carries one - see
+// App::BrowseInstance below.)
+struct RbToolbarGeom {
+    // menuR was moreR until the drawer went away: the row's LAST permanent item
+    // is the "..." panel menu now, and the contract it stands for is unchanged -
+    // whatever ends the toolbar row must still be inside the panel at any width.
+    float x0 = 0, x1 = 0, filterL = 0, filterR = 0, menuR = 0;
+    float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+    int   emptyLocalBtn = 0;               // the not-connected state's local entry
+    float rowX = 0, rowY = 0;              // centre of the first row submitted
+    // ---- the bottom status line, and the star that ends the path line -------
+    // The line is built as one string and then elided to fit, so the selftest
+    // reads the LITERAL text the user sees rather than re-deriving it.
+    std::string statusText;                // after elision: what is on screen
+    std::string statusFull;                // before elision: the whole sentence
+    int   statusShown = 0, statusTotal = 0, statusSel = 0;
+    // what the drawn line MEASURES against the room it had. The line elides
+    // middle-out and must never wrap into a second row, so textW <= availW is
+    // the whole contract, checked at every width the geometry sweep uses.
+    float statusTextW = 0, statusAvailW = 0;
+    float listTopY = 0;                    // where the listing starts: a band
+                                           // above it would push this down
+    ImVec2 starCentre = ImVec2(-1, -1);    // the path line's bookmark star
+    int   starLit = 0;                     // 1 = this place is bookmarked
+    // ---- the ancestors held at the top of a scrolled tree -------------------
+    // What the reader can still see of where they are. Recorded rather than
+    // inferred because the whole claim this feature makes is about the SCREEN:
+    // "the folder you are inside is laid out, at the top", and a flag saying
+    // the feature is enabled would not have caught a band that drew nothing.
+    int   pinnedRows = 0;                  // how many levels are held
+    std::string pinnedNames;               // which, outermost first, ";"-joined
+    // ...and where the outermost one landed, so an injected click can be aimed
+    // at it. A pinned row that cannot be clicked would be a picture of a row.
+    ImVec2 pinCentre = ImVec2(-1, -1);
+};
+
+// One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
+// (docs/npz-design.md §2.1). An .npz is a container: the file is a batch, a
+// member is a stack or a frame - and a member that is not pixels must never
+// become pixels. (Defined up here because App carries the member picker; the
+// scanner that fills these lives with the zip reader.)
+struct NpzMember {
+    enum Role {
+        RImage,    // 2-D+ and interpretable: opens as a stack or a frame
+        RAxis,     // 1-D numeric: the per-frame x axis, or metadata. NOT pixels
+        RMeta,     // scalar / string / object dtype: provenance, never opened
+        RAmbig,    // deeper than (F,H,W,C): which axis is frames? we do not guess
+        RBad       // this viewer cannot read it, and says why
+    };
+    std::string name;         // array name, without the ".npy" the zip member has
+    std::string shapeText;    // "(24, 480, 640)" / "scalar" - as WRITTEN
+    std::string dtype;        // "u16" ... or the raw descr when unreadable
+    std::string becomes;      // what it will become, in the picker's own words
+    std::string why;          // why it is not an image (RAxis/RMeta/RAmbig/RBad)
+    int role = RMeta;
+    int frames = 1;           // RImage: frames of the stack it makes (1 = a frame)
+    int w = 0, h = 0, ch = 1;
+    std::vector<double> vals; // RAxis: every value, at FULL precision (never float)
+    std::string text;         // RMeta: the value as text (fmtExact / the string)
+    bool selected = false;
+    size_t entry = 0;         // index into the zip listing
+};
+
+struct App {
+    std::vector<std::unique_ptr<ImageDoc>> images;
+    int current = -1;
+    ViewState view;
+    bool showGrid = false;
+    float dispGamma = 1.0f;           // 1.0 or 2.2
+    float uiScale = 1.0f;
+    int themeVariant = ui_theme::VariantDark;   // View > Theme
+    int themeAccent = 0;                        // index into ui_theme::accents()
+    std::string toast; double toastUntil = 0; bool toastErr = false;
+    bool fitRequested = false;
+    std::unique_ptr<pfd::open_file> openDlg;   // polled each frame; never blocks render
+    std::unique_ptr<pfd::save_file> saveDlg;
+    std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
+    std::unique_ptr<pfd::save_file> texportDlg; // Temporal > Save (CSV)...
+    std::unique_ptr<pfd::save_file> pngDlg;    // Image > Save view as PNG
+    // One predicate for "an OS file dialog is pending". pollFileDialog only
+    // runs inside a drawn frame, so a dialog missing from the idle loop's busy
+    // set is polled only when some unrelated event happens to wake the loop -
+    // which is how Export curves' CSV came to be written on the viewer's next
+    // input rather than when the dialog closed. Defined out of line below,
+    // next to folderDlg.
+    std::string pendingCsv;                    // built at click time: the results may
+                                               // change while the OS dialog is open
+    std::string pendingTexport;                // Temporal export, same rule: built at
+                                               // click time, written when the dialog lands
+    bool showHelp = false, showAbout = false;
+    // hover state (image coords, -1 = none)
+    int hoverX = -1, hoverY = -1;
+    bool hoverInB = false;            // cursor is over the B pane of a split compare
+    // ---- unified annotations: ROIs (rect) and POIs (point), multiple of each ----
+    struct Ann {
+        int id = 0;
+        int type = 0;                 // 0 = rect (ROI), 1 = point (POI)
+        int x = 0, y = 0, w = 0, h = 0;
+        std::string label;
+        int color = 0;                // palette index
+        bool visible = true;
+        // pre-expansion rect memory for the X/Y band toggles (-1 = nothing saved)
+        int prevX = 0, prevW = -1, prevY = 0, prevH = -1;
+    };
+    std::vector<Ann> anns;
+    int nextAnnId = 1;
+    int roiSeq = 0, poiSeq = 0;       // monotonic label counters (no dupes after deletes)
+    int selectedAnn = 0;              // Ann::id; 0 = the built-in All (whole image) entry
+    uint64_t annRev = 0;              // bumped on any annotation change
+    bool annBusy = false;             // true while an annotation drag is in progress
+    bool dragPans = false;            // left-drag on empty canvas: pan instead of new ROI
+    int ctxX = -1, ctxY = -1;         // image coords the context menu was opened at
+    // A/B compare: A is always the current image; B is a second open image shown
+    // beside it (split) or under a draggable divider (wipe). Both panes use the
+    // one shared view, so a pixel is at the same place in both.
+    enum { CmpOff = 0, CmpWipe = 1, CmpSplit = 2, CmpDiff = 3, CmpFlip = 4 };
+    // Blink comparator: same view, whole frame, alternating between A and B. The
+    // eye finds a small difference far better from a flicker in place than from a
+    // seam or from two images side by side.
+    bool flipShowB = false;
+    bool flipAuto = false;
+    float flipPeriod = 0.5f;          // seconds per side
+    double flipNext = 0;
+    // Difference view: A-B as a signed map. Sign is hue, magnitude is brightness,
+    // and anything beyond the scale is flagged, because a difference image with a
+    // silently clipped scale is worse than no difference image.
+    struct DiffTex {
+        GLuint tex = 0;
+        uint64_t uidA = 0, uidB = 0;
+        int revA = -1, revB = -1;
+        float gain = 0;
+        bool absMode = false;
+        int w = 0, h = 0;
+        double clipped = 0;           // fraction of pixels outside +-gain
+    } diff;
+    float diffGain = 0;               // 0 = auto (99.9th percentile, rounded)
+    float diffAutoGain = 1;
+    bool diffAbs = false;
+    int compareMode = CmpOff;
+    // B is identified by uid: every frame of an in-file stack shares one name, so
+    // a name would silently re-point B at another frame as A walks the stack.
+    // The name (+ frame) is only the session fallback, resolved once on load.
+    uint64_t compareBUid = 0;
+    std::string compareB;             // B's name, for the session file
+    int compareBSeq = -1;             // ...and its frame index, when B is in a stack
+    // Stack-vs-stack compare: step A and B follows to the same frame NUMBER.
+    // Without this, comparing two 300-frame captures pins B to whatever frame
+    // it was on and every step compares against a stale image. Off when B is a
+    // single reference image (a dark, a golden sample) - then B must not move.
+    bool compareFollowFrame = true;
+    // How the two sides' DISPLAY range relates while comparing. Non-destructive
+    // throughout: B keeps its own numbers and gets them back when compare ends,
+    // exactly the contract linkRange has.
+    //   0 each own   - every side keeps its own stretch (shapes at wildly
+    //                  different exposures; the only case where it is honest)
+    //   1 B uses A's - one range, A's. Stable while stepping A.
+    //   2 union auto - both sides re-fit to min/max ACROSS A and B at the
+    //                  current frame pair, so neither clips and neither is
+    //                  favoured. This is "auto, but the same auto for both".
+    // The DEFAULT is 2. It used to be 1, and on two stacks captured at
+    // different levels that renders B at >white 99.69%: B's whole histogram
+    // collapses into one dashed line against the right edge of the plot, and
+    // its half of a side-by-side pair is empty. A mode whose purpose is "see B
+    // against A's reference" is not doing that when B saturates. The union
+    // shows both distributions on identical bins, and clipping drops to 0.02%
+    // on the same data. The cmprange pref persists a CHOSEN value, so only the
+    // out-of-the-box one moves.
+    int compareRangeMode = 2;
+    // A/B statistics panels: how the two sides are laid out. ONE global setting,
+    // not one per panel - "the same arrangement as the image" is a property of
+    // the comparison, not of the histogram, and per-panel state would multiply
+    // by five with no way to tell which panel is showing what.
+    // Auto mirrors the image: CmpSplit puts the images left/right, so the plots
+    // go left/right; wipe / blink / diff have ONE image area, so the plots overlay.
+    enum { AbAuto = 0, AbOverlay = 1, AbSide = 2 };
+    int abStatsLayout = AbAuto;
+    // Slot 1 of every statistics cache is filled ONLY while compare is on. This
+    // records whether it still holds anything, so compare-off invalidates it
+    // exactly once and then costs nothing at all.
+    bool abSlot1Live = false;
+    // While frames are being stepped faster than a person reads them, the B
+    // caches are NOT recomputed (see selectImage). nowSec() deadline.
+    double abStepBusyUntil = 0;
+    // Compare slots BEYOND B: C, D, E... An interim shape, deliberately bolted
+    // ON TOP of A/B rather than replacing it - every existing mode (wipe,
+    // split, diff, flip) still means exactly two images and still works
+    // untouched. The extras are for the numeric side, which extends to N
+    // without argument, and for side-by-side, which is the one image layout
+    // that does. docs/todo-open.md item 19 holds the shape this should
+    // eventually take.
+    std::vector<uint64_t> cmpExtra;          // uids, in slot order (C, D, ...)
+    uint64_t lastCompareBUid = 0;            // the B last CHOSEN, kept across compare being off
+    struct SlotWant { int frame; std::string path; };
+    std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
+    int pendingCompare = -1;          // --compare, applied once two images exist
+    uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
+    bool prefsDirty = false;          // a preference actually changed in this run
+    // The main window's geometry, remembered across runs (prefs.txt "window").
+    // winW/winH are LOGICAL pixels and winX/winY desktop coordinates - the two
+    // units are deliberate and are argued at fitSavedWindow. winW == 0 means
+    // nothing has been saved yet. While the window is MAXIMIZED these hold the
+    // rectangle to restore DOWN to, not the maximized one, which is why sampling
+    // them stops the moment winMax goes true.
+    int winX = 0, winY = 0, winW = 0, winH = 0;
+    bool winMax = false;
+    float inputLagMs = 0, inputLagMaxMs = 0;   // input event -> the frame answering it
+    float cpuMs = 0, swapMs = 0;               // our drawing vs presenting it
+    float wipeFrac = 0.5f;            // divider position, fraction of canvas width
+    float splitFrac = 0.5f;
+    bool wheelZoomPlain = false;// false: Ctrl+wheel zooms, plain wheel pans
+    // analyzer plugin state: cached result grid (rows = keys, cols = ROIs)
+    struct AnalysisState {
+        const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
+        int plugin = -1;
+        int dataRev = -1, cfa = -1, cfaPattern = -1;
+        float black = 0, white = 0;      // effective range is a plugin input
+        uint64_t rev = (uint64_t)-1;
+        std::vector<std::string> cols;                 // "whole" or ROI labels
+        std::vector<std::string> keys;                 // row keys, first-seen order
+        std::vector<std::vector<std::string>> vals;    // [row][col]
+        struct Series {                                // curves from V2 analyzers
+            std::string name, xLabel, yLabel;
+            std::vector<float> xs, ys;                 // xs empty = use index
+            int col = 0;                               // which ROI column produced it
+            int colorIdx = -1;                         // annotation palette; -1 = neutral
+        };
+        std::vector<Series> series;
+        std::string err;
+        // provenance, built once per run: where measured, on what, over which
+        // target, when, and how long it took. A screenshot of the panel must
+        // answer all of that without the surrounding session.
+        std::string prov;
+        float runMs = 0;
+        // presentation metadata, derived once per run (never in the draw loop):
+        std::vector<int> colColor;             // ANN palette per column; -1 = neutral
+        std::vector<std::string> units;        // per row; "" for text rows
+        std::vector<char> headline;            // per row: the number the user came for
+    } ana;
+    bool anaAuto = false;
+    int anaSel = 0;
+    bool anaRunRequest = false;       // set by the Measure menu; consumed by the panel
+    // user-set reference line on the curve plots (a spec limit, a pass line):
+    // one horizontal y = value across every analysis plot, session-persisted
+    bool anaRefOn = false;
+    float anaRef = 0.5f;              // 0.5 = the MTF50 line on an SFR plot
+    // host-built-in histogram cache (ROI-aware, CFA-split)
+    struct HistState {
+        const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
+        int dataRev = -1;
+        float black = 0, white = 0;
+        int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
+        int cfa = -1, cfaPattern = -1;
+        int nSeries = 0;
+        uint32_t bins[4][256] = {};
+        uint32_t maxBin = 1;
+        double clipLo = 0, clipHi = 0;
+        size_t sampled = 0;
+        bool roiUsed = false;
+        double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
+        const char* seriesNames[4] = {};
+    } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
+    // ...and one per extra compare slot (C, D, E...), indexed by cmpExtra
+    // position - which IS the letter, and travels with the resolved document
+    // (ResolvedSlot::idx), because after a follow-frame the document is no
+    // longer the pinned uid and a uid lookup would lose the letter. Exactly the
+    // shape projExtra and temporalExtra already have; the histogram was the one
+    // statistics cache still stopping at two, so the Statistics panel could
+    // only ever name A and B however many slots were armed.
+    std::vector<HistState> histExtra;
+    bool histLog = true;
+    // Which plane the histogram draws: -1 = all, else the series index. Four
+    // CFA planes times two sides is eight curves on one axis; the selector is
+    // what makes a CFA overlay readable at all. Presentation only - the bins
+    // are computed for every plane either way.
+    int histPlane = -1;
+
+    // ---- sequences (連番): a stack of frames that supports temporal analysis ----
+    struct SeqInfo {
+        int id = 0;
+        std::string name;             // display name (pattern)
+        int lastImageIdx = -1;        // last viewed frame, for stack switching
+        // remote origin: lets the temporal panel measure server-side without all
+        // frames being resident. remoteUrl for a frame-axis file; remoteFiles for
+        // a folder-of-frames stack. expectedFrames = the true total from META.
+        std::string remoteUrl, remoteHost;
+        int remotePort = 0;           // non-default ssh port, or 0
+        std::vector<std::string> remoteFiles;
+        int expectedFrames = 0;
+        int cfaType = 0, cfaPattern = 0;
+        // Data revision of the stack AS A SET of pixels: the reload walk (§3.2)
+        // bumps it whenever a member's source is swapped in place. Part of the
+        // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a
+        // reload that changes no shape (docs/reference-design.md §3.2).
+        int stackRev = 0;
+        // Per-frame X axis for the Temporal chart: what frame i physically IS
+        // (elapsed time, exposure, temperature). NAME + UNIT + one value per
+        // frame - a bare list of numbers cannot label an axis, so all three
+        // are required, exactly as a series carries name/unit/value for its
+        // stack-level parameter one layer up (docs/series-plan.md). This is
+        // legitimately per-STACK (unlike `level`): the axis maps THIS stack's
+        // frame numbers and nothing else. Empty axisVals = not set - and the
+        // unit is never defaulted (unset is unset, never assumed).
+        std::string axisName, axisUnit;
+        std::vector<double> axisVals;     // axisVals[i] belongs to seqIndex i
+        // NO level here. The value a stack was captured at is meaningless
+        // without the parameter's NAME and UNIT, and both of those belong to
+        // the series - so the value does too (Series::Member::value). Keeping
+        // it on the stack is what forced "one unit for the whole application".
+    };
+    std::vector<SeqInfo> seqs;
+    // A batch is the unit the Files panel groups by: created per OPEN ACTION
+    // (not per folder - reopening the same folder makes a NEW batch), named
+    // after the folder only as a starting value, renameable, session-saved.
+    // It is the user's analysis grouping, deliberately decoupled from disk.
+    // srcDir: the DIRECTORY loose opens reuse a batch for. Keying that reuse
+    // on the leaf NAME made ~/runA/10lx and ~/runB/10lx one "10lx" batch -
+    // two different measurements in two different directories, so Close batch
+    // took files from a directory the user never named, and "Create a series
+    // from this batch's stacks" offered two unrelated runs as one sweep with
+    // every row pre-ticked. Empty for batches made by the pickers, which are
+    // per OPEN ACTION by design.
+    struct Batch { int id; std::string name; std::string srcDir; };
+    std::vector<Batch> batches;
+    int nextBatchId = 1;
+    // ---- series (系列): the stacks of ONE swept parameter (docs/terminology.md) --
+    // A batch makes no structural claim; a series does. Its members carry a
+    // PARAMETER VALUE and an ORDER, and the whole run is one measurement - so
+    // the parameter's name, its unit and the kind of fit live HERE, not on the
+    // stack and not once per application.
+    //
+    // Series::members is the ONLY truth about membership. There is deliberately
+    // no SeqInfo::seriesId: two places holding the same fact drift apart, and
+    // the reverse lookup (seriesOfStack) is a walk over a handful of series.
+    struct Series {
+        enum { KLinearity = 0, KPtc = 1, KTemperature = 2, KOther = 3 };
+        int id = 0, batchId = 0;      // the batch it lives in - strictly ONE
+        std::string name;             // "<batch> 掃引" until a human names it
+        std::string paramName;        // "illuminance" / "exposure" / ...
+        // Empty = NOT SET, and that is the default: assuming "lx" would put a
+        // unit on an axis nobody chose. No unit, no fit (see seriesCanFit).
+        char unit[16] = "";
+        int kind = KLinearity;
+        // value NaN = not set. NEVER treated as 0 - it is left out of the fit
+        // and reads as "unset" on screen.
+        struct Member {
+            int seqId = 0;
+            double value = std::numeric_limits<double>::quiet_NaN();
+            bool include = true;
+        };
+        std::vector<Member> members;  // order = display order (sorting is a button)
+    };
+    std::vector<Series> series;
+    int nextSeriesId = 1;
+    int curSeriesId = 0;              // which series the Linearity panel shows
+    int loadBatchId = 0;              // batch newly opened images join; 0 = derive
+    uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
+    // Where that preview came from, so the browser can step through the
+    // sequence without opening it: the group's member paths (one file per
+    // frame), or the frame count of the ONE previewed file (frame axis), and
+    // the index currently shown. Cleared with the preview.
+    std::vector<std::string> previewFiles;
+    int previewFrames = 0;
+    int previewIndex = 0;
+    std::string previewLabel;
+    // ...and which machine those paths live on. The preview slot is GLOBAL -
+    // one across every Browse instance (the app's one throwaway; two instances
+    // previewing = last click wins, exactly like clicking twice in one panel) -
+    // so the stepper cannot ask "the" browse panel for its host any more.
+    std::string previewHost;
+    int previewPort = 0;
+    int nextSeqId = 1;
+    uint64_t nextUid = 1;
+    uint64_t imagesRev = 1;           // bumped whenever the image list changes
+    int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
+    int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
+    float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
+    // remote viewing: one peer process per host, reached over ssh.
+    // OWNERSHIP - remote::Session is documented not-thread-safe (remote.h), so
+    // every Session in this program has exactly ONE thread that touches it:
+    //   BrowseInstance::session -> that instance's browse worker (rbWorker),
+    //                 and nobody else. Not even a read: peerVersion /
+    //                 bytesReceived / alive are PUBLISHED into that instance's
+    //                 RemoteBrowse by the worker (RbResult) and the UI reads
+    //                 those plain values. One session per instance, one worker
+    //                 per instance - the singleton rule "one Session, one
+    //                 owning thread" generalises to "per place being viewed".
+    //   uiSession  -> the UI thread (openRemote's meta+tile), and nobody else.
+    //   rfWorker / mWorker each hold their own function-local Session.
+    // A mutex only one of two racing parties takes protects nothing, which is
+    // what the old shared app.remoteSession + app.sesMtx amounted to.
+    remote::Session uiSession;                     // the UI thread's, exclusively
+    std::string remoteExe;            // empty = ~/.viewer/viewer-serve (self-installed)
+    std::string exePath;              // argv[0], for the local:// test peer
+    bool remoteDlgOpen = false;       // File > Start Remote (ssh)...
+    std::string lastRemoteUrl;        // last host, prefilled next time (prefs)
+    // A connected server, browsable in the Files panel. Connect first, then look
+    // around - which is why nobody has to know the path shape up front.
+    struct RemoteBrowse {
+        bool connected = false;
+        bool autoUpdateTried = false; // one shot per connect: no update loops
+        std::string host, dir = "~", err;
+        int port = 0;
+        std::vector<remote::Entry> entries;
+        // Published by the worker with every result (RbResult), so no draw-path
+        // code ever names the Session. peerVersion gates the metadata columns
+        // and the MEASURE button; rxBytes feeds the status-bar tooltip.
+        int peerVersion = 0;
+        uint64_t rxBytes = 0;
+        // "Search under here" stores an ABSOLUTE path on THIS machine. It was a
+        // function-local static of drawPanelRemote, and every state-replacing
+        // path (the disconnect button, goToPlace) assigns `App::RemoteBrowse{}`
+        // - so entries, dir, host and the tree cache were forgotten on a host
+        // change and this string was not: Search on machine B stayed rooted at
+        // machine A's folder. Living here makes "reset on host change" true by
+        // construction, for this field and for the next one.
+        std::string searchRoot;
+        // Bumped on every listing REPLACEMENT. The row-selection and cursor
+        // caches keyed on host|dir|entry-COUNT, so a refresh that added one
+        // file and removed another kept row-indexed selection flags pointing
+        // at different files - and "Open N selected as stack" then acted on
+        // files the user never picked.
+        uint64_t rev = 1;
+        // The cancel token for SCAN, as rbSearch.gen is for GLOB. A cancelled
+        // scan's late reply used to reach openPickerWith, which does not merely
+        // raise a modal - it CLEARS app.folderPick and resets the root, filter,
+        // merge and sweep fields, destroying a local Open Folder selection the
+        // user was in the middle of filtering.
+        uint32_t scanGen = 0;
+    };
+    // The connect / install / list sequence runs on the INSTANCE's worker, never
+    // on the UI thread: a git clone on the far side takes seconds, and "Connect
+    // froze the app" is precisely the bug class this tool exists to avoid.
+    // RbTreeList is an ordinary LIST whose answer lands in the tree cache
+    // instead of replacing the listing: expanding a node must not navigate.
+    // RbDisconnect stops the session on the thread that OWNS it: the status bar
+    // must never call stop() on the worker's Session from the UI thread.
+    enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4,
+                  RbTreeList = 5, RbDisconnect = 6 };
+    struct RbJob {
+        int kind = RbConnect;
+        std::string host, dir;
+        int port = 0;
+        std::string pattern;          // RbGlob only
+        uint32_t gen = 0;             // RbGlob: Stop bumps it, stale results drop
+        std::string exe;              // frozen at enqueue: see MJob
+    };
+    struct RbResult {
+        int kind = RbConnect;
+        bool ok = false;
+        std::string err, host, dir, info;
+        int port = 0;
+        std::vector<remote::Entry> entries;
+        // RbScan payload: every stack under dir, plus how the walk ended
+        std::vector<remote::ScanGroup> scanGroups;
+        bool truncated = false;
+        int skippedDirs = 0;
+        // RbGlob payload
+        std::vector<remote::GlobHit> hits;
+        uint32_t gen = 0;
+        // Everything the UI would otherwise have to ask the Session for, read
+        // by the thread that OWNS it and carried home as plain values.
+        int peerVersion = 0;              // what the peer answered in HELLO
+        bool alive = false;               // is the session still up AFTER this job?
+        uint64_t rx = 0;                  // bytes received so far
+    };
+    // Stacks a remote folder scan decided to open, one at a time: the next
+    // stack starts only when the fetcher is idle, so the memory budget each
+    // openRemoteStack computes reflects what the previous one actually loaded.
+    // name: folder-qualified stack name ("10lx/frame_###.npy") - seven stacks
+    // all called frame_000.npy would be indistinguishable, and the linearity
+    // Auto-levels reads the level from exactly this folder prefix.
+    struct RemoteOpen { std::string host; std::vector<std::string> files;
+                        std::string name; int batchId = 0; int port = 0;
+                        int token = 0; };
+    std::vector<RemoteOpen> rbOpenQueue;
+    // Places: starred host+path urls, and the last ~10 visited (most recent
+    // first). Both persist in prefs - a lab machine's data layout outlives any
+    // one session.
+    std::vector<std::string> rbBookmarks;
+    std::vector<std::string> rbRecents;
+    // Server-side recursive find (GLOB). gen is the cancel token: Stop bumps
+    // it and the worker's result is dropped on arrival (the walk itself is
+    // bounded by depth and result caps, so there is nothing to interrupt).
+    struct RemoteSearch {
+        bool active = false;          // results view instead of the listing
+        bool running = false;
+        uint32_t gen = 0;
+        std::string root, pattern;
+        std::vector<remote::GlobHit> hits;
+        bool truncated = false;
+        int skippedDirs = 0;
+    };
+    // ==== ONE Browse instance: a view onto ONE place =========================
+    // Decision record: docs/todo-open.md item 17 ("instance-able views").
+    // The Browse panel stopped being a singleton: every instance holds a place
+    // (RemoteBrowse), the listing state that used to be ~21 function-local
+    // statics of drawPanelRemote and five g_rb* globals, and its OWN worker
+    // thread with its OWN Session. Local vs remote is where an instance
+    // STANDS, never a panel type - the place vocabulary of
+    // docs/browse-as-file-manager.md survives, only the panel count changed.
+    struct BrowseInstance {
+        // identity. num 1 is the primordial instance: it wears the original
+        // ImGui id "Browse###Remote" (existing layouts and the dock builder
+        // keep working) and is never destroyed, only hidden via app.showRemote
+        // - the last Browse closing behaves like the panel being hidden, so
+        // there is always a Browse to reopen. num >= 2 wear "Browse N###BrowseN"
+        // (stable across sessions: the number is saved) and are destroyed when
+        // their window closes.
+        int num = 1;
+        std::string wtitle;           // the ImGui window name, fixed at creation
+        bool open = true;             // window shown (num 1 mirrors app.showRemote)
+        bool focusReq = false;        // bring the window forward next frame
+        // Where "+" wants this panel to appear: the dock node of the panel whose
+        // "+" was clicked, so a new Browse is a TAB beside the one you were
+        // looking at rather than a floating window somewhere else. Applied once,
+        // then cleared - after that the panel is wherever the user put it.
+        unsigned dockInto = 0;
+        // the place, and everything listed there
+        RemoteBrowse b;
+        RemoteSearch search;
+        std::string pendingOpen;      // a pasted url, opened once the session is up
+        // ---- the worker: one thread, one Session, per instance --------------
+        // The Session is touched by THIS thread only; the UI reads the plain
+        // values the worker publishes (RbResult). Destroying an instance joins
+        // the thread first, so the Session's destruction is single-threaded too.
+        std::unique_ptr<remote::Session> session;   // the worker's, exclusively
+        std::thread thread;
+        std::mutex mtx;               // guards queue / done / phase
+        std::condition_variable cv;
+        std::vector<RbJob> queue;
+        std::vector<RbResult> done;
+        std::string phase;            // what the worker is doing, for the UI
+        std::atomic<bool> busy{ false };
+        std::atomic<bool> stop{ false };
+        // ---- tree mode: this instance's expanded nodes and their children ---
+        std::map<std::string, std::vector<remote::Entry>> treeCache;
+        std::vector<std::string> expanded;     // absolute dirs currently open
+        std::vector<std::string> treePending;  // ...and those still being listed
+        int treeLists = 0;                     // node LISTs issued (selftest)
+        // ---- navigation history (mouse back/forward, Alt+Left / Alt+Right) --
+        std::vector<std::string> histBack, histFwd;
+        std::string histKey;          // host:port the history belongs to
+        bool histNav = false;         // set while back/forward itself navigates
+        // ---- the shape of the listing. Per instance; app.rbFlat / rbTree /
+        // rbNatural remain the persisted DEFAULTS a new instance starts from,
+        // and a toggle writes through to them (last toggle wins next start).
+        // (`advanced` - was the "more" drawer open - went with the drawer.)
+        bool flat = false, tree = false;
+        // ...and the order the NAME column puts rows in. Natural by default
+        // (rp::naturalLess): see rbNameCmp for why the listing gets a choice
+        // here and a stack never does.
+        bool nameNatural = true;
+        // ---- panel state, formerly function-local statics of drawPanelRemote.
+        // keyboard cursor (row index into the built view, -1 = none)
+        int cursor = -1;
+        bool cursorScroll = false;    // bring it into view this frame
+        // A click GESTURE that navigated: how many clicks of it have landed so
+        // far (0 = no such gesture in flight). Everything after that click
+        // belongs to the navigation and not to the listing that replaced the
+        // one it was aimed at - see rbNavGesture in drawPanelRemote.
+        int navChain = 0;
+        std::string curSig;           // host|dir|rev the cursor was built for
+        bool curFlat = false, curTree = false;
+        // sort spec, stashed from the table one frame late (see RB_COL_NAME)
+        int sortCol = 0;              // RB_COL_NAME
+        bool sortDesc = false;
+        // multi-select, by row index; sig says which listing it was built for
+        std::vector<char> sel;
+        int selAnchor = -1;
+        bool selFlat = false, selTree = false;
+        std::string selSig;
+        // filter / search / path editing. ONE buffer: the filter box is also the
+        // search box, and Enter is the difference between "narrow these rows"
+        // and "walk below this folder". searchBuf/searchFocus fed a second,
+        // identical-looking box in a popup and went with it.
+        char filter[256] = "";
+        bool searchOpen = false;      // put the caret in the filter box next frame
+        char pathEdit[1024] = "";
+        bool pathEditing = false, pathFocus = false;
+        // Properties popup: a snapshot, because the row may scroll out of the
+        // clipper (or the listing may refresh) while the popup is up
+        remote::Entry propsEntry;
+        std::string propsPath;
+        bool propsOpen = false;
+        bool propsNoSize = false;     // an expanded frame: no size/mtime of its own
+        // deferred panel actions - see rbDefer. Per instance: the queue fills
+        // only while THIS instance's rows are alive and drains when they die.
+        std::vector<std::function<void()>> deferred;
+        // selftest probes: where the toolbar and the cursor row landed on screen
+        RbToolbarGeom toolbar;
+        ImVec2 cursorRect[2] = { ImVec2(0, 0), ImVec2(0, 0) };
+        std::string cursorName;
+        // ...and its FULL path, which is the key the tree's `expanded` set is
+        // written in: "is the cursor row expanded" cannot be asked with a bare
+        // name, and counting the whole set answers a different question.
+        std::string cursorFull;
+        // ...and the centre of the cursor row's chevron hit zone (tree dir
+        // rows only; x < 0 = the row has no chevron), for "chevclick"
+        ImVec2 cursorChev = ImVec2(-1, -1);
+        // The listing's row PITCH, measured from the rows the clipper actually
+        // laid out. The pinned-ancestor band has to know which row is at the
+        // top of the viewport BEFORE it submits anything (ImGui wants the
+        // frozen-row count before the first row), so it divides the scroll
+        // offset by this instead of asking the clipper - which has not run yet.
+        // Measured, not derived: a row is a Selectable inside a table cell, and
+        // reconstructing that height from font size and two paddings is a
+        // second copy of ImGui's arithmetic that would drift from it.
+        float listRowH = 0;
+    };
+    // Never empty once rbMain() ran; [0] is always the primordial instance.
+    std::vector<std::unique_ptr<BrowseInstance>> browsePanels;
+    bool showRemoteError = false;     // the full failure text, on demand
+    // (there is deliberately no session mutex here any more: see the ownership
+    // note on session/uiSession above. Nothing is shared, so nothing locks.)
+    // where analysis runs. auto: remote data -> server, local -> local. server:
+    // even a resident frame is measured server-side (one engine for a whole
+    // batch). local-fetch: never use the server for compute (today's behavior).
+    // PolServer (1) is RETIRED. It promised "even a resident frame is measured
+    // server-side", and nothing implemented it: serverComputes - the only
+    // functional read of procPolicy in the program - is
+    // `procPolicy != PolLocalFetch`, so PolServer and PolAuto took the same
+    // branch everywhere, and the Analysis panel (where a single-frame
+    // measurement would be routed) never reads procPolicy at all. Nor is it
+    // implementable as promised with today's protocol: the peer reads files by
+    // PATH on the server, so "measure a LOCAL frame on the server" has nothing
+    // to measure there. A persisted, CLI-settable setting labelled "measure on
+    // the server" that is byte-for-byte equivalent to auto is worse than a
+    // missing one, so the menu item is gone and the value folds into auto
+    // wherever it is read back.
+    enum { PolAuto = 0, PolServerRetired = 1, PolLocalFetch = 2 };
+    int procPolicy = PolAuto;
+    // background MEASURE worker (own ssh connection: a 300-frame aggregate must
+    // not stall the tile fetches). Results carry provenance for the panel.
+    // `exe` is the same snapshot RFetchJob carries and for the same reason
+    // (main.cpp: "how the peer is invoked, frozen NOW: the UI thread edits
+    // remoteExe freely"). A worker reading app.remoteExe while the Start Remote
+    // dialog assigns it is a data race on a std::string.
+    struct MJob { std::string url; int op; uint64_t token; std::vector<std::string> files;
+                  int cfaType = 0, cfaPattern = 0; float black = 0, white = 1;
+                  int rx = 0, ry = 0, rw = 0, rh = 0; std::string exe; };
+    struct MDone { uint64_t token; bool ok = false; std::string err, host;
+                   remote::MeasureResult res; };
+    std::thread mThread;
+    std::atomic<bool> mStop{ false };
+    std::atomic<int> mPending{ 0 };
+    std::mutex mMtx;
+    std::condition_variable mCv;
+    std::vector<MJob> mQueue;
+    std::vector<MDone> mDone;
+    // last server temporal result, keyed to the stack it describes
+    // Linearity: one row per MEMBER of one series (value in, response out), fits
+    // per CFA plane. Recomputed only on demand - this walks hundreds of frames.
+    struct LinState {
+        struct Row {
+            int seqId = 0;
+            std::string name;
+            double level = std::numeric_limits<double>::quiet_NaN();
+            bool include = true, valid = false, pending = false;
+            int frames = 0, nPl = 1;
+            double mean[4] = {}, sigmaT[4] = {};
+            std::string err;
+        };
+        std::vector<Row> rows;
+        int seriesId = 0;                 // the series these rows describe
+        // NOT the unit of any measurement: the PREFILL a newly created series
+        // starts from (prefs key linunit, unchanged). What gets printed on an
+        // axis comes from Series::unit, and empty there means "not set" - it
+        // never silently becomes "lx".
+        char unit[16] = "lx";
+        int tablePlane = 0;               // which CFA plane the per-stack table shows
+        bool snrDb = false;               // SNR curve y axis: ratio (default) or dB
+        bool fitValid = false, roiUsed = false;
+        bool readFromDark = false;        // read noise measured, not extrapolated
+        int nPl = 1, nPts = 0;
+        double slope[4] = {}, offs[4] = {}, r2[4] = {}, leMax[4] = {};
+        double ptcK[4] = {}, ptcRead2[4] = {}, readDN[4] = {};
+        uint64_t rev = 0, computedRev = 0;
+    } lin;
+    bool showLinearity = false;
+    // Create / edit a series. ONE modal for both: the fields are identical and
+    // "edit" is only "create with the boxes already ticked". The value column
+    // is a SUGGESTION the user confirms - see drawSeriesModal.
+    struct SeriesEdit {
+        bool open = false;
+        int editId = 0;                   // 0 = creating a new one
+        int batchId = 0;
+        char name[128] = "";
+        char param[64] = "";
+        char unit[16] = "";
+        int kind = Series::KLinearity;
+        struct Row {
+            int seqId = 0;
+            bool check = true;
+            // TEXT, not a double: "" has to stay distinguishable from 0, and a
+            // numeric box cannot be empty. Parsed on accept; empty = NaN = unset.
+            char value[32] = "";
+            bool suggested = false;       // still extractLevelFromName's proposal
+            // An EXISTING member's value, kept as the double it is. The box shows
+            // it as "%.6g" and a Save that never touched the box must give the
+            // member back UNCHANGED - re-parsing the display text would quietly
+            // round 1234567.89 to 1234570 on every visit to the dialog.
+            double orig = std::numeric_limits<double>::quiet_NaN();
+            bool haveOrig = false;        // this row is already a member
+            bool touched = false;         // a human typed in the box
+            // extractLevelFromName's proposal when it is NOT in the box: offered
+            // in the "read from" column, where it cannot be committed by accident.
+            double guess = std::numeric_limits<double>::quiet_NaN();
+            std::string name, from;       // from = the text the number was read out of
+        };
+        std::vector<Row> rows;
+    } seriesEdit;
+    int forceCfa = -1, forceCfaPattern = 0;   // --cfa: how 1ch files arrive
+    // Open by default (2026-08-03, user): Browse is how a file is found, and a
+    // tool you have to summon through the OS dialog it replaces is the wrong
+    // way round. The saved layout wins after the first run - close it and it
+    // stays closed, because layout.ini remembers.
+    bool showRemote = true;           // the server browser, its own panel
+    // Browse listing view: false = the collapsed group rows the peer sends,
+    // true = every frame of every sequence as its own row. Expansion is a pure
+    // CLIENT-SIDE view over the same reply (the peer always sends `.members`),
+    // so the toggle costs no round trip. Persisted: it is a way of working.
+    bool rbFlat = false;
+    // (rbAdvanced - whether the Browse header's "more" drawer started open -
+    // is gone with the drawer. Its contents each moved to the place they are
+    // about: docs/browse-topbar-design.md 10.2.)
+    // Tree mode: a directory expands IN PLACE instead of replacing the listing,
+    // so a folder of folders can be compared without losing your place. LAZY -
+    // expanding a node costs exactly one LIST, issued on the browse worker and
+    // never on the UI thread, and collapsing KEEPS the answer: re-expanding is
+    // free. Cache keyed by absolute path, so it survives navigation; dropped
+    // when the machine changes or on an explicit refresh.
+    bool rbTree = false;                                        // persisted
+    // (the tree cache, expanded set and pending list live per Browse instance
+    // now - BrowseInstance::treeCache / expanded / treePending)
+    // Name order in the listing: true = natural (frame_2 before frame_10, the
+    // order a stack is built in and the order the peer folds a scan in),
+    // false = plain lexicographic. Persisted, and the DEFAULT a new panel
+    // starts from - the panel that changes it changes only itself, exactly as
+    // rbFlat / rbTree do. There is no Preferences panel to put it in (#50).
+    bool rbNatural = true;                                      // persisted
+    bool focusRemote = false;         // bring the ACTIVE Browse instance forward
+    bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
+    struct Msg { std::string text; bool err; };
+    std::vector<Msg> msgLog;          // every toast, kept so it can be copied
+    // msgLog is capped, so its SIZE stops changing once the cap is reached and
+    // cannot be used to notice that it changed. This counter only ever goes up.
+    size_t msgSeq = 0;
+    bool showMessages = false, msgUnreadErr = false;
+    struct ServerTemporal {
+        uint64_t token = 0;           // matches the MJob that produced it
+        int seqId = -1;               // owning stack; -2 = detached (browser-fired
+                                      // aggregate over files nobody opened)
+        bool valid = false, pending = false;
+        bool detached = false;        // browser origin: no SeqInfo backs this
+        std::string host, err;
+        std::string label;            // what was measured ("10lx/frame_???.npy")
+        std::vector<std::string> files;   // detached only: for "Open as stack"
+        int frames = 0;
+        // The REGION the server actually measured. requestServerTemporal sends
+        // no ROI, so this is the whole frame - and it has to be recorded rather
+        // than assumed, because the panel used to label these numbers with the
+        // LOCAL side's roiUsed flag and so claimed a region they never had.
+        int rx = 0, ry = 0, rw = 0, rh = 0;   // rw/rh 0 = whole frame
+        bool roiUsed = false;
+        // Per CFA plane, because the peer answers per plane when it was told
+        // the mosaic (serve.cpp planeKey). nPl == 1 means the reply was pooled
+        // - which the panel then has to SAY, not hide.
+        int nPl = 1;
+        double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {}, mean[4] = {};
+        std::vector<float> idx, frameMean, frameStd;
+    } srvTemporal;
+    // The same, for the compare B side. NEVER fired automatically: a server
+    // aggregate is a real job on a real machine, and B following A around
+    // would double them silently. The Temporal panel's "Measure B" button is
+    // the only thing that fills this.
+    ServerTemporal srvTemporalB;
+    // background loader
+    std::thread seqThread;
+    std::atomic<bool> seqCancel{ false };
+    std::atomic<bool> seqRunning{ false };
+    std::atomic<int> seqDone{ 0 }, seqTotal{ 0 };
+    std::mutex seqMtx;
+    std::vector<std::pair<int, std::unique_ptr<ImageDoc>>> seqReady;   // (seqIndex, frame)
+    std::string seqErr;               // guarded by seqMtx
+    std::string seqNote;              // last loader message, kept on screen (UI thread)
+    int seqLoadingId = 0;
+    size_t seqBytes = 0;
+    // background full-resolution fetch for remote frames. Frame granularity on
+    // purpose: once the full frame lands, a remote image IS a local image - no
+    // tile bookkeeping, no partial state, no coordinate mapping to maintain.
+    // uid != 0: replace that doc's pixels (preview -> full swap).
+    // uid == 0: a NEW frame of stack seqId - the remote prefetch, which is how a
+    // server-side folder becomes an ordinary local stack, one frame at a time.
+    struct RFetchJob {
+        std::string url, name;
+        std::string note;             // the head frame's note, copied verbatim onto
+                                      // this one: a stack-constant Inspector row
+                                      // (see openRemote, materializeDerivedFrame)
+        std::string exe;              // snapshot at enqueue: the UI may edit
+                                      // remoteExe while the worker connects
+        int frame = 0;
+        uint64_t uid = 0;
+        int seqId = 0, seqIndex = 0;
+        uint32_t gen = 0;             // closeAll bumps the generation; stale
+                                      // results must not graft onto a new list
+        bool low = false;             // preview buffering: yields to registered opens
+        size_t bytes = 0;             // what this frame will occupy once resident
+        int64_t mtime = 0;            // local:// only: the disk baseline statted at
+        uint64_t fsize = 0;           // ENQUEUE (identity before bytes) - the minted
+                                      // sibling binds to the OPEN's stat epoch
+    };
+    struct RFetchDone {
+        uint64_t uid = 0;
+        int w = 0, h = 0, ch = 0;
+        float vmin = 0, vmax = 1;     // computed on the worker: 12M floats is a
+                                      // visible hitch on the UI thread
+        std::string dtype, err;
+        std::vector<float> data;
+        std::string url, name, note;
+        int frame = 0, seqId = 0, seqIndex = 0;
+        uint32_t gen = 0;
+        size_t bytes = 0;             // what was committed for it, to give back
+        int64_t mtime = 0;            // the job's enqueue-time disk baseline
+        uint64_t fsize = 0;           // (local:// only) - see RFetchJob
+    };
+    std::atomic<uint32_t> rfGen{ 0 };
+    std::thread rfThread;
+    std::atomic<bool> rfStop{ false };
+    std::atomic<int> rfPending{ 0 };
+    // Bytes COMMITTED but not yet resident. residentImageBytes() counts only
+    // app.images, so two opens a second apart each sized their prefetch against
+    // a budget the other had already spent - each enqueueing a full budget's
+    // worth. rbOpenQueue serialises the scan-open path for exactly this reason
+    // ("the next stack starts only when the fetcher is idle"), but every
+    // browser open and every session-restore line bypasses that queue.
+    std::atomic<size_t> rfBytesInFlight{ 0 };
+    std::atomic<int> rfTotal{ 0 }, rfFetched{ 0 };   // progress for the Files panel
+    std::mutex rfMtx;
+    std::condition_variable rfCv;
+    std::vector<RFetchJob> rfQueue;   // guarded by rfMtx
+    std::atomic<uint64_t> rfBusyUid{ 0 };   // the uid the worker is fetching NOW:
+                                      // requestFullRemote's dedupe must see the
+                                      // job that left the queue, or a promote
+                                      // mid-flight enqueues the fetch twice
+    std::vector<RFetchDone> rfDone;   // guarded by rfMtx
+    // pending "load the rest of the folder?" question
+    int seqAskImage = -1;
+    std::vector<std::string> seqAskFiles;
+    std::string seqAskPattern;
+    // queued stacks from "Open Folder" (loaded one after another).
+    // shape: "24x1200x1600 u16" when known (npy header peek locally, v3 listing
+    // metadata remotely); the picker shows it and the merge warning compares it.
+    // token: the identity of the stack this group is GOING to create, stamped
+    // when the group is queued and recorded against the real seqId the moment
+    // the stack appears (see groupStacks). A pending sweep resolves against
+    // that, never against a display name.
+    // openId: which Open Folder queued this group. The queue spans Opens (a
+    // second Open while the first drains appends), and the raw format recipe is
+    // answered once per OPEN - it must not reach the other one's files.
+    struct PendingGroup { std::string name; std::vector<std::string> files;
+                          bool isRaw = false; int batchId = 0; std::string shape;
+                          int token = 0; int openId = 0; };
+    std::vector<PendingGroup> seqQueue;
+    // Sibling loads a session asked for, drained one at a time.
+    // startSequenceLoad calls stopSequenceLoader, so restoring N stacks by
+    // calling it N times in the parse loop cancelled every load but the last:
+    // a 3-stack session came back with 7 of its 15 frames.
+    // `name` is the user-given stack name from the session's seqname line.
+    // seqload only QUEUES the rescan, so when seqname is parsed the SeqInfo
+    // does not exist yet and the reader's `cur()->seqId != 0` guard dropped the
+    // rename with no message - the stack came back under its folder-derived
+    // pattern. It travels with the restore entry and is applied when the stack
+    // is actually created.
+    struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern;
+                        std::string name;
+                        // the session's per-frame x axis, applied with the name
+                        // once the stack exists (same window, same fix)
+                        std::string axisName, axisUnit;
+                        std::vector<double> axisVals; };
+    std::vector<SeqRestore> seqRestore;
+    // "Open as frame average" on a stack that is not here yet. Browse opens are
+    // asynchronous - the first frame shows and the rest stream in - so the mean
+    // cannot be taken at click time; the request is parked on the seqId it is
+    // waiting for and fired by pumpStackAverages() once nothing more is coming.
+    // A session restore pushes into the SAME list (through avgRestore below), so
+    // there is one place where a stack becomes an average and one set of rules
+    // about when it is allowed to happen.
+    std::vector<int> pendingAvg;
+    // ...and the session's side of it, by PATH, resolved lazily exactly like
+    // seriesRestore: at parse time a folder stack is one loose image plus a
+    // queued rescan, so the stack this names does not exist yet.
+    std::vector<std::string> avgRestore;
+    // Series a session asked for, resolved LAZILY for the same reason: at parse
+    // time the stacks do not exist yet (a folder stack is one loose image plus a
+    // queued rescan), so a member cannot be looked up. Members are named by the
+    // PATH OF THEIR FIRST FRAME - a stack NAME would not do, because a name is
+    // renameable and not unique (two folders can hold the same stack name, and
+    // the user may change it between save and load), while a path is what the
+    // image lines themselves already round-trip.
+    struct SeriesRestore {
+        std::string name, batchName, paramName, unit;
+        int kind = 0;
+        int badValues = 0;                // value fields the parser could not read
+        int truncated = 0;                // member lines cut before their path
+        struct M { double value; bool include; std::string path; };
+        std::vector<M> members;
+    };
+    std::vector<SeriesRestore> seriesRestore;
+    // MIGRATION of the old per-stack level, also by path. saveSession has never
+    // written "seqlevel" (verified over the whole history), so this is normally
+    // empty - it exists for hand-written and third-party files, and it creates
+    // a series only where the file actually says there was a sweep.
+    std::vector<std::pair<std::string, double>> seqLevelLegacy;
+    // A sweep the PICKER was told to make ("open as a sweep"), resolved once
+    // its stacks are open - the same lateness as seriesRestore and for the same
+    // reason. Each member carries the TOKEN of the group it was ticked on, and
+    // that is what it resolves by: the stack the group actually created is
+    // recorded under that token at creation (App::groupStacks). The group name
+    // is kept for the message and as a fallback, but it is not identity - it is
+    // a display string, renameable with F2 the instant the head frame lands.
+    struct SeriesPending {
+        int batchId = 0;
+        std::string name, paramName, unit;
+        int kind = Series::KLinearity;
+        struct Want { int token = 0; std::string name; double value = 0; };
+        std::vector<Want> members;
+    };
+    // A QUEUE, not a slot. Resolution waits for every load to drain, which for a
+    // folder-of-folders is seconds and for a remote sweep much longer, and File >
+    // Open Folder is available throughout - a single slot meant the second sweep
+    // silently threw the first one's ticked box, typed parameter and unit away.
+    std::vector<SeriesPending> seriesPending;
+    // Which stack each queued group produced, by token. Filled while a sweep is
+    // waiting and cleared when it resolves, so it never outlives the Open that
+    // stamped it.
+    int nextGroupToken = 1;
+    std::vector<std::pair<int, int>> groupStacks;   // group token -> seqId
+    bool folderRecipeValid = false;   // raw recipe shared by the queue (see g_folderRecipe)
+    int folderRecipeOpenId = 0;       // ...and WHOSE Open answered for it
+    int nextOpenId = 1;               // one per Open Folder, stamped on its groups
+    // "which stacks do you want?" picker shown after scanning a folder.
+    // rel: each file's "folder/name" relative to the scanned root - the live
+    // filter matches against exactly these strings, so folder names and file
+    // names both narrow the tree. match/nMatch: the filter's current cut;
+    // filtered-out files are NOT loaded when the group is accepted.
+    struct FolderPick {
+        PendingGroup g;
+        bool selected = true;
+        std::vector<std::string> rel;     // parallel to g.files
+        std::vector<uint8_t> match;       // parallel to g.files; 1 = passes filter
+        int nMatch = 0;
+    };
+    std::vector<FolderPick> folderPick;
+    bool folderPickOpen = false;
+    std::string folderPickRoot;
+    // remote variant: the same picker, but accepted groups go through
+    // rbOpenQueue / openRemoteStack instead of the local sequence loader
+    bool folderPickRemote = false;
+    std::string folderPickHost;
+    int folderPickPort = 0;                // the port is part of the locator
+    // one live filter box: space-separated terms AND together, '!' excludes,
+    // * and ? wildcards, matched anywhere in FolderPick::rel (see applyPickFilter)
+    char pickFilter[256] = "";
+    int pickMerge = 0;                // 0 = one stack per group, 1 = ONE merged stack
+    // batch assignment for the accepted selection: 0 = the whole Open is ONE
+    // batch (the canon's default), 1 = one batch per top-level folder of the
+    // scanned root. Ignored under pickMerge (a merged stack is one batch).
+    int pickBatchMode = 0;
+    // "open as a sweep": the accepted groups also become ONE series. Not
+    // persisted and cleared on accept - a sticky box would create a sweep on
+    // some later Open that nobody asked for, which is the one thing series are
+    // never allowed to do. Exclusive with pickBatchMode (a series lives in one
+    // batch); the parameter name and unit are the series', typed here.
+    bool pickSweep = false;
+    char pickSweepParam[64] = "";
+    char pickSweepUnit[16] = "";
+    std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
+    // ---- .npz member picker (docs/npz-design.md §2.3) ----------------------
+    // The SAME dialog as the folder picker, one layer down: an .npz is a batch
+    // and its members are the stacks and frames inside it, so the vocabulary,
+    // the All/None/Invert row and the accept path are the folder picker's.
+    // Raised only when there is a choice to make - a file holding one image and
+    // nothing else opens with no dialog at all, exactly as it does today.
+    std::vector<NpzMember> npzPick;
+    bool npzPickOpen = false;
+    std::string npzPickPath;          // the .npz these members came from
+    // Dropping several .npz files calls openPath in a LOOP, and one picker can
+    // be up at a time: the rest WAIT here and are named, rather than the second
+    // silently overwriting the first one's pending choice.
+    std::vector<std::string> npzPickQueue;
+    // The axis' NAME and UNIT are the user's to confirm. The key name is offered
+    // as the default label because it is the only honest starting point; the
+    // unit starts EMPTY and is never read out of the key name ("exposure_ms"
+    // does not prove milliseconds - docs/terminology.md: 単位を仮定しない).
+    char npzAxisName[64] = "";
+    char npzAxisUnit[16] = "";
+    // Members that are NOT pixels, kept per .npz file so the Inspector can show
+    // the file's provenance next to the frame it opened
+    // (docs/npz-design.md §4 item 3 「実装で答えたこと (v1)」).
+    struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
+    std::vector<NpzMeta> npzMeta;
+    // ---- input adapters (docs/input-adapters.md §4.12 / §4.13) ---------------
+    // v1 remembers ONE thing: which reader read which file. Folder and glob
+    // RULES are deliberately absent (§8 item 7) - they need a trust rule first,
+    // because a rule living in a shared data folder would run someone else's
+    // Python without anyone choosing it. This list is a record of choices the
+    // user made, which is why it is visible and removable rather than magic.
+    std::string pythonExe;                  // configured interpreter; "" = probe PATH
+    struct ReaderMemo { std::string path, spec; };
+    std::vector<ReaderMemo> readerMemo;     // most recent first; bounded, see §4.12
+    std::vector<std::string> readerShown;   // specs whose command was shown once (§4.13)
+    // §4.13.0: ONE panel, three entrances, and it does not close. Writing an
+    // adapter is write -> load -> read the failure -> fix -> load again, and a
+    // modal cuts that loop every time the author leaves for their editor.
+    std::string readerPickPath;             // the file or folder the panel is aimed at
+    bool readerPanelOpen = false;
+    bool readerPanelRaise = false;          // an entrance asked for focus
+    bool readerListOpen = false;            // §4.12's visible, removable list
+    char readerPickFile[512] = "";
+    char readerPickFunc[128] = "load";
+    char readerLocalDir[512] = "";          // a folder of the user's own readers
+    std::string readerPickWhy;              // why we are asking (native's own refusal)
+    // The last run, kept WHOLE. A traceback is the only debugging surface an
+    // adapter author has; folding it into "could not open" makes the feature
+    // useless to exactly the people it exists for (§4.13.0).
+    std::string readerLastOut;
+    std::string readerLastSpec;
+    bool readerLastOk = false;
+    bool readerRan = false;
+    std::unique_ptr<pfd::select_folder> folderDlg;
+    int folderDlgMode = 0;            // 0 = Open Folder (load stacks), 1 = Browse
+    // The reader panel's own dialogs. These went in as pfd::open_file(...).
+    // result() - blocking, inside the frame - which broke the rule the openDlg
+    // comment states, skipped the one-at-a-time guard every other dialog has,
+    // and left anyFileDialog() saying "no dialog" while one was on screen.
+    std::unique_ptr<pfd::open_file>     rdOpenDlg;
+    int rdOpenMode = 0;               // 0 = pick a reader .py, 1 = open a file with one
+    std::unique_ptr<pfd::select_folder> rdFolderDlg;
+    int rdFolderMode = 0;             // 0 = the folder of readers, 1 = open a folder with one
+    std::unique_ptr<pfd::save_file>     rdNewDlg;   // where to write the template
+    // A reader runs for as long as the user's data takes. Waiting for it on the
+    // UI thread made the whole window stop answering - up to the five-minute
+    // timeout - with nothing on screen to say why or to stop it. Only the wait
+    // moves off-thread: reading what it produced touches images and GL.
+    struct ReaderJob {
+        std::string src, spec, out;        // what it is reading, with what, to where
+        std::vector<std::string> argv;
+        std::string outFile, errFile;      // the child's streams, readable AS it writes
+        std::thread th;
+        std::atomic<bool> done{ false };
+        std::atomic<bool> cancel{ false };
+        adapter::Run r;
+        double startedAt = 0;
+        size_t shown = 0;                  // how much of the live output is on screen
+        int64_t srcMtime = 0;              // the origin's stat, taken BEFORE the
+        uint64_t srcFsize = 0;             // reader ran (identity before bytes)
+    };
+    std::unique_ptr<ReaderJob> rdJob;
+    bool anyFileDialog() const {      // see the note on csvDlg
+        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg ||
+               rdOpenDlg || rdFolderDlg || rdNewDlg;
+    }
+                                      // Folder (local peer in the Browse panel)
+    // temporal analysis cache (built-in, follows the selected ROI)
+    struct TemporalState {
+        int seqId = -1;
+        int frames = 0;
+        int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
+        // The mosaic is part of the KEY: toggling CFA in the Inspector changes
+        // what these numbers mean, and a cache that ignored it served the old
+        // plane-mixed answer back.
+        int cfa = -1, cfaPattern = -1;
+        // SeqInfo::stackRev at compute time - the DATA revision. Without it the
+        // key is (seqId, frames, ROI, CFA) and a reload that changes no shape
+        // hands back the dead pixels' sigma_t (docs/reference-design.md §3.2).
+        int stackRev = -1;
+        int nPl = 1;                              // 4 when the frame is mosaiced
+        uint64_t nonFinite = 0;                   // samples EXCLUDED, and said so
+        size_t dropped = 0;                       // samples with < 2 valid frames
+        std::vector<float> idx, frameMean, frameStd;
+        double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {};
+        bool valid = false;
+        bool roiUsed = false;
+    } temporal[2];                    // 0 = A, 1 = B (compare)
+    // ...and one per extra compare slot (C, D, E...), in cmpExtra order. Same
+    // cache, same key: a slot only pays for a recompute when its STACK or the
+    // ROI changes, so N slots cost N cached lookups per frame, not N passes.
+    std::vector<TemporalState> temporalExtra;
+    // H/V projections (line profiles) of the selected ROI / whole image
+    struct ProjState {
+        const ImageDoc* img = nullptr;
+        uint64_t uid = 0;
+        int dataRev = -1;
+        int mode = -1, cfa = -1, cfaPattern = -1;
+        int rx = 0, ry = 0, rw = 0, rh = 0;
+        int nSeries = 0;
+        // 5, not 4: slot 4 is the optional "all" row - every pixel of the ROI
+        // regardless of plane. The canon forbids MIXING planes inside a
+        // per-plane statistic, so this is a DIFFERENT measurement and is
+        // labelled "all", never drawn as a fifth plane. nSeries stays the plane
+        // count; allRow says whether slot 4 is filled.
+        const char* seriesNames[5] = {};
+        std::vector<float> h[5], v[5];    // per series: mean along columns / rows
+        float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
+        // statistics of the profiles themselves (sigma of column means = column FPN)
+        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
+        Stats hStat[5], vStat[5];
+        // ...and of the REGION itself. sigma of the column means says how much
+        // the columns differ; this says how much the pixels do. Reading the two
+        // profile sigmas without it is reading a ratio with no denominator -
+        // and it is the third quantity the row/column noise split needs.
+        Stats fStat[5];
+        bool allRow = false;              // slot 4 holds the plane-mixed row
+        bool roiUsed = false;
+    } proj[2];                        // 0 = A, 1 = B (compare)
+    std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
+    // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.
+    // Wide = one row per plane with sigma_f / sigma_v / sigma_h across it, which
+    // keeps a plane's three numbers on ONE line - and leaves the row axis free
+    // for the sides, which is where extra frames or slots will have to go.
+    int projStatLayout = 0;
+    // Decimals in the profile-statistics table. -1 = significant digits (%g,
+    // the old behaviour), 0..6 = fixed places. Interim, and the reason is
+    // alignment rather than precision: %g gives every cell its own length, so
+    // a column of numbers can be neither scanned down nor pasted into a report
+    // as a column. What the app should do about number formats in GENERAL is
+    // docs/todo-open.md.
+    int projDecimals = -1;
+    // an extra row over every pixel of the ROI, planes mixed. Off by default:
+    // it is a different measurement from the per-plane rows and reading it as
+    // a fifth plane is exactly the mistake the canon's iron rule exists to stop.
+    bool projAllRow = false;
+    // 0 = side major (A's planes, then B's), 1 = channel major (R: A then B,
+    // then Gr: ...). Comparing one plane across sides wants the second.
+    int projStatOrder = 0;
+    int projMode = 0;                 // 0 = mean, 1 = max, 2 = min
+    bool showProjH = true, showProjV = true;
+    int projYMode = 0;                // value axis: 0 auto (H/V shared), 1 display range, 2 fixed
+    float projYLo = 0, projYHi = 1;   // used by mode 2
+    std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
+    int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
+    // (npyAxis lived here: one global override for every 3-D .npy in a run.
+    //  docs/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
+    //  is per file, visible in the Inspector, and saved with that image.)
+    // shared display range: every open image (and every newly loaded one) uses it
+    bool linkRange = false;
+    float linkBlack = 0, linkWhite = 1;
+    // panel visibility (persisted with the ImGui layout)
+    bool showFiles = true, showInspector = true, showRois = true, showAnalysis = true;
+    // Projection is on by default, and its tab in FRONT of Histogram's: the
+    // row/column profiles are what this user looks at first. A saved session
+    // still restores whatever arrangement it recorded.
+    bool showHistogram = true, showTemporal = true, showProjection = true;
+    bool resetLayout = false;
+    std::string pendingLayout;        // dock settings from a session, applied next frame
+    bool compactUi = true;            // dense spacing: this tool is table-heavy
+    int wakeFrames = 3;               // frames still to draw after the last input
+    bool lowBandwidth = false;        // remote/ssh: draw the minimum, not a tail
+    bool showFps = false;
+    bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
+    // window frame: 1 = the title bar lives in our menu bar (see window_frame.h),
+    // 0 = the desktop draws one above us. Persisted; --frame overrides for one run.
+    int frameMode = 1;
+};
+// ANN_COLORS: annotations の配色だが App 定義と app 定義の間に居る。住所のまま移動(§1) → P 段階で core/app/annotations.inc へ
+static const ImU32 ANN_COLORS[8] = {
+    IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
+    IM_COL32(255, 120, 120, 255), IM_COL32(200, 120, 255, 255), IM_COL32(90, 220, 220, 255),
+    IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
+};
