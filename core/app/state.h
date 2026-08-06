@@ -1,5 +1,69 @@
-// core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 全テーマ共有
-// P6 でこのファイルが自己完結の core/app/state.h になる(docs/split-plan.md §1)。App app の定義は §6 により背骨(main.cpp)に残っている。
+// core/app/state.h — 共有状態の自己完結ヘッダ。担当: 全テーマ共有
+// P6 (docs/split-plan.md §5): state.inc がこのヘッダになった。単独で include できる
+// (必要なものは全て自分で include する)ので、新規コードは実 TU として生まれられる
+// (core/analysis/、最初の客は #84)。App app の定義は §6 により背骨(main.cpp)に
+// 残る — ここにあるのは extern 宣言だけ。
+// ファイルスコープの static は inline になった: このヘッダは複数 TU から include
+// されるので、per-TU コピー(static)ではプログラム全体で 1 個であるべきもの
+// (ソースレジストリ、その mutex、srcId カウンタ)が TU ごとに分裂する。
+#pragma once
+
+// GLuint (ImageDoc::tex, DiffTex::tex) — 背骨と同じプラットフォーム分岐。
+#if defined(__APPLE__)
+  #ifndef GL_SILENCE_DEPRECATION
+    #define GL_SILENCE_DEPRECATION
+  #endif
+  #include <OpenGL/gl3.h>            // 3.2+ core declarations
+#elif defined(_WIN32)
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>               // GL/gl.h needs APIENTRY/WINGDIAPI
+  #include <GL/gl.h>
+#else
+  #include <GL/gl.h>
+#endif
+
+#include "imgui.h"                   // ImVec2 / ImU32 / ImGuiKeyChord
+#include "portable-file-dialogs.h"   // the pfd dialogs App holds
+// core/ neighbours, spelled relative to THIS file (quoted includes resolve
+// against the including file's directory - the ../browse respell precedent):
+// core/ itself is not on the viewer target's include path.
+#include "../ui_theme.h"             // ui_theme::VariantDark
+#include "../remote.h"               // remote::Session / Entry / ScanGroup / GlobHit / MeasureResult
+#include "../adapter.h"              // adapter::Run (App::ReaderJob)
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+// UTF-8 -> native path (wide on Windows, bytes on POSIX). Lived in util.inc
+// until P6: statSourceFile / statLocalUrl / srcKeyPath below need it, and this
+// header must not depend on a fragment. util.inc is included after this header
+// in the spine, so its remaining functions keep seeing it.
+inline std::filesystem::path pathFromUtf8(const std::string& s) {
+    return std::filesystem::u8path(s);
+}
+
 // ---------------------------------------------------------------- image model
 // Per-FRAME state: the pixels and their provenance (docs/reference-design.md
 // §2.1). Held by ImageDoc through a shared_ptr so one frame can belong to
@@ -11,13 +75,13 @@
 // to another, and Browse needs MODK long before the menu bar is written.
 #if defined(__APPLE__)
   #define SC_MOD "Cmd"
-  static const ImGuiKeyChord MODK = ImGuiMod_Super;
+  inline constexpr ImGuiKeyChord MODK = ImGuiMod_Super;
 #else
   #define SC_MOD "Ctrl"
-  static const ImGuiKeyChord MODK = ImGuiMod_Ctrl;
+  inline constexpr ImGuiKeyChord MODK = ImGuiMod_Ctrl;
 #endif
 
-static std::atomic<uint64_t> g_nextSrcId{ 1 };
+inline std::atomic<uint64_t> g_nextSrcId{ 1 };
 struct FrameSource {
     std::vector<float> data;          // raw values, size w*h*ch
     int w = 0, h = 0, ch = 1;
@@ -68,7 +132,7 @@ struct FrameSource {
 };
 // Watch baseline (§2.1): what was on disk when these pixels were decoded.
 // Any failure (missing file, remote path) leaves 0 = unknown.
-static void statSourceFile(FrameSource& s) {
+inline void statSourceFile(FrameSource& s) {
     std::error_code ec;
     auto p = pathFromUtf8(s.path);
     auto t = std::filesystem::last_write_time(p, ec);
@@ -82,7 +146,7 @@ static void statSourceFile(FrameSource& s) {
 // disk followed by a re-open of the same url would ADOPT the stale resident
 // and silently show the old pixels. ssh:// urls stay 0/0 on purpose (a peer's
 // disk cannot be statted from here; change detection there is Watch's).
-static void statLocalUrl(FrameSource& s) {
+inline void statLocalUrl(FrameSource& s) {
     if (s.remoteUrl.rfind("local://", 0) != 0) return;
     std::error_code ec;
     auto p = pathFromUtf8(s.remoteUrl.substr(8));
@@ -94,7 +158,7 @@ static void statLocalUrl(FrameSource& s) {
 // A deep copy of s with its own identity: same content, fresh srcId, rev 0.
 // The two callers are the crop CoW (§2.2) and any ImageDoc copy that must not
 // alias a live source.
-static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
+inline std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
     auto ns = std::make_shared<FrameSource>(s);   // same content...
     ns->srcId = g_nextSrcId.fetch_add(1);         // ...own identity
     ns->rev = 0;
@@ -130,14 +194,14 @@ static std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // while it is held, only map and field operations happen. Identity fields are
 // only ever written by the UI thread (load, reload swap, crop) or on a source
 // no other thread can see yet, so a pre-lock read of them is never torn.
-static std::mutex g_srcRegMtx;              // lookups also run on the seq loader thread
-static std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry;
+inline std::mutex g_srcRegMtx;              // lookups also run on the seq loader thread
+inline std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry;
 
 // The same file reached as "C:\data\F.npy" and "c:/data/f.npy" is ONE tuple:
 // canonicalize exactly once, HERE, where the key is built. The stored path is
 // provenance (reload and sessions read it verbatim) and is never rewritten.
 // URLs (ssh://, local://) pass through - they are not filesystem paths.
-static std::string srcKeyPath(const std::string& p) {
+inline std::string srcKeyPath(const std::string& p) {
     if (p.empty() || p.find("://") != std::string::npos) return p;
     std::error_code ec;
     std::filesystem::path c = std::filesystem::weakly_canonical(pathFromUtf8(p), ec);
@@ -160,9 +224,9 @@ static std::string srcKeyPath(const std::string& p) {
 // collapses onto 0 too, so "read as (H,W,C)" on a natively-HWC file and a
 // plain open are ONE tuple. Only a declaration that actually changes the
 // reading keys its own tuple.
-static int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);
+int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);   // defined in loader_npz.inc (external since P6: srcIdentityKey is inline here and calls it)
 
-static std::string srcIdentityKey(const FrameSource& s) {
+inline std::string srcIdentityKey(const FrameSource& s) {
     char t[160];
     if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
         snprintf(t, sizeof t, "\n%d|%d\nraw%d,%d,%d,%d,%dx%d\n%lld,%llu",
@@ -185,7 +249,7 @@ static std::string srcIdentityKey(const FrameSource& s) {
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
 // fetch are not the frame; no identity or no disk baseline means no tuple.
-static bool srcShareable(const FrameSource& s) {
+inline bool srcShareable(const FrameSource& s) {
     if (s.path.empty() && s.remoteUrl.empty()) return false;   // montage/processed
     if (s.remoteStep > 1 || !s.remoteErr.empty()) return false;
     // no disk baseline = no tuple, and local:// counts as disk: its embedded
@@ -199,7 +263,7 @@ static bool srcShareable(const FrameSource& s) {
         return s.w == s.srcW && s.h == s.srcH && s.cropX == 0 && s.cropY == 0;
     return s.srcW == 0;               // npy: srcW only appears once cropped
 }
-static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key) {
+inline std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key) {
     auto it = g_srcRegistry.find(key);
     if (it == g_srcRegistry.end()) return nullptr;
     std::shared_ptr<FrameSource> sp = it->second.lock();
@@ -219,7 +283,7 @@ static std::shared_ptr<FrameSource> srcRegistryFindLocked(const std::string& key
 // residents) - and nullptr when s was registered or is not shareable.
 // `key` is srcIdentityKey(*s), computed by the caller OUTSIDE the lock
 // (srcKeyPath does filesystem IO - see the lock-order note above).
-static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s,
+inline std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<FrameSource>& s,
                                                          const std::string& key) {
     if (!s || !srcShareable(*s)) { if (s) s->regKey.clear(); return nullptr; }
     std::weak_ptr<FrameSource>& slot = g_srcRegistry[key];
@@ -244,7 +308,7 @@ static std::shared_ptr<FrameSource> srcRegistryAddLocked(const std::shared_ptr<F
     }
     return nullptr;
 }
-static std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
+inline std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSource>& s) {
     if (!s || !srcShareable(*s)) return nullptr;
     const std::string key = srcIdentityKey(*s);   // IO: before the lock
     std::lock_guard<std::mutex> lk(g_srcRegMtx);
@@ -305,7 +369,7 @@ struct ImageDoc {
 // for the next open to find. Returns true when it adopted - callers then skip
 // their computeMinMax (the resident source is already measured, and rewriting
 // shared fields from here would race a loader thread reading them).
-static bool shareOrRegisterSource(ImageDoc& d) {
+inline bool shareOrRegisterSource(ImageDoc& d) {
     if (!srcShareable(*d.src)) return false;
     const std::string key = srcIdentityKey(*d.src);   // IO: before the lock
     // ONE hold of g_srcRegMtx across find + add + mirror sync: the worker's
@@ -322,15 +386,15 @@ static bool shareOrRegisterSource(ImageDoc& d) {
 }
 
 // CFA pattern tables: channel of each 2x2 cell position (cy*2+cx); 0=R 1=Gr 2=Gb 3=B
-static const char* CFA_PATTERNS[] = { "RGGB", "BGGR", "GRBG", "GBRG" };
-static const char* CFA_CH_NAMES[] = { "R", "Gr", "Gb", "B" };
-static const int CFA_MAP[4][4] = {
+inline constexpr const char* CFA_PATTERNS[] = { "RGGB", "BGGR", "GRBG", "GBRG" };
+inline constexpr const char* CFA_CH_NAMES[] = { "R", "Gr", "Gb", "B" };
+inline constexpr int CFA_MAP[4][4] = {
     { 0, 1, 2, 3 },   // RGGB
     { 3, 2, 1, 0 },   // BGGR
     { 1, 0, 3, 2 },   // GRBG
     { 2, 3, 0, 1 },   // GBRG
 };
-static int cfaChannelAt(const ImageDoc& im, int x, int y) {
+inline int cfaChannelAt(const ImageDoc& im, int x, int y) {
     if (im.cfa == 0) return -1;
     int cx = im.cfa == 2 ? (x >> 1) & 1 : x & 1;   // Quad Bayer: 2x2 blocks share a color
     int cy = im.cfa == 2 ? (y >> 1) & 1 : y & 1;
@@ -1511,9 +1575,8 @@ struct App {
     // 0 = the desktop draws one above us. Persisted; --frame overrides for one run.
     int frameMode = 1;
 };
-// ANN_COLORS: annotations の配色だが App 定義と app 定義の間に居る。住所のまま移動(§1) → P 段階で core/app/annotations.inc へ
-static const ImU32 ANN_COLORS[8] = {
-    IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
-    IM_COL32(255, 120, 120, 255), IM_COL32(200, 120, 255, 255), IM_COL32(90, 220, 220, 255),
-    IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
-};
+// (ANN_COLORS は P6 で core/app/annotations.inc へ — state.inc 時代の注記の履行。)
+
+// THE app. Declared here so every TU that includes this header sees the same
+// object; DEFINED in core/main.cpp — §6 keeps the definition in the spine.
+extern App app;

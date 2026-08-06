@@ -78,10 +78,14 @@
 #define GL_RGBA8 0x8058
 #endif
 
-#include "app/util.inc"
+// state.h first (P6): self-contained, and util.inc below uses its pathFromUtf8.
+#include "app/state.h"
+// THE App instance. state.h declares it extern; the definition stays in the
+// spine (docs/split-plan.md §6) — external linkage since P6, so the real TUs
+// state.h exists for (core/analysis/, #84) link against this one object.
+App app;
 
-#include "app/state.inc"
-static App app;
+#include "app/util.inc"
 
 #include "app/remote_client.inc"
 

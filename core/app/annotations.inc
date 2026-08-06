@@ -1,5 +1,12 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ImageView
 // ---------------------------------------------------------------- annotations
+// ANN_COLORS: annotations の配色。App 定義と app 定義の間に居たのを P6 でここへ
+// (state.inc の「P 段階で core/app/annotations.inc へ」の履行)。
+static const ImU32 ANN_COLORS[8] = {
+    IM_COL32(77, 163, 255, 255), IM_COL32(105, 220, 130, 255), IM_COL32(255, 184, 77, 255),
+    IM_COL32(255, 120, 120, 255), IM_COL32(200, 120, 255, 255), IM_COL32(90, 220, 220, 255),
+    IM_COL32(255, 150, 200, 255), IM_COL32(180, 200, 90, 255),
+};
 static App::Ann* findAnn(int id) {
     for (auto& a : app.anns)
         if (a.id == id) return &a;

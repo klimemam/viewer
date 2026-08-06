@@ -217,7 +217,10 @@ static int npyNativeRead(const std::vector<int64_t>& shape) {
 // actually decoded these pixels, with every spelling of "what native does"
 // folded onto NR_NATIVE. A declaration that does not fit the shape decoded
 // natively (npyLayout's fallback), so it keys natively too.
-static int npyKeyRead(const std::vector<int64_t>& shape, int npyRead) {
+// External linkage since P6: state.h declares it and srcIdentityKey — inline
+// there, callable from any TU — calls it, so a per-TU `static` no longer works.
+// Still the one definition, in the main TU.
+int npyKeyRead(const std::vector<int64_t>& shape, int npyRead) {
     if (npyRead == NR_NATIVE) return NR_NATIVE;
     int iF, iH, iW, iC;
     if (!npyReadAxes(shape.size(), npyRead, iF, iH, iW, iC)) return NR_NATIVE;
