@@ -296,6 +296,8 @@ jobs:
           fi
           echo "publishing as ${TARGET}"
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Sweep binaries branches whose source is gone
         # Every branch build publishes binaries-<branch>, and merged branches
         # get deleted - so the binaries- copies linger forever unless something
@@ -312,7 +314,5 @@ jobs:
               git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" --delete "$b" || true
             fi
           done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
