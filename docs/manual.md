@@ -65,7 +65,7 @@ OS のもの、という理由。メニュー項目に理由が出ます)。
 `uniformity/prnu-fpn`、SFR…)は Analysis ウィンドウで実行し、結果は ROI ごとの列に
 並びます。どちらも同じ ROI に紐づきます。
 
-**「PRNU」は2か所にあり、同じ数ではありません。** ROIs の表の `PRNU [σ %]` は
+**「PRNU」は2か所にあり、同じ数ではありません。** ROIs の表の `std / mean [%]` は
 その ROI の **σ/mean をそのまま**(ローパス除去なし)、プラグインの `X.prnu_pct` は
 **9×9 ボックスのローパスを引いた残差**の σ/mean です(§5.2 と
 [analyzers.md](analyzers.md#uniformityprnu-fpn))。シェーディングや絵柄を含むか
@@ -418,7 +418,7 @@ compare 中は同じ表に **`A` / `B` / `A-B`** の列が増えます(§3b)。
 ROI を選択している間はその ROI の値になります(未選択なら画像全体)。
 ROI ごとの mean/std/PRNU[σ %]/min/max は **ROIs** パネルの表です。
 
-`PRNU [σ %]` は **その行の σ ÷ その行の mean × 100**(表に出ている σ と mean そのもの。
+`std / mean [%]` は **その行の σ ÷ その行の mean × 100**(表に出ている σ と mean そのもの。
 間引いて測っていればその標本の比)。**1枚・dark 補正なし・flat 補正なし**なので時間ノイズ
 込みであり、固定パターンとしては**上界**にしかなりません。EMVA が言う PRNU は frame を
 超えた層(flat stack + dark stack)が要ります([flat-field-stats.md](flat-field-stats.md))。

@@ -19434,7 +19434,10 @@ static RoiStat roiBasicStatsUncached(const ImageDoc& im, int rx, int ry, int rw,
     return s;
 }
 
-// The "PRNU [sigma %]" column: this row's own sd over this row's own mean.
+// The "std / mean [%]" column: this row's own sd over this row's own mean.
+// Born "PRNU [σ %]", renamed by the 2026-08-06 ruling: a famous measurement
+// name may not sit on a plain ratio. PRNU now belongs only to analyses whose
+// inputs declare a dark (docs/analysis-layers.md). The number is unchanged.
 // DERIVED, not measured, and deliberately not a field of RoiStat - it is the
 // two numbers the row already prints, divided, so it cannot drift from them
 // (which also settles the decimated case for free: the sample the sd describes
@@ -19458,7 +19461,7 @@ static bool roiPrnuPct(const RoiStat& s, double* out) {
 // columns format at the edge. n both directions: past ~200k samples the sampler
 // reads whole rows at a stride, and n = 1 (a 1x1 ROI) makes sd exactly 0 - the
 // single most confusing number this panel can print, so it says why.
-// PRNU gets the longest note in this panel because its NAME claims more than
+// This ratio keeps the longest note in this panel because its OLD name claimed more than
 // one frame can deliver: what is on screen is the spatial spread of one region
 // as displayed, so the tooltip has to hand back the conditions the name implies
 // and this layer does not have (docs/flat-field-stats.md).
@@ -19473,7 +19476,7 @@ static void roiStatTooltip(const RoiStat& s, bool planesMixed) {
     double pr = 0;
     if (roiPrnuPct(s, &pr)) ImGui::Text("PRNU %.10g   [σ %%]  = sd / mean * 100", pr);
     else ImGui::TextDisabled("PRNU: mean is not above 0, so sd / mean states nothing");
-    ImGui::TextDisabled("PRNU here is THIS ROI's sd over its own mean, as displayed:\n"
+    ImGui::TextDisabled("THIS ROI's sd over its own mean, as displayed:\n"
                         "one frame, no dark subtraction, no flat-field correction.\n"
                         "Temporal noise is inside it, so it bounds the fixed pattern\n"
                         "from above and is not a measurement of it. A PRNU that means\n"
@@ -19483,7 +19486,7 @@ static void roiStatTooltip(const RoiStat& s, bool planesMixed) {
         ImGui::TextDisabled("channel = all: the planes' level differences are in this sd.");
     if (s.step > 1) ImGui::Text("n = %zu (sampled 1 row in %zu)", s.n, s.step);
     else            ImGui::Text("n = %zu (every row)", s.n);
-    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition, so PRNU is 0");
+    if (s.n < 2) ImGui::TextDisabled("one sample: sd is 0 by definition, so the ratio is 0");
     ImGui::EndTooltip();
 }
 
@@ -19584,9 +19587,9 @@ static void drawPanelRois() {
         // Next to the two numbers it is made of, and wider than them: the unit
         // is part of the name, the way the Analysis grid carries a unit column
         // rather than leaving a reader to guess what a figure is measured in -
-        // and a header clipped to "PRNU [..." would be the one column nobody
+        // and a header clipped to "std / m..." would be the one column nobody
         // could identify from a screenshot.
-        ImGui::TableSetupColumn("PRNU [σ %]", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+        ImGui::TableSetupColumn("std / mean [%]", ImGuiTableColumnFlags_WidthStretch, 1.5f);
         ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
@@ -25115,7 +25118,7 @@ static void printUsage() {
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
-        "  --roistats-selftest         the ROI table's numbers and its PRNU column,\n"
+        "  --roistats-selftest         the ROI table's numbers and its std/mean column,\n"
         "                              through the real panel, on analytic fixtures\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
         "                              coinciding, through the real panel\n"
