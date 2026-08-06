@@ -15083,7 +15083,17 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     }
 }
 
+// What the Projection panel SAID about the slots on the last frame it drew -
+// the same grammar as g_histSideProbe ("rowX;" per table side, "curves=",
+// "said-no-curve="), because it guards the same equation:
+// rows ⊆ curves ∪ said-no-curve. The projection was the panel issue #60 caught
+// giving slots table rows while the plots drew A and B and said NOTHING about
+// the letters they left off - the exact silence the histogram had already been
+// cured of, unguarded here because no probe existed to assert it.
+static std::string g_projSideProbe;
+
 static void drawPanelProjection() {
+    g_projSideProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -15372,6 +15382,31 @@ static void drawPanelProjection() {
                            P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
                            PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
     if (tooNarrow) abNarrowNote();
+    {   // What the plots took and what they left, as the panel says it. The
+        // profile plots still draw only A and B: the lettered slots are fed
+        // (projExtra recomputes above) and the table below gives them rows,
+        // and until the N overlay lands (docs/compare-n.md §12) the plots
+        // cannot take them - which must be SAID, right here under the plots,
+        // or a slot's absence reads as the slot having been lost. Same rule,
+        // same wording shape and same amber as the histogram's off-plot note.
+        g_projSideProbe += std::string("curves=A") + (Bim ? "B" : "") + ";";
+        if (!xslots.empty()) {
+            std::string off;
+            for (const ResolvedSlot& rs : xslots) {
+                if (!off.empty()) off += ", ";
+                off += slotName(rs.idx);
+            }
+            std::string offLetters;
+            for (const ResolvedSlot& rs : xslots) offLetters += slotName(rs.idx);
+            g_projSideProbe += "said-no-curve=" + offLetters + ";";
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                               "slot %s: no curve here yet - the profile plots draw "
+                               "only A and B. The table below has every slot's numbers.",
+                               off.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    }
 
     // numbers to go with the curves
     ImGui::SeparatorText("profile statistics");
@@ -15403,6 +15438,8 @@ static void drawPanelProjection() {
         if (rs.idx < app.projExtra.size())
             sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx),
                               slotFollowDiverged(rs.idx) || abStepBusy() });
+    // every side the table is about to give numbers to, for the equation
+    for (const SideRef& sr : sides) g_projSideProbe += "row" + sr.name + ";";
     {   // a diverged slot's rows are the last frame its stack had - say so with
         // the same sentence the B side gets (g_abFollowDiverged, above)
         std::string div;
@@ -35308,6 +35345,46 @@ int main(int argc, char** argv) {
                       "N5 ...and one plane on the axis draws every one of them");
                 check(accountedFor(pArm, unsaid),
                       "N5 every armed slot is drawn or named");
+            }
+
+            // N6: the same equation over the PROJECTION panel, which had no
+            // probe at all - the panel issue #60 actually caught. Its table
+            // went N wide (75e5369) while its plots still draw only A and B,
+            // and nothing on screen said so: rows had letters that were in
+            // neither curves nor any sentence. The plots keeping to A|B is the
+            // pinned CURRENT limit, spoken on screen since this change; when
+            // the N overlay lands (compare-n.md §12) the curves assert below
+            // moves to ABCDE and said-no-curve empties.
+            {
+                auto projFrame = [&]() {
+                    for (int pass = 0; pass < 2; pass++) {
+                        ImGui_ImplOpenGL3_NewFrame();
+                        ImGui_ImplGlfw_NewFrame();
+                        ImGui::NewFrame();
+                        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                        ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
+                        ImGui::Begin("ProjProbe", nullptr,
+                                     ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_NoTitleBar |
+                                     ImGuiWindowFlags_NoDocking);
+                        drawPanelProjection();
+                        ImGui::End();
+                        ImGui::EndFrame();
+                    }
+                };
+                check(app.cmpExtra.size() == 3, "N6 fixture: N5 left C, D, E armed");
+                projFrame();
+                std::string pProj = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N6 projection probe '%s'\n",
+                        pProj.c_str());
+                check(rowsOf(pProj) == "ABCDE",
+                      "N6 the projection table gives every armed side a row");
+                check(field(pProj, "curves=") == "AB",
+                      "N6 the profile plots hold A and B - today's limit, pinned");
+                check(field(pProj, "said-no-curve=") == "CDE",
+                      "N6 ...and the letters off the plots are named on screen");
+                check(accountedFor(pProj, unsaid),
+                      "N6 no slot has numbers and no word about it");
             }
 
             app.cmpExtra.clear();
