@@ -14061,9 +14061,14 @@ static void drawInspector() {
                 // be the stretch. When it is off, SAY the numbers differ - that
                 // is the case where a reading can mislead.
                 ImGui::SetNextItemWidth(-1);
+                // "both" and "B uses" were true when the comparison was a
+                // pair. The RULE was always N-wide (abRange spans every
+                // compared pane), so at three slots the labels lied about
+                // arity - issue #60 named this one by name. "every side" is
+                // the noun the panels already use, and it is true at two.
                 static const char* AB_RANGE_ITEMS[3] = {
-                    "A/B: each keeps its own", "A/B: B uses A's range",
-                    "A/B: auto over both (union)" };
+                    "A/B: each keeps its own", "A/B: every side uses A's range",
+                    "A/B: auto over every side (union)" };
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::Combo("##abrange", &app.compareRangeMode,
                                  AB_RANGE_ITEMS, 3)) {
@@ -14074,14 +14079,14 @@ static void drawInspector() {
                         "How the compared sides are STRETCHED - every pane, slots\n"
                         "included, not just A and B. Display only - each keeps its own\n"
                         "numbers and gets them back when compare ends.\n"
-                        "  auto over both (union), the default: every compared side\n"
-                        "    re-fits to min/max across A, B and the slots, so no side\n"
-                        "    clips and none is favoured. Two stacks at different\n"
+                        "  auto over every side (union), the default: every compared\n"
+                        "    side re-fits to min/max across A, B and the slots, so no\n"
+                        "    side clips and none is favoured. Two stacks at different\n"
                         "    exposures need this - B against A's range alone saturates\n"
                         "    into a single bin.\n"
-                        "  B uses A's range: one range, A's, for every other letter,\n"
-                        "    and it does not move while you step A. Right when the\n"
-                        "    others really are measured against A.\n"
+                        "  every side uses A's range: one range, A's, for every other\n"
+                        "    letter, and it does not move while you step A. Right when\n"
+                        "    the others really are measured against A.\n"
                         "  each keeps its own: comparing SHAPES at wildly different\n"
                         "    exposures - the one case where the sides are not directly\n"
                         "    comparable, and it says so.");
@@ -14445,7 +14450,7 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
     const std::string xu = abValueUnit(a->dtype);
     const char* xr = abRangeSaid(b != nullptr);
     if (b && b->dtype != a->dtype)
-        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins both sides)"
+        snprintf(xl, sizeof xl, "pixel value (%s, %s - bins every side)"
                                 "  -  A %s / B %s, DTYPE MISMATCH",
                  xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str());
     else
@@ -23214,9 +23219,12 @@ static void drawFileList() {
         if (ImGui::MenuItem(("Add as compare slot " + letter).c_str()))
             addCompareSlot(pick);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("slots beyond B show up in the statistics tables and\n"
-                              "side by side. Wipe, split, difference and blink stay\n"
-                              "A against B - those only mean two.");
+            // Split is NOT in the two-only list: it is precisely the mode that
+            // tiles every letter (tileSlots engages there and only there), and
+            // saying it "stays A against B" contradicted the sentence before it.
+            ImGui::SetTooltip("slots beyond B show up in the statistics tables and,\n"
+                              "in Split, as side-by-side panes. Wipe, difference and\n"
+                              "blink stay A against B - those only mean two.");
     };
     // Returns whether it put anything in the menu, so a caller can skip the
     // separator that would otherwise lead an empty group. Every row with a
@@ -24225,8 +24233,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 app.compareFollowFrame = !app.compareFollowFrame;
             {   // the display range relationship, where the compare modes live
                 static const char* RN[3] = { "  each side keeps its own range",
-                                             "  B uses A's range",
-                                             "  auto over both (union)" };
+                                             "  every side uses A's range",
+                                             "  auto over every side (union)" };
                 ImGui::TextDisabled("Display range");
                 for (int r = 0; r < 3; r++)
                     if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
@@ -24259,7 +24267,10 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("Side by side images (split) -> side by side plots.\n"
                                   "Wipe / blink / difference have one image area,\n"
                                   "so their plots overlay.");
-            if (ImGui::MenuItem("  Overlay (A solid, B dashed)", nullptr,
+            // "(A solid, B dashed)" described a stroke style that no longer
+            // exists - every side past A draws SOLID in its own ink, and at N
+            // the parenthetical also implied a pair. Say what the mode does.
+            if (ImGui::MenuItem("  Overlay (every side on one plot)", nullptr,
                                 app.abStatsLayout == App::AbOverlay))
                 app.abStatsLayout = App::AbOverlay;
             if (ImGui::MenuItem("  Side by side (A on the left)", nullptr,
@@ -24642,7 +24653,8 @@ static void drawHelpAbout() {
                 row("X / Y",         "select the row / column: through the selected pin, the "
                                      "cursor, or widen the selected ROI (press again to restore)");
                 row("Del / Esc",     "delete / deselect annotation");
-                row("\\ or C",       "A/B compare: off -> wipe -> side by side");
+                row("\\ or C",       "A/B compare: off -> wipe -> side by side -> "
+                                     "difference -> blink");
                 row("Shift+\\",       "swap A and B (also the status bar button)");
                 row("Shift+C",       "side by side with the slots past B (C, D, ...)");
                 row("B (hold)",      "show B full-frame while held");
