@@ -53,7 +53,7 @@ static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out
     out.resize((size_t)sz);
     return sz == 0 || (bool)f.read((char*)out.data(), sz);
 }
-static std::string baseName(const std::string& p) {
+std::string baseName(const std::string& p) {
     size_t i = p.find_last_of("/\\");
     return i == std::string::npos ? p : p.substr(i + 1);
 }
@@ -81,7 +81,7 @@ static std::string dispPath(std::string p) {
 // volume, and neither \\nas nor a bare \\ can be listed, so it must not be cut
 // into clickable "nas" / "share" pieces. A bare "C:" is not the drive's root
 // either - on Windows it means the process's current directory ON that drive.
-static std::string pathRootOf(const std::string& d) {
+std::string pathRootOf(const std::string& d) {
     if (d.size() > 1 && d[0] == '/' && d[1] == '/') {          // //server/share
         size_t srv = d.find('/', 2);
         size_t shr = srv == std::string::npos ? std::string::npos : d.find('/', srv + 1);
@@ -97,8 +97,9 @@ static std::string pathRootOf(const std::string& d) {
 // UNC share, and rebuilding a prefix from the pieces has to give back a path
 // that exists (a NAS reported 2026-08-03: clicking the path errored, while ".."
 // kept working, because "//nas/share/x" was being rebuilt as "/nas").
-struct PathSeg { std::string label, path; };
-static std::vector<PathSeg> pathSegments(const std::string& d) {
+// (struct PathSeg lives in core/browse/host.h since P7: this declaration-
+// carrying header is where the Browse TUs see the return type.)
+std::vector<PathSeg> pathSegments(const std::string& d) {
     std::vector<PathSeg> segs;
     size_t i = 0;
     std::string root = pathRootOf(d);

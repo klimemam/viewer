@@ -65,7 +65,9 @@ static void openRawDialogFor(const std::string& path) {
 // apart is what makes it structurally impossible for a display toggle to move
 // a measurement: there is no code path from the menu item to this function.
 // (user decision, 2026-08-05: "stack を積むときは natural のみ")
-static void sortFramesNumerically(std::vector<std::string>& files) {
+// non-static since P7: nav.cpp (pumpRemoteOpenQueue) and panel.cpp (the
+// selection ctx menu) call it by name - declared in core/browse/host.h
+void sortFramesNumerically(std::vector<std::string>& files) {
     std::sort(files.begin(), files.end(), rp::naturalLess);
 }
 
@@ -74,7 +76,7 @@ static void sortFramesNumerically(std::vector<std::string>& files) {
 // prebuilt binary from the repository's binaries branch (it has git and network;
 // this machine may not even be the same OS). Everything lives under ~/.viewer,
 // so uninstalling is one rm -rf.
-static std::string g_bootstrapLog;
+std::string g_bootstrapLog;   // non-static since P7: the pump (nav.cpp) assigns it
 
 // The Linux/macOS peer, found on THIS machine. A binaries-branch checkout has
 // every platform side by side, and the source tree has the built one - so the
@@ -170,7 +172,7 @@ static std::string updateScript() {
 }
 
 // Install the peer, best method first. Returns a human-readable log either way.
-static bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
+bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
     std::string out, err;
     // 1. what machine is over there, and is a WORKING peer already in place?
     //    (--help must actually run: a peer that was copied but dies on a glibc
@@ -323,7 +325,7 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port)
     return false;
 }
 
-static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port) {
+std::string makeRemoteUrl(const std::string& host, const std::string& path, int port) {
     if (host.empty()) return "local://" + path;
     // A home-relative path ("~/data/x.npy") pasted straight after the host would
     // read as part of the HOST ("ssh://trc2~/data/..."), and the mis-split host
@@ -719,7 +721,6 @@ static void requestBrowseTemporal(const std::string& host,
     app.focusTemporal = true;
 }
 
-#include "../browse/nav.inc"
 
 // Close the transient preview, if one is still unpromoted.
 static void dropPreview() {

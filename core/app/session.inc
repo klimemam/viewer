@@ -2,7 +2,8 @@
 static bool openRemote(const std::string& url, bool asPreview, int frame);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
-static std::string makeRemoteUrl(const std::string& host, const std::string& path, int port);   // defaults: first decl
+// (makeRemoteUrl: extern since P7, declared in core/browse/host.h - which the
+// spine includes before this fragment - so no local redeclaration here.)
 // ---------------------------------------------------------------- session save/load
 // (sequence helpers are defined further down; sessions can restore a stack)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,

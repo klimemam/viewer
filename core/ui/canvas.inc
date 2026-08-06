@@ -1504,7 +1504,9 @@ static std::string elideFront(const std::string& s, size_t keep) {
 
 // The one amber this UI warns in: the fallback notices, the mismatch notices,
 // and the [stale] marker below. Anything the reader must NOTICE is this colour.
-static const ImVec4 AB_AMBER(0.95f, 0.72f, 0.35f, 1.0f);
+// AB_AMBER sheds static (P7): the Browse status line warns in the same amber,
+// and host.h declares it extern for the panel TU.
+const ImVec4 AB_AMBER(0.95f, 0.72f, 0.35f, 1.0f);
 static const ImU32  AB_AMBER32 = IM_COL32(242, 184, 89, 255);
 // B's numbers are one frame behind while A is being stepped. The marker used to
 // be appended to B's NAME and drawn in the surrounding grey, which during fast
