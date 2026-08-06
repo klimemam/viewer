@@ -296,5 +296,23 @@ jobs:
           fi
           echo "publishing as ${TARGET}"
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
+      - name: Sweep binaries branches whose source is gone
+        # Every branch build publishes binaries-<branch>, and merged branches
+        # get deleted - so the binaries- copies linger forever unless something
+        # sweeps them. Thirteen had accumulated in two days. Main's publish is
+        # the natural broom: for each binaries-* ref, if the branch it was
+        # built from no longer exists, delete it.
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' > /tmp/heads
+          grep '^binaries-' /tmp/heads | while read -r b; do
+            src="${b#binaries-}"
+            if ! grep -qxF "$src" /tmp/heads; then
+              echo "sweeping $b (source $src is gone)"
+              git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" --delete "$b" || true
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
