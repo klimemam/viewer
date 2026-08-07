@@ -456,6 +456,32 @@ channel = all の CFA/多チャンネルでは**面ごとのレベル差が σ �
   そのときは `not opened:` 付きで出ます
 - compare が入っていると **A / B / delta の表**になります(§3c)
 
+### 5.2c 塊を1枚に畳む(frame average / frame sum)
+
+stack の時間軸を畳んで **1枚の frame** として開けます。畳み方は **mean / sum の
+選択**で、既定は mean です([analysis-layers.md §3.2](analysis-layers.md) の裁定):
+
+| 入口 | 畳み方 |
+|---|---|
+| Files で stack 行を右クリック > **Open frame average** | mean(画素ごとの時間平均) |
+| Files で stack 行を右クリック > **Open frame sum** | sum(画素ごとの時間和) |
+| Browse の各「Open as frame average」/ Temporal の同名ボタン | mean(名前どおり平均のみ) |
+
+- 結果は stack ではなく **frame** です(Files では単発 frame として batch に
+  ぶら下がります)。なので Histogram / Projection / ROIs がそのまま効きます —
+  時間平均画像の空間 σ は σ_fpn そのもの
+- **double で蓄積**し、NaN は**画素ごとに除外して数えます**(分母に畳みません)
+- **NaN が混入していたら Warning が出ます** — 除外したサンプル数と有効枚数
+  (何枚を畳んだか)を併記します。同じ数字は結果の note にも残ります
+- 部分ロードなら名前と note が「n of N」と言います(黙って「平均」を名乗りません)
+- **sum の注意**: NaN の除外が起きると**画素ごとに足された枚数が違う** =
+  画素間で別の量になります。note が有効枚数の幅(`0..3 of 3` のように)を
+  併記するので、画素どうしを比べる用途では mean を使ってください
+- 計算で作った frame はファイルを持たず、**名前と note に由来**を運びます。
+  セッションにはレシピ(元 stack の先頭フレームのパス+畳み方)が書かれ、
+  復元時に**計算し直します**。sum のレシピ行(`stacksum`)は旧版ビューアでは
+  読み飛ばされます(mean に化けて戻ることはありません)
+
 ### 5.3 ヒストグラム(内蔵)
 - 黒点/白点レンジで正規化した 256bin。**選択中の ROI に自動追従**(未選択なら全体)
 - **CFA 画像は R/Gr/Gb/B の4系列**に自動分離(チャンネルバランスが一目)。

@@ -62,6 +62,9 @@ Measure メニューはそれをツールチップに出す(UX 設計は [measur
 
 制約: **単一フレーム法のため prnu_pct は温度ノイズを含む**。EMVA 1288 厳密値には
 複数フレーム平均が必要(マルチフレーム ABI 導入後に `emva1288/` 系として実装予定)。
+時間ノイズを下げたい場合は、Files で stack を右クリック > **Open frame average**
+(時間平均を1枚の frame として開く — [manual.md §5.2c](manual.md))に掛ける手が
+ある: σ_t が 1/√n に落ちる。dark 減算はしないので、EMVA 準拠を名乗るものではない。
 CFA は Bayer=パリティ分離 / Quad=4px 周期サブサンプルで各チャンネル独立に処理。
 
 ## sharpness/gradient
