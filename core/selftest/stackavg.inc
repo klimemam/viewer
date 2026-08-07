@@ -101,7 +101,7 @@
         app.seqLoadMode = 1;                    // always load numbered runs
         // Opens the average of the ONE stack the given folder holds, and hands
         // back the frame it made. Goes through requestStackAverage, the same
-        // door every menu item uses - a test that called stackAverageFrame
+        // door every menu item uses - a test that called stackReduceFrame
         // directly would not be testing what the menu does.
         auto averageOf = [&](const std::string& dir, int* seqOut) -> ImageDoc* {
             closeAll();

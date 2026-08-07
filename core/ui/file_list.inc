@@ -294,6 +294,7 @@ static void drawFileList() {
     int pendingAvgSeq = 0;      // ...and the frame average, for the same reason:
                                 // it appends to app.images, which this walk is
                                 // iterating over
+    int pendingSumSeq = 0;      // the sum fold, deferred identically
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -995,6 +996,12 @@ static void drawFileList() {
             // and this is the one that crosses a layer (stack -> frame).
             if (ImGui::MenuItem("Open frame average")) pendingAvgSeq = si->id;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", AVG_TIP);
+            // The fold is a CHOICE (docs/analysis-layers.md §3.2): mean and sum
+            // are two items with two names, not a mode hidden in a dialog - the
+            // item's name is the declaration of what the resulting pixels hold,
+            // exactly as the result's own name will be.
+            if (ImGui::MenuItem("Open frame sum")) pendingSumSeq = si->id;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", SUM_TIP);
             // A NEW stack from a subset of this one - the dialog offers the
             // matching rules (same names / numbers as another stack, a range,
             // hand-picked). References frames; this stack is not touched.
@@ -1119,6 +1126,7 @@ static void drawFileList() {
         toast(msg, failed > 0);
     }
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
+    if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {

@@ -717,6 +717,11 @@ struct StackStats {
     uint64_t nonFinite = 0;       // samples EXCLUDED, reported not hidden
     size_t dropped = 0;           // pixels with fewer than 2 valid frames
     size_t unknown = 0;           // samples with NO valid frame: the mean does not exist
+    // Per-sample valid-count extremes over the region. Equal = every sample
+    // folded the same number of frames; unequal is exactly what the SUM fold
+    // must declare (docs/analysis-layers.md §3.2: sums over different counts
+    // are different quantities pixel to pixel).
+    uint32_t cntMin = 0, cntMax = 0;
     std::string err;
 };
 
@@ -724,17 +729,20 @@ struct StackStats {
 // given ROI. The same statistic the server aggregate computes, evaluated on
 // whatever is local - which covers NAS data and fully fetched remote stacks.
 //
-// meanOut (optional): the PER-PIXEL temporal mean over the ROI, interleaved
-// exactly like a frame's pixels (rw*rh*C floats). This is the picture "Open as
-// frame average" opens, and it comes out of THIS accumulator on purpose - the
-// mean drawn on screen and the mean printed in the Temporal table are then the
-// same number by construction, not by two functions agreeing today. (Doing it
-// twice is the defect this codebase keeps finding: PRNU twice, naturalLess
-// versus compare, the channel rule in three places.) A sample no frame had a
-// finite value for is NaN there - unknown, and said so, rather than 0, which
-// would be a measurement.
+// foldOut (optional): the PER-PIXEL temporal fold over the ROI, interleaved
+// exactly like a frame's pixels (rw*rh*C floats) - the mean by default, the
+// sum when `fold` says so (docs/analysis-layers.md §3.2: the fold is a
+// choice, and both come off ONE accumulator). This is the picture "Open frame
+// average" / "Open frame sum" opens, and it comes out of THIS accumulator on
+// purpose - the mean drawn on screen and the mean printed in the Temporal
+// table are then the same number by construction, not by two functions
+// agreeing today. (Doing it twice is the defect this codebase keeps finding:
+// PRNU twice, naturalLess versus compare, the channel rule in three places.)
+// A sample no frame had a finite value for is NaN there - unknown, and said
+// so, rather than 0, which would be a measurement.
 static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
-                                    std::vector<float>* meanOut = nullptr) {
+                                    std::vector<float>* foldOut = nullptr,
+                                    int fold = FOLD_MEAN) {
     StackStats out;
     std::vector<int> fr = framesOfSeq(seqId);
     const ImageDoc* first = nullptr;
@@ -774,26 +782,31 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
                 s1[i] += v; s2[i] += v * v; cn[i]++;
             }
         }
-    if (meanOut) {
+    if (foldOut) {
         // float32 out, DOUBLE all the way in. sum[] is double for exactly this
         // reason: adding hundreds of float32 samples in float32 loses low bits
         // at up to half a ULP per add, and a dark-current map IS its low bits -
         // the whole point of averaging N frames is to see what one frame's noise
         // buries. A pixel no frame had a finite value for comes out NaN, which
         // every panel already reads as "not measured"; 0 would be a measurement.
-        meanOut->resize(samples);
+        // The sum is the same accumulator without the divide - which is why it
+        // shares the mean's precision and the mean's NaN discipline for free.
+        foldOut->resize(samples);
         for (size_t i = 0; i < samples; i++)
-            (*meanOut)[i] = cnt[i] ? (float)(sum[i] / (double)cnt[i])
-                                   : std::numeric_limits<float>::quiet_NaN();
+            (*foldOut)[i] = cnt[i]
+                ? (float)(fold == FOLD_SUM ? sum[i] : sum[i] / (double)cnt[i])
+                : std::numeric_limits<float>::quiet_NaN();
     }
     out.nPl = first->cfa ? 4 : 1;
     double plM[4] = {}, plV[4] = {};
     size_t plC[4] = {};
+    uint32_t cmin = std::numeric_limits<uint32_t>::max(), cmax = 0;
     for (int y = 0; y < rh; y++)
         for (int x = 0; x < rw; x++) {
             int p = first->cfa ? cfaChannelAt(*first, rx + x, ry + y) : 0;
             for (int c = 0; c < C; c++) {
                 size_t i = ((size_t)y * rw + x) * C + c;
+                cmin = std::min(cmin, cnt[i]); cmax = std::max(cmax, cnt[i]);
                 double nI = (double)cnt[i];
                 if (nI < 1) out.unknown++;                 // and no mean either
                 if (nI < 2) { out.dropped++; continue; }   // no variance to speak of
@@ -807,12 +820,14 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
         out.mean[p] = plM[p] / (double)plC[p];
         out.sigmaT[p] = sqrt(plV[p] / (double)plC[p]);
     }
+    out.cntMin = cmin == std::numeric_limits<uint32_t>::max() ? 0 : cmin;
+    out.cntMax = cmax;
     out.frames = (int)use.size();
     out.valid = true;
     return out;
 }
 
-// ---- frame average: a stack's per-pixel mean, opened as ONE frame ----------
+// ---- frame average / frame sum: a stack's time axis, folded to ONE frame ----
 // One tooltip for every door into it: the five Browse entry points and the
 // Files panel item must not describe the same operation five different ways.
 // non-static since P7: the Browse ctx menus show the same tooltip (host.h)
@@ -823,6 +838,16 @@ const char* AVG_TIP =
     "per pixel and counted. A mosaic stays a mosaic. The result is a\n"
     "computed frame, not a capture, and says so in its name and note;\n"
     "the stack itself stays open beside it.";
+// ...and the sum fold beside it (docs/analysis-layers.md §3.2: the fold is a
+// mean / sum CHOICE). Static, unlike AVG_TIP: Browse's doors say "average" and
+// keep meaning it - the sum is selected where the open stack lives, in Files.
+static const char* SUM_TIP =
+    "Open the stack's PER-PIXEL SUM across frames as one frame -\n"
+    "the same accumulator as the frame average, without the divide.\n"
+    "Accumulated in double; non-finite samples are excluded per pixel\n"
+    "and counted, so pixels with NaN frames sum FEWER terms - the\n"
+    "note declares the per-pixel count range and a warning names the\n"
+    "exclusions. For comparing pixels, prefer the average.";
 
 // A STACK-level operation whose VALUE is a FRAME. docs/terminology.md makes that
 // an ordinary frame hanging straight off the source's batch ("単発 frame は stack
@@ -830,6 +855,17 @@ const char* AVG_TIP =
 // and ROIs work on it because there is nothing here for them to special-case.
 // The picture is the point: a dark-current map, a flat field, the thing sigma_t
 // is the noise AROUND. Getting it today means opening N frames and leaving.
+//
+// THE FOLD IS A CHOICE - mean or sum, mean the default (docs/analysis-layers.md
+// §3.2, 判断record 3). The original ruling draft banned the sum because NaN
+// exclusion gives it a per-pixel population; the user's correction stands: the
+// mean has the same varying population, normalization only hides it. So
+// honesty is by DECLARATION, for both folds alike - NaN present raises a
+// warning, the exclusion count and the valid frame count always travel with
+// the result, and the sum additionally declares its per-pixel count range,
+// because sums over different counts are different quantities pixel to pixel
+// (the per-pixel count MAP has no vessel until #49; the range in the note is
+// the declaration this build can already make).
 //
 // PROVENANCE IS THE HARD PART. This image looks exactly like a capture and will
 // end up in a report as one if it does not keep saying otherwise. So it says it
@@ -849,7 +885,9 @@ const char* AVG_TIP =
 // names that stack, and provenance pointing at something the program silently
 // destroyed is worth less than the memory. Close stack is one click away in the
 // same menu, and there the user can see what they are closing.
-static bool stackAverageFrame(int seqId, std::string& err) {
+static bool stackReduceFrame(int seqId, int fold, std::string& err) {
+    const bool sumF = fold == FOLD_SUM;
+    const char* noun = sumF ? "sum" : "average";   // the fold IS the name
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "that stack is not open"; return false; }
     const std::string srcName = si->name;
@@ -877,12 +915,16 @@ static bool stackAverageFrame(int seqId, std::string& err) {
     // same key Series members travel by, for the same reason (paths round-trip;
     // ids do not survive a session and names are renameable and not unique).
     const std::string firstPath = app.images[fr.front()]->src->path;
-    std::vector<float> mean;
-    // ONE averaging in the program. This is the accumulator the Temporal panel's
-    // mean and sigma_t come out of, so the number under the picture and the
-    // number in the table cannot disagree - see computeStackStats.
-    StackStats st = computeStackStats(seqId, 0, 0, W, H, &mean);
-    if (!st.valid) { err = "frame average of \"" + srcName + "\": " + st.err; return false; }
+    std::vector<float> folded;
+    // ONE accumulator in the program, for either fold. This is the one the
+    // Temporal panel's mean and sigma_t come out of, so the number under the
+    // picture and the number in the table cannot disagree - see
+    // computeStackStats. The sum is the same pass without the divide.
+    StackStats st = computeStackStats(seqId, 0, 0, W, H, &folded, fold);
+    if (!st.valid) {
+        err = "frame " + std::string(noun) + " of \"" + srcName + "\": " + st.err;
+        return false;
+    }
     const int n = st.frames;
     const int N = std::max(expected, n);
 
@@ -893,7 +935,7 @@ static bool stackAverageFrame(int seqId, std::string& err) {
     // labelling fractional DN "u16" would misdescribe every number printed off
     // this frame. Same call montageROI makes when its values stop being DN.
     S.dtype = "f32";
-    S.data = std::move(mean);
+    S.data = std::move(folded);
     // The mean is PER PIXEL: nothing moves, nothing resamples, every pixel keeps
     // its coordinate and therefore its Bayer phase. So a Bayer stack's mean IS
     // still Bayer and the declaration travels verbatim - per-plane statistics on
@@ -905,7 +947,7 @@ static bool stackAverageFrame(int seqId, std::string& err) {
     out->batchId = refBatch;
     const std::string ofN = n < N ? std::to_string(n) + " of " + std::to_string(N)
                                   : std::to_string(n);
-    out->name = srcName + "  frame average (" + ofN + " frames)";
+    out->name = srcName + "  frame " + noun + " (" + ofN + " frames)";
     // docs/terminology.md, 実装上の不変条件: "部分ロードされた stack の集計は
     // 「何枚中何枚か」を必ず併記する". The canon says STATE the ratio, not refuse
     // the aggregate - every other stack-level statistic in the program (montage,
@@ -914,26 +956,40 @@ static bool stackAverageFrame(int seqId, std::string& err) {
     // itself "the average", so the count is in the name, in the note, and in a
     // warning toast; and the count is of frames actually AVERAGED (st.frames),
     // not of frames present, so a ragged or preview frame cannot inflate it.
-    std::string note = "frame average of \"" + srcName + "\": per-pixel mean over " +
+    std::string note = "frame " + std::string(noun) + " of \"" + srcName +
+                       "\": per-pixel " + (sumF ? "sum" : "mean") + " over " +
                        ofN + " frame(s), accumulated in double";
     if (st.nonFinite)
         note += "; " + std::to_string((unsigned long long)st.nonFinite) +
-                " non-finite sample(s) EXCLUDED - each pixel's own denominator";
+                (sumF ? " non-finite sample(s) EXCLUDED - each pixel sums only "
+                        "its own finite frames"
+                      : " non-finite sample(s) EXCLUDED - each pixel's own denominator");
+    // §3.2's one caution that is the SUM's alone: per-pixel exclusion gives it
+    // a per-pixel term count, and two sums over different counts are different
+    // quantities. The range is the declaration (the count MAP waits on #49's
+    // vessel); the mean needs none, its varying population is already priced
+    // into each pixel's own denominator above.
+    if (sumF && st.cntMin != st.cntMax)
+        note += "; per-pixel valid frame counts vary (" + std::to_string(st.cntMin) +
+                ".." + std::to_string(st.cntMax) + " of " + std::to_string(n) +
+                ") - sums over different counts are different quantities pixel to pixel";
     if (st.unknown)
         note += "; " + std::to_string((unsigned long long)st.unknown) +
                 " sample(s) had no finite frame at all and are NaN here";
     if (n < N)
-        note += "; the stack is PARTLY LOADED - this is the mean of the " +
+        note += "; the stack is PARTLY LOADED - this is the " +
+                std::string(sumF ? "sum" : "mean") + " of the " +
                 std::to_string(n) + " frame(s) present, not of all " + std::to_string(N);
     if (firstPath.empty())
         note += "; no file path behind the source stack, so a session cannot "
                 "recompute this frame";
     out->note = note;
     out->avgOfPath = firstPath;
+    out->avgFold = fold;             // the recipe must round-trip its QUANTITY
     out->texDirty = true;
-    fprintf(stderr, "frame average: %s - %d of %d frame(s), %dx%d %dch, cfa=%d, "
-                    "%llu excluded, %llu unknown\n", srcName.c_str(), n, N, W, H, C,
-            refCfa, (unsigned long long)st.nonFinite, (unsigned long long)st.unknown);
+    fprintf(stderr, "frame %s: %s - %d of %d frame(s), %dx%d %dch, cfa=%d, "
+                    "%llu excluded, %llu unknown\n", noun, srcName.c_str(), n, N, W, H,
+            C, refCfa, (unsigned long long)st.nonFinite, (unsigned long long)st.unknown);
     addImage(std::move(out));
     // addImage runs defaultRange, which is right for a file just opened and
     // wrong here. Averaging suppresses exactly the spread an auto-range keys
@@ -941,12 +997,27 @@ static bool stackAverageFrame(int seqId, std::string& err) {
     // residue and look nothing like the frames it summarises. It inherits the
     // source's display range instead, and is directly comparable with them.
     ImageDoc* made = app.images.back().get();
-    made->black = refBlack; made->white = refWhite;
+    // The sum is the mean's picture at n times the scale, so it inherits the
+    // same range times the frames it folded - comparable with its sources the
+    // way the mean is, instead of clipping solid white against theirs.
+    const float rangeScale = sumF ? (float)std::max(n, 1) : 1.0f;
+    made->black = refBlack * rangeScale; made->white = refWhite * rangeScale;
     if (n < N)
-        toast("frame average: " + std::to_string(n) + " of " + std::to_string(N) +
-              " frames are loaded - the result says so", true);
+        toast("frame " + std::string(noun) + ": " + std::to_string(n) + " of " +
+              std::to_string(N) + " frames are loaded - the result says so", true);
     else
-        toast("frame average of \"" + srcName + "\": " + std::to_string(n) + " frames");
+        toast("frame " + std::string(noun) + " of \"" + srcName + "\": " +
+              std::to_string(n) + " frames");
+    // §3.2 (判断record 3): NaN 混入時は Warning. The note above is where the
+    // count lives permanently; this is what makes it SEEN at reduction time -
+    // exclusion count and valid frame count together, the same declaration the
+    // frame average has always written, now impossible to not notice. Fired
+    // last, so it is the toast left standing (both land in the Messages log).
+    if (st.nonFinite)
+        toast("frame " + std::string(noun) + " of \"" + srcName + "\": NaN present - " +
+              std::to_string((unsigned long long)st.nonFinite) +
+              " non-finite sample(s) excluded per pixel; " + (sumF ? "sum" : "mean") +
+              " over " + ofN + " frame(s)", true);
     return true;
 }
 
@@ -971,27 +1042,21 @@ static bool loadingSettled() {
 // budget did), which is a fact about the stack rather than about timing.
 static void requestStackAverage(int seqId, int fold) {
     if (!seqId) return;
-    // 判断record 3 (docs/analysis-layers.md §3.2): the fold is a CHOICE of
-    // mean / sum. This commit carries the ruling's asserts; the sum fold does
-    // not exist yet, and a door that quietly averaged what was asked to sum
-    // would be a wrong number under the right name - so it refuses by name,
-    // and the selftest goes red on the missing behavior, not on a wrong one.
-    if (fold != FOLD_MEAN) {
-        toast("frame sum: this build cannot fold by sum yet", true);
-        return;
-    }
     if (!loadingSettled()) {
-        app.pendingAvg.push_back(seqId);
+        app.pendingAvg.push_back({ seqId, fold });
         const App::SeqInfo* si = seqInfo(seqId);
-        toast("frame average: \"" + (si ? si->name : std::string("stack")) +
-              "\" will be averaged once its frames are here");
+        toast("frame " + std::string(fold == FOLD_SUM ? "sum" : "average") + ": \"" +
+              (si ? si->name : std::string("stack")) + "\" will be " +
+              (fold == FOLD_SUM ? "summed" : "averaged") + " once its frames are here");
         return;
     }
     std::string err;
-    if (!stackAverageFrame(seqId, err)) toast(err, true);
+    if (!stackReduceFrame(seqId, fold, err)) toast(err, true);
 }
 
-// The parked "Open as frame average" requests, from Browse and from a session.
+// The parked "Open as frame average" / "Open frame sum" requests, from Browse
+// and from a session - each carrying its fold, because a parked sum that fired
+// as a mean would be the quiet 1/n error the recipe key exists to prevent.
 static void pumpStackAverages() {
     if (app.pendingAvg.empty() && app.avgRestore.empty()) return;
     if (!loadingSettled()) return;
@@ -1000,18 +1065,19 @@ static void pumpStackAverages() {
     for (const auto& p : app.avgRestore) {
         int found = 0;
         for (const auto& d : app.images)
-            if (d->seqId != 0 && d->src->path == p) { found = d->seqId; break; }
-        if (found) app.pendingAvg.push_back(found);
-        else fprintf(stderr, "session: a frame average named \"%s\", which is not "
-                             "open - not recomputed\n", p.c_str());
+            if (d->seqId != 0 && d->src->path == p.first) { found = d->seqId; break; }
+        if (found) app.pendingAvg.push_back({ found, p.second });
+        else fprintf(stderr, "session: a frame %s named \"%s\", which is not "
+                             "open - not recomputed\n",
+                     p.second == FOLD_SUM ? "sum" : "average", p.first.c_str());
     }
     app.avgRestore.clear();
-    std::vector<int> todo;
+    std::vector<std::pair<int, int>> todo;
     todo.swap(app.pendingAvg);
-    for (int id : todo) {
-        if (!seqInfo(id)) continue;              // closed while it was waiting
+    for (const auto& id : todo) {
+        if (!seqInfo(id.first)) continue;        // closed while it was waiting
         std::string err;
-        if (!stackAverageFrame(id, err)) toast(err, true);
+        if (!stackReduceFrame(id.first, id.second, err)) toast(err, true);
     }
 }
 
