@@ -1043,7 +1043,7 @@ static bool loadingSettled() {
 static void requestStackAverage(int seqId, int fold) {
     if (!seqId) return;
     if (!loadingSettled()) {
-        app.pendingAvg.push_back({ seqId, fold });
+        app.pendingAvg.push_back({ seqId, fold, false, 0, 0, {} });
         const App::SeqInfo* si = seqInfo(seqId);
         toast("frame " + std::string(fold == FOLD_SUM ? "sum" : "average") + ": \"" +
               (si ? si->name : std::string("stack")) + "\" will be " +
@@ -1065,20 +1065,29 @@ static void pumpStackAverages() {
     for (const auto& p : app.avgRestore) {
         int found = 0;
         for (const auto& d : app.images)
-            if (d->seqId != 0 && d->src->path == p.first) { found = d->seqId; break; }
-        if (found) app.pendingAvg.push_back({ found, p.second });
+            if (d->seqId != 0 && d->src->path == p.path) { found = d->seqId; break; }
+        if (found) app.pendingAvg.push_back({ found, p.fold, p.hasGen,
+                                              p.srcCount, p.srcDigest, p.when });
         else fprintf(stderr, "session: a frame %s named \"%s\", which is not "
                              "open - not recomputed\n",
-                     p.second == FOLD_SUM ? "sum" : "average", p.first.c_str());
+                     p.fold == FOLD_SUM ? "sum" : "average", p.path.c_str());
     }
     app.avgRestore.clear();
-    std::vector<std::pair<int, int>> todo;
+    std::vector<App::PendingAvg> todo;
     todo.swap(app.pendingAvg);
     for (const auto& id : todo) {
-        if (!seqInfo(id.first)) continue;        // closed while it was waiting
+        if (!seqInfo(id.seqId)) continue;        // closed while it was waiting
         std::string err;
-        if (!stackReduceFrame(id.first, id.second, err)) toast(err, true);
+        if (!stackReduceFrame(id.seqId, id.fold, err)) toast(err, true);
     }
+}
+
+// Recompute (§10.1): the user's one move against a stale reduced frame.
+// NOT IMPLEMENTED YET - the selftest's C group is red against this stub.
+static bool recomputeStackAverage(ImageDoc* m, std::string& err) {
+    (void)m;
+    err = "not implemented";
+    return false;
 }
 
 // least squares y = a*x + b; returns false with fewer than 2 distinct points

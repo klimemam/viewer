@@ -891,6 +891,32 @@ static App::SeqInfo* seqInfo(int id) {
     for (auto& s : app.seqs) if (s.id == id) return &s;
     return nullptr;
 }
+// Is this reduced frame (frame average / frame sum) still describing its
+// stack? docs/reference-design.md §10.1: the doc recorded (seqId, stackRev) at
+// compute time; the reload walk latches avgStale at the moment it bumps the
+// key - at the EVENT, so a stack that is reloaded and then closed cannot take
+// the fact with it. The live comparison below is the backstop for a key that
+// moved without the walk (a future bump site, a selftest driving stackRev
+// directly). Stale never clears by itself: only Recompute - the user's move -
+// renews the record, because the picture is never redrawn behind the user.
+static bool avgIsStale(const ImageDoc* d) {
+    if (!d || d->avgOfPath.empty()) return false;
+    if (d->avgStale) return true;
+    if (!d->avgSeqId) return false;
+    const App::SeqInfo* si = seqInfo(d->avgSeqId);
+    return si && si->stackRev != d->avgStackRev;
+}
+// "Same picture" between two reduced frames is a TUPLE comparison, never a
+// pixel comparison - §10.2 reuses §6.2's identity vocabulary instead of
+// inventing a second generation concept. Two results of the same recipe over
+// the same recorded inputs are the same picture; the registry never dedups
+// computed results, so this is how the program can still SAY it.
+static bool avgSamePicture(const ImageDoc* a, const ImageDoc* b) {
+    return a && b && a != b && !a->avgOfPath.empty() &&
+           a->avgOfPath == b->avgOfPath && a->avgFold == b->avgFold &&
+           a->avgSrcDigest != 0 && a->avgSrcDigest == b->avgSrcDigest &&
+           a->avgSrcCount == b->avgSrcCount;
+}
 static void selectImage(int idx) {
     if (idx < 0 || idx >= (int)app.images.size()) return;
     // Walking A onto the image pinned as B used to SWAP them, so that looking

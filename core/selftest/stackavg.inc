@@ -491,6 +491,277 @@
             }
         }
 
+        // ---- C: generation & staleness (issue #82, reference-design.md §10) --
+        // A reduced frame is a computation whose inputs can move on without
+        // it, and it ends up in reports as if it had been captured. Within a
+        // session its key is (seqId, stackRev): the reload walk moves the key
+        // and the picture must go VISIBLY stale - never silently recompute.
+        // Across sessions the vocabulary is §6.2's identity tuple (path +
+        // mtime + fsize), recorded beside the recipe, compared at restore.
+        // The group also pins #82's four questions as behavior: two averages
+        // are two docs (1), two session lines stay two docs (2), the recipe
+        // follows a batch move (3), and WHEN/which generation is on screen (4).
+
+        {   // ---- C1/C2: stale on reload - the key moves, the pixels do not ----
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "C1 an average to make stale");
+            if (m) {
+                check(m->avgSeqId == seq && seqInfo(seq) &&
+                      m->avgStackRev == seqInfo(seq)->stackRev,
+                      "C1 the doc records (seqId, stackRev) at compute time");
+                check(m->avgSrcDigest != 0 && m->avgSrcCount == 3,
+                      "C1 ...and the input tuple digest of the 3 folded frames");
+                check(!m->avgWhen.empty() &&
+                      m->note.find("; computed ") != std::string::npos,
+                      "C1 ...and WHEN, in the doc and in the note");
+                check(!avgIsStale(m), "C1 fresh from its stack, it is not stale");
+                const std::string noteBefore = m->note;
+                // the disk moves on: one member rewritten, stack reloaded
+                writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 500.0f));
+                int failed = 0;
+                std::string msg = reloadStackFromDisk(seq, &failed);
+                fprintf(stderr, "stackavgselftest: C1 reload said: %s\n", msg.c_str());
+                // the walk runs once per member SOURCE, so a 3-frame stack
+                // reload moves the key three times - what matters is that it
+                // moved at all, past the recorded value
+                check(failed == 0 && seqInfo(seq) &&
+                      seqInfo(seq)->stackRev > m->avgStackRev,
+                      "C1 the reload walk bumped stackRev");
+                check(avgIsStale(m), "C1 the average is STALE the moment its key moves");
+                bool still200 = true;
+                for (float v : m->px()) if (v != 200.0f) still200 = false;
+                check(still200 && m->note == noteBefore,
+                      "C2 ...and its pixels and note did NOT move - no silent recompute");
+                check(msg.find("stale") != std::string::npos,
+                      "C2 ...and the reload summary SAYS a computed frame went stale");
+                for (size_t k = 0; k < app.images.size(); k++)
+                    if (app.images[k].get() == m) { selectImage((int)k); break; }
+                check(windowTitleText().find("(stale)") != std::string::npos,
+                      "C2 ...and the title - where reports copy the name from - says so");
+
+                // ---- C3: Recompute is the USER'S one move ---------------------
+                std::string rerr;
+                bool rok = recomputeStackAverage(m, rerr);
+                fprintf(stderr, "stackavgselftest: C3 recompute err='%s'\n  note='%s'\n",
+                        rerr.c_str(), m->note.c_str());
+                check(rok, "C3 Recompute from stack succeeds while the stack is open");
+                bool now300 = true;                       // (100+500+300)/3
+                for (float v : m->px()) if (v != 300.0f) now300 = false;
+                check(now300, "C3 ...the pixels are the CURRENT stack's mean");
+                check(!avgIsStale(m) && seqInfo(seq) &&
+                      m->avgStackRev == seqInfo(seq)->stackRev,
+                      "C3 ...and the mark clears because the record is the new key");
+
+                // ---- C4: the latch survives the stack closing -----------------
+                writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));
+                reloadStackFromDisk(seq, &failed);
+                check(avgIsStale(m), "C4 stale again after a second reload");
+                closeStack(seq);
+                check(seqInfo(seq) == nullptr && avgIsStale(m),
+                      "C4 ...and closing the stack cannot take the fact with it");
+            }
+        }
+
+        {   // ---- C5: the generation record rides the session ------------------
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "C5 an average to save with its record");
+            std::string sess = root + "/stackgen.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            check(txt.find("stackavggen 3 ") != std::string::npos,
+                  "C5 the recipe line travels with its input tuple record");
+            std::string lerr = loadSession(sess);
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images) if (!d->avgOfPath.empty()) back = d.get();
+            fprintf(stderr, "stackavgselftest: C5 restored note='%s'\n",
+                    back ? back->note.c_str() : "(none)");
+            check(back != nullptr &&
+                  back->note.find("recomputed from newer files") == std::string::npos &&
+                  !back->avgGenChanged,
+                  "C5 unchanged files restore with NO generation claim");
+        }
+
+        {   // ---- C6: #82's core - the stack was rewritten between sessions ----
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "C6 an average to betray");
+            std::string sess = root + "/stackgen2.vsession";
+            saveSession(sess, true);
+            // let a coarse-mtime filesystem move before the rewrite: the tuple
+            // comparison is mtime+fsize, and the pixels here keep the size
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 800.0f));
+            size_t msgs = app.msgLog.size();
+            std::string lerr = loadSession(sess);
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images) if (!d->avgOfPath.empty()) back = d.get();
+            check(back != nullptr, "C6 the average still comes back");
+            if (back) {
+                bool now400 = true;                       // (100+800+300)/3
+                for (float v : back->px()) if (v != 400.0f) now400 = false;
+                fprintf(stderr, "stackavgselftest: C6 restored note='%s'\n",
+                        back->note.c_str());
+                check(now400,
+                      "C6 ...recomputed from what the disk holds TODAY (as always)");
+                check(back->note.find("recomputed from newer files (source changed "
+                                      "since ") != std::string::npos,
+                      "C6 ...and the note SAYS so, dating the saved picture");
+                check(back->avgGenChanged,
+                      "C6 ...and carries the mark the Files row shows");
+                bool warned = false;
+                for (size_t k = msgs; k < app.msgLog.size(); k++)
+                    if (app.msgLog[k].err && app.msgLog[k].text.find(
+                            "recomputed from newer files") != std::string::npos)
+                        warned = true;
+                check(warned, "C6 ...and a WARNING is surfaced at restore, not only stored");
+            }
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));   // fixture back
+        }
+
+        {   // ---- C7: #82 (1) - a second average is a SECOND doc ----------------
+            int seq = 0;
+            ImageDoc* m1 = averageOf(dA, &seq);
+            check(m1 != nullptr, "C7 a first average");
+            size_t before = app.images.size();
+            requestStackAverage(seq);
+            loadAll();
+            check(app.images.size() == before + 1,
+                  "C7 averaging twice makes a SECOND doc - results are never deduped");
+            ImageDoc* m2 = app.images.back().get();
+            check(m1 && m2 && m1 != m2 && m1->avgOfPath == m2->avgOfPath,
+                  "C7 ...both naming the same stack");
+            check(avgSamePicture(m1, m2),
+                  "C7 same recorded input tuples -> the program can SAY 'same picture'");
+            // the stack moves on: a third average records a DIFFERENT tuple,
+            // and the reload marks both earlier results stale in one step.
+            // Sleep first, like C6: mtime through _wstat is 1 s coarse on
+            // Windows, and the rewrite keeps the byte size - a same-second
+            // rewrite is genuinely the same tuple, which is not this fixture.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 900.0f));
+            int failed = 0;
+            reloadStackFromDisk(seq, &failed);
+            check(avgIsStale(m1) && avgIsStale(m2),
+                  "C7 one reload marks BOTH earlier results stale");
+            requestStackAverage(seq);
+            loadAll();
+            ImageDoc* m3 = app.images.back().get();
+            fprintf(stderr, "stackavgselftest: C7 digests m1=%016llx m3=%016llx "
+                            "(n %d/%d), m3 stale=%d\n",
+                    (unsigned long long)m1->avgSrcDigest,
+                    (unsigned long long)m3->avgSrcDigest,
+                    m1->avgSrcCount, m3->avgSrcCount, (int)avgIsStale(m3));
+            check(m3 != m2 && !avgIsStale(m3) &&
+                  m3->avgSrcDigest != m1->avgSrcDigest && !avgSamePicture(m1, m3),
+                  "C7 a new generation records a new tuple - and says NOT the same picture");
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));   // fixture back
+        }
+
+        {   // ---- C8: #82 (2) - two session lines restore as two docs ----------
+            int seq = 0;
+            ImageDoc* m1 = averageOf(dA, &seq);
+            check(m1 != nullptr, "C8 a first average to save");
+            requestStackAverage(seq);
+            loadAll();
+            std::string sess = root + "/stacktwo.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            int lines = 0;
+            for (size_t p = txt.find("stackavg "); p != std::string::npos;
+                 p = txt.find("stackavg ", p + 1)) lines++;
+            check(lines == 2, "C8 the session writes TWO recipe lines, not one key");
+            std::string lerr = loadSession(sess);
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int avgs = 0;
+            bool all200 = true, anyClaim = false;
+            for (auto& d : app.images)
+                if (!d->avgOfPath.empty()) {
+                    avgs++;
+                    for (float v : d->px()) if (v != 200.0f) all200 = false;
+                    if (d->note.find("recomputed from newer files") != std::string::npos)
+                        anyClaim = true;
+                }
+            check(lerr.empty() && avgs == 2,
+                  "C8 ...and two docs come back - same recipe, no collapse");
+            check(all200 && !anyClaim,
+                  "C8 ...each recomputed clean: same files, no generation claim");
+        }
+
+        {   // ---- C9: #82 (3) - the recipe follows the stack across batches ----
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "C9 an average whose stack will move");
+            int nb = newBatch("moved-here");
+            moveStackToBatch(seq, nb);
+            std::string sess = root + "/stackmove.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            check(txt.find("stackavg ") != std::string::npos,
+                  "C9 a batch move does not orphan the recipe (the path is the key)");
+            std::string lerr = loadSession(sess);
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images) if (!d->avgOfPath.empty()) back = d.get();
+            check(back != nullptr &&
+                  back->note.find("recomputed from newer files") == std::string::npos,
+                  "C9 ...and it comes back clean from the moved stack");
+            check(back && batchNameOf(back->batchId) == "moved-here",
+                  "C9 ...in the batch the stack lives in now");
+        }
+
+        {   // ---- C10: #82 (4) - the generation is visible where reports are made
+            int seq = 0;
+            ImageDoc* m = averageOf(dA, &seq);
+            check(m != nullptr, "C10 an average to export");
+            for (size_t k = 0; k < app.images.size(); k++)
+                if (app.images[k].get() == m) { selectImage((int)k); break; }
+            std::string tsv = buildTemporalExport('\t');
+            check(tsv.find("frame average of") != std::string::npos,
+                  "C10 the export cites the full provenance note (recipe, count, when)");
+            check(tsv.find("(stale)") == std::string::npos,
+                  "C10 fresh: no stale token anywhere in the export");
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 700.0f));
+            int failed = 0;
+            reloadStackFromDisk(seq, &failed);
+            tsv = buildTemporalExport('\t');
+            fputs(tsv.c_str(), stdout);          // the stale document, for eyeballs
+            check(tsv.find("(stale)") != std::string::npos,
+                  "C10 stale reaches the TSV export's provenance lines");
+            writeNpy(dA + "/f_001.npy", W, H, flat(W, H, 200.0f));   // fixture back
+        }
+
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "stackavgselftest: %s\n", ok ? "ok" : "FAILED");

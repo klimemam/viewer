@@ -362,6 +362,28 @@ struct ImageDoc {
                                       // must bring back the same QUANTITY - a
                                       // sum reloaded as a mean would come back
                                       // 1/n of itself under one name.
+    // The GENERATION record (docs/reference-design.md §10, issue #82): a
+    // reduced frame is a computation over pixels that can move on without it,
+    // and it ends up in reports as if it had been captured - so it must be
+    // able to SAY whether it still describes its stack.
+    //   - Within a session the key is (avgSeqId, avgStackRev): the reload walk
+    //     bumps SeqInfo::stackRev and latches avgStale here, and the picture is
+    //     never recomputed behind the user (silent recompute = silent
+    //     overwrite). Recompute is the user's one move; it renews the record.
+    //   - Across sessions stackRev does not survive; the vocabulary that does
+    //     is §6.2's identity tuple (path + mtime + fsize). avgSrcDigest folds
+    //     the tuples of every member that went into the fold, avgSrcCount says
+    //     how many, avgWhen says when - and the restore compares its own fresh
+    //     digest against the session's record to say "recomputed from newer
+    //     files (source changed since ...)" instead of silently presenting a
+    //     different picture under the same name (avgGenChanged).
+    int avgSeqId = 0;                 // source stack at compute time (this session)
+    int avgStackRev = 0;              // SeqInfo::stackRev at compute time
+    bool avgStale = false;            // latched by the reload walk; only Recompute clears it
+    bool avgGenChanged = false;       // restored from a DIFFERENT generation than saved
+    uint64_t avgSrcDigest = 0;        // FNV-1a over the folded members' identity tuples
+    int avgSrcCount = 0;              // how many member tuples the digest folds
+    std::string avgWhen;              // wall clock at compute time ("source changed since ...")
 
     // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
     // fields because they are read on 240+ lines (docs/reference-design.md
@@ -1111,11 +1133,31 @@ struct App {
     // into the SAME list (through avgRestore below), so there is one place
     // where a stack becomes a folded frame and one set of rules about when it
     // is allowed to happen.
-    std::vector<std::pair<int, int>> pendingAvg;           // (seqId, StackFold)
+    // The generation record rides along (hasGen): a session's recipe carries
+    // the input tuple digest it was computed from (§10.2), and the reduction
+    // compares it against what it actually folds - the restore path is the one
+    // caller that has an expectation to hand in.
+    struct PendingAvg {
+        int seqId = 0;
+        int fold = FOLD_MEAN;                              // StackFold
+        bool hasGen = false;                               // a record to compare against
+        int srcCount = 0;
+        uint64_t srcDigest = 0;
+        std::string when;                                  // "source changed since ..."
+    };
+    std::vector<PendingAvg> pendingAvg;
     // ...and the session's side of it, by PATH, resolved lazily exactly like
     // seriesRestore: at parse time a folder stack is one loose image plus a
     // queued rescan, so the stack this names does not exist yet.
-    std::vector<std::pair<std::string, int>> avgRestore;   // (path, StackFold)
+    struct AvgRestore {
+        std::string path;
+        int fold = FOLD_MEAN;                              // StackFold
+        bool hasGen = false;                               // stackavggen was present
+        int srcCount = 0;
+        uint64_t srcDigest = 0;
+        std::string when;
+    };
+    std::vector<AvgRestore> avgRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the

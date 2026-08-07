@@ -1515,8 +1515,10 @@ static std::string loadSession(const std::string& path) {
         // this path". Collected here and resolved after everything is open, for
         // exactly the reason the series block gives below - and taken again
         // rather than reloaded, because there is no file holding the answer.
-        else if (key == "stackavg") app.avgRestore.push_back({ restOfLine(ls), FOLD_MEAN });
-        else if (key == "stacksum") app.avgRestore.push_back({ restOfLine(ls), FOLD_SUM });
+        else if (key == "stackavg")
+            app.avgRestore.push_back({ restOfLine(ls), FOLD_MEAN, false, 0, 0, {} });
+        else if (key == "stacksum")
+            app.avgRestore.push_back({ restOfLine(ls), FOLD_SUM, false, 0, 0, {} });
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
         // with a queued rescan behind it. See resolveSeriesRestore.
