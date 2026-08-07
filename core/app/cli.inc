@@ -25,6 +25,7 @@ static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slo
 static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
 static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
+static std::string g_asetSelftest;      // --aset-selftest <dir>: AnalysisSet transport/binding/session, exit
 // --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
 // window. It takes no directory because it needs no file: every fixture it
 // measures is analytic and built in memory (see roiStatsSelftest()).
@@ -431,6 +432,7 @@ static void printUsage() {
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
+        "  --aset-selftest <dir>       AnalysisSet: transport, Ref binding, session\n"
         "  --roistats-selftest         the ROI table's numbers and its std/mean column,\n"
         "                              through the real panel, on analytic fixtures\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
@@ -587,6 +589,8 @@ static void parseCli(int argc, char** argv) {
             g_browseKeysActs = next();             // override the canned action list
         } else if (a == "--verify-selftest") {
             g_verifySelftest = next();             // handled in main()
+        } else if (a == "--aset-selftest") {
+            g_asetSelftest = next();               // handled in main()
         } else if (a == "--derive-selftest") {
             g_deriveSelftest = next();             // handled in main()
         } else if (a == "--stackavg-selftest") {

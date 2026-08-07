@@ -267,19 +267,21 @@ ImVec4 clearColor(int variant) {
 // says nothing. Ordered frame, stack, series, batch: the hue walks with the
 // containment, blue -> green -> amber -> violet.
 ImVec4 layerInk(int variant, int layer) {
-    static const ImVec4 dark[4] = {
+    static const ImVec4 dark[5] = {
         ImVec4(0.62f, 0.73f, 0.92f, 1.0f),   // frame  - cool blue-grey
         ImVec4(0.55f, 0.82f, 0.63f, 1.0f),   // stack  - green
         ImVec4(0.89f, 0.76f, 0.46f, 1.0f),   // series - amber
         ImVec4(0.78f, 0.67f, 0.91f, 1.0f),   // batch  - violet
+        ImVec4(0.52f, 0.83f, 0.83f, 1.0f),   // set    - teal (bindings, 5th layer)
     };
-    static const ImVec4 light[4] = {
+    static const ImVec4 light[5] = {
         ImVec4(0.20f, 0.34f, 0.60f, 1.0f),
         ImVec4(0.13f, 0.42f, 0.22f, 1.0f),
         ImVec4(0.50f, 0.35f, 0.05f, 1.0f),
         ImVec4(0.39f, 0.26f, 0.58f, 1.0f),
+        ImVec4(0.07f, 0.42f, 0.42f, 1.0f),
     };
-    if (layer < 0 || layer > 3) layer = 0;
+    if (layer < 0 || layer > 4) layer = 0;
     return variant == VariantLight ? light[layer] : dark[layer];
 }
 

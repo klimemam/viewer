@@ -786,6 +786,60 @@ struct App {
     std::vector<Series> series;
     int nextSeriesId = 1;
     int curSeriesId = 0;              // which series the Linearity panel shows
+    // ---- AnalysisSet (docs/reader-analysisset.md, "ras"): role bindings ------
+    // A set is a NODE of one batch (ras 1.4) and its identity is (batch, set
+    // name) - never its contents. Each role BINDS a member that keeps living
+    // wherever it lives: binding is not containment, and it legitimately
+    // crosses batches (the dark taken once, used by every set). A binding
+    // target is at most one of stack / loose frame / series; all zero =
+    // unbound, and `reason` says why in one line (ras 3.1: a Ref speaks about
+    // the world, so its failure is a state to SHOW, never a call failure -
+    // the inline side of that asymmetry fails in the harness, before here).
+    struct ASetRole {
+        std::string role;             // [A-Za-z0-9_]+ (ras 1.2)
+        int seqId = 0;                // bound to a stack
+        uint64_t frameUid = 0;        // bound to a loose frame
+        int seriesId = 0;             // bound to a series
+        std::string refPath;          // the Ref that made it ("" = inline member)
+        std::string refMember;        // ...and its npz member, when one was named
+        std::string note;             // a bound role's declaration (ras 2.2 case 2:
+                                      // "bound to the open copy - ...")
+        std::string reason;           // unbound: the one-line reason (ras 3.2)
+        bool bound() const { return seqId != 0 || frameUid != 0 || seriesId != 0; }
+    };
+    struct ASet {
+        int id = 0, batchId = 0;
+        std::string name, note;
+        std::string readerSpec;       // reader-born sets: who computed it (ras 4)
+        std::string origin;           // ...and from which file
+        std::vector<ASetRole> roles;  // declaration order = display order (ras 4)
+    };
+    std::vector<ASet> analysisSets;
+    int nextASetId = 1;
+    // A bind that had to wait for the drain gate (the seriesRestore gate).
+    // Two kinds: a stack forming through the asynchronous group loader binds
+    // by its head path once the rescan lands (kind 0); and a whole Ref whose
+    // resolution was DEFERRED because a session restore is in flight (kind 1)
+    // - resolving it at once would re-open files whose own image lines the
+    // session is still about to load, and the restore would grow a twin stack
+    // per cycle. Either way it binds at the gate, or says why not - never a
+    // silent drop.
+    struct ASetBind { int setId = 0; int roleIdx = 0; int batchId = 0;
+                      int kind = 0;                    // 0 = by head, 1 = full Ref
+                      std::string headPath;            // kind 0
+                      std::string refPath, refMember, origin;   // kind 1
+                      std::string what; };
+    std::vector<ASetBind> aSetBindPending;
+    // The session's analysisset block, held VERBATIM until every stack the
+    // file asked for exists (ras 5.2 - the seriesRestore precedent, including
+    // the rule that a save during the wait writes it back unchanged).
+    struct ASetRestore {
+        std::string name, batchName, readerSpec, origin;
+        struct R { std::string role, kind, batchName, key, reason; };
+        std::vector<R> roles;
+        int truncated = 0;            // setrole lines cut before their key
+    };
+    std::vector<ASetRestore> aSetRestore;
     int loadBatchId = 0;              // batch newly opened images join; 0 = derive
     uint64_t previewUid = 0;          // the ONE reusable preview slot (0 = none)
     // Where that preview came from, so the browser can step through the

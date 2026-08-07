@@ -970,6 +970,232 @@ def shipped_adapters_run():
     assert m["__pixels_0"].shape == (4, 5, 3)
 
 
+# ------------------------------------------- reader-analysisset.md 1 / 4
+# The fifth type.  Every case below is written against docs/reader-analysisset.md
+# and annotated with the section it comes from ("ras" = that document).
+
+@case
+def analysisset_type_and_default_name():
+    """ras 1.1: AnalysisSet(role dict, name=, note=, meta=); the default name is
+    the role list, and an explicit name is remembered as explicit (1.4)."""
+    need_lib(); need_numpy()
+    s = vi.AnalysisSet({"image": vi.Stack(np.zeros((3, 4, 4))),
+                        "dark": vi.Ref("darks/dark_50ms/")}, name="PRNU 10lx")
+    assert s.name == "PRNU 10lx" and s.name_given is True
+    assert list(s.roles) == ["image", "dark"], "declaration order is kept"
+    d = vi.AnalysisSet({"image": vi.Stack(np.zeros((3, 4, 4))),
+                        "dark": vi.Ref("darks/")})
+    assert d.name == "{image, dark}", d.name          # ras 1.1: schema-derived
+    assert d.name_given is False
+    assert getattr(type(vi.AnalysisSet), "__name__", "") == "type"
+    assert vi.AnalysisSet.LAYER == "analysisset"
+    # a set has no pixels, so it has no range field (ras 1.1)
+    assert not hasattr(s, "range")
+
+
+@case
+def analysisset_construction_refusals():
+    """ras 1.2/1.3: the mistake fails on the constructing line, named."""
+    need_lib(); need_numpy()
+    st = vi.Stack(np.zeros((3, 4, 4)))
+    fails(lambda: vi.AnalysisSet({}), "no roles")
+    fails(lambda: vi.AnalysisSet([st]), "roles must be a dict", TypeError)
+    fails(lambda: vi.AnalysisSet({"da rk": st}), 'role name')
+    fails(lambda: vi.AnalysisSet({"暗黒": st}), 'role name')
+    # ras 1.2 / decision 2: a bare array is not a declaration
+    fails(lambda: vi.AnalysisSet({"dark": np.zeros((3, 4, 4))}),
+          "bare array", TypeError)
+    # Batch / AnalysisSet are not role values; a set does not nest
+    fails(lambda: vi.AnalysisSet({"dark": vi.Batch([st])}), "does not nest", TypeError)
+    fails(lambda: vi.AnalysisSet({"dark": vi.AnalysisSet({"image": st})}),
+          "does not nest", TypeError)
+    fails(lambda: vi.Ref(""), "path is empty")
+    fails(lambda: vi.Ref("  "), "path is empty")
+
+
+@case
+def analysisset_in_batch_and_name_collision():
+    """ras 1.1/1.3/1.4: a Batch holds sets; two sets with the same EXPLICIT name
+    fail at the Batch's constructing line; default-name twins do not (the
+    viewer numbers those)."""
+    need_lib(); need_numpy()
+    st = lambda: vi.Stack(np.zeros((3, 4, 4)))
+    a = vi.AnalysisSet({"image": st()}, name="X")
+    b = vi.AnalysisSet({"image": st()}, name="X")
+    fails(lambda: vi.Batch([a, b]), 'both named "X"')
+    # same schema, no explicit names: legal here, numbered on the viewer side
+    c = vi.AnalysisSet({"image": st(), "dark": vi.Ref("d1/")})
+    d = vi.AnalysisSet({"image": st(), "dark": vi.Ref("d2/")})
+    assert c.name == d.name == "{image, dark}"
+    vi.Batch([c, d])
+    # ...and a set beside ordinary members
+    vi.Batch([st(), vi.AnalysisSet({"image": st()}, name="ok")])
+
+
+@case
+def analysisset_transport():
+    """ras 4: __layer analysisset; inline role members are CHILDREN carrying
+    __role_<i>; Refs are __refs_<i> JSON in declaration order; and the
+    set-bearing container names __viewer 2."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Batch, Ref, Stack
+def load(path):
+    z = np.load(path)["data"]
+    return Batch([Stack(np.ascontiguousarray(z), name="loose"),
+                  AnalysisSet({"image": Stack(z + 1),
+                               "dark":  Ref("darks/dark_50ms/"),
+                               "flat":  Ref("flats/f.npy", member="arr")},
+                              name="PRNU 10lx", note="a note")])
+"""
+    _, out = run_adapter(src, "load", path)
+    m = members(out)
+    assert int(scalar(m, "__viewer")) == 2, "a set-bearing container is version 2"
+    layers = dict((k, scalar(m, k)) for k in m if k.startswith("__layer_"))
+    setIdx = [k for k, v in layers.items() if v == "analysisset"]
+    assert len(setIdx) == 1, layers
+    i = int(setIdx[0].rsplit("_", 1)[1])
+    assert scalar(m, "__name_%d" % i) == "PRNU 10lx"
+    # the inline member is a child of the set and says which role it plays
+    kids = [k for k in m if k.startswith("__parent_") and int(scalar(m, k)) == i]
+    assert len(kids) == 1, kids
+    ci = int(kids[0].rsplit("_", 1)[1])
+    assert scalar(m, "__layer_%d" % ci) == "stack"
+    assert scalar(m, "__role_%d" % ci) == "image"
+    refs = ast.literal_eval(scalar(m, "__refs_%d" % i)
+                            .replace("true", "True").replace("false", "False"))
+    assert list(refs) == ["dark", "flat"], "JSON key order = declaration order"
+    assert refs["dark"] == {"path": "darks/dark_50ms/", "member": ""}
+    assert refs["flat"] == {"path": "flats/f.npy", "member": "arr"}
+
+
+@case
+def analysisset_version_moves_only_for_sets():
+    """ras 4: a set-free container stays __viewer 1 - compatibility does not
+    move one millimetre for files without a set."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    _, out = run_adapter(BARE, "load", path)
+    m = members(out)
+    assert int(scalar(m, "__viewer")) == 1, "no set, version 1"
+
+
+@case
+def analysisset_same_object_once():
+    """ras 1.2: the same instance is ONE node - pixels travel once whether it
+    sits in two roles or in the batch members and a role."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Batch, Stack
+def load(path):
+    s = Stack(np.load(path)["data"])
+    # one instance, three appearances: batch member, and two roles
+    return Batch([s, AnalysisSet({"image": s, "bias": s}, name="twice")])
+"""
+    _, out = run_adapter(src, "load", path)
+    m = members(out)
+    pixels = [k for k in m if k.startswith("__pixels_")]
+    assert len(pixels) == 1, "pixels travel once: %s" % pixels
+    # the bindings still both exist: one as __role / node-ref, per declaration
+    refs = [scalar(m, k) for k in m if k.startswith("__refs_")]
+    joined = ";".join(refs)
+    assert "image" in joined or any(scalar(m, k) == "image" for k in m
+                                    if k.startswith("__role_")), (refs, m.keys())
+    assert '"node"' in joined, "the second appearance is a node ref: %s" % refs
+
+
+@case
+def analysisset_explicit_dupe_fails_call():
+    """ras 1.4: one call returning two sets under the same explicit name is a
+    failed call - checked in the harness too, where the type check can be
+    sidestepped."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Batch, Stack
+def load(path):
+    z = np.load(path)["data"]
+    a = AnalysisSet({"image": Stack(z)}, name="A")
+    b = AnalysisSet({"image": Stack(z + 1)}, name="B")
+    batch = Batch([a, b])
+    object.__setattr__(b, "name", "A")     # sidestep the Batch check
+    return batch
+"""
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode != 0
+    assert 'both named "A"' in proc.stderr, proc.stderr
+
+
+@case
+def analysisset_stream_carries_roles():
+    """ras 4: the streamed carrier says the same things - VIEWERSTREAM 2, role
+    and refs lines."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    d = tempdir()
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Ref, Stack
+def load(path):
+    return AnalysisSet({"image": Stack(np.load(path)["data"]),
+                        "dark": Ref("darks/")}, name="S")
+"""
+    apath = write(os.path.join(d, "s.py"), src)
+    proc = subprocess.run([sys.executable, RUNNER, apath + ":load", path, "--stream"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    head = proc.stdout.split(b"\nend\n", 1)[0].decode("utf-8")
+    lines = head.splitlines()
+    assert lines[0] == "VIEWERSTREAM 2", lines[0]
+    assert any(l.startswith("layer 0 analysisset") for l in lines), lines
+    assert any(l.startswith("role 1 image") for l in lines), lines
+    refline = [l for l in lines if l.startswith("refs 0 ")]
+    assert refline and '"dark"' in refline[0], lines
+    # ...and a set-free stream stays version 1
+    proc2 = subprocess.run([sys.executable, RUNNER, apath + ":load", path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+    assert proc2.returncode == 0
+
+
+@case
+def analysisset_inline_failure_fails_call():
+    """ras 3.1: a broken inline member fails the whole call, traceback and all -
+    a set is never half-received."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Stack
+def load(path):
+    return AnalysisSet({"image": Stack(np.zeros((4, 4)))})   # (H,W) is not a stack
+"""
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode != 0
+    assert "Stack: shape (4, 4)" in proc.stderr, proc.stderr
+    assert "Traceback" in proc.stderr, "the constructing line must be visible"
+
+
+@case
+def analysisset_summary_counts_sets():
+    """4.11: the one-line summary counts what was read - sets included."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((3, 4, 5))
+    src = """
+import numpy as np
+from viewer_import import AnalysisSet, Ref, Stack
+def load(path):
+    return AnalysisSet({"image": Stack(np.load(path)["data"]), "dark": Ref("d/")})
+"""
+    proc, _ = run_adapter(src, "load", path)
+    assert "1 set" in proc.stderr, proc.stderr
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv):

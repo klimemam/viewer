@@ -339,6 +339,159 @@ static void pruneDeadFrameMembers() {
     pruneEmptySeries();
 }
 
+// ---- AnalysisSet (docs/reader-analysisset.md, "ras"): the model --------------
+// No UI here, the series-model rule: the invariants have to hold before
+// anything can draw them. Sets are few and roles are a handful each, so every
+// lookup is a plain walk.
+static App::ASet* aSetById(int id) {
+    for (auto& s : app.analysisSets) if (s.id == id) return &s;
+    return nullptr;
+}
+// ras 1.4: the ONE prohibition is a same-name set in one batch - (batch, name)
+// is the identity the session's adopt rule and provenance key on. Default-name
+// twins from one call are numbered here (" (2)"), the series-default-name
+// precedent: a starting value people rename, not an exemption from the rule.
+static std::string aSetUniqueName(int batchId, const std::string& base) {
+    auto taken = [&](const std::string& n) {
+        for (const auto& s : app.analysisSets)
+            if (s.batchId == batchId && s.name == n) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int i = 2;; i++) {
+        std::string n = base + " (" + std::to_string(i) + ")";
+        if (!taken(n)) return n;
+    }
+}
+// The Files row's text, pure so the selftest asserts the exact words (ras 6):
+// `PRNU 10lx  (2/2 roles)`, or `(1/2 roles - dark unbound)` when one is not.
+// NO byte count, ever: a binding is not ownership, and the unique-source sum
+// gains nothing from a set row (reference-design.md 7's one-line lesson).
+static std::string aSetRowText(const App::ASet& S) {
+    int total = (int)S.roles.size(), bound = 0;
+    std::string firstUnbound;
+    for (const auto& r : S.roles) {
+        if (r.bound()) bound++;
+        else if (firstUnbound.empty()) firstUnbound = r.role;
+    }
+    char b[160];
+    if (bound == total)
+        snprintf(b, sizeof b, "(%d/%d roles)", bound, total);
+    else
+        snprintf(b, sizeof b, "(%d/%d roles - %s unbound)", bound, total,
+                 firstUnbound.c_str());
+    return S.name + "  " + b;
+}
+// One role row: what this role is bound TO (the member's home stays the
+// member's own row - the tree is not duplicated). Unbound rows carry their
+// one-line reason (ras 3.2).
+static std::string aSetRoleText(const App::ASetRole& r) {
+    if (!r.bound())
+        return r.role + ": unbound (" +
+               (r.reason.empty() ? std::string("no reason recorded") : r.reason) + ")";
+    std::string target = "?";
+    if (r.seqId != 0) {
+        const App::SeqInfo* si = seqInfo(r.seqId);
+        target = (si ? si->name : std::string("stack")) + " (" +
+                 std::to_string((int)framesOfSeq(r.seqId).size()) + ")";
+    } else if (r.frameUid != 0) {
+        for (const auto& d : app.images)
+            if (d->uid == r.frameUid) { target = d->name; break; }
+    } else if (r.seriesId != 0) {
+        for (const auto& s : app.series)
+            if (s.id == r.seriesId) { target = s.name; break; }
+    }
+    std::string s = r.role + " -> " + target;
+    if (!r.note.empty()) s += "  - " + r.note;   // e.g. "bound to the open copy ..."
+    return s;
+}
+// The tooltip sentence the MEMBER side gets - and nothing else: no column, no
+// mark on the member row (ras 6). One line per binding that names this stack /
+// frame / series.
+static std::string aSetBoundSentence(int seqId, uint64_t uid, int seriesId) {
+    std::string s;
+    for (const auto& S : app.analysisSets)
+        for (const auto& r : S.roles) {
+            bool mine = (seqId != 0 && r.seqId == seqId) ||
+                        (uid != 0 && r.frameUid == uid) ||
+                        (seriesId != 0 && r.seriesId == seriesId);
+            if (!mine) continue;
+            if (!s.empty()) s += "\n";
+            s += "bound as \"" + r.role + "\" in \"" + S.name + "\"";
+        }
+    return s;
+}
+// "メンバを閉じたら束縛を失い、そう表示する (黙って空にしない)" - the canon's
+// rule (analysis-layers.md 1.1), applied after every close: a role whose
+// target is gone becomes UNBOUND with the reason, never a dangling id and
+// never a silent blank.
+static void aSetAuditBindings() {
+    bool changed = false;
+    for (auto& S : app.analysisSets)
+        for (auto& r : S.roles) {
+            if (r.seqId != 0 && !seqInfo(r.seqId)) {
+                r.seqId = 0;
+                r.reason = "the stack was closed while bound";
+                changed = true;
+            } else if (r.frameUid != 0) {
+                bool alive = false;
+                for (const auto& d : app.images)
+                    if (d->uid == r.frameUid) { alive = true; break; }
+                if (!alive) {
+                    r.frameUid = 0;
+                    r.reason = "the frame was closed while bound";
+                    changed = true;
+                }
+            } else if (r.seriesId != 0) {
+                bool alive = false;
+                for (const auto& s : app.series)
+                    if (s.id == r.seriesId) alive = true;
+                if (!alive) {
+                    r.seriesId = 0;
+                    r.reason = "the series was closed or ungrouped while bound";
+                    changed = true;
+                }
+            }
+        }
+    if (changed) app.imagesRev++;      // the Files rows read these
+}
+// Close on the SET node: the bindings are a record, and only the record goes -
+// members are untouched, because a binding is not ownership (ras 6). The
+// report counts, the closeStack survival notice's shape.
+static void closeAnalysisSet(int setId) {
+    for (auto it = app.analysisSets.begin(); it != app.analysisSets.end(); ++it)
+        if (it->id == setId) {
+            int n = 0;
+            for (const auto& r : it->roles) if (r.bound()) n++;
+            char m[320];
+            snprintf(m, sizeof m, "closed set \"%s\" - %d binding(s) dropped, "
+                                  "members untouched", it->name.c_str(), n);
+            app.analysisSets.erase(it);
+            for (auto p = app.aSetBindPending.begin(); p != app.aSetBindPending.end();)
+                p = p->setId == setId ? app.aSetBindPending.erase(p) : std::next(p);
+            app.imagesRev++;
+            fprintf(stderr, "%s\n", m);
+            toast(m);
+            pruneEmptyBatches();       // the batch may have held only this set
+            return;
+        }
+}
+// Rename: allowed, session-saved (the canon's operations table). The one
+// refusal is ras 1.4's prohibition itself - two same-name sets in one batch.
+static bool renameAnalysisSet(int setId, const std::string& name, std::string* whyNot) {
+    App::ASet* S = aSetById(setId);
+    if (!S || name.empty()) return false;
+    for (const auto& o : app.analysisSets)
+        if (o.id != setId && o.batchId == S->batchId && o.name == name) {
+            if (whyNot) *whyNot = "a set named \"" + name + "\" already exists in "
+                                  "this batch - a set's identity is (batch, name)";
+            return false;
+        }
+    S->name = name;
+    app.imagesRev++;
+    return true;
+}
+
 // Close a set of images by index: erase in descending order so the indices stay
 // valid, one forget per cache that can name them, current re-picked at the end.
 static void closeImages(std::vector<int> idxs) {
@@ -377,6 +530,7 @@ static void closeImages(std::vector<int> idxs) {
     }
     pruneDeadFrameMembers();   // a closed frame is not a series member anymore
     pruneEmptyBatches();
+    aSetAuditBindings();  // a closed member's binding becomes unbound, said so
 }
 
 // What the last close SAID about pixels that survived it (§4's survival
@@ -508,6 +662,9 @@ static void closeStack(int seqId, bool announce = true) {
     app.temporal[0].seqId = app.temporal[1].seqId = -1;
     if (app.srvTemporal.seqId == seqId) app.srvTemporal = App::ServerTemporal{};
     if (app.srvTemporalB.seqId == seqId) app.srvTemporalB = App::ServerTemporal{};
+    // the SeqInfo and any series this stack emptied are gone only now, so the
+    // closeImages audit above could not see it - ask again
+    aSetAuditBindings();
 }
 
 // Close a batch: every stack and loose frame in it, plus the queued opens that
@@ -515,6 +672,27 @@ static void closeStack(int seqId, bool announce = true) {
 // exactly one batch, so the batch's series go too - Close on a batch is the
 // canon's "discard the contents", not "ungroup".
 static void closeBatch(int batchId) {
+    // The batch's SETS go with it - a set is a node of its batch (ras 1.4).
+    // Counted, never silent: bindings are records, and records do not vanish
+    // without a number attached. Members OUTSIDE this batch are untouched -
+    // their pixels were never this set's to take.
+    {
+        int drop = 0, binds = 0;
+        for (auto it = app.analysisSets.begin(); it != app.analysisSets.end();)
+            if (it->batchId == batchId) {
+                for (const auto& r : it->roles) if (r.bound()) binds++;
+                drop++;
+                it = app.analysisSets.erase(it);
+            } else {
+                ++it;
+            }
+        for (auto p = app.aSetBindPending.begin(); p != app.aSetBindPending.end();)
+            p = p->batchId == batchId ? app.aSetBindPending.erase(p) : std::next(p);
+        if (drop)
+            fprintf(stderr, "close batch: %d set(s) dropped, %d binding(s) with "
+                            "them - members outside the batch untouched\n",
+                    drop, binds);
+    }
     for (auto it = app.series.begin(); it != app.series.end();)
         if (it->batchId == batchId) {
             if (app.curSeriesId == it->id) app.curSeriesId = 0;
@@ -593,6 +771,9 @@ static void pruneEmptyBatches() {
         if (!used)
             for (const auto& d : app.images)
                 if (d->batchId == it->id) { used = true; break; }
+        if (!used)   // a set is a NODE of its batch (ras 1.4): the heading stays
+            for (const auto& s : app.analysisSets)
+                if (s.batchId == it->id) { used = true; break; }
         if (!used)
             for (const auto& q : app.seqQueue)
                 if (q.batchId == it->id) { used = true; break; }
@@ -674,6 +855,7 @@ static void ungroupSeries(int seriesId) {
             break;
         }
     if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
+    aSetAuditBindings();   // a role bound to the ungrouped series says so now
 }
 // Close a series: the canon's Close, which discards the CONTENTS. Each member's
 // closeStack removes it from the series, and the last one takes the series with
@@ -701,6 +883,7 @@ static void closeSeries(int seriesId) {
             break;
         }
     toast("closed series \"" + n + "\": " + std::to_string(ids.size()) + " stack(s)");
+    aSetAuditBindings();
 }
 // "seqctx > Series > <name>": the one join that does not go through the modal.
 // A function like every other command behind a Files row, so the selftest can
@@ -806,6 +989,11 @@ static void closeAll() {
     app.seqLevelLegacy.clear();
     app.seriesPending.clear();                  // they named stacks being thrown away
     app.groupStacks.clear();                    // ...and those stacks are gone too
+    // sets name members and batches of the list being thrown away; the pending
+    // block entries name paths that will not be open either (ras 5.2)
+    app.analysisSets.clear();
+    app.aSetBindPending.clear();
+    app.aSetRestore.clear();
     // The batches go with their contents: an empty batch that survives Close
     // All keeps its NAME reserved, so reopening the same folder came back as
     // "multi (2)" - the uniquifier colliding with a ghost.
