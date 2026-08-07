@@ -448,8 +448,8 @@ set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" T
 # byte-identical to the same test with a window (the load-progress line
 # "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
-# mode). The six without it - browse-keys, browse-dbl, abstats, verify, tile,
-# frame-lin - stop at needWindow() and say so; they drive real ImGui frames and
+# mode). The five without it - browse-keys, browse-dbl, abstats, verify, tile
+# - stop at needWindow() and say so; they drive real ImGui frames and
 # assert on the LAYOUT that comes back, which is exactly what the backends the
 # window carries are what produce.
 #
@@ -462,6 +462,12 @@ set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" T
 # `viewer --roistats-selftest --no-window`, byte-identical, no exceptions, which
 # is why its dump prints numbers and no rectangles.
 viewer_selftest(series      NOGL --series-selftest tools/testdata/linset)
+# The Series Analysis panel's contract (docs/analysis-layers.md §3.3, 判断
+# record 7): frame|stack mixed members, per-member folds with the sum refusal,
+# the migrated fit window/method, and the session round trip. Values and
+# strings only, so NOGL; it writes its own exact fixtures under a scratch
+# subdirectory, the stackavg discipline.
+viewer_selftest(seriespanel NOGL --seriespanel-selftest tools/testdata)
 viewer_selftest(lin         NOGL --lin-selftest --stack always
                             --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
 viewer_selftest(browse      NOGL --browse-selftest tools/testdata/rb)
@@ -550,8 +556,11 @@ viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
 viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
-# F11 draws the Temporal section itself and asserts on the plot geometry.
-viewer_selftest(frame-lin   --frame-lin-selftest tools/testdata)
+# (frame-lin retired with the §3.3 migration: the frame-axis linearity fit
+# lives in the Series Analysis panel now, and selftest.seriespanel above
+# carries its fixture discipline - window inclusion/exclusion, per-plane auto
+# windows, the two methods' predicted disagreement, NaN counting, the ROI
+# convention - at the series layer, where the analysis is.)
 viewer_selftest(newwin      NOGL --newwin-selftest tools/testdata)
 # The 22nd flag, which the scratchpad orchestrator never ran: its fixture
 # (levelfiles/) was hand-made and lived outside the repo. gen_testdata.py

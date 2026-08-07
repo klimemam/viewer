@@ -764,10 +764,22 @@ struct App {
         int kind = KLinearity;
         // value NaN = not set. NEVER treated as 0 - it is left out of the fit
         // and reads as "unset" on screen.
+        //
+        // Members are frame | stack MIXED (docs/analysis-layers.md §3.3,
+        // 判断record 7): a member is EITHER a stack (seqId != 0) OR a
+        // standalone frame (frameUid != 0), never both. A stack member stands
+        // in as a frame through §3.2's fold, DECLARED per member in `fold`;
+        // the fit itself takes mean statistics only - a sum is n x the mean's
+        // scale, so with differing n the points are different quantities, and
+        // a sum-standing member REFUSES the fit out loud instead of entering
+        // it. frameUid/fold ride AFTER include so the existing aggregate
+        // initializers ({ seqId, value, include }) keep their meaning.
         struct Member {
             int seqId = 0;
             double value = std::numeric_limits<double>::quiet_NaN();
             bool include = true;
+            uint64_t frameUid = 0;    // standalone frame member (seqId == 0)
+            int fold = 0;             // StackFold a stack member stands as
         };
         std::vector<Member> members;  // order = display order (sorting is a button)
     };
@@ -906,9 +918,39 @@ struct App {
             int frames = 0, nPl = 1;
             double mean[4] = {}, sigmaT[4] = {};
             std::string err;
+            // frame | stack mixed members (§3.3): a frame member's row keys on
+            // the doc's uid (seqId stays 0), carries the frame's spatial mean,
+            // and has NO sigma_t - the canon forbids printing one for a frame
+            // (σ_t is a stack's attribute). hasSigma marks rows whose sigma_t
+            // column, PTC point and SNR point exist at all.
+            uint64_t uid = 0;             // frame member: the doc it measured
+            bool isFrame = false;
+            bool hasSigma = false;        // stack with >= 2 frames
+            int fold = 0;                 // the member's declared StackFold
+            uint64_t nonFinite = 0;       // NaN samples excluded (§3.2 warning)
         };
         std::vector<Row> rows;
         int seriesId = 0;                 // the series these rows describe
+        // ---- fit settings, the frame-linearity machinery in its series-layer
+        // home (§3.3 migration; board row 104). Session-persisted ("seriespanel"
+        // line) - the interim tool's settings were not, which was half of the
+        // 暫定. Defaults reproduce the panel's historic fit exactly: no window,
+        // ordinary least squares.
+        int fitMethod = 0;                // 0 = OLS, 1 = relative-weighted (rev4-style)
+        int winMode = 0;                  // 0 = all points, 1 = auto 5..95%, 2 = manual
+        double winLo = 0, winHi = 0;      // manual window [DN]
+        // what the window DID at Compute time, per plane - the screen and the
+        // export state the applied window, never the setting alone
+        double winPlaneLo[4] = {}, winPlaneHi[4] = {};
+        int nFit[4] = {};                 // points the fit actually used, per plane
+        bool planeFit[4] = {};            // THIS compute fitted the plane - without
+                                          // it a refused plane's row would print the
+                                          // previous compute's numbers as its own
+        int nZero = 0;                    // in-window |mean|~0 points rev4-style dropped
+        // Non-empty: Compute REFUSED to fit and this is the sentence, verbatim
+        // on screen (§3.3: a sum-standing member is refused BEFORE running -
+        // stated, never coerced to a mean it was not declared as).
+        std::string refusal;
         // NOT the unit of any measurement: the PREFILL a newly created series
         // starts from (prefs key linunit, unchanged). What gets printed on an
         // axis comes from Series::unit, and empty there means "not set" - it
@@ -923,7 +965,7 @@ struct App {
         double ptcK[4] = {}, ptcRead2[4] = {}, readDN[4] = {};
         uint64_t rev = 0, computedRev = 0;
     } lin;
-    bool showLinearity = false;
+    bool showSeriesAnalysis = false;
     // Create / edit a series. ONE modal for both: the fields are identical and
     // "edit" is only "create with the boxes already ticked". The value column
     // is a SUGGESTION the user confirms - see drawSeriesModal.
@@ -937,6 +979,12 @@ struct App {
         int kind = Series::KLinearity;
         struct Row {
             int seqId = 0;
+            // frame | stack mixed (§3.3): a row is EITHER a stack (seqId) or a
+            // standalone frame (uid), exactly like the member it becomes. fold
+            // is carried through Save untouched - the modal does not edit it
+            // (the panel's member table does), but Save must not reset it.
+            uint64_t uid = 0;
+            int fold = 0;                 // StackFold (stack rows only)
             bool check = true;
             // TEXT, not a double: "" has to stay distinguishable from 0, and a
             // numeric box cannot be empty. Parsed on accept; empty = NaN = unset.
@@ -1170,7 +1218,13 @@ struct App {
         int kind = 0;
         int badValues = 0;                // value fields the parser could not read
         int truncated = 0;                // member lines cut before their path
-        struct M { double value; bool include; std::string path; };
+        // kind: 0 = stack standing as mean ("seriesmember"), 1 = stack
+        // standing as sum ("seriessum"), 2 = standalone frame ("seriesframe").
+        // Three KEYS, not one key plus flags (the stackavg/stacksum rule): an
+        // older viewer skips lines it does not know, so a sum declaration or a
+        // frame member simply does not come back there - the right failure -
+        // instead of a flag being dropped and a sum quietly reading as a mean.
+        struct M { double value; bool include; std::string path; int kind = 0; };
         std::vector<M> members;
     };
     std::vector<SeriesRestore> seriesRestore;

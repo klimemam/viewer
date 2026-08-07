@@ -292,10 +292,14 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 |---|---|
 | フォルダを開くとき | Select stacks の **「open as a sweep (creates a series)」**。別スタックが 2 つ以上選ばれているときだけ出ます。チェックするとパラメータ名と単位の欄が現れ、各行に**名前から読めた値のプレビュー**(`-> 100 lx`)が付きます。読めない行は琥珀色で `-> no value in the name`。**「トップフォルダ毎に batch」とは排他**です(series は 1 つの batch に収まるため) |
 | 開いた後 | Files で stack を**右クリック > Series ▸**。同じ batch の series 一覧(参加したときに付く値も出ます)、`New series...`、`Remove from this series`。別 batch の series は選べず、「先に Move to batch」と理由が出ます |
-| Linearity パネル | series が 0 個のときの空状態にある「Create a series from this batch's stacks...」、あるいは `New...` / `Edit...`。**このパネルは既定で出ていません** —— `View > Panels > Linearity` で出します |
+| Series Analysis パネル(旧 Linearity) | series が 0 個のときの空状態にある「Create a series from this batch's stacks...」、あるいは `New...` / `Edit...`。**このパネルは既定で出ていません** —— `View > Panels > Series Analysis` で出します |
 
-作成と編集は**同じモーダル**です: 名前 / パラメータ / 単位 / 種類 と、対象 batch の stack 一覧
-(チェック・値・読み取り元・`^` `v` の並べ替え・「Sort by value」)。
+作成と編集は**同じモーダル**です: 名前 / パラメータ / 単位 / 種類 と、対象 batch の stack と
+単発 frame の一覧(チェック・値・読み取り元・`^` `v` の並べ替え・「Sort by value」)。
+メンバは **stack と frame の混在可**(正典どおり)で、stack メンバは Series Analysis
+パネルの「as」列で宣言した畳み方(mean / sum)により 1 点に立ちます —— フィットに
+入るのは mean 統計だけで、sum 立ちのメンバが含まれているとフィットは実行せずに
+理由を言います。
 
 - **単位の既定は空**です。空のままでも series は作れ、メンバごとの平均も出ますが、
   **フィットは出ません** —— 「DN / 何」が決まらないものに感度は書けないからです。
@@ -372,7 +376,7 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
   全画素を取りに行きます。**プレビューの間は ROI / ピンを置けません**
 - **Files に複数選択がありません。** 「stack を複数選んで Group as series」という経路が
   無いのはこれが理由で、開いた後に series へ入れるのは右クリック > Series ▸ から 1 本ずつです
-- **リニアリティパネルが式を持っているのは linearity と PTC の 2 種類だけ**です。
+- **Series Analysis パネルが式を持っているのは linearity と PTC の 2 種類だけ**です。
   temperature / other の series はメンバごとの平均までは出しますが、フィットは出しません
   (画面でそう言います)。式の無い量は印字しません
 - **1 つの stack は高々 1 つの series にしか属せません**(当面の制限。表示と操作が一意に決まるように)

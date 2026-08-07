@@ -3,7 +3,7 @@
 「Measure メニュー以下の項目や使い勝手、結果の提示が若干寂しい」への回答。
 このファイルが理想の定義で、実装はここに書いた順序と理由に従う。
 対象は Measure メニュー / Analysis パネル / 結果グリッド / カーブプロット。
-Linearity 機能・remote/ssh 系・README は対象外(別導線で構築中)。
+Series Analysis(旧 Linearity)機能・remote/ssh 系・README は対象外(別導線で構築中)。
 
 ## 原則 — 測定ツールの結果は「それ単体で証拠になる」こと
 
@@ -101,4 +101,4 @@ Linearity 機能・remote/ssh 系・README は対象外(別導線で構築中)�
   この2型の上の汎用装飾である。
 - **params_schema**(測定パラメータの宣言 UI)は ABI v2 の未実装項目の
   まま。今回の装飾はパラメータを持たないので依存しない。
-- **Linearity / remote 系 / README.md** には触れない。
+- **Series Analysis(旧 Linearity)/ remote 系 / README.md** には触れない。

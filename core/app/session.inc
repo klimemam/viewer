@@ -81,6 +81,14 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
       << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
+    // Series Analysis panel settings (docs/analysis-layers.md §3.3 migration;
+    // board row 104's 「設定のセッション未保存」): the fit method and window are
+    // part of what a printed number MEANT, so they travel with the session
+    // like every other panel's settings. tablePlane and the SNR dB toggle
+    // ride along - same panel, same line.
+    f << "seriespanel " << app.lin.tablePlane << " " << (app.lin.snrDb ? 1 : 0) << " "
+      << app.lin.fitMethod << " " << app.lin.winMode << " "
+      << app.lin.winLo << " " << app.lin.winHi << "\n";
     // "npyaxis" used to sit here: one global reading for a whole session
     // (§3.4). Its successor is the per-image "npyread" line below, so nothing
     // global is written any more. An OLD session's npyaxis is skipped like any
@@ -96,7 +104,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "panels " << (app.showFiles ? 1 : 0) << " " << (app.showInspector ? 1 : 0) << " "
       << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
-      << (app.showProjection ? 1 : 0) << " " << (app.showLinearity ? 1 : 0) << " "
+      << (app.showProjection ? 1 : 0) << " " << (app.showSeriesAnalysis ? 1 : 0) << " "
       << (app.showRemote ? 1 : 0) << "\n";
     // Browse places (docs/todo-open.md item 10, user decision A5: auto-
     // reconnect): one "rbplace <num> <url>" line per instance that stands
@@ -285,15 +293,33 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         f << "seriesunit " << S.unit << "\n";          // empty line = unit not set
         f << "serieskind " << S.kind << "\n";
         for (const auto& m : S.members) {
-            std::vector<int> fr = framesOfSeq(m.seqId);
-            if (fr.empty()) { lostMembers++; continue; }
-            f << "seriesmember ";
+            // Three keys, not one key plus flags (the stackavg/stacksum rule,
+            // see App::SeriesRestore::M): a stack standing as mean keeps the
+            // historic "seriesmember", a stack standing as sum is "seriessum"
+            // - so the same line can never bring back a different QUANTITY -
+            // and a frame member is "seriesframe", travelling by ITS OWN path
+            // (the key a stack member's first frame already uses).
+            const char* key2 = "seriesmember ";
+            std::string path;
+            if (m.seqId != 0) {
+                std::vector<int> fr = framesOfSeq(m.seqId);
+                if (fr.empty()) { lostMembers++; continue; }
+                path = app.images[fr.front()]->src->path;
+                if (m.fold == FOLD_SUM) key2 = "seriessum ";
+            } else {
+                // a computed frame (frame average) has no file, so it cannot
+                // be written - counted, like every loss this format admits to
+                const ImageDoc* fd = frameMemberDoc(m.frameUid);
+                if (!fd || fd->src->path.empty()) { lostMembers++; continue; }
+                path = fd->src->path;
+                key2 = "seriesframe ";
+            }
+            f << key2;
             // EXACTLY, not to the file-wide 9 digits: this is the axis a fit is
             // taken against, and the modal no longer rounds it either.
             if (std::isfinite(m.value)) f << fmtExact(m.value);
             else f << "-";                             // "-" = unset, NOT zero
-            f << " " << (m.include ? 1 : 0) << " "
-              << app.images[fr.front()]->src->path << "\n";   // path last: spaces
+            f << " " << (m.include ? 1 : 0) << " " << path << "\n";   // path last: spaces
         }
         f << "seriesend\n";
     }
@@ -319,7 +345,8 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         f << "seriesunit " << R.unit << "\n";
         f << "serieskind " << R.kind << "\n";
         for (const auto& m : R.members) {
-            f << "seriesmember ";
+            f << (m.kind == 2 ? "seriesframe " : m.kind == 1 ? "seriessum "
+                                                             : "seriesmember ");
             if (std::isfinite(m.value)) f << fmtExact(m.value);
             else f << "-";
             f << " " << (m.include ? 1 : 0) << " " << m.path << "\n";
@@ -1385,6 +1412,17 @@ static std::string loadSession(const std::string& path) {
             if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
         }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
+        else if (key == "seriespanel") {   // Series Analysis panel settings (§3.3)
+            int tp = 0, db = 0, fm = 0, wm = 0;
+            double lo = 0, hi = 0;
+            ls >> tp >> db >> fm >> wm >> lo >> hi;
+            app.lin.tablePlane = std::clamp(tp, 0, 3);
+            app.lin.snrDb = db != 0;
+            app.lin.fitMethod = std::clamp(fm, 0, 1);
+            app.lin.winMode = std::clamp(wm, 0, 2);
+            if (std::isfinite(lo)) app.lin.winLo = lo;
+            if (std::isfinite(hi)) app.lin.winHi = hi;
+        }
         // "npyaxis" is deliberately NOT parsed any more (§3.4): the flag it
         // restored no longer exists, and an old session's value falls through
         // the chain like any unknown key rather than being half-honoured.
@@ -1411,7 +1449,7 @@ static std::string loadSession(const std::string& path) {
             ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2 >> h2 >> i2;
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
-            app.showProjection = g2 != 0; app.showLinearity = h2 != 0; app.showRemote = i2 != 0;
+            app.showProjection = g2 != 0; app.showSeriesAnalysis = h2 != 0; app.showRemote = i2 != 0;
         }
         else if (key == "rbplace") {
             // "<num> <url>": where a Browse instance stood (item 10, A5).
@@ -1435,6 +1473,11 @@ static std::string loadSession(const std::string& path) {
                 size_t p;
                 while ((p = ini.find("[Window][Remote]")) != std::string::npos)
                     ini.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+                // ...and before "Linearity" -> "Series Analysis###Linearity"
+                // (docs/analysis-layers.md §3.3 renamed the panel): same rule
+                while ((p = ini.find("[Window][Linearity]")) != std::string::npos)
+                    ini.replace(p, strlen("[Window][Linearity]"),
+                                "[Window][Series Analysis###Linearity]");
             }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);
@@ -1578,7 +1621,9 @@ static std::string loadSession(const std::string& path) {
         else if (key == "serieskind") {
             if (curSeries >= 0) { int k = 0; ls >> k; app.seriesRestore[curSeries].kind = k; }
         }
-        else if (key == "seriesmember") {   // "<value|-> <0|1> <path of frame 0>"
+        else if (key == "seriesmember" || key == "seriessum" || key == "seriesframe") {
+            // "<value|-> <0|1> <path>". Three keys, one shape: a stack member
+            // standing as mean / as sum, and a standalone frame member (§3.3).
             // Both fields as TEXT. A value this program cannot read is UNSET,
             // not 0: atof() turns "notanumber", "1e" or a half-written line into
             // a hard measurement at zero, which the fit then treats as the dark
@@ -1599,7 +1644,8 @@ static std::string loadSession(const std::string& path) {
             } else {
                 double val = parseSeriesValue(v.c_str());
                 if (v != "-" && !std::isfinite(val)) app.seriesRestore[curSeries].badValues++;
-                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p });
+                int mk = key == "seriessum" ? 1 : key == "seriesframe" ? 2 : 0;
+                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p, mk });
             }
         }
         else if (key == "linunit") { std::string u = restOfLine(ls);

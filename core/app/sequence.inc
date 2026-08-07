@@ -603,6 +603,21 @@ static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
     return any;
 }
 
+// The frame twin: the STANDALONE frame a "seriesframe" member names, by its
+// own path. Same disambiguation shape as seqIdOfFirstFramePath - prefer the
+// series' batch, never a doc an earlier member already claimed.
+static uint64_t uidOfFramePath(const std::string& path, int preferBatch,
+                               const std::vector<uint64_t>& taken) {
+    uint64_t any = 0;
+    for (const auto& d : app.images) {
+        if (d->seqId != 0 || d->preview || d->src->path != path) continue;
+        if (std::find(taken.begin(), taken.end(), d->uid) != taken.end()) continue;
+        if (preferBatch && d->batchId == preferBatch) return d->uid;
+        if (!any) any = d->uid;
+    }
+    return any;
+}
+
 // Turn what the session file said into real series. Runs once, when every
 // stack the file asked for exists - a member cannot be looked up before then.
 // Members that cannot be found are COUNTED and reported: silently dropping
@@ -619,6 +634,7 @@ static void resolveSeriesRestore() {
     // worse - the later one STOLE the earlier one's stacks, pruneEmptySeries
     // deleted what was left of it, and `made` had already counted it.
     std::vector<int> taken;
+    std::vector<uint64_t> takenU;   // frame members claim docs the same way
     for (const auto& R : app.seriesRestore) {
         badValues += R.badValues;
         lost += R.truncated;        // cut before its path: never became a member
@@ -627,11 +643,26 @@ static void resolveSeriesRestore() {
         if (!bid) { lostSeries++; lost += (int)R.members.size(); continue; }
         std::vector<App::Series::Member> ms;
         for (const auto& m : R.members) {
+            if (m.kind == 2) {      // a standalone frame member (§3.3)
+                uint64_t u = uidOfFramePath(m.path, bid, takenU);
+                const ImageDoc* fd = u ? frameMemberDoc(u) : nullptr;
+                // strict containment survives the round trip too, or not at all
+                if (!fd || fd->batchId != bid) { lost++; continue; }
+                takenU.push_back(u);
+                App::Series::Member mm;
+                mm.frameUid = u;
+                mm.value = m.value;
+                mm.include = m.include;
+                ms.push_back(mm);
+                continue;
+            }
             int sid = seqIdOfFirstFramePath(m.path, bid, &taken);
-            // strict containment survives the round trip too, or not at all
             if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
             taken.push_back(sid);
             ms.push_back({ sid, m.value, m.include });
+            // the declared fold comes back as declared: a sum reloaded as a
+            // mean would be a different quantity under the same member line
+            if (m.kind == 1) ms.back().fold = FOLD_SUM;
         }
         if (ms.empty()) { lostSeries++; continue; }
         int id = newSeries(bid, R.name);
@@ -641,8 +672,13 @@ static void resolveSeriesRestore() {
         // makes impossible (closeAll) and which nothing else in the program
         // arranges.
         for (const auto& m : ms) {
-            App::Series* other = seriesOfStack(m.seqId);
-            if (other && other->id != id) removeFromSeries(m.seqId);
+            if (m.seqId != 0) {
+                App::Series* other = seriesOfStack(m.seqId);
+                if (other && other->id != id) removeFromSeries(m.seqId);
+            } else {
+                App::Series* other = seriesOfFrame(m.frameUid);
+                if (other && other->id != id) removeFrameFromSeries(m.frameUid);
+            }
         }
         if (App::Series* S = seriesById(id)) {
             S->paramName = R.paramName;

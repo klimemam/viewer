@@ -289,219 +289,13 @@ static bool applyFrameAxis(int seqId, const char* name, const char* unit,
     return applyFrameAxisVals(seqId, nm, un, std::move(vals), err);
 }
 
-// ---- frame-wise linearity (interim) -----------------------------------------
-// Fits the per-frame means of ONE stack against its custom frame axis: the
-// frames were captured under a swept quantity (exposure, illumination...), the
-// pasted axis IS that quantity, and the deviation from a straight line is the
-// measurement.
-//
-// Relationship: this is NOT the Linearity panel's fit. linRecompute fits a
-// SERIES - one point per STACK, x = the series' level, the dark handled by the
-// level-0 member's rule. This fits one point per FRAME of a single stack,
-// x = the frame axis, and nothing is dark-subtracted: the offset b is absorbed
-// by the fit and REPORTED. Different objects, deliberately not entangled.
-//
-// Naming (docs/todo-open.md item 16, B1+B3): the layer is named ("frame
-// axis"), and nothing here claims EMVA 1288. The fit window is EMVA-STYLE
-// (fit only where the response can be linear, classically 5..95% of
-// saturation), the rev4-style method matches Release 4's published approach
-// as best understood - NOT verified against the standard text - and every
-// label says "-style".
-struct FrameLinData {
-    int nPl = 1;
-    bool cfa = false;
-    bool roiUsed = false;
-    int rx = 0, ry = 0, rw = 0, rh = 0;    // the region the means describe
-    int resident = 0, expected = 0;        // n of N honesty
-    int skipped = 0;                       // frames not resident (previews lie)
-    uint64_t nonFinite = 0;                // samples EXCLUDED, and counted
-    struct Pt {
-        int frame = 0;                     // seqIndex - the mapping's primary key
-        double x = 0;                      // the frame axis value
-        double mean[4] = {};
-        bool has[4] = {};                  // plane p had >= 1 finite sample
-    };
-    std::vector<Pt> pts;                   // resident frames, seqIndex order
-};
-// Full-pixel scan of the region, per plane, planes never mixed - the same walk
-// (and the same ROI convention: selected rect, else whole frame) as
-// exportPerFrameBlock, without the profile columns it also carries.
-static FrameLinData frameLinCollect(int seqId, const FrameAxis& ax) {
-    FrameLinData D;
-    int rx = 0, ry = 0, rw = 0, rh = 0;
-    if (App::Ann* a = findAnn(app.selectedAnn))
-        if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; D.roiUsed = true; }
-    std::vector<int> fr = framesOfSeq(seqId);
-    for (int idx : fr) {
-        const ImageDoc* d = app.images[idx].get();
-        if (d->px().empty() || d->src->remoteStep > 1) { D.skipped++; continue; }
-        int W = d->w, H = d->h, C = d->ch;
-        int x0 = std::clamp(rx, 0, W - 1), y0 = std::clamp(ry, 0, H - 1);
-        int ww = rw <= 0 ? W - x0 : std::min(rw, W - x0);
-        int hh = rh <= 0 ? H - y0 : std::min(rh, H - y0);
-        if (D.pts.empty()) {                       // region + planes from frame 1
-            D.cfa = d->cfa != 0;
-            D.nPl = D.cfa ? 4 : std::min(C, 4);
-            D.rx = x0; D.ry = y0; D.rw = ww; D.rh = hh;
-        }
-        double sum[4] = {};
-        size_t cnt[4] = {};
-        for (int y = 0; y < hh; y++) {
-            const float* row = &d->px()[((size_t)(y0 + y) * W + x0) * C];
-            for (int x = 0; x < ww; x++)
-                for (int c = 0; c < C; c++) {
-                    int p = D.cfa ? cfaChannelAt(*d, x0 + x, y0 + y)
-                                  : std::min(c, D.nPl - 1);
-                    double v = row[(size_t)x * C + c];
-                    if (!std::isfinite(v)) { D.nonFinite++; continue; }
-                    sum[p] += v; cnt[p]++;
-                }
-        }
-        FrameLinData::Pt q;
-        q.frame = d->seqIndex;
-        q.x = ax.at(d->seqIndex);
-        for (int p = 0; p < D.nPl; p++) {
-            q.has[p] = cnt[p] > 0;
-            q.mean[p] = cnt[p] ? sum[p] / (double)cnt[p] : 0.0;
-        }
-        D.pts.push_back(q);
-        D.resident++;
-    }
-    App::SeqInfo* si = seqInfo(seqId);
-    D.expected = std::max(si ? si->expectedFrames : 0, D.resident + D.skipped);
-    return D;
-}
-
-// The fit METHODS. Both share the window, the exclusion rules and the
-// per-plane discipline; the method only changes what the fit stage minimises.
-//   0  windowed OLS (3.1-style):          min sum (y_i - a*x_i - b)^2
-//   1  relative-weighted LS (rev4-style): min sum ((y_i - a*x_i - b)/y_i)^2
-//      - a weighted least squares (w_i = 1/y_i^2) in which bright points no
-//        longer dominate absolutely. Matches EMVA 1288 Release 4's published
-//        approach as best understood; NOT verified against the standard text -
-//        do not cite as EMVA 1288 compliant.
-// No through-origin variant: forcing b = 0 is dark subtraction by another
-// name, which this interim tool explicitly does not do (b is reported).
-static const char* FRAMELIN_METHODS[2] = { "windowed OLS (3.1-style)",
-                                           "relative-weighted LS (rev4-style)" };
-
-// least squares y = a*x + b with per-point weights; r2 is the weighted R^2.
-// A sibling of linFit, not a change to it: the series fit keeps its own path.
-static bool linFitWeighted(const std::vector<double>& xs, const std::vector<double>& ys,
-                           const std::vector<double>& ws, double& a, double& b, double& r2) {
-    size_t n = xs.size();
-    if (n < 2) return false;
-    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (size_t i = 0; i < n; i++) {
-        sw += ws[i]; sx += ws[i] * xs[i]; sy += ws[i] * ys[i];
-        sxx += ws[i] * xs[i] * xs[i]; sxy += ws[i] * xs[i] * ys[i];
-    }
-    if (!(sw > 0)) return false;
-    double d = sw * sxx - sx * sx;
-    // relative degeneracy test: 1/y^2 weights make the ABSOLUTE determinant
-    // tiny on perfectly good data
-    if (fabs(d) <= 1e-12 * std::max(sw * sxx, sx * sx)) return false;
-    a = (sw * sxy - sx * sy) / d;
-    b = (sy - a * sx) / sw;
-    double ym = sy / sw, sst = 0, ssr = 0;
-    for (size_t i = 0; i < n; i++) {
-        double e = ys[i] - (a * xs[i] + b);
-        ssr += ws[i] * e * e;
-        sst += ws[i] * (ys[i] - ym) * (ys[i] - ym);
-    }
-    r2 = sst > 1e-12 ? 1.0 - ssr / sst : 1.0;
-    return true;
-}
-
-struct FrameLinFit {
-    bool valid = false;
-    int nWin = 0;                // points inside the window
-    int nIn = 0;                 // ...of which the fit actually used
-    int nZero = 0;               // in-window points rev4-style dropped (|y| ~ 0)
-    double ylo = 0, yhi = 0;     // the window actually applied to this plane
-    double a = 0, b = 0, r2 = 0; // slope [DN per axis unit], offset [DN]
-    double leMaxPos = 0, leMaxNeg = 0;   // signed LE extremes over fitted points
-    int framePos = -1, frameNeg = -1;    // ...and whose frames they are
-};
-static FrameLinFit frameLinFitPlane(const FrameLinData& D, int p, int method,
-                                    bool manual, double mlo, double mhi) {
-    FrameLinFit F;
-    if (manual) { F.ylo = std::min(mlo, mhi); F.yhi = std::max(mlo, mhi); }
-    else {
-        // AUTO, EMVA-style: 5..95% of this PLANE's max observed per-frame mean.
-        // There is no saturation measurement here - the max observed mean
-        // stands in for it, and the label says which rule was used.
-        double ymax = -DBL_MAX;
-        for (const auto& q : D.pts) if (q.has[p]) ymax = std::max(ymax, q.mean[p]);
-        if (ymax == -DBL_MAX) return F;
-        F.ylo = 0.05 * ymax;
-        F.yhi = 0.95 * ymax;
-    }
-    std::vector<double> xs, ys, ws;
-    std::vector<int> frames;
-    for (const auto& q : D.pts) {
-        if (!q.has[p] || q.mean[p] < F.ylo || q.mean[p] > F.yhi) continue;
-        F.nWin++;
-        if (method == 1 && fabs(q.mean[p]) < 1e-12) { F.nZero++; continue; }
-        xs.push_back(q.x);
-        ys.push_back(q.mean[p]);
-        ws.push_back(method == 1 ? 1.0 / (q.mean[p] * q.mean[p]) : 1.0);
-        frames.push_back(q.frame);
-    }
-    F.nIn = (int)xs.size();
-    // 3 fitted points minimum: 2 points fit ANY line exactly and would report
-    // a flawless LE for arbitrarily bent data
-    if (F.nIn < 3) return F;
-    if (!linFitWeighted(xs, ys, ws, F.a, F.b, F.r2)) return F;
-    F.valid = true;
-    for (size_t i = 0; i < xs.size(); i++) {
-        double fit = F.a * xs[i] + F.b;
-        if (fabs(fit) < 1e-9) continue;
-        double le = 100.0 * (ys[i] - fit) / fit;   // against the FIT, never the y mean
-        if (le > F.leMaxPos) { F.leMaxPos = le; F.framePos = frames[i]; }
-        if (le < F.leMaxNeg) { F.leMaxNeg = le; F.frameNeg = frames[i]; }
-    }
-    return F;
-}
-
-// The one sentence both the panel and the export print about the window - one
-// source, so the screen and a pasted document can never disagree.
-static std::string frameLinWindowLabel(bool manual, double lo, double hi) {
-    char b[160];
-    if (manual)
-        snprintf(b, sizeof b, "fit window: manual [%.9g, %.9g] DN (all planes)",
-                 std::min(lo, hi), std::max(lo, hi));
-    else
-        snprintf(b, sizeof b, "fit window: auto = 5%%..95%% of each plane's max "
-                              "observed mean");
-    return b;
-}
-
-// The section's settings. File-scope, not function-static: the export builder
-// reads them too (a pasted document must state the window and the method that
-// were in force), and the selftest drives them. `open` is the collapsing
-// state, owned here so the panel and the selftest flip the same switch.
-struct FrameLinCfg {
-    bool open = false;
-    int method = 0;              // index into FRAMELIN_METHODS
-    bool manual = false;
-    double ylo = 0, yhi = 0;     // manual window [DN]
-};
-static FrameLinCfg g_frameLin;
-
-// What the section decided to show, for the selftest: this machine cannot
-// screenshot GL, so "the section is on screen" is an assertion on state.
-struct FrameLinProbe {
-    int state = 0;               // 0 not reached, 1 no axis, 2 too few frames, 3 drawn
-    int nPl = 0, nPts = 0;
-    int nIn[4] = {};
-    bool valid[4] = {};
-    bool plotMean = false, plotResid = false;
-    float plotBot = 0, winBot = 0;
-    float availBefore = 0, half = 0;     // the height budget the plots divided
-    char window[160] = {};
-};
-static FrameLinProbe g_flin;
+// ---- frame-wise linearity: MIGRATED (docs/analysis-layers.md §3.3) --------
+// The interim "Linearity (frame axis)" section lived here while the series
+// layer could not hold it. It can now: a swept capture is a series by
+// definition, so the fit - window, OLS / rev4-style methods, settings in the
+// session - lives in the Series Analysis panel, over frame | stack mixed
+// members. The frame axis KEEPS its monitor role in this panel (the per-frame
+// mean curve below), which is all §3.3 leaves at the stack layer.
 
 // ---- Temporal export: one document, two sinks (docs/export-design.md) -------
 // A CSV/TSV document under construction. ONE builder produces the cells; the
@@ -659,96 +453,6 @@ static void copyPerFrameStats(int seqId) {
              r.skipped ? " - " : "",
              r.skipped ? (std::to_string(r.skipped) + " not resident").c_str() : "");
     toast(b, r.skipped != 0);
-}
-
-// ---- export section: frame-wise linearity -----------------------------------
-// Rides at the tail of the unified Temporal export (bulk last, like the
-// per-frame section) when the feature has something to say for the CURRENT
-// stack: a usable custom axis and >= 3 measured frames. Side A only for the
-// interim - the compare sides keep their per-frame blocks and nothing else.
-// Gated on the DATA, never on whether the panel section happens to be
-// expanded: a collapsed section describes the same measurement.
-static void frameLinExportSection(ExportDoc& doc, const ImageDoc* d) {
-    if (!d || d->seqId == 0) return;
-    const FrameAxis ax = frameAxisOf(d->seqId);
-    if (!ax.custom) return;
-    FrameLinData D = frameLinCollect(d->seqId, ax);
-    if ((int)D.pts.size() < 3) return;
-    FrameLinFit F[4];
-    for (int p = 0; p < D.nPl; p++)
-        F[p] = frameLinFitPlane(D, p, g_frameLin.method, g_frameLin.manual,
-                                g_frameLin.ylo, g_frameLin.yhi);
-    doc.comment("== frame linearity (side A: per-frame means vs the frame axis; "
-                "interim) ==");
-    doc.comment("method: " + std::string(FRAMELIN_METHODS[g_frameLin.method]) +
-                "  -  EMVA-style window, own naming; NOT an EMVA 1288 compliance "
-                "claim (rev4-style matches Release 4's published approach as best "
-                "understood; not verified against the standard text)");
-    char b[320];
-    if (D.roiUsed) snprintf(b, sizeof b, "region: ROI (%d,%d) %dx%d", D.rx, D.ry, D.rw, D.rh);
-    else snprintf(b, sizeof b, "region: whole frame (%dx%d)", D.rw, D.rh);
-    doc.comment(std::string(b) + "  |  x: " + ax.name + " [" + ax.unit + "]  |  " +
-                frameLinWindowLabel(g_frameLin.manual, g_frameLin.ylo, g_frameLin.yhi));
-    snprintf(b, sizeof b, "resident %d of %d frame(s); non-finite samples "
-                          "(excluded) = %llu",
-             D.resident, D.expected, (unsigned long long)D.nonFinite);
-    doc.comment(b);
-    doc.comment(std::string("fit: y = a*x + b over in-window points (") +
-                (g_frameLin.method == 1
-                     ? "minimising sum ((y_i - a*x_i - b)/y_i)^2"
-                     : "ordinary least squares") +
-                "); LE_i = 100*(y_i - fit_i)/fit_i; offset b is reported, not "
-                "subtracted - dark subtraction is the series linearity's job");
-    doc.row({ "plane", "window lo [DN]", "window hi [DN]", "n fit",
-              std::string("slope a [DN/") + ax.unit + "]", "offset b [DN]", "R^2",
-              "LE_max+ [%]", "LE_max- [%]" });
-    for (int p = 0; p < D.nPl; p++) {
-        const FrameLinFit& f = F[p];
-        std::string pl = D.nPl > 1 ? LIN_PLANES[p] : "all";
-        if (f.valid)
-            doc.row({ pl, expNum(f.ylo), expNum(f.yhi), std::to_string(f.nIn),
-                      expNum(f.a), expNum(f.b), expNum(f.r2),
-                      expNum(f.leMaxPos), expNum(f.leMaxNeg) });
-        else {
-            doc.row({ pl, expNum(f.ylo), expNum(f.yhi), std::to_string(f.nIn),
-                      "-", "-", "-", "-", "-" });
-            snprintf(b, sizeof b, "plane %s: fit refused - %d in-window point(s), "
-                                  "3 required", pl.c_str(), f.nIn);
-            doc.comment(b);
-        }
-        if (f.nZero) {
-            snprintf(b, sizeof b, "plane %s: %d in-window point(s) at |mean| ~ 0 "
-                                  "dropped by the relative-weighted fit",
-                     pl.c_str(), f.nZero);
-            doc.comment(b);
-        }
-    }
-    // the per-frame rows: the second rectangle. Out-of-window frames are
-    // PRESENT and flagged 0 - a hidden exclusion is a lie.
-    doc.comment("-- per-frame rows (in_window: 1 = inside the fit window, "
-                "0 = excluded from the fit but listed) --");
-    std::vector<std::string> h = { "frame", ax.name + " [" + ax.unit + "]" };
-    for (int p = 0; p < D.nPl; p++) {
-        std::string sfx = D.nPl > 1 ? std::string("_") + LIN_PLANES[p] : std::string();
-        h.push_back("mean" + sfx + " [DN]");
-        h.push_back("LE" + sfx + " [%]");
-        h.push_back("in_window" + sfx);
-    }
-    doc.row(h);
-    for (const auto& q : D.pts) {
-        std::vector<std::string> r = { std::to_string(q.frame), expNum(q.x) };
-        for (int p = 0; p < D.nPl; p++) {
-            const FrameLinFit& f = F[p];
-            if (!q.has[p]) { r.push_back("-"); r.push_back("-"); r.push_back("-"); continue; }
-            r.push_back(expNum(q.mean[p]));
-            double fit = f.valid ? f.a * q.x + f.b : 0.0;
-            r.push_back(f.valid && fabs(fit) > 1e-9
-                            ? expNum(100.0 * (q.mean[p] - fit) / fit)
-                            : std::string("-"));
-            r.push_back(q.mean[p] >= f.ylo && q.mean[p] <= f.yhi ? "1" : "0");
-        }
-        doc.row(r);
-    }
 }
 
 // One side's temporal numbers, wherever they came from. The A/B table takes
@@ -1096,11 +800,9 @@ static std::string buildTemporalExport(char delim) {
         else doc.comment("(no resident frames)");
     }
 
-    // ---- section 4: frame-wise linearity (interim; the current stack only) --
-    // Emitted only when the feature is active for side A (custom axis + >= 3
-    // measured frames) - an inactive feature adds no section, so the older
-    // three-section shape survives byte for byte.
-    frameLinExportSection(doc, sides[0].doc);
+    // (the frame-linearity section rode here until §3.3 moved the analysis
+    // to the Series Analysis panel; the per-frame rows above keep carrying
+    // the frame axis, which is the monitor role the axis retains)
     return doc.out;
 }
 
@@ -1796,285 +1498,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (tooNarrow) abNarrowNote();
 }
 
-// ---- the "Linearity (frame axis)" section of the Temporal panel -------------
-// Interim frame-wise linearity (see the FrameLinData block for what it is and
-// is not). Single-stack view only: the compare layouts keep their chart, and
-// the section keeps out of their height budget entirely.
-static void drawFrameLinSection(ImageDoc* im) {
-    g_flin = FrameLinProbe{};
-    g_flin.winBot = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
-    const FrameAxis ax = frameAxisOf(im->seqId);
-    if (!ax.custom) {
-        // without a real quantity per frame there is nothing to fit against -
-        // the section shows this one line and nothing else
-        g_flin.state = 1;
-        ImGui::TextDisabled("set the x axis first (the \"x axis...\" button above): "
-                            "the fit needs a real quantity per frame.");
-        if (!ax.why.empty()) ImGui::TextColored(AB_AMBER, "%s", ax.why.c_str());
-        return;
-    }
-    FrameLinData D = frameLinCollect(im->seqId, ax);
-    if ((int)D.pts.size() < 3) {
-        g_flin.state = 2;
-        ImGui::TextDisabled("needs >= 3 measured frames (%d resident)", (int)D.pts.size());
-        return;
-    }
-    g_flin.state = 3;
-
-    // ---- controls: method and window ----
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 15);
-    ImGui::Combo("fit method", &g_frameLin.method, FRAMELIN_METHODS, 2);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "windowed OLS (3.1-style): min sum (y - a*x - b)^2 over the window.\n"
-            "relative-weighted LS (rev4-style): min sum ((y - a*x - b)/y)^2 -\n"
-            "matches EMVA 1288 Release 4's published approach as best understood;\n"
-            "NOT verified against the standard text - do not cite either method\n"
-            "as EMVA 1288 compliant. The offset b is absorbed by the fit and\n"
-            "reported - dark subtraction is the series linearity's job\n"
-            "(Linearity panel).");
-    ImGui::Checkbox("manual window", &g_frameLin.manual);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("EMVA-style fit window in DN: points whose mean lies outside\n"
-                          "[lo, hi] are excluded from the FIT but stay on the chart,\n"
-                          "dimmed. auto = 5%%..95%% of each plane's max observed mean.");
-    if (g_frameLin.manual) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
-        ImGui::InputDouble("lo [DN]", &g_frameLin.ylo, 0, 0, "%.6g");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
-        ImGui::InputDouble("hi [DN]", &g_frameLin.yhi, 0, 0, "%.6g");
-    }
-    // the window that is in force, ALWAYS said (shared string with the export)
-    std::string wlab = frameLinWindowLabel(g_frameLin.manual, g_frameLin.ylo, g_frameLin.yhi);
-    ImGui::TextDisabled("%s", wlab.c_str());
-    snprintf(g_flin.window, sizeof g_flin.window, "%s", wlab.c_str());
-
-    // ---- the fits ----
-    FrameLinFit F[4];
-    int nValid = 0, nZero = 0;
-    for (int p = 0; p < D.nPl; p++) {
-        F[p] = frameLinFitPlane(D, p, g_frameLin.method, g_frameLin.manual,
-                                g_frameLin.ylo, g_frameLin.yhi);
-        g_flin.nIn[p] = F[p].nIn;
-        g_flin.valid[p] = F[p].valid;
-        if (F[p].valid) nValid++;
-        nZero += F[p].nZero;
-    }
-    g_flin.nPl = D.nPl;
-    g_flin.nPts = (int)D.pts.size();
-    char hb[160];
-    if (D.roiUsed) snprintf(hb, sizeof hb, "region: ROI (%d,%d) %dx%d",
-                            D.rx, D.ry, D.rw, D.rh);
-    else snprintf(hb, sizeof hb, "region: whole frame (%dx%d)", D.rw, D.rh);
-    if (D.resident < D.expected)
-        ImGui::TextColored(AB_AMBER, "%s  |  n=%d/%d frames (partial stack)",
-                           hb, D.resident, D.expected);
-    else ImGui::TextDisabled("%s  |  n=%d/%d frames", hb, D.resident, D.expected);
-    if (D.nonFinite)
-        ImGui::TextColored(AB_AMBER, "non-finite samples (excluded) = %llu",
-                           (unsigned long long)D.nonFinite);
-    if (nZero)
-        ImGui::TextColored(AB_AMBER, "%d in-window point(s) at |mean| ~ 0 dropped "
-                           "by the relative-weighted fit", nZero);
-
-    // ---- per-plane numbers ----
-    if (ImGui::BeginTable("framelin", 7, ImGuiTableFlags_SizingFixedFit |
-                                         ImGuiTableFlags_RowBg)) {
-        std::string slopeH = "slope a [DN/" + ax.unit + "]";
-        ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(slopeH.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("offset b [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("R^2", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("LE_max+ [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("LE_max- [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("n fit", ImGuiTableColumnFlags_WidthFixed,
-                                ImGui::CalcTextSize("99 (<3)").x);
-        ImGui::TableHeadersRow();
-        for (int p = 0; p < D.nPl; p++) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("%s", D.nPl > 1 ? LIN_PLANES[p] : "all");
-            if (F[p].valid) {
-                ImGui::TableNextColumn(); textNum("%.6g", F[p].a);
-                ImGui::TableNextColumn(); textNum("%.6g", F[p].b);
-                ImGui::TableNextColumn(); textNum("%.6g", F[p].r2);
-                ImGui::TableNextColumn(); textNum("%.4g", F[p].leMaxPos);
-                ImGui::TableNextColumn(); textNum("%.4g", F[p].leMaxNeg);
-                ImGui::TableNextColumn(); textNumStr(std::to_string(F[p].nIn));
-            } else {
-                for (int c = 0; c < 5; c++) { ImGui::TableNextColumn(); textNumStr("-"); }
-                ImGui::TableNextColumn();
-                textNumStr(std::to_string(F[p].nIn) + " (<3)");
-            }
-        }
-        ImGui::EndTable();
-    }
-    if (!nValid) {
-        // refuse with a reason, not an empty chart
-        ImGui::TextColored(AB_AMBER, "no fit: fewer than 3 in-window points on "
-                           "every plane - widen the window or check the axis");
-    }
-
-    // ---- the two plots: mean vs axis, and the residual people actually read -
-    // Box-zoom per plot: zoomRangeFromDrag is the shipped pure mapping; the
-    // drag chrome is the Temporal chart's pattern, keyed to the stack + axis
-    // so a zoom cannot survive into data where the numbers mean something else.
-    struct SecZoom {
-        bool on = false, dragging = false;
-        float x0 = 0, x1 = 1, y0 = 0, y1 = 1;
-        ImVec2 a;
-        std::string sig;
-        void key(const std::string& s) { if (s != sig) { sig = s; on = false; dragging = false; } }
-        void ui(const PlotRect& tp) {
-            if (!tp.ok) return;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            bool hov = ImGui::IsMouseHoveringRect(tp.p0, tp.p1) &&
-                       ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
-            if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                on = false; dragging = false;
-            }
-            if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                a = ImGui::GetMousePos(); dragging = true;
-            }
-            if (dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                ImVec2 b2 = ImGui::GetMousePos();
-                dl->AddRectFilled(a, b2, IM_COL32(120, 190, 255, 30));
-                dl->AddRect(a, b2, IM_COL32(120, 190, 255, 160));
-            }
-            if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                dragging = false;
-                float zx0, zx1, zy0, zy1;
-                if (zoomRangeFromDrag(tp, a, ImGui::GetMousePos(), zx0, zx1, zy0, zy1)) {
-                    x0 = zx0; x1 = zx1; y0 = zy0; y1 = zy1; on = true;
-                }
-            }
-            if (on) {
-                const char* zt = "zoomed - double-click to reset";
-                ImVec2 ts = ImGui::CalcTextSize(zt);
-                dl->AddText(ImVec2(tp.p1.x - ts.x - 4 * app.uiScale,
-                                   tp.p0.y + 2 * app.uiScale), AB_AMBER32, zt);
-            }
-        }
-    };
-    static SecZoom zMean, zResid;
-    {
-        std::string zsig = std::to_string((unsigned long long)im->uid) + "|" + ax.label;
-        zMean.key(zsig);
-        zResid.key(zsig);
-    }
-    double fx0 = DBL_MAX, fx1 = -DBL_MAX, my0 = DBL_MAX, my1 = -DBL_MAX;
-    for (const auto& q : D.pts) {
-        fx0 = std::min(fx0, q.x);
-        fx1 = std::max(fx1, q.x);
-        for (int p = 0; p < D.nPl; p++)
-            if (q.has[p]) { my0 = std::min(my0, q.mean[p]); my1 = std::max(my1, q.mean[p]); }
-    }
-    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
-    if (my0 > my1) { my0 = 0; my1 = 1; }
-    // The two-stacked-plots budget, the Linearity panel's own shape: split
-    // what is left, floor at 70 logical px. beginPlot consumes height +
-    // (fh + 4s) above + (2fh + 6s) below, plus one ItemSpacing per plot - the
-    // budget subtracts exactly that, so on a tall panel the plots end flush
-    // with the bottom. On a genuinely too-short panel they keep their floor
-    // and the panel scrolls (drawPanelLinearity's precedent); the probe
-    // records where the bottom landed either way.
-    const float chrome = ImGui::GetFontSize() * 3 + 10 * app.uiScale
-                       + ImGui::GetStyle().ItemSpacing.y;
-    float half = std::max((ImGui::GetContentRegionAvail().y - 2 * chrome) * 0.5f,
-                          70.0f * app.uiScale);
-    g_flin.availBefore = ImGui::GetContentRegionAvail().y;
-    g_flin.half = half;
-    auto dimmed = [](ImU32 c) { return (c & 0x00FFFFFF) | 0x50000000; };
-    {   // plot 1: mean vs axis - points, per-plane fit lines, the window bounds
-        char ylab[64];
-        snprintf(ylab, sizeof ylab, "%s mean [DN]", D.roiUsed ? "ROI" : "frame");
-        float px0 = (float)fx0, px1 = (float)fx1, py0 = (float)my0, py1 = (float)my1;
-        if (zMean.on) { px0 = zMean.x0; px1 = zMean.x1; py0 = zMean.y0; py1 = zMean.y1; }
-        PlotRect p1 = beginPlot(ax.label.c_str(), ylab, px0, px1, py0, py1,
-                                false, false, half);
-        if (p1.ok) {
-            g_flin.plotMean = true;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->PushClipRect(p1.p0, p1.p1, true);
-            // window bounds: DASHED, faint - a reference, not data
-            auto hline = [&](double y, ImU32 col) {
-                ImVec2 seg[2] = { p1.at(p1.xmin, (float)y), p1.at(p1.xmax, (float)y) };
-                float dash = 5 * app.uiScale;
-                addDashedPolyline(dl, seg, 2, col, 1.0f, dash, dash);
-            };
-            if (g_frameLin.manual) {
-                hline(std::min(g_frameLin.ylo, g_frameLin.yhi), IM_COL32(150, 160, 170, 110));
-                hline(std::max(g_frameLin.ylo, g_frameLin.yhi), IM_COL32(150, 160, 170, 110));
-            } else
-                for (int p = 0; p < D.nPl; p++) {
-                    hline(F[p].ylo, dimmed(LIN_COLS[p]));
-                    hline(F[p].yhi, dimmed(LIN_COLS[p]));
-                }
-            // the fit: thin and SOLID - it is a MODEL, but plane-coloured (the
-            // dashed convention here is reserved for references like the bounds)
-            for (int p = 0; p < D.nPl; p++) {
-                if (!F[p].valid) continue;
-                dl->AddLine(p1.at(px0, (float)(F[p].a * px0 + F[p].b)),
-                            p1.at(px1, (float)(F[p].a * px1 + F[p].b)),
-                            (LIN_COLS[p] & 0x00FFFFFF) | 0x88000000, 1.2f);
-            }
-            // every measured point; out-of-window DIMMED, never hidden
-            for (const auto& q : D.pts)
-                for (int p = 0; p < D.nPl; p++) {
-                    if (!q.has[p]) continue;
-                    bool in = q.mean[p] >= F[p].ylo && q.mean[p] <= F[p].yhi;
-                    dl->AddCircleFilled(p1.at((float)q.x, (float)q.mean[p]), 3.0f,
-                                        in ? LIN_COLS[p] : dimmed(LIN_COLS[p]));
-                }
-            dl->PopClipRect();
-            zMean.ui(p1);
-            g_flin.plotBot = p1.p1.y;
-        }
-    }
-    if (nValid) {   // plot 2: LE vs axis - the plot people actually read
-        struct RPt { double x, le; int p; bool in; };
-        std::vector<RPt> rpts;
-        double e1 = 0.1;
-        for (const auto& q : D.pts)
-            for (int p = 0; p < D.nPl; p++) {
-                if (!q.has[p] || !F[p].valid) continue;
-                double fit = F[p].a * q.x + F[p].b;
-                if (fabs(fit) < 1e-9) continue;
-                double le = 100.0 * (q.mean[p] - fit) / fit;
-                bool in = q.mean[p] >= F[p].ylo && q.mean[p] <= F[p].yhi;
-                // the range comes from the fitted points; an out-of-window LE
-                // may sit off-scale (it is still on plot 1, and zoom exists)
-                if (in) e1 = std::max(e1, fabs(le));
-                rpts.push_back({ q.x, le, p, in });
-            }
-        float lim = (float)(e1 * 1.2);
-        float px0 = (float)fx0, px1 = (float)fx1, py0 = -lim, py1 = lim;
-        if (zResid.on) { px0 = zResid.x0; px1 = zResid.x1; py0 = zResid.y0; py1 = zResid.y1; }
-        PlotRect p2 = beginPlot(ax.label.c_str(), "linearity error [%]",
-                                px0, px1, py0, py1, false, false, half);
-        if (p2.ok) {
-            g_flin.plotResid = true;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->PushClipRect(p2.p0, p2.p1, true);
-            dl->AddLine(p2.at(px0, 0), p2.at(px1, 0), IM_COL32(140, 150, 160, 160));
-            for (const auto& q : rpts)
-                dl->AddCircleFilled(p2.at((float)q.x, (float)q.le), 3.0f,
-                                    q.in ? LIN_COLS[q.p] : dimmed(LIN_COLS[q.p]));
-            dl->PopClipRect();
-            zResid.ui(p2);
-            g_flin.plotBot = std::max(g_flin.plotBot, p2.p1.y);
-        }
-    } else ImGui::TextDisabled("no residual plot without a fit");
-}
-
 static void drawPanelTemporal() {
     // a browser-fired aggregate (files nobody opened) owns the panel until
     // dismissed - it is the freshest thing the user asked for and has no
     // current image to attach to
     g_tchart = TemporalChartProbe{};   // stale probe data is worse than none
-    g_flin = FrameLinProbe{};          // ...for the linearity section too
     if (app.srvTemporal.seqId == -2) { drawBrowseTemporal(); return; }
     ImageDoc* im = cur();
     if (!im) { ImGui::TextDisabled("no image"); return; }
@@ -2085,14 +1513,6 @@ static void drawPanelTemporal() {
     // with a perfectly good time axis, went unplotted.
     if (ImageDoc* Bim = abStatsB()) {
         drawTemporalAB(im, Bim);
-        // The frame-linearity section only fits the single-stack view, but a
-        // section that silently VANISHES when compare is on reads as "the
-        // feature does not exist" (user report, day one). The header stays,
-        // and says what to do.
-        if (ImGui::CollapsingHeader("Linearity (frame axis)"))
-            ImGui::TextDisabled("shown in the single-stack view. Press ESC to leave the\n"
-                                "comparison (the B/C seats are kept) and fit side A;\n"
-                                "C brings the comparison back afterwards.");
         return;
     }
     if (im->seqId != 0) {
@@ -2104,10 +1524,6 @@ static void drawPanelTemporal() {
             temporalExportButtons();
             ImGui::SameLine();
             frameAxisPopupButton(im);
-            if (ImGui::CollapsingHeader("Linearity (frame axis)"))
-                ImGui::TextDisabled("needs locally resident frames: this stack is measured\n"
-                                    "on the server, and the fit reads pixels. Open the\n"
-                                    "frames locally (double-click in Browse) to fit them.");
             return;
         }
         recomputeTemporalIfNeeded(im, app.temporal[0]);
@@ -2166,25 +1582,18 @@ static void drawPanelTemporal() {
                                    "%s%zu sample(s) had < 2 valid frames",
                                    (unsigned long long)T.nonFinite,
                                    T.dropped ? ";  " : "", T.dropped);
-            // ---- Linearity (frame axis): interim frame-wise linearity ------
-            // Open, the section REPLACES the pooled per-frame chart below: its
-            // mean-vs-axis plot is the same material with the planes separated
-            // and the model drawn on it, and the panel's height cannot
-            // honestly hold both. The open state lives in g_frameLin so the
-            // selftest and the panel flip the same switch.
-            ImGui::SetNextItemOpen(g_frameLin.open, ImGuiCond_Always);
-            g_frameLin.open = ImGui::CollapsingHeader("Linearity (frame axis)");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "fit the per-frame means against the custom x axis, with an\n"
-                    "EMVA-style fit window - own naming, NOT an EMVA 1288\n"
-                    "compliance claim. The offset is absorbed by the fit and\n"
-                    "reported; dark subtraction (and the fit ACROSS stacks of a\n"
-                    "series) is the Linearity panel's job.");
-            if (g_frameLin.open) {
-                drawFrameLinSection(im);
-                return;
-            }
+            // The frame-axis LINEARITY FIT moved to its series-layer home
+            // (docs/analysis-layers.md §3.3): a swept capture is a series by
+            // definition, so the fit - window, methods, session-saved settings
+            // - lives in the Series Analysis panel now, over frame | stack
+            // mixed members. A section that silently vanished would read as
+            // "the feature is gone" (the user report from the section's own
+            // day one), so this line says where it went; the axis keeps its
+            // MONITOR role here, which is the curve below.
+            FrameAxis axPeek = frameAxisOf(im->seqId);
+            if (axPeek.custom)
+                ImGui::TextDisabled("linearity fit: Series Analysis panel (a swept capture "
+                                    "is a series; the axis keeps the monitor curve below)");
             // per-frame mean over time - against the custom x axis when this
             // stack carries one (a real quantity per frame), else frame index.
             // Non-monotonic values are fine: the polyline follows frame order,

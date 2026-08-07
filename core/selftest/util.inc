@@ -7,7 +7,7 @@ static bool g_haveWindow = false;
 // and those backends are not initialised when there is no window: calling them
 // is a null device and a crash with nothing in it that names the test. Five
 // groups do it (--tile-selftest T12, --verify-selftest's ROI probe,
-// --abstats-selftest's T chart, --frame-lin-selftest F11, and the whole of
+// --abstats-selftest's T chart and the whole of
 // --browse-keys-selftest, which runs the real loop), and every one of them is
 // asserting on LAYOUT - which is exactly the thing that cannot be computed
 // without the backend that reports the display.

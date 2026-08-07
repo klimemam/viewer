@@ -827,6 +827,52 @@ static StackStats computeStackStats(int seqId, int rx, int ry, int rw, int rh,
     return out;
 }
 
+// The FRAME member's response (docs/analysis-layers.md §3.3): the spatial mean
+// per plane of ONE standalone frame over the ROI, in the same StackStats
+// vessel so a mixed member table has one shape. frames = 1, sigmaT stays 0 and
+// the row that carries this says hasSigma = false - a single frame has no time
+// axis, and the canon forbids dressing anything up as its sigma_t. The plane
+// discipline (CFA by position, non-CFA pooled into plane 0) and the per-sample
+// NaN exclusion (counted, never folded into a divisor) are computeStackStats'
+// own, so a frame member's mean and a stack member's mean are the same
+// quantity by construction.
+static StackStats computeFrameStats(const ImageDoc* d, int rx, int ry, int rw, int rh) {
+    StackStats out;
+    if (!d || d->px().empty() || d->src->remoteStep > 1) {
+        out.err = "frame not resident";
+        return out;
+    }
+    int W = d->w, H = d->h, C = d->ch;
+    rx = std::clamp(rx, 0, W - 1);
+    ry = std::clamp(ry, 0, H - 1);
+    rw = rw <= 0 ? W - rx : std::min(rw, W - rx);
+    rh = rh <= 0 ? H - ry : std::min(rh, H - ry);
+    out.nPl = d->cfa ? 4 : 1;
+    double sum[4] = {};
+    size_t cnt[4] = {};
+    for (int y = 0; y < rh; y++) {
+        const float* row = &d->px()[((size_t)(ry + y) * W + rx) * C];
+        for (int x = 0; x < rw; x++) {
+            int p = d->cfa ? cfaChannelAt(*d, rx + x, ry + y) : 0;
+            for (int c = 0; c < C; c++) {
+                double v = row[(size_t)x * C + c];
+                if (!std::isfinite(v)) { out.nonFinite++; continue; }
+                sum[p] += v;
+                cnt[p]++;
+            }
+        }
+    }
+    size_t total = 0;
+    for (int p = 0; p < out.nPl; p++) total += cnt[p];
+    if (!total) { out.err = "no finite samples in the region"; return out; }
+    for (int p = 0; p < out.nPl; p++)
+        if (cnt[p]) out.mean[p] = sum[p] / (double)cnt[p];
+    out.frames = 1;
+    out.cntMin = out.cntMax = 1;
+    out.valid = true;
+    return out;
+}
+
 // ---- frame average / frame sum: a stack's time axis, folded to ONE frame ----
 // One tooltip for every door into it: the five Browse entry points and the
 // Files panel item must not describe the same operation five different ways.
@@ -1240,6 +1286,37 @@ static bool linFit(const std::vector<double>& xs, const std::vector<double>& ys,
     return true;
 }
 
+// least squares y = a*x + b with per-point weights; r2 is the weighted R^2.
+// A sibling of linFit, not a change to it. Born in the Temporal panel's
+// interim frame-linearity section and moved here with the analysis (§3.3
+// migration): the series fit's rev4-style method is this function, weights
+// w_i = 1/y_i^2.
+static bool linFitWeighted(const std::vector<double>& xs, const std::vector<double>& ys,
+                           const std::vector<double>& ws, double& a, double& b, double& r2) {
+    size_t n = xs.size();
+    if (n < 2) return false;
+    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (size_t i = 0; i < n; i++) {
+        sw += ws[i]; sx += ws[i] * xs[i]; sy += ws[i] * ys[i];
+        sxx += ws[i] * xs[i] * xs[i]; sxy += ws[i] * xs[i] * ys[i];
+    }
+    if (!(sw > 0)) return false;
+    double d = sw * sxx - sx * sx;
+    // relative degeneracy test: 1/y^2 weights make the ABSOLUTE determinant
+    // tiny on perfectly good data
+    if (fabs(d) <= 1e-12 * std::max(sw * sxx, sx * sx)) return false;
+    a = (sw * sxy - sx * sy) / d;
+    b = (sy - a * sx) / sw;
+    double ym = sy / sw, sst = 0, ssr = 0;
+    for (size_t i = 0; i < n; i++) {
+        double e = ys[i] - (a * xs[i] + b);
+        ssr += ws[i] * e * e;
+        sst += ws[i] * (ys[i] - ym) * (ys[i] - ym);
+    }
+    r2 = sst > 1e-12 ? 1.0 - ssr / sst : 1.0;
+    return true;
+}
+
 static const char* LIN_PLANES[4] = { "R", "Gr", "Gb", "B" };
 static const ImU32 LIN_COLS[4] = {
     IM_COL32(255, 92, 92, 255), IM_COL32(79, 221, 107, 255),
@@ -1264,6 +1341,13 @@ static void linRecompute(int seriesId) {
     if (App::Ann* a = findAnn(app.selectedAnn))
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; L.roiUsed = true; }
     L.rows.clear();
+    L.refusal.clear();
+    L.nZero = 0;
+    for (int p = 0; p < 4; p++) {
+        L.winPlaneLo[p] = L.winPlaneHi[p] = 0;
+        L.nFit[p] = 0;
+        L.planeFit[p] = false;
+    }
     App::Series* S = seriesById(seriesId);
     if (!S) {
         L.fitValid = false;
@@ -1272,18 +1356,31 @@ static void linRecompute(int seriesId) {
         return;
     }
     for (const auto& m : S->members) {
-        App::SeqInfo* si = seqInfo(m.seqId);
-        if (!si) continue;              // seriesAudit says this cannot happen
         App::LinState::Row r;
-        r.seqId = m.seqId;
-        r.name = si->name;
+        StackStats st;
+        if (m.seqId != 0) {             // a stack member: §3.2's mean statistics
+            App::SeqInfo* si = seqInfo(m.seqId);
+            if (!si) continue;          // seriesAudit says this cannot happen
+            r.seqId = m.seqId;
+            r.name = si->name;
+            r.fold = m.fold;
+            st = computeStackStats(m.seqId, rx, ry, rw, rh);
+            r.hasSigma = st.valid && st.frames >= 2;
+        } else {                        // a frame member IS its own point (§3.3)
+            ImageDoc* fd = frameMemberDoc(m.frameUid);
+            if (!fd) continue;          // seriesAudit says this cannot happen
+            r.uid = m.frameUid;
+            r.isFrame = true;
+            r.name = fd->name;
+            st = computeFrameStats(fd, rx, ry, rw, rh);
+        }
         r.level = m.value;
         r.include = m.include;
-        StackStats st = computeStackStats(m.seqId, rx, ry, rw, rh);
         r.valid = st.valid;
         r.err = st.err;
         r.frames = st.frames;
         r.nPl = st.nPl;
+        r.nonFinite = st.nonFinite;
         for (int p = 0; p < 4; p++) { r.mean[p] = st.mean[p]; r.sigmaT[p] = st.sigmaT[p]; }
         L.rows.push_back(std::move(r));
     }
@@ -1292,28 +1389,85 @@ static void linRecompute(int seriesId) {
     L.nPl = 1;
     for (const auto& r : L.rows) if (r.valid) L.nPl = std::max(L.nPl, r.nPl);
     int fitted = 0;
+    // §3.3: the fit takes MEAN statistics only. A sum-standing member is
+    // refused BEFORE anything fits - a sum is n x the mean's scale, so with
+    // differing n the points are different quantities point to point - and it
+    // is refused OUT LOUD, never quietly read as the mean it was not declared
+    // to be. The rows above are still measured: mean statistics are honest
+    // for both folds, it is only the fit's axis they must not share.
+    for (const auto& r : L.rows) {
+        if (r.isFrame || r.fold != FOLD_SUM) continue;
+        if (!r.include || !std::isfinite(r.level)) continue;
+        L.refusal = "fit refused: \"" + r.name + "\" stands as sum - a sum is n x the "
+                    "mean's scale, so with differing n the points are different "
+                    "quantities. Set it to mean (or exclude it) to fit.";
+        break;
+    }
     // No unit, no fit - and no fit for a kind these equations do not describe.
-    // The per-stack MEANS above are DN either way and stay on screen; a
+    // The per-member MEANS above are DN either way and stay on screen; a
     // sensitivity is DN per SOMETHING measured by a KNOWN law, and inventing
     // either is exactly the assumption the series layer exists to stop.
-    if (S->unit[0] == '\0' || !seriesFitKind(*S)) {
+    if (S->unit[0] == '\0' || !seriesFitKind(*S) || !L.refusal.empty()) {
         L.nPts = 0;
         L.computedRev = ++L.rev;
         return;
     }
     for (int p = 0; p < L.nPl; p++) {
-        std::vector<double> lx, ly, pm, pv;
+        // candidates: the fit's own inclusion rule; the response is the mean
+        int nCand = 0;
+        double ymax = -DBL_MAX;
         for (const auto& r : L.rows) {
             if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+            nCand++;
+            ymax = std::max(ymax, r.mean[p]);
+        }
+        L.nPts = nCand;
+        // The fit WINDOW (§3.3 migration of the interim frame-linearity):
+        // none / auto = 5..95% of THIS plane's max member mean / manual [DN].
+        // The applied bounds are recorded per plane so the screen and the
+        // export state what was DONE, never only what was set.
+        double wlo = -DBL_MAX, whi = DBL_MAX;
+        if (L.winMode == 1 && ymax > -DBL_MAX) {
+            wlo = 0.05 * ymax;
+            whi = 0.95 * ymax;
+        } else if (L.winMode == 2) {
+            wlo = std::min(L.winLo, L.winHi);
+            whi = std::max(L.winLo, L.winHi);
+        }
+        L.winPlaneLo[p] = L.winMode ? wlo : 0;
+        L.winPlaneHi[p] = L.winMode ? whi : 0;
+        std::vector<double> lx, ly, lw, pm, pv;
+        for (const auto& r : L.rows) {
+            if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
+            if (L.winMode && (r.mean[p] < wlo || r.mean[p] > whi)) continue;
+            // rev4-style weights are 1/y^2: a point at |mean| ~ 0 has no
+            // weight to give and is dropped, COUNTED (the interim tool's rule)
+            if (L.fitMethod == 1 && fabs(r.mean[p]) < 1e-12) { L.nZero++; continue; }
             lx.push_back(r.level);
             ly.push_back(r.mean[p]);
-            pm.push_back(r.mean[p]);
-            pv.push_back(r.sigmaT[p] * r.sigmaT[p]);
+            lw.push_back(L.fitMethod == 1 ? 1.0 / (r.mean[p] * r.mean[p]) : 1.0);
+            // PTC wants sigma_t^2 vs mean - only rows that HAVE a sigma_t
+            // (stack members with >= 2 frames; a frame member carries none)
+            if (r.hasSigma) {
+                pm.push_back(r.mean[p]);
+                pv.push_back(r.sigmaT[p] * r.sigmaT[p]);
+            }
         }
-        L.nPts = (int)lx.size();
-        if (!linFit(lx, ly, L.slope[p], L.offs[p], L.r2[p])) continue;
+        L.nFit[p] = (int)lx.size();
+        // A WINDOWED fit needs 3 points - 2 fit any line exactly and would
+        // report a flawless LE for arbitrarily bent data (the interim tool's
+        // rule, migrated). Windowless keeps the panel's historic 2, so no
+        // existing series measures differently.
+        if (L.winMode != 0 && L.nFit[p] < 3) continue;
+        bool fitOk = L.fitMethod == 1
+                         ? linFitWeighted(lx, ly, lw, L.slope[p], L.offs[p], L.r2[p])
+                         : linFit(lx, ly, L.slope[p], L.offs[p], L.r2[p]);
+        if (!fitOk) continue;
         fitted++;
-        // linearity error: worst deviation from the fit, relative to the fit
+        L.planeFit[p] = true;
+        // linearity error: worst deviation from the fit, relative to the fit,
+        // over the points the fit USED (out-of-window points stay on the
+        // chart, dimmed - they are not this number's business)
         double worst = 0;
         for (size_t i = 0; i < lx.size(); i++) {
             double fit = L.slope[p] * lx[i] + L.offs[p];
@@ -1338,7 +1492,11 @@ static void linRecompute(int seriesId) {
         L.readFromDark = false;
         for (const auto& r : L.rows) {
             if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
-            if (fabs(r.level) > 1e-9) continue;             // not a dark stack
+            if (fabs(r.level) > 1e-9) continue;             // not a dark member
+            // read noise is MEASURED only where there is a sigma_t to measure:
+            // a dark FRAME member anchors the black level (its mean is real)
+            // but has no time axis, so the read noise stays an extrapolation
+            if (!r.hasSigma) continue;
             L.readDN[p] = r.sigmaT[p];                      // measured, not fitted
             L.readFromDark = true;
             break;
@@ -1360,11 +1518,14 @@ static void linRecompute(int seriesId) {
 // here by the same test. The dark row itself is no point: zero signal has no
 // ratio, and the log axis could not place it anyway. *belowDark counts lit rows
 // whose corrected mean came out <= 0 (or whose sigma_t was 0) - they are
-// dropped, and the caller must SAY so, not hide them.
+// dropped, and the caller must SAY so, not hide them. *noSigma counts lit
+// FRAME members (§3.3): no time axis, no sigma_t, no ratio - a different
+// reason from belowDark, and the caller states it as its own sentence.
 struct LinSnrPt { int seqId; int plane; double x, snr; };
 static void linSnrPoints(const App::LinState& L, std::vector<LinSnrPt>& out,
-                         bool* fromDark, int* belowDark) {
+                         bool* fromDark, int* belowDark, int* noSigma = nullptr) {
     out.clear();
+    if (noSigma) *noSigma = 0;
     const App::LinState::Row* darkRow = nullptr;
     for (const auto& r : L.rows) {
         if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
@@ -1375,6 +1536,10 @@ static void linSnrPoints(const App::LinState& L, std::vector<LinSnrPt>& out,
     for (const auto& r : L.rows) {
         if (!r.include || !r.valid || !std::isfinite(r.level)) continue;
         if (&r == darkRow) continue;
+        // a frame member carries no sigma_t (§3.3), so it has no SNR point -
+        // COUNTED, so the caller says "N member(s) without sigma_t" instead
+        // of a curve that silently holds fewer points than the table
+        if (!r.hasSigma) { if (noSigma) (*noSigma)++; continue; }
         for (int p = 0; p < r.nPl && p < 4; p++) {
             double dark = darkRow ? darkRow->mean[p] : L.offs[p];
             double x = r.mean[p] - dark;

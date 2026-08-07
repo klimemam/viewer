@@ -57,9 +57,9 @@ class 列: S1 / TN / LM(+m = +meta、+r = +ref)。「実装」列は現在の所
 | dark noise(EMVA) | TN+m | **dark stack** + 露光条件 | sc | Linearity の level-0 ルールが部分実装 | 「dark である」ことはメタ情報 |
 | DSNU(EMVA 1288) | TN+r | dark stack の時間平均 → 空間σ | sc+mp | — | σ_fpn の dark 限定版。正式には基準条件指定 |
 | PRNU(EMVA 1288) | TN+r | **flat stack + dark stack** の各時間平均 | sc | —(`emva1288/*` 予定) | 現 plugin は proxy と明記 |
-| **linearity fit(感度・offset・LE max)** | **LM+m** | レベル別 stack ×3+ + **level 値と単位** | sc+cv | Linearity パネル | level は folder 名から auto、編集可 |
-| conversion gain K(PTC) | LM | 同上(level 値自体は不要: σ_t² vs mean) | sc | Linearity パネル(K [DN/e-]) | |
-| read noise | LM / TN+m | PTC 外挿、または **dark stack で実測** | sc | Linearity パネル(extrap. 明示) | dark 有無で信頼度が変わる設計済み |
+| **linearity fit(感度・offset・LE max)** | **LM+m** | レベル別 stack / frame ×3+ + **level 値と単位** | sc+cv | Series Analysis パネル | level は folder 名から auto、編集可 |
+| conversion gain K(PTC) | LM | 同上(level 値自体は不要: σ_t² vs mean。σ_t を持つ stack メンバのみ) | sc | Series Analysis パネル(K [DN/e-]) | |
+| read noise | LM / TN+m | PTC 外挿、または **dark stack で実測**(dark frame メンバは黒レベルのみ) | sc | Series Analysis パネル(extrap. 明示) | dark 有無で信頼度が変わる設計済み |
 | SNR curve(mean vs SNR) | LM | レベル別 stack | cv | —(素材 = linearity rows) | |
 | dynamic range | LM+m | 飽和までのスイープ+飽和定義 | sc | — | |
 | dark current | LM+m | 露光時間違いの dark stack 群+**時間** | sc | — | 横軸が時間になった linearity |
@@ -93,7 +93,7 @@ frame 番号 / plane 毎 mean / var(std) / min / max / percentile / クリップ
 |---|---|---|---|
 | 1 | 2枚目のフレームが要るか? | No → **S1** | 既存の数値の見せ方なら **UI-only**(TSV copy 等)。新統計なら **local compute**(plugin か host)。remote stack 全体に効かせるなら **MEASURE op**(`MOP_ANALYZER` 経由なら protocol 変更なし) |
 | 2 | 同一条件の N フレームか? | **TN** | 常駐フレームだけなら local compute(`computeStackStats` 系)。**全フレーム対象なら必ず protocol MEASURE op**(remote stack は手元に全画素がない。processing policy `auto/server/local-fetch` に従う) |
-| 3 | 条件(レベル)を変えた複数 stack か? | **LM** | Linearity パネルの拡張が第一候補。新パネルは最後の手段 |
+| 3 | 条件(レベル)を変えた複数 stack か? | **LM** | Series Analysis パネルの拡張が第一候補。新パネルは最後の手段 |
 | 4 | ファイルに無い数値(照度・時間・gain)が要るか? | **+meta** | **新 user-input field**: stack 単位の編集可能フィールド+auto 抽出+session 保存(`SeqInfo::level` が先例) |
 | 5 | 参照画像・チャート定義が要るか? | **+ref** | 参照の指定 UI+session 保存+検証(サイズ/dtype 一致)。コスト最大 |
 | 6 | 校正器材が要るか? | **+cal** | ツールの外。数値の**入力欄と単位表記**だけ提供する |
