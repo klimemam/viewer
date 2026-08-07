@@ -545,7 +545,8 @@ static double npyElem(const std::vector<uint8_t>& buf, const NpyHead& H, size_t 
 // A string member's value, so a "note" key can be SHOWN and not merely counted.
 // numpy writes <U as UCS-4 and |S as bytes. Anything else is left empty, which
 // reads as "not shown" - never as a guess at what the bytes meant.
-static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& H) {
+static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& H,
+                                size_t cap = 120) {
     if (H.code.empty() || H.dataOff >= buf.size()) return {};
     // ONE element wide, not "to the end of the member". "<U8" and "|S8" carry
     // their item size in the descr, and reading past it walked into the next
@@ -579,7 +580,9 @@ static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& 
                    s += (char)(0x80 | (c & 0x3f)); }
         }
     }
-    if (s.size() > 120) s = s.substr(0, 117) + "...";
+    // cap 0 = uncapped: __refs_<i> JSON and other machine-read strings must
+    // come back whole - the cap is for values a human reads in a list.
+    if (cap && s.size() > cap) s = s.substr(0, cap - 3) + "...";
     return s;
 }
 
@@ -817,14 +820,30 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
 // file is an ordinary npz and the shape classifier owns it exactly as before -
 // the two readings never overlap, so npz-design.md §2.5's human-written form is
 // untouched by anything here.
-static const int VIEWER_NPZ_VERSION = 1;
+// 2 since AnalysisSet (docs/reader-analysisset.md §4, "ras"): a version this
+// build WRITES nowhere - the harness names 2 on set-bearing files only, and
+// set-free files stay 1, so nothing that has no set moves at all. Reading 2
+// is what this constant grants; a 3 is still refused by name.
+static const int VIEWER_NPZ_VERSION = 2;
 static std::string readerFileOf(const std::string& spec);   // fwd (§4.12, below)
 static std::string readerFuncOf(const std::string& spec);
+static std::string readerFor(const std::string& path);      // fwd (session.inc)
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch,
+                                 const std::vector<int>* taken);  // fwd (sequence.inc)
+static std::vector<std::string> findSequenceSiblings(const std::string& path,
+                                                     std::string& patternOut);  // fwd
+static std::string loadNpz(const std::string& path, const std::string& onlyMember,
+                           int npyRead, const std::string& readerSpec,
+                           const std::string& origin);       // fwd (below)
+static std::string loadNpy(const std::string& path, int npyRead);  // fwd (below)
+static std::string loadImageFile(const std::string& path);   // fwd (below)
 
 struct VnzNode {
-    std::string layer;                 // "frame" "stack" "series" "batch"
+    std::string layer;                 // "frame" "stack" "series" "batch" "analysisset"
     int parent = -1;
     std::string name, note, cfa;
+    std::string role;                  // set child: the role it plays (ras §4)
+    std::string refsJson;              // set node: the __refs_<i> JSON, verbatim
     bool hasPixels = false;
     size_t pixelEntry = 0;
     std::vector<double> condVals, tsVals, range;
@@ -849,10 +868,11 @@ static bool vnzRead(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>
 }
 
 static std::string vnzStr(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
-                          const std::map<std::string, size_t>& byName, const std::string& name) {
+                          const std::map<std::string, size_t>& byName, const std::string& name,
+                          bool full = false) {
     std::vector<uint8_t> buf; NpyHead H; std::string e;
     if (!vnzRead(zip, entries, byName, name, buf, H, e)) return {};
-    return npzTextValue(buf, H);
+    return npzTextValue(buf, H, full ? 0 : 120);
 }
 
 static bool vnzNum(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
@@ -909,6 +929,205 @@ static int vnzCfaPattern(const std::string& cfa, int& kind) {
     return -1;
 }
 
+// ---- the set members (docs/reader-analysisset.md §4) ------------------------
+// __role_<i> is a role name: identifier-shaped, the same charset that lets a
+// session line be split on whitespace (ras §1.2).
+static bool vnzRoleName(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    return true;
+}
+
+// One JSON string out of __refs_<i>, unescaped for real: json.dumps escapes
+// quotes, backslashes (every Windows path has them) and, under ensure_ascii,
+// anything non-ASCII as \uXXXX with surrogate pairs - and a ref's PATH must
+// come out byte-exact, not display-approximate, because it is resolved against
+// the filesystem. This is why npzTextValue (display, capped, escapes left
+// alone) cannot serve here.
+static bool vnzJsonString(const std::string& s, size_t& p, std::string& out,
+                          std::string& err) {
+    auto utf8 = [&](uint32_t c) {
+        if (c < 0x80) out += (char)c;
+        else if (c < 0x800) { out += (char)(0xc0 | (c >> 6));
+                              out += (char)(0x80 | (c & 0x3f)); }
+        else if (c < 0x10000) { out += (char)(0xe0 | (c >> 12));
+                                out += (char)(0x80 | ((c >> 6) & 0x3f));
+                                out += (char)(0x80 | (c & 0x3f)); }
+        else { out += (char)(0xf0 | (c >> 18));
+               out += (char)(0x80 | ((c >> 12) & 0x3f));
+               out += (char)(0x80 | ((c >> 6) & 0x3f));
+               out += (char)(0x80 | (c & 0x3f)); }
+    };
+    auto hex4 = [&](uint32_t& v) -> bool {
+        if (p + 4 > s.size()) return false;
+        v = 0;
+        for (int k = 0; k < 4; k++) {
+            char h = s[p++];
+            v <<= 4;
+            if (h >= '0' && h <= '9') v |= (uint32_t)(h - '0');
+            else if (h >= 'a' && h <= 'f') v |= (uint32_t)(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') v |= (uint32_t)(h - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+    if (p >= s.size() || s[p] != '"') { err = "expected a string"; return false; }
+    p++;
+    out.clear();
+    while (p < s.size() && s[p] != '"') {
+        char c = s[p];
+        if (c != '\\') { out += c; p++; continue; }
+        if (++p >= s.size()) { err = "truncated escape"; return false; }
+        char e = s[p++];
+        switch (e) {
+        case '"':  out += '"';  break;
+        case '\\': out += '\\'; break;
+        case '/':  out += '/';  break;
+        case 'b':  out += '\b'; break;
+        case 'f':  out += '\f'; break;
+        case 'n':  out += '\n'; break;
+        case 'r':  out += '\r'; break;
+        case 't':  out += '\t'; break;
+        case 'u': {
+            uint32_t v = 0;
+            if (!hex4(v)) { err = "bad \\u escape"; return false; }
+            if (v >= 0xD800 && v < 0xDC00 && p + 6 <= s.size() &&
+                s[p] == '\\' && s[p + 1] == 'u') {
+                p += 2;
+                uint32_t lo = 0;
+                if (!hex4(lo)) { err = "bad \\u escape"; return false; }
+                v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+            }
+            utf8(v);
+            break;
+        }
+        default: err = "unknown escape"; return false;
+        }
+    }
+    if (p >= s.size()) { err = "unterminated string"; return false; }
+    p++;
+    return true;
+}
+
+// __refs_<i>: {"dark": {"path": "...", "member": ""}, "bias": {"node": 3}} -
+// KEY ORDER KEPT, because declaration order is display order (ras §4). A
+// {"node": k} entry binds a node this same container carries: how one instance
+// placed in two roles (or in the batch members AND a role) travels once.
+// Unknown keys inside a ref are skipped, the additive-member rule.
+struct VnzRef { std::string role, path, member; int node = -1; };
+static bool vnzParseRefs(const std::string& js, std::vector<VnzRef>& out,
+                         std::string& err) {
+    size_t p = 0;
+    auto ws = [&]() {
+        while (p < js.size() && (js[p] == ' ' || js[p] == '\t' ||
+                                 js[p] == '\n' || js[p] == '\r'))
+            p++;
+    };
+    ws();
+    if (p >= js.size() || js[p] != '{') { err = "refs is not a JSON object"; return false; }
+    p++; ws();
+    if (p < js.size() && js[p] == '}') return true;
+    while (true) {
+        VnzRef R;
+        if (!vnzJsonString(js, p, R.role, err)) return false;
+        ws();
+        if (p >= js.size() || js[p] != ':') { err = "expected ':'"; return false; }
+        p++; ws();
+        if (p >= js.size() || js[p] != '{') { err = "a ref is an object"; return false; }
+        p++; ws();
+        bool sawPath = false, sawNode = false;
+        if (p < js.size() && js[p] == '}') {
+            p++;
+        } else while (true) {
+            std::string k;
+            if (!vnzJsonString(js, p, k, err)) return false;
+            ws();
+            if (p >= js.size() || js[p] != ':') { err = "expected ':'"; return false; }
+            p++; ws();
+            if (p < js.size() && js[p] == '"') {
+                std::string v;
+                if (!vnzJsonString(js, p, v, err)) return false;
+                if (k == "path") { R.path = v; sawPath = true; }
+                else if (k == "member") R.member = v;
+            } else {
+                size_t q = p;
+                while (q < js.size() && (js[q] == '-' || js[q] == '+' || js[q] == '.' ||
+                                         (js[q] >= '0' && js[q] <= '9') ||
+                                         (js[q] >= 'a' && js[q] <= 'z')))
+                    q++;
+                if (q == p) { err = "expected a value"; return false; }
+                if (k == "node") { R.node = atoi(js.substr(p, q - p).c_str()); sawNode = true; }
+                p = q;
+            }
+            ws();
+            if (p < js.size() && js[p] == ',') { p++; ws(); continue; }
+            if (p < js.size() && js[p] == '}') { p++; break; }
+            err = "expected ',' or '}'";
+            return false;
+        }
+        if (!sawPath && !sawNode) {
+            err = "ref \"" + R.role + "\" names neither a path nor a node";
+            return false;
+        }
+        out.push_back(std::move(R));
+        ws();
+        if (p < js.size() && js[p] == ',') { p++; ws(); continue; }
+        if (p < js.size() && js[p] == '}') return true;
+        err = "expected ',' or '}'";
+        return false;
+    }
+}
+
+// What a set-bearing container must hold, shared by BOTH carriers (npz and
+// stream - the reader route arrives down the pipe, so a check living only on
+// the npz side would not guard the door most sets come through). A malformed
+// set is refused whole, by the member at fault, BEFORE anything lands: a
+// half-built set would be a binding record nobody declared.
+static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int version) {
+    bool any = false;
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        const std::string si = std::to_string(i);
+        if (v.layer == "analysisset") {
+            any = true;
+            if (v.parent >= 0 && nodes[(size_t)v.parent].layer != "batch")
+                return "node " + si + " is an analysisset inside a " +
+                       nodes[(size_t)v.parent].layer + ": a set is a node of a "
+                       "batch, or the whole return value (reader-analysisset.md §1.4)";
+            if (v.hasPixels)
+                return "__pixels_" + si + " on an analysisset: a set has no "
+                       "pixels - it binds members, it does not contain them";
+        }
+        const bool underSet = v.parent >= 0 &&
+                              nodes[(size_t)v.parent].layer == "analysisset";
+        if (underSet && v.layer != "frame" && v.layer != "stack" && v.layer != "series")
+            return "node " + si + " is a " + v.layer + " inside an analysisset: "
+                   "a role holds a frame, a stack or a series (a set does not nest)";
+        if (underSet && v.role.empty())
+            return "node " + si + " is a child of an analysisset but plays no "
+                   "__role_" + si + ": a set's children are its inline role members";
+        if (!v.role.empty() && !underSet)
+            return "__role_" + si + ": only a child of an analysisset plays a role";
+        if (!v.role.empty() && !vnzRoleName(v.role))
+            return "__role_" + si + " is \"" + v.role + "\": a role name is "
+                   "[A-Za-z0-9_]+ (reader-analysisset.md §1.2)";
+        if (!v.refsJson.empty() && v.layer != "analysisset")
+            return "__refs_" + si + " on a " + v.layer + ": refs belong to the set node";
+    }
+    // §4: only a set-bearing file names version 2 - and the converse holds
+    // too, so a hand-built "version 1 with a set" is refused rather than
+    // slipping past every viewer whose version gate is the whole protection.
+    if (any && version < 2)
+        return "this container holds an analysis set but names version " +
+               std::to_string(version) + " - a set-bearing container is version 2, "
+               "so an older viewer refuses it whole instead of silently dropping "
+               "the set (reader-analysisset.md §4)";
+    return {};
+}
+
 // Build the layers a container declares. Refusals name the member at fault:
 // stage 6's rule is that a malformed container says WHAT is wrong, and "this
 // npz is invalid" would send the reader back to a hex editor.
@@ -939,7 +1158,9 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
 // Header rules are the session file's: one key per line, the value is the rest
 // of the line, and a key this build does not know is skipped rather than
 // refused, so an older viewer still reads what it does understand.
-static const int VIEWER_STREAM_VERSION = 1;
+// 2 since AnalysisSet, same rule as the npz (ras §4): the harness writes 2 on
+// set-bearing streams ONLY; a set-free stream stays 1.
+static const int VIEWER_STREAM_VERSION = 2;
 
 // A .npy header for a blob the stream described, written into space reserved at
 // the front of the SAME buffer the bytes are read into. That is what lets the
@@ -1022,6 +1243,8 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
         };
         if      (key == "layer")  v->layer = val;
         else if (key == "parent") v->parent = atoi(val.c_str());
+        else if (key == "role")   v->role = val;        // set child (ras §4)
+        else if (key == "refs")   v->refsJson = val;    // set node, one JSON line
         else if (key == "name")   v->name = val;
         else if (key == "note")   v->note = val;
         else if (key == "cfa")    v->cfa = val;
@@ -1053,6 +1276,11 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
     }
     if (!sawEnd) return "the stream stopped before its header ended - the reader was cut short";
     if (n < 0) return "the stream never said how many nodes it has";
+    {   // the set structure, shared with the npz carrier (ras §4). This is the
+        // door most sets arrive through - a reader's result comes down the pipe.
+        std::string serr = vnzCheckSets(nodes, n, ver);
+        if (!serr.empty()) return serr;
+    }
 
     // The blobs follow, in order. Read one, hand it to the same decoder a loose
     // .npy goes through, move on: only one blob is in memory at a time.
@@ -1110,12 +1338,12 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         std::string si = std::to_string(i);
         if (byName.find("__layer_" + si) == byName.end())
             return "__layer_" + si + " is missing: every node declares its layer "
-                   "(frame / stack / series / batch)";
+                   "(frame / stack / series / batch / analysisset)";
         nd2.layer = vnzStr(zip, entries, byName, "__layer_" + si);
         if (nd2.layer != "frame" && nd2.layer != "stack" && nd2.layer != "series" &&
-            nd2.layer != "batch")
+            nd2.layer != "batch" && nd2.layer != "analysisset")
             return "__layer_" + si + " is \"" + nd2.layer + "\": not a layer "
-                   "(frame / stack / series / batch)";
+                   "(frame / stack / series / batch / analysisset)";
         double pv = -1;
         if (byName.count("__parent_" + si)) {
             if (!vnzNum(zip, entries, byName, "__parent_" + si, pv, err)) return err;
@@ -1131,6 +1359,12 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         nd2.name = vnzStr(zip, entries, byName, "__name_" + si);
         nd2.note = vnzStr(zip, entries, byName, "__note_" + si);
         nd2.cfa  = vnzStr(zip, entries, byName, "__cfa_" + si);
+        // the set members (ras §4). refs come back WHOLE (full=true): the JSON
+        // is machine-read and a display cap would truncate a path mid-escape.
+        if (byName.count("__role_" + si))
+            nd2.role = vnzStr(zip, entries, byName, "__role_" + si);
+        if (byName.count("__refs_" + si))
+            nd2.refsJson = vnzStr(zip, entries, byName, "__refs_" + si, true);
         auto px = byName.find("__pixels_" + si);
         if (px != byName.end()) { nd2.hasPixels = true; nd2.pixelEntry = px->second; }
         if ((nd2.layer == "frame" || nd2.layer == "stack") && !nd2.hasPixels)
@@ -1164,7 +1398,7 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         kids[(size_t)c.parent]++;
         if (p.layer == "frame" || p.layer == "stack")
             return "__parent_" + std::to_string(i) + " is a " + p.layer +
-                   ": only a series or a batch holds other layers";
+                   ": only a series, a batch or an analysisset holds other layers";
         if (p.layer == "series" && c.layer != "stack" && c.layer != "frame")
             return "node " + std::to_string(i) + " is a " + c.layer +
                    " inside a series: a series holds stacks or frames (§4.4)";
@@ -1187,6 +1421,13 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         }
     }
 
+    // the set structure, shared with the stream carrier (ras §4) - refused
+    // whole before anything lands, by the member at fault
+    {
+        std::string serr = vnzCheckSets(nodes, n, version);
+        if (!serr.empty()) return serr;
+    }
+
     // __meta_* lives in the zip, so it is read here where the zip is.
     std::vector<std::pair<std::string, std::string>> meta;
     for (const auto& kv : byName) {
@@ -1199,6 +1440,347 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
                     [&](int, const VnzNode& v, std::vector<uint8_t>& out,
                         std::string& e) { return npzExtract(zip, entries[v.pixelEntry], out, e); },
                     meta, originStat);
+}
+
+// ---- Ref resolution (docs/reader-analysisset.md §2.2) ------------------------
+// The order is the source registry's, not a new invention: identity tuple
+// match -> share the open copy (no decode, no copy - "読み直さない" is this one
+// step); path match with a moved tuple -> bind the OPEN copy and SAY the disk
+// changed (the newer bytes are reload's job, not a binding's); not open ->
+// open natively into the CALLING batch, so "opened for this set" stays on the
+// books. Anything else leaves the role unbound with its one-line reason
+// (§3.1: a Ref speaks about the world, and a world without that dark is not a
+// reason to throw the declaration away).
+
+static std::string aSetFirstLine(const std::string& s) {
+    size_t nl = s.find('\n');
+    return nl == std::string::npos ? s : s.substr(0, nl);
+}
+
+// True while loadSession is replaying its image lines. A Ref resolved in that
+// window must NOT open anything: the file it would open is one the session's
+// own lines are still about to load, and the twin membership would then be
+// SAVED, so every save/load cycle grew another copy. Deferred refs resolve at
+// the drain gate instead, where the session's docs all exist and the path-hit
+// branch binds them (§2.2 order, merely asked later).
+static bool g_sessionRestoring = false;
+
+// A file (or one npz member) opened natively for a binding. No picker and no
+// dialog can come out of a binding: an npz holding several images is a
+// question, and a binding never answers questions by guessing (§2.1) - it
+// says which members there are and asks to be told.
+static std::string aSetOpenRefFile(const std::string& path, const std::string& member) {
+    std::string low = path;
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    const bool isNpz = low.size() > 4 && low.compare(low.size() - 4, 4, ".npz") == 0;
+    if (isNpz) {
+        if (!member.empty()) return loadNpz(path, member, 0, std::string(), std::string());
+        std::vector<uint8_t> zip;
+        if (!readFileBytes(path, zip)) return "cannot read " + baseName(path);
+        std::vector<NpzEntry> entries;
+        std::string err;
+        if (!npzList(zip, entries, err)) return baseName(path) + ": " + err;
+        int vver = 0;
+        if (vnzIsContainer(zip, entries, vver))
+            return baseName(path) + " is a viewer container (a whole tree) - a "
+                   "role binds one member; open the file itself and bind what it makes";
+        std::vector<NpzMember> mem = npzScan(zip, entries);
+        std::string one;
+        int images = 0;
+        for (const auto& m : mem)
+            if (m.role == NpzMember::RImage) { images++; one = m.name; }
+        if (images == 0) return "no image-shaped arrays in " + baseName(path);
+        if (images > 1)
+            return baseName(path) + " holds " + std::to_string(images) +
+                   " image members - name one with member=";
+        return loadNpz(path, one, 0, std::string(), std::string());
+    }
+    if (imagefile::forPath(path)) return loadImageFile(path);
+    if (low.size() > 4 && low.compare(low.size() - 4, 4, ".npy") == 0)
+        return loadNpy(path, 0);
+    // Not native. §2.1 says pull the path->reader memory here; running Python
+    // from inside a binding is NOT wired in this build (a nested reader run
+    // would land its docs in its own batch, against §2.2's "the born stack
+    // enters the calling batch") - deferred out loud, never half-done.
+    if (!readerFor(path).empty())
+        return baseName(path) + " is not readable natively; a reader is "
+               "remembered for it, but this build does not run readers from a "
+               "binding - open the file once, then bind again";
+    return baseName(path) + " is not readable natively - " +
+           std::string(NPY_NATIVE_FORMS);
+}
+
+// A stack role by its FIRST FRAME's path (§5.1, the series-member key). An
+// open stack with that head is bound (with the changed-on-disk declaration
+// when the tuple moved); an unopened one is opened - the head now, the
+// siblings through the queued rescan, and the bind lands at the drain gate.
+// Partial binding is normal (§3.2): the bind points at the stack, not at a
+// frame count.
+static void aSetBindStackByHead(App::ASetRole& r, const std::string& headPath,
+                                int setId, int roleIdx, int batchId) {
+    int sid = seqIdOfFirstFramePath(headPath, batchId, nullptr);
+    if (sid) {
+        FrameSource now;
+        now.path = headPath;
+        statSourceFile(now);
+        for (const auto& d : app.images)
+            if (d->seqId == sid && d->src->path == headPath) {
+                if (now.mtime != 0 && (d->src->mtime != now.mtime ||
+                                       d->src->fsize != now.fsize))
+                    r.note = "bound to the open copy - the file on disk has "
+                             "changed since it was opened";
+                break;
+            }
+        r.seqId = sid;
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(pathFromUtf8(headPath), ec)) {
+        r.reason = headPath + " not found";
+        return;
+    }
+    const int prevBatch = app.loadBatchId;
+    app.loadBatchId = batchId;
+    const bool quietWas = g_quietLoad;
+    g_quietLoad = true;                     // a binding never steals the selection
+    size_t before = app.images.size();
+    std::string err = imagefile::forPath(headPath) ? loadImageFile(headPath)
+                                                   : loadNpy(headPath, 0);
+    g_quietLoad = quietWas;
+    app.loadBatchId = prevBatch;
+    if (!err.empty()) { r.reason = aSetFirstLine(err); return; }
+    if (app.images.size() == before) { r.reason = "nothing opened from " + headPath; return; }
+    ImageDoc* head = app.images[before].get();
+    if (head->seqId != 0) { r.seqId = head->seqId; return; }   // in-file frame axis
+    std::string pat;
+    std::vector<std::string> sibs = findSequenceSiblings(headPath, pat);
+    if (sibs.size() >= 2) {
+        app.seqRestore.push_back({ head->uid, std::move(sibs), pat, {}, {}, {}, {} });
+        App::ASetBind b;
+        b.setId = setId;
+        b.roleIdx = roleIdx;
+        b.batchId = batchId;
+        b.kind = 0;
+        b.headPath = headPath;
+        b.what = headPath;
+        app.aSetBindPending.push_back(std::move(b));
+        r.reason = "opening " + baseName(headPath) + " and its siblings ...";
+        return;
+    }
+    r.frameUid = head->uid;                 // one file, one frame: that IS the member
+}
+
+// One Ref, resolved. `origin` anchors a RELATIVE path: the §1.1 example writes
+// Ref("darks/dark_50ms/") from a reader handed an absolute file, and the only
+// place such a path can mean anything is beside that file.
+static void resolveSetRef(App::ASetRole& r, int setId, int roleIdx, int batchId,
+                          const std::string& origin) {
+    if (g_sessionRestoring) {   // see the flag: resolve at the gate, not mid-replay
+        App::ASetBind b;
+        b.setId = setId;
+        b.roleIdx = roleIdx;
+        b.batchId = batchId;
+        b.kind = 1;
+        b.refPath = r.refPath;
+        b.refMember = r.refMember;
+        b.origin = origin;
+        b.what = r.refPath;
+        app.aSetBindPending.push_back(std::move(b));
+        r.reason = "resolving " + r.refPath + " ...";
+        return;
+    }
+    std::string path = r.refPath;
+    {
+        std::filesystem::path p = pathFromUtf8(path);
+        if (p.is_relative() && !origin.empty()) {
+            std::error_code oec;
+            std::filesystem::path o = pathFromUtf8(origin);
+            std::filesystem::path base =
+                std::filesystem::is_directory(o, oec) ? o : o.parent_path();
+            if (!base.empty()) path = (base / p).u8string();
+        }
+    }
+    std::error_code ec;
+    // ---- a folder: the ONE numbered group inside it = one stack (§2.1).
+    // No sibling scan from a file, no guessing across groups: two or more
+    // groups are refused BY NAME and the Ref is re-said, not reinterpreted.
+    if (std::filesystem::is_directory(pathFromUtf8(path), ec)) {
+        std::vector<std::string> files;
+        for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(path), ec)) {
+            std::error_code ec2;
+            if (e.is_regular_file(ec2)) files.push_back(e.path().u8string());
+        }
+        std::sort(files.begin(), files.end());
+        std::vector<std::pair<std::string, std::vector<std::string>>> groups;
+        std::vector<std::string> claimed;
+        for (const auto& f : files) {
+            if (std::find(claimed.begin(), claimed.end(), f) != claimed.end()) continue;
+            std::string pat;
+            std::vector<std::string> sibs = findSequenceSiblings(f, pat);
+            if (sibs.size() < 2) continue;
+            for (const auto& s : sibs) claimed.push_back(s);
+            groups.push_back({ pat, std::move(sibs) });
+        }
+        if (groups.empty()) {
+            r.reason = "no numbered file group in " + r.refPath +
+                       " (a folder Ref means one group = one stack)";
+            return;
+        }
+        if (groups.size() > 1) {
+            std::string names;
+            for (const auto& g : groups)
+                names += (names.empty() ? "" : ", ") + g.first;
+            r.reason = r.refPath + " holds " + std::to_string(groups.size()) +
+                       " numbered groups (" + names + ") - a folder Ref means "
+                       "exactly one; say which";
+            return;
+        }
+        aSetBindStackByHead(r, groups[0].second.front(), setId, roleIdx, batchId);
+        return;
+    }
+    // ---- a file. The open copies first (§2.2 order): a file deleted from
+    // disk but still open is a path hit with a moved tuple, not a "not found".
+    FrameSource now;
+    now.path = path;
+    statSourceFile(now);
+    const std::string key = srcKeyPath(path);
+    ImageDoc* hitTuple = nullptr;
+    ImageDoc* hitPath = nullptr;
+    std::vector<std::string> membersOpen;   // distinct npz members of this path
+    for (const auto& d : app.images) {
+        if (d->preview || d->src->path.empty()) continue;
+        if (srcKeyPath(d->src->path) != key) continue;
+        if (!r.refMember.empty() && d->src->npzMember != r.refMember) continue;
+        if (r.refMember.empty() && !d->src->npzMember.empty() &&
+            std::find(membersOpen.begin(), membersOpen.end(), d->src->npzMember) ==
+                membersOpen.end())
+            membersOpen.push_back(d->src->npzMember);
+        const bool tuple = now.mtime != 0 && d->src->mtime == now.mtime &&
+                           d->src->fsize == now.fsize;
+        if (tuple && !hitTuple) hitTuple = d.get();
+        if (!hitPath) hitPath = d.get();
+    }
+    if (r.refMember.empty() && membersOpen.size() > 1) {
+        std::string list;
+        for (const auto& m : membersOpen) list += (list.empty() ? "" : ", ") + m;
+        r.reason = std::to_string(membersOpen.size()) + " members of " +
+                   baseName(path) + " are open (" + list + ") - say which with member=";
+        return;
+    }
+    auto bindDoc = [&](ImageDoc* d) {
+        if (d->seqId != 0) r.seqId = d->seqId;
+        else r.frameUid = d->uid;
+    };
+    if (hitTuple) { bindDoc(hitTuple); return; }        // share: nothing decoded
+    if (hitPath) {                                      // §2.2 case 2: declare it
+        bindDoc(hitPath);
+        r.note = "bound to the open copy - the file on disk has changed since "
+                 "it was opened";
+        return;
+    }
+    if (!std::filesystem::exists(pathFromUtf8(path), ec)) {
+        r.reason = r.refPath + " not found";
+        return;
+    }
+    // §2.2 case 3: open it, into the calling batch - the books say "opened
+    // for this set" because the batch does.
+    const int prevBatch = app.loadBatchId;
+    app.loadBatchId = batchId;
+    const bool quietWas = g_quietLoad;
+    g_quietLoad = true;
+    size_t before = app.images.size();
+    std::string err = aSetOpenRefFile(path, r.refMember);
+    g_quietLoad = quietWas;
+    app.loadBatchId = prevBatch;
+    if (!err.empty()) { r.reason = aSetFirstLine(err); return; }
+    if (app.images.size() == before) { r.reason = "nothing opened from " + r.refPath; return; }
+    bindDoc(app.images[before].get());
+}
+
+// ---- the sets themselves (ras §1.4 landing + §4 order) -----------------------
+// Runs AFTER every node landed, inside the call's batch. Inline children bind
+// by what they became (stack / frame / series); refs resolve in §2.2 order;
+// the set's name is numbered within the batch when a default-name twin
+// collides (§1.4 - explicit collisions already failed the call in the
+// harness, so what reaches here is legitimately numberable).
+static std::string vnzBuildSets(std::vector<VnzNode>& nodes, int n, int batchId,
+                                const std::string& origin, const std::string& readerSpec,
+                                int& setsBuilt) {
+    auto bindBuilt = [&](const VnzNode& c, App::ASetRole& r) {
+        if (c.layer == "series" && c.seriesId != 0) { r.seriesId = c.seriesId; return; }
+        if (c.seqId != 0) { r.seqId = c.seqId; return; }
+        if (c.docFirst >= 0 && c.docCount >= 1) {
+            r.frameUid = app.images[(size_t)c.docFirst]->uid;
+            return;
+        }
+        r.reason = "the member did not open";
+    };
+    for (int i = 0; i < n; i++) {
+        VnzNode& v = nodes[(size_t)i];
+        if (v.layer != "analysisset") continue;
+        App::ASet S;
+        S.id = app.nextASetId++;
+        S.batchId = batchId;
+        S.note = v.note;
+        S.readerSpec = readerSpec;
+        S.origin = readerSpec.empty() ? std::string() : origin;
+        auto bail = [&](const std::string& why) {  // no half-built set survives
+            for (auto p = app.aSetBindPending.begin(); p != app.aSetBindPending.end();)
+                p = p->setId == S.id ? app.aSetBindPending.erase(p) : std::next(p);
+            return why;
+        };
+        // inline role members, in node order (each carrier keeps its order, §4)
+        for (int k = 0; k < n; k++) {
+            if (nodes[(size_t)k].parent != i) continue;
+            App::ASetRole r;
+            r.role = nodes[(size_t)k].role;
+            bindBuilt(nodes[(size_t)k], r);
+            S.roles.push_back(std::move(r));
+        }
+        // ...then the refs, in JSON key order
+        std::vector<VnzRef> refs;
+        std::string perr;
+        if (!v.refsJson.empty() && !vnzParseRefs(v.refsJson, refs, perr))
+            return bail("__refs_" + std::to_string(i) + ": " + perr);
+        for (const auto& R : refs) {
+            if (!vnzRoleName(R.role))
+                return bail("__refs_" + std::to_string(i) + ": role name \"" +
+                            R.role + "\" is not [A-Za-z0-9_]+");
+            App::ASetRole r;
+            r.role = R.role;
+            if (R.node >= 0) {
+                if (R.node >= n)
+                    return bail("__refs_" + std::to_string(i) + ": node " +
+                                std::to_string(R.node) + " does not exist");
+                bindBuilt(nodes[(size_t)R.node], r);
+            } else {
+                r.refPath = R.path;
+                r.refMember = R.member;
+                resolveSetRef(r, S.id, (int)S.roles.size(), batchId, origin);
+            }
+            S.roles.push_back(std::move(r));
+        }
+        // one role name, once: the dict side cannot even write a duplicate, so
+        // one here is a malformed container and the whole call refuses
+        for (size_t a = 0; a < S.roles.size(); a++)
+            for (size_t b = a + 1; b < S.roles.size(); b++)
+                if (S.roles[a].role == S.roles[b].role)
+                    return bail("node " + std::to_string(i) + ": role \"" +
+                                S.roles[a].role + "\" appears twice in one set");
+        std::string base = v.name;
+        if (base.empty()) {                 // schema-derived default (§1.1)
+            base = "{";
+            for (size_t a = 0; a < S.roles.size(); a++)
+                base += (a ? ", " : "") + S.roles[a].role;
+            base += "}";
+        }
+        S.name = aSetUniqueName(batchId, base);   // §1.4: default twins numbered
+        app.analysisSets.push_back(std::move(S));
+        setsBuilt++;
+        app.imagesRev++;
+    }
+    return {};
 }
 
 // ---- build ---------------------------------------------------------------
@@ -1219,6 +1801,7 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
     for (int i = 0; i < n; i++) {
         VnzNode& v = nodes[(size_t)i];
         if (v.layer == "batch") continue;
+        if (v.layer == "analysisset") continue;   // built below, once members landed
         if (v.layer == "series") {
             v.seriesId = newSeries(batchId, v.name);
             seriesN++;
@@ -1253,7 +1836,8 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
         int ord = 0;
         for (int k = 0; k < i; k++)
             if (nodes[(size_t)k].parent == v.parent &&
-                nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series")
+                nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series" &&
+                nodes[(size_t)k].layer != "analysisset")
                 ord++;
         std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(ord) : v.name;
         std::string lErr = loadNpyBuffer(member, origin, label);
@@ -1352,6 +1936,14 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                 }
         }
     }
+    // The sets, while the call's batch is still the load target: a Ref that
+    // opens something must land it HERE (§2.2 case 3 - "opened for this set"
+    // stays on the books), so this runs before loadBatchId is handed back.
+    int setsBuilt = 0;
+    if (firstErr.empty()) {
+        std::string serr = vnzBuildSets(nodes, n, batchId, origin, readerSpec, setsBuilt);
+        if (!serr.empty()) firstErr = serr;
+    }
     app.loadBatchId = prevBatch;
 
     // metadata: __meta_<k> at the root, __meta_<i>_<k> below it. The viewer
@@ -1369,11 +1961,16 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
     }
 
     if (!firstErr.empty()) return firstErr;
-    if (!frames) return "the container declares no pixels";
+    // A set of nothing but Refs carries no pixels of its own and that is a
+    // legal return value (§1.1: Ref-only sets are the record shape §1.6 shows)
+    if (!frames && !setsBuilt) return "the container declares no pixels";
     app.imagesRev++;
-    char say[320];
-    snprintf(say, sizeof say, "%s: %d frame(s), %d stack(s), %d series%s",
-             baseName(origin).c_str(), frames, stacks, seriesN,
+    char setPart[48] = "";
+    if (setsBuilt)
+        snprintf(setPart, sizeof setPart, ", %d set(s)", setsBuilt);
+    char say[368];
+    snprintf(say, sizeof say, "%s: %d frame(s), %d stack(s), %d series%s%s",
+             baseName(origin).c_str(), frames, stacks, seriesN, setPart,
              readerSpec.empty() ? ""
                  : (" via " + baseName(readerFileOf(readerSpec)) + ":" +
                     readerFuncOf(readerSpec)).c_str());

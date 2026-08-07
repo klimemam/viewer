@@ -716,6 +716,170 @@ static void migrateLegacyLevels() {
     }
 }
 
+// ---- AnalysisSet: the binds that had to wait (docs/reader-analysisset.md) ----
+// A folder Ref (or a session's stack role) opens its head at once and its
+// siblings through the queued rescan; the BIND lands here, at the same drain
+// gate seriesRestore resolves at - and a bind that still cannot land becomes
+// an unbound role with the reason, never a silent drop.
+static void resolveASetBindPending() {
+    std::vector<App::ASetBind> q;
+    q.swap(app.aSetBindPending);
+    int bound = 0, failed = 0;
+    for (const auto& b : q) {
+        App::ASet* S = aSetById(b.setId);
+        if (!S || b.roleIdx < 0 || b.roleIdx >= (int)S->roles.size())
+            continue;                        // the set was closed while forming
+        App::ASetRole& r = S->roles[(size_t)b.roleIdx];
+        if (b.kind == 1) {
+            // a Ref deferred past the session replay: full §2.2 order, now
+            // that everything the session loads is loaded. May queue a kind-0
+            // bind of its own (a folder group) - the gate refires for it.
+            r.reason.clear();
+            resolveSetRef(r, b.setId, b.roleIdx, b.batchId, b.origin);
+            if (r.bound()) {
+                bound++;
+            } else {
+                // a folder group may have re-queued itself (kind 0): still
+                // forming is not a failure yet - the gate refires for it
+                const bool forming = !app.aSetBindPending.empty() &&
+                                     app.aSetBindPending.back().setId == b.setId &&
+                                     app.aSetBindPending.back().roleIdx == b.roleIdx;
+                if (!forming) failed++;
+            }
+            continue;
+        }
+        int sid = seqIdOfFirstFramePath(b.headPath, b.batchId);
+        if (sid) {
+            r.seqId = sid;
+            r.reason.clear();
+            bound++;
+        } else {
+            r.reason = b.what + " did not open as a stack";
+            failed++;
+        }
+    }
+    if (bound || failed) {
+        app.imagesRev++;
+        if (failed)
+            toast(std::to_string(failed) + " set binding(s) could not be made - "
+                  "the roles say why", true);
+    }
+}
+
+// The session's analysisset blocks, once every stack the file asked for
+// exists. §5.2: a reader re-run has usually rebuilt the same set already -
+// the block ADOPTS it on (setbatch, name) rather than making a second node
+// (the same-name prohibition of §1.4 is what makes that key valid). Roles are
+// the re-run's truth; differences are counted and said. A block whose name
+// matches nothing, but whose reader origin left exactly ONE unclaimed set in
+// that batch, is the same set RENAMED - the block owns the rename (the
+// seqname-on-SeqRestore precedent). Only when the reader could not speak at
+// all does the block rebuild the set from its own records, each role resolved
+// in §2.2 order and the unresolvable ones left unbound with the reason.
+static void resolveASetRestore() {
+    int made = 0, adopted = 0, renamed = 0, roleDiff = 0;
+    int lostSets = 0, unbound = 0, truncated = 0;
+    std::vector<int> claimed;
+    auto isClaimed = [&](int id) {
+        return std::find(claimed.begin(), claimed.end(), id) != claimed.end();
+    };
+    std::vector<App::ASetRestore> blocks;
+    blocks.swap(app.aSetRestore);
+    for (const auto& R : blocks) {
+        truncated += R.truncated;
+        int bid = 0;
+        for (const auto& b : app.batches) if (b.name == R.batchName) bid = b.id;
+        if (!bid) { lostSets++; continue; }
+        App::ASet* hit = nullptr;
+        for (auto& S : app.analysisSets)
+            if (S.batchId == bid && S.name == R.name && !isClaimed(S.id)) {
+                hit = &S;
+                break;
+            }
+        if (!hit && !R.origin.empty()) {
+            App::ASet* cand = nullptr;
+            int nc = 0;
+            for (auto& S : app.analysisSets)
+                if (S.batchId == bid && S.origin == R.origin && !isClaimed(S.id)) {
+                    cand = &S;
+                    nc++;
+                }
+            if (nc == 1) { hit = cand; hit->name = R.name; renamed++; }
+        }
+        if (hit) {
+            claimed.push_back(hit->id);
+            adopted++;
+            // truth is the re-run's; a role the block remembers that the
+            // re-run no longer has (the reader was edited) is COUNTED
+            for (const auto& rr : R.roles) {
+                bool found = false;
+                for (const auto& sr : hit->roles)
+                    if (sr.role == rr.role) { found = true; break; }
+                if (!found) roleDiff++;
+            }
+            continue;
+        }
+        // the block alone (§5.2 last bullet): every role from the records,
+        // resolved in §2.2 order
+        App::ASet S;
+        S.id = app.nextASetId++;
+        S.batchId = bid;
+        S.readerSpec = R.readerSpec;
+        S.origin = R.origin;
+        for (const auto& rr : R.roles) {
+            App::ASetRole r;
+            r.role = rr.role;
+            if (rr.kind == "unbound") {
+                r.reason = rr.reason.empty() ? std::string("unbound when saved")
+                                             : rr.reason;
+                unbound++;
+            } else {
+                int mbid = 0;      // the member's own batch, named by the block:
+                for (const auto& b : app.batches)   // bindings cross batches (§1.4)
+                    if (b.name == rr.batchName) mbid = b.id;
+                if (mbid == 0) mbid = bid;
+                if (rr.kind == "stack") {
+                    aSetBindStackByHead(r, rr.key, S.id, (int)S.roles.size(), mbid);
+                } else if (rr.kind == "series") {
+                    for (const auto& s : app.series)
+                        if (s.batchId == mbid && s.name == rr.key) r.seriesId = s.id;
+                    if (r.seriesId == 0)
+                        r.reason = "series \"" + rr.key + "\" not found in batch \"" +
+                                   rr.batchName + "\"";
+                } else {           // frame: a file path, §2.2 whole
+                    r.refPath = rr.key;
+                    resolveSetRef(r, S.id, (int)S.roles.size(), mbid, std::string());
+                    r.refPath.clear();   // the record was the session's, not a Ref's
+                }
+                if (!r.bound() && r.reason.empty()) r.reason = rr.key + " not found";
+            }
+            S.roles.push_back(std::move(r));
+        }
+        S.name = aSetUniqueName(bid, R.name);
+        claimed.push_back(S.id);
+        app.analysisSets.push_back(std::move(S));
+        made++;
+        app.imagesRev++;
+    }
+    if (made || adopted || lostSets || roleDiff || truncated) {
+        std::string msg = "restored " + std::to_string(made + adopted) + " set(s)";
+        if (adopted)
+            msg += " (" + std::to_string(adopted) + " adopted from the reader's re-run" +
+                   (renamed ? ", " + std::to_string(renamed) + " renamed by the session"
+                            : std::string()) + ")";
+        if (roleDiff)
+            msg += "; " + std::to_string(roleDiff) +
+                   " recorded role(s) differ - the reader's are kept";
+        if (lostSets)
+            msg += "; " + std::to_string(lostSets) + " set(s) had no batch to restore into";
+        if (truncated)
+            msg += "; " + std::to_string(truncated) + " role line(s) were cut short";
+        toast(msg, lostSets > 0 || truncated > 0);
+        fprintf(stderr, "analysisset: %s\n", msg.c_str());
+    }
+    (void)unbound;
+}
+
 // The picker's "open as a sweep", once its stacks exist. Matching is by
 // IDENTITY: each ticked group was stamped with a token, and the stack that
 // group created was recorded under it at creation (noteGroupStack). A display
@@ -838,12 +1002,19 @@ static void pumpSequenceAndQueue() {
     // stacks arrive over many frames, and a lookup one frame too early would
     // report perfectly good members as missing.
     if ((!app.seriesRestore.empty() || !app.seqLevelLegacy.empty() ||
-         !app.seriesPending.empty()) &&
+         !app.seriesPending.empty() || !app.aSetRestore.empty() ||
+         !app.aSetBindPending.empty()) &&
         !app.seqRunning && app.seqQueue.empty() && app.seqRestore.empty() &&
         app.rbOpenQueue.empty() && !seqReadyPending()) {
         if (!app.seriesRestore.empty()) resolveSeriesRestore();
         if (!app.seqLevelLegacy.empty()) migrateLegacyLevels();
         if (!app.seriesPending.empty()) resolvePendingSeries();
+        // Binds BEFORE blocks: a bind waiting here belongs to an earlier
+        // drain, and its stack exists now. Blocks may queue NEW rescans and
+        // new binds - those wait for the NEXT drain, and this gate refires
+        // because aSetBindPending is nonempty (ras §5.2 / §2.2).
+        if (!app.aSetBindPending.empty()) resolveASetBindPending();
+        if (!app.aSetRestore.empty()) resolveASetRestore();
     }
     // Parked frame averages last, and behind the same "everything has landed"
     // gate: a mean taken while the stack is still filling would be a mean of

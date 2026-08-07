@@ -865,6 +865,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/verify.inc"
 
+    #include "selftest/aset.inc"
+
     #include "selftest/derive.inc"
 
     #include "selftest/reload.inc"
