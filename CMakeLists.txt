@@ -462,6 +462,12 @@ set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" T
 # `viewer --roistats-selftest --no-window`, byte-identical, no exceptions, which
 # is why its dump prints numbers and no rectangles.
 viewer_selftest(series      NOGL --series-selftest tools/testdata/linset)
+# The Series Analysis panel's contract (docs/analysis-layers.md §3.3, 判断
+# record 7): frame|stack mixed members, per-member folds with the sum refusal,
+# the migrated fit window/method, and the session round trip. Values and
+# strings only, so NOGL; it writes its own exact fixtures under a scratch
+# subdirectory, the stackavg discipline.
+viewer_selftest(seriespanel NOGL --seriespanel-selftest tools/testdata)
 viewer_selftest(lin         NOGL --lin-selftest --stack always
                             --cfa bayer --bayer-pattern RGGB tools/testdata/linset)
 viewer_selftest(browse      NOGL --browse-selftest tools/testdata/rb)

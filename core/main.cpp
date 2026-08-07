@@ -887,6 +887,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/lin.inc"
 
+    #include "selftest/seriespanel.inc"
+
     // Everything past this point draws. Every selftest that can run windowless
     // has returned above, so reaching here with no window means either
     // --no-window on a test that needs one (say so, by name) or --no-window on

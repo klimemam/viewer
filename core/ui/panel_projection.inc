@@ -1228,8 +1228,9 @@ static void linRecompute(int seriesId) {
 // dropped, and the caller must SAY so, not hide them.
 struct LinSnrPt { int seqId; int plane; double x, snr; };
 static void linSnrPoints(const App::LinState& L, std::vector<LinSnrPt>& out,
-                         bool* fromDark, int* belowDark) {
+                         bool* fromDark, int* belowDark, int* noSigma = nullptr) {
     out.clear();
+    if (noSigma) *noSigma = 0;
     const App::LinState::Row* darkRow = nullptr;
     for (const auto& r : L.rows) {
         if (!r.include || !r.valid || !std::isfinite(r.level)) continue;

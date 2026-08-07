@@ -29,6 +29,33 @@ static App::Series* seriesOfStack(int seqId) {
             if (m.seqId == seqId) return &s;
     return nullptr;
 }
+// ---- frame members (docs/analysis-layers.md §3.3, 判断record 7) --------------
+// A series member may be a STANDALONE FRAME: the doc named by uid, seqId 0,
+// not a preview. A frame that sits inside a stack is never a member by itself
+// - it belongs to the series through its stack (the canon's containment; the
+// 省略 rule covers a frame with no stack, not a frame escaping one).
+static ImageDoc* frameMemberDoc(uint64_t uid) {
+    // red stage of the fail-first contract: implemented with the model commit
+    (void)uid;
+    return nullptr;
+}
+// Reverse membership for frames - the frame twin of seriesOfStack.
+static App::Series* seriesOfFrame(uint64_t uid) {
+    (void)uid;
+    return nullptr;
+}
+// Drop one frame from whatever series holds it. Returns the series' id, or 0.
+static int removeFrameFromSeries(uint64_t uid) {
+    (void)uid;
+    return 0;
+}
+// Add a standalone frame to a series - the frame twin of addToSeries, with the
+// same strict-containment refusal (the frame's batch must be the series').
+static bool addFrameToSeries(int seriesId, uint64_t uid, double value,
+                             bool include = true) {
+    (void)seriesId; (void)uid; (void)value; (void)include;
+    return false;
+}
 // The batch a stack is in, read off its frames (the frames own batchId).
 // 0 = the stack has no frames resident, so it claims no batch.
 static int batchOfStack(int seqId) {
@@ -139,6 +166,13 @@ static int seriesFitPoints(const App::Series& S) {
     for (const auto& m : S.members)
         if (m.include && std::isfinite(m.value) && seqInfo(m.seqId)) n++;
     return n;
+}
+// The ONE line that names the layer of everything this panel prints (canon
+// invariant (a): 解析結果は自分の層を名乗る). Screen, TSV comment and selftest
+// all read this string, so they cannot drift apart.
+static std::string seriesProvLine(const App::Series& S, const App::LinState& L) {
+    (void)S; (void)L;
+    return {};
 }
 static const char* seriesKindName(int k) {
     switch (k) {

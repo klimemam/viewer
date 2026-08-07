@@ -16,6 +16,8 @@ static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
+static std::string g_seriesPanelSelftest; // --seriespanel-selftest <dir>: Series Analysis
+                                          // panel (mixed members, folds, fit window), exit
 static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
 static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal export document, exit
 static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise linearity, synthetic, exit
@@ -419,6 +421,8 @@ static void printUsage() {
         "                              synthetic stacks with exact means, both methods\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit\n"
         "  --series-selftest <dir>     series (系列) model + invariants\n"
+        "  --seriespanel-selftest <dir> Series Analysis panel: frame|stack mixed\n"
+        "                              members, folds, fit window/method, session\n"
         "  --range-selftest <dir>      every A/B display-range combination (2 stacks)\n"
         "  --framestats-selftest       per-frame statistics, TSV to stdout\n"
         "  --abstats-selftest <dir>    A/B statistics caches: two slots\n"
@@ -600,6 +604,8 @@ static void parseCli(int argc, char** argv) {
             g_exportSelftest = next();             // handled in main()
         } else if (a == "--series-selftest") {
             g_seriesSelftest = next();             // handled in main()
+        } else if (a == "--seriespanel-selftest") {
+            g_seriesPanelSelftest = next();        // handled in main()
         } else if (a == "--sweepfile-selftest") {
             g_sweepFileSelftest = next();          // handled in main()
         } else if (a == "--newwin-selftest") {
