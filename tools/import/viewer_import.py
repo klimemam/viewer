@@ -15,12 +15,15 @@ Stack when the frames are repeats of one condition (sigma_t means something) and
 Series when a condition was swept (sigma_t would report the sweep as noise).  No
 other vocabulary is introduced; see docs/terminology.md.
 
-A fifth layer exists in the canon: AnalysisSet, a set of role bindings
-({"image": ..., "dark": ...}), with Ref as the way to bind data that is already
-open without re-reading it.  Both are specified in docs/reader-analysisset.md and
-are NOT implemented in this file yet -- importing them fails until the viewer
-side lands.  The spec is the contract to write them against; nothing already
-here changes meaning (VERSION stays 1).
+The fifth layer of the canon is here too: AnalysisSet, a set of role bindings
+({"image": Stack(arr), "dark": Ref("darks/")}), with Ref as the way to bind
+data the viewer already has open without re-reading it.  Both are specified in
+docs/reader-analysisset.md ("ras" in comments below).  A role value is Frame /
+Stack / Series (inline: this call carries the pixels) or Ref (a path: the
+viewer resolves it against what is open, 2.2).  A bare array is NOT a role
+value (ras decision 2): the role dict is a declaration, and the one place that
+must not fall back to shape guessing.  Nothing already here changed meaning,
+so VERSION stays 1 (it moves when a FIELD changes meaning, not on additions).
 
 Returning a bare array is also allowed and is read exactly as the viewer reads a
 .npy natively -- (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C).  Naming a type is what
@@ -42,7 +45,7 @@ Python floor: 3.8.
 from dataclasses import dataclass, fields as _fields
 from typing import Any, ClassVar, Dict, Optional
 
-__all__ = ["Frame", "Stack", "Series", "Batch", "Values",
+__all__ = ["Frame", "Stack", "Series", "Batch", "AnalysisSet", "Ref", "Values",
            "CFA_PATTERNS", "LAYOUTS", "VERSION"]
 
 #: bumped when the meaning of a field changes; the viewer keys its cache on it
@@ -457,20 +460,143 @@ class Batch:
         members = self.members
         if not isinstance(members, (list, tuple)) or not members:
             raise ValueError("Batch: no members -- a batch is a sequence of "
-                             "Frame / Stack / Series")
+                             "Frame / Stack / Series / AnalysisSet")
+        setNames = []
         for i, m in enumerate(members):
-            if not isinstance(m, (Frame, Stack, Series)):
+            if not isinstance(m, (Frame, Stack, Series, AnalysisSet)):
                 raise TypeError("Batch: member %d is a %s -- a batch holds "
-                                "Frame / Stack / Series (a batch does not nest)"
-                                % (i, type(m).__name__))
+                                "Frame / Stack / Series / AnalysisSet (a batch "
+                                "does not nest)" % (i, type(m).__name__))
+            # ras 1.3/1.4: a set's identity is (batch, name), and every member
+            # of this batch lands in ONE batch - so two sets under the same
+            # EXPLICIT name fail here, on the constructing line.  Default
+            # (schema-derived) names are exempt: numbering those is the
+            # viewer's job, not a defect of this reader.
+            if isinstance(m, AnalysisSet) and m.name_given:
+                if m.name in setNames:
+                    raise ValueError('Batch: two sets are both named "%s" -- a '
+                                     "set's identity is (batch, name), so one "
+                                     "call cannot return two (rename one; only "
+                                     "explicit name= collides - default-named "
+                                     "sets are numbered by the viewer)" % m.name)
+                setNames.append(m.name)
         object.__setattr__(self, "members", tuple(members))
 
     def __repr__(self):
         return "Batch(%d member(s), name=%r)" % (len(self.members), self.name)
 
 
+# ------------------------------------------------------------------------ Ref
+# docs/reader-analysisset.md 2: "this role is THAT, over there" -- said by path,
+# never by name (names are renameable and not unique, the session file's rule).
+
+@dataclass(frozen=True, eq=False, repr=False)
+class Ref:
+    """A role bound to data the viewer resolves by path -- never re-read here.
+
+    Ref(path, member="").  A file path means that one file read natively; a
+    folder means the ONE numbered file group inside it (two or more groups are
+    refused by name).  `member` names one array of an .npz container.  The
+    viewer resolves it in ras 2.2 order: an open copy with the same identity is
+    shared; an open copy whose file changed on disk is bound WITH a declaration;
+    an unopened path is opened into the calling reader's batch.  A path that
+    cannot be resolved leaves the role UNBOUND with the reason - it never fails
+    the call (ras 3.1: a Ref speaks about the world, not about this reader).
+    """
+
+    path: str
+    member: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.path, str) or not isinstance(self.member, str):
+            raise TypeError("Ref: path and member must be strings")
+        if not self.path.strip():
+            raise ValueError("Ref: path is empty -- a reference names where "
+                             "the data lives")
+
+    def __repr__(self):
+        return "Ref(%r%s)" % (self.path,
+                              ", member=%r" % self.member if self.member else "")
+
+
+def _is_role_name(name):
+    """ras 1.2: role names are [A-Za-z0-9_]+ -- identifier-shaped, so session
+    lines can be split on whitespace and the existing role vocabulary fits."""
+    if not isinstance(name, str) or not name:
+        return False
+    for c in name:
+        if not (c.isascii() and (c.isalnum() or c == "_")):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------- AnalysisSet
+
+@dataclass(frozen=True, eq=False, repr=False)
+class AnalysisSet:
+    """A set of role bindings: {"image": Stack(arr), "dark": Ref("darks/")}.
+
+    The first positional argument is the ROLE DICT (ras decision 1) - the
+    canon's own role-schema notation become code, so a misspelling fails on the
+    line that made it.  Role values are Frame / Stack / Series (inline) or Ref;
+    a bare array is refused (decision 2), and neither Batch nor AnalysisSet can
+    be a role value - a set does not nest.  A set carries no pixels of its own,
+    so there is no `range`.  The default name is the role list ("{image, dark}"),
+    a starting value in the tradition of the series default name; whether a
+    name was explicitly given is kept (`name_given`) because only EXPLICIT
+    same-name sets in one batch are a defect (ras 1.4).
+    """
+
+    roles: Any
+    name: str = ""
+    note: str = ""
+    meta: Optional[Dict[str, Any]] = None
+
+    LAYER: ClassVar[str] = "analysisset"
+
+    def __post_init__(self):
+        roles = self.roles
+        if not isinstance(roles, dict):
+            raise TypeError("AnalysisSet: roles must be a dict of {role: member}"
+                            ' -- e.g. {"image": Stack(arr), "dark": Ref("darks/")}')
+        if not roles:
+            raise ValueError("AnalysisSet: no roles -- a set is a set of role "
+                             "bindings")
+        for k, v in roles.items():
+            if not _is_role_name(k):
+                raise ValueError("AnalysisSet: role name %r -- letters, digits "
+                                 "and _ only (role names are written unquoted "
+                                 "in session files)" % (k,))
+            if isinstance(v, Ref):
+                continue
+            if isinstance(v, (Frame, Stack, Series)):
+                continue
+            if isinstance(v, (Batch, AnalysisSet)):
+                raise TypeError('AnalysisSet: role "%s" is a %s -- a set does '
+                                "not nest; a role holds Frame / Stack / Series "
+                                "or Ref" % (k, type(v).__name__))
+            raise TypeError('AnalysisSet: role "%s" is a %s -- a role holds '
+                            "Frame / Stack / Series or Ref; a bare array does "
+                            "not declare its layer (say Stack(arr), ras "
+                            "decision 2)" % (k, type(v).__name__))
+        object.__setattr__(self, "roles", dict(roles))
+        if not isinstance(self.name, str) or not isinstance(self.note, str):
+            raise TypeError("AnalysisSet: name and note must be strings")
+        object.__setattr__(self, "meta", _check_meta("AnalysisSet", self.meta))
+        # not a dataclass field on purpose: it is derived, and the transport
+        # does not carry it - the harness reads it to tell an explicit-name
+        # collision (a defect, ras 1.4) from a default-name one (numbered).
+        object.__setattr__(self, "name_given", bool(self.name))
+        if not self.name:
+            object.__setattr__(self, "name", "{" + ", ".join(roles) + "}")
+
+    def __repr__(self):
+        return "AnalysisSet(%d role(s): %s, name=%r)" % (
+            len(self.roles), ", ".join(self.roles), self.name)
+
+
 #: the layer types an adapter may return, in containment order
-LAYERS = (Frame, Stack, Series, Batch)
+LAYERS = (Frame, Stack, Series, AnalysisSet, Batch)
 
 
 def describe(obj):
@@ -488,6 +614,8 @@ def _self_check():
         Stack: ["pixels", "timestamps", "cfa", "name", "note", "meta", "range", "layout"],
         Series: ["stacks", "conditions", "name", "note", "meta", "range", "layout"],
         Batch: ["members", "name"],
+        AnalysisSet: ["roles", "name", "note", "meta"],   # no range: a set has no pixels
+        Ref: ["path", "member"],
         Values: ["values", "name", "unit"],
     }
     for cls, names in want.items():

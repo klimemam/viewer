@@ -22,11 +22,22 @@ series says which stacks are its members without the stacks having to carry the
 condition themselves (4.5).
 
     __viewer                   container format version; its PRESENCE is what
-                               distinguishes a viewer container from a plain npz
+                               distinguishes a viewer container from a plain npz.
+                               1, or 2 when an analysisset is aboard (ONLY then:
+                               set-free files stay 1, docs/reader-analysisset.md 4)
     __n                        number of nodes
-    __layer_<i>                "frame" | "stack" | "series" | "batch"
+    __layer_<i>                "frame" | "stack" | "series" | "batch" | "analysisset"
     __parent_<i>               parent node index, -1 for the root
     __pixels_<i>               pixels (frame and stack nodes only)
+    __role_<i>                 the role a child of an analysisset plays (its parent
+                               is the set; the member still LANDS in the batch -
+                               binding is not containment)
+    __refs_<i>                 on an analysisset node: JSON, declaration order.
+                               {"dark": {"path": "...", "member": ""}} is a Ref the
+                               viewer resolves; {"bias": {"node": 3}} binds a node
+                               this container already carries - how one instance
+                               placed in two roles (or in the batch members AND a
+                               role) travels once (ras 1.2: same object, same node)
     __name_<i> __note_<i> __layout_<i>       always written, possibly ""
     __cfa_<i> __range_<i>                    written when given
     __timestamps_values_<i> __timestamps_name_<i> __timestamps_unit_<i>
@@ -55,7 +66,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROG = "run_adapter"
 
-LAYERS = ("frame", "stack", "series", "batch")
+LAYERS = ("frame", "stack", "series", "batch", "analysisset")
 # 3.1: the last axis is channels when it is 4 or FEWER.  Byte-for-byte the same
 # sentence core/main.cpp prints (NPY_NATIVE_FORMS) -- the viewer and this harness
 # refusing the same array in two different wordings is how issue #71 stayed
@@ -83,9 +94,29 @@ def layer_of(obj):
         return layer
     name = type(obj).__name__.lower()
     if name in LAYERS and (hasattr(obj, "pixels") or hasattr(obj, "stacks")
-                           or hasattr(obj, "members")):
+                           or hasattr(obj, "members") or hasattr(obj, "roles")):
         return name
     return None
+
+
+def ref_of(obj):
+    """(path, member) when this is Ref-shaped, else None.  Duck typed for the
+    same reason layer_of is: the adapter may hold its own viewer_import copy."""
+    if type(obj).__name__ != "Ref":
+        return None
+    if not hasattr(obj, "path") or not hasattr(obj, "member"):
+        return None
+    return str(obj.path), str(obj.member or "")
+
+
+def is_role_name(name):
+    """ras 1.2: [A-Za-z0-9_]+ -- identifier-shaped, session-line safe."""
+    if not name:
+        return False
+    for c in name:
+        if not ("a" <= c <= "z" or "A" <= c <= "Z" or "0" <= c <= "9" or c == "_"):
+            return False
+    return True
 
 
 def values_of(where, what, obj):
@@ -178,6 +209,8 @@ class Node(object):
         self.conditions = None
         self.meta = {}
         self.notes = []                 # what the harness had to add
+        self.role = ""                  # a set child: the role it plays (ras 4)
+        self.refs = []                  # a set node: [(role, {...})], declaration order
 
     def full_note(self):
         parts = [p for p in ([self.note] + self.notes) if p]
@@ -188,6 +221,8 @@ class Build(object):
     def __init__(self):
         self.nodes = []
         self.skipped = []               # one line per thing not applied
+        self.seen = {}                  # id(layer object) -> node index (ras 1.2)
+        self.keep = []                  # holds those objects so id() stays unique
 
     # -- common fields off any layer object ---------------------------------
     def common(self, node, obj, where):
@@ -250,11 +285,23 @@ class Build(object):
         layer = layer_of(obj)
         if layer is None:
             return self.bare(obj, parent, where)
+        # ras 1.2: the same instance is the same node.  The pixels travel once;
+        # whoever meets the object again gets the index of the node it already
+        # is (the set handler turns that into a {"node": k} ref).
+        key = id(obj)
+        if key in self.seen:
+            return self.seen[key]
         if layer == "batch":
-            return self.batch(obj, parent, where)
-        if layer == "series":
-            return self.series(obj, parent, where)
-        return self.leaf(obj, layer, parent, where)
+            idx = self.batch(obj, parent, where)
+        elif layer == "series":
+            idx = self.series(obj, parent, where)
+        elif layer == "analysisset":
+            idx = self.analysisset(obj, parent, where)
+        else:
+            idx = self.leaf(obj, layer, parent, where)
+        self.seen[key] = idx
+        self.keep.append(obj)
+        return idx
 
     def leaf(self, obj, layer, parent, where):
         idx, node = self.add(layer, parent)
@@ -315,12 +362,76 @@ class Build(object):
         members = getattr(obj, "members", None)
         if not members:
             raise AdapterError("Batch: no members -- a batch is a sequence of "
-                               "Frame / Stack / Series")
+                               "Frame / Stack / Series / AnalysisSet")
+        # ras 1.4: every member of this call lands in ONE batch, and a set's
+        # identity is (batch, name) - so two sets under the same EXPLICIT name
+        # are a defect of this reader's output and fail the call HERE, where the
+        # type check can no longer be sidestepped.  Default (schema-derived)
+        # names are exempt: the viewer numbers those.
+        names = []
         for m in members:
-            if layer_of(m) not in ("frame", "stack", "series"):
+            if layer_of(m) == "analysisset":
+                nm = str(getattr(m, "name", "") or "")
+                given = bool(getattr(m, "name_given", nm != ""))
+                if given and nm:
+                    if nm in names:
+                        raise AdapterError(
+                            'two sets in one call are both named "%s" -- a '
+                            "set's identity is (batch, name); rename one "
+                            "(ras 1.4: this is a defect of the reader's own "
+                            "output, so the call fails)" % nm)
+                    names.append(nm)
+        for m in members:
+            if layer_of(m) not in ("frame", "stack", "series", "analysisset"):
                 raise AdapterError("Batch: member is a %s -- a batch holds "
-                                   "Frame / Stack / Series" % type(m).__name__)
+                                   "Frame / Stack / Series / AnalysisSet"
+                                   % type(m).__name__)
             self.walk(m, idx, where)
+        return idx
+
+    def analysisset(self, obj, parent, where):
+        """ras 4: the set is a node; inline role members are its CHILDREN with
+        __role, refs ride as one JSON member.  Landing (everything into the
+        batch) is the viewer's job - the tree stays a tree here."""
+        if parent != -1 and self.nodes[parent].layer != "batch":
+            raise AdapterError("AnalysisSet: a set is a node of a batch (or the "
+                               "whole return value) -- it cannot live inside a "
+                               "%s" % self.nodes[parent].layer)
+        idx, node = self.add("analysisset", parent)
+        self.common(node, obj, where)
+        roles = getattr(obj, "roles", None)
+        if not isinstance(roles, dict) or not roles:
+            raise AdapterError("AnalysisSet: roles must be a non-empty dict of "
+                               "{role: member}")
+        if not node.name:                       # ras 1.1: schema-derived default
+            node.name = "{" + ", ".join(str(k) for k in roles) + "}"
+        for role, val in roles.items():
+            role = str(role)
+            if not is_role_name(role):
+                raise AdapterError("AnalysisSet: role name %r -- letters, digits "
+                                   "and _ only" % role)
+            ref = ref_of(val)
+            if ref is not None:
+                path, member = ref
+                if not path.strip():
+                    raise AdapterError('AnalysisSet: role "%s": Ref path is '
+                                       "empty" % role)
+                node.refs.append((role, {"path": path, "member": member}))
+                continue
+            sub = layer_of(val)
+            if sub not in ("frame", "stack", "series"):
+                raise AdapterError('AnalysisSet: role "%s" is a %s -- a role '
+                                   "holds Frame / Stack / Series or Ref (a bare "
+                                   "array does not declare its layer, ras "
+                                   "decision 2)" % (role, type(val).__name__))
+            if id(val) in self.seen:
+                # 1.2: this object is already a node somewhere in the tree
+                # (the batch members, another role, another set).  The pixels
+                # travel once; the binding travels as a node ref.
+                node.refs.append((role, {"node": self.seen[id(val)]}))
+                continue
+            cidx = self.walk(val, idx, where)
+            self.nodes[cidx].role = role
         return idx
 
     def bare(self, obj, parent, where):
@@ -377,8 +488,21 @@ def meta_key(prefix, key):
 #: bumped when the MEANING of a reserved member changes; additions are compatible
 CONTAINER_VERSION = 1
 
+#: ras 4: ONLY a set-bearing container names version 2 - an old viewer then
+#: refuses it whole instead of silently dropping the set; a set-free file
+#: stays 1 and its compatibility does not move at all.
+CONTAINER_VERSION_SET = 2
+
 
 STREAM_VERSION = 1
+STREAM_VERSION_SET = 2                  # same rule, same reason (ras 4)
+
+
+def carries_set(nodes):
+    for nd in nodes:
+        if nd.layer == "analysisset":
+            return True
+    return False
 
 
 def _stream_line(fh, text):
@@ -400,12 +524,17 @@ def stream_out(fh, nodes):
     frame or per member, which is nothing beside the pixels, and text is what the
     session already writes axis values as.
     """
-    _stream_line(fh, "VIEWERSTREAM %d" % STREAM_VERSION)
+    _stream_line(fh, "VIEWERSTREAM %d"
+                 % (STREAM_VERSION_SET if carries_set(nodes) else STREAM_VERSION))
     _stream_line(fh, "n %d" % len(nodes))
     blobs = []
     for i, nd in enumerate(nodes):
         _stream_line(fh, "layer %d %s" % (i, nd.layer))
         _stream_line(fh, "parent %d %d" % (i, nd.parent))
+        if nd.role:
+            _stream_line(fh, "role %d %s" % (i, nd.role))
+        if nd.refs:                     # one line: json.dumps emits no newlines
+            _stream_line(fh, "refs %d %s" % (i, json.dumps(dict(nd.refs))))
         if nd.name:
             _stream_line(fh, "name %d %s" % (i, nd.name))
         note = nd.full_note()
@@ -462,7 +591,8 @@ def write_npz(path, nodes):
     # an ordinary npz and the viewer classifies its members by shape
     # (docs/npz-design.md).  It is written FIRST and always, because "is this a
     # container?" must be answerable without understanding anything else here.
-    out = {"__viewer": np.array(CONTAINER_VERSION, dtype="int32"),
+    out = {"__viewer": np.array(CONTAINER_VERSION_SET if carries_set(nodes)
+                                else CONTAINER_VERSION, dtype="int32"),
            "__n": np.array(len(nodes), dtype="int32")}
     for i, nd in enumerate(nodes):
         out["__layer_%d" % i] = np.array(nd.layer)
@@ -470,6 +600,10 @@ def write_npz(path, nodes):
         out["__name_%d" % i] = np.array(nd.name)
         out["__note_%d" % i] = np.array(nd.full_note())
         out["__layout_%d" % i] = np.array(nd.layout)
+        if nd.role:
+            out["__role_%d" % i] = np.array(nd.role)
+        if nd.refs:                     # declaration order: dict keeps insertion,
+            out["__refs_%d" % i] = np.array(json.dumps(dict(nd.refs)))   # no sort_keys
         if nd.pixels is not None:
             out["__pixels_%d" % i] = nd.pixels
         if nd.cfa:
@@ -493,7 +627,7 @@ def write_npz(path, nodes):
 
 
 def summary(spec, src, nodes, skipped, path, member_count):
-    counts = {"batch": 0, "series": 0, "stack": 0, "frame": 0}
+    counts = {"batch": 0, "series": 0, "stack": 0, "frame": 0, "analysisset": 0}
     frames = 0
     for nd in nodes:
         counts[nd.layer] += 1
@@ -504,6 +638,9 @@ def summary(spec, src, nodes, skipped, path, member_count):
         n = counts[word]
         if n:
             read.append("%d %s%s" % (n, word, "" if word == "series" or n == 1 else "s"))
+    if counts["analysisset"]:           # ras 4: sets are read too, so they are counted
+        n = counts["analysisset"]
+        read.append("%d set%s" % (n, "" if n == 1 else "s"))
     read.append("%d frame%s" % (frames, "" if frames == 1 else "s"))
     why = ""
     if skipped:
