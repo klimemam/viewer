@@ -250,8 +250,11 @@ def load(path):            # path: str。この1引数だけが必須
 
 ### 4.2 返り値が層を名乗る
 
-**返り値の型が、frame / stack / series / batch のどれかを名乗る。**
-層モデルの4語以外の語を持ち込まない (`frames` のような新語を作らない)。
+**返り値の型が、frame / stack / series / batch / AnalysisSet のどれかを
+名乗る。** 層モデルの5語以外の語を持ち込まない (`frames` のような新語を
+作らない)。5語目 (役割束縛の AnalysisSet — 正典の5層化に伴い 2026-08-07 追加)
+の返し方は [reader-analysisset.md](reader-analysisset.md) が仕様で、本節の
+以下は最初の4語のまま。
 
 ```python
 from viewer_import import Frame, Stack, Series, Batch
@@ -560,9 +563,14 @@ ValueError: Series: conditions has 8 value(s) but there are 16 stack(s)
 - 非連続配列の連続化、endianness の正規化
 - 返り値の検査 (形・dtype・`conditions`/`timestamps` の長さの整合)
 - **.npz への書き出し**。予約メンバ:
-  - 木: `__n` (ノード数) / `__layer_<i>` (`frame` `stack` `series` `batch`) /
-    `__parent_<i>` (親のノード番号、根は -1)。深さ優先で並べ、ノード 0 が
-    adapter の返り値。**series と stack を区別できる唯一の手段なので必須**
+  - 木: `__n` (ノード数) / `__layer_<i>` (`frame` `stack` `series` `batch`
+    `analysisset`) / `__parent_<i>` (親のノード番号、根は -1)。深さ優先で
+    並べ、ノード 0 が adapter の返り値。**series と stack を区別できる唯一の
+    手段なので必須**
+  - set の束縛 (2026-08-07 追加、[reader-analysisset.md](reader-analysisset.md)
+    §4): `__role_<i>` (親が analysisset のメンバが演じる役割名) /
+    `__refs_<i>` (set ノードに置く JSON の参照 —
+    `{"dark": {"path": "...", "member": ""}}`)
   - 画素と付随物: `__pixels_<i>` / `__cfa_<i>` / `__name_<i>` / `__note_<i>` /
     `__range_<i>`
   - 軸: `__conditions_values_<i>` / `__conditions_name_<i>` / `__conditions_unit_<i>` /
@@ -622,6 +630,10 @@ __layer_2 'stack'    __parent_2  0   __pixels_2 ...
 `__viewer 1` を**必ず最初に書く**。読む側は `__viewer` の**有無だけ**で分岐し、
 **自分より新しい版は読まずに断る** (意味が変わっているかもしれないため)。
 メンバの**追加は互換**、意味の変更は版を上げる。
+(2026-08-07 追記) **AnalysisSet を含むコンテナだけが `__viewer 2` を名乗る**
+— 版はファイル単位で、set の無いファイルは 1 のまま。旧 viewer が set を
+黙って落とす代わりに断るための版上げである
+([reader-analysisset.md](reader-analysisset.md) §4)。
 
 **注意**: これを「汎用の交換形式」だと名乗らないこと。npz は zip + npy であって、
 `__layer_<i>` の意味を知っているのはこの道具だけ。**この道具のための容器**であり、
