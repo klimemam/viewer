@@ -317,6 +317,13 @@ inline std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSo
     std::lock_guard<std::mutex> lk(g_srcRegMtx);
     return srcRegistryAddLocked(s, key);
 }
+// How a stack's time axis is folded into one frame (docs/analysis-layers.md
+// §3.2, 判断record 3): the fold is a CHOICE of mean / sum, and the default is
+// mean - the mechanism `0e4d4ec`'s frame average already built. Honesty is not
+// in which folds are offered but in what every fold DECLARES: NaN present is a
+// warning, and both folds carry the exclusion count and the valid frame count.
+enum StackFold { FOLD_MEAN = 0, FOLD_SUM = 1 };
+
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
 // range, interpretation) and per-view (texture) state.
@@ -350,6 +357,11 @@ struct ImageDoc {
     // restore recomputes the mean once that stack is back. Empty on every frame
     // that came from a file, which is every other frame in the program.
     std::string avgOfPath;
+    int avgFold = 0;                  // StackFold the recipe folds by. It rides
+                                      // beside the path because the same line
+                                      // must bring back the same QUANTITY - a
+                                      // sum reloaded as a mean would come back
+                                      // 1/n of itself under one name.
 
     // w/h/ch/dtype/vmin/vmax above are per-doc MIRRORS of *src, kept as plain
     // fields because they are read on 240+ lines (docs/reference-design.md
@@ -1091,18 +1103,19 @@ struct App {
                         std::string axisName, axisUnit;
                         std::vector<double> axisVals; };
     std::vector<SeqRestore> seqRestore;
-    // "Open as frame average" on a stack that is not here yet. Browse opens are
-    // asynchronous - the first frame shows and the rest stream in - so the mean
-    // cannot be taken at click time; the request is parked on the seqId it is
-    // waiting for and fired by pumpStackAverages() once nothing more is coming.
-    // A session restore pushes into the SAME list (through avgRestore below), so
-    // there is one place where a stack becomes an average and one set of rules
-    // about when it is allowed to happen.
-    std::vector<int> pendingAvg;
+    // "Open as frame average" (or sum) on a stack that is not here yet. Browse
+    // opens are asynchronous - the first frame shows and the rest stream in -
+    // so the fold cannot be taken at click time; the request is parked on the
+    // seqId it is waiting for, with its StackFold, and fired by
+    // pumpStackAverages() once nothing more is coming. A session restore pushes
+    // into the SAME list (through avgRestore below), so there is one place
+    // where a stack becomes a folded frame and one set of rules about when it
+    // is allowed to happen.
+    std::vector<std::pair<int, int>> pendingAvg;           // (seqId, StackFold)
     // ...and the session's side of it, by PATH, resolved lazily exactly like
     // seriesRestore: at parse time a folder stack is one loose image plus a
     // queued rescan, so the stack this names does not exist yet.
-    std::vector<std::string> avgRestore;
+    std::vector<std::pair<std::string, int>> avgRestore;   // (path, StackFold)
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the

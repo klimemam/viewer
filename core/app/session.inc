@@ -232,7 +232,13 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         for (auto& o : app.images)            // there is nothing left to average
             if (o->seqId != 0 && o->src->path == d->avgOfPath) { live = true; break; }
         if (!live) { avgLost++; continue; }
-        f << "stackavg " << d->avgOfPath << "\n";   // path last: may contain spaces
+        // Two keys, not one key plus a flag: an older viewer skips lines it
+        // does not know (the series block's rule), so a sum saved here simply
+        // does not come back there - which is the right failure. A flag on the
+        // stackavg line would instead be DROPPED by the old parser, and the
+        // sum would come back as a mean: 1/n of itself under the same note.
+        f << (d->avgFold == FOLD_SUM ? "stacksum " : "stackavg ")
+          << d->avgOfPath << "\n";                  // path last: may contain spaces
     }
     if (avgLost)
         fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
@@ -1509,7 +1515,8 @@ static std::string loadSession(const std::string& path) {
         // this path". Collected here and resolved after everything is open, for
         // exactly the reason the series block gives below - and taken again
         // rather than reloaded, because there is no file holding the answer.
-        else if (key == "stackavg") app.avgRestore.push_back(restOfLine(ls));
+        else if (key == "stackavg") app.avgRestore.push_back({ restOfLine(ls), FOLD_MEAN });
+        else if (key == "stacksum") app.avgRestore.push_back({ restOfLine(ls), FOLD_SUM });
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
         // with a queued rescan behind it. See resolveSeriesRestore.
