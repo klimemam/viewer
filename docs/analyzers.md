@@ -22,6 +22,20 @@ Measure メニューはそれをツールチップに出す(UX 設計は [measur
   アクセント強調される: `.noise` / `.prnu_pct` / `tenengrad` / `mtf50 (cy/px)`。
   ABI v3 でプラグイン申告に移す予定
 
+## Provenance — どの dll が計算したか (#46 段階1)
+
+ホストは登録時に「どのファイルがどのアナライザを登録したか」を帳簿に記録する
+(`AnalyzerPluginInfo::file / path`。登録は dll のロード中に起こるので、その
+瞬間のファイルが出自 — ABI には何も足さない)。Analysis パネルの provenance
+行は末尾に `アナライザ名 (ファイル名)` を刻み、フルパスは行のホバーと
+Copy (TSV) / Export (CSV) の `# plugin:` コメント行に出る。builtin の統計
+(Temporal エクスポート等)は従来どおり `app: viewer <版>` のみで、プラグイン
+タグを着ない。検証は `--anaprov-selftest`。
+
+**版はまだ無い**: psAnalyzerV1/V2 に version フィールドが無いため、ABI v3 の
+新設欄と同時に入る([analysis-layers.md §8](analysis-layers.md)、判断record 6
+— ABI の版上げを2回にしない)。
+
 ## stats/moments
 
 基本統計。任意の画像/ROI に使える。

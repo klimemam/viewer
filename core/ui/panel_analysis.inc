@@ -51,8 +51,11 @@ static const char* analyzerHeadlineSuffix(const std::string& name) {
 static std::string buildAnalysisTsv() {
     const auto& ana = app.ana;
     // provenance rides along as a # comment: a pasted grid must carry
-    // the same evidence as a screenshot of the panel
+    // the same evidence as a screenshot of the panel - plus the dll's full
+    // path (#46), which the status line only shows on hover but a pasted
+    // document has room to cite outright
     std::string tsv = "# " + ana.prov + "\n";
+    if (!ana.provDll.empty()) tsv += "# plugin: " + ana.provDll + "\n";
     tsv += "metric\tunit";
     for (const auto& cn : ana.cols) tsv += "\t" + cn;
     tsv += "\n";
@@ -231,6 +234,17 @@ static void drawPanelAnalysis() {
                          rois.empty() ? "whole image" : tgt + 2,   // tgt = "| N ROI(s)"
                          ana.black, ana.white, ts, ana.runMs);
                 ana.prov = pv;
+                // ...and WHO computed it (#46 stage 1): the analyzer, and the
+                // dll the host's ledger says it came from. Name + basename on
+                // the line - a screenshot must answer "which plugin" without
+                // the session - and the full path one hover away (below) and
+                // in the exports, where a report actually cites it. The
+                // VERSION is still missing on purpose: the ABI has no field
+                // for it until v3 (判断record 6 - one ABI bump, not two).
+                ana.prov += "  |  " + anas[app.anaSel].name;
+                if (!anas[app.anaSel].file.empty())
+                    ana.prov += " (" + anas[app.anaSel].file + ")";
+                ana.provDll = anas[app.anaSel].path;
             }
         }
         // Run-state line: one line, every state, constant height - the grid
@@ -239,6 +253,11 @@ static void drawPanelAnalysis() {
             ImGui::TextDisabled("not measured yet  -  Run, M, or the Measure menu");
         } else {
             ImGui::TextDisabled("%s", ana.prov.c_str());
+            // the dll's full path: too long for a line that must stay one
+            // line, exactly right for the hover that asks "which file, on
+            // which disk" - the same answer the exports carry as "# plugin:"
+            if (!ana.provDll.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("plugin: %s", ana.provDll.c_str());
             if (stale && !ranNow && !app.anaAuto) {
                 // amber, matching the temporal panel's partial-data warning:
                 // old numbers are still shown (they were true when measured),
@@ -265,6 +284,9 @@ static void drawPanelAnalysis() {
             // along as # comment rows. Built NOW: the results may change
             // while the OS dialog is open.
             std::string csv = "# " + ana.prov + "\n";
+            // same "# plugin:" citation as the TSV: the curves come from the
+            // same run as the grid, so they carry the same computer
+            if (!ana.provDll.empty()) csv += "# plugin: " + ana.provDll + "\n";
             std::vector<std::string> names;
             for (const auto& s : ana.series) {
                 bool seen = false;

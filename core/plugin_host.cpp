@@ -34,6 +34,8 @@ std::vector<AnalyzerPluginInfo>  g_analyzers;
 std::vector<ProcessorPluginInfo> g_processors;
 std::function<void(const std::string&, bool)> g_log;
 std::string g_loading;            // filename currently registering, for log prefixes
+std::string g_loadingPath;        // ...and its absolute path: the ledger's source
+                                  // of truth for "which file registered this"
 
 void logMsg(const std::string& m, bool err) {
     if (g_log) g_log(m, err);
@@ -90,6 +92,11 @@ int32_t hostRegisterAnalyzer(void*, const psAnalyzerV1* a) {
     if (dupName(g_analyzers, a->name)) return 1;
     AnalyzerPluginInfo info;
     info.name = a->name;
+    // the ledger (#46 stage 1): registration happens inside fn(&g_api), so the
+    // file being loaded RIGHT NOW is the one this analyzer came from - recorded
+    // here because no later moment can know it
+    info.file = g_loading;
+    info.path = g_loadingPath;
     info.isV2 = false;
     info.v1 = *a;
     g_analyzers.push_back(std::move(info));
@@ -101,6 +108,8 @@ int32_t hostRegisterAnalyzer2(void*, const psAnalyzerV2* a) {
     AnalyzerPluginInfo info;
     info.name = a->name;
     info.desc = a->description ? a->description : "";
+    info.file = g_loading;            // the ledger, same as the V1 register above
+    info.path = g_loadingPath;
     info.isV2 = true;
     info.v2 = *a;
     g_analyzers.push_back(std::move(info));
@@ -194,10 +203,12 @@ void loadAll(const std::vector<std::string>& dirsUtf8,
                 continue;
             }
             g_loading = base;
+            g_loadingPath = p.u8string();
             size_t before = g_displays.size() + g_analyzers.size() + g_processors.size();
             int32_t rc = fn(&g_api);
             size_t added = g_displays.size() + g_analyzers.size() + g_processors.size() - before;
             g_loading.clear();
+            g_loadingPath.clear();
             if (rc != 0 && added == 0) {
                 logMsg(base + ": registration failed (ABI mismatch?)", true);
 #if defined(_WIN32)
