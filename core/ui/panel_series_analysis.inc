@@ -1,11 +1,18 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
-static void drawPanelLinearity() {
+// The SERIES layer's General Analyzer home (docs/analysis-layers.md §3.3):
+// linearity fit / PTC (K) / read noise / SNR curve over ONE series - the
+// Linearity panel generalized, and renamed with the layer it speaks for.
+// Members are frame | stack mixed (判断record 7): a stack member stands in as
+// a frame through its declared fold, a frame member is its own point, and the
+// fit takes mean statistics only.
+static void drawPanelSeriesAnalysis() {
     App::LinState& L = app.lin;
     // ---- which series? Nothing here creates one on its own -------------------
     if (app.series.empty()) {
-        ImGui::TextWrapped("No series yet. Linearity is measured over a SERIES: the stacks "
-                           "of one swept parameter, each with its value, and the parameter's "
-                           "name and unit belong to that series - not to the application.");
+        ImGui::TextWrapped("No series yet. Series analysis works over a SERIES: the stacks "
+                           "and frames of one swept parameter, each with its value, and the "
+                           "parameter's name and unit belong to that series - not to the "
+                           "application.");
         ImGui::Spacing();
         ImGui::TextDisabled("A sweep is never guessed from the folder tree. One wrong");
         ImGui::TextDisabled("guess would quietly fit data that was never a sweep.");
@@ -72,7 +79,7 @@ static void drawPanelLinearity() {
     if (ImGui::Button("Compute")) linRecompute(S->id);
     ImGui::SameLine();
     ImGui::TextDisabled(L.roiUsed ? "| selected ROI" : "| whole frame");
-    // The per-stack table has room for ONE response column. Averaging the CFA
+    // The per-member table has room for ONE response column. Averaging the CFA
     // planes into it would be a different measurement, so it shows the plane you
     // pick and says which one; the fits and the plots stay per-plane.
     if (L.nPl > 1) {
@@ -81,9 +88,48 @@ static void drawPanelLinearity() {
         ImGui::Combo("table plane", &L.tablePlane, "R\0Gr\0Gb\0B\0");
         L.tablePlane = std::clamp(L.tablePlane, 0, L.nPl - 1);
     }
+    // ---- fit settings: the frame-linearity machinery in its series-layer
+    // home (docs/analysis-layers.md §3.3; board row 104). Session-persisted
+    // (the "seriespanel" line). Changing either stales the fit - the printed
+    // numbers must never outlive the settings that made them.
+    {
+        bool ch = false;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 13);
+        ch |= ImGui::Combo("fit method", &L.fitMethod,
+                           "OLS\0relative-weighted LS (rev4-style)\0");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "OLS: min sum (y - a*x - b)^2.\n"
+                "relative-weighted LS (rev4-style): min sum ((y - a*x - b)/y)^2 -\n"
+                "matches EMVA 1288 Release 4's published approach as best\n"
+                "understood; NOT verified against the standard text - do not\n"
+                "cite either method as EMVA 1288 compliant.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        ch |= ImGui::Combo("window", &L.winMode,
+                           "none (all points)\0auto 5..95% of max mean\0manual [DN]\0");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "EMVA-style fit window on the response [DN]: members whose mean\n"
+                "lies outside are excluded from the FIT but stay in the table\n"
+                "and on the chart. Own naming, NOT an EMVA 1288 compliance\n"
+                "claim. A windowed fit needs 3+ points (2 fit any line).");
+        if (L.winMode == 2) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            ch |= ImGui::InputDouble("lo [DN]", &L.winLo, 0, 0, "%.6g");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+            ch |= ImGui::InputDouble("hi [DN]", &L.winHi, 0, 0, "%.6g");
+        }
+        if (ch) linFitStale();
+    }
     const bool fresh = L.seriesId == S->id;
 
-    // one row per MEMBER, in the series' order: value in, response out
+    // one row per MEMBER - frame or stack - in the series' order: value in,
+    // response out. The "as" column is the member's DECLARATION (§3.3): a
+    // frame is a frame; a stack stands in as its fold, mean or sum, chosen
+    // here because this table is where the declaration is read.
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
     char lvlHdr[64], meanHdr[32], sigHdr[32];
@@ -92,44 +138,74 @@ static void drawPanelLinearity() {
     snprintf(meanHdr, sizeof meanHdr, "mean %s [DN]", pl);
     snprintf(sigHdr, sizeof sigHdr, "sigma_t %s [DN]", pl);
     float tableH = ImGui::GetFontSize() * std::min<int>(10, (int)S->members.size() + 2) * 1.6f;
-    if (ImGui::BeginTable("lintab", 7, TF, ImVec2(0, tableH))) {
+    uint64_t rowNaN = 0;                 // §3.2: NaN present is a WARNING, counted
+    if (ImGui::BeginTable("lintab", 8, TF, ImVec2(0, tableH))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
-        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
+        ImGui::TableSetupColumn("member", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 11);
         ImGui::TableSetupColumn(lvlHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("as", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 4.6f);
         ImGui::TableSetupColumn("frames", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3.2f);
         ImGui::TableSetupColumn(meanHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(sigHdr, ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2);
         ImGui::TableHeadersRow();
         for (auto& m : S->members) {
-            App::SeqInfo* si = seqInfo(m.seqId);
-            if (!si) continue;
-            ImGui::PushID(m.seqId);
+            const bool isFrame = m.seqId == 0;
+            App::SeqInfo* si = isFrame ? nullptr : seqInfo(m.seqId);
+            ImageDoc* fd = isFrame ? frameMemberDoc(m.frameUid) : nullptr;
+            if (!si && !fd) continue;
+            ImGui::PushID(!isFrame ? m.seqId : -(int)(m.frameUid & 0x7fffffff));
             const App::LinState::Row* row = nullptr;
             if (fresh)
-                for (const auto& r : L.rows) if (r.seqId == m.seqId) { row = &r; break; }
+                for (const auto& r : L.rows)
+                    if (isFrame ? r.uid == m.frameUid : r.seqId == m.seqId) { row = &r; break; }
+            if (row) rowNaN += row->nonFinite;
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("##inc", &m.include)) {
-                for (auto& r : L.rows) if (r.seqId == m.seqId) r.include = m.include;
+                for (auto& r : L.rows)
+                    if (isFrame ? r.uid == m.frameUid : r.seqId == m.seqId)
+                        r.include = m.include;
                 // the fit below was measured WITH this point (or without it):
                 // it is now describing a set of points that is not on screen
                 linFitStale();
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("include this point in the fit");
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(si->name.c_str());
+            ImGui::TextUnformatted(isFrame ? fd->name.c_str() : si->name.c_str());
             ImGui::TableNextColumn();
             // NEVER 0 for "not set": the whole reason values live on the member
             if (std::isfinite(m.value)) textNum("%.6g", m.value);
             else ImGui::TextDisabled("unset");
             ImGui::TableNextColumn();
+            if (isFrame) {
+                ImGui::TextDisabled("frame");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("a standalone frame IS its own point - no fold");
+            } else {
+                // the fold declaration (§3.2/§3.3). Changing it changes what
+                // this member STANDS AS, so the fit on screen goes stale.
+                ImGui::SetNextItemWidth(-1);
+                const bool wasSum = m.fold == FOLD_SUM;
+                if (wasSum)   // a sum cannot enter the fit: say so in place
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1));
+                bool foldCh = ImGui::Combo("##fold", &m.fold, "mean\0sum\0");
+                if (wasSum) ImGui::PopStyleColor();
+                if (foldCh) linFitStale();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "how this stack stands in as a frame (§3.2's fold).\n"
+                        "The fit takes MEAN statistics only: a sum is n x the\n"
+                        "mean's scale, so a sum-standing member refuses the fit\n"
+                        "- the table still shows its mean statistics.");
+            }
+            ImGui::TableNextColumn();
             // used/expected whenever the total is known: Compute derives
             // sigma_t, K, LEmax and read noise from whatever is RESIDENT, and a
             // bare "60" beside a [server, 300 frames] figure for the same stack
             // is the difference the canon requires to be stated
-            if (row && row->valid && si->expectedFrames > row->frames)
+            if (row && row->valid && si && si->expectedFrames > row->frames)
                 ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%d/%d",
                                    row->frames, si->expectedFrames);
             else if (row && row->valid) ImGui::Text("%d", row->frames);
@@ -139,14 +215,27 @@ static void drawPanelLinearity() {
             if (row && row->valid) textNum("%.6g", row->mean[tp]);
             else ImGui::TextDisabled(row ? row->err.c_str() : "-");
             ImGui::TableNextColumn();
-            if (row && row->valid) textNum("%.6g", row->sigmaT[tp]);
+            if (row && row->valid && row->hasSigma) textNum("%.6g", row->sigmaT[tp]);
             else ImGui::TextDisabled("-");
+            if (row && row->valid && !row->hasSigma && ImGui::IsItemHovered())
+                ImGui::SetTooltip("a single frame has no time axis - sigma_t is a\n"
+                                  "STACK's attribute and is never printed for a frame");
             ImGui::TableNextColumn();
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
     ImGui::TextDisabled("values are edited in Edit... - a blank one is UNSET, not zero");
+    if (rowNaN)   // §3.2, 判断record 3: NaN present is a warning, with the count
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "non-finite samples (excluded per pixel and counted) = %llu",
+                           (unsigned long long)rowNaN);
+    // §3.3: a sum-standing member refuses the fit BEFORE it runs - stated
+    // verbatim, and the member measurements above stay on screen.
+    if (fresh && !L.refusal.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", L.refusal.c_str());
+        return;
+    }
 
     if (!L.fitValid || !fresh) {
         if (!haveUnit)
@@ -165,7 +254,7 @@ static void drawPanelLinearity() {
 
     // ---- the answers ----
     ImGui::SeparatorText("fit  (response = sensitivity * value + offset)");
-    if (ImGui::BeginTable("linfit", 7, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+    if (ImGui::BeginTable("linfit", 8, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         char sensHdr[64];
         snprintf(sensHdr, sizeof sensHdr, "sensitivity [DN/%s]", S->unit);
         ImGui::TableSetupColumn("plane", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
@@ -173,6 +262,8 @@ static void drawPanelLinearity() {
         ImGui::TableSetupColumn("offset [DN]", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("R^2", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("LE max [%]", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("n", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::CalcTextSize("99 (<3)").x);
         ImGui::TableSetupColumn("K [DN/e-]", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(L.readFromDark ? "read noise [DN]" : "read noise [DN] (extrap.)",
                                 ImGuiTableColumnFlags_WidthFixed, numColW() * 1.3f);
@@ -183,10 +274,23 @@ static void drawPanelLinearity() {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(LIN_COLS[p]));
             ImGui::TextUnformatted(L.nPl > 1 ? LIN_PLANES[p] : "all");
             ImGui::PopStyleColor();
+            if (!L.planeFit[p]) {
+                // THIS compute did not fit the plane (window kept < 3 points,
+                // or the fit degenerated): '-' rather than the previous
+                // compute's numbers wearing this one's settings
+                for (int c = 0; c < 4; c++) { ImGui::TableNextColumn(); ImGui::TextDisabled("-"); }
+                ImGui::TableNextColumn();
+                if (L.winMode) ImGui::TextDisabled("%d (<3)", L.nFit[p]);
+                else ImGui::TextDisabled("%d", L.nFit[p]);
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::TextDisabled("-");
+                continue;
+            }
             ImGui::TableNextColumn(); textNum("%.6g", L.slope[p]);
             ImGui::TableNextColumn(); textNum("%.6g", L.offs[p]);
             ImGui::TableNextColumn(); textNum("%.5f", L.r2[p]);
             ImGui::TableNextColumn(); textNum("%.3f", L.leMax[p]);
+            ImGui::TableNextColumn(); ImGui::Text("%d", L.nFit[p]);
             ImGui::TableNextColumn(); textNum("%.5g", L.ptcK[p]);
             ImGui::TableNextColumn();
             if (L.readFromDark) textNum("%.4g", L.readDN[p]);
@@ -198,15 +302,29 @@ static void drawPanelLinearity() {
                     ImGui::SetTooltip("Extrapolated from the photon transfer fit to the black\n"
                                       "level, so it is a difference of two large numbers and\n"
                                       "can be off by several DN.\n"
-                                      "Add a dark stack (level 0) to MEASURE it instead.");
+                                      "Add a dark STACK at level 0 to MEASURE it instead\n"
+                                      "(a dark frame member anchors the black level, but a\n"
+                                      "frame has no sigma_t to measure).");
             }
         }
         ImGui::EndTable();
     }
-    ImGui::TextDisabled("%d points | K from photon transfer (sigma_t^2 vs mean); "
-                        "LE = worst deviation from the fit | read noise %s", L.nPts,
+    // invariant (a): the result names its layer - the same line the TSV carries
+    ImGui::TextDisabled("%s", seriesProvLine(*S, L).c_str());
+    ImGui::TextDisabled("%d member point(s) | %s | method: %s", L.nPts,
+                        seriesWinLabel(L).c_str(), seriesFitMethodName(L.fitMethod));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("EMVA-style window, own naming - NOT an EMVA 1288 compliance\n"
+                          "claim (rev4-style matches Release 4's published approach as\n"
+                          "best understood; not verified against the standard text).");
+    ImGui::TextDisabled("K from photon transfer (sigma_t^2 vs mean, stack members only); "
+                        "LE = worst deviation from the fit | read noise %s",
                         L.readFromDark ? "measured in the level-0 stack"
                                        : "extrapolated (no dark stack)");
+    if (L.nZero)
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                           "%d in-window point(s) at |mean| ~ 0 dropped by the "
+                           "relative-weighted fit", L.nZero);
 
     // ---- SNR curve: the same rows, the mean set against the noise it carries.
     // A SECTION of this panel, not a new one: the material is the fit's own rows
@@ -214,8 +332,8 @@ static void drawPanelLinearity() {
     {
         std::vector<LinSnrPt> sp;
         bool snrDark = false;
-        int dropped = 0;
-        linSnrPoints(L, sp, &snrDark, &dropped);
+        int dropped = 0, noSig = 0;
+        linSnrPoints(L, sp, &snrDark, &dropped, &noSig);
         if (ImGui::CollapsingHeader("SNR curve", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("dB##snrdb", &L.snrDb);
             if (ImGui::IsItemHovered())
@@ -224,11 +342,12 @@ static void drawPanelLinearity() {
             ImGui::BeginDisabled(sp.empty());
             if (ImGui::SmallButton("Copy curve (TSV)")) {
                 // provenance rides along as a # comment, like every other copy
-                std::string tsv = "# SNR curve: series '" + S->name + "' (batch '" +
-                                  batchNameOf(S->batchId) + "') | " +
-                                  (L.roiUsed ? "selected ROI" : "whole frame") +
+                std::string tsv = "# SNR curve - " + seriesProvLine(*S, L) + "\n" +
+                                  "# " + (L.roiUsed ? "selected ROI" : "whole frame") +
+                                  " | " + seriesWinLabel(L) + " | method: " +
+                                  seriesFitMethodName(L.fitMethod) +
                                   " | SNR = (mean - dark) / sigma_t per CFA plane | dark = " +
-                                  (snrDark ? "measured level-0 stack"
+                                  (snrDark ? "measured level-0 member"
                                            : "fitted offset (extrapolated)") + "\n";
                 char b[320];
                 snprintf(b, sizeof b, "value [%s]\tstack\tplane\tmean [DN]\tsignal [DN]\t"
@@ -255,14 +374,15 @@ static void drawPanelLinearity() {
             ImGui::EndDisabled();
             ImGui::SameLine();
             // the same measured-vs-extrapolated honesty the read noise column has
-            ImGui::TextDisabled(snrDark ? "| dark = measured level-0 stack"
+            ImGui::TextDisabled(snrDark ? "| dark = measured level-0 member"
                                         : "| dark = fitted offset (extrapolated)");
             if (!snrDark && ImGui::IsItemHovered())
                 ImGui::SetTooltip("No dark (level-0) stack in the series, so the signal is\n"
                                   "the mean minus the FITTED offset - an extrapolation.\n"
                                   "Add a dark stack to measure the black level instead.");
             if (sp.empty()) {
-                ImGui::TextDisabled("no lit points: SNR needs a level with signal above dark.");
+                ImGui::TextDisabled("no lit points: SNR needs a lit STACK member above dark "
+                                    "(a frame member has no sigma_t, so it has no ratio).");
             } else {
                 double x0 = DBL_MAX, x1 = 0, y0 = DBL_MAX, y1 = 0;
                 for (const auto& q : sp) {
@@ -352,6 +472,9 @@ static void drawPanelLinearity() {
                     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
                                        "%d plane point(s) at or below dark level left out "
                                        "(nothing positive to plot)", dropped);
+                if (noSig)
+                    ImGui::TextDisabled("%d frame member(s) carry no sigma_t - SNR "
+                                        "needs a stack member", noSig);
             }
         }
     }
@@ -366,6 +489,7 @@ static void drawPanelLinearity() {
             pts.push_back({ r.level, r.mean[p], p });
             x0 = std::min(x0, r.level); x1 = std::max(x1, r.level);
             y0 = std::min(y0, r.mean[p]); y1 = std::max(y1, r.mean[p]);
+            if (!L.planeFit[p]) continue;
             double fit = L.slope[p] * r.level + L.offs[p];
             if (fabs(fit) > 1e-9)
                 e1 = std::max(e1, fabs((r.mean[p] - fit) / fit) * 100.0);
@@ -387,6 +511,7 @@ static void drawPanelLinearity() {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(pr.p0, pr.p1, true);
             for (int p = 0; p < L.nPl; p++) {   // the fit first, under the points
+                if (!L.planeFit[p]) continue;       // no line for a plane not fitted
                 ImVec2 a = pr.at((float)x0, (float)(L.slope[p] * x0 + L.offs[p]));
                 ImVec2 b = pr.at((float)x1, (float)(L.slope[p] * x1 + L.offs[p]));
                 dl->AddLine(a, b, (LIN_COLS[p] & 0x00FFFFFF) | 0x60000000, 1.5f);
@@ -406,6 +531,7 @@ static void drawPanelLinearity() {
             ImVec2 z0 = pr.at((float)x0, 0), z1 = pr.at((float)x1, 0);
             dl->AddLine(z0, z1, IM_COL32(140, 150, 160, 160));
             for (const auto& q : pts) {
+                if (!L.planeFit[q.p]) continue;     // no residual against no fit
                 double fit = L.slope[q.p] * q.x + L.offs[q.p];
                 if (fabs(fit) < 1e-9) continue;
                 double res = (q.y - fit) / fit * 100.0;

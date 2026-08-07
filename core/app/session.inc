@@ -104,7 +104,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "panels " << (app.showFiles ? 1 : 0) << " " << (app.showInspector ? 1 : 0) << " "
       << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
-      << (app.showProjection ? 1 : 0) << " " << (app.showLinearity ? 1 : 0) << " "
+      << (app.showProjection ? 1 : 0) << " " << (app.showSeriesAnalysis ? 1 : 0) << " "
       << (app.showRemote ? 1 : 0) << "\n";
     // Browse places (docs/todo-open.md item 10, user decision A5: auto-
     // reconnect): one "rbplace <num> <url>" line per instance that stands
@@ -1432,7 +1432,7 @@ static std::string loadSession(const std::string& path) {
             ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2 >> h2 >> i2;
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
-            app.showProjection = g2 != 0; app.showLinearity = h2 != 0; app.showRemote = i2 != 0;
+            app.showProjection = g2 != 0; app.showSeriesAnalysis = h2 != 0; app.showRemote = i2 != 0;
         }
         else if (key == "rbplace") {
             // "<num> <url>": where a Browse instance stood (item 10, A5).
@@ -1456,6 +1456,11 @@ static std::string loadSession(const std::string& path) {
                 size_t p;
                 while ((p = ini.find("[Window][Remote]")) != std::string::npos)
                     ini.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+                // ...and before "Linearity" -> "Series Analysis###Linearity"
+                // (docs/analysis-layers.md §3.3 renamed the panel): same rule
+                while ((p = ini.find("[Window][Linearity]")) != std::string::npos)
+                    ini.replace(p, strlen("[Window][Linearity]"),
+                                "[Window][Series Analysis###Linearity]");
             }
             // applied between frames: loading dock settings mid-frame is not safe
             app.pendingLayout = std::move(ini);

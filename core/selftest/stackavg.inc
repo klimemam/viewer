@@ -350,7 +350,7 @@
         };
         // The warning is a toast, and toasts are kept: every one lands in
         // app.msgLog (compare.inc), so "a warning was SURFACED" is an assert on
-        // state, exactly like the FrameLinProbe. `since` bounds the scan to
+        // state, exactly like the panel probes. `since` bounds the scan to
         // what THIS reduction said.
         auto warningSince = [&](size_t since) -> std::string {
             for (size_t i = since; i < app.msgLog.size(); i++)

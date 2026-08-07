@@ -450,7 +450,10 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);
             ImGui::MenuItem("Temporal", nullptr, &app.showTemporal);
             ImGui::MenuItem("Projection (H/V)", nullptr, &app.showProjection);
-            ImGui::MenuItem("Linearity", nullptr, &app.showLinearity);
+            ImGui::MenuItem("Series Analysis", nullptr, &app.showSeriesAnalysis);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("the series layer's analyses: linearity / PTC fit, read\n"
+                                  "noise, SNR curve over one series (was \"Linearity\")");
             if (ImGui::MenuItem("Messages", nullptr, &app.showMessages)) app.msgUnreadErr = false;
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) {

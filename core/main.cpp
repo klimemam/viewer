@@ -156,7 +156,7 @@ static std::string fmtVal(float v, const std::string& dtype) {
 #include "ui/panel_histogram.inc"
 #include "ui/panel_projection.inc"
 #include "ui/modal_series.inc"
-#include "ui/panel_linearity.inc"
+#include "ui/panel_series_analysis.inc"
 #include "ui/panel_temporal.inc"
 #include "ui/panel_rois.inc"
 #include "ui/panel_analysis.inc"
@@ -881,8 +881,6 @@ int main(int argc, char** argv) {
 
     #include "selftest/export-tsv.inc"
 
-    #include "selftest/frame-lin.inc"
-
     #include "selftest/framestats.inc"
 
     #include "selftest/lin.inc"
@@ -909,7 +907,7 @@ int main(int argc, char** argv) {
     if (benchFrames) {                 // exercise every panel, not just the defaults
         app.showFiles = app.showInspector = app.showRois = app.showAnalysis = true;
         app.showHistogram = app.showTemporal = app.showProjection = true;
-        app.showLinearity = true;      // ...which now includes the series selector
+        app.showSeriesAnalysis = true;      // ...which now includes the series selector
         benchMs.reserve(benchFrames);
     }
     if (benchTiles) {
@@ -918,7 +916,7 @@ int main(int argc, char** argv) {
         // thing this run is not trying to measure.
         app.showFiles = app.showInspector = app.showRois = app.showAnalysis = false;
         app.showHistogram = app.showTemporal = app.showProjection = false;
-        app.showLinearity = false;
+        app.showSeriesAnalysis = false;
     }
     double lastFrameEnd = nowSec();
     // The frame body lives in a callable so it can also run from the window
@@ -1255,9 +1253,14 @@ int main(int argc, char** argv) {
             if (ImGui::Begin("Projection", &app.showProjection)) drawPanelProjection();
             ImGui::End();
         }
-        if (app.showLinearity) {
+        if (app.showSeriesAnalysis) {
             ImGui::SetNextWindowSize(ImVec2(760 * uiScale, 520 * uiScale), ImGuiCond_FirstUseEver);
-            if (ImGui::Begin("Linearity", &app.showLinearity)) drawPanelLinearity();
+            // "###Linearity" keeps the window's ImGui IDENTITY while the title
+            // says the layer (docs/analysis-layers.md §3.3 renamed the panel):
+            // the Browse###Remote precedent, so saved docking survives via the
+            // session loader's ini migration.
+            if (ImGui::Begin("Series Analysis###Linearity", &app.showSeriesAnalysis))
+                drawPanelSeriesAnalysis();
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small

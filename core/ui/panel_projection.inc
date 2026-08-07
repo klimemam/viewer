@@ -1208,7 +1208,11 @@ static void linRecompute(int seriesId) {
     L.rows.clear();
     L.refusal.clear();
     L.nZero = 0;
-    for (int p = 0; p < 4; p++) { L.winPlaneLo[p] = L.winPlaneHi[p] = 0; L.nFit[p] = 0; }
+    for (int p = 0; p < 4; p++) {
+        L.winPlaneLo[p] = L.winPlaneHi[p] = 0;
+        L.nFit[p] = 0;
+        L.planeFit[p] = false;
+    }
     App::Series* S = seriesById(seriesId);
     if (!S) {
         L.fitValid = false;
@@ -1325,6 +1329,7 @@ static void linRecompute(int seriesId) {
                          : linFit(lx, ly, L.slope[p], L.offs[p], L.r2[p]);
         if (!fitOk) continue;
         fitted++;
+        L.planeFit[p] = true;
         // linearity error: worst deviation from the fit, relative to the fit,
         // over the points the fit USED (out-of-window points stay on the
         // chart, dimmed - they are not this number's business)

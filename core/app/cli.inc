@@ -20,7 +20,6 @@ static std::string g_seriesPanelSelftest; // --seriespanel-selftest <dir>: Serie
                                           // panel (mixed members, folds, fit window), exit
 static std::string g_exportSelftest;    // --export-selftest <dir>: PNG + montage, exit
 static std::string g_exportTsvSelftest; // --export-tsv-selftest <dir>: Temporal export document, exit
-static bool g_frameLinSelftest = false; // --frame-lin-selftest: frame-wise linearity, synthetic, exit
 static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy per level, exit
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
@@ -417,8 +416,6 @@ static void printUsage() {
         // believed not to exist. Adding a flag means adding its line here.
         "self-tests (load, check, print, exit; 0 = pass). ctest runs all 22:\n"
         "  --lin-selftest              linearity fit over the stacks given\n"
-        "  --frame-lin-selftest        frame-wise linearity (Temporal section):\n"
-        "                              synthetic stacks with exact means, both methods\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit\n"
         "  --series-selftest <dir>     series (系列) model + invariants\n"
         "  --seriespanel-selftest <dir> Series Analysis panel: frame|stack mixed\n"
@@ -564,8 +561,6 @@ static void parseCli(int argc, char** argv) {
             g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--export-tsv-selftest") {
             g_exportTsvSelftest = next();          // handled in main()
-        } else if (a == "--frame-lin-selftest") {
-            g_frameLinSelftest = true;             // handled in main()
         } else if (a == "--roistats-selftest") {
             g_roiStatsSelftest = true;             // handled in main()
         } else if (a == "--abeq-selftest") {

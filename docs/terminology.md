@@ -152,7 +152,7 @@ Yes なら series、No なら batch。
   指定した時のみ複数）。同じフォルダの再オープンは新しい batch になる。
 - **series は自動で作らない**（フォルダ構造から推測すると外れたときに黙って嘘の
   掃引ができる）。picker の「照度掃引として開く」か、Files で stack を選んで
-  「Group as series」か、リニアリティパネルで作る。
+  「Group as series」か、Series Analysis パネル(旧リニアリティパネル)で作る。
 - 1つの stack は**高々1つ**の series に属する。
 - メンバの stack を単独で別 batch へ移すと、その stack は series から**外れる**
   （禁止はしない。外れたことを画面で告げる）。

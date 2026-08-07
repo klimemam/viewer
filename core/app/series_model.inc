@@ -218,6 +218,24 @@ static std::string seriesProvLine(const App::Series& S, const App::LinState& L) 
              st, fr);
     return b;
 }
+// The window that was in force, ALWAYS said - one string for the panel and
+// the TSV, so the screen and a pasted document cannot disagree (the interim
+// frame-lin's frameLinWindowLabel, migrated with the machinery).
+static std::string seriesWinLabel(const App::LinState& L) {
+    char b[160];
+    if (L.winMode == 2)
+        snprintf(b, sizeof b, "fit window: manual [%.9g, %.9g] DN (all planes)",
+                 std::min(L.winLo, L.winHi), std::max(L.winLo, L.winHi));
+    else if (L.winMode == 1)
+        snprintf(b, sizeof b,
+                 "fit window: auto = 5%%..95%% of each plane's max member mean");
+    else
+        snprintf(b, sizeof b, "fit window: none (all included points)");
+    return b;
+}
+static const char* seriesFitMethodName(int m) {
+    return m == 1 ? "relative-weighted LS (rev4-style)" : "OLS";
+}
 // Whether the Linearity panel's EQUATIONS are the ones this series asked for.
 // The canon (docs/terminology.md: 測定の種類 ... fit の式と出す量が決まる) makes
 // the kind decide that, and this panel knows exactly two: a straight response

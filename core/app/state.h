@@ -921,6 +921,9 @@ struct App {
         // export state the applied window, never the setting alone
         double winPlaneLo[4] = {}, winPlaneHi[4] = {};
         int nFit[4] = {};                 // points the fit actually used, per plane
+        bool planeFit[4] = {};            // THIS compute fitted the plane - without
+                                          // it a refused plane's row would print the
+                                          // previous compute's numbers as its own
         int nZero = 0;                    // in-window |mean|~0 points rev4-style dropped
         // Non-empty: Compute REFUSED to fit and this is the sentence, verbatim
         // on screen (§3.3: a sum-standing member is refused BEFORE running -
@@ -940,7 +943,7 @@ struct App {
         double ptcK[4] = {}, ptcRead2[4] = {}, readDN[4] = {};
         uint64_t rev = 0, computedRev = 0;
     } lin;
-    bool showLinearity = false;
+    bool showSeriesAnalysis = false;
     // Create / edit a series. ONE modal for both: the fields are identical and
     // "edit" is only "create with the boxes already ticked". The value column
     // is a SUGGESTION the user confirms - see drawSeriesModal.
