@@ -239,6 +239,23 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // sum would come back as a mean: 1/n of itself under the same note.
         f << (d->avgFold == FOLD_SUM ? "stacksum " : "stackavg ")
           << d->avgOfPath << "\n";                  // path last: may contain spaces
+        // The GENERATION record (§10.2), on its own line right after its
+        // recipe (the reader attaches it to the last recipe line): the digest
+        // of the input tuples this picture was folded from, how many, and
+        // when. The recipe alone recomputes silently from whatever the disk
+        // holds next time; the record is what lets the restore SAY whether
+        // that was still the same picture. An older viewer drops the unknown
+        // key and restores the recipe with no generation claim - the right
+        // failure, per the format's one rule. Note this is the DOC's record,
+        // not today's disk: a stale average saves the tuples of the pixels it
+        // is still showing, so the next restore states the change instead of
+        // inheriting a silently refreshed record.
+        if (d->avgSrcCount > 0) {
+            char gb[64];
+            snprintf(gb, sizeof gb, "stackavggen %d %016llx ", d->avgSrcCount,
+                     (unsigned long long)d->avgSrcDigest);
+            f << gb << d->avgWhen << "\n";          // timestamp last: has spaces
+        }
     }
     if (avgLost)
         fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
@@ -1519,6 +1536,26 @@ static std::string loadSession(const std::string& path) {
             app.avgRestore.push_back({ restOfLine(ls), FOLD_MEAN, false, 0, 0, {} });
         else if (key == "stacksum")
             app.avgRestore.push_back({ restOfLine(ls), FOLD_SUM, false, 0, 0, {} });
+        // The recipe's generation record (§10.2): count, input tuple digest,
+        // and when the saved picture was computed. Attaches to the recipe line
+        // just above (the writer keeps them adjacent); a record with no recipe
+        // to attach to is dropped, exactly like any other unparseable line -
+        // and a recipe WITHOUT a record (an older session) restores with no
+        // generation claim, which is the correct silence: it cannot state a
+        // change it never recorded.
+        else if (key == "stackavggen") {
+            if (!app.avgRestore.empty()) {
+                auto& r = app.avgRestore.back();
+                int cnt = 0; std::string hex;
+                ls >> cnt >> hex;
+                if (cnt > 0 && !hex.empty()) {
+                    r.srcCount = cnt;
+                    r.srcDigest = strtoull(hex.c_str(), nullptr, 16);
+                    r.when = restOfLine(ls);
+                    r.hasGen = true;
+                }
+            }
+        }
         // ---- series (系列) block: collected here, RESOLVED later -------------
         // Nothing can be looked up yet - a folder stack is still one loose image
         // with a queued rescan behind it. See resolveSeriesRestore.

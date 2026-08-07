@@ -885,13 +885,22 @@ static const char* SUM_TIP =
 // names that stack, and provenance pointing at something the program silently
 // destroyed is worth less than the memory. Close stack is one click away in the
 // same menu, and there the user can see what they are closing.
-static bool stackReduceFrame(int seqId, int fold, std::string& err) {
+// `expect` is a session's generation record (§10.2): compare what we fold
+// against what the saved picture was folded from, and SAY when they differ.
+// `into` is Recompute (§10.1): fold into this existing reduced frame instead
+// of opening a new one - same uid, same batch, same display range; only the
+// pixels and the record move, and the stale mark clears because the record is
+// now the current key.
+static bool stackReduceFrame(int seqId, int fold, std::string& err,
+                             const App::PendingAvg* expect = nullptr,
+                             ImageDoc* into = nullptr) {
     const bool sumF = fold == FOLD_SUM;
     const char* noun = sumF ? "sum" : "average";   // the fold IS the name
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "that stack is not open"; return false; }
     const std::string srcName = si->name;
     const int expected = si->expectedFrames;
+    const int srcRev = si->stackRev;   // the §10.1 key, at compute time
     std::vector<int> fr = framesOfSeq(seqId);
     // The reference frame is the first RESIDENT full-resolution one - the same
     // frame computeStackStats measures against, since a remote preview is a
@@ -915,6 +924,43 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err) {
     // same key Series members travel by, for the same reason (paths round-trip;
     // ids do not survive a session and names are renameable and not unique).
     const std::string firstPath = app.images[fr.front()]->src->path;
+    // The INPUT TUPLE record (§10.2 / §6.2): one digest over the identity
+    // tuple of every member the fold will read - (path or url, npzMember,
+    // fileFrame, remoteFrame, mtime, fsize), each statted at decode time, so
+    // the record describes the pixels that actually went in, not whatever the
+    // disk holds at some later moment. The member walk is computeStackStats's
+    // own `use` selection verbatim (previews and ragged frames excluded), so
+    // the digest counts exactly the frames the numbers count.
+    uint64_t srcDig = 1469598103934665603ull;      // FNV-1a 64 offset basis
+    int srcDigN = 0;
+    {
+        auto digAdd = [&srcDig](const void* p, size_t n) {
+            const uint8_t* b = (const uint8_t*)p;
+            for (size_t i = 0; i < n; i++) { srcDig ^= b[i]; srcDig *= 1099511628211ull; }
+        };
+        const ImageDoc* first = nullptr;
+        for (int idx : fr) {
+            const ImageDoc* d = app.images[idx].get();
+            if (d->src->remoteStep > 1 || d->px().empty()) continue;
+            if (!first) first = d;
+            if (d->w != first->w || d->h != first->h || d->ch != first->ch) continue;
+            const FrameSource& s = *d->src;
+            digAdd(s.path.data(), s.path.size());
+            digAdd(s.remoteUrl.data(), s.remoteUrl.size());
+            digAdd(s.npzMember.data(), s.npzMember.size());
+            digAdd(&s.fileFrame, sizeof s.fileFrame);
+            digAdd(&s.remoteFrame, sizeof s.remoteFrame);
+            digAdd(&s.mtime, sizeof s.mtime);
+            digAdd(&s.fsize, sizeof s.fsize);
+            srcDigN++;
+        }
+    }
+    char whenTs[32] = "";                          // "computed WHEN" - #82's 4th
+    {                                              // question was exactly this
+        time_t nowT = time(nullptr);
+        if (struct tm* lt = localtime(&nowT))
+            strftime(whenTs, sizeof whenTs, "%Y-%m-%d %H:%M:%S", lt);
+    }
     std::vector<float> folded;
     // ONE accumulator in the program, for either fold. This is the one the
     // Temporal panel's mean and sigma_t come out of, so the number under the
@@ -927,27 +973,9 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err) {
     }
     const int n = st.frames;
     const int N = std::max(expected, n);
-
-    auto out = std::make_unique<ImageDoc>();
-    FrameSource& S = *out->src;
-    S.w = W; S.h = H; S.ch = C;
-    // NOT the source dtype. The mean of N integers is not an integer, and
-    // labelling fractional DN "u16" would misdescribe every number printed off
-    // this frame. Same call montageROI makes when its values stop being DN.
-    S.dtype = "f32";
-    S.data = std::move(folded);
-    // The mean is PER PIXEL: nothing moves, nothing resamples, every pixel keeps
-    // its coordinate and therefore its Bayer phase. So a Bayer stack's mean IS
-    // still Bayer and the declaration travels verbatim - per-plane statistics on
-    // the result are the per-plane statistics of the stack, which is the whole
-    // reason a mosaic must never be silently dropped here.
-    out->cfa = refCfa; out->cfaPattern = refCfaPat; out->cfaColorize = refColorize;
-    out->displayLut = refLut;
-    out->syncMirrors();
-    out->batchId = refBatch;
     const std::string ofN = n < N ? std::to_string(n) + " of " + std::to_string(N)
                                   : std::to_string(n);
-    out->name = srcName + "  frame " + noun + " (" + ofN + " frames)";
+    const std::string rName = srcName + "  frame " + noun + " (" + ofN + " frames)";
     // docs/terminology.md, 実装上の不変条件: "部分ロードされた stack の集計は
     // 「何枚中何枚か」を必ず併記する". The canon says STATE the ratio, not refuse
     // the aggregate - every other stack-level statistic in the program (montage,
@@ -983,9 +1011,87 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err) {
     if (firstPath.empty())
         note += "; no file path behind the source stack, so a session cannot "
                 "recompute this frame";
+    // WHEN this picture was read off its stack - #82's fourth question was
+    // that the note said "N frames of <stack>" but never when. Part of the
+    // note, not decoration: this is the date a report will cite.
+    note += "; computed " + std::string(whenTs);
+    // §10.2, the restore's one comparison: the recipe recomputes from whatever
+    // the disk holds today (existing semantics, unchanged) - but if the input
+    // tuples no longer match the record the session carried, this is a
+    // DIFFERENT picture under the same name, and it says so instead of
+    // silently standing in for the one the report cited.
+    const bool genChanged = expect && expect->hasGen &&
+        (expect->srcDigest != srcDig || expect->srcCount != srcDigN);
+    if (genChanged)
+        note += "; recomputed from newer files (source changed since " +
+                (expect->when.empty() ? std::string("it was saved") : expect->when) + ")";
+
+    if (into) {
+        // Recompute (§10.1): the user's one move, into the SAME doc - uid,
+        // batch, compare seats and the user's display range stay; the pixels,
+        // the provenance and the generation record move. The source is private
+        // by construction (path empty, outside the §6.2 registry), so writing
+        // it in place cannot reach any other doc.
+        FrameSource& S = *into->src;
+        S.w = W; S.h = H; S.ch = C;
+        S.dtype = "f32";
+        S.data = std::move(folded);
+        into->cfa = refCfa; into->cfaPattern = refCfaPat; into->cfaColorize = refColorize;
+        computeMinMax(*into);
+        into->syncMirrors();
+        into->name = rName;
+        into->note = note;
+        into->avgOfPath = firstPath;
+        into->avgFold = fold;
+        into->avgSeqId = seqId;
+        into->avgStackRev = srcRev;
+        into->avgSrcDigest = srcDig;
+        into->avgSrcCount = srcDigN;
+        into->avgWhen = whenTs;
+        into->avgStale = false;          // the record IS the current key again
+        into->avgGenChanged = false;
+        into->dataRev++;                 // hist/proj/ROI/diff keys unlatch
+        forgetImage(into);
+        into->texDirty = true;
+        fprintf(stderr, "frame %s: %s - recomputed, %d of %d frame(s), %dx%d %dch\n",
+                noun, srcName.c_str(), n, N, W, H, C);
+        toast("frame " + std::string(noun) + " of \"" + srcName +
+              "\": recomputed over " + ofN + " frame(s)");
+        if (st.nonFinite)
+            toast("frame " + std::string(noun) + " of \"" + srcName + "\": NaN present - " +
+                  std::to_string((unsigned long long)st.nonFinite) +
+                  " non-finite sample(s) excluded per pixel; " + (sumF ? "sum" : "mean") +
+                  " over " + ofN + " frame(s)", true);
+        return true;
+    }
+
+    auto out = std::make_unique<ImageDoc>();
+    FrameSource& S = *out->src;
+    S.w = W; S.h = H; S.ch = C;
+    // NOT the source dtype. The mean of N integers is not an integer, and
+    // labelling fractional DN "u16" would misdescribe every number printed off
+    // this frame. Same call montageROI makes when its values stop being DN.
+    S.dtype = "f32";
+    S.data = std::move(folded);
+    // The mean is PER PIXEL: nothing moves, nothing resamples, every pixel keeps
+    // its coordinate and therefore its Bayer phase. So a Bayer stack's mean IS
+    // still Bayer and the declaration travels verbatim - per-plane statistics on
+    // the result are the per-plane statistics of the stack, which is the whole
+    // reason a mosaic must never be silently dropped here.
+    out->cfa = refCfa; out->cfaPattern = refCfaPat; out->cfaColorize = refColorize;
+    out->displayLut = refLut;
+    out->syncMirrors();
+    out->batchId = refBatch;
+    out->name = rName;
     out->note = note;
     out->avgOfPath = firstPath;
     out->avgFold = fold;             // the recipe must round-trip its QUANTITY
+    out->avgSeqId = seqId;           // the §10.1 key this doc will be judged by
+    out->avgStackRev = srcRev;
+    out->avgSrcDigest = srcDig;      // ...and the §10.2 record a session carries
+    out->avgSrcCount = srcDigN;
+    out->avgWhen = whenTs;
+    out->avgGenChanged = genChanged;
     out->texDirty = true;
     fprintf(stderr, "frame %s: %s - %d of %d frame(s), %dx%d %dch, cfa=%d, "
                     "%llu excluded, %llu unknown\n", noun, srcName.c_str(), n, N, W, H,
@@ -1018,6 +1124,13 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err) {
               std::to_string((unsigned long long)st.nonFinite) +
               " non-finite sample(s) excluded per pixel; " + (sumF ? "sum" : "mean") +
               " over " + ofN + " frame(s)", true);
+    // The generation statement outranks everything above: a restored picture
+    // that is NOT the one the session saved must be the toast left standing
+    // (both land in the Messages log). The note carries it permanently.
+    if (genChanged)
+        toast("frame " + std::string(noun) + " of \"" + srcName +
+              "\": recomputed from newer files - the source changed since " +
+              (expect->when.empty() ? std::string("it was saved") : expect->when), true);
     return true;
 }
 
@@ -1066,6 +1179,8 @@ static void pumpStackAverages() {
         int found = 0;
         for (const auto& d : app.images)
             if (d->seqId != 0 && d->src->path == p.path) { found = d->seqId; break; }
+        // the generation record rides to the reduction: the recompute is
+        // where the fresh tuples exist to compare against it (§10.2)
         if (found) app.pendingAvg.push_back({ found, p.fold, p.hasGen,
                                               p.srcCount, p.srcDigest, p.when });
         else fprintf(stderr, "session: a frame %s named \"%s\", which is not "
@@ -1078,16 +1193,27 @@ static void pumpStackAverages() {
     for (const auto& id : todo) {
         if (!seqInfo(id.seqId)) continue;        // closed while it was waiting
         std::string err;
-        if (!stackReduceFrame(id.seqId, id.fold, err)) toast(err, true);
+        if (!stackReduceFrame(id.seqId, id.fold, err, id.hasGen ? &id : nullptr))
+            toast(err, true);
     }
 }
 
-// Recompute (§10.1): the user's one move against a stale reduced frame.
-// NOT IMPLEMENTED YET - the selftest's C group is red against this stub.
+// Recompute (§10.1): the user's one move against a stale reduced frame - and
+// only the user's. Resolves the source stack by the live seqId first, then by
+// the recipe path (a stack reopened after a session has a new id), and folds
+// into the SAME doc through the same accumulator every reduction uses.
 static bool recomputeStackAverage(ImageDoc* m, std::string& err) {
-    (void)m;
-    err = "not implemented";
-    return false;
+    if (!m || m->avgOfPath.empty()) { err = "not a computed frame"; return false; }
+    int seq = 0;
+    if (m->avgSeqId && seqInfo(m->avgSeqId)) seq = m->avgSeqId;
+    else
+        for (const auto& d : app.images)
+            if (d->seqId != 0 && d->src->path == m->avgOfPath) { seq = d->seqId; break; }
+    if (!seq) {
+        err = "the stack this frame was computed from is not open";
+        return false;
+    }
+    return stackReduceFrame(seq, m->avgFold, err, nullptr, m);
 }
 
 // least squares y = a*x + b; returns false with fewer than 2 distinct points

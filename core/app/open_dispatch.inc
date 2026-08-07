@@ -608,6 +608,14 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     bool linHit = false;
     for (int sid : seqIds) {
         if (App::SeqInfo* si = seqInfo(sid)) si->stackRev++;   // the temporal key
+        // §10.1: reduced frames (frame average / sum) recorded this key at
+        // compute time. The bump is the event that makes them describe pixels
+        // that no longer exist, so the mark is LATCHED here, at the event -
+        // a stack reloaded and then closed cannot take the fact with it. The
+        // picture itself never recomputes behind the user: silent recompute
+        // is silent overwrite, and Recompute is the user's move.
+        for (auto& rd : app.images)
+            if (!rd->avgOfPath.empty() && rd->avgSeqId == sid) rd->avgStale = true;
         // a server aggregate naming this stack now describes dead pixels:
         // re-fire it (same shape as seqMosaicChanged above)
         if (app.srvTemporal.seqId == sid) requestServerTemporal(sid, app.srvTemporal);
@@ -685,6 +693,17 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
             snprintf(buf, sizeof buf, " (+%d more)", (int)sharedNames.size() - 1);
             msg += buf;
         }
+    }
+    // A frame average/sum of this stack now shows pixels the disk no longer
+    // holds (§10.1). The walk latched the mark; the summary must SAY it, or
+    // the one picture that ends up in reports goes quietly wrong.
+    int staleAvg = 0;
+    for (const auto& d : app.images)
+        if (!d->avgOfPath.empty() && d->avgSeqId == seqId && d->avgStale) staleAvg++;
+    if (staleAvg) {
+        snprintf(buf, sizeof buf, " - %d computed frame(s) of this stack now stale "
+                                  "(right-click > Recompute from stack)", staleAvg);
+        msg += buf;
     }
     return msg;
 }

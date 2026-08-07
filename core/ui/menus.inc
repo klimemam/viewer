@@ -35,7 +35,10 @@ static std::string viewingHost() {
 // button, and the integrated title bar this app draws for itself.
 static std::string windowTitleText() {
     const ImageDoc* im = cur();
-    std::string t = im ? im->name + " - viewer" : std::string("viewer  ") + viewerVersion();
+    // (stale) rides in the title because the title is where a report copies
+    // the picture's name from (§10.1) - same vocabulary as the A/B panels.
+    std::string t = im ? im->name + (avgIsStale(im) ? "  (stale)" : "") + " - viewer"
+                       : std::string("viewer  ") + viewerVersion();
     // The bracket answers "which machine are these pixels on?". A local browse
     // goes through the peer protocol but the file is on this disk, so there is
     // no other machine to name - and "[local peer]" named one, which is how a

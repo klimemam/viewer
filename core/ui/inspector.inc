@@ -529,6 +529,16 @@ static void drawInspector() {
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
+        // §10.1: a stale reduced frame must say so where its provenance is
+        // read. Amber, the A/B panels' stale ink - one vocabulary for "this
+        // is being shown, and it is out of date".
+        if (avgIsStale(im)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+            ImGui::TextWrapped("%s the source stack was reloaded after this frame was "
+                               "computed - the picture shows the OLD pixels. Right-click "
+                               "it in Files > Recompute from stack.", AB_STALE_TOKEN);
+            ImGui::PopStyleColor();
+        }
         // ---- how this file was read, and how to read it differently ----------
         // docs/input-adapters.md §4.13. Every file answers this, including the
         // ones read natively: "reader native" is a fact about this file, and a

@@ -291,6 +291,8 @@ static void drawFileList() {
     // Reload from disk, deferred like the rest: reloadSource's walk calls
     // forgetImage while the row loop still holds this frame's cached indices.
     int pendingReloadImg = -1, pendingReloadSeq = 0;
+    int pendingRecomputeImg = -1;   // Recompute from stack (§10.1): forgetImage
+                                    // again, on the reduced frame itself
     int pendingAvgSeq = 0;      // ...and the frame average, for the same reason:
                                 // it appends to app.images, which this walk is
                                 // iterating over
@@ -668,8 +670,23 @@ static void drawFileList() {
             // is what the note is for. The share sentence (§4) follows either
             // lead: whose pixels these also are is true of computed frames too.
             if (hov) {
-                const std::string lead = d.src->path.empty() && !d.note.empty()
-                                       ? d.note : dispPath(d.src->path);
+                std::string lead = d.src->path.empty() && !d.note.empty()
+                                 ? d.note : dispPath(d.src->path);
+                // the generation statements, where the provenance is read
+                // (§10.1 / §10.2): stale leads - it is the warning; "same
+                // picture" trails - it is the reassurance two results of one
+                // recipe can give when their recorded input tuples match.
+                if (avgIsStale(&d))
+                    lead = "(stale) the source stack was reloaded after this frame "
+                           "was computed - the picture shows the OLD pixels. "
+                           "Right-click > Recompute from stack.\n" + lead;
+                else if (!d.avgOfPath.empty())
+                    for (const auto& q : app.images)
+                        if (avgSamePicture(&d, q.get()) && !avgIsStale(q.get())) {
+                            lead += "\nsame picture as \"" + q->name +
+                                    "\" (same recipe over the same source generation)";
+                            break;
+                        }
                 if (share.empty())
                     ImGui::SetTooltip("%s\n%s", lead.c_str(), meta);
                 else
@@ -710,9 +727,18 @@ static void drawFileList() {
             badge += slotOf(&head);
             char lb[512];
             // the leading spaces reserve the badge's ground: two per letter,
-            // and at least the two the rows have always had
+            // and at least the two the rows have always had.
+            // (stale) / (recomputed): the generation marks of a reduced frame
+            // (§10.1 / §10.2) - stale means the picture shows pixels its stack
+            // no longer holds; recomputed means a restore rebuilt it from
+            // files newer than the session's record. Same row position as
+            // [preview]: facts about THIS row's pixels, next to the name.
+            const char* genMark = head.preview ? "   [preview]"
+                                : avgIsStale(&head) ? "   (stale)"
+                                : head.avgGenChanged ? "   (recomputed from newer files)"
+                                : "";
             snprintf(lb, 512, "%*s%s%s##%d", (int)std::max<size_t>(badge.size() * 2, 2),
-                     "", head.name.c_str(), head.preview ? "   [preview]" : "", i);
+                     "", head.name.c_str(), genMark, i);
             std::string share;                 // §4: this frame's pixels, elsewhere
             {
                 auto sh = srcOwners.find(head.src->srcId);
@@ -773,6 +799,22 @@ static void drawFileList() {
                             ImGui::SetTooltip("no file behind these pixels - they were composed\n"
                                               "here (montage / plugin result).");
                     }
+                }
+                // Recompute (§10.1): the reduced frame's own "reload" - it has
+                // no file, it has a stack, and the picture NEVER refreshes
+                // itself. This item is the one way it gets new pixels.
+                if (!head.avgOfPath.empty()) {
+                    bool canRe = head.avgSeqId && seqInfo(head.avgSeqId);
+                    if (!canRe)
+                        for (const auto& q : app.images)
+                            if (q->seqId != 0 && q->src->path == head.avgOfPath) {
+                                canRe = true; break;
+                            }
+                    if (ImGui::MenuItem("Recompute from stack", nullptr, false, canRe))
+                        pendingRecomputeImg = i;
+                    if (!canRe && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("the stack this frame was computed from is not "
+                                          "open - there is nothing to recompute over.");
                 }
                 int t = moveToBatchMenu(head.batchId);
                 if (t) { pendingMoveImg = i; pendingMoveTarget = t; }
@@ -1115,6 +1157,23 @@ static void drawFileList() {
                 if (sharedNames.size() > 1)
                     msg += " (+" + std::to_string((int)sharedNames.size() - 1) + " more)";
             }
+            // the walk latched staleness on every reduced frame of every stack
+            // this source belongs to (§10.1) - the toast must say so too. The
+            // row is a loose frame, but a shared source can sit in stacks too,
+            // so the criterion is the walk's own: memberships of THIS source.
+            {
+                int staleAvg = 0;
+                for (const auto& q : app.images) {
+                    if (q->avgOfPath.empty() || !q->avgStale || !q->avgSeqId) continue;
+                    for (const auto& r : app.images)
+                        if (r->src == d->src && r->seqId == q->avgSeqId) {
+                            staleAvg++; break;
+                        }
+                }
+                if (staleAvg)
+                    msg += " - " + std::to_string(staleAvg) + " computed frame(s) now "
+                           "stale (right-click > Recompute from stack)";
+            }
             toast(msg);
         } else {
             toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
@@ -1124,6 +1183,11 @@ static void drawFileList() {
         int failed = 0;
         std::string msg = reloadStackFromDisk(pendingReloadSeq, &failed);
         toast(msg, failed > 0);
+    }
+    if (pendingRecomputeImg >= 0 && pendingRecomputeImg < (int)app.images.size()) {
+        std::string err;   // success toasts inside (the reduction's own voice)
+        if (!recomputeStackAverage(app.images[pendingRecomputeImg].get(), err))
+            toast("recompute failed - " + err, true);
     }
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);

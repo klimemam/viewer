@@ -933,9 +933,20 @@ static std::string buildTemporalExport(char delim) {
     for (const TExpSide& s : sides) {
         const ImageDoc* d = s.doc;
         char b[512];
-        snprintf(b, sizeof b, "%s: %s  |  path: %s", s.letter.c_str(),
-                 abDocLabel(d).c_str(), d->src->path.empty() ? "-" : d->src->path.c_str());
+        snprintf(b, sizeof b, "%s: %s%s  |  path: %s", s.letter.c_str(),
+                 abDocLabel(d).c_str(), avgIsStale(d) ? " (stale)" : "",
+                 d->src->path.empty() ? "-" : d->src->path.c_str());
         doc.comment(b);
+        // A computed frame's provenance is its note - there is no path to
+        // cite, and the note carries the recipe, the count, WHEN it was
+        // computed, and any generation statement. The export is the report's
+        // doorstep, so the whole statement travels (§10).
+        if (d->src->path.empty() && !d->note.empty())
+            doc.comment(s.letter + ": " + d->note);
+        if (avgIsStale(d))
+            doc.comment("NOTE: side " + s.letter + ": (stale) - the source stack was "
+                        "reloaded after this frame was computed; these numbers "
+                        "describe the OLD pixels (Recompute to refresh)");
         std::string cfa = d->cfa
             ? std::string(CFA_PATTERNS[d->cfaPattern & 3]) + (d->cfa == 2 ? " quad" : "") + " (4 planes)"
             : std::string("none");

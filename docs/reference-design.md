@@ -418,3 +418,9 @@ stackavg は main 側の機能なので、この追補の実装は **ref-integra
 入った後** (stackRev と tuple 語彙が main に存在してから) の一段。それまで
 main 単独では #82 の挙動は変わらない — 変えようとすると世代概念を先に二重
 発明することになる。
+
+実装済 (2026-08-07, branch average-generation / #82): §10.1 の (seqId,
+stackRev) 記録と reload walk での stale ラッチ (title / Files 行 / Inspector /
+Temporal エクスポートに表示、再計算は Recompute from stack のみ)、§10.2 の
+入力 tuple 記録 (セッションの `stackavggen` 行、復元照合で "recomputed from
+newer files") 。検証は --stackavg-selftest グループ C。
