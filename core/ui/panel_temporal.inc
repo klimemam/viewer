@@ -385,33 +385,8 @@ static FrameLinData frameLinCollect(int seqId, const FrameAxis& ax) {
 static const char* FRAMELIN_METHODS[2] = { "windowed OLS (3.1-style)",
                                            "relative-weighted LS (rev4-style)" };
 
-// least squares y = a*x + b with per-point weights; r2 is the weighted R^2.
-// A sibling of linFit, not a change to it: the series fit keeps its own path.
-static bool linFitWeighted(const std::vector<double>& xs, const std::vector<double>& ys,
-                           const std::vector<double>& ws, double& a, double& b, double& r2) {
-    size_t n = xs.size();
-    if (n < 2) return false;
-    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (size_t i = 0; i < n; i++) {
-        sw += ws[i]; sx += ws[i] * xs[i]; sy += ws[i] * ys[i];
-        sxx += ws[i] * xs[i] * xs[i]; sxy += ws[i] * xs[i] * ys[i];
-    }
-    if (!(sw > 0)) return false;
-    double d = sw * sxx - sx * sx;
-    // relative degeneracy test: 1/y^2 weights make the ABSOLUTE determinant
-    // tiny on perfectly good data
-    if (fabs(d) <= 1e-12 * std::max(sw * sxx, sx * sx)) return false;
-    a = (sw * sxy - sx * sy) / d;
-    b = (sy - a * sx) / sw;
-    double ym = sy / sw, sst = 0, ssr = 0;
-    for (size_t i = 0; i < n; i++) {
-        double e = ys[i] - (a * xs[i] + b);
-        ssr += ws[i] * e * e;
-        sst += ws[i] * (ys[i] - ym) * (ys[i] - ym);
-    }
-    r2 = sst > 1e-12 ? 1.0 - ssr / sst : 1.0;
-    return true;
-}
+// (linFitWeighted lives beside linFit in panel_projection.inc since the §3.3
+// migration - the series fit's rev4-style method is the same function.)
 
 struct FrameLinFit {
     bool valid = false;

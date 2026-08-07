@@ -132,8 +132,14 @@
             check(seriesFitPoints(*S) == 2, "A1 fit points count frame members too");
             check(audit(), "A1 audit passes on a mixed series");
             int sid2 = newSeries(b1, "second");
-            check(addFrameToSeries(sid2, f40, 41) && seriesOfFrame(f40) == seriesById(sid2) &&
-                  seriesById(sid) == nullptr,
+            bool moved = addFrameToSeries(sid2, f40, 41);
+            bool inNew = seriesById(sid2) != nullptr &&
+                         seriesOfFrame(f40) == seriesById(sid2);
+            bool outOld = true;          // the old series keeps its STACK member
+            if (App::Series* SM = seriesById(sid))
+                for (const auto& m : SM->members)
+                    if (m.frameUid == f40) outOld = false;
+            check(moved && inNew && outOld,
                   "A1 a frame belongs to AT MOST one series (joining moves it)");
             check(audit(), "A1 audit after the move");
         }
@@ -261,22 +267,34 @@
         }
 
         // ==== A7: the two methods disagree in the PREDICTED direction ========
-        // Bend the TOP in-window member (+2% at value 100). OLS lets the bright
-        // point pull the whole fit; the relative-weighted rev4-style fit stays
-        // with the low points, so a bright-end bend keeps MORE of its
-        // deviation: LE rev4 > LE OLS. (Migrated F4.)
+        // The interim tool's F4 fixture, member-shaped: 9 levels at LINEAR
+        // spacing (the geometry matters - on a sparse geometric axis OLS's
+        // worst RELATIVE deviation walks down to the small-denominator end),
+        // the TOP one bent +2%. OLS lets the bright point pull the whole fit;
+        // the relative-weighted rev4-style fit stays with the low points, so
+        // a bright-end bend keeps MORE of its deviation: LE rev4 > LE OLS
+        // (verified analytically: OLS 1.235%, rev4 1.556%, both at the bend).
         {
-            uint64_t bent = mkFrame(bA, "bent100.npy", false, [&](int, int, int) {
+            int bM = mkBatch("spmeth");
+            int sidM = newSeries(bM, "methods");
+            App::Series* SM = seriesById(sidM);
+            snprintf(SM->unit, sizeof SM->unit, "lx");
+            for (int v = 20; v <= 90; v += 10) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "m%03d.npy", v);
+                addFrameToSeries(sidM, lineFrame(bM, nm, v), v);
+            }
+            uint64_t bent = mkFrame(bM, "bent100.npy", false, [&](int, int, int) {
                 return (float)((A_GT * 100 + B_GT) * 1.02);
             });
-            addFrameToSeries(sidA, bent, 100);
+            addFrameToSeries(sidM, bent, 100);
             app.lin.winMode = 0;
             app.lin.fitMethod = 0;
-            linRecompute(sidA);
+            linRecompute(sidM);
             double leOls = app.lin.leMax[0];
             bool okOls = app.lin.fitValid;
             app.lin.fitMethod = 1;
-            linRecompute(sidA);
+            linRecompute(sidM);
             double leRev = app.lin.leMax[0];
             fprintf(stderr, "seriespanelselftest: A7 LE OLS=%.4f%% rev4=%.4f%%\n",
                     leOls, leRev);
@@ -285,7 +303,6 @@
                   "A7 both methods catch the 2% bend in its ballpark");
             check(leRev > leOls, "A7 rev4-style shows the LARGER LE for a bright-end bend");
             app.lin.fitMethod = 0;
-            removeFrameFromSeries(bent);
         }
 
         // ==== A8: a WINDOWED fit needs 3 points; unwindowed keeps the old 2 ==

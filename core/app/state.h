@@ -1173,7 +1173,13 @@ struct App {
         int kind = 0;
         int badValues = 0;                // value fields the parser could not read
         int truncated = 0;                // member lines cut before their path
-        struct M { double value; bool include; std::string path; };
+        // kind: 0 = stack standing as mean ("seriesmember"), 1 = stack
+        // standing as sum ("seriessum"), 2 = standalone frame ("seriesframe").
+        // Three KEYS, not one key plus flags (the stackavg/stacksum rule): an
+        // older viewer skips lines it does not know, so a sum declaration or a
+        // frame member simply does not come back there - the right failure -
+        // instead of a flag being dropped and a sum quietly reading as a mean.
+        struct M { double value; bool include; std::string path; int kind = 0; };
         std::vector<M> members;
     };
     std::vector<SeriesRestore> seriesRestore;

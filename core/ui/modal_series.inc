@@ -61,12 +61,18 @@ static void openSeriesModal(int batchId, int editId) {
         // the prefill, and only that: an empty box stays empty (prefs linunit)
         snprintf(E.unit, sizeof E.unit, "%s", app.lin.unit);
     }
-    auto addRow = [&](int seqId, bool checked, double value, bool haveValue) {
+    auto addRow = [&](int seqId, uint64_t uid, bool checked, double value, bool haveValue) {
         App::SeriesEdit::Row r;
         r.seqId = seqId;
+        r.uid = uid;
         r.check = checked;
-        App::SeqInfo* si = seqInfo(seqId);
-        r.name = si ? si->name : std::string();
+        if (seqId != 0) {
+            App::SeqInfo* si = seqInfo(seqId);
+            r.name = si ? si->name : std::string();
+        } else {
+            ImageDoc* fd = frameMemberDoc(uid);
+            r.name = fd ? fd->name : std::string();
+        }
         double guess = extractLevelFromName(r.name, &r.from);
         if (haveValue) {
             // An EXISTING member. Its value is the user's - INCLUDING the
@@ -95,12 +101,21 @@ static void openSeriesModal(int batchId, int editId) {
         E.rows.push_back(std::move(r));
     };
     if (S)
-        for (const auto& m : S->members) addRow(m.seqId, true, m.value, true);
+        for (const auto& m : S->members) addRow(m.seqId, m.frameUid, true, m.value, true);
     for (const auto& si : app.seqs) {
         if (batchOfStack(si.id) != E.batchId) continue;
         bool already = false;
         for (const auto& r : E.rows) if (r.seqId == si.id) already = true;
-        if (!already) addRow(si.id, S == nullptr, 0, false);
+        if (!already) addRow(si.id, 0, S == nullptr, 0, false);
+    }
+    // frame | stack MIXED (docs/analysis-layers.md §3.3, 判断record 7): the
+    // batch's standalone frames are candidates too - a series of one-frame
+    // members is the frame-linearity's final form, and this modal is its door.
+    for (const auto& d : app.images) {
+        if (d->seqId != 0 || d->preview || d->batchId != E.batchId) continue;
+        bool already = false;
+        for (const auto& r : E.rows) if (r.uid == d->uid) already = true;
+        if (!already) addRow(0, d->uid, S == nullptr, 0, false);
     }
     E.open = true;
 }
@@ -116,15 +131,28 @@ static int seriesModalAccept() {
     // order, which is why the arrows exist.
     std::vector<App::Series::Member> ms;
     for (const auto& r : E.rows) {
-        if (!r.check || !seqInfo(r.seqId)) continue;
-        if (batchOfStack(r.seqId) != E.batchId) continue;   // strict containment
+        if (!r.check) continue;
         App::Series::Member m;
-        m.seqId = r.seqId;
+        if (r.seqId != 0) {
+            if (!seqInfo(r.seqId)) continue;
+            if (batchOfStack(r.seqId) != E.batchId) continue;   // strict containment
+            m.seqId = r.seqId;
+        } else {
+            const ImageDoc* fd = frameMemberDoc(r.uid);
+            if (!fd || fd->batchId != E.batchId) continue;      // same rule for frames
+            m.frameUid = r.uid;
+        }
         m.value = seriesEditRowValue(r);
         m.include = true;
-        if (const App::Series* old = seriesById(E.editId))   // keep the fit flag
+        if (const App::Series* old = seriesById(E.editId))
             for (const auto& om : old->members)
-                if (om.seqId == r.seqId) m.include = om.include;
+                if ((m.seqId != 0 && om.seqId == m.seqId) ||
+                    (m.frameUid != 0 && om.frameUid == m.frameUid)) {
+                    m.include = om.include;   // keep the fit flag...
+                    m.fold = om.fold;         // ...and the declared fold - the
+                                              // modal does not edit it, so Save
+                                              // must not silently reset it
+                }
         ms.push_back(m);
     }
     if (ms.empty()) return 0;
@@ -141,11 +169,16 @@ static int seriesModalAccept() {
     // the membership and the values the user typed survive.
     int id = (E.editId && seriesById(E.editId)) ? E.editId
                                                 : newSeries(E.batchId, E.name);
-    // a stack belongs to AT MOST ONE series: taking one in takes it out of
-    // wherever it was
+    // a member belongs to AT MOST ONE series: taking one in takes it out of
+    // wherever it was - stacks and frames alike
     for (const auto& m : ms) {
-        App::Series* other = seriesOfStack(m.seqId);
-        if (other && other->id != id) removeFromSeries(m.seqId);
+        if (m.seqId != 0) {
+            App::Series* other = seriesOfStack(m.seqId);
+            if (other && other->id != id) removeFromSeries(m.seqId);
+        } else {
+            App::Series* other = seriesOfFrame(m.frameUid);
+            if (other && other->id != id) removeFrameFromSeries(m.frameUid);
+        }
     }
     if (App::Series* S = seriesById(id)) {
         S->name = E.name[0] ? E.name : batchNameOf(E.batchId) + " 掃引";
@@ -204,7 +237,7 @@ static void drawSeriesModal() {
     if (!E.unit[0])
         ImGui::TextDisabled("unit not set - members and means still show, the fit will not.");
 
-    ImGui::SeparatorText("members  (value = the parameter this stack was captured at)");
+    ImGui::SeparatorText("members  (value = the parameter this member was captured at)");
     if (ImGui::SmallButton("Sort by value")) {
         std::stable_sort(E.rows.begin(), E.rows.end(),
                          [](const App::SeriesEdit::Row& a, const App::SeriesEdit::Row& b) {
@@ -227,7 +260,7 @@ static void drawSeriesModal() {
         // holding "-" or "1e" is an unset member, and the count has to say so
         if (std::isfinite(seriesEditRowValue(r))) nValued++;
     }
-    ImGui::TextDisabled("| %d of %d stacks, %d with a value", nChecked,
+    ImGui::TextDisabled("| %d of %d members, %d with a value", nChecked,
                         (int)E.rows.size(), nValued);
 
     const ImGuiTableFlags TF = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
@@ -237,7 +270,7 @@ static void drawSeriesModal() {
     if (ImGui::BeginTable("sermembers", 5, TF, ImVec2(0, std::max(tableH, 80.0f * app.uiScale)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
-        ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("member", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("read from", ImGuiTableColumnFlags_WidthFixed,
                                 ImGui::GetFontSize() * 9);
@@ -246,12 +279,18 @@ static void drawSeriesModal() {
         ImGui::TableHeadersRow();
         for (int i = 0; i < (int)E.rows.size(); i++) {
             App::SeriesEdit::Row& r = E.rows[i];
-            ImGui::PushID(r.seqId);
+            // frame rows have seqId 0: their id is the uid, kept out of the
+            // stacks' positive range so the two families can never collide
+            ImGui::PushID(r.seqId != 0 ? r.seqId : -(int)(r.uid & 0x7fffffff));
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::Checkbox("##m", &r.check);
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(r.name.c_str());
+            if (r.seqId == 0) {   // a standalone frame member (§3.3)
+                ImGui::SameLine();
+                ImGui::TextDisabled("(frame)");
+            }
             ImGui::TableNextColumn();
             ImGui::SetNextItemWidth(-1);
             if (r.suggested)      // a proposal reads as one until it is confirmed
@@ -311,7 +350,7 @@ static void drawSeriesModal() {
     }
     if (!canAccept) {
         ImGui::SameLine();
-        ImGui::TextDisabled("tick at least one stack");
+        ImGui::TextDisabled("tick at least one member");
     }
     ImGui::EndPopup();
 }

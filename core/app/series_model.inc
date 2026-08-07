@@ -35,26 +35,52 @@ static App::Series* seriesOfStack(int seqId) {
 // - it belongs to the series through its stack (the canon's containment; the
 // 省略 rule covers a frame with no stack, not a frame escaping one).
 static ImageDoc* frameMemberDoc(uint64_t uid) {
-    // red stage of the fail-first contract: implemented with the model commit
-    (void)uid;
+    if (!uid) return nullptr;
+    for (const auto& d : app.images)
+        if (d->uid == uid && d->seqId == 0 && !d->preview) return d.get();
     return nullptr;
 }
-// Reverse membership for frames - the frame twin of seriesOfStack.
+// Reverse membership for frames - the frame twin of seriesOfStack, with the
+// same first-hit-is-the-only-hit contract (seriesAudit proves it).
 static App::Series* seriesOfFrame(uint64_t uid) {
-    (void)uid;
+    if (uid == 0) return nullptr;
+    for (auto& s : app.series)
+        for (const auto& m : s.members)
+            if (m.frameUid == uid) return &s;
     return nullptr;
 }
 // Drop one frame from whatever series holds it. Returns the series' id, or 0.
 static int removeFrameFromSeries(uint64_t uid) {
-    (void)uid;
+    if (uid == 0) return 0;
+    for (auto& s : app.series)
+        for (auto it = s.members.begin(); it != s.members.end(); ++it)
+            if (it->frameUid == uid) {
+                s.members.erase(it);
+                app.imagesRev++;
+                return s.id;
+            }
     return 0;
 }
 // Add a standalone frame to a series - the frame twin of addToSeries, with the
-// same strict-containment refusal (the frame's batch must be the series').
+// same strict-containment refusal (the frame's batch must be the series' - the
+// caller's answer is "Move to batch first") and the same at-most-one rule
+// (joining moves the frame out of whatever series held it).
 static bool addFrameToSeries(int seriesId, uint64_t uid, double value,
                              bool include = true) {
-    (void)seriesId; (void)uid; (void)value; (void)include;
-    return false;
+    App::Series* S = seriesById(seriesId);
+    ImageDoc* d = frameMemberDoc(uid);
+    if (!S || !d) return false;
+    if (d->batchId != S->batchId) return false;
+    for (auto& m : S->members)
+        if (m.frameUid == uid) { m.value = value; m.include = include; return true; }
+    removeFrameFromSeries(uid);
+    App::Series::Member m;
+    m.frameUid = uid;
+    m.value = value;
+    m.include = include;
+    S->members.push_back(m);
+    app.imagesRev++;
+    return true;
 }
 // The batch a stack is in, read off its frames (the frames own batchId).
 // 0 = the stack has no frames resident, so it claims no batch.
@@ -160,19 +186,15 @@ static void linInvalidate() {
     linFitStale();
 }
 // Points a fit would actually use: included, value SET (NaN is "unset", never
-// 0), and the stack still there.
+// 0), and the member - stack or frame - still there.
 static int seriesFitPoints(const App::Series& S) {
     int n = 0;
-    for (const auto& m : S.members)
-        if (m.include && std::isfinite(m.value) && seqInfo(m.seqId)) n++;
+    for (const auto& m : S.members) {
+        if (!m.include || !std::isfinite(m.value)) continue;
+        if (m.seqId != 0 ? seqInfo(m.seqId) != nullptr
+                         : frameMemberDoc(m.frameUid) != nullptr) n++;
+    }
     return n;
-}
-// The ONE line that names the layer of everything this panel prints (canon
-// invariant (a): 解析結果は自分の層を名乗る). Screen, TSV comment and selftest
-// all read this string, so they cannot drift apart.
-static std::string seriesProvLine(const App::Series& S, const App::LinState& L) {
-    (void)S; (void)L;
-    return {};
 }
 static const char* seriesKindName(int k) {
     switch (k) {
@@ -181,6 +203,20 @@ static const char* seriesKindName(int k) {
         case App::Series::KOther:       return "other";
         default:                        return "linearity";
     }
+}
+// The ONE line that names the layer of everything this panel prints (canon
+// invariant (a): 解析結果は自分の層を名乗る - a number that does not carry its
+// layer cannot be quoted in a report). Screen, TSV comment and selftest all
+// read this string, so they cannot drift apart.
+static std::string seriesProvLine(const App::Series& S, const App::LinState& L) {
+    int st = 0, fr = 0;
+    for (const auto& r : L.rows) (r.isFrame ? fr : st)++;
+    char b[320];
+    snprintf(b, sizeof b,
+             "layer: series \"%s\" (batch \"%s\") | kind %s | members: %d stack + %d frame",
+             S.name.c_str(), batchNameOf(S.batchId).c_str(), seriesKindName(S.kind),
+             st, fr);
+    return b;
 }
 // Whether the Linearity panel's EQUATIONS are the ones this series asked for.
 // The canon (docs/terminology.md: 測定の種類 ... fit の式と出す量が決まる) makes
@@ -204,12 +240,41 @@ static bool seriesCanFit(const App::Series& S) {
 // --series-selftest after every mutation; cheap enough to call from anywhere.
 static bool seriesAudit(std::string& why) {
     std::vector<int> seen;
+    std::vector<uint64_t> seenU;
     for (const auto& S : app.series) {
         if (S.members.empty()) { why = "series '" + S.name + "' has no members"; return false; }
         bool haveBatch = false;
         for (const auto& b : app.batches) if (b.id == S.batchId) haveBatch = true;
         if (!haveBatch) { why = "series '" + S.name + "' points at a dead batch"; return false; }
         for (const auto& m : S.members) {
+            // a member is EXACTLY one of stack / frame (§3.3) - both or neither
+            // is a corrupt membership, not a new kind
+            if ((m.seqId != 0) == (m.frameUid != 0)) {
+                why = "series '" + S.name + "' has a member that is " +
+                      (m.seqId ? "both a stack and a frame" : "neither stack nor frame");
+                return false;
+            }
+            if (m.frameUid != 0) {
+                const ImageDoc* d = frameMemberDoc(m.frameUid);
+                if (!d) {
+                    why = "series '" + S.name + "' frame member uid " +
+                          std::to_string((unsigned long long)m.frameUid) + " does not exist";
+                    return false;
+                }
+                if (d->batchId != S.batchId) {
+                    why = "series '" + S.name + "' frame member \"" + d->name +
+                          "\" is in batch " + std::to_string(d->batchId) +
+                          " (series batch " + std::to_string(S.batchId) + ")";
+                    return false;
+                }
+                for (uint64_t u : seenU)
+                    if (u == m.frameUid) {
+                        why = "frame " + d->name + " is in two series";
+                        return false;
+                    }
+                seenU.push_back(m.frameUid);
+                continue;
+            }
             if (!seqInfo(m.seqId)) {
                 why = "series '" + S.name + "' member seq " + std::to_string(m.seqId) +
                       " does not exist";
@@ -232,6 +297,28 @@ static bool seriesAudit(std::string& why) {
     }
     why.clear();
     return true;
+}
+
+// Frame MEMBERS die with their docs (§3.3). Every close funnels through
+// closeImages, so this is the one sweep that keeps a series from holding a
+// member whose frame is gone - the frame twin of closeStack's
+// removeFromSeries. The fit goes stale with the membership (the canon:
+// editing the members discards the computed numbers); the close itself
+// already spoke, so this only drops the bookkeeping.
+static void pruneDeadFrameMembers() {
+    bool dropped = false;
+    for (auto& s : app.series)
+        for (auto it = s.members.begin(); it != s.members.end();)
+            if (it->frameUid != 0 && !frameMemberDoc(it->frameUid)) {
+                it = s.members.erase(it);
+                dropped = true;
+            } else {
+                ++it;
+            }
+    if (!dropped) return;
+    app.imagesRev++;
+    linFitStale();
+    pruneEmptySeries();
 }
 
 // Close a set of images by index: erase in descending order so the indices stay
@@ -270,6 +357,7 @@ static void closeImages(std::vector<int> idxs) {
     if (!resolveB()) {   // B went with them: a later same-name file must not
         app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
     }
+    pruneDeadFrameMembers();   // a closed frame is not a series member anymore
     pruneEmptyBatches();
 }
 
@@ -638,9 +726,21 @@ static bool seriesJoinFromMenu(int seriesId, int seqId, std::string* msgOut) {
     return true;
 }
 // A standalone frame (no stack) hangs off the batch directly and moves alone.
+// A frame MEMBER moved out alone leaves its series, exactly like a stack
+// member (series ⊂ batch is strict, and the canon says say so, not forbid).
 static void moveImageToBatch(int imageIdx, int batchId) {
     if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
-    app.images[imageIdx]->batchId = batchId;
+    ImageDoc* d = app.images[imageIdx].get();
+    if (d->seqId == 0)
+        if (App::Series* S = seriesOfFrame(d->uid))
+            if (S->batchId != batchId) {
+                std::string sn = S->name;
+                removeFrameFromSeries(d->uid);
+                pruneEmptySeries();
+                linFitStale();   // the fit measured a membership that just changed
+                toast(d->name + " left series \"" + sn + "\" (moved to another batch)");
+            }
+    d->batchId = batchId;
     app.imagesRev++;
     pruneEmptyBatches();
 }
