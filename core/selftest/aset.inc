@@ -519,6 +519,68 @@
                   "A9 a matching (setbatch, name) block ADOPTS - no second node");
         }
 
+        // ---- A11: end to end - a READER returns a set, down the STREAM --------
+        // The npz carrier is A1-A9's; the framed stream is the door a real
+        // reader's result arrives through, and its role/refs lines deserve one
+        // pass through the actual pipe. Python-gated, skipping out loud, the
+        // V25h rule: a red line meaning "this machine has no numpy" would
+        // train everyone to ignore red lines. Prefs are snapshotted around it
+        // because a remembered reader writes prefs.txt (the V25 discipline).
+        {
+            std::string pyWhy;
+            std::string py = adapter::findPython(app.pythonExe, pyWhy);
+            std::string script = runAdapterScript();
+            if (py.empty() || script.empty()) {
+                fprintf(stderr, "asetselftest: A11 SKIPPED - %s\n",
+                        py.empty() ? pyWhy.c_str()
+                                   : "tools/import/run_adapter.py not found");
+            } else {
+                std::vector<App::ReaderMemo> memoSnapshot = app.readerMemo;
+                std::vector<std::string> bmSnapshot = app.rbBookmarks;
+                std::vector<std::string> rcSnapshot = app.rbRecents;
+                std::string srcPath = (adir / "a11_src.npz").u8string();
+                writeNpz2(srcPath, {
+                    { "data", npyB("<u2", { 3, 8, 8 }, px3.data(), px3.size() * 2) },
+                });
+                std::string fwd = darksDir;      // Python source: forward slashes
+                for (char& c : fwd) if (c == '\\') c = '/';
+                std::string pyPath = (adir / "a11_reader.py").u8string();
+                {
+                    std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                    pf << "import numpy as np\n"
+                       << "from viewer_import import AnalysisSet, Ref, Stack\n"
+                       << "def load(path):\n"
+                       << "    z = np.load(path)\n"
+                       << "    return AnalysisSet({'image': Stack(z['data']),\n"
+                       << "                        'dark': Ref('" << fwd << "')},\n"
+                       << "                       name='E2E')\n";
+                }
+                closeAll();
+                std::string herr = openWithReader(srcPath, pyPath + ":load");
+                drain();
+                fprintf(stderr, "asetselftest: A11 err=\"%s\" sets=%zu docs=%zu\n",
+                        herr.c_str(), app.analysisSets.size(), app.images.size());
+                bool built = herr.empty() && app.analysisSets.size() == 1;
+                check(built, "A11 a reader's set arrives down the stream");
+                if (built) {
+                    const App::ASet& S = app.analysisSets.front();
+                    check(S.name == "E2E" && S.readerSpec.find("a11_reader.py") !=
+                              std::string::npos,
+                          "A11 the set carries its reader's spec (provenance)");
+                    check(S.roles.size() == 2 && S.roles[0].role == "image" &&
+                              S.roles[0].seqId != 0,
+                          "A11 the inline role binds through the stream too");
+                    check(S.roles[1].role == "dark" && S.roles[1].seqId != 0 &&
+                              framesOfSeq(S.roles[1].seqId).size() == 2,
+                          "A11 the folder Ref resolves after the drain");
+                }
+                app.readerMemo = memoSnapshot;   // the user's prefs, as found
+                app.rbBookmarks = bmSnapshot;
+                app.rbRecents = rcSnapshot;
+                savePrefs();
+            }
+        }
+
         // ---- A10: the row/role texts, exact (6) --------------------------------
         {
             App::ASet L;
