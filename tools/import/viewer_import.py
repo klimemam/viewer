@@ -15,6 +15,13 @@ Stack when the frames are repeats of one condition (sigma_t means something) and
 Series when a condition was swept (sigma_t would report the sweep as noise).  No
 other vocabulary is introduced; see docs/terminology.md.
 
+A fifth layer exists in the canon: AnalysisSet, a set of role bindings
+({"image": ..., "dark": ...}), with Ref as the way to bind data that is already
+open without re-reading it.  Both are specified in docs/reader-analysisset.md and
+are NOT implemented in this file yet -- importing them fails until the viewer
+side lands.  The spec is the contract to write them against; nothing already
+here changes meaning (VERSION stays 1).
+
 Returning a bare array is also allowed and is read exactly as the viewer reads a
 .npy natively -- (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C).  Naming a type is what
 you do when you want to kill an ambiguity yourself.

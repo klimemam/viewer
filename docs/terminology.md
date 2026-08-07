@@ -96,18 +96,18 @@ Yes なら series、No なら batch。
 「その操作をその層に対して行ったとき何が起きるか」。空欄はその層に対して
 提供しない（＝UI に出さない）。
 
-| 操作 | frame | stack | series | batch |
-|---|---|---|---|---|
-| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 含む stack / frame をすべて破棄 |
-| **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
-| **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — | 同 = everything（全体で共有） |
-| **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） | — （条件混在は平均に意味がない） |
-| **frame 平均** | — （1枚に時間軸はない） | ここが本体。全 frame の画素ごと平均を **1枚の frame** として開く（stack を開く各所の右クリックと Files の stack 行）。結果は stack ではなく frame なので、Histogram / Projection / ROI がそのまま効く。元の stack は開いたまま残す | — （条件が違うものを平均しても量にならない） | — （条件混在は平均に意味がない） |
-| **per-frame 表 (TSV)** | 1行 | 全 frame の表。**σ_t 列は持たない**（stack の属性を frame 行に置くのは誤り） | 将来: series 横断の表（パラメータ列つき） | 将来: batch 横断の表 |
-| **リニアリティ** | — | 1 stack = 1 照度点（`level` は series が与える） | **ここが本体**。1 series = 1 本のフィット。単位も series が持つ | — （batch は構造を主張しない） |
-| **preview** | 使い捨て枠1つ。昇格で通常の frame になる | 先頭 frame のみ preview | — | preview は専用の擬似 batch に居る |
-| **compare (A/B)** | frame 対 frame | フレーム番号を保って stack 間比較 | — | — |
-| **測定 (analyzer)** | 対象は現在の frame + ROI | 集計系は stack 単位 | 掃引系（linearity/PTC/SNR）は series 単位 | — |
+| 操作 | frame | stack | series | AnalysisSet | batch |
+|---|---|---|---|---|---|
+| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](reader-analysisset.md) §6） | 含む stack / frame をすべて破棄 |
+| **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
+| **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — |  | 同 = everything（全体で共有） |
+| **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） |  | — （条件混在は平均に意味がない） |
+| **frame 平均** | — （1枚に時間軸はない） | ここが本体。全 frame の画素ごと平均を **1枚の frame** として開く（stack を開く各所の右クリックと Files の stack 行）。結果は stack ではなく frame なので、Histogram / Projection / ROI がそのまま効く。元の stack は開いたまま残す | — （条件が違うものを平均しても量にならない） |  | — （条件混在は平均に意味がない） |
+| **per-frame 表 (TSV)** | 1行 | 全 frame の表。**σ_t 列は持たない**（stack の属性を frame 行に置くのは誤り） | 将来: series 横断の表（パラメータ列つき） |  | 将来: batch 横断の表 |
+| **リニアリティ** | — | 1 stack = 1 照度点（`level` は series が与える） | **ここが本体**。1 series = 1 本のフィット。単位も series が持つ |  | — （batch は構造を主張しない） |
+| **preview** | 使い捨て枠1つ。昇格で通常の frame になる | 先頭 frame のみ preview | — |  | preview は専用の擬似 batch に居る |
+| **compare (A/B)** | frame 対 frame | フレーム番号を保って stack 間比較 | — |  | — |
+| **測定 (analyzer)** | 対象は現在の frame + ROI | 集計系は stack 単位 | 掃引系（linearity/PTC/SNR）は series 単位 |  | — |
 
 ## 命名の規則（表示文字列）
 
