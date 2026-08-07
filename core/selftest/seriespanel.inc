@@ -245,6 +245,9 @@
                   "A5 manual window keeps the 4 on-line points, recovers the line");
             check(fabs(L.winPlaneLo[0] - 110) < 1e-12 && fabs(L.winPlaneHi[0] - 1400) < 1e-12,
                   "A5 the APPLIED window is recorded per plane");
+            // the shared label: screen and TSV read the same string
+            check(seriesWinLabel(L).find("manual [110, 1400] DN") != std::string::npos,
+                  "A5 the shared window label states the applied window");
             removeFrameFromSeries(lo);
             removeFrameFromSeries(hi);
         }
@@ -262,6 +265,8 @@
                   "A6 auto window = [51.2, 972.8] from max member mean 1024");
             check(L.fitValid && L.nFit[0] == 4 && fabs(L.slope[0] - A_GT) < 1e-9,
                   "A6 the 1024 DN member is out, the rest recover the line");
+            check(seriesWinLabel(L).find("auto = 5%..95%") != std::string::npos,
+                  "A6 the shared window label says AUTO");
             removeFrameFromSeries(f120);
             app.lin.winMode = 0;
         }
@@ -284,6 +289,18 @@
                 snprintf(nm, sizeof nm, "m%03d.npy", v);
                 addFrameToSeries(sidM, lineFrame(bM, nm, v), v);
             }
+            // on LINEAR data the two methods must agree - the weights only
+            // matter when there is a residual to weigh
+            app.lin.winMode = 0;
+            app.lin.fitMethod = 0;
+            linRecompute(sidM);
+            double aLin = app.lin.slope[0], bLin = app.lin.offs[0];
+            app.lin.fitMethod = 1;
+            linRecompute(sidM);
+            check(app.lin.fitValid && fabs(aLin - A_GT) < 1e-9 &&
+                  fabs(app.lin.slope[0] - aLin) < 1e-6 &&
+                  fabs(app.lin.offs[0] - bLin) < 1e-4,
+                  "A7 the two methods agree on linear data");
             uint64_t bent = mkFrame(bM, "bent100.npy", false, [&](int, int, int) {
                 return (float)((A_GT * 100 + B_GT) * 1.02);
             });
