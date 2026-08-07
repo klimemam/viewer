@@ -524,6 +524,12 @@ viewer_selftest(roistats    NOGL --roistats-selftest)
 # roistats - it asserts what the panel prints, not where it landed - and the
 # same analytic in-memory fixtures, so it needs no fixture directory either.
 viewer_selftest(abeq        NOGL --abeq-selftest)
+# Which dll computed the Analysis grid (#46 stage 1): the host ledger's file
+# name must reach the provenance line and the Copy-table TSV, and builtin
+# statistics must never wear a plugin tag. Same NOGL reasoning as roistats -
+# strings, not layout - and the same analytic in-memory fixture; the analyzers
+# themselves are the real dlls the build put in build/plugins.
+viewer_selftest(anaprov     NOGL --anaprov-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)

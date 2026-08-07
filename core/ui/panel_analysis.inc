@@ -44,6 +44,27 @@ static const char* analyzerHeadlineSuffix(const std::string& name) {
     return nullptr;                    // stats/moments: all rows are peers
 }
 
+// The "Copy table (TSV)" document, built from the panel's cached state. A
+// function rather than button-local code for the buildTemporalExport reason:
+// what a report will paste has to be assertable by a machine, and
+// --anaprov-selftest asserts on this exact string.
+static std::string buildAnalysisTsv() {
+    const auto& ana = app.ana;
+    // provenance rides along as a # comment: a pasted grid must carry
+    // the same evidence as a screenshot of the panel
+    std::string tsv = "# " + ana.prov + "\n";
+    tsv += "metric\tunit";
+    for (const auto& cn : ana.cols) tsv += "\t" + cn;
+    tsv += "\n";
+    for (int k = 0; k < (int)ana.keys.size(); k++) {
+        tsv += ana.keys[k] + "\t" + (k < (int)ana.units.size() ? ana.units[k] : "");
+        for (int c = 0; c < (int)ana.cols.size(); c++)
+            tsv += "\t" + (c < (int)ana.vals[k].size() ? ana.vals[k][c] : std::string());
+        tsv += "\n";
+    }
+    return tsv;
+}
+
 static void drawPanelAnalysis() {
     ImageDoc* im = cur();
     if (im && !plugin_host::analyzers().empty()) {
@@ -231,19 +252,7 @@ static void drawPanelAnalysis() {
         // so the grid below sits at a fixed height in every state)
         ImGui::BeginDisabled(ana.img != im || ana.keys.empty());
         if (ImGui::Button("Copy table (TSV)")) {
-            // provenance rides along as a # comment: a pasted grid must carry
-            // the same evidence as a screenshot of the panel
-            std::string tsv = "# " + ana.prov + "\n";
-            tsv += "metric\tunit";
-            for (const auto& cn : ana.cols) tsv += "\t" + cn;
-            tsv += "\n";
-            for (int k = 0; k < (int)ana.keys.size(); k++) {
-                tsv += ana.keys[k] + "\t" + (k < (int)ana.units.size() ? ana.units[k] : "");
-                for (int c = 0; c < (int)ana.cols.size(); c++)
-                    tsv += "\t" + (c < (int)ana.vals[k].size() ? ana.vals[k][c] : std::string());
-                tsv += "\n";
-            }
-            ImGui::SetClipboardText(tsv.c_str());
+            ImGui::SetClipboardText(buildAnalysisTsv().c_str());
             toast("result grid copied as TSV (provenance included)");
         }
         ImGui::EndDisabled();

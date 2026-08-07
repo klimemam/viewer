@@ -610,6 +610,13 @@ struct App {
         // target, when, and how long it took. A screenshot of the panel must
         // answer all of that without the surrounding session.
         std::string prov;
+        // ...and WHO computed it (#46 stage 1): the absolute path of the dll
+        // the analyzer came from, copied from the host's ledger at run time.
+        // The analyzer name + dll basename ride inside `prov` itself; the full
+        // path is too long for the status line, so it surfaces as the line's
+        // tooltip and as a "# plugin:" comment in the TSV/CSV exports. Empty =
+        // no plugin file known (a builtin result must never wear a false one).
+        std::string provDll;
         float runMs = 0;
         // presentation metadata, derived once per run (never in the draw loop):
         std::vector<int> colColor;             // ANN palette per column; -1 = neutral

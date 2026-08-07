@@ -465,6 +465,8 @@ static void sampleWindowGeometry(GLFWwindow* w) {
 
 #include "selftest/util.inc"
 
+#include "selftest/anaprov.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -856,6 +858,10 @@ int main(int argc, char** argv) {
     // is what the Statistics panel PRINTS, and that is CPU on both sides of the
     // window branch.
     if (g_abEqSelftest) return abEqSelftest();
+
+    // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
+    // through the real panel. Windowless because every assertion is a string.
+    if (g_anaProvSelftest) return anaProvSelftest();
 
     #include "selftest/verify.inc"
 

@@ -35,6 +35,13 @@ static bool g_roiStatsSelftest = false;
 // the same reason: see abEqSelftest().
 static bool g_abEqSelftest = false;
 
+// --anaprov-selftest: analyzer results name the dll they came from (#46 stage
+// 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
+// directory and no window for the --roistats-selftest reasons: the fixture is
+// analytic, the assertions are strings. The analyzers are the REAL dlls
+// startup loaded from exeDir()/plugins.
+static bool g_anaProvSelftest = false;
+
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
 // is enough for what the rows contain but blind to everything that only exists
@@ -427,6 +434,8 @@ static void printUsage() {
         "                              through the real panel, on analytic fixtures\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
         "                              coinciding, through the real panel\n"
+        "  --anaprov-selftest          analyzer results name the plugin dll that\n"
+        "                              computed them (the host's ledger, #46)\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
         "                              value, NaN exclusion, CFA planes, provenance\n"
@@ -557,6 +566,8 @@ static void parseCli(int argc, char** argv) {
             g_roiStatsSelftest = true;             // handled in main()
         } else if (a == "--abeq-selftest") {
             g_abEqSelftest = true;                 // handled in main()
+        } else if (a == "--anaprov-selftest") {
+            g_anaProvSelftest = true;              // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {
