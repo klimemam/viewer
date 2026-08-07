@@ -512,6 +512,10 @@ viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
 # rows the panel laid out actually are - the delete button's rect and the clicks
 # that have to reach it past a span-all-columns Selectable.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)
+# AnalysisSet (docs/reader-analysisset.md): transport read, Ref binding order,
+# close semantics, session block + adopt. Fixtures are built by the test
+# itself under a scratch dir, so the argument is only a place to put them.
+viewer_selftest(aset        NOGL --aset-selftest tools/testdata)
 # ...and the same panel's NUMBERS, which are not a rectangle and so do not need
 # a display. V19 used to hold both, which put the PRNU column's arithmetic
 # behind a GL context and therefore on one runner of the three: it was measured

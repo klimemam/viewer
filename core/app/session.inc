@@ -18,7 +18,9 @@ static void selectImage(int idx);
 // Rendering is separate from writing so the crash handler can keep a pre-rendered
 // copy and never has to build one while the process is already dying.
 static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
-                           int* lostMembersOut = nullptr) {
+                           int* lostMembersOut = nullptr,
+                           int* lostSetsOut = nullptr,
+                           int* lostSetRolesOut = nullptr) {
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << app.dispGamma << "\n";
@@ -330,6 +332,99 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                         "restore them from\n", lostSeries, lostMembers);
     if (lostSeriesOut) *lostSeriesOut = lostSeries;
     if (lostMembersOut) *lostMembersOut = lostMembers;
+    // ---- analysis sets (docs/reader-analysisset.md §5), AFTER the series ----
+    // blocks: a set may bind a series, and the referenced side writes first.
+    // The four rules are the series block's, by name (§5): flat unique keys;
+    // members travel by first-frame path (stack) / path (frame) / (batch,
+    // series name); what cannot be resolved is COUNTED; and the pending
+    // blocks below round-trip verbatim while the restore is still waiting.
+    int lostSets = 0, lostSetRoles = 0;
+    auto writeSetRole = [&](const App::ASetRole& r) {
+        if (r.seqId != 0) {
+            std::vector<int> fr = framesOfSeq(r.seqId);
+            const std::string p = fr.empty() ? std::string()
+                                             : app.images[fr.front()]->src->path;
+            if (p.empty()) {          // computed pixels: nothing reloads them
+                f << "setrole " << r.role << " unbound the bound member has no "
+                     "file to come back from\n";
+                lostSetRoles++;
+                return;
+            }
+            f << "setrole " << r.role << " stack "
+              << batchNameOf(batchOfStack(r.seqId)) << "\t" << p << "\n";
+            return;
+        }
+        if (r.frameUid != 0) {
+            for (const auto& d : app.images)
+                if (d->uid == r.frameUid) {
+                    if (d->src->path.empty()) {
+                        f << "setrole " << r.role << " unbound the bound member "
+                             "has no file to come back from\n";
+                        lostSetRoles++;
+                        return;
+                    }
+                    f << "setrole " << r.role << " frame " << batchNameOf(d->batchId)
+                      << "\t" << d->src->path << "\n";
+                    return;
+                }
+            f << "setrole " << r.role << " unbound the bound frame is gone\n";
+            lostSetRoles++;
+            return;
+        }
+        if (r.seriesId != 0) {
+            for (const auto& s : app.series)
+                if (s.id == r.seriesId) {
+                    f << "setrole " << r.role << " series " << batchNameOf(s.batchId)
+                      << "\t" << s.name << "\n";
+                    return;
+                }
+            f << "setrole " << r.role << " unbound the bound series is gone\n";
+            lostSetRoles++;
+            return;
+        }
+        // unbound roles are WRITTEN (§5.1): the declaration is a record, and
+        // it does not vanish across a save. The reason rides as restOfLine.
+        f << "setrole " << r.role << " unbound "
+          << (r.reason.empty() ? std::string("no reason recorded") : r.reason) << "\n";
+    };
+    for (const auto& S : app.analysisSets) {
+        std::string bn = batchNameOf(S.batchId);
+        if (bn.empty()) { lostSets++; lostSetRoles += (int)S.roles.size(); continue; }
+        f << "analysisset " << S.name << "\n";
+        f << "setbatch " << bn << "\n";
+        if (!S.readerSpec.empty()) f << "setreader " << S.readerSpec << "\n";
+        if (!S.origin.empty())     f << "setorigin " << S.origin << "\n";
+        for (const auto& r : S.roles) writeSetRole(r);
+        f << "setend\n";
+    }
+    // Blocks still waiting for their stacks write back VERBATIM (§5 rule 4 -
+    // the seriesRestore precedent above, and the same window: the autosave and
+    // the crash snapshot are both live while a restore is still draining).
+    for (const auto& R : app.aSetRestore) {
+        lostSetRoles += R.truncated;
+        if (R.batchName.empty()) {
+            lostSets++;
+            lostSetRoles += (int)R.roles.size();
+            continue;
+        }
+        f << "analysisset " << R.name << "\n";
+        f << "setbatch " << R.batchName << "\n";
+        if (!R.readerSpec.empty()) f << "setreader " << R.readerSpec << "\n";
+        if (!R.origin.empty())     f << "setorigin " << R.origin << "\n";
+        for (const auto& rr : R.roles) {
+            if (rr.kind == "unbound")
+                f << "setrole " << rr.role << " unbound " << rr.reason << "\n";
+            else
+                f << "setrole " << rr.role << " " << rr.kind << " "
+                  << rr.batchName << "\t" << rr.key << "\n";
+        }
+        f << "setend\n";
+    }
+    if (lostSets || lostSetRoles)
+        fprintf(stderr, "analysisset: NOT saved whole: %d set(s) and %d role(s) "
+                        "had nothing to restore them from\n", lostSets, lostSetRoles);
+    if (lostSetsOut) *lostSetsOut = lostSets;
+    if (lostSetRolesOut) *lostSetRolesOut = lostSetRoles;
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " "
@@ -350,15 +445,18 @@ static void saveSession(std::string path, bool quiet = false) {
     if (path.find('.') == std::string::npos) path += ".vsession";
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { if (!quiet) toast("cannot write session file", true); return; }
-    int lostSeries = 0, lostMembers = 0;
-    writeSessionTo(f, &lostSeries, &lostMembers);
+    int lostSeries = 0, lostMembers = 0, lostSets = 0, lostSetRoles = 0;
+    writeSessionTo(f, &lostSeries, &lostMembers, &lostSets, &lostSetRoles);
     if (quiet) return;
     std::string msg = "session saved: " + baseName(path);
     // the load side counts what it could not restore; so does this one now
     if (lostSeries || lostMembers)
         msg += " (" + std::to_string(lostSeries) + " series and " +
                std::to_string(lostMembers) + " series member(s) could NOT be saved)";
-    toast(msg, lostSeries > 0 || lostMembers > 0);
+    if (lostSets || lostSetRoles)
+        msg += " (" + std::to_string(lostSets) + " set(s) and " +
+               std::to_string(lostSetRoles) + " role binding(s) could NOT be saved)";
+    toast(msg, lostSeries > 0 || lostMembers > 0 || lostSets > 0 || lostSetRoles > 0);
 }
 
 static std::string loadNpy(const std::string& path, int npyRead);   // fwd (defined above)
@@ -1299,6 +1397,10 @@ static std::string loadSession(const std::string& path) {
     closeAll();                    // stops the loader and empties every open
                                    // queue: orphan frames from a previous load
                                    // must not graft onto the restored list
+    // A container/reader rebuild inside the replay re-declares its sets; their
+    // Refs must wait for the gate (see g_sessionRestoring at its definition),
+    // or every save/load cycle grows a twin of each referenced stack.
+    g_sessionRestoring = true;
     app.anns.clear();
     app.selectedAnn = 0;
     app.annRev++;
@@ -1315,6 +1417,7 @@ static std::string loadSession(const std::string& path) {
     // (seqframe, which picks the frame, comes after the image line).
     int lineOrd = -1, wantCurrent = -1, resolvedCurrent = -1;
     int curSeries = -1;               // index into app.seriesRestore, -1 = outside a block
+    int curSet = -1;                  // index into app.aSetRestore, same shape
     bool capturing = false;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
@@ -1563,6 +1666,55 @@ static std::string loadSession(const std::string& path) {
                 app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p });
             }
         }
+        // ---- analysisset block (docs/reader-analysisset.md §5.1): collected
+        // here, resolved at the drain gate (resolveASetRestore). A reader-read
+        // origin re-runs its reader through the image lines above, so the
+        // adopt rule (§5.2) has both declarations in hand by the time it fires.
+        else if (key == "analysisset") {
+            App::ASetRestore r;
+            r.name = restOfLine(ls);
+            app.aSetRestore.push_back(std::move(r));
+            curSet = (int)app.aSetRestore.size() - 1;
+        }
+        else if (key == "setend") curSet = -1;
+        else if (key == "setbatch") {
+            if (curSet >= 0) app.aSetRestore[curSet].batchName = restOfLine(ls);
+        }
+        else if (key == "setreader") {
+            if (curSet >= 0) app.aSetRestore[curSet].readerSpec = restOfLine(ls);
+        }
+        else if (key == "setorigin") {
+            if (curSet >= 0) app.aSetRestore[curSet].origin = restOfLine(ls);
+        }
+        else if (key == "setrole") {   // "<role> <kind> <batch>\t<key>" | "<role> unbound <reason>"
+            if (curSet < 0) continue;
+            std::string role, kind;
+            ls >> role >> kind;
+            App::ASetRestore::R rr;
+            rr.role = role;
+            rr.kind = kind;
+            std::string rest = restOfLine(ls);
+            if (kind == "unbound") {
+                rr.reason = rest;      // restOfLine: the reason may contain anything
+            } else if (kind == "stack" || kind == "frame" || kind == "series") {
+                // TAB separates batch name from path / series name: both halves
+                // can hold spaces, only one can hold a tab (the readerfor rule)
+                size_t tab = rest.find('\t');
+                if (tab == std::string::npos || tab + 1 >= rest.size()) {
+                    // the key is the LAST field, so a cut line loses it first -
+                    // counted, the seriesmember truncation rule
+                    app.aSetRestore[curSet].truncated++;
+                    continue;
+                }
+                rr.batchName = rest.substr(0, tab);
+                rr.key = rest.substr(tab + 1);
+            } else {
+                // a kind from a future build: counted, never guessed at
+                app.aSetRestore[curSet].truncated++;
+                continue;
+            }
+            app.aSetRestore[curSet].roles.push_back(std::move(rr));
+        }
         else if (key == "linunit") { std::string u = restOfLine(ls);
                                      snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
         else if (key == "seqframe") {   // select the frame this stack was left on
@@ -1734,6 +1886,7 @@ static std::string loadSession(const std::string& path) {
         if (failures.size() > 5) msg += "  ...";
         toast(msg, true);
     }
+    g_sessionRestoring = false;        // deferred refs resolve at the drain gate
     markAllTexDirty();                 // gamma may have changed
     return {};
 }
