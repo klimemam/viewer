@@ -8,7 +8,11 @@
     // the divisor, a sample with no finite frame at all, a sum that float32
     // cannot carry, a mosaic whose four planes must survive per pixel, a partly
     // loaded stack that must name its count, and a session that must bring the
-    // provenance back rather than a capture wearing its name.
+    // provenance back rather than a capture wearing its name. The B group at
+    // the end is the stack reduction ruling (docs/analysis-layers.md §3.2):
+    // the fold as a mean/sum choice, NaN as a surfaced warning that carries
+    // the exclusion count and the valid frame count, and the sum standing on
+    // the mean's own frame path.
     if (!g_stackAvgSelftest.empty()) {
         bool ok = true;
         auto check = [&](bool cond, const char* what) {
@@ -319,6 +323,171 @@
                       "A10 ...and it is saying what it came from again");
                 check(back->src->path.empty(),
                       "A10 ...and it still has no file behind it");
+            }
+        }
+
+        // ---- B: the stack reduction ruling (docs/analysis-layers.md §3.2, ----
+        // 判断record 3). The fold is a CHOICE of mean / sum; NaN present is a
+        // WARNING, carrying the exclusion count and the valid frame count
+        // together; and the fold's result stands on the same frame path the
+        // mean already stands on (判断record 7's premise). Written before the
+        // behavior existed, red against the unimplemented fold on purpose.
+        //
+        // Opens the one stack in `dir`, folded as asked, through the same door
+        // the menu items use - the fold sibling of averageOf above.
+        auto reduceOf = [&](const std::string& dir, int fold, int* seqOut) -> ImageDoc* {
+            closeAll();
+            openFolder(dir);
+            loadAll();
+            int seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            if (seqOut) *seqOut = seq;
+            if (!seq) return nullptr;
+            size_t before = app.images.size();
+            requestStackAverage(seq, fold);
+            loadAll();
+            if (app.images.size() != before + 1) return nullptr;
+            return app.images.back().get();
+        };
+        // The warning is a toast, and toasts are kept: every one lands in
+        // app.msgLog (compare.inc), so "a warning was SURFACED" is an assert on
+        // state, exactly like the FrameLinProbe. `since` bounds the scan to
+        // what THIS reduction said.
+        auto warningSince = [&](size_t since) -> std::string {
+            for (size_t i = since; i < app.msgLog.size(); i++)
+                if (app.msgLog[i].err &&
+                    app.msgLog[i].text.find("non-finite") != std::string::npos)
+                    return app.msgLog[i].text;
+            return std::string();
+        };
+
+        {   // ---- B1: NaN in the fold is a WARNING, not only a note ------------
+            // §3.2: "NaN 混入時は Warning を出す". The mean path already counted
+            // its exclusions in the note (A6); what the ruling adds is that the
+            // count is SURFACED - a warning at reduction time, stating the
+            // exclusion count and the valid frame count together. A note is
+            // where you look when you already suspect; a warning is how you
+            // come to suspect.
+            closeAll();
+            openFolder(dN);
+            loadAll();
+            int seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            size_t before = app.images.size(), msgs = app.msgLog.size();
+            requestStackAverage(seq);
+            loadAll();
+            check(app.images.size() == before + 1,
+                  "B1 NaN warns and still reduces - never refuses");
+            std::string w = warningSince(msgs);
+            fprintf(stderr, "stackavgselftest: B1 warning='%s'\n", w.c_str());
+            check(!w.empty(),
+                  "B1 NaN in the reduction surfaces a WARNING, not only a note");
+            check(w.find("4 non-finite sample(s)") != std::string::npos,
+                  "B1 ...the warning carries the exclusion count");
+            check(w.find("3 frame") != std::string::npos,
+                  "B1 ...and the valid frame count, stated together");
+        }
+
+        {   // ---- B2/B3: sum is SELECTABLE, and its value is the sum ------------
+            int seq = 0;
+            ImageDoc* m = reduceOf(dA, FOLD_SUM, &seq);
+            check(m != nullptr, "B2 'sum' is a selectable fold and opens one new image");
+            if (m) {
+                bool all600 = true;
+                for (float v : m->px()) if (v != 600.0f) all600 = false;
+                fprintf(stderr, "stackavgselftest: B2 name='%s'\n  note='%s'\n",
+                        m->name.c_str(), m->note.c_str());
+                check(all600, "B2 frames at 100, 200, 300 sum to exactly 600");
+                check(m->name.find("frame sum") != std::string::npos,
+                      "B2 the NAME carries the fold - a sum never reads as 'the average'");
+                check(m->note.find("per-pixel sum over") != std::string::npos &&
+                      m->note.find("3 frame(s)") != std::string::npos,
+                      "B2 the NOTE says sum, and over how many frames");
+                // 判断record 7's premise: mean OR sum stands as a frame, on the
+                // very path the mean established - nothing special-cased.
+                check(m->seqId == 0, "B3 the sum is a FRAME, the same path as the mean");
+                check(m->batchId == app.images[framesOfSeq(seq).front()]->batchId,
+                      "B3 ...in the source stack's batch");
+                check(m->src->path.empty() && !m->avgOfPath.empty(),
+                      "B3 ...computed (no file), carrying its recipe for the session");
+            }
+        }
+
+        {   // ---- B4: sum under NaN - terms excluded, counted, and DECLARED -----
+            // §3.2's one warning about sum: with per-pixel exclusion the number
+            // of terms differs pixel to pixel, so two sums are two different
+            // quantities. The count map's vessel is #49's business; what this
+            // build must already do is SAY the counts vary, with the range.
+            closeAll();
+            openFolder(dN);
+            loadAll();
+            int seq = app.seqs.empty() ? 0 : app.seqs.front().id;
+            size_t before = app.images.size(), msgs = app.msgLog.size();
+            requestStackAverage(seq, FOLD_SUM);
+            loadAll();
+            check(app.images.size() == before + 1, "B4 the NaN stack still sums");
+            if (app.images.size() == before + 1) {
+                ImageDoc* m = app.images.back().get();
+                fprintf(stderr, "stackavgselftest: B4 px0=%.9g (want 400), px1=%.9g "
+                                "(want NaN)\n  note='%s'\n",
+                        (double)m->px()[0], (double)m->px()[1], m->note.c_str());
+                check(m->px()[0] == 400.0f,
+                      "B4 a NaN term is EXCLUDED: 100+300 = 400, never rescaled");
+                check(std::isnan(m->px()[1]),
+                      "B4 a pixel with no finite frame at all is NaN, not 0");
+                check(m->note.find("4 non-finite sample(s) EXCLUDED") != std::string::npos,
+                      "B4 the sum's note carries the exclusion count");
+                check(m->note.find("valid frame counts vary (0..3 of 3)") != std::string::npos,
+                      "B4 ...and DECLARES the per-pixel count range");
+                check(!warningSince(msgs).empty(),
+                      "B4 ...and the sum warns on NaN exactly as the mean does");
+            }
+        }
+
+        {   // ---- B5: the sum's precision is the mean's - double all the way ----
+            int seq = 0;
+            ImageDoc* m = reduceOf(dP, FOLD_SUM, &seq);
+            check(m != nullptr, "B5 the precision stack sums");
+            if (m) {
+                fprintf(stderr, "stackavgselftest: B5 got %.9g (want 16777218)\n",
+                        (double)m->px()[0]);
+                check(m->px()[0] == 16777218.0f,
+                      "B5 2^24+1+1 sums to 16777218 - float32 would have said 2^24");
+            }
+        }
+
+        {   // ---- B6: the sum through a session, as a recipe WITH its fold ------
+            // A10 proved the recipe round-trips; what the fold adds is that the
+            // recipe must say WHICH fold, or a saved sum comes back as a mean -
+            // a number 3x off under the same provenance-looking note.
+            int seq = 0;
+            ImageDoc* m = reduceOf(dA, FOLD_SUM, &seq);
+            check(m != nullptr, "B6 a sum to round-trip");
+            std::string sess = root + "/stacksum.vsession";
+            saveSession(sess, true);
+            std::string txt;
+            {
+                std::vector<uint8_t> b;
+                if (readFileBytes(sess, b)) txt.assign((const char*)b.data(), b.size());
+            }
+            check(txt.find("stacksum ") != std::string::npos,
+                  "B6 the session writes the sum's own recipe key");
+            std::string lerr = loadSession(sess);
+            loadAll();
+            for (int i = 0; i < 400 && !app.avgRestore.empty(); i++) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int sums = 0;
+            ImageDoc* back = nullptr;
+            for (auto& d : app.images)
+                if (!d->avgOfPath.empty()) { sums++; back = d.get(); }
+            check(lerr.empty() && sums == 1, "B6 exactly one computed frame comes back");
+            if (back) {
+                bool same = true;
+                for (float v : back->px()) if (v != 600.0f) same = false;
+                fprintf(stderr, "stackavgselftest: B6 restored note='%s'\n",
+                        back->note.c_str());
+                check(same && back->note.find("frame sum of") != std::string::npos,
+                      "B6 ...recomputed as a SUM (600), not folded back to a mean");
             }
         }
 

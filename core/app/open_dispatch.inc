@@ -1105,7 +1105,9 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     }
 }
 
-static void requestStackAverage(int seqId);   // fwd: needs computeStackStats, defined below
+// fwd: needs computeStackStats, defined below. The fold defaults to mean -
+// every existing door means "average", and the sum is asked for by name.
+static void requestStackAverage(int seqId, int fold = FOLD_MEAN);
 // "Open as frame average" from Browse: open the stack exactly as "Open as
 // stack" does, and park the mean until its frames are here. Browse opens are
 // asynchronous by design (first frame now, the rest in the background), so

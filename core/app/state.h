@@ -317,6 +317,13 @@ inline std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSo
     std::lock_guard<std::mutex> lk(g_srcRegMtx);
     return srcRegistryAddLocked(s, key);
 }
+// How a stack's time axis is folded into one frame (docs/analysis-layers.md
+// §3.2, 判断record 3): the fold is a CHOICE of mean / sum, and the default is
+// mean - the mechanism `0e4d4ec`'s frame average already built. Honesty is not
+// in which folds are offered but in what every fold DECLARES: NaN present is a
+// warning, and both folds carry the exclusion count and the valid frame count.
+enum StackFold { FOLD_MEAN = 0, FOLD_SUM = 1 };
+
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
 // range, interpretation) and per-view (texture) state.

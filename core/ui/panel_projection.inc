@@ -969,8 +969,17 @@ static bool loadingSettled() {
 // question about "however many frames had arrived by the time you clicked".
 // n of N therefore appears only when the load really did stop short (the memory
 // budget did), which is a fact about the stack rather than about timing.
-static void requestStackAverage(int seqId) {
+static void requestStackAverage(int seqId, int fold) {
     if (!seqId) return;
+    // 判断record 3 (docs/analysis-layers.md §3.2): the fold is a CHOICE of
+    // mean / sum. This commit carries the ruling's asserts; the sum fold does
+    // not exist yet, and a door that quietly averaged what was asked to sum
+    // would be a wrong number under the right name - so it refuses by name,
+    // and the selftest goes red on the missing behavior, not on a wrong one.
+    if (fold != FOLD_MEAN) {
+        toast("frame sum: this build cannot fold by sum yet", true);
+        return;
+    }
     if (!loadingSettled()) {
         app.pendingAvg.push_back(seqId);
         const App::SeqInfo* si = seqInfo(seqId);
