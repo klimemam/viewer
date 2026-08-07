@@ -35,7 +35,8 @@ ImVec4 clearColor(int variant);
 //
 // The hues walk in containment order (frame → stack → series → batch), so the
 // sequence itself carries the nesting rather than being four arbitrary colors.
-enum Layer { LayerFrame = 0, LayerStack = 1, LayerSeries = 2, LayerBatch = 3 };
+enum Layer { LayerFrame = 0, LayerStack = 1, LayerSeries = 2, LayerBatch = 3,
+             LayerSet = 4 };   // AnalysisSet - the canon's 5th layer
 ImVec4 layerInk(int variant, int layer);
 
 }  // namespace ui_theme

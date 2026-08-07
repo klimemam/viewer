@@ -132,6 +132,13 @@ static std::string filesShareSentence(const std::vector<const ImageDoc*>& shared
 // Files rows read as "this row is a series" rather than as a colour lookup.
 static ImVec4 inkOf(int layer) { return ui_theme::layerInk(app.themeVariant, layer); }
 
+// Which set row / role row is SELECTED (click = select; double-click = go to
+// the bound member - the click/commit convention every list here follows).
+// Selection of a role is a reading position, not app model state, so it lives
+// with the panel.
+static int g_aSetSelId = 0;      // ASet::id, 0 = none
+static int g_aSetSelRole = -1;   // index into its roles, -1 = the set node itself
+
 // One condition, printed to the format the WHOLE series shares, so the values
 // read as a column. Formatting each on its own with %g gives 1, 2, 5, 10, 20
 // four different widths and nothing lines up. The digits of the UI font are
@@ -291,6 +298,10 @@ static void drawFileList() {
     // Reload from disk, deferred like the rest: reloadSource's walk calls
     // forgetImage while the row loop still holds this frame's cached indices.
     int pendingReloadImg = -1, pendingReloadSeq = 0;
+    // Set commands, deferred for the same reason: the walk iterates
+    // app.analysisSets, and a close would erase under the loop drawing it.
+    int pendingCloseSet = 0, pendingSetRename = 0;
+    std::string pendingSetName;
     int pendingAvgSeq = 0;      // ...and the frame average, for the same reason:
                                 // it appends to app.images, which this walk is
                                 // iterating over
@@ -718,6 +729,10 @@ static void drawFileList() {
                 auto sh = srcOwners.find(head.src->srcId);
                 if (sh != srcOwners.end() && sh->second > 1)
                     share = filesShareSentence({ &head });
+                // ras §6: the member side gets a SENTENCE, never a mark - the
+                // ⧉ tooltip precedent, one line per binding this frame holds
+                std::string b2 = aSetBoundSentence(0, head.uid, 0);
+                if (!b2.empty()) share += (share.empty() ? "" : "\n") + b2;
             }
             // A loose image is a frame. Preview keeps the dim ink: "transient"
             // outranks "which layer" on that one row.
@@ -873,6 +888,9 @@ static void drawFileList() {
                       sharedFrames.push_back(&f);
               }
               if (!sharedFrames.empty()) share = filesShareSentence(sharedFrames);
+              // ras §6: `bound as "dark" in "PRNU 10lx"` - sentence, no mark
+              std::string b2 = aSetBoundSentence(head.seqId, 0, 0);
+              if (!b2.empty()) share += (share.empty() ? "" : "\n") + b2;
           }
           ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
           bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn, share);
@@ -1066,6 +1084,104 @@ static void drawFileList() {
             ImGui::PopID();
             g_filesSpans.push_back({ group.batch, S.id, sy0, shy, ImGui::GetCursorPos().y });
         }
+        // ---- the batch's SETS: one node each, its role rows under it --------
+        // (docs/reader-analysisset.md §6). Reading order inside the node: set
+        // -> role -> member. A role row is the BINDING's display; the member's
+        // home stays the member's own stack row - the tree is not duplicated,
+        // so a role row jumps (double-click) rather than re-parents.
+        for (const auto& AS : app.analysisSets) {
+            if (AS.batchId != group.batch) continue;
+            ImGui::PushID(-AS.id);        // negative: never collides with seqIds
+            ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerSet));
+            bool sopen = ImGui::TreeNodeEx("##aset", ImGuiTreeNodeFlags_DefaultOpen |
+                                                     ImGuiTreeNodeFlags_SpanAvailWidth,
+                                           "%s", aSetRowText(AS).c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemClicked()) { g_aSetSelId = AS.id; g_aSetSelRole = -1; }
+            if (ImGui::IsItemHovered()) {
+                std::string tip = "analysis set: " + std::to_string((int)AS.roles.size()) +
+                                  " role binding(s)";
+                if (!AS.readerSpec.empty()) tip += "\nmade by reader " + AS.readerSpec;
+                tip += "\n\n(right-click: rename, close - Close drops the bindings"
+                       "\nonly; the members are untouched)";
+                ImGui::SetTooltip("%s", tip.c_str());
+            }
+            if (ImGui::BeginPopupContextItem("asetctx")) {
+                static char abuf[256];
+                if (ImGui::IsWindowAppearing())
+                    snprintf(abuf, sizeof abuf, "%s", AS.name.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+                bool done = ImGui::InputText("##aname", abuf, sizeof abuf,
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                done |= ImGui::SmallButton("rename");
+                if (done && abuf[0]) {
+                    pendingSetRename = AS.id;
+                    pendingSetName = abuf;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Close set (drop bindings, keep members)"))
+                    pendingCloseSet = AS.id;
+                ImGui::EndPopup();
+            }
+            if (sopen) {
+                for (int ri = 0; ri < (int)AS.roles.size(); ri++) {
+                    const App::ASetRole& r = AS.roles[ri];
+                    const bool sel = g_aSetSelId == AS.id && g_aSetSelRole == ri;
+                    ImGui::PushID(ri);
+                    if (!r.bound()) {
+                        // unbound: the reason is ON the row (ras §3.2), in the
+                        // same warning ink the partial-load note uses
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
+                        if (ImGui::Selectable(aSetRoleText(r).c_str(), sel))
+                            { g_aSetSelId = AS.id; g_aSetSelRole = ri; }
+                        ImGui::PopStyleColor();
+                    } else {
+                        if (ImGui::Selectable(aSetRoleText(r).c_str(), sel,
+                                              ImGuiSelectableFlags_AllowDoubleClick)) {
+                            g_aSetSelId = AS.id;
+                            g_aSetSelRole = ri;
+                            if (ImGui::IsMouseDoubleClicked(0)) {
+                                // double-click COMMITS: go to the bound member
+                                int jump = -1;
+                                if (r.seqId != 0) {
+                                    const App::SeqInfo* si2 = seqInfo(r.seqId);
+                                    if (si2 && si2->lastImageIdx >= 0 &&
+                                        si2->lastImageIdx < (int)app.images.size() &&
+                                        app.images[si2->lastImageIdx]->seqId == r.seqId)
+                                        jump = si2->lastImageIdx;
+                                    else {
+                                        std::vector<int> fr = framesOfSeq(r.seqId);
+                                        if (!fr.empty()) jump = fr.front();
+                                    }
+                                } else if (r.frameUid != 0) {
+                                    for (int q = 0; q < (int)app.images.size(); q++)
+                                        if (app.images[q]->uid == r.frameUid) { jump = q; break; }
+                                } else if (r.seriesId != 0) {
+                                    for (const auto& s2 : app.series)
+                                        if (s2.id == r.seriesId && !s2.members.empty()) {
+                                            std::vector<int> fr =
+                                                framesOfSeq(s2.members.front().seqId);
+                                            if (!fr.empty()) jump = fr.front();
+                                        }
+                                }
+                                if (jump >= 0) {
+                                    selectImage(jump);
+                                    if (app.fitOnSwitch) app.fitRequested = true;
+                                }
+                            }
+                        }
+                        if (ImGui::IsItemHovered() && !r.refPath.empty())
+                            ImGui::SetTooltip("Ref %s\nclick selects; double-click goes "
+                                              "to the bound member", r.refPath.c_str());
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
         // ---- then everything this batch holds that is NOT in a series -------
         for (const auto& stackPtr : group.stacks) {
             const ImageDoc& head = *app.images[stackPtr->front()];
@@ -1127,6 +1243,12 @@ static void drawFileList() {
     }
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);
+    if (pendingCloseSet) closeAnalysisSet(pendingCloseSet);
+    if (pendingSetRename) {
+        std::string why;
+        if (!renameAnalysisSet(pendingSetRename, pendingSetName, &why) && !why.empty())
+            toast(why, true);   // the one refusal: same name in one batch (ras 1.4)
+    }
     // ---- the series commands, after the walk that drew them -----------------
     if (pendingSerRename)
         if (App::Series* S = seriesById(pendingSerRename)) {
