@@ -308,6 +308,13 @@ static void drawFileList() {
                                 // it appends to app.images, which this walk is
                                 // iterating over
     int pendingSumSeq = 0;      // the sum fold, deferred identically
+    // The detrend stage's product (docs/flat-field-stats.md 判断6): a NEW stack,
+    // so it appends to app.images and defers for the same reason as the two
+    // above. The spec rides with the id - "which removal" is the whole content
+    // of the request, and a product made with the wrong one is not fixable by
+    // renaming it afterwards.
+    int pendingDetrendSeq = 0;
+    DetrendSpec pendingDetrendSpec;
     // "Move to batch" submenu, shared by the stack row (seqctx) and the
     // standalone frame row (imgctx). Returns the chosen batch id, 0 = none.
     // Batch names go through a ### suffix: user text must not become the ID.
@@ -1063,6 +1070,70 @@ static void drawFileList() {
             // exactly as the result's own name will be.
             if (ImGui::MenuItem("Open frame sum")) pendingSumSeq = si->id;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", SUM_TIP);
+            // ---- the AnalysisPreProcessor (docs/analysis-layers.md §5) ------
+            // The detrend stage lives HERE and nowhere else (判断6): it makes a
+            // PRODUCT, and every analyzer then applies to that product
+            // unchanged. There is deliberately no detrend option on Histogram /
+            // Projection / ROIs / Temporal - one would make the same column
+            // name carry a different quantity.
+            //
+            // The items are named after what they DO, the frame average / sum
+            // precedent: the settled default is one item that says it is the
+            // default, and every other band is an item of its own rather than a
+            // number in a dialog nobody re-reads. The choice ends up in the
+            // product's name, note and cutoff, so what is chosen here is what a
+            // report will cite.
+            if (si->dt.made()) {
+                ImGui::TextDisabled("already a detrend product");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This stack IS the output of the stage:\n%s\n"
+                                      "One stage, one cutoff - change the method on the "
+                                      "source stack\ninstead of removing a surface twice.",
+                                      detrendCutoffText(si->dt.spec).c_str());
+            } else if (ImGui::BeginMenu("Detrend (remove shading)")) {
+                auto item = [&](const char* label, const DetrendSpec& s) {
+                    if (ImGui::MenuItem(label)) {
+                        pendingDetrendSeq = si->id;
+                        pendingDetrendSpec = s;
+                    }
+                };
+                {   // 判断7: "ON にしたときの既定方式 = 多項式2次・減算・プレーン別"
+                    DetrendSpec s; s.method = DTR_POLY; s.degree = 2;
+                    item("polynomial degree 2, subtractive  (the settled default)", s);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", DETREND_TIP);
+                if (ImGui::BeginMenu("other bands")) {
+                    ImGui::TextDisabled("a higher degree removes more, and every");
+                    ImGui::TextDisabled("statistic below it is a function of that band");
+                    for (int deg = 1; deg <= 4; deg++) {
+                        if (deg == 2) continue;
+                        char lb[64];
+                        snprintf(lb, sizeof lb, "polynomial degree %d, subtractive", deg);
+                        DetrendSpec s; s.method = DTR_POLY; s.degree = deg;
+                        item(lb, s);
+                    }
+                    ImGui::Separator();
+                    for (int blk : { 32, 64, 128 }) {
+                        char lb[64];
+                        snprintf(lb, sizeof lb, "block median, %d px window, subtractive", blk);
+                        DetrendSpec s; s.method = DTR_BLOCKMED; s.block = blk;
+                        item(lb, s);
+                    }
+                    ImGui::Separator();
+                    {   // 約束6: offered, and warned about where it is offered
+                        DetrendSpec s; s.method = DTR_POLY; s.degree = 2; s.divide = true;
+                        item("polynomial degree 2, DIVIDE (multiplicative shading)", s);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Dividing by the surface scales the noise by 1/s, so\n"
+                                          "the spatial variance stops being uniform across the\n"
+                                          "field - and the estimators downstream assume it is.\n"
+                                          "Prefer subtraction for noise statistics; the product\n"
+                                          "says which one it was made with either way.");
+                    ImGui::EndMenu();
+                }
+                ImGui::EndMenu();
+            }
             // A NEW stack from a subset of this one - the dialog offers the
             // matching rules (same names / numbers as another stack, a range,
             // hand-picked). References frames; this stack is not touched.
@@ -1308,6 +1379,10 @@ static void drawFileList() {
     }
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);
+    if (pendingDetrendSeq) {
+        std::string err;   // the success toast is the product's own voice
+        if (!detrendStackProduct(pendingDetrendSeq, pendingDetrendSpec, err)) toast(err, true);
+    }
     if (pendingCloseSet) closeAnalysisSet(pendingCloseSet);
     if (pendingSetRename) {
         std::string why;

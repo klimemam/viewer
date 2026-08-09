@@ -301,6 +301,18 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
   [flat-field-stats.md](flat-field-stats.md) の「順序」節が既に持っている。
   PreProcessor 連鎖はそれを型にする器で、順序の中身は #57 の凍結解除後に
   そちらで確定する。
+<!-- 【実装 2026-08-10 — detrend PreProcessor (#57 判断6/7)】この種は宣言だけの
+     存在ではなくなった。detrend 段 (`core/app/detrend.inc`) の生成物は
+     **detrend 済みの stack** (`core/app/preprocess.inc`) で、本節の不変条件を
+     そのまま負う: 名前が方式を言い、note が由来・方式・窓・除去前後の
+     シェーディング量・「computed, not captured」を運び、`src->path` は空のまま
+     (だから session は `image` 行を書けず、レシピ `detrend <spec> <元 stack の
+     先頭 path>` を書いて開き直しに再計算する)。生成物が一級である帰結も文字どおり
+     効いている — Files/Temporal/Projection/ROIs は何も特別扱いせず、SetAnalyzer の
+     役割にも束ねられ、束ねた結果の cutoff (§8 の「数値を変えるパラメータ」欄) が
+     その方式と窓を自分から名乗る。順序 (§5 の下、flat-field-stats.md の「順序」節)
+     における位置は 3 で、時間方向の畳み込みは前処理ではなく下流の集計のまま。 -->
+
 - **当面の作成経路は Reader** (判断record 2)。「dark を引く」のような共通
   前処理は入力アダプタ (reader) で書ける — dark と image を受け取り、引いた
   stack を返す reader は、Python で書いた AnalysisPreProcessor そのものである

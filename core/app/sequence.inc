@@ -1055,6 +1055,7 @@ static void resolvePendingSeries() {
 
 // called once per frame: integrate decoded frames, then chain the next stack
 static void pumpStackAverages();   // fwd: it needs computeStackStats, defined below
+static void pumpDetrendProducts(); // fwd: same, and it rides the same gate
 static void pumpSequenceAndQueue() {
     pumpSequence();
     // one restore at a time, matched by uid: indices shift as frames land
@@ -1104,6 +1105,10 @@ static void pumpSequenceAndQueue() {
     // every selftest's drain loop drives it too, without a second pump to keep
     // in step.
     pumpStackAverages();
+    // ...and the preprocessor products a session asked for, behind the same
+    // gate and for the same reason: a surface fitted mid-load is a surface of
+    // whatever had arrived (docs/analysis-layers.md §5).
+    pumpDetrendProducts();
 }
 
 // ---- stacks & navigation ------------------------------------------------------

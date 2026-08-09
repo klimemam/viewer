@@ -871,6 +871,14 @@ viewer_selftest(aset        NOGL --aset-selftest tools/testdata)
 # scan walks the sources relative to WORKING_DIRECTORY, which viewer_selftest
 # already pins to the source root.
 viewer_selftest(setanalysis NOGL --setanalysis-selftest tools/testdata/multi)
+# The detrend AnalysisPreProcessor (docs/flat-field-stats.md 判断6/7): the raw
+# default, the shading figure that is printed whether or not anything was
+# removed, the product and the predicted direction its statistics move in, and
+# the recipe a session brings it back by. The argument is only a place to write
+# the fixture stack - it is synthetic, with a shading profile whose p-p and
+# centre are known in closed form, so every expected number is arithmetic. NOGL
+# for the roistats reasoning: what it asserts is numbers and strings.
+viewer_selftest(detrend     NOGL --detrend-selftest tools/testdata)
 # ...and the same panel's NUMBERS, which are not a rectangle and so do not need
 # a display. V19 used to hold both, which put the PRNU column's arithmetic
 # behind a GL context and therefore on one runner of the three: it was measured
