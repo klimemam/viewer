@@ -159,10 +159,15 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
 - **既定は Mean。** `0e4d4ec` の frame 平均が既に作った機構そのもの
   (`computeStackStats` の蓄積器・double 蓄積・NaN 画素毎除外・n/N)。
   時間平均画像の空間σが σ_fpn なので、**Stack ROIs の σ 列は Temporal
-  パネルの σ_fpn と同じ蓄積器から出る同じ数**になり (絵の下の数と表の数が
-  食い違えない、の原則)、Stack Projection は平均画像の行/列 FPN
-  ([flat-field-stats.md](flat-field-stats.md) (b) の「列 FPN は平均画像に
-  (a) の分解を掛ければ出る」がそのまま画面になる)。
+  パネルの σ_fpn と同じ蓄積器から出る**。**【修正 2026-08-09 — #57 判断2】**
+  ここは「同じ蓄積器から出る**同じ数**」だった。σ_fpn は時間残差
+  `−C = −mean(s_t,i²/n_i)` を引いた補正済みの量になるので、**同じ数ではない**
+  — 共通なのは蓄積器 (sum / sum² / cnt) の方だけである。「絵の下の数と表の数が
+  食い違えない」の原則は**名前の側**が担う: ROIs の列は畳み方修飾つきの中立名
+  `sigma [DN] (mean_t)`、Temporal の行は補正とクランプを申告する `sigma_fpn`
+  ([flat-field-stats.md](flat-field-stats.md) (b))。Stack Projection は平均
+  画像の行/列 FPN (同 (b) の「列 FPN は平均画像に (a) の分解を掛ければ出る」が
+  そのまま画面になる)。
 - **per-frame の重ね / 並べ表示**: N 枚それぞれの frame 解析を重ねる。
   これは S1×N の**見せ方** ([stats-taxonomy.md](stats-taxonomy.md) §3) で、
   ドリフト・外れ frame の発見用。新しい量は出さない。
