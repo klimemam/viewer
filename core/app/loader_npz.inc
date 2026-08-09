@@ -99,15 +99,11 @@ static bool npyPeekHeader(const std::vector<uint8_t>& buf, NpyHead& H, std::stri
 
 // "(24, 480, 640)" / "scalar" - the shape a human recognises from the script
 // that wrote it, printed from the header and never from what we made of it.
+// Defined in core/remote_proto.h so the peer prints a shape the same way this
+// door does; a listing and a refusal that spell the same file differently is
+// the confusion issue #71 was about, one level down.
 static std::string npyShapeText(const std::vector<int64_t>& shape) {
-    if (shape.empty()) return "scalar";
-    std::string s = "(";
-    for (size_t i = 0; i < shape.size(); i++) {
-        s += std::to_string(shape[i]);
-        if (i + 1 < shape.size()) s += ", ";
-        else if (shape.size() == 1) s += ",";
-    }
-    return s + ")";
+    return rp::npyShapeText(shape);
 }
 
 // One .npy FILE on disk from a shape, a dtype and its bytes. v1.0 header, C
@@ -173,11 +169,14 @@ enum NpyRead {
 //
 // "C<=4", not "3|4": the rule is a CEILING (§3.1's table, and issue #71), and a
 // refusal that still quotes 3|4 once (H,W,1) opens sends the next reader looking
-// for a rule nobody implements. Spelled in ASCII on purpose - §4.13.0 draws it
-// with U+2264, but this string is printed to a console whose codepage may be
-// cp932 (which cannot encode that character at all) and is quoted back verbatim
-// by tools/import/run_adapter.py through a pipe.
-static const char* NPY_NATIVE_FORMS = "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)";
+// for a rule nobody implements.
+//
+// The sentence itself now lives in core/remote_proto.h, because core/serve.cpp
+// has to say the SAME one - the peer refusing a shape and this loader refusing
+// the same shape are the same message to the same reader, and two copies of it
+// is how the two doors came to disagree in the first place (issue #71). This
+// name stays as the local spelling of it so the call sites read unchanged.
+static const char* const NPY_NATIVE_FORMS = rp::NPY_NATIVE_FORMS;
 
 // Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
 // -1 = "this reading has no such axis". False = r does not apply to this rank,
@@ -242,11 +241,12 @@ int npyKeyRead(const std::vector<int64_t>& shape, int npyRead) {
 // text as the reason, so the refusal is the affordance rather than a dead end
 // the user has to leave in order to act on.
 static std::string npyNotNative(const std::vector<int64_t>& shape) {
-    // npyShapeText says "scalar" for a 0-D array, and "shape scalar" is not a
-    // sentence; everything else is a shape and is named as one.
-    return (shape.empty() ? std::string("a scalar")
-                          : "shape " + npyShapeText(shape)) +
-           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS) +
+    // The first two lines are rp::npyNotNativeText - the same two the peer
+    // sends, from the same place. The third is this door's alone: it is the
+    // one with a reader picker to send the user to (issue #71 D3 leaves the
+    // remote half without one), and a promise is only worth making where it
+    // can be kept.
+    return rp::npyNotNativeText(shape) +
            "\n  choose a reader to read it another way";
 }
 

@@ -144,6 +144,55 @@ static inline size_t dtypeSize(uint32_t t) {
 const char* dtypeName(uint32_t t);
 uint32_t dtypeFromName(const char* s);
 
+// ---- how a .npy shape is SAID, spelled once for both doors -----------------
+//
+// This viewer has two ways in - the local decoder (core/app/loader_npz.inc) and
+// the peer (core/serve.cpp) - and issue #71 was what happens when they answer
+// the same file differently. The RULE is one rule now (the last axis is
+// channels when it is 4 or fewer, on both sides). These are the SENTENCES that
+// describe it, and they belong in the one header both sides already include for
+// the same reason the rule does: a refusal the peer sends is read by a person
+// looking at this viewer's window, so it has to be the sentence the local door
+// would have used. A second copy in serve.cpp is a copy that drifts, which is
+// precisely how the "3|4" spelling outlived the rule it was describing.
+//
+// ASCII "C<=4" rather than U+2264: this string is printed to consoles whose
+// codepage may be cp932 (which cannot encode that character at all) and is
+// quoted back verbatim through a pipe by tools/import/run_adapter.py.
+// docs/input-adapters.md §4.13.0 draws the same forms with the real character.
+static const char* const NPY_NATIVE_FORMS =
+    "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)";
+
+// "(24, 480, 640)" / "scalar" - the shape a human recognises from the script
+// that wrote it, printed from the header and never from what we made of it.
+inline std::string npyShapeText(const std::vector<int64_t>& shape) {
+    if (shape.empty()) return "scalar";
+    std::string s = "(";
+    for (size_t i = 0; i < shape.size(); i++) {
+        s += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s += ", ";
+        else if (shape.size() == 1) s += ",";
+    }
+    return s + ")";
+}
+
+// docs/input-adapters.md §3.2: name the shape that ARRIVED, and name what
+// native DOES read. A refusal that says only "cannot open" sends the reader
+// nowhere - which is how a 1-D exposure vector stayed a one-pixel-tall image
+// for as long as it did.
+//
+// Two lines, not three. The local door adds a third ("choose a reader to read
+// it another way") because openReaderPicker is there to receive it; the peer
+// does not, because a document opened through a peer has no reader picker yet
+// (issue #71 D3 - FrameSource::npyShape is only ever set by the local decoder).
+// Promising a way out that the remote half does not have would be worse than
+// the dead end it replaces, so the peer stops at the two lines it can keep.
+inline std::string npyNotNativeText(const std::vector<int64_t>& shape) {
+    return (shape.empty() ? std::string("a scalar")
+                          : "shape " + npyShapeText(shape)) +
+           " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS);
+}
+
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.
 int runServeMode();
 
