@@ -20,7 +20,8 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                               const std::string& pattern);
 static void stopSequenceLoader();
 static std::vector<int> framesOfSeq(int seqId);
-static App::SeqInfo* seqInfo(int id);
+static App::SeqInfo* seqInfo(int id);   // never held across an open/close: the
+                                        // rule is over its definition, sequence.inc
 static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 // Rendering is separate from writing so the crash handler can keep a pre-rendered

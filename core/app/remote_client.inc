@@ -182,7 +182,9 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
 }
 
 // UI thread: swap arrived frames in. After this an ex-preview is a local image.
-static App::SeqInfo* seqInfo(int id);   // fwd: closed-stack results are dropped
+// fwd: closed-stack results are dropped. What it returns is never held across
+// an open or a close - the rule is written over the definition in sequence.inc.
+static App::SeqInfo* seqInfo(int id);
 static void pumpRemoteFetch() {
     std::vector<App::RFetchDone> batch;
     {

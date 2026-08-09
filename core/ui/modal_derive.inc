@@ -210,7 +210,11 @@ static int applyDerivePlan(const DerivePlan& P, bool intoNewBatch) {
     if (P.notResident > 0)
         note += "; " + std::to_string(P.notResident) +
                 " matched frame(s) were not loaded and were left out";
-    app.seqs.push_back(si);            // `src` may dangle past this line
+    // `src` is dead from here on - not "may be", IS: App::seqs reseats on every
+    // mutation (state.h), so this push_back frees the storage it points into on
+    // every platform rather than only where the allocator chose to grow. srcName
+    // and rule were copied out above for exactly this reason.
+    app.seqs.push_back(si);
     for (const auto& pk : P.picks)
         materializeDerivedFrame(*app.images[pk.srcImageIdx], si.id, pk.newIndex,
                                 batchId, note);

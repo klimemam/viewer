@@ -1140,6 +1140,25 @@ static const std::vector<std::vector<int>>& stacksCached() {
     if (rev != app.imagesRev) { rev = app.imagesRev; cache = stacksOf(); }
     return cache;
 }
+// THE rule for the pointer this returns, and the only one:
+//
+//     NEVER hold it across anything that can open or close a stack.
+//     Ask again by id instead. It costs a walk over a handful of entries.
+//
+// It points INTO App::seqs, whose every mutation reseats the storage on purpose
+// (App::SeqTable in core/app/state.h says why), so an add or a remove leaves it
+// pointing at freed memory - always, on every platform, not only where the
+// allocator happened to grow. "Anything that can" is the operative phrase: the
+// call in between does not have to look like an open or a close. closeStack,
+// closeAll, closeBatch, closeSeries, applyDerivePlan, promotePreview,
+// openRemote, attachRemoteStack, startSequenceLoad, loadNpyBuffer,
+// loadImageFile and the ~60 functions that reach one of them all qualify, and
+// the list moves with the code - which is why the rule is stated over the
+// pointer rather than as a list to check against.
+//
+// Copy out what you need (`const std::string name = si->name;`) when the value
+// has to outlive the call. If you must assert, App::seqs.holds(p) is the only
+// defined question to ask of a pointer that may already be stale.
 static App::SeqInfo* seqInfo(int id) {
     for (auto& s : app.seqs) if (s.id == id) return &s;
     return nullptr;
