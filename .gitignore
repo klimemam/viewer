@@ -9,6 +9,11 @@ build-mingw/
 *.ini
 build-verify/
 build-dbg/
+# a Release tree configured with -D_GLIBCXX_ASSERTIONS: the libstdc++ container
+# preconditions (vector::operator[] in range, iterators valid) checked at run
+# time. It is where a subscript one past the end of a buffer stops being
+# invisible - Release does not check, so such a defect passes the whole suite.
+build-hard/
 *.egg-info/
 build-board/
 # tools/run_selftests.sh files a failing test's output here, one file per test.

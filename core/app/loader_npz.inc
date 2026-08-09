@@ -42,7 +42,12 @@ static bool npyPeekHeader(const std::vector<uint8_t>& buf, NpyHead& H, std::stri
         uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
     }
     if (hoff + hlen > buf.size()) return fail("corrupt npy header");
-    std::string hdr((char*)&buf[hoff], hlen);
+    // data() + hoff, never &buf[hoff]: a 10-byte v1 file declaring hlen 0 passes
+    // the check above with hoff == buf.size(), and the subscript is then one
+    // past the end - undefined, and an abort under -D_GLIBCXX_ASSERTIONS. Same
+    // defect as decodeNpyBuffer's payload pointer, one call earlier in the same
+    // path; the empty header is refused by "cannot parse descr" either way.
+    std::string hdr((const char*)buf.data() + hoff, hlen);
     auto findQuoted = [&](const char* key) -> std::string {
         size_t k = hdr.find(key);
         if (k == std::string::npos) return {};
@@ -370,7 +375,10 @@ static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out,
         uint16_t nlen = rd16(p + 28), elen = rd16(p + 30), clen = rd16(p + 32);
         e.localOff = rd32(p + 42);
         if (p + 46 + nlen > buf.size()) break;
-        e.name.assign((const char*)&buf[p + 46], nlen);
+        // data() + off again: a central-directory header that ends exactly at
+        // the last byte with a zero-length name satisfies both bounds above and
+        // then subscripts one past the end. Same defect as decodeNpyBuffer's.
+        e.name.assign((const char*)buf.data() + p + 46, nlen);
         if (e.csize == 0xffffffffu || e.usize == 0xffffffffu || e.localOff == 0xffffffffu) {
             size_t ep = p + 46 + nlen, eend = ep + elen;      // zip64 extra field
             while (ep + 4 <= eend && ep + 4 <= buf.size()) {
