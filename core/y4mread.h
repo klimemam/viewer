@@ -43,9 +43,18 @@ namespace imagefile {
 // refusals that name it.
 extern const char* const Y4M_LIBRARY;
 
-// (y4mDecode - the reader itself - is the NEXT commit. What this build does
-// today is refuse every video container by name, including this one, and
-// core/selftest/media.inc already says what reading a y4m will have to mean.)
+// Decode every frame of a y4m. Matches Backend::decode: one call, one or many
+// pictures, and a reason when there are none.
+//
+// One picture per FRAME, in presentation order, luma only, with Image::member
+// left EMPTY - which is what tells the caller these are the frames of a stack
+// and not the named parts of a container.
+//
+// N is arithmetic from the byte count, because the format declares no frame
+// count anywhere. A file that ends inside a frame therefore yields the whole
+// frames it has, and the caller is told n of N (docs/terminology.md forbids
+// reporting a partial stack without the ratio).
+bool y4mDecode(const uint8_t* p, size_t n, std::vector<Image>& out, std::string& err);
 
 // (videoRefusal is declared in imagefile.h, not here: it is the one thing in
 // this file the REST of the program calls, and the rest of the program is only

@@ -165,6 +165,7 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 | JPEG | 同上 | baseline / progressive、8bit |
 | TIFF | **自前** (`core/tiffread.cpp`、`tiffread 1`) | classic TIFF (magic 42)、II/MM 両方、strip、8/16bit 符号なし整数と 32bit IEEE float、grey (WhiteIsZero/BlackIsZero) と RGB (±alpha)、none/PackBits/LZW/Deflate、predictor 1/2、**複数ページ = stack** |
 | OpenEXR | 公式 OpenEXR 3.4.13 + Imath 3.2.2 (`core/exrread.cpp`、`-DVIEWER_WITH_EXR=OFF` で外せる) | scanline と 1レベル tiled、half/float、全圧縮 (NONE/RLE/ZIP/ZIPS/PIZ/PXR24/B44/DWA)、**レイヤ = document** |
+| y4m (YUV4MPEG2) | **自前** (`core/y4mread.cpp`、`y4mread 1`) | progressive、8〜16bit の**輝度プレーンのみ**、Cmono/C444/C422/C420/C411 (jpeg/mpeg2/paldv 込み)、**1ファイル = 1 stack**。他の動画コンテナは名指しで拒否 |
 
 **値の扱い — 宣言する、推測しない。**
 
@@ -309,6 +310,54 @@ frame として断る** —— 複数ページ TIFF の並びは「stack の sta
 回避するのではなく `isNpyName` と peer の側で 1回解く (docs/media-support.md の
 (b))。**開ける経路**: File > Open・drag & drop・コマンドライン・セッション復元・
 フォルダ走査。
+
+### 3.6.3 y4m — 動画のうち、数値が生き残った部分だけ (2026-08-09)
+
+議論と実測は [video-support.md](video-support.md)。ここには結論だけ置く。
+
+**問いは「デコードできるか」ではなく「その数値はまだ数値か」。** 実測: 8bit の
+lossy 往復は既知の σ_t = 40 DN16 を **0.00 にする**(劣化ではなく消滅)。8bit で
+表現できるノイズも 11% 減衰し、GOP 周期のバイアスが乗る (I frame が P frame より
+3.9% 多く残す)。**lossy な stack の per-frame ノイズ図はエンコーダの測定である。**
+
+結論は普通と逆になる: **libavcodec が開けるようにしてくれる形式は、まさにこの
+ツールが測定に使ってはいけない形式**。正直な部分集合は依存ゼロで届く。
+
+**なぜ y4m が画像形式の表にいるのか。** §2 の問いを通した後の y4m は画像形式
+だから: テキスト 1行 + 生プレーン、圧縮なし・フレーム間予測なし。1ファイル =
+**同じ形の絵が N 枚、順番付き**で、これは複数ページ TIFF と同じものである。
+`Image::member` を空のまま返すだけで `loadImageFile` が §3.6.2 の規則で
+**1 stack** を組む —— y4m 専用の経路は 1本も無い。
+
+**読むもの**: progressive のみ / 8〜16bit / Cmono・Cmono<N>・C444・C422・C420・
+C411 (jpeg・mpeg2・paldv の siting 差は輝度に影響しないので読む) / pNN の深度
+接尾辞 / alpha プレーン付きも可 (数えるだけ)。**輝度プレーンのみ。**
+
+**断るもの**: interlaced (`I` が `p` 以外) —— **1フレームが2フィールド = 2瞬間**で、
+その stack の σ_t は時間ノイズではない / 知らない colour space (名指し) / 8〜16bit
+以外の輝度深度 / `MAX_DIM` 超の W・H / 100000 フレーム超。
+
+**クロマは読まない。** 2x2 に 1サンプルから全解像度 3ch を作るのは補間で、
+**補間値は測定値ではない**。「クロマはあったが読んでいない」ことを note が言う。
+
+**n of N は割り算である。** フレームは固定長なので、枚数は**バイト数から出る** ——
+この形式はフレーム数をどこにも宣言しない。したがって途中で切れたファイルは
+「生き残ったバイトが示す N」で報告する (5枚書いたものを半分にすると
+「2 of 3」であって「2 of 5」ではない。5 は**ファイルに無い数**)。
+
+**他の動画コンテナは名指しで拒否する** (`imagefile::videoRefusal`、21拡張子)。
+形式名・**実測の理由**・正直に取り込む ffmpeg コマンドの3点セット。可逆 codec を
+入れうるコンテナ (.mov/.mkv/.avi) にはその旨も言う。**raw ダイアログより先に**
+判定するので、H.264 のビットストリームに幅と高さを入力させる誘導は起きない。
+`Backend` の行に**しない**理由: `absent` は「何かをリンクすれば読める」状態で、
+ここでの答えはリンクしても変わらない。表はバイトで判定し `dialogPattern()` を
+作るので、21行足すと `*.mp4` が画像ダイアログに並んでしまう。
+
+**未解決 (旧ブランチから変わった1点)**: 旧実装は `seqMemBudget()` で読む枚数を
+切っていた。継ぎ目の `decode` はバイト列から `vector<Image>` を返す形なので
+途中で予算を見る場所が無く、**黙って切るより切らない方**を選んだ (予算切れと
+ファイル切れが同じ「n of N」を出すと診断が潰れるため)。上限は敵対的ヘッダ用の
+`MAX_FRAMES` のみ。巨大 y4m の予算付き読みは継ぎ目に streaming を教える別件。
 
 ---
 

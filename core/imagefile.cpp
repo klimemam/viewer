@@ -25,6 +25,7 @@
 #include "stb_image.h"
 #include "tiffread.h"
 #include "exrread.h"
+#include "y4mread.h"
 
 namespace imagefile {
 
@@ -44,6 +45,11 @@ static bool sniffTiff(const uint8_t* p, size_t n) {
     if (p[0] == 'I' && p[1] == 'I') return (p[2] == 42 || p[2] == 43) && p[3] == 0;
     if (p[0] == 'M' && p[1] == 'M') return p[2] == 0 && (p[3] == 42 || p[3] == 43);
     return false;
+}
+static bool sniffY4m(const uint8_t* p, size_t n) {
+    // A text signature, which is unusual here and is the format's own: the file
+    // begins with the literal "YUV4MPEG2" and a space.
+    return n >= 10 && memcmp(p, "YUV4MPEG2", 9) == 0 && (p[9] == ' ' || p[9] == '\n');
 }
 static bool sniffExr(const uint8_t* p, size_t n) {
     // 20000630 as a little-endian int32. It is the same four bytes for every
@@ -189,6 +195,18 @@ const std::vector<Backend>& backends() {
         // holds layers, which are documents, where a multi-page TIFF holds
         // pages, which are frames.
         { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, EXR_DECODE, EXR_ABSENT, "exr layer" },
+        // y4m is a VIDEO container in a picture-format table, and it belongs
+        // here because after docs/video-support.md's question it is one: a text
+        // header plus raw planes, no compression, no inter-frame prediction -
+        // so a file is N pictures of one shape in order, which is precisely
+        // what a multi-page TIFF is and what this table's `member` rule already
+        // covers. Everything that makes video a different KIND of problem (a
+        // codec, a GOP, a seek that can land on the wrong picture) is absent
+        // from this one format, which is also exactly why it is the only one:
+        // the containers a codec library would open are the containers whose
+        // numbers did not survive (core/y4mread.h). Those are refused by NAME,
+        // in videoRefusal, and deliberately NOT as rows here.
+        { "y4m", ".y4m", Y4M_LIBRARY, sniffY4m, y4mDecode, nullptr, nullptr },
     };
     return B;
 }

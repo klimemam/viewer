@@ -192,6 +192,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 | **JPEG** | baseline / progressive、8bit | codec の YCbCr→RGB を通った値である旨が note に出ます |
 | **TIFF** | 8/16bit 整数と **32bit float**、grey / grey+alpha / RGB / RGBA、II・MM 両方、strip、無圧縮 / PackBits / LZW / Deflate(predictor 付きも) | **複数ページは stack になります**(下記)。読めないものは**名指しで断ります** |
 | **OpenEXR** | half / float、scanline と 1レベル tiled、圧縮は全種(ZIP・PIZ・DWA など) | **シーンリニアの値をそのまま**入れます —— トーンマップも clamp もしません。**レイヤは1枚ずつ別の画像**になります(下記) |
+| **y4m** | progressive、8〜16bit の**輝度のみ**、Cmono / C420 / C422 / C444 など | **1ファイル = 1つの stack。** 非圧縮なので値は DN。他の動画形式は名指しで断ります(§2.3c) |
 
 - チャンネル数は npy と同じ規則: **grey は 1ch、RGBA は 4ch**(モノクロが 4ch に
   水増しされることはありません)
@@ -252,6 +253,41 @@ beauty.exr: OpenEXR: multi-part EXR (2 parts): each part is a separate image
 `.exr` の対応は `-DVIEWER_WITH_EXR=OFF` でビルドから外せます。外したビルドでも
 `.exr` は**形式として残り**、「このビルドは OFF で構成されている」と名指しで
 断ります(黙って「不明なファイル」にはなりません)。
+
+### 2.3c 動画 — y4m だけ開きます(理由があります)
+
+**`.y4m` は開きます。1ファイルが1つの stack** になり、フレームは提示順、値は
+**ビット完全な DN** です(輝度プレーンのみ)。時間方向の解析もフレーム送りも
+連番フォルダの stack とまったく同じに使えます。
+
+**`.mp4` / `.mov` / `.mkv` / `.avi` / `.webm` などは開きません。** 「未対応」では
+なく**測ってから決めた**結果です: 8bit の lossy 往復に通すと、既知の
+σ_t = 40 DN16 が **0.00 になります**(劣化ではなく消滅)。8bit で表現できる
+ノイズも 11% 減衰し、GOP 周期のバイアスが乗ります。**その stack でノイズを
+測ると、測っているのはエンコーダです。**
+
+なので落としても黙って失敗しません。**形式名・理由・変換コマンド**が出ます:
+
+```
+capture.mp4: MP4 (H.264/HEVC) needs a video codec this build does not link.
+  Decoded 8-bit video is display-referred, not DN - a known sigma_t of 40 DN16
+  comes back as 0.00 ...
+  Convert the frames you want to measure and open the .y4m:
+      ffmpeg -i "capture.mp4" -pix_fmt gray16le -strict -1 out.y4m
+```
+
+そのまま貼れば `.y4m` になり、それは開きます。`.mov` / `.mkv` / `.avi` は
+可逆 codec (FFV1 など) を入れられるコンテナなので、その場合の話も文面に出ます。
+
+**y4m のうち断るもの**: インターレース(1フレームが2フィールド = **2つの瞬間**
+なので、その σ_t は時間ノイズではありません)、知らない colour space。
+**クロマは読みません** —— 2x2 に1サンプルから色を作るのは補間で、補間値は
+測定値ではないからです(あったことは note に出ます)。
+
+**途中で切れたファイルは「n of N」を言います。** y4m はフレーム数をどこにも
+書かないので、N は**残ったバイトから割り算で出した数**です。
+
+測定と判断の全文: [video-support.md](video-support.md)
 
 設計と、ライブラリの差し替え方: [input-adapters.md §3.6](input-adapters.md)
 
