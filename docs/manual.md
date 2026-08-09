@@ -304,6 +304,15 @@ capture.mp4: MP4 (H.264/HEVC) needs a video codec this build does not link.
 
 - **検出**: ファイル名のうち **フォルダ内で実際に変化している数字フィールド**を番号と判定
   (`shot_0007_1920x1080.raw` は `0007` でグループ化され、解像度の数字では割れない)
+- **形の違う兄弟は積みません**。検出は**名前**しか見ない(`.raw` / `.bin` は形を名乗らず、
+  300枚のヘッダを覗けばフォルダを2度読むことになる)ので、形が分かるのは**読んだ後**です。
+  先頭フレームと違う形のファイルはそこで**名指しで断ります** ——
+  `shape_2.npy: 8x8 3ch and shape_1.npy is 8x8 1ch: a run of numbered files is a stack,
+  and a stack's frames are one shape - open it on its own`。
+  stack は**時間軸**を持つ層なので(`terminology.md`)、形が揃っていなければ σ_t も
+  FPN 分離も per-frame 表も意味を失います。**断られたファイルは単独で開けば普通に開き**、
+  そのときはそれが先頭フレームになります。何枚中何枚読めたかは Files パネルに残ります
+  (複数ページ TIFF が形の違うページを断るのと同じ規則です → §2.3b)
 - **読み込むかの選択**: 既定は毎回確認。`File > Stack loading` で
   「毎回確認 / 常に読む / 読まない」を切替、モーダルの「remember my choice」でも設定される。
   CLI は `--stack ask|always|never`

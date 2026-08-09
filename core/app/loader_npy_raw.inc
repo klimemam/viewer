@@ -34,7 +34,17 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     size_t count = 1;
     for (int64_t d : shape) count *= (size_t)d;
     if (Hd.dataOff + count * esize > buf.size()) return fail("file too small for shape");
-    const uint8_t* raw = &buf[Hd.dataOff];
+    // buf.data() + off, never &buf[off]. A shape carrying a zero-length axis -
+    // (0,8,8), which numpy writes and this loader is handed - makes count 0, so
+    // the check above PASSES with dataOff == buf.size(), and &buf[buf.size()] is
+    // undefined behaviour. Nothing showed for it: getVal is never called at
+    // count 0 and npyLayout refuses the shape a few lines below, so the only
+    // consequence was a pointer nobody used. A hardened libstdc++
+    // (-D_GLIBCXX_ASSERTIONS) aborts on the subscript itself, before any of
+    // that reasoning applies - which is the point, because the reasoning is
+    // about today's callers and the subscript is about the language. data() +
+    // size() is the one spelling that is legal one past the end.
+    const uint8_t* raw = buf.data() + Hd.dataOff;
 
     auto bswap = [&](uint64_t v, int n) -> uint64_t {
         uint64_t r = 0;

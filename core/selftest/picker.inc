@@ -200,6 +200,134 @@
                 }
             }
         }
+        // ---- UC7: a numbered family whose SHAPES disagree is not one stack ----
+        // The grouper reads NAMES, and names are all it can read: .raw and .bin
+        // declare no geometry at all, and peeking the header of every file in a
+        // 300-frame run would read the folder twice to answer a question the
+        // decode answers for free. So four files called shape_1..shape_4 are one
+        // group whatever is inside them - that part is right and is asserted
+        // here so it stays right. What was wrong is what happened NEXT: every
+        // sibling was stacked whatever it turned out to hold. docs/terminology.md
+        // gives a stack a TIME axis - the same picture measured again - so
+        // sigma_t, FPN separation and the per-frame table are quantities only if
+        // the frames are one shape; four different pictures under one seqId make
+        // all three into numbers with no meaning, which is the failure the whole
+        // terminology exists to prevent. The disagreeing sibling is refused BY
+        // NAME instead, in the words core/tiffread.cpp already refuses a
+        // disagreeing PAGE in.
+        //
+        // The shapes are (8,8), (8,8,3) and (4,4) ON PURPOSE. Issue #71 - whether
+        // a trailing axis of 1 or 2 counts as channels - is open, and every
+        // reading in it agrees about these three, so this test neither answers
+        // #71 nor depends on the answer. What it pins is that siblings which
+        // disagree do not silently stack, which has to hold either way.
+        //
+        // Fixtures are written here rather than read from tools/testdata, for the
+        // reasons the --remote-selftest channel sweep gives at length: that tree
+        // is gitignored and generated, so a machine without it would skip the
+        // check in silence, and a fixture living apart from the rule it pins
+        // drifts away from it. The per-test TMP directory CMake hands this test
+        // is also the one place no other selftest scans.
+        {
+            closeAll();
+            std::error_code sec;
+            std::filesystem::path sdir =
+                std::filesystem::temp_directory_path(sec) / "viewer_pickershape";
+            std::filesystem::remove_all(sdir, sec);
+            std::filesystem::create_directories(sdir, sec);
+            std::vector<uint16_t> ramp(8 * 8 * 3);
+            for (size_t i = 0; i < ramp.size(); i++) ramp[i] = (uint16_t)(i * 13 + 7);
+            // shape_1 and shape_4 are the stack. shape_2 disagrees in CHANNELS
+            // and shape_3 in GRID, because those are two different ways for a
+            // capture to go wrong and a check on one is not a check on the other.
+            npyWriteFile((sdir / "shape_1.npy").u8string(), "<u2",
+                         { 8, 8 }, ramp.data(), 64 * 2);
+            const std::string s2 = npyWriteFile((sdir / "shape_2.npy").u8string(), "<u2",
+                                                { 8, 8, 3 }, ramp.data(), 64 * 3 * 2);
+            npyWriteFile((sdir / "shape_3.npy").u8string(), "<u2",
+                         { 4, 4 }, ramp.data(), 16 * 2);
+            npyWriteFile((sdir / "shape_4.npy").u8string(), "<u2",
+                         { 8, 8 }, ramp.data(), 64 * 2);
+
+            auto grp = scanFolderGroups(sdir.u8string());
+            fprintf(stderr, "pickerselftest: UC7 scan -> %zu group(s), %zu file(s)\n",
+                    grp.size(), grp.empty() ? (size_t)0 : grp[0].files.size());
+            if (grp.size() != 1 || grp[0].files.size() != 4) {
+                fprintf(stderr, "pickerselftest: UC7 FAILED - four numbered files must "
+                                "still scan as ONE group: the fix is not a name rule\n");
+                ok = false;
+            }
+
+            // app.seqNote carries the loader's word to the Files panel and is
+            // REPLACED per pump, so it is collected as the load proceeds rather
+            // than read once at the end - two refusals need not arrive together.
+            std::string notes;
+            auto loadCollect = [&]() {
+                double t0 = nowSec();
+                while (nowSec() - t0 < 120.0) {
+                    if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                    pumpSequenceAndQueue();
+                    if (!app.seqNote.empty() && notes.find(app.seqNote) == std::string::npos)
+                        notes += app.seqNote;
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        !app.folderPickOpen) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            app.seqNote.clear();
+            app.pickMerge = 0;              // UC2/UC5 left the footer radios where
+            app.pickBatchMode = 0;          // they were: this case answers for none
+            openFolder(sdir.u8string());
+            loadCollect();
+            std::vector<std::string> got =
+                app.seqs.size() == 1 ? stackFiles(app.seqs[0].id) : std::vector<std::string>();
+            fprintf(stderr, "pickerselftest: UC7 loaded %d doc(s), %d stack(s) [%s]\n",
+                    (int)app.images.size(), (int)app.seqs.size(), joinBase(got).c_str());
+            if (app.images.size() != 2 || got.size() != 2 ||
+                baseName(got[0]) != "shape_1.npy" || baseName(got[1]) != "shape_4.npy") {
+                fprintf(stderr, "pickerselftest: UC7 FAILED - the stack must hold the two "
+                                "8x8 1ch frames and NOTHING else\n");
+                ok = false;
+            }
+            // ...and it must SAY which files it left out, and why. Both sides of
+            // the comparison by name, the rule in the canon's words: a refusal
+            // nobody can read is the silent stacking with extra steps.
+            const char* WANT[] = {
+                "shape_2.npy: 8x8 3ch and shape_1.npy is 8x8 1ch: a run of numbered files "
+                "is a stack, and a stack's frames are one shape - open it on its own",
+                "shape_3.npy: 4x4 1ch and shape_1.npy is 8x8 1ch: a run of numbered files "
+                "is a stack, and a stack's frames are one shape - open it on its own",
+            };
+            for (const char* w : WANT)
+                if (notes.find(w) == std::string::npos) {
+                    fprintf(stderr, "pickerselftest: UC7 FAILED - the refusal never said\n"
+                                    "  want: %s\n  said: %s\n", w, notes.c_str());
+                    ok = false;
+                }
+
+            // The way out the refusal names has to exist. Opening the odd file
+            // ITSELF makes it the reference frame, so the sibling offer stays on
+            // ("always", the setting under which the stack above was built) and
+            // the file still opens as what it is.
+            closeAll();
+            const int mode = app.seqLoadMode;
+            app.seqLoadMode = 1;
+            openPath(s2);
+            loadCollect();
+            app.seqLoadMode = mode;
+            const ImageDoc* alone = app.images.empty() ? nullptr : app.images[0].get();
+            fprintf(stderr, "pickerselftest: UC7 \"open it on its own\" -> %d doc(s) %dx%d %dch\n",
+                    (int)app.images.size(), alone ? alone->w : 0, alone ? alone->h : 0,
+                    alone ? alone->ch : 0);
+            if (app.images.size() != 1 || !alone ||
+                alone->w != 8 || alone->h != 8 || alone->ch != 3) {
+                fprintf(stderr, "pickerselftest: UC7 FAILED - the refused file must still "
+                                "open ALONE, as its own shape\n");
+                ok = false;
+            }
+            closeAll();
+            std::filesystem::remove_all(sdir, sec);      // ours: ours to remove
+        }
         fprintf(stderr, "pickerselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         return ok ? 0 : 1;

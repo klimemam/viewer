@@ -98,6 +98,22 @@ odd.npy: shape (4, 8, 8, 8, 2) is not a native form
   [ choose a reader... ]        ← その場から adapter を指定できる
 ```
 
+**stack に入れなかったときも同じ**。連番のグループ分けは**名前**だけで決まる
+(`.raw` / `.bin` は形を名乗らず、300ファイルのヘッダを覗くのはフォルダを2度読む
+ことになる)ので、形が判るのは**デコードした後**。そこで先頭フレームと形が違った
+兄弟は、両方の形と規則を名乗って断る — 落とすのはその1ファイルだけで、
+残りは stack になり、何枚中何枚かは Files パネルに残る:
+
+```
+shape_2.npy: 8x8 3ch and shape_1.npy is 8x8 1ch: a run of numbered files is a
+stack, and a stack's frames are one shape - open it on its own
+```
+
+複数ページ TIFF が形の違うページを断る文 (§3.6.1) と同じ規則の、同じ言い方である。
+`terminology.md` では stack は**時間軸**を持つ層 —— 形が揃っていない並びは stack
+ではないので、σ_t も FPN 分離も per-frame 表も量にならない。逃げ道は最後の句が
+言うとおりで、単独で開けばそのファイルが先頭フレームになる。
+
 ### 3.3 取り違えたときの逃げ道 — Inspector で言い直す
 
 ユーザー提案 (2026-08-03):「Inspector に ch 数を明示すれば、ch=1 に変更して
