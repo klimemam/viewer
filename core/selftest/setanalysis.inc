@@ -206,7 +206,8 @@
         // Analytic, exact in float32, so every expected value below is
         // arithmetic rather than a fit - the V27 discipline.
         auto makeStack = [&](const char* name, int W, int H, int NF,
-                             const std::function<double(int, int, int)>& gen) {
+                             const std::function<double(int, int, int)>& gen,
+                             int CH = 1) {
             App::SeqInfo si;
             si.id = app.nextSeqId++;
             si.name = name;
@@ -215,12 +216,13 @@
             for (int f = 0; f < NF; f++) {
                 auto d = std::make_unique<ImageDoc>();
                 d->name = std::string(name) + "_" + std::to_string(f) + ".npy";
-                d->src->w = W; d->src->h = H; d->src->ch = 1;
+                d->src->w = W; d->src->h = H; d->src->ch = CH;
                 d->src->dtype = "f32";
-                d->src->data.resize((size_t)W * H);
+                d->src->data.resize((size_t)W * H * CH);
                 for (int y = 0; y < H; y++)
                     for (int x = 0; x < W; x++)
-                        d->px()[(size_t)y * W + x] = (float)gen(x, y, f);
+                        for (int c = 0; c < CH; c++)
+                            d->px()[((size_t)y * W + x) * CH + c] = (float)gen(x, y, f);
                 d->syncMirrors();
                 d->uid = app.nextUid++;
                 d->seqId = si.id;
@@ -654,6 +656,512 @@
             closeAll();
         }
 
+
+        // ================= the separation fit (#57 judgment 5) ================
+        // docs/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09).
+        // The model is sigma_fpn^2(mu) = DSNU^2 + (PRNU*mu)^2, a straight line
+        // in mu^2, fitted by UNWEIGHTED OLS over the levels of a sweep. What is
+        // asserted:
+        //
+        //   F1  a fixture sweep whose TRUE gain and TRUE per-pixel gain spread
+        //       are known by construction, against the fit's hand-derived
+        //       intercept and slope
+        //   F2  a level's sigma_fpn^2 IS the direct row's estimator - bit for
+        //       bit against a set that binds the same stack as "dark"
+        //   F3  the lit levels are NOT dark-subtracted, and the fixture can
+        //       tell: the dark carries a DIFFERENT additive pattern
+        //   F4  the residual display, and both coefficients clamping
+        //       independently, on a fixture perturbed by a known amount
+        //   F5  frame / sum / not-included / valueless members are excluded and
+        //       COUNTED, in one sentence the screen and this test share
+        //   F6  every refusal: fewer than 3 levels, a Series() role bound to a
+        //       stack and to a frame, both missing roles, mismatched planes
+        //   F7  the result names its set, its sweep and M
+        //   F8  cutoff, estimator form, and the uncorrelatedness note are
+        //       required fields that are actually filled
+        //
+        // Every fixture below is EXACT: the pixel values are integers under
+        // 2^24, the accumulators are integers under 2^53, and the temporal
+        // spread {-9,-3,0,3,9}*kt over 5 frames was chosen so that
+        //   s_t^2 = 45*kt^2 and C = s_t^2/5 = 9*kt^2
+        // are both exact in binary, and so that the deterministic residual left
+        // in the temporal mean (+-3*kt on the (x^y) parity) has population
+        // variance 9*kt^2 = C - i.e. the fixture's mean image carries exactly
+        // the residual the correction is there to take off. The ONE inexact
+        // number in the whole construction is the ddof=1 factor
+        // n/(n-1) = 1024/1023, which is not a dyadic rational; it is written
+        // into every expected value below rather than hidden in a tolerance.
+        {
+            const int Wf = 32, Hf = 32, NFs = 5;
+            const double L0 = 1024.0;        // black level
+            const double Bl = 32.0;          // the LEVELS' additive pattern (y parity)
+            const double Bd = 8.0;           // the DARK's own - deliberately different
+            const double qg = 1.0 / 32.0;    // per-pixel gain spread (x parity)
+            const double kt = 8.0;           // temporal scale
+            const double gainDN = 128.0;     // DN per lx: the sweep's true sensitivity
+            static const double TD[5] = { -9, -3, 0, 3, 9 };
+            const double nS = (double)(Wf * Hf);
+            const double rr = nS / (nS - 1.0);       // the ddof=1 factor, 1024/1023
+            const double Cl = 9.0 * kt * kt;         // C at every level: 576, exactly
+
+            // pixel = L0 +- B (y parity)                      the additive pattern
+            //            + mu0 * (1 +- qg) (x parity)         the multiplicative one
+            //            +- 3*kt (x^y parity)                 the temporal mean's residual
+            //            + TD[f]*kt                           the temporal spread
+            // The three +- patterns are mutually orthogonal (Walsh), so the
+            // population spatial variance of the temporal mean is exactly
+            // B^2 + (mu0*qg)^2 + 9*kt^2 - the sum, with no cross terms.
+            auto sweepPix = [&](double mu0, double Bthis, int x, int y, int f) {
+                const double t = ((x ^ y) & 1) ? -3.0 * kt : 3.0 * kt;
+                return L0 + ((y & 1) ? -Bthis : Bthis)
+                          + mu0 * (1.0 + ((x & 1) ? -qg : qg))
+                          + t + TD[f] * kt;
+            };
+            auto makeLevel = [&](const char* name, double mu0, double Bthis) {
+                return makeStack(name, Wf, Hf, NFs, [&, mu0, Bthis](int x, int y, int f) {
+                    return sweepPix(mu0, Bthis, x, y, f);
+                });
+            };
+            auto makeDark = [&](const char* name, int NF) {
+                return makeStack(name, Wf, Hf, NF, [&](int x, int y, int f) {
+                    return sweepPix(0.0, Bd, x, y, f);
+                });
+            };
+            struct SM { int seqId; uint64_t uid; double value; bool include; int fold; };
+            auto makeSeries = [&](const char* name, const char* param, const char* unit,
+                                  const std::vector<SM>& ms) {
+                App::Series Sr;
+                Sr.id = app.nextSeriesId++;
+                Sr.batchId = 1;
+                Sr.name = name;
+                Sr.paramName = param;
+                snprintf(Sr.unit, sizeof Sr.unit, "%s", unit);
+                for (const SM& m : ms) {
+                    App::Series::Member mm;
+                    mm.seqId = m.seqId;
+                    mm.frameUid = m.uid;
+                    mm.value = m.value;
+                    mm.include = m.include;
+                    mm.fold = m.fold;
+                    Sr.members.push_back(mm);
+                }
+                app.series.push_back(std::move(Sr));
+                return app.series.back().id;
+            };
+            auto makeSepSet = [&](const char* name, int seriesId, int darkSeq) {
+                App::ASet Ss;
+                Ss.id = app.nextASetId++;
+                Ss.batchId = 1;
+                Ss.name = name;
+                App::ASetRole rs; rs.role = "sweep"; rs.seriesId = seriesId;
+                Ss.roles.push_back(rs);
+                App::ASetRole rd; rd.role = "dark"; rd.seqId = darkSeq;
+                Ss.roles.push_back(rd);
+                app.analysisSets.push_back(Ss);
+                return Ss.id;
+            };
+
+            {   // ---- F1 / F2 / F3: the exact sweep -------------------------
+                // TRUE by construction: gain 128 DN/lx, additive pattern 32 DN,
+                // per-pixel gain spread 1/32 = 3.125 %.
+                //
+                //   mu_l = mean(M_l) - mean(M_dark) = (L0 + mu0_l) - L0 = mu0_l
+                //          EXACTLY (both +- patterns average to 0 over even W,H)
+                //   y_l  = var_spatial(M_l, ddof=1) - C
+                //        = (Bl^2 + (mu0_l*qg)^2 + 9kt^2) * rr - 9kt^2
+                //        = [(Bl^2 + C)*rr - C]  +  [qg^2 * rr] * mu0_l^2
+                //
+                // so the line is known WITHOUT running a fit, and the residuals
+                // are zero by construction:
+                //   intercept = (1024 + 576)*1024/1023 - 576 = 1025.56402737
+                //   slope     = (1/1024)*(1024/1023)        = 1/1023
+                //   DSNU      = sqrt(1025.56402737)         = 32.0244286 DN
+                //   PRNU      = 100/sqrt(1023)              = 3.12652700 %
+                // against a true 32 DN and 3.125 %: the estimator sits 0.076 %
+                // and 0.049 % high, and that gap is the ddof=1 factor, computed
+                // here rather than tolerated.
+                //
+                // Skipping the -C at every level adds a CONSTANT 576 to every
+                // y, so it lands entirely in the intercept and leaves the slope
+                // untouched - the spec's own symptom, "DSNU だけが大きく出る":
+                //   uncorrected DSNU = sqrt(1600*1024/1023) = 40.01954557 DN
+                //                      (+24.97 %), PRNU unchanged.
+                closeAll();
+                const double lux[4] = { 4, 9, 16, 25 };
+                int seqs[4];
+                char nm[32];
+                std::vector<SM> ms;
+                for (int i = 0; i < 4; i++) {
+                    snprintf(nm, sizeof nm, "%glx", lux[i]);
+                    seqs[i] = makeLevel(nm, gainDN * lux[i], Bl);
+                    ms.push_back({ seqs[i], 0, lux[i], true, FOLD_MEAN });
+                }
+                const int dseq = makeDark("dark", NFs);
+                const int ser = makeSeries("lx sweep", "illuminance", "lx", ms);
+                const int sid = makeSepSet("sep", ser, dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+
+                const double interExp = (Bl * Bl + Cl) * rr - Cl;
+                const double slopeExp = qg * qg * rr;
+                const double dsnuExp = sqrt(interExp);
+                const double prnuExp = 100.0 * sqrt(slopeExp);
+                const double dsnuRawExp = sqrt((Bl * Bl + Cl) * rr);
+                // ...and what a per-pixel dark subtraction WOULD have printed:
+                // the levels' pattern minus the dark's, 32 - 8 = 24 DN.
+                const double ifSubtracted = sqrt(((Bl - Bd) * (Bl - Bd) + Cl) * rr - Cl);
+                fprintf(stderr,
+                        "setanalysisselftest: F1 M=%d  intercept %.9g (exp %.9g)  "
+                        "slope %.12g (exp %.12g)\n"
+                        "setanalysisselftest: F1 dsnu %.9g (exp %.9g, true %.4g)  "
+                        "prnu %.9g%% (exp %.9g%%, true %.4g%%)\n"
+                        "setanalysisselftest: F1 uncorrected dsnu %.9g (exp %.9g, "
+                        "%+.2f%%)  prnu %.9g%% (unchanged)  |  a per-pixel dark "
+                        "subtraction would print %.6g\n",
+                        F.M, F.ok ? F.inter[0] : 0.0, interExp,
+                        F.ok ? F.slope[0] : 0.0, slopeExp,
+                        F.ok ? F.dsnu.value[0] : -1.0, dsnuExp, Bl,
+                        F.ok ? F.prnu.value[0] : -1.0, prnuExp, 100.0 * qg,
+                        F.ok ? F.dsnu.uncorr[0] : -1.0, dsnuRawExp,
+                        100.0 * (dsnuRawExp / dsnuExp - 1.0),
+                        F.ok ? F.prnu.uncorr[0] : -1.0, ifSubtracted);
+                check(F.ok && F.M == 4 && F.nPl == 1,
+                      "F1 the sweep fits: 4 levels, one plane");
+                check(F.ok && fabs(F.inter[0] - interExp) < 1e-6,
+                      "F1 intercept = (B^2 + C)*n/(n-1) - C, derived by hand");
+                check(F.ok && fabs(F.slope[0] - slopeExp) < 1e-15,
+                      "F1 slope = qg^2 * n/(n-1), derived by hand");
+                check(F.ok && fabs(F.dsnu.value[0] - dsnuExp) < 1e-9,
+                      "F1 the intercept row is sqrt(intercept) [DN]");
+                check(F.ok && fabs(F.prnu.value[0] - prnuExp) < 1e-9,
+                      "F1 the slope row is 100*sqrt(slope) [%]");
+                check(fabs(dsnuExp / Bl - 1.0) < 0.001 &&
+                      fabs(prnuExp / (100.0 * qg) - 1.0) < 0.001,
+                      "F1 ...and both land within 0.1% of the injected truth");
+                check(F.ok && fabs(F.dsnu.uncorr[0] - dsnuRawExp) < 1e-9 &&
+                      F.dsnu.uncorr[0] > 1.24 * F.dsnu.value[0],
+                      "F1 without the -C the additive term reads ~25% high");
+                check(F.ok && fabs(F.prnu.uncorr[0] - F.prnu.value[0]) < 1e-9,
+                      "F1 ...and the multiplicative term is untouched by it");
+                bool zeroResid = F.ok;
+                for (const auto& L : F.levels)
+                    if (fabs(L.resid[0]) > 1e-6) zeroResid = false;
+                check(zeroResid, "F1 a sweep that obeys the model leaves no residual");
+                check(F.ok && F.levels.size() == 4 &&
+                      F.levels[0].mu[0] == gainDN * lux[0] &&
+                      F.levels[3].mu[0] == gainDN * lux[3],
+                      "F1 mu is mean(M_l) - mean(M_dark), exactly the injected level");
+                check(F.ok && !F.dsnu.clamped[0] && !F.prnu.clamped[0] && F.r2[0] > 0.9999,
+                      "F1 nothing clamped, and R^2 is 1 on an exact line");
+
+                // ---- F2: a level's sigma_fpn^2 IS the direct estimator ------
+                // Not "the same formula": the same function on the same
+                // accumulator, so the comparison is ==. Bind level 2's stack as
+                // a "dark" in its own set and the direct row must print exactly
+                // the square root of what the fit used for it.
+                if (F.ok && F.levels.size() == 4) {
+                    int sD = makeSet("as dark", { { "dark", seqs[2] } });
+                    SetResult D = runSetAnalyzer(*aSetById(sD), SA_DSNU);
+                    fprintf(stderr, "setanalysisselftest: F2 level sigma_fpn %.17g  "
+                                    "direct %.17g\n",
+                            sqrt(F.levels[2].fpnVar[0]), D.value[0]);
+                    check(D.ok && sqrt(F.levels[2].fpnVar[0]) == D.value[0],
+                          "F2 a level's sigma_fpn is the direct row's, bit for bit");
+                    check(D.ok && F.levels[2].corr[0] == Cl,
+                          "F2 ...and its C is the level's own, exactly 9*kt^2");
+                }
+                // ---- F3: the lit levels are not dark-subtracted -------------
+                // The dark's additive pattern is 8 DN and the levels' is 32. A
+                // per-pixel subtraction would leave 24 and print 24.02 here;
+                // the settled estimator leaves the levels alone and prints
+                // 32.02. The two are 8 DN apart, so this is a fixture that can
+                // actually tell them apart rather than a comment claiming it.
+                check(F.ok && fabs(F.dsnu.value[0] - ifSubtracted) > 7.0,
+                      "F3 the intercept is the LEVELS' additive term, not "
+                      "levels-minus-dark");
+                // ---- F7 / F8 on the same result -----------------------------
+                fprintf(stderr, "setanalysisselftest: F7 \"%s\" / \"%s\"\n",
+                        setResultTitle(F.dsnu).c_str(), setResultTitle(F.prnu).c_str());
+                check(setResultTitle(F.dsnu) ==
+                          "DSNU [DN] - set \"sep\": sweep \"lx sweep\" 4 levels, dark 5/5",
+                      "F7 the additive row names its set, its sweep and M");
+                check(setResultTitle(F.prnu) ==
+                          "PRNU [%] - set \"sep\": sweep \"lx sweep\" 4 levels, dark 5/5",
+                      "F7 ...and so does the multiplicative one");
+                check(F.cutoff == kSetCutoffRaw && F.dsnu.cutoff == kSetCutoffRaw,
+                      "F8 the cutoff is a required field and states 'raw'");
+                check(F.dsnu.form.find("intercept") != std::string::npos &&
+                      F.prnu.form.find("NOT dark-subtracted") != std::string::npos,
+                      "F8 each row says which coefficient it is, and that the "
+                      "levels are not dark-subtracted");
+                check(F.note.find("UNCORRELATED") != std::string::npos &&
+                      F.note.find("rho") != std::string::npos,
+                      "F8 the uncorrelatedness assumption rides in the result");
+                check(F.sweepWarn.find("LIGHT, not the exposure time") != std::string::npos,
+                      "F8 ...and so does what the sweep has to be");
+                check(sepLevelCensus(F) == "levels: 4 of 4 sweep member(s) used",
+                      "F8 the census is said even when nothing was excluded");
+                closeAll();
+            }
+
+            {   // ---- F4: residuals, and the two clamps ----------------------
+                // Same construction, three levels, and the TOP one is given a
+                // 96 DN additive pattern instead of 32. That moves its y by
+                //   d = (96^2 - 32^2) * rr = 8192 * 1024/1023
+                // and nothing else, so the perturbed fit follows from the
+                // unperturbed one by the OLS influence identity - a different
+                // route to the answer than the implementation's sums:
+                //   slope' = slope + d*(x2-xb)/Sxx
+                //   inter' = inter + d*(1/3 - xb*(x2-xb)/Sxx)
+                //   resid_2 =  d*(1 - 1/3 - (x2-xb)^2/Sxx)
+                //   resid_j = -d*(1/3 + (xj-xb)(x2-xb)/Sxx)      j = 0,1
+                // With x = mu^2 = {262144, 1327104, 4194304} the intercept
+                // multiplier is NEGATIVE (-0.1949), so a positive d drives the
+                // intercept to about -572: the additive row clamps at 0 and
+                // says so, while the multiplicative row stays positive. The two
+                // coefficients clamp independently, and this fixture shows it.
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                const double Bp = 96.0;
+                int seqs[3];
+                std::vector<SM> ms;
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    seqs[i] = makeLevel(nm, mu0[i], i == 2 ? Bp : Bl);
+                    ms.push_back({ seqs[i], 0, mu0[i] / gainDN, true, FOLD_MEAN });
+                }
+                const int dseq = makeDark("dark", NFs);
+                const int sid = makeSepSet("perturbed",
+                                           makeSeries("bumped", "illuminance", "lx", ms),
+                                           dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+
+                const double x[3] = { mu0[0] * mu0[0], mu0[1] * mu0[1], mu0[2] * mu0[2] };
+                const double xb = (x[0] + x[1] + x[2]) / 3.0;
+                const double Sxx = (x[0] - xb) * (x[0] - xb) + (x[1] - xb) * (x[1] - xb) +
+                                   (x[2] - xb) * (x[2] - xb);
+                const double d = (Bp * Bp - Bl * Bl) * rr;
+                const double inter0 = (Bl * Bl + Cl) * rr - Cl;
+                const double slope0 = qg * qg * rr;
+                const double interP = inter0 + d * (1.0 / 3.0 - xb * (x[2] - xb) / Sxx);
+                const double slopeP = slope0 + d * (x[2] - xb) / Sxx;
+                const double rE[3] = {
+                    -d * (1.0 / 3.0 + (x[0] - xb) * (x[2] - xb) / Sxx),
+                    -d * (1.0 / 3.0 + (x[1] - xb) * (x[2] - xb) / Sxx),
+                     d * (1.0 - 1.0 / 3.0 - (x[2] - xb) * (x[2] - xb) / Sxx),
+                };
+                fprintf(stderr,
+                        "setanalysisselftest: F4 intercept %.9g (exp %.9g)  slope %.12g "
+                        "(exp %.12g)  residuals %.7g / %.7g / %.7g (exp %.7g / %.7g / %.7g)\n",
+                        F.ok ? F.inter[0] : 0.0, interP, F.ok ? F.slope[0] : 0.0, slopeP,
+                        F.ok && F.M == 3 ? F.levels[0].resid[0] : 0.0,
+                        F.ok && F.M == 3 ? F.levels[1].resid[0] : 0.0,
+                        F.ok && F.M == 3 ? F.levels[2].resid[0] : 0.0,
+                        rE[0], rE[1], rE[2]);
+                check(F.ok && F.M == 3, "F4 three levels are enough to fit");
+                check(F.ok && fabs(F.inter[0] - interP) < 1e-6,
+                      "F4 the perturbed intercept matches the influence identity");
+                check(F.ok && fabs(F.slope[0] - slopeP) < 1e-12,
+                      "F4 ...and so does the perturbed slope");
+                bool res = F.ok && F.M == 3;
+                for (int i = 0; i < 3 && res; i++)
+                    if (fabs(F.levels[i].resid[0] - rE[i]) > 1e-6) res = false;
+                check(res, "F4 every level's residual is the identity's, per level");
+                check(F.ok && interP < 0 && F.dsnu.clamped[0] && F.dsnu.value[0] == 0.0,
+                      "F4 a negative intercept clamps at 0 and DECLARES the clamp");
+                check(F.ok && !F.prnu.clamped[0] && F.prnu.value[0] > 0,
+                      "F4 ...and the other coefficient is unaffected: they clamp "
+                      "independently");
+                check(F.ok && F.rms[0] > 100.0 && F.r2[0] < 1.0,
+                      "F4 the residual summary is not zero on data that is not the model");
+                closeAll();
+            }
+
+            {   // ---- F5: the exclusions, counted out loud -------------------
+                // Three usable levels plus one of each thing that cannot be
+                // one. None of them refuses the fit - they leave it, and the
+                // sentence that says so is the one the panel prints.
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                std::vector<SM> ms;
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    ms.push_back({ makeLevel(nm, mu0[i], Bl), 0, mu0[i] / gainDN,
+                                   true, FOLD_MEAN });
+                }
+                ms.push_back({ makeLevel("summed", 2560.0, Bl), 0, 20.0, true, FOLD_SUM });
+                ms.push_back({ makeLevel("dropped", 3072.0, Bl), 0, 24.0, false, FOLD_MEAN });
+                ms.push_back({ makeLevel("valueless", 3584.0, Bl), 0,
+                               std::numeric_limits<double>::quiet_NaN(), true, FOLD_MEAN });
+                // a STACK with one frame: min_frames = 2 for the same reason a
+                // frame member cannot be a level - no s_t, no correction
+                ms.push_back({ makeStack("oneframe", Wf, Hf, 1,
+                                         [&](int x, int y, int f) {
+                                             return sweepPix(4096.0, Bl, x, y, f);
+                                         }),
+                               0, 32.0, true, FOLD_MEAN });
+                {   // ...and a standalone FRAME member: no time axis at all
+                    auto fd = std::make_unique<ImageDoc>();
+                    fd->name = "loose.npy";
+                    fd->src->w = Wf; fd->src->h = Hf; fd->src->ch = 1;
+                    fd->src->dtype = "f32";
+                    fd->src->data.assign((size_t)Wf * Hf, 1200.0f);
+                    fd->syncMirrors();
+                    fd->uid = app.nextUid++;
+                    const uint64_t uid = fd->uid;
+                    app.images.push_back(std::move(fd));
+                    ms.push_back({ 0, uid, 12.0, true, FOLD_MEAN });
+                }
+                const int dseq = makeDark("dark", NFs);
+                const int sid = makeSepSet("census",
+                                           makeSeries("mixed", "illuminance", "lx", ms),
+                                           dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+                const std::string census = sepLevelCensus(F);
+                fprintf(stderr, "setanalysisselftest: F5 %s\n", census.c_str());
+                for (const auto& sk : F.skipped)
+                    fprintf(stderr, "setanalysisselftest: F5   excluded \"%s\": %s\n",
+                            sk.member.c_str(), sk.why.c_str());
+                check(F.ok && F.M == 3,
+                      "F5 the three usable levels still fit; the rest only leave");
+                check(census ==
+                          "levels: 3 of 8 sweep member(s) used - excluded: "
+                          "1 frame member(s) - no time axis, so no -sigma_t^2/N "
+                          "correction, 1 standing as sum - a sum is n x the mean's "
+                          "scale, 1 stack(s) with fewer than 2 frames loaded - same "
+                          "reason as a frame, 1 not included, 1 with no value set",
+                      "F5 every exclusion is counted, with its reason, in one line");
+                check(F.skipped.size() == 5,
+                      "F5 ...and each excluded member is named individually");
+                closeAll();
+            }
+
+            {   // ---- F6: the refusals ---------------------------------------
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                std::vector<SM> ms;
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    ms.push_back({ makeLevel(nm, mu0[i], Bl), 0, mu0[i] / gainDN,
+                                   true, FOLD_MEAN });
+                }
+                const int dseq = makeDark("dark", NFs);
+                const int ser = makeSeries("lx sweep", "illuminance", "lx", ms);
+                // (a) no "sweep" role at all
+                {
+                    int sid = makeSet("R-nosweep", { { "dark", dseq } });
+                    SepFit F = runSeparationFit(*aSetById(sid));
+                    fprintf(stderr, "setanalysisselftest: F6a \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "this set has no \"sweep\" role - a role binding is "
+                              "declared, never inferred",
+                          "F6a no sweep role: refused, and the reason is the rule");
+                }
+                // (b) a sweep but no dark - mu has nothing to be corrected against
+                {
+                    App::ASet Ss;
+                    Ss.id = app.nextASetId++; Ss.batchId = 1; Ss.name = "R-nodark";
+                    App::ASetRole rs; rs.role = "sweep"; rs.seriesId = ser;
+                    Ss.roles.push_back(rs);
+                    app.analysisSets.push_back(Ss);
+                    SepFit F = runSeparationFit(*aSetById(Ss.id));
+                    fprintf(stderr, "setanalysisselftest: F6b \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "this set has no \"dark\" role - a role binding is "
+                              "declared, never inferred",
+                          "F6b no dark role: mu is dark-corrected, so there is no fit");
+                }
+                // (c) "sweep" bound to a STACK - the schema is Series()
+                {
+                    int sid = makeSet("R-stack", { { "sweep", dseq }, { "dark", dseq } });
+                    SepFit F = runSeparationFit(*aSetById(sid));
+                    fprintf(stderr, "setanalysisselftest: F6c \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "\"sweep\" is bound to a stack - this analysis takes a "
+                              "Series() role: one stack is ONE level, and separating "
+                              "the additive term from the multiplicative one needs 3",
+                          "F6c a stack in a Series() role is refused in one line");
+                }
+                // (d) "sweep" bound to a loose FRAME
+                {
+                    auto fd = std::make_unique<ImageDoc>();
+                    fd->name = "one.npy";
+                    fd->src->w = Wf; fd->src->h = Hf; fd->src->ch = 1;
+                    fd->src->dtype = "f32";
+                    fd->src->data.assign((size_t)Wf * Hf, 100.0f);
+                    fd->syncMirrors();
+                    fd->uid = app.nextUid++;
+                    const uint64_t uid = fd->uid;
+                    app.images.push_back(std::move(fd));
+                    App::ASet Ss;
+                    Ss.id = app.nextASetId++; Ss.batchId = 1; Ss.name = "R-frame";
+                    App::ASetRole rs; rs.role = "sweep"; rs.frameUid = uid;
+                    Ss.roles.push_back(rs);
+                    App::ASetRole rd; rd.role = "dark"; rd.seqId = dseq;
+                    Ss.roles.push_back(rd);
+                    app.analysisSets.push_back(Ss);
+                    SepFit F = runSeparationFit(*aSetById(Ss.id));
+                    fprintf(stderr, "setanalysisselftest: F6d \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "\"sweep\" is bound to a frame - this analysis takes a "
+                              "Series() role: one frame is ONE level, and separating "
+                              "the additive term from the multiplicative one needs 3",
+                          "F6d a frame in a Series() role is refused in one line");
+                }
+                // (e) M < 3: two levels fit any line exactly
+                {
+                    std::vector<SM> two(ms.begin(), ms.begin() + 2);
+                    int sid = makeSepSet("R-two",
+                                         makeSeries("short", "illuminance", "lx", two), dseq);
+                    SepFit F = runSeparationFit(*aSetById(sid));
+                    fprintf(stderr, "setanalysisselftest: F6e \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "the sweep \"short\" has 2 usable level(s) - the "
+                              "separation needs 3 (two points fit a line exactly, so "
+                              "there is no residual left to check the model with). "
+                              "levels: 2 of 2 sweep member(s) used",
+                          "F6e fewer than 3 levels is refused, and the census is in "
+                          "the same sentence");
+                }
+                // (f) ...and the census in that sentence explains WHY it is short
+                {
+                    std::vector<SM> mixed(ms.begin(), ms.begin() + 2);
+                    mixed.push_back({ makeLevel("summed", 2560.0, Bl), 0, 20.0,
+                                      true, FOLD_SUM });
+                    int sid = makeSepSet("R-two-sum",
+                                         makeSeries("short2", "illuminance", "lx", mixed),
+                                         dseq);
+                    SepFit F = runSeparationFit(*aSetById(sid));
+                    fprintf(stderr, "setanalysisselftest: F6f \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok &&
+                          F.refusal.find("levels: 2 of 3 sweep member(s) used - "
+                                         "excluded: 1 standing as sum") != std::string::npos,
+                          "F6f a sweep that is short BECAUSE of an exclusion says so");
+                }
+                // (g) planes that do not mean the same thing on both sides
+                {
+                    int rgb = makeStack("rgb", Wf, Hf, NFs,
+                                        [&](int x, int y, int f) {
+                                            return sweepPix(1024.0, Bl, x, y, f);
+                                        }, 3);
+                    std::vector<SM> mm(ms.begin(), ms.begin() + 3);
+                    mm.push_back({ rgb, 0, 8.0, true, FOLD_MEAN });
+                    int sid = makeSepSet("R-planes",
+                                         makeSeries("mixedch", "illuminance", "lx", mm),
+                                         dseq);
+                    SepFit F = runSeparationFit(*aSetById(sid));
+                    fprintf(stderr, "setanalysisselftest: F6g \"%s\"\n", F.refusal.c_str());
+                    check(!F.ok && F.refusal ==
+                              "sweep member \"rgb\" is 3ch / 1 plane(s) and \"dark\" is "
+                              "1ch / 1 plane(s) - mu is a per-plane difference, so the "
+                              "planes have to mean the same thing on both sides",
+                          "F6g mismatched planes are refused, and BOTH are named");
+                }
+                closeAll();
+            }
+        }
 
         fprintf(stderr, "setanalysisselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
