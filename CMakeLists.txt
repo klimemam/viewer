@@ -197,7 +197,8 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
-                      core/imagefile.cpp core/tiffread.cpp core/stb_image_impl.c
+                      core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
+                      core/stb_image_impl.c
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
@@ -237,6 +238,7 @@ target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} 
 # the same way, and the selftest evidence for both is the same one fact -
 # viewer-serve.exe is byte-identical across the change.
 if(VIEWER_WITH_EXR)
+  target_link_libraries(viewer PRIVATE OpenEXR::OpenEXR)
   target_compile_definitions(viewer PRIVATE VIEWER_WITH_EXR)
 endif()
 if(UNIX)

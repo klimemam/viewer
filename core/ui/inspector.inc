@@ -573,7 +573,16 @@ static void drawInspector() {
         // the reason the file was written that way - so they belong beside it
         // rather than in a panel of their own (docs/npz-design.md §4 item 3).
         if (!im->src->npzMember.empty()) {
-            ImGui::TextDisabled("npz member  %s", im->src->npzMember.c_str());
+            // One FIELD holds the name, because "a named part inside one
+            // container file" is one idea and the session, the identity tuple
+            // and the Inspector all key off it. The WORD is the container's
+            // own, and it comes from the format table (Backend::partWord) -
+            // calling an EXR layer an "npz member" would be wrong twice, and
+            // testing the extension HERE would be a second place that knows
+            // what an .exr is.
+            const imagefile::Backend* pb = imagefile::forPath(im->src->path);
+            ImGui::TextDisabled("%-11s %s", pb && pb->partWord ? pb->partWord : "npz member",
+                                im->src->npzMember.c_str());
             for (const auto& e : app.npzMeta) {
                 if (e.path != im->src->path) continue;
                 if (e.items.empty()) break;

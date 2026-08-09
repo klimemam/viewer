@@ -1,10 +1,12 @@
-// PNG / JPEG / TIFF, behind one interface (core/imagefile.h).
+// PNG / JPEG / TIFF / OpenEXR, behind one interface (core/imagefile.h).
 //
 // This is the ONLY translation unit that knows a decoder library exists. The
 // implementation of stb_image itself is in core/stb_image_impl.c, compiled with
 // warnings off the way miniz.c is - third-party code is not policed here, and
 // keeping it in its own file means this file IS held to -Wall -Wextra. The TIFF
-// reader in core/tiffread.cpp is OURS, so it is held to it too.
+// reader in core/tiffread.cpp is OURS, so it is held to it too, and
+// core/exrread.cpp is our wrapper around a third-party library and is held to
+// it as well - the library's own sources are compiled by its own project.
 //
 // To put a different library behind a format:
 //   1. write `bool xxxDecode(const uint8_t*, size_t, std::vector<Image>&, std::string&)`;
@@ -22,6 +24,7 @@
 #define STBI_NO_STDIO          // the caller has already read the bytes
 #include "stb_image.h"
 #include "tiffread.h"
+#include "exrread.h"
 
 namespace imagefile {
 
@@ -41,6 +44,14 @@ static bool sniffTiff(const uint8_t* p, size_t n) {
     if (p[0] == 'I' && p[1] == 'I') return (p[2] == 42 || p[2] == 43) && p[3] == 0;
     if (p[0] == 'M' && p[1] == 'M') return p[2] == 0 && (p[3] == 42 || p[3] == 43);
     return false;
+}
+static bool sniffExr(const uint8_t* p, size_t n) {
+    // 20000630 as a little-endian int32. It is the same four bytes for every
+    // .exr there has ever been - scanline, tiled, deep or multi-part - so this
+    // says "an EXR", and which KIND it is is the decoder's business to read and
+    // (for three of those four) to refuse.
+    static const uint8_t sig[4] = { 0x76, 0x2f, 0x31, 0x01 };
+    return n >= 4 && memcmp(p, sig, 4) == 0;
 }
 
 // ---------------------------------------------------------------- PNG / JPEG
@@ -155,8 +166,8 @@ static bool stbDecode(const uint8_t* p, size_t n, std::vector<Image>& images,
 // ---------------------------------------------------------------- the table
 const std::vector<Backend>& backends() {
     static const std::vector<Backend> B = {
-        { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr },
-        { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr },
+        { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr, nullptr },
+        { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr, nullptr },
         // TIFF shipped for a while as a row with NO decoder, refusing by name.
         // What that row said is still the standard the reader behind it is held
         // to: TIFF is the only one of the three that carries measurements
@@ -166,7 +177,18 @@ const std::vector<Backend>& backends() {
         // pictures and wrong per-plane statistics with nothing on screen to say
         // so - so core/tiffread.cpp REFUSES a CFA TIFF, by name, rather than
         // open one. Everything else it will not read is refused the same way.
-        { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr },
+        { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr, nullptr },
+        // OpenEXR is the row that exercises BOTH first-class states of this
+        // table from one build option: with -DVIEWER_WITH_EXR=ON it points at
+        // core/exrread.cpp, and with OFF the same row still lists .exr, still
+        // sniffs it, still dispatches to it, and refuses with EXR_ABSENT naming
+        // the option. A user who turned the dependency off is told that; a user
+        // who never had it is not left with "unknown file, try the raw dialog".
+        //
+        // It is also the only row whose parts are NAMED (partWord): an .exr
+        // holds layers, which are documents, where a multi-page TIFF holds
+        // pages, which are frames.
+        { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, EXR_DECODE, EXR_ABSENT, "exr layer" },
     };
     return B;
 }

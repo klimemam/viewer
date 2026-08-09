@@ -836,7 +836,10 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
                            int npyRead, const std::string& readerSpec,
                            const std::string& origin);       // fwd (below)
 static std::string loadNpy(const std::string& path, int npyRead);  // fwd (below)
-static std::string loadImageFile(const std::string& path);   // fwd (below)
+static std::string loadImageFile(const std::string& path,
+                                 const std::string& onlyMember = "");   // fwd (below)
+static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
+                                                      std::string& errOut);  // fwd (below)
 
 struct VnzNode {
     std::string layer;                 // "frame" "stack" "series" "batch" "analysisset"
@@ -2146,14 +2149,27 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
 // this file has already paid for once (loadNpy and the .npz member loop said
 // different things about a partial stack until they were made one function).
 //
-// ONE FILE IS NOT ALWAYS ONE PICTURE. A multi-page TIFF is a stack, and that is
-// this side's word for it (App::SeqInfo), not the decoder's: imagefile::decode
-// hands back several Images and the stack is built HERE, the same way
-// loadNpyBuffer builds one out of a frame axis. Deliberately the same shape as
-// that loop rather than a second one - the seq is registered before the frames
-// are added, every frame carries the head's range so they stay comparable, and
-// each frame records which page of the FILE it came from (§6.2's identity).
-static std::string loadImageFile(const std::string& path) {
+// ONE FILE IS NOT ALWAYS ONE PICTURE, and it is not always one KIND of "more
+// than one" either. imagefile::decode hands back several Images and says which
+// of the two this file is, in Image::member:
+//
+//   * unnamed pictures (a multi-page TIFF) are ORDERED, and an order over
+//     pictures of one shape is a frame axis - so they become one stack, built
+//     here the same way loadNpyBuffer builds one out of a .npy's frame axis:
+//     the seq is registered before the frames are added, every frame carries
+//     the head's range so they stay comparable, and each frame records which
+//     page of the FILE it came from (§6.2's identity).
+//   * NAMED parts (the layers of an .exr) are not ordered and need not share a
+//     shape - "diffuse" is 3 channels and "Z" is 1 - so they become one
+//     document each, exactly as the members of a multi-member .npz do, carrying
+//     the name in FrameSource::member so a session reopens the one it saved.
+//
+// `onlyMember` is that reopen: it is what a session restore passes, and it is
+// the same argument loadNpz takes for the same reason. The file is decoded
+// whole and the other parts are dropped - honest about the cost rather than
+// teaching the seam a selective decode, and it is no more work than opening
+// the file normally was.
+static std::string loadImageFile(const std::string& path, const std::string& onlyMember) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read file";
     std::vector<imagefile::Image> imgs;
@@ -2163,10 +2179,11 @@ static std::string loadImageFile(const std::string& path) {
     const std::string label = baseName(path);
     auto build = [&](imagefile::Image& img, int page) {
         auto im = std::make_unique<ImageDoc>();
-        im->name = label;
+        im->name = img.member.empty() ? label : label + ":" + img.member;
         FrameSource& S = *im->src;
         S.path = path;
         S.fileFrame = page;         // which page of the FILE: identity and provenance
+        S.npzMember = img.member;   // ...and which NAMED part of it, when it has any
         S.w = img.w; S.h = img.h; S.ch = img.ch;
         S.dtype = img.dtype;
         S.data = std::move(img.data);
@@ -2183,6 +2200,31 @@ static std::string loadImageFile(const std::string& path) {
         statSourceFile(S);          // the file on disk IS these pixels: Watch baseline
         return im;
     };
+
+    // ---- named parts: one document each -------------------------------------
+    bool named = false;
+    for (const auto& img : imgs) if (!img.member.empty()) named = true;
+    if (named) {
+        std::vector<std::string> opened;
+        for (auto& img : imgs) {
+            if (!onlyMember.empty() && img.member != onlyMember) continue;
+            opened.push_back(img.member.empty() ? std::string("(base)") : img.member);
+            addImage(build(img, 0));
+        }
+        if (opened.empty())
+            return onlyMember.empty()
+                 ? "nothing readable in this file"
+                 : "'" + onlyMember + "' is not a part of this file";
+        // Say what opened, BY NAME - never silent about having produced more
+        // than one document from one file. The .npz member path sets this
+        // convention and this is the same sentence.
+        if (opened.size() > 1) {
+            std::string m = label + ": " + std::to_string(opened.size()) + " layers: ";
+            for (size_t i = 0; i < opened.size(); i++) m += (i ? ", " : "") + opened[i];
+            toast(m);
+        }
+        return {};
+    }
 
     if (imgs.size() == 1) {
         addImage(build(imgs[0], 0));
@@ -2216,6 +2258,44 @@ static std::string loadImageFile(const std::string& path) {
     fprintf(stderr, "picture stack: %s - %zu frames (%dx%d %dch)\n", label.c_str(),
             imgs.size(), ref->w, ref->h, ref->ch);
     return {};
+}
+
+// ONE picture out of one file, for the background sequence loader - the same
+// role decodeNpy plays, and it touches no app state for the same reason.
+//
+// A folder of .exr (or of .png, or of single-page .tif) is a stack, and the
+// frame axis comes from the FILES: that is what makes this function's contract
+// "exactly one picture". A file that holds several is refused rather than
+// silently reduced to its first, because a folder of multi-page TIFFs is a
+// stack of stacks and this loader has no way to be that - and dropping pages
+// without a word is the failure this whole seam is arranged to avoid.
+static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
+                                                      std::string& errOut) {
+    std::vector<uint8_t> buf;
+    if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
+    std::vector<imagefile::Image> imgs;
+    if (!imagefile::decode(path, buf, imgs, errOut)) return {};
+    if (imgs.size() != 1) {
+        errOut = "this file holds " + std::to_string(imgs.size()) +
+                 " pictures, so it is a stack of its own and not one frame of "
+                 "a folder's stack - open it on its own";
+        return {};
+    }
+    imagefile::Image& img = imgs[0];
+    auto im = std::make_unique<ImageDoc>();
+    im->name = baseName(path);
+    FrameSource& S = *im->src;
+    S.path = path;
+    S.npzMember = img.member;
+    S.w = img.w; S.h = img.h; S.ch = img.ch;
+    S.dtype = img.dtype;
+    S.data = std::move(img.data);
+    im->note = img.note;
+    im->cfa = img.cfa;
+    im->cfaPattern = img.cfaPattern & 3;
+    im->syncMirrors();
+    statSourceFile(S);
+    return im;
 }
 
 // ---- §3.3: say it again, and mean it ----------------------------------------

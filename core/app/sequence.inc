@@ -330,6 +330,11 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     for (int i = 0; i < (int)files.size(); i++)
         if (i != selfIdx) jobs.push_back({ files[i], i });
     bool isRaw = ref->src->rawDtype >= 0;
+    // ...and which door the SIBLINGS go through, decided by the reference
+    // frame's own path: whatever read frame 1 reads the rest (docs/§6.2 - one
+    // stack is one kind of thing). A picture format decodes through the seam on
+    // this thread exactly as .npy does through decodeNpy.
+    const bool isPicture = !isRaw && imagefile::forPath(ref->src->path) != nullptr;
     RawDialog recipe;
     if (isRaw) {
         recipe.dtype = ref->src->rawDtype;
@@ -358,11 +363,11 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     }
     app.seqNote.clear();
     fprintf(stderr, "stack: %s - %d files (%s)\n", info.name.c_str(),
-            (int)files.size(), isRaw ? "raw recipe" : "npy");
+            (int)files.size(), isRaw ? "raw recipe" : isPicture ? "picture file" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
     const std::string refNote = ref->note;   // same recipe/shape as every sibling
-    app.seqThread = std::thread([jobs, isRaw, recipe, startBytes, budget, refNote]() {
+    app.seqThread = std::thread([jobs, isRaw, isPicture, recipe, startBytes, budget, refNote]() {
         size_t bytes = startBytes;
         int failures = 0;
         double lastPost = 0;
@@ -414,6 +419,8 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                     RawDialog d = recipe;
                     d.path = j.path;
                     doc = decodeRawFrame(d, err);
+                } else if (isPicture) {
+                    doc = decodeImageFileFrame(j.path, err);
                 } else {
                     doc = decodeNpy(j.path, err);
                 }
@@ -1200,10 +1207,14 @@ static void gotoStack(int delta) {
 }
 
 // ---- open a whole folder tree: every numbered group becomes its own stack ----
+// The headerless ones are listed here by name because nothing else can say what
+// they are. The picture formats are NOT listed: they are asked of
+// core/imagefile.h, so a format gained or lost there is gained or lost here
+// with it, and this list cannot come to disagree with the file dialog's.
 static const char* SEQ_EXTS[] = { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
 static bool isLoadableExt(const std::string& extLower) {
     for (const char* e : SEQ_EXTS) if (extLower == e) return true;
-    return false;
+    return imagefile::forPath("x" + extLower) != nullptr;
 }
 
 // Walk root recursively; each directory yields one group per numeric pattern.
@@ -1268,7 +1279,13 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             std::string ext = std::filesystem::u8path(g.files[0]).extension().u8string();
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            g.isRaw = ext != ".npy";
+            // "raw" here means HEADERLESS: the user must state the geometry
+            // before anything can be decoded. A .npy carries its own shape and
+            // so does every picture format behind core/imagefile.h, so neither
+            // may be sent to the RAW dialog - a folder of .exr would otherwise
+            // open a width/height/dtype prompt for files that already say all
+            // three.
+            g.isRaw = ext != ".npy" && !imagefile::forPath(g.files[0]);
             groups.push_back(std::move(g));
         };
         std::vector<std::string> leftover;
@@ -1343,6 +1360,8 @@ static void startNextQueuedGroup() {
         d.path = g.files[0];
         d.replaceIdx = -1;
         err = loadRaw(d);
+    } else if (imagefile::forPath(g.files[0])) {
+        err = loadImageFile(g.files[0]);
     } else {
         err = loadNpy(g.files[0]);
     }

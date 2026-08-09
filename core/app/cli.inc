@@ -354,10 +354,15 @@ static std::string g_browseKeysActs =
     "rawopen,popupcheck,seqask,popupcheck";
 
 static void printUsage() {
+    // The picture extensions come from the format table, not from a literal
+    // here: parseCli already dispatches on imagefile::forPath, so a literal
+    // list is a second statement of the same fact that can only ever go stale
+    // (it said ".png, .jpg" for the whole time TIFF was readable).
     printf(
         "usage: viewer [options] [files or folders...]\n"
-        "  files:  .npy, .npz, .png, .jpg, .vsession (saved session),\n"
-        "          or raw binaries (.bin/.raw/...)\n"
+        "  files:  .npy, .npz, .vsession (saved session), %s,\n"
+        "          or raw binaries (.bin/.raw/...)\n", imagefile::dialogPattern().c_str());
+    printf(
         "  folder: loads the numbered files below it, one stack per group\n"
         "options:\n"
         "  --session <file.vsession>   restore a saved session\n"

@@ -1300,9 +1300,16 @@ static void openPath(const std::string& path) {
         // falling through to the raw dialog and asking a user who opened a .tif
         // to type in its width. A multi-page TIFF becomes a stack in
         // loadImageFile, so this door opens one file and may gain N documents.
+        const size_t before = app.images.size();
         std::string err = loadImageFile(path);
         if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
-        else toast("loaded " + baseName(path));
+        // A file whose parts are NAMED, that produced several of them, has
+        // already said WHICH ones inside loadImageFile. A blanket "loaded
+        // x.exr" on top would be a second and vaguer sentence about the same
+        // event. Everything else - one picture, or the pages of a stack - is
+        // announced here exactly as it always was.
+        else if (app.images.size() - before <= 1 || !imagefile::forPath(path)->partWord)
+            toast("loaded " + baseName(path));
     } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
         openFolder(path);                     // dropping a folder loads every stack below it
     } else {

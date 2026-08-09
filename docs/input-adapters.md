@@ -142,7 +142,7 @@ read as   1 frame x 3 ch   (H,W,C)         [ re-read as... ]
 raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示するので、
 そもそも推測が無い — 今のままでよい。
 
-### 3.6 PNG / JPEG / TIFF — 形を推測しない形式は、器に訊く
+### 3.6 PNG / JPEG / TIFF / OpenEXR — 形を推測しない形式は、器に訊く
 
 **決定 (2026-08-04、ユーザー)**:
 
@@ -164,6 +164,7 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 | PNG | stb_image 2.30 (1ヘッダ、MIT/PD、`third_party/stb/` に vendor) | 8/16bit、grey/GA/RGB/RGBA/palette |
 | JPEG | 同上 | baseline / progressive、8bit |
 | TIFF | **自前** (`core/tiffread.cpp`、`tiffread 1`) | classic TIFF (magic 42)、II/MM 両方、strip、8/16bit 符号なし整数と 32bit IEEE float、grey (WhiteIsZero/BlackIsZero) と RGB (±alpha)、none/PackBits/LZW/Deflate、predictor 1/2、**複数ページ = stack** |
+| OpenEXR | 公式 OpenEXR 3.4.13 + Imath 3.2.2 (`core/exrread.cpp`、`-DVIEWER_WITH_EXR=OFF` で外せる) | scanline と 1レベル tiled、half/float、全圧縮 (NONE/RLE/ZIP/ZIPS/PIZ/PXR24/B44/DWA)、**レイヤ = document** |
 
 **値の扱い — 宣言する、推測しない。**
 
@@ -242,6 +243,72 @@ TIFF は CFA ページを**断る**ので、この3形式はいずれも常に 0
 コマンドライン引数・セッション復元では開く。peer に配らせるのは別件
 (docs/media-support.md の (b) と同じ形になる)。**peer は形式を増やさない**
 のが EXR のときの前例で、TIFF もそれに従う (`viewer-serve` は npy のみ)。
+
+### 3.6.2 OpenEXR — レイヤは frame ではなく document (2026-08-09)
+
+**レイヤ = document、ページ = frame。** `core/imagefile.h` が引く区別がここで
+初めて両側から効く。1ファイルから複数の絵が出たとき、それが何なのかは
+**デコーダが `Image::member` で言う**:
+
+- **名前が無い** → 順序があり、同じ形の絵の順序は frame 軸である。TIFF の
+  3ページは **1 stack の 3 frame** (§3.6.1)。
+- **名前がある** → 順序は無く、形が揃っている必要も無い (`diffuse` は 3ch、
+  `Z` は 1ch)。EXR の 2レイヤは **2つの document** で、`.npz` の 2メンバと
+  同じもの。`FrameSource::member` に名前が載り、**セッションは保存した
+  レイヤだけを開き直す** (`loadImageFile(path, member)`、`loadNpz` と同じ形)。
+
+枚数からは区別できない (「2枚」はどちらでも起きる) ので、**推測せずデコーダが
+宣言する**。
+
+**チャンネルのまとめ方**: EXR のチャンネル名は `layer.LEAF`。同じ layer に
+`R`,`G`,`B` が揃っていれば 1つの 3ch (あれば `A` を足して 4ch) にし、
+**それ以外のチャンネルは 1枚 1ch** にする。`R,G,B,A` 以外の並びには形式が
+定める意味が無いので、`X,Y,Z` を色として詰めるのは推測になる。順序は
+**ファイルの順序** (EXR の ChannelList はソート済み) のままで、並べ替えない。
+
+**読むもの**: single-part / scanline と **1レベル tiled** / half と float /
+圧縮は OpenEXR が読めるものすべて (NONE・RLE・ZIP・ZIPS・PIZ・PXR24・B44・DWAA・
+DWAB) / data window が原点でなくてもよい (**document は data window**、
+display window との差は note が言う)。
+
+**断るもの (すべて名指しで)**: multi-part / deep (scanline・tile とも) /
+**multi-resolution (mipmap・ripmap)** / chroma subsample されたチャンネル /
+`Y`/`RY`/`BY` の輝度色差レイアウト / **UINT チャンネル** / チャンネルが 1つも
+無いファイル / data window が viewer の上限 (32768) を超えるもの。
+
+**tiled を読み、mipmap を断る理由** (#53 判断 3 の解決): tiling は**格納形式**で
+あって、リンク済みのライブラリが可逆に解く。断れば「このビルドが正確に開ける
+ファイル」を利用者から取り上げることになる。mipmap は格納形式ではなく
+**同じ絵の複数解像度**で、どれが「その絵」かはファイルが投げた問いだから、
+loader が黙って答えてはいけない。TIFF が tiled を断るのは**自前リーダに
+tile のコードが無いから**であって、同じ語で違う理由である。
+
+**なぜ自前ではなくライブラリか** (TIFF と逆になる理由): TIFF は「この program が
+読むべきでないもの」を断ると**小さくなる**。EXR は小さくならない —— tiled と
+deep を断いても scanline half/float は残り、その中身は PIZ (wavelet + Huffman) と
+DWA (DCT) である。レンダラが実際に書くのはそれなので、NONE と ZIP だけの
+自前リーダは**開けないファイルの山**を作る。つまりここには「小さくて正直な
+リーダ」という選択肢が無い。代償は隠さない: OpenEXR + Imath はこの木で最も重い
+依存で、実測は `docs/media-support.md` §1、ライセンスは THIRD-PARTY-NOTICES.md、
+外し方は `-DVIEWER_WITH_EXR=OFF`。
+
+**`-DVIEWER_WITH_EXR=OFF` のとき**: `.exr` の行は**表に残る**。listed・sniff
+される・dispatch される、そして「このビルドは `-DVIEWER_WITH_EXR=OFF` で
+構成されている」と名指しで断る (`Backend::absent`、§3.2 の体裁のまま)。
+`--media-selftest` はその構成で EXR の assert を**声を出して skip** する。
+
+**フォルダ = stack**: `.exr` が並んだフォルダは 1 stack になる。判定は
+`imagefile::forPath` で行うので、この表に足された形式は自動的にそうなる
+(`SEQ_EXTS` に名前を書き足す必要は無い)。**1ファイルが複数の絵を持つ場合は
+frame として断る** —— 複数ページ TIFF の並びは「stack の stack」であり、
+黙って 1ページ目だけ取るのは §3.2 に反する。
+
+**Browse の既知の境界は EXR も同じ** (#53 判断 4): `isNpyName` は remote peer と
+共有の関数で、peer は npy しか読まない。**`.exr` も Browse の一覧には出ない**。
+これは EXR 固有ではなく PNG/JPEG/TIFF と同じ 1件の未解決事項なので、形式ごとに
+回避するのではなく `isNpyName` と peer の側で 1回解く (docs/media-support.md の
+(b))。**開ける経路**: File > Open・drag & drop・コマンドライン・セッション復元・
+フォルダ走査。
 
 ---
 

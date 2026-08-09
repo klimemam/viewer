@@ -1915,8 +1915,12 @@ static std::string loadSession(const std::string& path) {
                     else if (imagefile::forPath(p))
                         // a session that saved a .png must reopen a .png:
                         // loadNpy would fail its magic check and the document
-                        // would come back as "cannot open", not as pixels
-                        err = loadImageFile(p);
+                        // would come back as "cannot open", not as pixels.
+                        // pendingMember carries the NAMED part when the format
+                        // has any (an .exr layer), for the same reason loadNpz
+                        // takes it: a session that saved one layer of six must
+                        // not reopen six.
+                        err = loadImageFile(p, pendingMember);
                     else
                         err = loadNpy(p, pendingRead);
                 }

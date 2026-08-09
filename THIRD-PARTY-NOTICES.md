@@ -28,15 +28,26 @@ ls build/_deps/*/LICENSE*                          # the texts quoted below
 | miniz | 3.0.2 | MIT | yes | yes | no |
 | portable-file-dialogs | commit `c12ea8c` | WTFPL-2.0 | yes (header-only) | no | no |
 | stb_image | commit `013ac3b` (v2.30) | MIT **or** public domain (Unlicense) | yes | no | no |
+| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes, when `VIEWER_WITH_EXR=ON` (the default) | no | no |
+| Imath | v3.2.2 | BSD-3-Clause | yes, when `VIEWER_WITH_EXR=ON` (the default) | no | no |
 
 `viewer-serve` is the remote peer. It reads `.npy` only, so it links neither a
 window toolkit nor an image decoder - which is also why the Ubuntu 20.04
 compatibility rebuild in `build.yml` can still compile it with one `g++` line.
 Formats added to `viewer` are deliberately not added to it.
 
-The bundled plugins (`plugins/*.c`), the TIFF reader (`core/tiffread.cpp`) and
+The bundled plugins (`plugins/*.c`), the TIFF reader (`core/tiffread.cpp`), the
+OpenEXR *wrapper* (`core/exrread.cpp` - the library itself is the row above) and
 the reader harness shipped beside the binaries (`tools/import/*.py`) are this
 project's own code, under the repository's own Apache-2.0 licence.
+
+**OpenEXR is the one row that a build can legitimately not have.**
+`-DVIEWER_WITH_EXR=OFF` links neither it nor Imath, and `.exr` then refuses by
+naming that option (`core/imagefile.h`, the `absent` state). A binary built that
+way needs neither notice below; the ones this project publishes are built with
+the default, so both are included and both are reproduced. OpenEXR 3.4 vendors
+libdeflate and OpenJPH inside its own tree and both are covered by the notice
+OpenEXR ships, quoted below with it.
 
 ## Not bundled, and why it is worth saying
 
@@ -232,4 +243,46 @@ AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
 ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
+```
+
+
+## OpenEXR - BSD-3-Clause
+
+https://github.com/AcademySoftwareFoundation/openexr - `openexr-src/LICENSE.md`.
+The same text covers the copies of libdeflate and OpenJPH that OpenEXR 3.4
+vendors under `external/` and that this build compiles (OPENEXR_FORCE_INTERNAL_DEFLATE).
+
+```
+Copyright (c) Contributors to the OpenEXR Project. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+
+## Imath - BSD-3-Clause
+
+https://github.com/AcademySoftwareFoundation/Imath - `imath-src/LICENSE.md`.
+Declared by this project's own CMakeLists.txt rather than fetched by OpenEXR,
+so that the pin is a URL like every other dependency here and no git is needed.
+
+```
+Copyright Contributors to the OpenEXR Project. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```

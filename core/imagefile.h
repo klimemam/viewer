@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// The picture formats that are not .npy: PNG, JPEG, TIFF.
+// The picture formats that are not .npy: PNG, JPEG, TIFF, OpenEXR.
 //
 // THE SEAM IS THE DELIVERABLE. Which library decodes a PNG is a build-time
 // detail that this repository has already changed its mind about once (the
@@ -25,6 +25,13 @@
 //     value intact; a decoder that normalised to 0..1 would make the same file
 //     measure differently depending on which library was linked, which is the
 //     one thing a seam like this must never allow.
+//
+//     The float formats say the same rule from the other side: a 12.5 in an
+//     .exr is a 12.5 in the document. Not tone mapped, not gamma-encoded, not
+//     clamped to 0..1, and negatives kept - a viewer that display-encodes a
+//     scene-linear file on load has destroyed the measurement it was opened
+//     to make, and it has done so in a way that still draws a plausible
+//     picture.
 //
 //  2. WHAT WAS DONE IS SAID. Every decode fills `note`, and the Inspector
 //     prints it. "8-bit" is a fact about the file; "no transfer curve was
@@ -58,6 +65,19 @@ enum { MAX_DIM = 32768 };
 // a multi-page TIFF is a stack, which is the caller's word (App::SeqInfo) and
 // not a decoder's. That backend has arrived: it returns several of these and
 // the caller builds the stack the same way loadNpyBuffer does.
+//
+// SEVERAL PICTURES OUT OF ONE FILE ARE ONE OF TWO THINGS, and `member` is which:
+//
+//   * empty  - the file's pictures are UNNAMED, so they are ordered, and an
+//              order over pictures of one shape is a frame axis. Three pages of
+//              a TIFF are three frames of one stack.
+//   * set    - the file NAMES its parts, so they are not ordered and they need
+//              not share a shape. Two layers of an .exr are two documents, the
+//              same as two arrays inside one .npz.
+//
+// The decoder says which; the caller (loadImageFile) builds the stack or the
+// documents. Neither concept belongs to a decoder, and neither is guessable
+// from a count - a two-layer .exr and a two-page TIFF are both "two pictures".
 struct Image {
     int w = 0, h = 0, ch = 1;      // ch: 1 grey, 2 grey+alpha, 3 RGB, 4 RGBA
     std::string dtype;             // "u8" / "u16": what the FILE stored, not what we hold
@@ -65,6 +85,7 @@ struct Image {
     std::string note;              // what the decoder did, for the Inspector (rule 2)
     int cfa = 0;                   // 0 none, 1 Bayer, 2 Quad Bayer - only if READ (rule 3)
     int cfaPattern = 0;            // index into CFA_PATTERNS, meaningless when cfa == 0
+    std::string member;            // this picture's name INSIDE the file; see above
 };
 
 // A format, and whatever reads it in THIS build.
@@ -87,6 +108,13 @@ struct Backend {
     bool (*sniff)(const uint8_t* p, size_t n);                 // magic bytes, never the name
     bool (*decode)(const uint8_t* p, size_t n, std::vector<Image>& out, std::string& err);
     const char* absent;            // why there is no decoder; nullptr when there is one
+    // What THIS format calls a named part, for the one line the Inspector
+    // prints over `Image::member`. nullptr = the format has no named parts.
+    // It is a column of this table because it is a fact about the format, and
+    // because the alternative - the Inspector testing the extension itself -
+    // is a second place that knows what an .exr is, which is precisely what
+    // this seam exists to prevent.
+    const char* partWord;
 };
 
 // The table, in dispatch order. THE ONLY PLACE A LIBRARY IS NAMED.

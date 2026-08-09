@@ -181,7 +181,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 - **Reinterpret raw...**: RAW 由来の画像を画素フォーマットから読み直し(ダイアログ再表示、
   ビュー位置・ズームは維持)
 
-### 2.3b PNG / JPEG / TIFF
+### 2.3b PNG / JPEG / TIFF / OpenEXR
 
 そのまま開けます。**値は保存されたまま** —— 8bit は 0..255、16bit は 0..65535 [DN] で、
 **0..1 に正規化しません**。表示レンジの初期値だけがビット深度から決まります。
@@ -191,6 +191,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 | **PNG** | 1/2/4/8/16 bit、grey / grey+alpha / RGB / RGBA / palette / interlace | **16bit がそのまま 16bit で入ります** |
 | **JPEG** | baseline / progressive、8bit | codec の YCbCr→RGB を通った値である旨が note に出ます |
 | **TIFF** | 8/16bit 整数と **32bit float**、grey / grey+alpha / RGB / RGBA、II・MM 両方、strip、無圧縮 / PackBits / LZW / Deflate(predictor 付きも) | **複数ページは stack になります**(下記)。読めないものは**名指しで断ります** |
+| **OpenEXR** | half / float、scanline と 1レベル tiled、圧縮は全種(ZIP・PIZ・DWA など) | **シーンリニアの値をそのまま**入れます —— トーンマップも clamp もしません。**レイヤは1枚ずつ別の画像**になります(下記) |
 
 - チャンネル数は npy と同じ規則: **grey は 1ch、RGBA は 4ch**(モノクロが 4ch に
   水増しされることはありません)
@@ -222,6 +223,35 @@ scan_tiled.tif: TIFF: tiled layout (TileWidth 256, TileLength 256): this build
   reads strip layouts (tiffread 1, core/tiffread.cpp)
   choose a reader to read it another way
 ```
+
+**OpenEXR は「レイヤ = 別の画像」です。** `.exr` が `diffuse` と `specular` の
+2レイヤを持つなら、開くと **2枚の画像**(`beauty.exr:diffuse` と
+`beauty.exr:specular`)になります —— 複数ページ TIFF のような1つの stack では
+ありません。レイヤは順番でも同じ形でもなく(`diffuse` は 3ch、`Z` は 1ch)、
+`.npz` のメンバと同じものだからです。**セッションは開いていたレイヤだけを
+開き直します**。同じ layer 名に `R`,`G`,`B`(あれば `A`)が揃っていればまとめて
+1枚のカラー画像になり、それ以外のチャンネルは **1本ずつ 1ch の画像**になります。
+
+**値には何もしません。** シーンリニアの EXR は 1 を超える値も負の値も普通に
+持ちます。`12.5` は `12.5` のまま入り、half は float に**無損失で**広がります。
+**トーンマップ・ガンマ・0..1 への clamp はいずれも行いません** —— 見た目を
+整えるのは表示レンジ(§3)の仕事で、測定値の側には触りません。
+
+**OpenEXR が断るもの**: multi-part / deep / **mipmap・ripmap(複数解像度)** /
+chroma subsample されたチャンネル・`Y`/`RY`/`BY` / **UINT チャンネル**。
+**tiled(1レベル)は読めます** —— タイルは格納形式にすぎず可逆に解けるためです。
+mipmap を断るのは「どの解像度がその絵か」を勝手に選ばないためです。
+
+```
+beauty.exr: OpenEXR: multi-part EXR (2 parts): each part is a separate image
+  with its own header, and which one was meant is not something a loader may
+  decide (OpenEXR 3.4.13)
+  choose a reader to read it another way
+```
+
+`.exr` の対応は `-DVIEWER_WITH_EXR=OFF` でビルドから外せます。外したビルドでも
+`.exr` は**形式として残り**、「このビルドは OFF で構成されている」と名指しで
+断ります(黙って「不明なファイル」にはなりません)。
 
 設計と、ライブラリの差し替え方: [input-adapters.md §3.6](input-adapters.md)
 
