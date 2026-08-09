@@ -188,7 +188,7 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 | PNG | stb_image 2.30 (1ヘッダ、MIT/PD、`third_party/stb/` に vendor) | 8/16bit、grey/GA/RGB/RGBA/palette |
 | JPEG | 同上 | baseline / progressive、8bit |
 | TIFF | **自前** (`core/tiffread.cpp`、`tiffread 1`) | classic TIFF (magic 42)、II/MM 両方、strip、8/16bit 符号なし整数と 32bit IEEE float、grey (WhiteIsZero/BlackIsZero) と RGB (±alpha)、none/PackBits/LZW/Deflate、predictor 1/2、**複数ページ = stack** |
-| OpenEXR | 公式 OpenEXR 3.4.13 + Imath 3.2.2 (`core/exrread.cpp`、`-DVIEWER_WITH_EXR=OFF` で外せる) | scanline と 1レベル tiled、half/float、全圧縮 (NONE/RLE/ZIP/ZIPS/PIZ/PXR24/B44/DWA)、**レイヤ = document** |
+| OpenEXR | 公式 OpenEXR 3.4.13 + Imath 3.2.2 (`core/exrread.cpp`、**常にリンクされる**) | scanline と 1レベル tiled、half/float、全圧縮 (NONE/RLE/ZIP/ZIPS/PIZ/PXR24/B44/DWA)、**レイヤ = document** |
 | y4m (YUV4MPEG2) | **自前** (`core/y4mread.cpp`、`y4mread 1`) | progressive、8〜16bit の**輝度プレーンのみ**、Cmono/C444/C422/C420/C411 (jpeg/mpeg2/paldv 込み)、**1ファイル = 1 stack**。他の動画コンテナは名指しで拒否 |
 
 **値の扱い — 宣言する、推測しない。**
@@ -312,13 +312,23 @@ deep を断いても scanline half/float は残り、その中身は PIZ (wavele
 DWA (DCT) である。レンダラが実際に書くのはそれなので、NONE と ZIP だけの
 自前リーダは**開けないファイルの山**を作る。つまりここには「小さくて正直な
 リーダ」という選択肢が無い。代償は隠さない: OpenEXR + Imath はこの木で最も重い
-依存で、実測は `docs/media-support.md` §1、ライセンスは THIRD-PARTY-NOTICES.md、
-外し方は `-DVIEWER_WITH_EXR=OFF`。
+依存で、実測は `docs/media-support.md` §1、ライセンスは THIRD-PARTY-NOTICES.md。
 
-**`-DVIEWER_WITH_EXR=OFF` のとき**: `.exr` の行は**表に残る**。listed・sniff
-される・dispatch される、そして「このビルドは `-DVIEWER_WITH_EXR=OFF` で
-構成されている」と名指しで断る (`Backend::absent`、§3.2 の体裁のまま)。
-`--media-selftest` はその構成で EXR の assert を**声を出して skip** する。
+**外し方は無い** (#53 の裁定、2026-08-09 —— 「既定ONで。OFFにするパスは
+不要です」)。`VIEWER_WITH_EXR` という option は**削除**した。`.exr` を読むのは
+この viewer の性質であって、ビルドの構成項目ではない。したがって
+`--media-selftest` の EXR assert (M16-M23) は**常に走る** —— 「この構成では
+skip する」という出口が無くなったので、skip する構成も無い。
+
+**その代償を正直に書く**: OFF の道が無くなったので、**ネットワークの無い
+clean clone は、OpenEXR/Imath が既にマシンに入っていない限りビルドできない**。
+FetchContent が無条件になったからである。これはまさに `third_party/stb/` と
+自前 TIFF リーダ (§3.6.1) が守っている性質で、そこと逆の結論になっているのは
+承知の上。和らげるものは 2つあり、どちらも意図的に残してある:
+`find_package(OpenEXR)` を先に試すこと (システムに入っていればダウンロード
+しない) と、`-DFETCHCONTENT_SOURCE_DIR_IMATH` /
+`-DFETCHCONTENT_SOURCE_DIR_OPENEXR` でローカルの source tree を指せること。
+vendor 化や CI キャッシュはこれを完全に消すが、それは持ち主の判断。
 
 **フォルダ = stack**: `.exr` が並んだフォルダは 1 stack になる。判定は
 `imagefile::forPath` で行うので、この表に足された形式は自動的にそうなる

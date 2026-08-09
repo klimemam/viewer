@@ -28,8 +28,8 @@ ls build/_deps/*/LICENSE*                          # the texts quoted below
 | miniz | 3.0.2 | MIT | yes | yes | no |
 | portable-file-dialogs | commit `c12ea8c` | WTFPL-2.0 | yes (header-only) | no | no |
 | stb_image | commit `013ac3b` (v2.30) | MIT **or** public domain (Unlicense) | yes | no | no |
-| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes, when `VIEWER_WITH_EXR=ON` (the default) | no | no |
-| Imath | v3.2.2 | BSD-3-Clause | yes, when `VIEWER_WITH_EXR=ON` (the default) | no | no |
+| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes | no | no |
+| Imath | v3.2.2 | BSD-3-Clause | yes | no | no |
 
 `viewer-serve` is the remote peer. It reads `.npy` only, so it links neither a
 window toolkit nor an image decoder - which is also why the Ubuntu 20.04
@@ -41,13 +41,20 @@ OpenEXR *wrapper* (`core/exrread.cpp` - the library itself is the row above) and
 the reader harness shipped beside the binaries (`tools/import/*.py`) are this
 project's own code, under the repository's own Apache-2.0 licence.
 
-**OpenEXR is the one row that a build can legitimately not have.**
-`-DVIEWER_WITH_EXR=OFF` links neither it nor Imath, and `.exr` then refuses by
-naming that option (`core/imagefile.h`, the `absent` state). A binary built that
-way needs neither notice below; the ones this project publishes are built with
-the default, so both are included and both are reproduced. OpenEXR 3.4 vendors
-libdeflate and OpenJPH inside its own tree and both are covered by the notice
-OpenEXR ships, quoted below with it.
+**OpenEXR and Imath are in every build.** There used to be a
+`-DVIEWER_WITH_EXR=OFF` that linked neither, so the `yes` column above had to be
+qualified; that option was removed by #53's ruling (2026-08-09) and the two rows
+are now as unconditional as the five above them. Nobody has to check how a
+binary was configured before deciding whether these notices apply to it - they
+always do. OpenEXR 3.4 vendors libdeflate and OpenJPH inside its own tree and
+both are covered by the notice OpenEXR ships, quoted below with it.
+
+The other side of that is a **build** property rather than a licensing one, and
+it is recorded in `CMakeLists.txt` beside the fetch: with no OFF path, a clean
+clone with no network cannot be built unless the machine already provides
+OpenEXR and Imath (`find_package` is tried first, and
+`FETCHCONTENT_SOURCE_DIR_IMATH` / `FETCHCONTENT_SOURCE_DIR_OPENEXR` point the
+build at local source trees).
 
 ## Not bundled, and why it is worth saying
 

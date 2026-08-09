@@ -22,11 +22,17 @@
 //     does not exist here, and the choice is the official library or nothing.
 //
 // The cost of that is real and is not hidden: OpenEXR + Imath is the heaviest
-// dependency in this tree. CMakeLists.txt carries the fetch and the offline
-// escape, docs/media-support.md §1 carries the measured build and binary cost,
-// and THIRD-PARTY-NOTICES.md carries the licence. -DVIEWER_WITH_EXR=OFF removes
-// all of it and leaves .exr LISTED with no decoder, which is a first-class
-// state of the table above rather than a hole.
+// dependency in this tree. CMakeLists.txt carries the fetch, docs/
+// media-support.md §1 carries the measured build and binary cost, and
+// THIRD-PARTY-NOTICES.md carries the licence.
+//
+// AND THERE IS NO SWITCH TO TURN IT OFF (#53, 2026-08-09: 「既定ONで。OFFに
+// するパスは不要です」). .exr is read by this viewer the way .png is - a
+// property of the program, not of how someone configured it - so this file is
+// compiled unconditionally and the row below always has a decoder behind it.
+// What that costs is written where the fetch is (CMakeLists.txt, the OpenEXR
+// block): with no OFF path, an offline clean clone needs a system OpenEXR, or
+// a local source tree named to FetchContent, or the network.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -36,24 +42,14 @@
 
 namespace imagefile {
 
-// What is linked for .exr in THIS build, for the `library` column and for the
-// refusals that name it. "" when there is none.
+// What is linked for .exr, for the `library` column of the table and for the
+// refusals that name it. Version included, from the library's own header.
 extern const char* const EXR_LIBRARY;
 
-// Why there is no decoder, or nullptr when there is one. This is the `absent`
-// column: with -DVIEWER_WITH_EXR=OFF the format stays listed, stays dispatched
-// to, and refuses with a sentence naming the build option - which is a far more
-// useful answer than "unknown file, try the raw dialog".
-extern const char* const EXR_ABSENT;
-
-// The `decode` column: &exrDecode, or nullptr when EXR_ABSENT is set. A pointer
-// rather than a function so that core/imagefile.cpp needs no #ifdef to build
-// its table - the table stays a table.
-//
-// One picture per LAYER, in the file's channel order, each carrying its layer
-// name in Image::member. A layer is a NAMED part, so several of them are
-// several documents and never the frames of a stack (core/imagefile.h).
-extern bool (*const EXR_DECODE)(const uint8_t* p, size_t n,
-                                std::vector<Image>& out, std::string& err);
+// The `decode` column. One picture per LAYER, in the file's channel order, each
+// carrying its layer name in Image::member. A layer is a NAMED part, so several
+// of them are several documents and never the frames of a stack
+// (core/imagefile.h).
+bool exrDecode(const uint8_t* p, size_t n, std::vector<Image>& out, std::string& err);
 
 }  // namespace imagefile
