@@ -482,15 +482,152 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     }
 }
 
+// ---- writing a file without destroying the one that is already there --------
+// Opening the target with an ofstream TRUNCATES it. From that instant until the
+// last byte lands there is no complete file on disk at all, so a crash, a full
+// disk or a machine switched off mid-write leaves nothing where the previous
+// session used to be. That is not a rare corner for this particular file:
+// autosaveSession() goes through exactly the same call every few seconds,
+// unattended, and what it destroys on the way down is the one copy of the
+// arrangement the user would want back.
+//
+// So the target is never opened for writing at all. A NEW file is written
+// beside it, put on the disk, and then moved over the target in one directory
+// operation - after which a reader sees either the whole old file or the whole
+// new one and never a half of either. Every failure leaves the OLD file exactly
+// as it was and says, in the platform's own words, what went wrong.
+//
+// BESIDE the target, in the same directory, is load-bearing rather than tidy:
+// rename is a single metadata operation only WITHIN one filesystem. A temp
+// under %TEMP% or /tmp is usually another volume, where the rename degrades
+// into copy-then-delete - the truncate-and-write this exists to avoid, with an
+// extra pass over the data on top.
+//
+// WHY std::filesystem::rename and not ReplaceFileW. libstdc++ implements
+// fs::rename as MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows and rename(2)
+// elsewhere, so this is one call for the whole matrix. Measured on this
+// toolchain (MinGW/UCRT, Windows 11), not assumed:
+//
+//   case                              fs::rename            ReplaceFileW
+//   target absent (any first save)    OK                    FAIL  err 2
+//   target present                    OK                    OK
+//   target open by this process       FAIL  err 5           FAIL  err 32
+//   target open, FILE_SHARE_DELETE    FAIL  err 5           -
+//   target FILE_ATTRIBUTE_READONLY    FAIL  err 5           FAIL  err 5
+//
+// In every failing row the target still held its old bytes - which is the whole
+// property being bought here, and both calls have it. They also fail in the
+// same places, so ReplaceFileW's one real advantage (the replacement inherits
+// the target's ACL, creation time and object id instead of the temp's) buys
+// nothing for a file this app creates in the user's own config directory, while
+// costing a second code path for the save where the target does not exist yet.
+//
+// What Windows does that POSIX does not, and the user is therefore told rather
+// than left guessing: a READ-ONLY target cannot be replaced (POSIX rename asks
+// about the DIRECTORY's permissions, not the file's), and neither can one that
+// any process still holds open - not even with FILE_SHARE_DELETE, measured
+// above. Both surface as "session NOT saved: <reason>".
+static unsigned long currentPid();                  // fwd (with the lock code below)
+
+static std::string savingTempPath(const std::string& utf8Path) {
+    // Named after the target so a leftover from a hard crash is obviously
+    // attached to the file it was going to become. The pid is in it because two
+    // viewers saving to ONE path (a share, "Save As" from both) must not write
+    // into one temp: a shared temp would make the rename atomic and the CONTENT
+    // interleaved, which is worse than the defect being fixed.
+    return utf8Path + ".saving-" + std::to_string(currentPid());
+}
+
+// Push the bytes past the OS cache before the rename. The rename is what makes
+// the new file THE file, and if the rename reaches the disk while the bytes
+// have not, a power cut leaves a session file full of zeroes where a whole old
+// one used to be. The DIRECTORY entry is deliberately not synced as well:
+// without that, a power cut can leave the OLD name in place - and the old file,
+// whole, is an outcome this is allowed to have. It is the only outcome it is
+// allowed to have besides the new one.
+static void syncFileToDisk(const std::string& utf8Path) {
+#if defined(_WIN32)
+    int fd = _wopen(pathFromUtf8(utf8Path).wstring().c_str(), _O_RDWR | _O_BINARY);
+    if (fd >= 0) { _commit(fd); _close(fd); }   // _commit needs write access
+#else
+    int fd = open(pathFromUtf8(utf8Path).c_str(), O_WRONLY);
+    if (fd >= 0) { if (fsync(fd) != 0) { /* best effort: the rename still gates */ } close(fd); }
+#endif
+}
+
+// true on success. On failure nothing at utf8Path has been touched and *whyOut
+// says why, ready to be shown to a person.
+static bool writeFileAtomically(const std::string& utf8Path,
+                                const std::function<void(std::ostream&)>& emit,
+                                std::string* whyOut) {
+    std::string tmp = savingTempPath(utf8Path);
+    std::error_code ec;
+    auto giveUp = [&](const std::string& why) {
+        std::error_code rm;
+        std::filesystem::remove(pathFromUtf8(tmp), rm);   // never leave a half one behind
+        if (whyOut) *whyOut = why;
+        return false;
+    };
+    {
+        std::ofstream f(pathFromUtf8(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return giveUp("cannot create " + baseName(tmp));
+        emit(f);
+        f.flush();
+        // A full disk does not announce itself at open() - it announces itself
+        // here, or at close(), and an ofstream that is never asked swallows it.
+        // Asking is the difference between "the write failed" and "a session
+        // file of the right name and the wrong length".
+        if (!f.good()) { f.close(); return giveUp("the write failed (disk full?)"); }
+        f.close();
+        if (f.fail()) return giveUp("the write could not be completed (disk full?)");
+    }
+    syncFileToDisk(tmp);
+    std::filesystem::rename(pathFromUtf8(tmp), pathFromUtf8(utf8Path), ec);
+    if (ec) return giveUp(ec.message());
+    return true;
+}
+
+// The crash handler holds the autosave file OPEN for the life of the process
+// (openCrashFile, further down: a SIGSEGV handler must not be opening files).
+// That single fd is what makes the rename above a platform question:
+//
+//   * Windows refuses to replace a file anyone has open - ERROR_ACCESS_DENIED,
+//     measured, and FILE_SHARE_DELETE does not rescue it - so the autosave, the
+//     one save that runs unattended, could never complete;
+//   * POSIX allows the rename and then leaves that fd pointing at the file that
+//     was just replaced, so the next crash would write its snapshot into a file
+//     with no name in any directory.
+//
+// One fix for both: drop the fd, replace the file, take a fresh one on the new
+// file. In the window between them a crash writes nothing and the autosave on
+// disk is still the previous one - which is the same amount of work a crash
+// between two autosaves loses anyway.
+static bool releaseCrashFileFor(const std::string& path);   // fwd
+static void retakeCrashFile();                              // fwd
+
 static void saveSession(std::string path, bool quiet = false) {
     // A saved session has no transients - but the way to honour that is to
     // leave the preview OUT of the file (isSavedLine), not to promote it into
     // a real open behind the user's back.
     if (path.find('.') == std::string::npos) path += ".vsession";
-    std::ofstream f(pathFromUtf8(path), std::ios::binary);
-    if (!f) { if (!quiet) toast("cannot write session file", true); return; }
     int lostSeries = 0, lostMembers = 0, lostSets = 0, lostSetRoles = 0;
-    writeSessionTo(f, &lostSeries, &lostMembers, &lostSets, &lostSetRoles);
+    bool retake = releaseCrashFileFor(path);
+    std::string why;
+    bool ok = writeFileAtomically(path, [&](std::ostream& f) {
+        writeSessionTo(f, &lostSeries, &lostMembers, &lostSets, &lostSetRoles);
+    }, &why);
+    if (retake) retakeCrashFile();
+    if (!ok) {
+        // The news is not that a write failed; it is that nothing was lost by
+        // it - the file they had is still the file they have. The autosave says
+        // it in the Messages log instead of a toast: it runs every few seconds
+        // with nobody watching, and logMsg drops a repeat of the line it just
+        // wrote, so a disk that stays full says this once and not forever.
+        std::string msg = "session NOT saved: " + why + " - the previous " +
+                          baseName(path) + " is unchanged";
+        if (quiet) logMsg(msg, true); else toast(msg, true);
+        return;
+    }
     if (quiet) return;
     std::string msg = "session saved: " + baseName(path);
     // the load side counts what it could not restore; so does this one now
@@ -1400,6 +1537,25 @@ static void openCrashFile() {
     g_crashFd = open(pathFromUtf8(p).c_str(), O_CREAT | O_RDWR, 0644);
 #endif
 }
+
+// The two halves of the handshake saveSession performs around the rename; the
+// reasoning is written out at their forward declarations, beside the writer
+// that needs them. Answering "is this the file we hold open" by PATH and not by
+// identity is on purpose: a false negative costs a failed save that reports
+// itself and leaves the old file whole, which is the outcome this whole change
+// is about, while stat()-ing the target on every autosave would buy nothing.
+static bool releaseCrashFileFor(const std::string& path) {
+    if (g_crashFd < 0 || path.empty() || path != autosavePath()) return false;
+#if defined(_WIN32)
+    _close(g_crashFd);
+#else
+    close(g_crashFd);
+#endif
+    g_crashFd = -1;                 // the handler checks this: it now writes nothing
+    return true;
+}
+
+static void retakeCrashFile() { openCrashFile(); }
 
 static void crashHandler(int sig) {
     static volatile sig_atomic_t inHandler = 0;

@@ -323,6 +323,157 @@
             }
         }
 
+        // N9: a save that fails leaves the session that was already there.
+        //
+        // This is the one property the session file has to have and the one it
+        // did not: saveSession opened the TARGET with an ofstream, which
+        // truncates, so from that call until the last byte landed there was no
+        // whole session on disk anywhere - and autosaveSession, running
+        // unattended every few seconds, went through the same line.
+        //
+        // The failures below are made to happen for real rather than asserted
+        // about a branch nobody entered. A directory sitting on the temp path
+        // is a write that cannot start (measured: an ofstream will not open a
+        // directory on any of the three platforms); a directory sitting on the
+        // TARGET path is a rename that cannot land. Both are exactly the shape
+        // of the accidents this exists for - a full disk, a locked file, a
+        // machine switched off - and both must end with the old bytes intact.
+        {
+            std::string sp = dir + "/keepme.vsession";
+            app.dispGamma = 2.2f;                  // something to recognise
+            app.showGrid = true;
+
+            // A whole session on disk to protect, written the way the app
+            // writes one.
+            saveSession(sp, true);
+            std::vector<uint8_t> good;
+            bool hadGood = readFileBytes(sp, good);
+            check(hadGood && !good.empty(), "N9 a session is written to start from");
+            check(!std::filesystem::exists(pathFromUtf8(savingTempPath(sp)), ec),
+                  "N9 a save that worked leaves no temp file behind");
+
+            // What the file contains is not allowed to change because of how it
+            // is now written: byte for byte what writeSessionTo emits.
+            {
+                std::ostringstream direct;
+                writeSessionTo(direct);
+                std::string onDisk(good.begin(), good.end());
+                check(onDisk == direct.str(),
+                      "N9 the atomic save writes exactly what the session renderer emits");
+            }
+
+            // (a) the temp cannot be created: the write never starts.
+            {
+                std::string tp = savingTempPath(sp);
+                std::filesystem::remove_all(pathFromUtf8(tp), ec);
+                std::filesystem::create_directory(pathFromUtf8(tp), ec);
+                // Not empty, on purpose: the writer removes its own temp when a
+                // save fails, and remove() takes an EMPTY directory with it. A
+                // blocker that survives the attempt is what makes this test say
+                // the same thing on a re-run as it does the first time.
+                { std::ofstream in(pathFromUtf8(tp + "/pin.txt"), std::ios::binary); in << "x"; }
+                app.dispGamma = 9.9f;              // a change that must NOT land
+                size_t logBefore = app.msgLog.size();
+                saveSession(sp, true);             // quiet: the autosave's own path
+                std::vector<uint8_t> after;
+                bool hadAfter = readFileBytes(sp, after);
+                check(hadAfter && after == good,
+                      "N9 a save whose temp cannot be written leaves the session byte-identical");
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("session NOT saved") != std::string::npos &&
+                        app.msgLog[i].text.find("is unchanged") != std::string::npos)
+                        said = true;
+                check(said, "N9 the unattended save says what happened and that nothing was lost");
+                std::filesystem::remove_all(pathFromUtf8(tp), ec);
+            }
+
+            // (b) the rename cannot land: the target is a directory. The temp
+            // is written and then has nowhere to go, and the thing already at
+            // that path survives untouched.
+            {
+                std::string bp = dir + "/blocked.vsession";
+                std::filesystem::create_directory(pathFromUtf8(bp), ec);
+                { std::ofstream in(pathFromUtf8(bp + "/inside.txt"), std::ios::binary); in << "x"; }
+                size_t logBefore = app.msgLog.size();
+                saveSession(bp, true);
+                check(std::filesystem::is_directory(pathFromUtf8(bp), ec) &&
+                      std::filesystem::exists(pathFromUtf8(bp + "/inside.txt"), ec),
+                      "N9 a rename that cannot land destroys nothing at the target");
+                check(!std::filesystem::exists(pathFromUtf8(savingTempPath(bp)), ec),
+                      "N9 a failed save cleans its own temp away");
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("session NOT saved") != std::string::npos)
+                        said = true;
+                check(said, "N9 a failed rename is reported, not swallowed");
+                std::filesystem::remove_all(pathFromUtf8(bp), ec);
+            }
+
+            // (c) the same save, unobstructed, still lands - and comes back.
+            {
+                app.dispGamma = 1.75f;
+                app.showGrid = false;
+                saveSession(sp, true);
+                app.dispGamma = 0.5f;
+                app.showGrid = true;
+                std::string lerr = loadSession(sp);
+                check(lerr.empty() && app.dispGamma > 1.74f && app.dispGamma < 1.76f &&
+                      !app.showGrid,
+                      "N9 a normal save still round-trips through the file");
+            }
+
+            // (d) the autosave file is held OPEN by the crash handler for the
+            // whole life of the process (openCrashFile). Windows refuses to
+            // replace a file anyone has open - measured, ERROR_ACCESS_DENIED,
+            // and FILE_SHARE_DELETE does not help - so without the handshake in
+            // saveSession the autosave could never complete there. POSIX would
+            // let the rename through and leave that fd on the file that was
+            // replaced, so the next crash would write its snapshot into a file
+            // with no name. Both halves are pinned here: the save succeeds, and
+            // the fd afterwards is on the file that path now names.
+            {
+                std::string ap = autosavePath();
+                if (!ap.empty() && g_crashFd >= 0) {
+                    std::vector<uint8_t> apBefore;
+                    bool hadAp = readFileBytes(ap, apBefore);
+                    app.dispGamma = 1.25f;
+                    saveSession(ap, true);          // exactly what autosaveSession calls
+                    std::vector<uint8_t> apAfter;
+                    bool wrote = readFileBytes(ap, apAfter);
+                    check(wrote && apAfter != apBefore && !apAfter.empty(),
+                          "N9 the autosave file is replaced even while the crash fd holds it");
+                    check(g_crashFd >= 0, "N9 the crash fd is taken again after the replace");
+                    // The fd has to be on the file this path names now, or a
+                    // crash would write the snapshot into an orphan.
+                    const char mark[] = "viewer-session";
+#if defined(_WIN32)
+                    _lseek(g_crashFd, 0, SEEK_SET);
+                    _write(g_crashFd, "VIEWER-SESSION", (unsigned)(sizeof mark - 1));
+                    _commit(g_crashFd);
+#else
+                    lseek(g_crashFd, 0, SEEK_SET);
+                    ssize_t iw = write(g_crashFd, "VIEWER-SESSION", sizeof mark - 1);
+                    (void)iw;
+                    if (fsync(g_crashFd) != 0) { /* best effort */ }
+#endif
+                    std::vector<uint8_t> apMarked;
+                    readFileBytes(ap, apMarked);
+                    check(apMarked.size() >= sizeof mark - 1 &&
+                          std::string(apMarked.begin(),
+                                      apMarked.begin() + (sizeof mark - 1)) == "VIEWER-SESSION",
+                          "N9 the crash fd writes into the file the path now names");
+                    if (hadAp) {                    // put the autosave back as found
+                        std::ofstream rf(pathFromUtf8(ap), std::ios::binary);
+                        rf.write((const char*)apBefore.data(), (std::streamsize)apBefore.size());
+                    } else {
+                        std::filesystem::remove(pathFromUtf8(ap), ec);
+                    }
+                }
+            }
+            closeAll();
+        }
+
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
         fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
         return ok ? 0 : 1;
