@@ -104,6 +104,76 @@
                   L.fitValid && L.readFromDark && fabs(L.readDN[0] - 3.0) <= 0.15);
         }
 
+        // ---- the session round trip of an IN-FILE stack -----------------------
+        // This fixture is the only one in the suite whose stacks are carried by
+        // the FILE (one 8-frame capture.npy per level), and that is the half of
+        // the session format nothing was checking. The saved line is written
+        // from the frame the stack was left on - its range, its LUT, its batch -
+        // but the loader rebuilds the whole stack from that one line and leaves
+        // `cur()` on frame 0, so everything the line said used to land there
+        // while `seqframe` put the user back on the representative frame,
+        // looking at the decode-time defaults. Worse than a display slip: the
+        // batch moved ONE frame out of the stack, which breaks the canon's
+        // frame ⊂ stack ⊂ batch (moveStackToBatch's own invariant) and makes
+        // the NEXT autosave write the leaf batch and the default range back -
+        // one save/load cycle and the user's grouping is silently gone.
+        //
+        // A folder stack does not have this: pumpSequence copies the head's
+        // black/white/lut/cfa/batch onto every sibling as they land. The assert
+        // is that both halves of the format agree.
+        {
+            std::error_code sec;
+            int sidLv = 0;
+            for (const auto& si : app.seqs) if (si.name == "lv080/capture.npy") sidLv = si.id;
+            std::vector<int> fr = sidLv ? framesOfSeq(sidLv) : std::vector<int>();
+            check("the in-file stack to round-trip is up with its 8 frames",
+                  fr.size() == 8);
+            if (fr.size() == 8) {
+                const int REP = 5;                 // NOT frame 0: that is the point
+                selectImage(fr[REP]);
+                setRange(*app.images[fr[REP]], 100.0f, 4000.0f);
+                app.images[fr[REP]]->displayLut = 0;
+                int nb = newBatch(uniqueBatchName("night run"));
+                moveStackToBatch(sidLv, nb);
+                std::string sess = (std::filesystem::temp_directory_path(sec) /
+                                    "viewer_sweepfile_infile.vsession").u8string();
+                saveSession(sess, true);
+                std::string lerr = loadSession(sess);
+                check("the in-file session reloaded", lerr.empty());
+                loadAll();
+                int rid = 0;
+                for (const auto& si : app.seqs) if (si.name == "lv080/capture.npy") rid = si.id;
+                std::vector<int> rf = rid ? framesOfSeq(rid) : std::vector<int>();
+                int night = 0;
+                for (const auto& b : app.batches) if (b.name == "night run") night = b.id;
+                int offRange = 0, offBatch = 0, offLut = 0;
+                for (int idx : rf) {
+                    const ImageDoc* d = app.images[idx].get();
+                    if (d->black != 100.0f || d->white != 4000.0f) offRange++;
+                    if (d->batchId != night) offBatch++;
+                    if (d->displayLut != 0) offLut++;
+                }
+                const ImageDoc* c = cur();
+                fprintf(stderr, "sweepfile: in-file round trip: %d frame(s) back, "
+                                "%d off-range, %d off-batch, %d off-lut; standing on "
+                                "frame %d at %.6g..%.6g (batch '%s')\n",
+                        (int)rf.size(), offRange, offBatch, offLut,
+                        c ? c->seqIndex : -1, c ? c->black : -1, c ? c->white : -1,
+                        c ? batchNameOf(c->batchId).c_str() : "");
+                check("an in-file stack comes back whole, 8 frames", rf.size() == 8);
+                check("...with the saved range on EVERY frame, not just frame 0",
+                      rf.size() == 8 && offRange == 0);
+                check("...and the saved LUT on every frame", rf.size() == 8 && offLut == 0);
+                check("...the WHOLE stack in the batch the line named",
+                      night != 0 && rf.size() == 8 && offBatch == 0);
+                check("...standing on the representative frame, showing its range",
+                      c && c->seqIndex == REP && c->black == 100.0f && c->white == 4000.0f);
+            }
+            std::filesystem::remove(std::filesystem::u8path(
+                (std::filesystem::temp_directory_path(sec) /
+                 "viewer_sweepfile_infile.vsession").u8string()), sec);
+        }
+
         // ---- a rename while the sweep is still loading -------------------------
         // Files renames a stack (F2 / right-click) the instant its head frame
         // lands, which is long before every queue drains and the sweep resolves.

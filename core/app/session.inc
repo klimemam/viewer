@@ -1775,7 +1775,19 @@ static std::string loadSession(const std::string& path) {
         else if (key == "imgbatch") {   // batch of the image above, by name
             std::string nm = restOfLine(ls);
             if (!nm.empty() && lastImageOk && cur()) {
-                cur()->batchId = batchReuse(nm);
+                int bid = batchReuse(nm);
+                // frame ⊂ stack ⊂ batch: a stack the FILE carries is already
+                // whole here (loadNpy/loadNpz/the container build it in one
+                // call), and assigning cur() alone moved its representative
+                // frame out on its own - the exact thing moveStackToBatch
+                // exists to prevent. "close batch" then closed the whole stack
+                // from either side, and the next autosave wrote the leaf batch
+                // back, so one save/load cycle silently undid the move.
+                // A FOLDER stack's siblings are not here yet (seqId == 0 at
+                // this point); they inherit the head's batch at integration,
+                // in pumpSequence.
+                if (cur()->seqId != 0) moveStackToBatch(cur()->seqId, bid);
+                else cur()->batchId = bid;
                 app.imagesRev++;
             }
         }
@@ -2124,6 +2136,34 @@ static std::string loadSession(const std::string& path) {
             lastImageOk = true;
             cur()->black = bk; cur()->white = wt; cur()->texDirty = true;
             cur()->displayLut = pendingLut; pendingLut = -1;
+            // ONE line per stack, and the line was written from the frame the
+            // stack was left on (isSavedLine) - so for a stack the FILE carries
+            // (an .npy frame axis, an .npz member, a container node) everything
+            // above has just landed on frame 0, which is where the rebuild
+            // leaves cur(). `seqframe` then selects the representative frame,
+            // which is still holding its decode-time defaults: the user comes
+            // back to the wrong range, the wrong LUT and the wrong mosaic
+            // reading, with the saved ones sitting invisibly on a frame nobody
+            // is looking at.
+            //
+            // Give the line to the whole stack, which is what the OTHER half of
+            // the format already does: pumpSequence copies exactly these fields
+            // from a folder stack's head onto every sibling as it lands. The
+            // format cannot express a per-frame range (it writes one line), so
+            // making both halves agree is the only reading of it that survives
+            // a round trip.
+            if (cur()->seqId != 0) {
+                const ImageDoc* ref = cur();
+                for (int idx : framesOfSeq(ref->seqId)) {
+                    ImageDoc* d = app.images[idx].get();
+                    if (d == ref) continue;
+                    d->black = ref->black; d->white = ref->white;
+                    d->displayLut = ref->displayLut;
+                    d->cfa = ref->cfa; d->cfaPattern = ref->cfaPattern;
+                    d->cfaColorize = ref->cfaColorize;
+                    d->texDirty = true;
+                }
+            }
             if (lineOrd == wantCurrent) capturing = true;
         }
     }
