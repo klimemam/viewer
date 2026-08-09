@@ -1352,7 +1352,14 @@ static void handleMeasure(Buf& in) {
         }
         perr[0] = 0;
         int32_t rc;
-        if (ana->abi == 2) {
+        // Three descriptor generations, one measurement path. The peer runs the
+        // SAME dlls the local host runs, so a v3 analyzer that only the local
+        // side could call would turn "MEASURE runs the same plugin on both
+        // sides" into a claim that quietly stopped being true.
+        if (ana->abi == 3) {
+            psAnalyzeSink3 sink{ &ctx, mNum, mTxt, mSer, {} };
+            rc = ana->v3.analyze(&fr, rp, &sink, perr, sizeof perr);
+        } else if (ana->abi == 2) {
             psAnalyzeSink2 sink{ &ctx, mNum, mTxt, mSer, {} };
             rc = ana->v2.analyze(&fr, rp, &sink, perr, sizeof perr);
         } else {

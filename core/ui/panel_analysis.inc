@@ -34,14 +34,44 @@ static std::string unitForAnalysisKey(const std::string& key, const std::string&
 }
 
 // The number the user came for, per analyzer: mtf50, prnu%, the noise floor.
-// Host knowledge until an ABI v3 lets plugins declare it - same trade-off as
-// the question groups in the Measure menu, and just as additive.
+// Host knowledge, and it stays host knowledge for exactly as long as the
+// analyzer cannot speak: ABI v3 gives descriptors a `headline` field, so this
+// table is now the V1/V2 fallback only (docs/abi-v3.md §3.2 - "宣言できるなら
+// 宣言が勝つ"). It is not deleted and must not be: the bundled analyzers are
+// V2 registrations and third-party V1/V2 dlls are loadable forever.
 static const char* analyzerHeadlineSuffix(const std::string& name) {
     if (name == "noise/floor")         return ".noise";
     if (name == "uniformity/prnu-fpn") return ".prnu_pct";
     if (name == "sharpness/gradient")  return "tenengrad";
     if (name == "iso12233/e-sfr")      return "mtf50 (cy/px)";
     return nullptr;                    // stats/moments: all rows are peers
+}
+
+// A v3 `headline` is the key with the channel prefix already off (§3.2), so
+// the row it accents is found by stripping the same prefix from the emitted
+// key and comparing whole strings. The V1/V2 table above is matched as a
+// SUFFIX instead, because that is what its entries are (".noise") - two rules
+// because they are two different declarations, not because either is unsure.
+static std::string stripChannelPrefix(const std::string& key) {
+    size_t dot = key.find('.');
+    if (dot == std::string::npos || dot == 0) return key;
+    std::string p = key.substr(0, dot);
+    bool chN = p.size() > 2 && p.compare(0, 2, "ch") == 0 &&
+               p.find_first_not_of("0123456789", 2) == std::string::npos;
+    if (chN || p == "R" || p == "G" || p == "B" || p == "A" ||
+        p == "Gr" || p == "Gb")
+        return key.substr(dot + 1);
+    return key;                        // "mtf50 (cy/px)", "finite ratio": no prefix
+}
+
+// The citation the exports and the hover carry: the version the plugin
+// DECLARED, then the file the ledger witnessed. Version first and in angle
+// brackets so the line stays parseable - a path may contain spaces, and a
+// trailing token after one cannot be told from part of it. Empty version =
+// a V1/V2 analyzer, and the line is then byte-for-byte the stage-1 one: a
+// blank is a fact here, never a placeholder.
+static std::string analyzerCitation(const std::string& version, const std::string& dll) {
+    return version.empty() ? dll : "<" + version + "> " + dll;
 }
 
 // The "Copy table (TSV)" document, built from the panel's cached state. A
@@ -55,7 +85,8 @@ static std::string buildAnalysisTsv() {
     // path (#46), which the status line only shows on hover but a pasted
     // document has room to cite outright
     std::string tsv = "# " + ana.prov + "\n";
-    if (!ana.provDll.empty()) tsv += "# plugin: " + ana.provDll + "\n";
+    if (!ana.provDll.empty())
+        tsv += "# plugin: " + analyzerCitation(ana.provVer, ana.provDll) + "\n";
     tsv += "metric\tunit";
     for (const auto& cn : ana.cols) tsv += "\t" + cn;
     tsv += "\n";
@@ -152,7 +183,16 @@ static void drawPanelAnalysis() {
                 psFrame f = makeFrame(*im);
                 char err[256] = { 0 };
                 int32_t rc;
-                if (anas[app.anaSel].abi == 2) {
+                if (anas[app.anaSel].abi == 3) {
+                    // sink3's three emits ARE sink2's (docs/abi-v3.md §4: the
+                    // call contract is unchanged from V2), so the same ctx and
+                    // the same three callbacks serve both. The seats after them
+                    // stay zero - §8 is a later stage, and a v3 analyzer is
+                    // required to probe before calling one.
+                    AnaEmit2Ctx ectx = { &rows, &ana, (int)ana.cols.size(), colorIdx };
+                    psAnalyzeSink3 sink = { &ectx, ana2Number, ana2Text, ana2Series, {} };
+                    rc = anas[app.anaSel].v3.analyze(&f, roi, &sink, err, sizeof err);
+                } else if (anas[app.anaSel].abi == 2) {
                     AnaEmit2Ctx ectx = { &rows, &ana, (int)ana.cols.size(), colorIdx };
                     psAnalyzeSink2 sink = { &ectx, ana2Number, ana2Text, ana2Series, {} };
                     rc = anas[app.anaSel].v2.analyze(&f, roi, &sink, err, sizeof err);
@@ -204,12 +244,21 @@ static void drawPanelAnalysis() {
             // per-row presentation, derived once here so the draw loop below
             // only reads cached strings (no per-frame string building)
             {
-                const char* hl = analyzerHeadlineSuffix(anas[app.anaSel].name);
+                // A v3 analyzer declares its headline, and a declaration beats
+                // the host's table outright (§3.2): the table is NOT consulted
+                // for v3, not even when the descriptor declares none - "no
+                // headline" is an answer a plugin is allowed to give.
+                const auto& sel = anas[app.anaSel];
+                const std::string& decl = sel.headline;
+                const char* hl = sel.abi >= 3 ? nullptr
+                                              : analyzerHeadlineSuffix(sel.name);
                 size_t hn = hl ? strlen(hl) : 0;
                 for (const auto& k : ana.keys) {
                     ana.units.push_back(unitForAnalysisKey(k, im->dtype));
-                    ana.headline.push_back(hl && k.size() >= hn &&
-                                           k.compare(k.size() - hn, hn, hl) == 0);
+                    ana.headline.push_back(
+                        sel.abi >= 3 ? (!decl.empty() && stripChannelPrefix(k) == decl)
+                                     : (hl && k.size() >= hn &&
+                                        k.compare(k.size() - hn, hn, hl) == 0));
                 }
             }
             {   // Provenance, built once per run and shown verbatim until the
@@ -234,17 +283,24 @@ static void drawPanelAnalysis() {
                          rois.empty() ? "whole image" : tgt + 2,   // tgt = "| N ROI(s)"
                          ana.black, ana.white, ts, ana.runMs);
                 ana.prov = pv;
-                // ...and WHO computed it (#46 stage 1): the analyzer, and the
-                // dll the host's ledger says it came from. Name + basename on
-                // the line - a screenshot must answer "which plugin" without
-                // the session - and the full path one hover away (below) and
-                // in the exports, where a report actually cites it. The
-                // VERSION is still missing on purpose: the ABI has no field
-                // for it until v3 (判断record 6 - one ABI bump, not two).
-                ana.prov += "  |  " + anas[app.anaSel].name;
-                if (!anas[app.anaSel].file.empty())
-                    ana.prov += " (" + anas[app.anaSel].file + ")";
-                ana.provDll = anas[app.anaSel].path;
+                // ...and WHO computed it (#46): the analyzer, the version it
+                // declares, and the dll the host's ledger says it came from.
+                // Name + version + basename on the line - a screenshot must
+                // answer "which plugin, which build" without the session - and
+                // the full path one hover away (below) and in the exports,
+                // where a report actually cites it.
+                //
+                // The version is angle-bracketed and sits between the two
+                // (docs/abi-v3.md §11), and it is ABSENT, not blank, for a
+                // V1/V2 analyzer: those descriptors have no version field, and
+                // an empty <> would read as "declared nothing" where the truth
+                // is "was never asked". Nothing here guesses one.
+                const auto& who = anas[app.anaSel];
+                ana.prov += "  |  " + who.name;
+                if (!who.version.empty()) ana.prov += " <" + who.version + ">";
+                if (!who.file.empty())    ana.prov += " (" + who.file + ")";
+                ana.provDll = who.path;
+                ana.provVer = who.version;
             }
         }
         // Run-state line: one line, every state, constant height - the grid
@@ -257,7 +313,8 @@ static void drawPanelAnalysis() {
             // line, exactly right for the hover that asks "which file, on
             // which disk" - the same answer the exports carry as "# plugin:"
             if (!ana.provDll.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("plugin: %s", ana.provDll.c_str());
+                ImGui::SetTooltip("plugin: %s",
+                                  analyzerCitation(ana.provVer, ana.provDll).c_str());
             if (stale && !ranNow && !app.anaAuto) {
                 // amber, matching the temporal panel's partial-data warning:
                 // old numbers are still shown (they were true when measured),
@@ -286,7 +343,8 @@ static void drawPanelAnalysis() {
             std::string csv = "# " + ana.prov + "\n";
             // same "# plugin:" citation as the TSV: the curves come from the
             // same run as the grid, so they carry the same computer
-            if (!ana.provDll.empty()) csv += "# plugin: " + ana.provDll + "\n";
+            if (!ana.provDll.empty())
+                csv += "# plugin: " + analyzerCitation(ana.provVer, ana.provDll) + "\n";
             std::vector<std::string> names;
             for (const auto& s : ana.series) {
                 bool seen = false;

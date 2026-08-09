@@ -131,6 +131,32 @@ int32_t hostRegisterAnalyzer2(void*, const psAnalyzerV2* a) {
     g_analyzers.push_back(std::move(info));
     return 0;
 }
+int32_t hostRegisterAnalyzer3(void*, const psAnalyzerV3* a) {
+    if (!a || !validCommon(a->abi_version, 3, a->caps, a->name, (const void*)a->analyze)) return 1;
+    // The one check v3 adds (docs/abi-v3.md §3.1). Declaring v3 IS declaring a
+    // version: the freedom to stay anonymous lives in V1/V2, which load
+    // forever, so a v3 descriptor without one is a contradiction. Refused with
+    // its reason on the line rather than filled in by the host - a version the
+    // host invented would be the host citing itself.
+    if (!a->version || !a->version[0]) {
+        logMsg(g_loading + ": v3 analyzer '" + a->name +
+               "' declares no version - rejected (ABI v3 requires a non-empty one)", true);
+        return 1;
+    }
+    if (dupName(g_analyzers, a->name)) return 1;
+    AnalyzerPluginInfo info;
+    info.name = a->name;
+    info.desc = a->description ? a->description : "";
+    info.version = a->version;        // verbatim, and that is the whole contract:
+                                      // never parsed, never ordered, never normalized
+    info.headline = a->headline ? a->headline : "";   // NULL = no headline (§3.2)
+    info.file = g_loading;            // the ledger, same as the V1/V2 registers above
+    info.path = g_loadingPath;
+    info.abi = 3;
+    info.v3 = *a;
+    g_analyzers.push_back(std::move(info));
+    return 0;
+}
 int32_t hostRegisterProcessor(void*, const psProcessorV1* p) {
     if (!p || !validCommon(p->abi_version, 1, p->caps, p->name, (const void*)p->process)) return 1;
     if (dupName(g_processors, p->name)) return 1;
@@ -142,9 +168,10 @@ psHostApi g_api = {
     PS_ABI_VERSION, (uint32_t)sizeof(psHostApi), nullptr,
     hostLog, hostFrameAlloc, hostFrameFree,
     hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor,
-    hostRegisterAnalyzer2,
-    nullptr,                          // register_analyzer3: seat not taken yet
-    {}
+    hostRegisterAnalyzer2, hostRegisterAnalyzer3,
+    {}                                // the seats after it stay NULL on purpose:
+                                      // docs/abi-v3.md §5/§7 are later stages, and
+                                      // a plugin asks by NULL test, not by version
 };
 
 } // namespace

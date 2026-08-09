@@ -5,6 +5,9 @@
 各アナライザは `method` 行に手法と制約を1行で明示する。
 同梱アナライザはすべて ABI v2 登録で、`description`(前提条件1行)を自己申告する。
 Measure メニューはそれをツールチップに出す(UX 設計は [measure-ux.md](measure-ux.md))。
+ホストは ABI v3 記述子(`version` / `headline` を申告する)も受けるが、
+**V1/V2 の登録経路は永久に不変**で、同梱分の V3 移行は別作業
+([abi-v3.md §2.1](abi-v3.md))。
 
 ## 出力キーの規約(単位・見出し)
 
@@ -18,23 +21,38 @@ Measure メニューはそれをツールチップに出す(UX 設計は [measur
   **ファイルの単位**: ホストが dtype から決める(整数 → DN、float → dtype 名。
   float ファイルの物理単位はファイルに書かれていないので断定しない)
 - 相対指標(`varlap` `tenengrad` `grad_mean`)は a.u.(絶対値に意味なし)
-- **見出し数値**(そのアナライザの主目的の数値)はホスト側の対応表で
-  アクセント強調される: `.noise` / `.prnu_pct` / `tenengrad` / `mtf50 (cy/px)`。
-  ABI v3 でプラグイン申告に移す予定
+- **見出し数値**(そのアナライザの主目的の数値)は**プラグインが申告する**:
+  ABI v3 記述子の `headline` 欄(チャンネル接頭辞を剥いだキー名1つ、NULL 可)。
+  ホストは emit されたキーの接頭辞(`chN.` / `R.` / `Gr.` …)を剥いた形が
+  これに一致した行をアクセント強調する。**宣言できるなら宣言が勝つ** ので、
+  v3 記述子にホスト側の対応表は適用しない(申告なし = 見出しなし)。
+  V1/V2 記述子は従来どおりホスト側の対応表
+  (`.noise` / `.prnu_pct` / `tenengrad` / `mtf50 (cy/px)`)で、これは
+  永久に残る —— 同梱アナライザは V2 登録で、サードパーティの V1/V2 dll も
+  ロードでき続けるため([abi-v3.md §3.2](abi-v3.md))
 
-## Provenance — どの dll が計算したか (#46 段階1)
+## Provenance — 誰が計算したか (#46)
 
 ホストは登録時に「どのファイルがどのアナライザを登録したか」を帳簿に記録する
 (`AnalyzerPluginInfo::file / path`。登録は dll のロード中に起こるので、その
-瞬間のファイルが出自 — ABI には何も足さない)。Analysis パネルの provenance
-行は末尾に `アナライザ名 (ファイル名)` を刻み、フルパスは行のホバーと
-Copy (TSV) / Export (CSV) の `# plugin:` コメント行に出る。builtin の統計
-(Temporal エクスポート等)は従来どおり `app: viewer <版>` のみで、プラグイン
-タグを着ない。検証は `--anaprov-selftest`。
+瞬間のファイルが出自 — ABI には何も足さない)。**版は帳簿がホストから知る
+ことができない唯一の欄**なので ABI v3 の記述子欄から合流する
+(`AnalyzerPluginInfo::version`、[abi-v3.md §3.1/§11](abi-v3.md))。
 
-**版はまだ無い**: psAnalyzerV1/V2 に version フィールドが無いため、ABI v3 の
-新設欄と同時に入る([analysis-layers.md §8](analysis-layers.md)、判断record 6
-— ABI の版上げを2回にしない)。
+- Analysis パネルの provenance 行は末尾に
+  **`アナライザ名 <version> (ファイル名)`** を刻む。
+- 行のホバー(ツールチップ)と Copy (TSV) / Export (CSV) の `# plugin:` 行は
+  **`<version> フルパス`**。version 前置はパスに空白がありうるため
+  (後置だとパスの一部と区別できない)。
+- **V1/V2 記述子は version 欄を持たないので空のまま**で、行からは `<…>` ごと
+  消える。ホストは**推測しない** —— dll のファイル版リソースも読まない
+  (それは宣言ではないので)。空欄は「宣言なし」であって「不明」ではない。
+- builtin の統計(Temporal エクスポート等)は従来どおり `app: viewer <版>`
+  のみで、プラグインタグを着ない。
+
+検証は `--anaprov-selftest` (AP1–AP27)。V2/V3 の同一計算を2つの dll で登録した
+比較 fixture (`plugins/test/abi_v[23]_twin.c`) がこの表の両方の行を1つの
+グリッドで確かめる。
 
 ## stats/moments
 
