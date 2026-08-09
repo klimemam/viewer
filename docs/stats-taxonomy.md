@@ -49,13 +49,13 @@ class 列: S1 / TN / LM(+m = +meta、+r = +ref)。「実装」列は現在の所
 | A−B 差分・画素比較 | S1+r | 1フレーム+**参照画像 B** | mp+sc | A/B compare(`\`) | B が参照データ。クラス上は +ref の最小例 |
 | defect pixel 検出(閾値法) | S1 | 1フレーム+閾値 | sc+mp | — | 簡易版は S1。dark/flat 基準の正式版は +ref |
 | **temporal noise σ_t** | **TN** | **1 つの stack**(同条件 ≥2 フレーム) | sc | Temporal パネル / `MOP_TEMPORAL_STATS` | 画素毎時間 var(**ddof=1**)の平均。stack の性質 |
-| FPN(σ_fpn = 時間平均の空間σ) | TN | 同上 | sc | 同上 | 平坦でなければ絵柄込み(注記あり) |
+| **FPN(σ_fpn)** | TN | 同上 | sc | 同上 | `sqrt(max(0, var_spatial(時間平均, **ddof=1**) − C))`、C = `mean(s_t,i²/n_i)`。**補正量 `fpn_corr` とクランプを併記**(#57 判断2)。平坦でなければ絵柄込み |
 | frame mean ドリフト / フリッカ | TN | 同上 | cv | Temporal パネルのグラフ | 横軸 frame、縦軸 ROI mean |
 | **per-frame ROI 統計テーブル** | TN(中身は S1×N) | 同上 | cv/表 | server `MOP_FRAME_ROI_STATS`(plane 毎 mean/var 系列) | §3 参照。Excel 貼り付け要求の正体 |
 | 時間平均フレーム(ノイズ低減画像) | TN | 同上 | mp | —(serve 内部では計算済み、出力なし) | EMVA 系 +ref の素材になる |
 | blink / RTS 画素検出 | TN | 多め(≥50〜)のフレーム | sc+mp | — | 画素毎の時系列が要る。map 出力 |
 | dark noise(EMVA) | TN+m | **dark stack** + 露光条件 | sc | Linearity の level-0 ルールが部分実装 | 「dark である」ことはメタ情報 |
-| DSNU(EMVA 1288) | TN+r | dark stack の時間平均 → 空間σ | sc+mp | — | σ_fpn の dark 限定版。正式には基準条件指定 |
+| DSNU(EMVA 1288) | TN+r | dark stack の時間平均 → 補正済み空間σ | sc+mp | — | **補正込み** σ_fpn の dark 限定版(同じ `−C`)。正式には基準条件指定 |
 | PRNU(EMVA 1288) | TN+r | **flat stack + dark stack** の各時間平均 | sc | —(`emva1288/*` 予定) | 現 plugin は proxy と明記 |
 | **linearity fit(感度・offset・LE max)** | **LM+m** | レベル別 stack / frame ×3+ + **level 値と単位** | sc+cv | Series Analysis パネル | level は folder 名から auto、編集可 |
 | conversion gain K(PTC) | LM | 同上(level 値自体は不要: σ_t² vs mean。σ_t を持つ stack メンバのみ) | sc | Series Analysis パネル(K [DN/e-]) | |

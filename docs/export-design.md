@@ -64,7 +64,7 @@ serve.cpp の key と同じ)。表示側の decimals 設定は反映しない
 行 = side × plane(+ pooled 行は per-frame の節を参照 — この表には無い。
 plane を持たない側は `all` 1行)。列:
 
-    side  ch  n  N  sigma_t [DN]  sigma_fpn [DN]  sigma_tot [DN]  source
+    side  ch  n  N  sigma_t [DN]  sigma_fpn [DN]  sigma_tot [DN]  fpn_corr [DN]  fpn_clamped  source
 
 - `n`/`N` = 使ったフレーム数 / stack の期待フレーム数(部分ロードの正直さ。
   N が不明なら n と同値)。
@@ -72,10 +72,23 @@ plane を持たない側は `all` 1行)。列:
   あればそれ、無ければローカル)で、**パネルの state struct
   (`AbTemporal` ← `TemporalState`/`ServerTemporal`)から読む。再計算しない**。
 - 数値の定義はパネルが計算しているものをそのまま述べる(発明しない):
-  σ_t = per-pixel 時間分散の平均の平方根、σ_fpn = 時間平均の空間σ、
-  σ_tot = 両者の quadrature。**σ_fpn に −σ_t²/N 補正は掛かっていない**
-  (ローカルも server も掛けていない)。ROI が平坦でなければ絵柄込み。
+  σ_t = per-pixel 時間分散の平均の平方根 (ddof=1)、
+  **σ_fpn = 補正済みの固定パターン** — `sqrt(max(0, var_spatial(時間平均, ddof=1) − fpn_corr²))`、
+  σ_tot = 両者の quadrature。ROI が平坦でなければ絵柄込み。
   この注意はセクション直下の `#` 注記として出力自体が運ぶ。
+- **`fpn_corr [DN]` / `fpn_clamped` は σ_fpn の申告欄で、省略できない**
+  ([flat-field-stats.md](flat-field-stats.md) (b)、#57 判断2):
+  - `fpn_corr` = `sqrt(mean(s_t,i²/n_i))` [DN]。σ_fpn から**二乗で引いた量**。
+    N 枚平均しても時間ノイズは √N でしか落ちないので、引かなければその残差が
+    固定パターンとして読まれる。**補正前の上界は行ごとに
+    `sqrt(σ_fpn² + fpn_corr²)` で戻せる** — この一文も `#` 注記が運ぶ。
+  - `fpn_clamped` = `yes` / `no`。減算が負に落ちたとき σ_fpn は 0 に
+    クランプされるが、**その 0 は「平坦なセンサ」ではなく「この stack は
+    自分の時間ノイズ床より下の固定パターンを分解できない」という測定の申告**
+    である。`yes` が1行でもあれば `# NOTE:` がそう言う(黙って 0 を出さない)。
+  - 列は `sigma_tot [DN]` の**後ろ**に置く。`sigma_t / sigma_fpn / sigma_tot`
+    の3列が隣接している事実を `tools/verify/invariants.sh` が1つのヘッダ
+    トークンとして読んでいるため。
 - ローカル値はサンプリング格子(≦40k サンプル、CFA セル単位)上の値である
   ことも `#` 注記で言う。per-frame 表(全画素走査)と mean が微差を持つ理由を
   出力自身が説明しないと、読者が「どちらかが間違い」と読む。

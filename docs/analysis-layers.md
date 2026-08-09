@@ -165,7 +165,14 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
   — 共通なのは蓄積器 (sum / sum² / cnt) の方だけである。「絵の下の数と表の数が
   食い違えない」の原則は**名前の側**が担う: ROIs の列は畳み方修飾つきの中立名
   `sigma [DN] (mean_t)`、Temporal の行は補正とクランプを申告する `sigma_fpn`
-  ([flat-field-stats.md](flat-field-stats.md) (b))。Stack Projection は平均
+  ([flat-field-stats.md](flat-field-stats.md) (b))。
+  **【実装時の照合 2026-08-10 — PR #124】** 畳み方修飾は着地した。ただし**語幹は
+  `std`** である: ROIs パネルの2列は確定済みの名前 `std` / `std / mean [%]`
+  (flat-field-stats.md (a)、旧 `PRNU [σ %]` からの改名) を既に持っており、上の
+  `sigma [DN]` はここでの例示なので、**修飾だけを足して**
+  `std (mean_t)` / `std / mean [%] (mean_t)` (sum なら `(sum_t)`) とした。
+  規範は「畳み方を名乗ること」であって語幹の綴りではない — どちらの名前も
+  黙って別物にしないために、選んだ側をここに残す。Stack Projection は平均
   画像の行/列 FPN (同 (b) の「列 FPN は平均画像に (a) の分解を掛ければ出る」が
   そのまま画面になる)。
 - **per-frame の重ね / 並べ表示**: N 枚それぞれの frame 解析を重ねる。

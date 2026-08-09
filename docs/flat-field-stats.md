@@ -167,9 +167,10 @@ N=16、σ_t=10 DN なら残差 2.5 DN。**二乗和で効く**ので、真の FP
 `√(25+6.25) = 5.59 DN` と読める (7.5 ではない)。
 
 **適用先 (判断2): Temporal パネル / `MOP_TEMPORAL_STATS` の `sigma_fpn` 行
-そのものを補正済みにする。** 現実装 (`recomputeTemporalIfNeeded` /
+そのものを補正済みにする。** 確定時点の実装 (`recomputeTemporalIfNeeded` /
 `runTemporalStats`) は補正なしの「時間平均の空間σ」を σ_fpn と呼んでおり、
-それは名前が主張する量の推定量ではなく上界である。補正後:
+それは名前が主張する量の推定量ではなく上界であった
+(**実装は PR #124 で着地 — 文末「適用ノート」**)。補正後:
 
 - `sigma_fpn [DN]` = 上式 (補正済み)。method 行 / TSV コメントに
   「temporal residual C subtracted」とクランプの有無を申告する。
@@ -604,12 +605,26 @@ Series Analysis パネル PR #102)。推定量はその下流に乗るだけな�
 
 - **判断3 の実装** — local (`core/app/temporal_model.inc`
   `recomputeTemporalIfNeeded`) の ddof=0 → ddof=1。**決定は済んでおり、コードは
-  本書の外**。
-- σ_fpn を補正済みにする実装が入るまで、**現行の出力は補正なしのまま**である:
-  [export-design.md](export-design.md) の temporal summary 節が
-  「σ_fpn に −σ_t²/N 補正は掛かっていない (ローカルも server も掛けていない)」と
-  正しく申告している。この一文は実装 PR と同時に更新するもので、**先に消すと
-  文書が現物より進んでしまう**。
+  本書の外**。**着地済み: PR #123 (`925f0d3`)。**
+- **判断2 の実装 (σ_fpn の `−C` 補正)** — **着地済み: PR #124
+  (`sigma-fpn-correction`)。** local (`recomputeTemporalIfNeeded`) と peer
+  (`core/serve.cpp` `runTemporalStats`) の両方が
+  `σ_fpn² = max(0, var_spatial(M, ddof=1) − mean(s_t,i²/n_i))` を計算し、
+  補正量 (`fpn_corr [DN]` = `sqrt(C)`) とクランプ (`fpn_clamped`) を画面と
+  TSV/CSV の両方で申告する。remote protocol は 6 に上げた — v5 のピアは同じ
+  キーで**補正前の上界**を返すので、意味が変わった以上バージョンも変える
+  (v4/v5 と同じ理由)。
+  同じ PR が、補正なしの記述を持っていた3文書
+  ([export-design.md](export-design.md) の temporal summary 節、
+  [stats-taxonomy.md](stats-taxonomy.md) の σ_fpn / DSNU 行、
+  [manual.md](manual.md) §5.2b/§5.2c) を更新し、
+  [analysis-layers.md](analysis-layers.md) §3.2 が要求する
+  **ROIs / Temporal の名前の分離** (`std (mean_t)` vs 申告つき `sigma_fpn`) を
+  実装した。**文書が現物より先回りしない**という規約どおり、記述の更新は
+  バイナリが変わるのと同じコミット群で行った。
+- **本書の残りの実装段は未着手** — 判断4 の直接 DSNU / PRNU、判断5 の分離
+  フィット、判断6/7 の detrend PreProcessor。「実装の進め方」の 2..6 がそれで、
+  それぞれ別 PR が持つ。
 
 ## 判断record (2026-08-09 確定 — もう「待ち」ではない)
 
