@@ -502,38 +502,343 @@ jpeg_bytes = base64.b64decode(JPEG_B64)
 (media / "mislabelled.png").write_bytes(jpeg_bytes)
 
 
-# A REAL TIFF - baseline, uncompressed, 8-bit greyscale, one strip. This build
-# refuses it for want of a decoder, and that refusal has to be about the missing
-# decoder and not about a malformed file, so the file is genuinely valid. The
-# day a TIFF decoder is linked behind the same seam, this is its round trip.
-def write_tiff_gray8(path, arr):
+# ---------------------------------------------------------------- TIFF -------
+# REAL TIFFs, written here for the same reason the PNGs are: CI installs numpy
+# and nothing else, so a fixture that needs Pillow is a fixture CI never sees.
+#
+# TIFF is the format the viewer reads that has the most ways to be written, and
+# a reader that quietly guesses at one of them is the failure this project
+# exists to avoid - so the fixtures are not "a TIFF" but ONE PER AXIS of that
+# variety: byte order, bit depth, sample format, compression, predictor, strip
+# count, page count, photometric. Half of them are files the reader must REFUSE,
+# because "it refused the right thing, by name" is as much a behaviour as
+# "it read the right numbers" and nothing else here can test it.
+#
+# Every one of them is generated from its samples on this side, so both what the
+# file DECLARES and what it HOLDS are known exactly - which is what makes
+# "16-bit comes back sample for sample" a test rather than a hope.
+
+_TIFF_FMT = {1: "B", 3: "H", 4: "I", 11: "f"}      # BYTE / SHORT / LONG / FLOAT
+_TIFF_SIZE = {1: 1, 3: 2, 4: 4, 11: 4}
+
+
+def _packbits(data):
+    """PackBits (TIFF compression 32773). Runs of 3+ equal bytes become a run."""
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        run = 1
+        while i + run < n and run < 128 and data[i + run] == data[i]:
+            run += 1
+        if run >= 3:
+            out += struct.pack("b", 1 - run) + bytes([data[i]])
+            i += run
+            continue
+        lit = 1
+        while i + lit < n and lit < 128:
+            if (i + lit + 2 < n and data[i + lit] == data[i + lit + 1] ==
+                    data[i + lit + 2]):
+                break
+            lit += 1
+        out += struct.pack("b", lit - 1) + data[i:i + lit]
+        i += lit
+    return bytes(out)
+
+
+def _lzw(data):
+    """TIFF LZW (compression 5): MSB-first codes, 9..12 bits, early change.
+
+    Written to match the decoder's contract exactly - clear at 256, EOI at 257,
+    first free code 258, and the width steps UP one code early (at 511/1023/
+    2047), which is the "early change" every TIFF encoder in the wild uses and
+    the one detail an LZW implementation copied from a GIF gets wrong.
+    """
+    bits, acc, nacc = bytearray(), 0, 0
+
+    def put(code, width):
+        nonlocal acc, nacc
+        acc = (acc << width) | code
+        nacc += width
+        while nacc >= 8:
+            nacc -= 8
+            bits.append((acc >> nacc) & 0xFF)
+
+    table = {bytes([i]): i for i in range(256)}
+    nxt, width = 258, 9
+    put(256, width)
+    omega = b""
+    for ch in data:
+        c = bytes([ch])
+        if omega + c in table:
+            omega += c
+            continue
+        put(table[omega], width)
+        if nxt < 4093:
+            table[omega + c] = nxt
+            nxt += 1
+            width = 12 if nxt >= 2047 else 11 if nxt >= 1023 else 10 if nxt >= 511 else 9
+        else:                                  # table full: start over, as libtiff does
+            put(256, width)
+            table = {bytes([i]): i for i in range(256)}
+            nxt, width = 258, 9
+        omega = c
+    if omega:
+        put(table[omega], width)
+    put(257, width)
+    if nacc:
+        bits.append((acc << (8 - nacc)) & 0xFF)
+    return bytes(bits)
+
+
+def _tiff_compress(data, code):
+    if code == 1:
+        return data
+    if code in (8, 32946):
+        return zlib.compress(data, 9)
+    if code == 5:
+        return _lzw(data)
+    if code == 32773:
+        return _packbits(data)
+    raise ValueError("no encoder for TIFF compression %d" % code)
+
+
+def _tiff_depth(a):
+    if a.dtype == np.uint8:
+        return 8, 1                                 # SampleFormat 1: unsigned
+    if a.dtype == np.uint16:
+        return 16, 1
+    if a.dtype == np.float32:
+        return 32, 3                                # SampleFormat 3: IEEE float
+    raise ValueError("no TIFF fixture path for dtype %r" % a.dtype)
+
+
+def _tiff_block(rows, bo, bits, sf, predictor, ch):
+    """One strip or tile of pixels, (R,W,C) -> the bytes the file holds."""
+    flat = rows.reshape(rows.shape[0], -1)
+    if predictor == 2:
+        if sf != 1:
+            raise ValueError("predictor 2 is for integer samples")
+        d = flat.astype(np.int64)
+        d[:, ch:] -= flat[:, :-ch].astype(np.int64)
+        flat = (d & ((1 << bits) - 1)).astype(flat.dtype)
+    dt = {8: "u1", 16: "u2", 32: "f4"}[bits]
+    return flat.astype(np.dtype(("|" if bits == 8 else bo) + dt)).tobytes()
+
+
+def tiff_page(arr, photometric=None, compression=1, predictor=1,
+              rows_per_strip=None, tile=None, subfiletype=None, extra=(),
+              blocks=None):
+    """One IFD's worth. `blocks` replaces the encoded pixels verbatim, which is
+    how a fixture can hold a compression this file has no encoder for."""
+    return dict(arr=arr, photometric=photometric, compression=compression,
+                predictor=predictor, rows_per_strip=rows_per_strip, tile=tile,
+                subfiletype=subfiletype, extra=list(extra), blocks=blocks)
+
+
+def _tiff_parts(pg, bo):
+    a = np.asarray(pg["arr"])
+    if a.ndim == 2:
+        a = a[:, :, None]
+    h, w, ch = a.shape
+    bits, sf = _tiff_depth(a)
+    comp, pred = pg["compression"], pg["predictor"]
+    photo = pg["photometric"]
+    if photo is None:
+        photo = 2 if ch >= 3 else 1                 # RGB / BlackIsZero
+    entries = [(256, 4, [w]), (257, 4, [h]), (258, 3, [bits] * ch),
+               (259, 3, [comp]), (262, 3, [photo]), (277, 3, [ch]),
+               (284, 3, [1]), (339, 3, [sf] * ch)]
+    if pred != 1:
+        entries.append((317, 3, [pred]))
+    if pg["subfiletype"] is not None:
+        entries.append((254, 4, [pg["subfiletype"]]))
+    entries += pg["extra"]
+    blocks = []
+    override = pg["blocks"] is not None
+    if pg["tile"]:
+        tw, th = pg["tile"]
+        entries += [(322, 3, [tw]), (323, 3, [th])]
+        offtag, cnttag = 324, 325
+        for ty in range(0, h, th):
+            for tx in range(0, w, tw):
+                if override:
+                    continue
+                t = np.zeros((th, tw, ch), a.dtype)
+                sub = a[ty:ty + th, tx:tx + tw]
+                t[:sub.shape[0], :sub.shape[1]] = sub
+                blocks.append(_tiff_compress(_tiff_block(t, bo, bits, sf, pred, ch), comp))
+    else:
+        rps = pg["rows_per_strip"] or h
+        entries.append((278, 4, [rps]))
+        offtag, cnttag = 273, 279
+        for y in range(0, h, rps):
+            if override:
+                continue
+            blocks.append(_tiff_compress(
+                _tiff_block(a[y:y + rps], bo, bits, sf, pred, ch), comp))
+    if override:
+        blocks = list(pg["blocks"])
+    return blocks, entries, offtag, cnttag
+
+
+def write_tiff(path, pages, bo="<"):
+    """pages: a list of tiff_page(). More than one = more than one IFD, which is
+    what the viewer has to turn into a stack."""
+    parts = [_tiff_parts(pg, bo) for pg in pages]
+
+    def overflow(typ, count):                       # bytes that do not fit the 4-byte field
+        b = _TIFF_SIZE[typ] * count
+        return 0 if b <= 4 else b + (b & 1)
+
+    sizes = []
+    for blocks, entries, _, _ in parts:
+        nent = len(entries) + 2                     # + offsets + byte counts
+        ov = sum(overflow(t, len(v)) for (_, t, v) in entries) + 2 * overflow(4, len(blocks))
+        sizes.append((sum(len(b) + (len(b) & 1) for b in blocks),
+                      2 + 12 * nent + 4, ov))
+    base, pos = [], 8
+    for data, ifd, ov in sizes:
+        base.append(pos)
+        pos += data + ifd + ov
+    ifd_at = [base[i] + sizes[i][0] for i in range(len(parts))]
+
+    out = bytearray(struct.pack(bo + "HHI", 0x4949 if bo == "<" else 0x4D4D, 42, ifd_at[0]))
+    for i, (blocks, entries, offtag, cnttag) in enumerate(parts):
+        assert len(out) == base[i], (len(out), base[i])
+        offs, cnts = [], []
+        for b in blocks:
+            offs.append(len(out))
+            cnts.append(len(b))
+            out += b
+            if len(b) & 1:
+                out += b"\0"
+        assert len(out) == ifd_at[i], (len(out), ifd_at[i])
+        full = sorted(entries + [(offtag, 4, offs), (cnttag, 4, cnts)])
+        ovbase = ifd_at[i] + 2 + 12 * len(full) + 4
+        ifd = bytearray(struct.pack(bo + "H", len(full)))
+        ovdata = bytearray()
+        for tag, typ, vals in full:
+            payload = struct.pack(bo + _TIFF_FMT[typ] * len(vals), *vals)
+            ifd += struct.pack(bo + "HHI", tag, typ, len(vals))
+            if len(payload) <= 4:
+                ifd += payload.ljust(4, b"\0")      # left-justified, both byte orders
+            else:
+                ifd += struct.pack(bo + "I", ovbase + len(ovdata))
+                ovdata += payload
+                if len(ovdata) & 1:
+                    ovdata += b"\0"
+        ifd += struct.pack(bo + "I", ifd_at[i + 1] if i + 1 < len(parts) else 0)
+        out += ifd + ovdata
+    path.write_bytes(bytes(out))
+
+
+def write_bigtiff_gray8(path, arr):
+    """A genuine BigTIFF (magic 43, 8-byte offsets, 20-byte IFD entries).
+
+    The point of it is that sniffTiff ACCEPTS magic 43, so a BigTIFF is
+    dispatched to the TIFF backend and must come back with a refusal that names
+    BigTIFF - not with a parse error from a reader that walked a classic IFD
+    over a structure that is not one.
+    """
     a = np.asarray(arr, np.uint8)
     h, w = a.shape
-    pixels = a.tobytes()
-    entries = [                                  # (tag, type, count, value)
-        (256, 3, 1, w),                          # ImageWidth
-        (257, 3, 1, h),                          # ImageLength
-        (258, 3, 1, 8),                          # BitsPerSample
-        (259, 3, 1, 1),                          # Compression: none
-        (262, 3, 1, 1),                          # Photometric: BlackIsZero
-        (273, 4, 1, 0),                          # StripOffsets (patched below)
-        (277, 3, 1, 1),                          # SamplesPerPixel
-        (278, 3, 1, h),                          # RowsPerStrip
-        (279, 4, 1, len(pixels)),                # StripByteCounts
-    ]
-    ifd_off = 8
-    data_off = ifd_off + 2 + 12 * len(entries) + 4
-    entries = [(t, ty, c, data_off if t == 273 else v) for (t, ty, c, v) in entries]
-    ifd = struct.pack("<H", len(entries))
+    px = a.tobytes()
+    ifd_at = 16 + len(px)
+    entries = [(256, 4, 1, w), (257, 4, 1, h), (258, 3, 1, 8), (259, 3, 1, 1),
+               (262, 3, 1, 1), (273, 16, 1, 16), (277, 3, 1, 1),
+               (278, 4, 1, h), (279, 16, 1, len(px))]
+    ifd = struct.pack("<Q", len(entries))
     for tag, typ, cnt, val in entries:
-        # a SHORT value sits in the low half of the 4-byte value field
-        ifd += struct.pack("<HHI", tag, typ, cnt) + (
-            struct.pack("<HH", val, 0) if typ == 3 else struct.pack("<I", val))
-    ifd += struct.pack("<I", 0)                  # no next IFD
-    path.write_bytes(struct.pack("<HHI", 0x4949, 42, ifd_off) + ifd + pixels)
+        ifd += struct.pack("<HHQ", tag, typ, cnt)
+        ifd += (struct.pack("<HHHH", val, 0, 0, 0) if typ == 3 else
+                struct.pack("<II", val, 0) if typ == 4 else struct.pack("<Q", val))
+    ifd += struct.pack("<Q", 0)
+    path.write_bytes(struct.pack("<HHHHQ", 0x4949, 43, 8, 0, ifd_at) + px + ifd)
 
 
-write_tiff_gray8(media / "gray8.tif", g8)
+# ---- what the reader must READ ---------------------------------------------
+# gray8.tif is the same picture in the same layout as the build that REFUSED it
+# (baseline, uncompressed, 8-bit grey, one strip): the file that was the honest
+# refusal is the file that is now the round trip, so nothing about this fixture
+# was chosen to flatter the new reader.
+write_tiff(media / "gray8.tif", [tiff_page(g8)])
+
+# 16-bit, and MULTI-STRIP with an uneven last strip (48 rows in 7s = 6 full + 6
+# rows). Real 16-bit TIFFs are strip-per-few-rows, and a reader that assumed one
+# strip reads the first rows and garbage after them - which looks like an image.
+g16t = ((myy * mw + mxx) * 37 % 65536).astype(np.uint16)
+write_tiff(media / "gray16.tif", [tiff_page(g16t, rows_per_strip=7)])
+
+# The same samples through LZW + horizontal differencing, which is what a
+# 16-bit TIFF off a real acquisition tool actually looks like. Asserted against
+# gray16.tif sample for sample: two paths, one answer, or the compression is
+# doing something to the measurement.
+write_tiff(media / "gray16_lzw.tif",
+           [tiff_page(g16t, compression=5, predictor=2, rows_per_strip=7)])
+
+# RGB 8-bit, PackBits. Same ramp as rgb8.png so the channel rule is asserted
+# against a known picture rather than against itself.
+write_tiff(media / "rgb8.tif", [tiff_page(rgb8, compression=32773)])
+
+# BIG-ENDIAN ("MM"), 16-bit RGB, Deflate + predictor. Byte order is a per-file
+# fact in TIFF and half the cameras that write one write MM; a reader that
+# assumed II returns byte-swapped samples, which are numbers, and wrong.
+rgb16 = np.stack([mxx * 65535 // (mw - 1), myy * 65535 // (mh - 1),
+                  np.full_like(mxx, 4096)], -1).astype(np.uint16)
+write_tiff(media / "rgb16_be.tif",
+           [tiff_page(rgb16, compression=8, predictor=2, rows_per_strip=16)], bo=">")
+
+# 32-bit IEEE float: TIFF is the one of the three formats that carries a
+# measurement straight, and this is the case that proves the viewer does not
+# round it into an integer on the way in.
+f32t = ((mxx - mw / 2) ** 2 + (myy - mh / 2) ** 2).astype(np.float32) / 100.0 - 3.5
+write_tiff(media / "float32.tif", [tiff_page(f32t, rows_per_strip=13)])
+
+# MULTI-PAGE = A STACK (core/imagefile.h). Three pages, each a constant plane at
+# a different level, so "which frame is which" is readable in a failure.
+pages3 = [np.full((mh, mw), v, np.uint16) for v in (1000, 2000, 3000)]
+write_tiff(media / "stack3.tif", [tiff_page(p, rows_per_strip=11) for p in pages3])
+
+# ...and the page that is NOT a frame. NewSubfileType bit 0 says "reduced
+# resolution version of another image", i.e. a thumbnail: counting it as a frame
+# of the stack would put a different picture in the middle of a measurement.
+write_tiff(media / "thumb.tif",
+           [tiff_page(g16t), tiff_page(g16t[::4, ::4].copy(), subfiletype=1)])
+
+# Photometric 0 (WhiteIsZero): 0 means WHITE. The samples are still the samples,
+# so they are NOT inverted - and that is exactly the kind of thing that has to
+# be said out loud rather than left for a histogram to reveal.
+write_tiff(media / "whitezero.tif", [tiff_page(g8, photometric=0)])
+
+# ---- what the reader must REFUSE, by name ----------------------------------
+# Tiled: a genuine tiled TIFF (16x16 tiles), not a strip file wearing tile tags.
+write_tiff(media / "tiled.tif", [tiff_page(g8, tile=(16, 16))])
+
+# JPEG-in-TIFF (compression 7). The strip really does hold the JPEG from above,
+# so the refusal is about the compression scheme and not about a broken file.
+write_tiff(media / "jpeginside.tif",
+           [tiff_page(np.zeros((24, 32), np.uint8), compression=7, blocks=[jpeg_bytes])])
+
+# Photometric 32803 = colour filter array. THE case core/imagefile.h rule 3 is
+# about: the pattern must be read exactly or not at all, and this build reads it
+# not at all - so it refuses instead of opening a plausible wrong picture.
+write_tiff(media / "cfa.tif", [tiff_page(g8, photometric=32803,
+                                         extra=[(33421, 3, [2, 2]),
+                                                (33422, 1, [0, 1, 1, 2])])])
+
+# Palette. PNG's palette IS expanded (stb does it, and the note says so), so the
+# difference between the two formats has to be visible rather than surprising.
+cmap = [(i * 257) % 65536 for i in range(256)] * 3
+write_tiff(media / "palette.tif",
+           [tiff_page((mxx % 256).astype(np.uint8), photometric=3,
+                      extra=[(320, 3, cmap)])])
+
+# Pages that are not one shape. A multi-page TIFF is a stack, and a stack's
+# frames are one grid: this one says so instead of building a ragged stack.
+write_tiff(media / "mixedpages.tif",
+           [tiff_page(g8), tiff_page(g8[:12, :16].copy())])
+
+write_bigtiff_gray8(media / "big.tif", g8)
 
 # Two ways to be refused, both of which have to say something better than
 # "unsupported": a PNG whose signature is right and whose body is not, and a

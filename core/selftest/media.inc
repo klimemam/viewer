@@ -49,8 +49,8 @@
             fprintf(stderr, "mediaselftest: table = %zu format(s), decodable: %s\n",
                     imagefile::backends().size(), imagefile::decodableFormats().c_str());
             check(sound, "M1 every format either decodes or says why it does not");
-            check(imagefile::decodableFormats() == "PNG, JPEG",
-                  "M1 this build decodes PNG and JPEG");
+            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF",
+                  "M1 this build decodes PNG, JPEG and TIFF");
         }
 
         // ---- M2: 16-bit PNG, sample for sample ------------------------------
@@ -159,23 +159,199 @@
                   "M6 ...and the note says the name and the bytes disagreed");
         }
 
-        // ---- M7: TIFF is absent, and that is a SENTENCE ---------------------
-        // §3.2's register: the file, the reason, and what to do instead. The
-        // fixture is a valid baseline TIFF, so this cannot pass by accident on
-        // a malformed-file path.
+        // ---- M7: TIFF, the baseline round trip ------------------------------
+        // The SAME file that this test used to assert a refusal on: gray8.tif is
+        // still the baseline, uncompressed, 8-bit greyscale, one-strip TIFF it
+        // was written as. Nothing about it was chosen to suit the reader.
         {
             ImageDoc* d = open1("gray8.tif");
-            const std::string msg = app.toast;
-            fprintf(stderr, "mediaselftest: M7 toast = \"%s\"\n", msg.c_str());
-            check(!d && app.images.empty(), "M7 a TIFF opens nothing in this build");
-            check(has(msg, "gray8.tif"), "M7 the refusal names the file");
-            check(has(msg, "TIFF is not read by this build") &&
-                  has(msg, "no TIFF decoder is linked"),
-                  "M7 ...and names what is missing, not just 'unsupported'");
-            check(has(msg, "PNG and JPEG are read natively") && has(msg, "choose a reader"),
-                  "M7 ...and says what does work, and where to go next");
-            check(app.readerPanelOpen && app.readerPickPath.find("gray8.tif") != std::string::npos,
-                  "M7 the refusal IS the affordance: the Reader panel is raised on it");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 1 && d->dtype == "u8";
+            bool vals = shape;
+            if (shape)
+                for (int y = 0; y < 48 && vals; y++)
+                    for (int x = 0; x < 64 && vals; x++)
+                        if (d->px()[(size_t)y * 64 + x] != (float)((x * 4 + y) % 256))
+                            vals = false;
+            fprintf(stderr, "mediaselftest: M7 note = \"%s\"\n", d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M7 a baseline 8-bit greyscale TIFF is one 1-channel u8 frame");
+            check(vals, "M7 every sample survives: (x*4+y)%256, unscaled");
+            check(d && d->white == 255, "M7 an 8-bit file's default range is 0..255 DN");
+            check(d && has(d->note, "TIFF") && has(d->note, "8-bit") &&
+                  has(d->note, "no scaling"),
+                  "M7 the note says what was read and what was NOT done to it");
+            check(d && d->src->fsize > 0, "M7 the Watch baseline is stamped (file, size)");
+        }
+
+        // ---- M11: 16-bit TIFF, sample for sample, however it is packed ------
+        // THE case this format exists for here. gray16.tif is multi-strip with a
+        // short last strip (48 rows in 7s), and gray16_lzw.tif holds the SAME
+        // samples through LZW and horizontal differencing - the shape a 16-bit
+        // TIFF off a real acquisition tool actually has. Asserted against the
+        // written values AND against each other: a compression path that changed
+        // one DN would pass "it opened" and fail here.
+        {
+            ImageDoc* d = open1("gray16.tif");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 1 && d->dtype == "u16";
+            bool exact = shape;
+            if (shape)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)((i * 37) % 65536)) exact = false;
+            std::vector<float> plain;
+            if (d) plain = d->px();
+            fprintf(stderr, "mediaselftest: M11 %s dtype=%s max=%g note=\"%s\"\n",
+                    d ? "opened" : "NOT OPENED", d ? d->dtype.c_str() : "",
+                    d ? d->vmax : 0.0f, d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M11 a 16-bit greyscale TIFF is one 1-channel u16 frame");
+            check(exact, "M11 every sample survives across 7 strips: (y*W+x)*37, unscaled");
+            check(d && d->white == 65535, "M11 the display range defaults to the u16 full scale");
+            check(d && has(d->note, "7 strips"), "M11 the note says how the file was laid out");
+
+            ImageDoc* z = open1("gray16_lzw.tif");
+            bool same = z && !plain.empty() && z->px() == plain;
+            fprintf(stderr, "mediaselftest: M11 lzw note = \"%s\"\n",
+                    z ? z->note.c_str() : app.toast.c_str());
+            check(same, "M11 LZW + Predictor 2 gives the identical samples, DN for DN");
+            check(z && has(z->note, "LZW") && has(z->note, "Predictor 2"),
+                  "M11 ...and the note names the compression and the predictor");
+        }
+
+        // ---- M12: a multi-page TIFF IS a stack ------------------------------
+        // core/imagefile.h says so in as many words, and this is what makes it
+        // true: three pages become three frames of ONE stack (App::SeqInfo), in
+        // page order, each frame knowing which page of the file it came from -
+        // the same identity a multi-frame .npy's frames carry (§6.2).
+        {
+            closeAll();
+            app.toast.clear();
+            openPath(root + "/stack3.tif");
+            const size_t n = app.images.size();
+            int sid = n ? app.images[0]->seqId : 0;
+            bool oneStack = n == 3 && sid != 0;
+            if (oneStack)
+                for (size_t i = 0; i < n; i++)
+                    if (app.images[i]->seqId != sid || app.images[i]->seqIndex != (int)i)
+                        oneStack = false;
+            bool levels = n == 3 && app.images[0]->px()[0] == 1000 &&
+                          app.images[1]->px()[0] == 2000 && app.images[2]->px()[0] == 3000;
+            bool pages = n == 3;
+            if (pages)
+                for (size_t i = 0; i < n; i++)
+                    if (app.images[i]->src->fileFrame != (int)i) pages = false;
+            std::string sname;
+            for (const auto& s : app.seqs) if (s.id == sid) sname = s.name;
+            fprintf(stderr, "mediaselftest: M12 %zu doc(s), seq \"%s\", note[1]=\"%s\"\n",
+                    n, sname.c_str(), n > 1 ? app.images[1]->note.c_str() : app.toast.c_str());
+            check(oneStack, "M12 a 3-page TIFF opens as ONE stack of 3 frames, in page order");
+            check(levels, "M12 ...and page N's pixels are frame N's pixels");
+            check(pages, "M12 ...and each frame records which page of the FILE it is");
+            check(has(sname, "3 frames"), "M12 the stack says how many frames it has");
+            check(n > 1 && has(app.images[1]->note, "page 2 of 3"),
+                  "M12 ...and each frame's note names its page");
+            check(n == 3 && app.images[1]->black == app.images[0]->black &&
+                  app.images[1]->white == app.images[0]->white,
+                  "M12 the frames share one display range, so they are comparable");
+
+            // A page that DECLARES it is a thumbnail (NewSubfileType bit 0) is
+            // not a frame of the measurement. Dropping it silently would be a
+            // stack of 1 that used to be 2; saying so is the whole difference.
+            ImageDoc* t = open1("thumb.tif");
+            fprintf(stderr, "mediaselftest: M12 thumb %zu doc(s) note=\"%s\"\n",
+                    app.images.size(), t ? t->note.c_str() : app.toast.c_str());
+            check(app.images.size() == 1 && t && t->seqId == 0 && t->w == 64,
+                  "M12 a reduced-resolution page is not a frame: one frame, full size");
+            check(t && has(t->note, "reduced-resolution") && has(t->note, "NewSubfileType"),
+                  "M12 ...and the note names the page that was left out, and why");
+        }
+
+        // ---- M13: byte order, and a float sample ----------------------------
+        // Byte order is a per-file fact in TIFF ("II" / "MM") and a reader that
+        // assumed one returns byte-swapped numbers - which still draw a picture.
+        // And 32-bit float is the reason this format is here at all: it is the
+        // only one of the three that carries a measurement straight.
+        {
+            ImageDoc* d = open1("rgb16_be.tif");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 3 && d->dtype == "u16";
+            bool corners = shape &&
+                           d->sample(0, 0, 0) == 0 && d->sample(63, 0, 0) == 65535 &&
+                           d->sample(0, 47, 1) == 65535 && d->sample(0, 0, 2) == 4096;
+            fprintf(stderr, "mediaselftest: M13 be %dx%d %dch corners %g/%g/%g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0,
+                    d ? d->sample(0, 0, 0) : -1.f, d ? d->sample(63, 0, 0) : -1.f,
+                    d ? d->sample(0, 0, 2) : -1.f, d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M13 a big-endian 16-bit RGB TIFF is 3 channels of u16");
+            check(corners, "M13 ...and the samples are the file's, not byte-swapped");
+            check(d && has(d->note, "big-endian"), "M13 the note says which byte order the file used");
+            check(d && has(d->note, "Deflate"), "M13 ...and that Deflate was what unpacked it");
+
+            ImageDoc* f = open1("float32.tif");
+            bool fshape = f && f->ch == 1 && f->dtype == "f32";
+            // (x-32)^2+(y-24)^2 over 100, minus 3.5: negative in the middle,
+            // which no integer path can represent and no rescaling would keep.
+            bool fvals = fshape && f->sample(32, 24, 0) == -3.5f &&
+                         f->sample(0, 0, 0) > 12.4f && f->sample(0, 0, 0) < 12.6f;
+            fprintf(stderr, "mediaselftest: M13 f32 dtype=%s centre=%g corner=%g\n",
+                    f ? f->dtype.c_str() : "-", f ? f->sample(32, 24, 0) : 0.f,
+                    f ? f->sample(0, 0, 0) : 0.f);
+            check(fshape, "M13 a 32-bit float TIFF keeps its dtype (f32), not an integer one");
+            check(fvals, "M13 ...and its values, negatives included, are as stored");
+        }
+
+        // ---- M14: RGB, PackBits, and a photometric that is READ not applied --
+        {
+            ImageDoc* c = open1("rgb8.tif");
+            bool rgb = c && c->ch == 3 && c->dtype == "u8" &&
+                       c->sample(0, 0, 0) == 0 && c->sample(0, 0, 2) == 96 &&
+                       c->sample(63, 0, 0) == 255 && c->sample(0, 47, 1) == 255;
+            check(rgb, "M14 an 8-bit RGB TIFF is 3 channels, in file order");
+            check(c && has(c->note, "PackBits"), "M14 ...and the note names PackBits");
+
+            // Photometric 0 says 0 is WHITE. Inverting would make the picture
+            // look right and every measurement wrong, so the samples are left
+            // exactly as stored and the note carries the fact instead.
+            ImageDoc* w = open1("whitezero.tif");
+            bool asStored = w && w->ch == 1 && w->px()[0] == 0 && w->px()[1] == 4;
+            fprintf(stderr, "mediaselftest: M14 whitezero note = \"%s\"\n",
+                    w ? w->note.c_str() : app.toast.c_str());
+            check(asStored, "M14 a WhiteIsZero TIFF is NOT inverted: values as stored");
+            check(w && has(w->note, "WhiteIsZero") && has(w->note, "NOT inverted"),
+                  "M14 ...and the note says that, because the picture looks wrong on purpose");
+        }
+
+        // ---- M15: what this build does NOT read, named one by one -----------
+        // The point of the whole seam. Every one of these is a VALID TIFF that
+        // this reader will not read, and each refusal names the exact feature -
+        // never "unsupported", and never a plausible wrong picture.
+        {
+            struct Case { const char* file; const char* needle; const char* what; };
+            const Case cases[] = {
+                { "tiled.tif",      "tiled layout",
+                  "M15 a tiled TIFF is refused by naming the tiling" },
+                { "jpeginside.tif", "compression 7 (JPEG)",
+                  "M15 JPEG-in-TIFF is refused by naming the compression scheme" },
+                { "cfa.tif",        "photometric 32803",
+                  "M15 a CFA TIFF is refused rather than opened on a guessed pattern" },
+                { "palette.tif",    "photometric 3 (palette",
+                  "M15 a palette TIFF is refused by naming the photometric" },
+                { "mixedpages.tif", "a stack's frames are one shape",
+                  "M15 pages that are not one shape are not a stack, and it says so" },
+                { "big.tif",        "BigTIFF",
+                  "M15 BigTIFF is refused as BigTIFF, not as a corrupt classic TIFF" },
+            };
+            for (const Case& c : cases) {
+                ImageDoc* d = open1(c.file);
+                const std::string msg = app.toast;
+                fprintf(stderr, "mediaselftest: M15 %-16s -> \"%s\"\n", c.file, msg.c_str());
+                check(!d && app.images.empty() && has(msg, c.file) && has(msg, "TIFF:") &&
+                      has(msg, c.needle) && has(msg, "choose a reader"), c.what);
+            }
+            // ...and the refusal is still the affordance: the Reader panel is
+            // raised on the file that could not be opened, exactly as it was
+            // when TIFF as a whole was the thing this build could not read.
+            open1("tiled.tif");
+            check(app.readerPanelOpen && app.readerPickPath.find("tiled.tif") != std::string::npos,
+                  "M15 a refused TIFF raises the Reader panel on itself");
+            // The decoder that said so is named, the way stb_image is for a PNG.
+            check(has(app.toast, "tiffread"), "M15 ...and the refusal names the reader that refused");
         }
 
         // ---- M8: the two other ways to be refused ---------------------------
