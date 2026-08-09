@@ -129,6 +129,25 @@ static bool abSideBySide() {
     return app.compareMode == App::CmpSplit;
 }
 
+// WHICH side the blink is showing this instant, as a side index: 0 = A,
+// 1 = B, 2 + i = the slot at cmpExtra[i]. -1 when nothing is blinking.
+//
+// `app.flipShowB` is the STATE and stays where it is - the canvas owns it, and
+// the timer that flips it. This is the question a READER asks of it, given a
+// name once so that a panel following the blink cannot answer it slightly
+// differently: the ROI table prints the numbers of whichever frame the canvas
+// is painting (the ruling on #76), and the two disagreeing for even one frame
+// is a table labelled with the wrong letter.
+//
+// It also gives N-blink one line to land in. `flipShowB` is a two-image
+// spelling - a bool cannot name C - so when the cycle generalises
+// (docs/compare-n.md 12, "巡回順は A -> B -> C -> ...") the position is computed
+// HERE, and every reader follows it without being touched.
+static int blinkSideIndex() {
+    if (app.compareMode != App::CmpFlip) return -1;
+    return app.flipShowB ? 1 : 0;
+}
+
 // Can A's and B's profiles be drawn on ONE axis? Only when both sampled the
 // same range - same origin and same length. Anything else would have to be
 // stretched to line up, and stretching invents a correspondence between two
