@@ -216,10 +216,10 @@ static int roiStatsSelftest() {
     // rests on have to be comparable byte for byte.
     auto dump = [&](const char* what) {
         for (const auto& r : g_roiRowProbe)
-            fprintf(stderr, "roistatsselftest: V19 %-16s %-3s mean=%.10g sd=%.10g "
+            fprintf(stderr, "roistatsselftest: V19 %-16s %-3s %c mean=%.10g sd=%.10g "
                             "min=%.10g max=%.10g prnu=%.10g(ok=%d) n=%zu step=%zu "
                             "valid=%d\n",
-                    what, r.id ? "roi" : "all", r.s.mean, r.s.sd, r.s.mn, r.s.mx,
+                    what, r.id ? "roi" : "all", r.side, r.s.mean, r.s.sd, r.s.mn, r.s.mx,
                     r.prnu, (int)r.prnuOk, r.s.n, r.s.step, (int)r.s.valid);
     };
     auto nearEq = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(b)); };
@@ -406,6 +406,161 @@ static int roiStatsSelftest() {
     }
     if (const RoiRowProbe* rz0 = row(0))
         check(!rz0->prnuOk, "V19 the All row withholds PRNU at mean 0 too");
+
+    // ---- R: the same ROIs, on more than one compared slot (issue #76) -------
+    // The user's ruling, 2026-08-09: 「roiは共通、blinkのときは表示切り替え、
+    // sidebysideのときは横に並べる(ヒストグラムとかと同様)」. Three claims, and
+    // each is asserted on what the CELLS printed rather than on the state that
+    // fed them, because the defect being fixed was a panel that had A's numbers
+    // in it whatever the rest of the screen was showing:
+    //   * blink       - the numbers are the BLINKED slot's, and they change when
+    //                   the blink does. A table cannot overlay, so this is its
+    //                   only way to put two rows in one place.
+    //   * side by side- every slot gets a column group, at once.
+    //   * shared      - ONE rectangle, N sets of numbers. Never N rectangles.
+    // Analytic fixtures again, so a level is a level: A 30000, B 20000, C 10000,
+    // all with the same 2 DN dither, so a cell holding the wrong slot's number
+    // is off by ten thousand rather than by a rounding.
+    auto rowSide = [&](int id, char side) -> const RoiRowProbe* {
+        for (const auto& r : g_roiRowProbe) if (r.id == id && r.side == side) return &r;
+        return nullptr;
+    };
+    auto sidesOn = [&](int id) {
+        std::string s;
+        for (const auto& r : g_roiRowProbe) if (r.id == id) s += r.side;
+        return s;
+    };
+    // the probe's fields, read the way --abeq-selftest reads the histogram's
+    auto pfield = [](const std::string& p, const char* key) {
+        size_t k = p.find(key);
+        if (k == std::string::npos) return std::string();
+        k += strlen(key);
+        size_t e = p.find(';', k);
+        return p.substr(k, e == std::string::npos ? e : e - k);
+    };
+
+    closeAll();
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
+    app.cmpExtra.clear();
+    app.compareFollowFrame = false;
+    app.abStepBusyUntil = 0;
+    app.roiChannel = -1;
+    app.images.push_back(mkMono(512, 512, 30000.0, 2.0, 0.0));   // A
+    app.images.push_back(mkMono(512, 512, 20000.0, 2.0, 0.0));   // B
+    app.images.push_back(mkMono(512, 512, 10000.0, 2.0, 0.0));   // C
+    app.current = 0;
+    addAnn(0, 32, 32, 128, 128);
+    const int shRoi = app.anns.back().id;
+
+    // ---- R1/R2: blink, and the table blinking WITH it -----------------------
+    app.compareMode = App::CmpFlip;
+    app.abStatsLayout = App::AbAuto;      // Auto over blink is one image area
+    setCompareB(app.images[1].get());
+    app.flipShowB = false;
+    settle();
+    std::string p = g_roiSideProbe;
+    fprintf(stderr, "roistatsselftest: R1 probe '%s'\n", p.c_str());
+    check(pfield(p, "sides=") == "AB", "R1 blink: the panel resolves A and B");
+    check(pfield(p, "shown=") == "A", "R1 ...and shows A while the blink is on A");
+    const RoiRowProbe* rA = rowSide(shRoi, 'A');
+    check(rA && nearEq(rA->s.mean, 30000.0), "R1 ...printing A's numbers");
+
+    app.flipShowB = true;                 // B / Space, or the auto timer
+    settle();
+    p = g_roiSideProbe;
+    fprintf(stderr, "roistatsselftest: R2 probe '%s'\n", p.c_str());
+    check(pfield(p, "shown=") == "B", "R2 blink to B: the table follows the blink");
+    check(sidesOn(shRoi) == "B", "R2 ...and the row carries B's letter, not A's");
+    const RoiRowProbe* rB = rowSide(shRoi, 'B');
+    check(rB && nearEq(rB->s.mean, 20000.0),
+          "R2 ...and B's numbers, not the ones that were there");
+    // the letter that is NOT on the table is named: a slot the panel is silent
+    // about is the defect #76 opened on, whichever direction it points
+    check(pfield(p, "said-not-shown=") == "A", "R2 ...and A is named as not shown");
+
+    // ---- R3: side by side - the slots next to each other, at once -----------
+    app.abStatsLayout = App::AbSide;
+    settle();
+    p = g_roiSideProbe;
+    fprintf(stderr, "roistatsselftest: R3 probe '%s'\n", p.c_str());
+    check(pfield(p, "cols=") == "AB", "R3 side by side: both slots get a column group");
+    check(pfield(p, "shown=").empty(), "R3 ...and nothing is collapsed away");
+    check(sidesOn(shRoi) == "AB", "R3 ...the one ROI row carries both letters");
+    rA = rowSide(shRoi, 'A'); rB = rowSide(shRoi, 'B');
+    check(rA && rB && nearEq(rA->s.mean, 30000.0) && nearEq(rB->s.mean, 20000.0),
+          "R3 ...each group holding its own slot's numbers");
+
+    // ---- R4: a LETTER past B, because there are N slots and not two ---------
+    addCompareSlot(app.images[2].get());
+    settle();
+    p = g_roiSideProbe;
+    fprintf(stderr, "roistatsselftest: R4 probe '%s'\n", p.c_str());
+    check(pfield(p, "sides=") == "ABC" && pfield(p, "cols=") == "ABC",
+          "R4 a third slot gets a third column group");
+    check(sidesOn(shRoi) == "ABC", "R4 ...on the same single ROI row");
+    const RoiRowProbe* rC = rowSide(shRoi, 'C');
+    check(rC && nearEq(rC->s.mean, 10000.0), "R4 ...carrying C's own numbers");
+    check(rowSide(0, 'C') != nullptr, "R4 ...and the All row has a C group too");
+
+    // ---- R5: the rectangles are SHARED --------------------------------------
+    // One annotation, three sets of numbers - never three annotations. And it is
+    // one rectangle in the sense that matters: move it, and every slot moves.
+    check(app.anns.size() == 1, "R5 three slots did not make three ROIs");
+    findAnn(shRoi)->x = 300;
+    app.annRev++;
+    settle();
+    rA = rowSide(shRoi, 'A'); rB = rowSide(shRoi, 'B'); rC = rowSide(shRoi, 'C');
+    check(rA && rB && rC && nearEq(rA->s.mean, 30000.0) &&
+          nearEq(rB->s.mean, 20000.0) && nearEq(rC->s.mean, 10000.0),
+          "R5 moving the shared ROI re-measures every slot");
+
+    // ---- R6: a slot whose frame does not hold the rectangle -----------------
+    // roiBasicStats CLAMPS, so the failure mode is not an empty cell - it is a
+    // plausible number measured on the intersection and printed under the same
+    // ROI's name. The panel must decline and SAY so, and A must be unaffected.
+    app.images.push_back(mkMono(256, 256, 40000.0, 2.0, 0.0));   // D, smaller
+    addCompareSlot(app.images[3].get());
+    settle();
+    p = g_roiSideProbe;
+    fprintf(stderr, "roistatsselftest: R6 probe '%s'\n", p.c_str());
+    check(pfield(p, "sides=") == "ABCD", "R6 the smaller frame is still a slot");
+    check(pfield(p, "said-no-numbers=") == "D",
+          "R6 ...and is NAMED as having none for a ROI it cannot hold");
+    const RoiRowProbe* rD = rowSide(shRoi, 'D');
+    check(rD && !rD->s.valid, "R6 ...its cell is empty, not a clamped intersection");
+    check(rD && !rD->prnuOk, "R6 ...and no ratio is derived from numbers it lacks");
+    rA = rowSide(shRoi, 'A');
+    check(rA && nearEq(rA->s.mean, 30000.0), "R6 ...while A keeps printing");
+    // the whole-image row is a per-image target, so D can always answer it
+    const RoiRowProbe* aD = rowSide(0, 'D');
+    check(aD && aD->s.valid && nearEq(aD->s.mean, 40000.0),
+          "R6 ...and D's All row measures D's own frame");
+
+    // ---- R7: no letter is dropped in silence --------------------------------
+    // The N group's equation, transposed onto a table: a side is on the table
+    // (a column group, or the one collapsed slot) or it is named as not being.
+    // It holds on both forms, so it is asked on both.
+    for (int form = 0; form < 2; form++) {
+        app.abStatsLayout = form ? App::AbOverlay : App::AbSide;
+        settle();
+        p = g_roiSideProbe;
+        const std::string all = pfield(p, "sides="),
+                          acc = pfield(p, "cols=") + pfield(p, "shown=") +
+                                pfield(p, "said-not-shown=");
+        std::string lost;
+        for (char ch : all) if (acc.find(ch) == std::string::npos) lost += ch;
+        fprintf(stderr, "roistatsselftest: R7 %s probe '%s'\n",
+                form ? "collapsed" : "laid out", p.c_str());
+        check(lost.empty(), form ? "R7 collapsed: every side is shown or named"
+                                 : "R7 laid out: every side is shown or named");
+    }
+
+    app.cmpExtra.clear();
+    setCompareB(nullptr);
+    app.compareMode = App::CmpOff;
+    app.compareFollowFrame = true;
+    app.abStatsLayout = App::AbAuto;
+    app.flipShowB = false;
 
     g_roiRowProbeOn = false;
     fprintf(stderr, "roistatsselftest: %s\n", ok ? "ok" : "FAILED");
