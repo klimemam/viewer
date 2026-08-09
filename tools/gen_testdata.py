@@ -545,8 +545,11 @@ jpeg_bytes = base64.b64decode(JPEG_B64)
 # file DECLARES and what it HOLDS are known exactly - which is what makes
 # "16-bit comes back sample for sample" a test rather than a hope.
 
-_TIFF_FMT = {1: "B", 3: "H", 4: "I", 11: "f"}      # BYTE / SHORT / LONG / FLOAT
-_TIFF_SIZE = {1: 1, 3: 2, 4: 4, 11: 4}
+# ASCII (2) is packed as bytes: a caller passes list(b"NIKON CORPORATION\0"),
+# and what lands in the file is a real type-2 entry, which is what a reader
+# that looks for a Make tag has to see.
+_TIFF_FMT = {1: "B", 2: "B", 3: "H", 4: "I", 11: "f"}   # BYTE / ASCII / SHORT / LONG / FLOAT
+_TIFF_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 11: 4}
 
 
 def _packbits(data):
@@ -947,6 +950,189 @@ _sub = 2 * (Y4W // 2) * (Y4H // 2)
 # container is by NAME, so what is inside is irrelevant and this says so by
 # being obviously nothing.
 (media / "capture.mp4").write_bytes(b"\x00" * 4096)
+
+
+# ------------------------------------------------- vendor RAW (as DNG) ----
+# The fixtures for the LibRaw backend (core/rawread.h), and the first question
+# about them is where a vendor RAW comes from at all: a camera file cannot be
+# written by this script and must not be committed - a real one is 10-60 MB and
+# is somebody else's photograph.
+#
+# The answer is that DNG is a vendor RAW that CAN be written. It is a TIFF
+# derivative whose raw IFD declares, in tags this file sets by hand, exactly the
+# four things the reader has to carry across: the CFA pattern (33422), the black
+# level (50714), the white level (50717) and the bit depth (258). So these
+# exercise the path that matters - "are the file's declared numbers the ones
+# that reach the document" - with every value on both sides of the round trip
+# known here rather than looked up from a camera.
+#
+# What they do NOT exercise is the vendor decompressors: Canon's wavelet,
+# Nikon's Huffman, Sony's delta. Those are LibRaw's, they cannot be synthesised,
+# and this repository trusts them - docs/input-adapters.md §3.6.5 records which
+# real camera files were opened by hand and where a clean clone fetches the same
+# ones. Naming the gap is the point; a fixture that pretended to cover it would
+# be worse than none.
+_DNG_FMT = {1: "B", 3: "H", 4: "I"}
+
+
+def _dng_bytes(tag, typ, vals):
+    if typ == 2:
+        return vals.encode() + b"\0"
+    return struct.pack("<" + _DNG_FMT[typ] * len(vals), *vals)
+
+
+def _dng_count(typ, vals):
+    return len(vals) + 1 if typ == 2 else len(vals)
+
+
+def _dng_over(typ, vals):
+    n = len(_dng_bytes(tag=0, typ=typ, vals=vals))
+    return 0 if n <= 4 else n + (n & 1)
+
+
+def _dng_dir(tags, values_at):
+    """One IFD, with values over 4 bytes placed at `values_at` and addressed
+    absolutely - which is what TIFF asks for and what makes the two-pass layout
+    below necessary."""
+    d = bytearray(struct.pack("<H", len(tags)))
+    ov = bytearray()
+    for tag, typ, vals in sorted(tags):
+        payload = _dng_bytes(tag, typ, vals)
+        d += struct.pack("<HHI", tag, typ, _dng_count(typ, vals))
+        if len(payload) <= 4:
+            d += payload.ljust(4, b"\0")
+        else:
+            d += struct.pack("<I", values_at + len(ov))
+            ov += payload
+            if len(ov) & 1:
+                ov += b"\0"
+    d += struct.pack("<I", 0)      # no next IFD: the raw one hangs off SubIFDs
+    return bytes(d), bytes(ov)
+
+
+def write_dng(path, w, h, samples, cfa=(0, 1, 1, 2), black=512, white=16383,
+              model="Fixture", compression=1, active=None, repeat=(2, 2)):
+    """A one-strip, uncompressed, 16-bit CFA DNG: IFD0 is the small thumbnail
+    the format asks for, and the raw image hangs off it as a SubIFD.
+
+    compression: anything but 1 writes a codec this build does not decode. The
+        tags stay valid and the payload is never reached, because LibRaw raises
+        its unsupported flag before it decodes anything.
+    active: an ActiveArea (top, left, bottom, right) - the visible window inside
+        a larger raw frame, i.e. a masked border.
+    repeat: the CFA repeat dimension. 6x6 with a 36-entry pattern is X-Trans,
+        which is a mosaic this viewer cannot name and must refuse.
+    """
+    raw = struct.pack("<%dH" % (w * h), *samples)
+    thumb = bytes(((x * 7 + y * 3) % 256)
+                  for y in range(6) for x in range(8) for _ in range(3))
+
+    rawtags = [(254, 4, [0]), (256, 4, [w]), (257, 4, [h]), (258, 3, [16]),
+               (259, 3, [compression]), (262, 3, [32803]), (277, 3, [1]),
+               (278, 4, [h]), (284, 3, [1]),
+               (33421, 3, list(repeat)), (33422, 1, list(cfa)),
+               (50710, 1, [0, 1, 2]), (50711, 3, [1]),
+               (50713, 3, [1, 1]), (50714, 3, [black]), (50717, 4, [white])]
+    if active:
+        rawtags.append((50829, 3, list(active)))
+    ifd0 = [(254, 4, [1]), (256, 4, [8]), (257, 4, [6]), (258, 3, [8, 8, 8]),
+            (259, 3, [1]), (262, 3, [2]), (277, 3, [3]), (278, 4, [6]),
+            (284, 3, [1]), (271, 2, "Synthetic"), (272, 2, model),
+            (50706, 1, [1, 4, 0, 0]), (50707, 1, [1, 1, 0, 0]),
+            (50708, 2, "Synthetic " + model)]
+
+    d0 = 2 + 12 * (len(ifd0) + 3) + 4          # + StripOffsets, ByteCounts, SubIFDs
+    d1 = 2 + 12 * (len(rawtags) + 2) + 4       # + StripOffsets, ByteCounts
+    ov0 = sum(_dng_over(t, v) for (_, t, v) in ifd0)
+    ov1 = sum(_dng_over(t, v) for (_, t, v) in rawtags)
+    off0, off1 = 8, 8 + d0 + ov0
+    soff0 = off1 + d1 + ov1
+    soff1 = soff0 + len(thumb) + (len(thumb) & 1)
+    ifd0 += [(273, 4, [soff0]), (279, 4, [len(thumb)]), (330, 4, [off1])]
+    rawtags += [(273, 4, [soff1]), (279, 4, [len(raw)])]
+
+    b0, v0 = _dng_dir(ifd0, off0 + d0)
+    b1, v1 = _dng_dir(rawtags, off1 + d1)
+    out = bytearray(struct.pack("<HHI", 0x4949, 42, off0))
+    out += b0 + v0 + b1 + v1
+    assert len(out) == soff0, (len(out), soff0)
+    out += thumb
+    if len(thumb) & 1:
+        out += b"\0"
+    assert len(out) == soff1, (len(out), soff1)
+    out += raw
+    path.write_bytes(bytes(out))
+
+
+RW, RH = 64, 48
+
+# The baseline round trip: RGGB, black 512, white 16383, samples whose value at
+# (x, y) is known here. A reader that normalised, that subtracted the declared
+# black, or that assumed RGGB where the file said otherwise all pass "it opened"
+# and fail on these numbers.
+write_dng(media / "sensor_rggb.dng", RW, RH,
+          [(y * RW + x) * 7 % 16384 for y in range(RH) for x in range(RW)])
+
+# The same shape with a DIFFERENT declared pattern and a different declared
+# white level. This is the fixture that makes "the CFA is read" a test rather
+# than an opinion: nothing in the pixels distinguishes the two, only tag 33422.
+write_dng(media / "sensor_gbrg.dng", RW, RH,
+          [(y * RW + x) * 3 % 1024 for y in range(RH) for x in range(RW)],
+          cfa=(1, 2, 0, 1), black=64, white=1023, model="Gbrg")
+
+# The Nikon case, synthesised. The file DECLARES black level 0 and its darkest
+# sample is 80: #52's survey (docs/media-formats.md, on the media-format-strategy
+# branch) §4.7 measured exactly that on a real NEF - declared 0, samples 80..306 -
+# which is why nothing here subtracts a declared black. Doing so would be
+# invisible on the two fixtures above and wrong here.
+write_dng(media / "sensor_black0.dng", RW, RH,
+          [80 + (i * 7) % 227 for i in range(RW * RH)],
+          black=0, white=4095, model="Black0")
+
+# A masked border: the raw frame is 64x48 and the file says only 52x40 of it, at
+# (6, 4), is image. Both margins are EVEN on purpose - LibRaw states the CFA
+# pattern for the visible window, and with an odd margin its own margin rounding
+# and that statement disagree, which would make this a fixture about LibRaw
+# rather than about this reader.
+write_dng(media / "sensor_masked.dng", RW, RH,
+          [(y * RW + x) % 16384 for y in range(RH) for x in range(RW)],
+          active=(4, 6, 44, 58), model="Masked")
+
+# A codec this build does not decode, written as an otherwise valid DNG:
+# compression 52546 is JPEG-XL (DNG 1.7). LibRaw binds a placeholder decoder and
+# raises UNSUPPORTED_FORMAT before it touches a pixel, which is what lets the
+# refusal name the codec instead of reporting a parse failure halfway through.
+write_dng(media / "sensor_jpegxl.dng", RW, RH, [0] * (RW * RH),
+          compression=52546, model="JpegXL")
+
+# A mosaic that is not one of the four Bayer orders this viewer can name: 6x6,
+# an X-Trans layout. LibRaw reads it happily and reports filters = 9, and a
+# viewer that squeezed that into "RGGB" would make every per-plane statistic
+# wrong in silence - so it is refused, by name.
+write_dng(media / "sensor_xtrans.dng", 72, 48,
+          [(y * 72 + x) % 4096 for y in range(48) for x in range(72)],
+          black=128, white=4095, model="XTrans", repeat=(6, 6),
+          cfa=[1, 1, 0, 1, 1, 2, 1, 1, 2, 1, 1, 0, 2, 0, 1, 0, 2, 1,
+               1, 1, 2, 1, 1, 0, 1, 1, 0, 1, 1, 2, 0, 2, 1, 2, 0, 1])
+
+# ...and a file whose first bytes claim a DNG and whose body is not one, so the
+# refusal has to come from the library rather than from a tag walk that stopped
+# early. It is the .dng counterpart of broken.png above.
+_broken = struct.pack("<HHI", 0x4949, 42, 8) + struct.pack("<H", 2)
+_broken += struct.pack("<HHI", 50706, 1, 4) + bytes([1, 4, 0, 0])   # DNGVersion 1.4
+_broken += struct.pack("<HHI", 256, 4, 1) + struct.pack("<I", 64)   # ImageWidth, alone
+_broken += struct.pack("<I", 0) + b"\0" * 64
+(media / "sensor_broken.dng").write_bytes(_broken)
+
+# The other half of the dispatch decision (core/imagefile.cpp, the vendor RAW
+# row): a file that is a PLAIN TIFF and carries a camera's name. It must still
+# reach the TIFF reader, because it has no sub-image chain - "a maker name alone
+# is not a raw container" is the rule that keeps a 16-bit measurement .tif off
+# the LibRaw path, and this is the file that would catch it moving.
+write_tiff(media / "cameramade.tif",
+           [tiff_page(g16t, rows_per_strip=9,
+                      extra=[(271, 2, b"NIKON CORPORATION\0"),
+                             (272, 2, b"NIKON Z 8\0")])])
 
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
