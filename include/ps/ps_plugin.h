@@ -25,18 +25,20 @@ extern "C" {
  *       and remain loadable forever.
  *   3 - layer-typed analyzers (docs/abi-v3.md): psAnalyzerV3 - the frame
  *       descriptor, +version/+headline - over psAnalyzeSink3, registered
- *       through psHostApi::register_analyzer3. V1/V2 structs and their two
+ *       through psHostApi::register_analyzer3; and psStack + psStackAnalyzerV3
+ *       (§5: frames PULLED one at a time, +min_frames) through
+ *       psHostApi::register_stack_analyzer3. V1/V2 structs and their two
  *       register slots stay loadable forever; psHostApi does not change size.
- *       The rest of v3 (psStack + psStackAnalyzerV3 §5, psSeriesAnalyzerV3
- *       §7, emit_number_u / emit_map §8) arrives in the reserved seats below
- *       and needs NO further version bump - see the probe rule. */
+ *       The rest of v3 (psSeriesAnalyzerV3 §7, emit_number_u / emit_map §8)
+ *       arrives in the reserved seats below and needs NO further version
+ *       bump - see the probe rule. */
 
 /* THE PROBE RULE (docs/abi-v3.md §2.2) - why v3 is meant to be the last bump.
  *
  *   - abi_version >= 3 guarantees the v3 CORE and nothing else: the host has
- *     register_analyzer3. Everything added afterwards arrives in a RESERVED
- *     SEAT: a slot whose name and contract are written here while the host may
- *     still leave it NULL.
+ *     register_analyzer3 and register_stack_analyzer3. Everything added
+ *     afterwards arrives in a RESERVED SEAT: a slot whose name and contract
+ *     are written here while the host may still leave it NULL.
  *   - Reserved fields have been zero-filled by whoever creates the struct
  *     since v1, so "is that seat taken?" is answerable by a plain NULL test -
  *     safe even against an ABI-1 host, which zero-filled the same bytes.
@@ -205,6 +207,85 @@ typedef struct psAnalyzerV3 {
     void*       reserved[4];
 } psAnalyzerV3;
 
+/* -- Stack (docs/abi-v3.md §5): the whole time axis of one stack, PULLED.
+ *
+ * The host does not hand over an array of frames, and this is the load-bearing
+ * decision of §5 rather than a convenience: an array would make "every frame is
+ * in memory at once" a promise of the ABI, which forecloses the two transports
+ * §9 keeps open (a bounded shared-memory window for the resident Python worker,
+ * and running peer-side instead of shipping the pixels). Pull costs one
+ * indirection and buys both. -- */
+
+/* A stack as shown to a plugin. The host serves frames on demand; what lives
+ * behind get_frame - resident memory, a shared-memory segment, a file - is host
+ * business and invisible here (docs/abi-v3.md §9). */
+typedef struct psStack {
+    uint32_t    frames;         /* n: frames the host will serve, 0..frames-1   */
+    uint32_t    expected;       /* N: declared stack size. frames < expected
+                                   = partial load (§6); never the reverse       */
+    uint32_t    w, h, ch;       /* every served frame has this geometry         */
+    psDtype     dtype;          /* v3 host: always PS_DTYPE_F32                 */
+    const char* name;           /* stack name, UTF-8, valid for the call only   */
+    const char* meta_json;      /* reserved; may be NULL                        */
+    void*       ctx;            /* opaque; pass to get_frame / release_frame    */
+    /* Returned pointer is valid until release_frame(ctx, index) or until
+     * analyze_stack returns, whichever comes first. May return NULL (frame
+     * lost, transport failure, pin budget exceeded): then write err and return
+     * nonzero - never fabricate a frame, and never report a partial answer with
+     * a success return.                                                        */
+    const psFrame* (*get_frame)(void* ctx, uint32_t index);
+    /* Optional to CALL, never NULL to read: both mouths are filled by any host
+     * that hands you a psStack. Releasing lets the host recycle the slot (the
+     * bounded shared-memory window of §9.2). Frames that are never released
+     * stay valid until analyze_stack returns - a naive sequential plugin is
+     * correct, just greedy.                                                    */
+    void (*release_frame)(void* ctx, uint32_t index);
+    uint64_t    reserved[4];
+} psStack;
+
+/* What the HOST guarantees, and what the PLUGIN then owes (docs/abi-v3.md §5.1):
+ *
+ *   HOST: every served frame has the w/h/ch/dtype above - frames of another
+ *         shape, and decimated previews standing in for pixels not yet here,
+ *         are excluded BEFORE `frames` is counted. index is stack order.
+ *         Which frame you are holding is carried by psFrame::name / pts_us.
+ *   HOST: analyze_stack is not called until the load has settled, so `frames`
+ *         is the count of a load that really did stop there - not a race.
+ *   HOST: one descriptor's calls are serialized; write no re-entrancy.
+ *   PLUGIN: aggregate over time with NaN EXCLUDED PER PIXEL and COUNTED, and
+ *         carry the exclusion count out in the result. Never fold a non-finite
+ *         sample into a divisor, and never exclude silently - the host's own
+ *         stack statistics have declared their exclusions since they existed.
+ *   PLUGIN: a NULL from get_frame is reported in err with a nonzero return.
+ *   PLUGIN: do not refuse for `frames < expected`. Measuring a partial load is
+ *         allowed; the one veto you get is min_frames, declared once at
+ *         registration (§6).
+ *
+ * roi means what it means for a frame (NULL = whole). get_frame always shows a
+ * whole frame; transporting only the ROI's rows is a host optimization and is
+ * invisible as long as the coordinate system does not appear to move. */
+typedef struct psStackAnalyzerV3 {
+    uint32_t    abi_version;    /* = 3 (version of THIS struct)                 */
+    uint32_t    caps;           /* PS_CAP_CPU mandatory                         */
+    uint32_t    min_frames;     /* >= 1. The host refuses BEFORE calling when
+                                   frames < min_frames, with a one-line reason.
+                                   0 is rejected at REGISTRATION: declare, do
+                                   not default (docs/abi-v3.md §6). Write 1 if
+                                   one frame will do - being asked once why this
+                                   is a stack analyzer at all is the point       */
+    uint32_t    _pad;           /* keep 8-byte alignment of the pointers below  */
+    const char* name;           /* "category/name", static lifetime             */
+    const char* version;        /* REQUIRED non-empty, static, carried verbatim
+                                   (#46 stage 2, docs/abi-v3.md §3.1)           */
+    const char* description;    /* one-line precondition hint; may be NULL      */
+    const char* params_schema;  /* reserved: pass NULL (future: JSON Schema UI) */
+    const char* headline;       /* accent key, channel-stripped; may be NULL    */
+    int32_t (*analyze_stack)(const psStack* in, const psRect* roi,
+                             const psAnalyzeSink3* sink,
+                             char* err, size_t err_cap);
+    void*       reserved[4];
+} psStackAnalyzerV3;
+
 struct psHostApi {
     uint32_t abi_version;       /* host ABI = PS_ABI_VERSION                     */
     uint32_t struct_size;       /* sizeof(psHostApi); forward-compat probe       */
@@ -225,11 +306,19 @@ struct psHostApi {
      * why sizeof(psHostApi) and every v1/v2 offset are unchanged: a plugin
      * built against ANY older header still finds its fields where they were. */
     int32_t (*register_analyzer3)(void* ctx, const psAnalyzerV3* a);
-    /* Reserved seats, zero-filled. docs/abi-v3.md §12 spends them on the stack
-     * mouth (§5), the series mouth (§7.2 - shipped NULL on purpose) and, the
-     * last two deliberately unnamed, the kind 3/4 set mouths. Each gets its
-     * name here as it is implemented; a name appearing is not a version bump. */
-    void*    reserved[6];
+    /* ...and the second half of the v3 core, in the seat straight after it
+     * (docs/abi-v3.md §5). Non-NULL on any host that says abi_version 3 -
+     * but still worth a NULL test, which costs nothing and is the one habit
+     * that keeps the seats after it usable. */
+    int32_t (*register_stack_analyzer3)(void* ctx, const psStackAnalyzerV3* a);
+    /* Reserved seats, zero-filled. docs/abi-v3.md §12 spends them on the series
+     * mouth (§7.2 - SHAPE frozen in the doc, shipped NULL on purpose until the
+     * built-in Series analysis has validated it) and, the last two deliberately
+     * unnamed, the kind 3/4 set mouths - a named seat is a promise about a
+     * shape, so the name is written the stage the implementation lands. Each
+     * gets its name here as it is implemented; a name appearing is not a
+     * version bump. */
+    void*    reserved[5];
 };
 
 /* Every plugin exports exactly one symbol:

@@ -27,6 +27,22 @@ struct AnalyzerPluginInfo  {
     psAnalyzerV2 v2{};
     psAnalyzerV3 v3{};
 };
+// A STACK analyzer (ABI v3 §5.2). Its own list, not a flag on the one above:
+// the two have different signatures, and the descriptor a caller must reach for
+// is decided by which list it came out of rather than by reading a kind field
+// and hoping. The ledger columns are the frame analyzer's, for the same reasons
+// - the file/path half is the host's knowledge (#46 stage 1), the version half
+// is the plugin's declaration (#46 stage 2) and stays verbatim.
+struct StackAnalyzerPluginInfo {
+    std::string name, desc, file, path, version, headline;
+    // The DECLARATION the host gates on before it calls (docs/abi-v3.md §6).
+    // Never defaulted: 0 is refused at registration, so a value here was
+    // written by the plugin's author on purpose.
+    uint32_t minFrames = 1;
+    uint32_t abi = 3;                // no V1/V2 stack analyzer exists, or ever will
+    psStackAnalyzerV3 v3{};
+};
+
 struct ProcessorPluginInfo { std::string name; psProcessorV1 v; };
 
 namespace plugin_host {
@@ -38,7 +54,8 @@ void loadAll(const std::vector<std::string>& dirsUtf8,
 void unloadAll();                                   // call at exit only (v1: no hot reload)
 
 const std::vector<DisplayPluginInfo>&   displays();
-const std::vector<AnalyzerPluginInfo>&  analyzers();
+const std::vector<AnalyzerPluginInfo>&  analyzers();       // frame analyzers
+const std::vector<StackAnalyzerPluginInfo>& stackAnalyzers();
 const std::vector<ProcessorPluginInfo>& processors();
 
 const psHostApi* hostApi();                         // for calling process()

@@ -41,12 +41,18 @@ static_assert(offsetof(psHostApi, register_analyzer2) ==
 static_assert(offsetof(psHostApi, register_analyzer3) ==
                   offsetof(psHostApi, register_analyzer2) + sizeof(void*),
               "register_analyzer3 must be the v2 header's reserved[0], nothing else");
+static_assert(offsetof(psHostApi, register_stack_analyzer3) ==
+                  offsetof(psHostApi, register_analyzer3) + sizeof(void*),
+              "the stack mouth must be the seat right after register_analyzer3 "
+              "(docs/abi-v3.md §12) - a plugin built against a header that said "
+              "so would otherwise call whatever moved into it");
 
 namespace {
 
 std::vector<void*>               g_handles;
 std::vector<DisplayPluginInfo>   g_displays;
 std::vector<AnalyzerPluginInfo>  g_analyzers;
+std::vector<StackAnalyzerPluginInfo> g_stackAnalyzers;
 std::vector<ProcessorPluginInfo> g_processors;
 std::function<void(const std::string&, bool)> g_log;
 std::string g_loading;            // filename currently registering, for log prefixes
@@ -157,6 +163,47 @@ int32_t hostRegisterAnalyzer3(void*, const psAnalyzerV3* a) {
     g_analyzers.push_back(std::move(info));
     return 0;
 }
+int32_t hostRegisterStackAnalyzer3(void*, const psStackAnalyzerV3* a) {
+    if (!a || !validCommon(a->abi_version, 3, a->caps, a->name,
+                           (const void*)a->analyze_stack)) return 1;
+    // §3.1, exactly as the frame register above: declaring v3 IS declaring a
+    // version, and the host never invents one.
+    if (!a->version || !a->version[0]) {
+        logMsg(g_loading + ": v3 stack analyzer '" + a->name +
+               "' declares no version - rejected (ABI v3 requires a non-empty one)", true);
+        return 1;
+    }
+    // ...and the check §6 adds. min_frames is the plugin's ONE veto over how
+    // little data it will be run on, and it is spent at registration rather
+    // than per call: sigma_t needs 2, an RTS study needs orders more, and the
+    // host cannot know which. A 0 here would have to mean something, and every
+    // meaning available ("any", "don't care", "the author forgot") is a
+    // default the host would be inventing on the author's behalf. So it is
+    // refused, and the refusal is also the one moment that asks an author why
+    // this is a stack analyzer at all.
+    if (a->min_frames == 0) {
+        logMsg(g_loading + ": v3 stack analyzer '" + a->name +
+               "' declares min_frames = 0 - rejected (ABI v3 §6: declare how many "
+               "frames the measurement needs; write 1 if one will do)", true);
+        return 1;
+    }
+    // One namespace across both mouths: "category/name" is the identity the
+    // Measure menu shows and the identity remote parity compares (§10), so a
+    // frame analyzer and a stack analyzer may not share one.
+    if (dupName(g_analyzers, a->name) || dupName(g_stackAnalyzers, a->name)) return 1;
+    StackAnalyzerPluginInfo info;
+    info.name = a->name;
+    info.desc = a->description ? a->description : "";
+    info.version = a->version;        // verbatim: never parsed, ordered or normalized
+    info.headline = a->headline ? a->headline : "";
+    info.minFrames = a->min_frames;
+    info.file = g_loading;            // the ledger, same as every register above
+    info.path = g_loadingPath;
+    info.abi = 3;
+    info.v3 = *a;
+    g_stackAnalyzers.push_back(std::move(info));
+    return 0;
+}
 int32_t hostRegisterProcessor(void*, const psProcessorV1* p) {
     if (!p || !validCommon(p->abi_version, 1, p->caps, p->name, (const void*)p->process)) return 1;
     if (dupName(g_processors, p->name)) return 1;
@@ -168,10 +215,11 @@ psHostApi g_api = {
     PS_ABI_VERSION, (uint32_t)sizeof(psHostApi), nullptr,
     hostLog, hostFrameAlloc, hostFrameFree,
     hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor,
-    hostRegisterAnalyzer2, hostRegisterAnalyzer3,
+    hostRegisterAnalyzer2, hostRegisterAnalyzer3, hostRegisterStackAnalyzer3,
     {}                                // the seats after it stay NULL on purpose:
-                                      // docs/abi-v3.md §5/§7 are later stages, and
-                                      // a plugin asks by NULL test, not by version
+                                      // docs/abi-v3.md §7 (series) and §8 are later
+                                      // stages, and a plugin asks by NULL test, not
+                                      // by version
 };
 
 } // namespace
@@ -249,9 +297,17 @@ void loadAll(const std::vector<std::string>& dirsUtf8,
             }
             g_loading = base;
             g_loadingPath = p.u8string();
-            size_t before = g_displays.size() + g_analyzers.size() + g_processors.size();
+            // Counted over EVERY list, stack analyzers included: this number is
+            // what decides "registered nothing, so unload it again", and a dll
+            // that registers only a stack analyzer would otherwise be dropped
+            // on the floor the moment it succeeded.
+            auto registeredCount = [] {
+                return g_displays.size() + g_analyzers.size() +
+                       g_stackAnalyzers.size() + g_processors.size();
+            };
+            size_t before = registeredCount();
             int32_t rc = fn(&g_api);
-            size_t added = g_displays.size() + g_analyzers.size() + g_processors.size() - before;
+            size_t added = registeredCount() - before;
             g_loading.clear();
             g_loadingPath.clear();
             if (rc != 0 && added == 0) {
@@ -270,7 +326,8 @@ void loadAll(const std::vector<std::string>& dirsUtf8,
 }
 
 void unloadAll() {
-    g_displays.clear(); g_analyzers.clear(); g_processors.clear();
+    g_displays.clear(); g_analyzers.clear(); g_stackAnalyzers.clear();
+    g_processors.clear();
     for (void* h : g_handles) {
 #if defined(_WIN32)
         FreeLibrary((HMODULE)h);
@@ -283,6 +340,7 @@ void unloadAll() {
 
 const std::vector<DisplayPluginInfo>&   displays()   { return g_displays; }
 const std::vector<AnalyzerPluginInfo>&  analyzers()  { return g_analyzers; }
+const std::vector<StackAnalyzerPluginInfo>& stackAnalyzers() { return g_stackAnalyzers; }
 const std::vector<ProcessorPluginInfo>& processors() { return g_processors; }
 const psHostApi* hostApi() { return &g_api; }
 void frameFree(void* p) { hostFrameFree(nullptr, p); }
