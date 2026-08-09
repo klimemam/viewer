@@ -879,23 +879,11 @@ static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work) {
     return true;
 }
 
-static void savePrefs() {
-    if (g_secondary) {
-        // Secondary windows read prefs but never write them: prefs.txt is one
-        // file and last-writer-wins, so a spawned scratch window saving on exit
-        // would overwrite what the main window meant to keep. Said once, in the
-        // log rather than a toast: it is an explanation, not an event.
-        static bool said = false;
-        if (!said) {
-            said = true;
-            logMsg("prefs are read-only in a secondary window");
-        }
-        return;
-    }
-    std::string p = prefsPath();
-    if (p.empty()) return;
-    std::ofstream f(pathFromUtf8(p), std::ios::binary);
-    if (!f) return;
+// Every preference the user has ever set, in the order loadPrefs reads them.
+// Split out of savePrefs for the same reason writeSessionTo is split out of
+// saveSession: the bytes are one thing and getting them onto the disk safely is
+// another, and only the second one has a failure worth talking about.
+static void writePrefsTo(std::ostream& f) {
     f << "viewer-prefs 1\n";
     f << "theme " << app.themeVariant << " " << app.themeAccent << "\n";
     f << "compact " << (app.compactUi ? 1 : 0) << "\n";
@@ -934,6 +922,40 @@ static void savePrefs() {
     // both halves can contain spaces and only one of them can contain a tab
     // (no filesystem this tool runs on puts one in a path).
     for (const auto& m : app.readerMemo) f << "readerfor " << m.path << "\t" << m.spec << "\n";
+}
+
+static void savePrefs() {
+    if (g_secondary) {
+        // Secondary windows read prefs but never write them: prefs.txt is one
+        // file and last-writer-wins, so a spawned scratch window saving on exit
+        // would overwrite what the main window meant to keep. Said once, in the
+        // log rather than a toast: it is an explanation, not an event.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            logMsg("prefs are read-only in a secondary window");
+        }
+        return;
+    }
+    std::string p = prefsPath();
+    if (p.empty()) return;
+    // Beside the file, then over it - the same mechanism saveSession uses and
+    // for a worse case. An ofstream on the TARGET truncates, so from that line
+    // until the last byte lands there was no whole prefs.txt anywhere, and this
+    // is the file that is rewritten on every toggle and once more on the way
+    // out, i.e. during shutdown, which is precisely when a machine gets
+    // switched off. There is also no second copy of it: a lost session is the
+    // one the user saved by hand and can save again, a lost prefs.txt is every
+    // preference they have ever set, their bookmarks and their recents.
+    std::string why;
+    if (!writeFileAtomically(p, [](std::ostream& f) { writePrefsTo(f); }, &why))
+        // In the log, never a toast: this runs on every toggle and from the
+        // exit path, where a toast would be drawn into a window that is already
+        // going away. The news is the same as the session's - the file they had
+        // is still the file they have - and logMsg drops an immediate repeat,
+        // so a disk that stays full says it once.
+        logMsg("preferences NOT saved: " + why +
+               " - the previous prefs.txt is unchanged", true);
 }
 
 static void loadPrefs() {

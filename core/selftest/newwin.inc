@@ -474,6 +474,176 @@
             closeAll();
         }
 
+        // N10: prefs.txt survives a save that fails - the same property N9 buys
+        // for the session, for the file that is worse to lose.
+        //
+        // savePrefs opened the TARGET with an ofstream too. A session at least
+        // has a copy the user made on purpose and can make again; prefs.txt is
+        // every preference they have ever set, their bookmarks and their
+        // recents, in one file with no second copy - and it is rewritten on
+        // every toggle and once more from the exit path, i.e. during shutdown,
+        // which is exactly when a machine gets switched off.
+        //
+        // The failures are made to happen, not asserted about: a directory on
+        // the temp path is a write that cannot start, a directory on the target
+        // path is a rename that cannot land. prefsPath() is not a parameter, so
+        // the second blocker has to sit on the real file's own path - it is put
+        // back byte for byte at the end, the way N8 puts it back.
+        {
+            std::string pp = prefsPath();
+            if (!pp.empty()) {
+                std::vector<uint8_t> restore;
+                bool hadRestore = readFileBytes(pp, restore);
+                bool sFps = app.showFps;
+
+                app.showFps = false;
+                savePrefs();                     // something whole to protect
+                std::vector<uint8_t> good;
+                bool hadGood = readFileBytes(pp, good);
+                check(hadGood && !good.empty(), "N10 prefs are written to start from");
+                check(!std::filesystem::exists(pathFromUtf8(savingTempPath(pp)), ec),
+                      "N10 a prefs save that worked leaves no temp file behind");
+
+                // What the file CONTAINS is not allowed to change because of
+                // how it is now written.
+                {
+                    std::ostringstream direct;
+                    writePrefsTo(direct);
+                    check(std::string(good.begin(), good.end()) == direct.str(),
+                          "N10 the atomic prefs save writes exactly what writePrefsTo emits");
+                }
+
+                // (a) the temp cannot be created: the write never starts, and
+                // the change it was carrying must NOT be on disk afterwards.
+                {
+                    std::string tp = savingTempPath(pp);
+                    std::filesystem::remove_all(pathFromUtf8(tp), ec);
+                    std::filesystem::create_directory(pathFromUtf8(tp), ec);
+                    // Not empty, on purpose - see N9(a): the writer removes its
+                    // own temp, and remove() takes an EMPTY directory with it.
+                    { std::ofstream in(pathFromUtf8(tp + "/pin.txt"), std::ios::binary); in << "x"; }
+                    app.showFps = true;          // a change that must NOT land
+                    size_t logBefore = app.msgLog.size();
+                    savePrefs();
+                    std::vector<uint8_t> after;
+                    bool hadAfter = readFileBytes(pp, after);
+                    check(hadAfter && after == good,
+                          "N10 a prefs save whose temp cannot be written leaves prefs.txt byte-identical");
+                    bool said = false;
+                    for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                        if (app.msgLog[i].text.find("preferences NOT saved") != std::string::npos &&
+                            app.msgLog[i].text.find("is unchanged") != std::string::npos)
+                            said = true;
+                    check(said, "N10 a prefs save that failed says so and that nothing was lost");
+                    std::filesystem::remove_all(pathFromUtf8(tp), ec);
+                }
+
+                // (b) the rename cannot land: prefs.txt is a directory for the
+                // length of this check.
+                {
+                    std::filesystem::remove(pathFromUtf8(pp), ec);
+                    std::filesystem::create_directory(pathFromUtf8(pp), ec);
+                    { std::ofstream in(pathFromUtf8(pp + "/inside.txt"), std::ios::binary); in << "x"; }
+                    size_t logBefore = app.msgLog.size();
+                    savePrefs();
+                    check(std::filesystem::is_directory(pathFromUtf8(pp), ec) &&
+                          std::filesystem::exists(pathFromUtf8(pp + "/inside.txt"), ec),
+                          "N10 a prefs rename that cannot land destroys nothing at the target");
+                    check(!std::filesystem::exists(pathFromUtf8(savingTempPath(pp)), ec),
+                          "N10 a failed prefs save cleans its own temp away");
+                    bool said = false;
+                    for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                        if (app.msgLog[i].text.find("preferences NOT saved") != std::string::npos)
+                            said = true;
+                    check(said, "N10 a failed prefs rename is reported, not swallowed");
+                    std::filesystem::remove_all(pathFromUtf8(pp), ec);
+                }
+
+                // (c) the same save, unobstructed, still lands and comes back.
+                // The lists are cleared before the read because loadPrefs
+                // APPENDS to them (V25k, and N8 above says the same) - reading
+                // what was just written back into the state it was written from
+                // is then exactly an identity.
+                app.showFps = true;
+                savePrefs();
+                app.showFps = false;
+                app.rbBookmarks.clear();
+                app.rbRecents.clear();
+                app.readerMemo.clear();
+                loadPrefs();
+                check(app.showFps, "N10 a normal prefs save still round-trips");
+
+                app.showFps = sFps;
+                if (hadRestore) {                // exactly as this test found it
+                    std::ofstream rf(pathFromUtf8(pp), std::ios::binary);
+                    rf.write((const char*)restore.data(), (std::streamsize)restore.size());
+                } else {
+                    std::filesystem::remove(pathFromUtf8(pp), ec);
+                }
+            }
+        }
+
+        // N11: the layout.ini migration reads the WHOLE ini and writes the whole
+        // thing back, so the truncate at the top of that write was the user's
+        // entire docking layout going away - on a startup path, where "the
+        // machine died while the app was starting" is not an exotic accident.
+        // Losing the layout is a much worse outcome than the misplaced Browse
+        // panel the migration exists to fix.
+        //
+        // Only ONE of N9's two blockers has a counterpart here, and the reason
+        // is worth writing down rather than leaving as an omission: a directory
+        // on the TARGET path never reaches the rename, because the migration
+        // READS the target first and a directory does not read. The temp-path
+        // blocker exercises the same property - the bytes that were there are
+        // still there - and it is the one this code can actually reach.
+        {
+            std::string ip = dir + "/layout.ini";
+            const std::string before =
+                "[Window][Remote]\nPos=10,20\nSize=300,400\n\n"
+                "[Window][Files]\nPos=0,0\n";
+            const std::string after =
+                "[Window][Browse###Remote]\nPos=10,20\nSize=300,400\n\n"
+                "[Window][Files]\nPos=0,0\n";
+            auto put = [&](const std::string& s) {
+                std::ofstream f(pathFromUtf8(ip), std::ios::binary);
+                f << s;
+            };
+            auto get = [&]() { std::string s; readWholeFile(ip, s); return s; };
+
+            put(before);
+            {
+                std::string tp = savingTempPath(ip);
+                std::filesystem::remove_all(pathFromUtf8(tp), ec);
+                std::filesystem::create_directory(pathFromUtf8(tp), ec);
+                { std::ofstream in(pathFromUtf8(tp + "/pin.txt"), std::ios::binary); in << "x"; }
+                size_t logBefore = app.msgLog.size();
+                migrateLayoutIni(ip);
+                check(get() == before,
+                      "N11 a migration whose temp cannot be written leaves layout.ini byte-identical");
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("layout NOT migrated") != std::string::npos &&
+                        app.msgLog[i].text.find("is unchanged") != std::string::npos)
+                        said = true;
+                check(said, "N11 a migration that failed says so and that nothing was lost");
+                std::filesystem::remove_all(pathFromUtf8(tp), ec);
+            }
+
+            // Unobstructed: every entry renamed, nothing else touched, no temp
+            // left behind - and a second start is a no-op, which is what
+            // "one-time" has to mean for a file read at every start.
+            migrateLayoutIni(ip);
+            check(get() == after, "N11 the migration renames every [Window][Remote] entry");
+            check(!std::filesystem::exists(pathFromUtf8(savingTempPath(ip)), ec),
+                  "N11 a migration that worked leaves no temp file behind");
+            migrateLayoutIni(ip);
+            check(get() == after, "N11 a second start migrates nothing and rewrites nothing");
+            std::filesystem::remove(pathFromUtf8(ip), ec);
+            migrateLayoutIni(ip);                // a first run: no ini at all
+            check(!std::filesystem::exists(pathFromUtf8(ip), ec),
+                  "N11 no layout.ini is not a reason to create one");
+        }
+
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
         fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
         return ok ? 0 : 1;
