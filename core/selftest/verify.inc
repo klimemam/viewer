@@ -550,6 +550,27 @@
                     T.fixedPattern[0], T.fixedPattern[1], T.fixedPattern[2], T.fixedPattern[3]);
             check(T.valid && T.nPl == 4, "V10 a mosaiced stack reports four planes");
             check(worstFpn < 1e-6, "V10 each plane's FPN is 0 on a per-plane-flat field");
+            // ...and since #57 judgment 2 that 0 is a CLAMP, which has to say so.
+            // Per plane the mean image is exactly constant, so var_spatial = 0,
+            // while the correction is C = mean(s_t,i^2/n_i) = (400/3)/4 = 100/3:
+            // the subtraction goes to -33.33 and the value clamps. A bare 0 here
+            // would read as "this sensor has no fixed pattern" when what the
+            // fixture says is "a 4-frame stack of +-10 DN cannot see one".
+            // fpn_corr is reported in DN, so sqrt(100/3) = 5.77350269.
+            {
+                const double corrExpect = sqrt((4.0 * 10.0 * 10.0 / (NF - 1.0)) / NF);
+                bool allClamped = true, corrOk = true;
+                for (int p = 0; p < T.nPl; p++) {
+                    allClamped &= T.fpnClamped[p];
+                    corrOk &= fabs(T.fpnCorr[p] - corrExpect) < 1e-9;
+                }
+                fprintf(stderr, "verifyselftest: V10 clamp: clamped %d/%d/%d/%d, "
+                                "fpn_corr %.9g (expected %.9g = sqrt((4x10^2/%d)/%d))\n",
+                        (int)T.fpnClamped[0], (int)T.fpnClamped[1], (int)T.fpnClamped[2],
+                        (int)T.fpnClamped[3], T.fpnCorr[0], corrExpect, NF - 1, NF);
+                check(allClamped, "V10 that 0 is DECLARED a clamp, not printed silently");
+                check(corrOk, "V10 the amount subtracted is reported, in DN");
+            }
             check(worstSigT < 1e-6,
                   "V10 each plane's sigma_t is the +-10 DN alternation, ddof=1");
             // ...and the same pixels read as gray give the pooled number the
@@ -559,12 +580,138 @@
             for (auto& d : app.images) if (d->seqId == si.id) d->cfa = 0;
             recomputeTemporalIfNeeded(cur(), app.temporal[0]);
             double pooled = app.temporal[0].fixedPattern[0];
+            // DERIVED, because #57 judgment 2 moved it and a five-digit constant
+            // cannot say why. n = 32x32 = 1024 samples in one plane; the mean
+            // image takes the four levels 256 times each, so the ddof=0 spatial
+            // variance is 285000 - 450^2 = 82500 and the ddof=1 form the settled
+            // estimator asks for is 82500 x 1024/1023 = 82580.6452. Off that
+            // comes C = 100/3, giving sqrt(82547.3118) = 287.310480.
+            // The 287.228014 that stood here was sqrt(82500) - the same level
+            // spread with neither the ddof nor the correction. Both are the
+            // inter-plane spread this assert is about; which one the panel
+            // prints is what #57 settled, and the fabrication the assert names
+            // is 287 DN either way.
+            const double pooledVar0 = 285000.0 - 450.0 * 450.0;      // 82500
+            const double pooledExpect =
+                sqrt(pooledVar0 * (1024.0 / 1023.0) - (4.0 * 10.0 * 10.0 / (NF - 1.0)) / NF);
             fprintf(stderr, "verifyselftest: V10 the same pixels as gray: nPl=%d, "
-                            "sigma_fpn %.6g (the level spread, expected 287.228)\n",
-                    app.temporal[0].nPl, pooled);
-            check(app.temporal[0].nPl == 1 && fabs(pooled - 287.228014) < 1e-3,
+                            "sigma_fpn %.9g (the level spread, expected %.9g), "
+                            "clamped=%d\n",
+                    app.temporal[0].nPl, pooled, pooledExpect,
+                    (int)app.temporal[0].fpnClamped[0]);
+            check(app.temporal[0].nPl == 1 && fabs(pooled - pooledExpect) < 1e-6,
                   "V10 the mosaic is part of the cache key");
+            check(!app.temporal[0].fpnClamped[0],
+                  "V10 a 287 DN spread is far above the residual: no clamp");
             closeAll();
+        }
+
+        {   // ---- V27: sigma_fpn is the CORRECTED quantity (#57 judgment 2) --
+            // docs/flat-field-stats.md (b) pins the estimator:
+            //
+            //     C         = mean_i(s_t,i^2 / n_i)
+            //     sigma_fpn = sqrt(max(0, var_spatial(M) - C))      ... var ddof=1
+            //
+            // and requires the amount and any clamp to be declared. Two
+            // synthetic stacks with a KNOWN fixed pattern and a KNOWN temporal
+            // noise, both exact in float32 so the expected value is arithmetic
+            // and not a fit:
+            //
+            //   pixels are L +- B by column (the fixed pattern) and +- A by
+            //   frame (the temporal noise), NF = 4 frames alternating.
+            //   Per pixel the four values are L+-B+-A, so the temporal mean is
+            //   L+-B EXACTLY and the sum of squared deviations is 4A^2:
+            //       s_t,i^2 = 4A^2/(NF-1)  (ddof = n_i-1, #57 item 3)
+            //       C       = s_t,i^2 / NF                (every n_i = NF here)
+            //   Half the pixels sit at L+B and half at L-B, so
+            //       var_spatial,ddof0(M) = B^2,  var_spatial,ddof1 = B^2 n/(n-1)
+            //   with n = 32x32 = 1024 samples in the single plane.
+            //
+            // FIXTURE 1 (B=40, A=30): var = 1601.564027, C = 300, so
+            //   sigma_fpn = sqrt(1301.564027) = 36.0771954 DN, against a TRUE
+            //   fixed pattern of 40 DN measured over only 4 frames. The
+            //   uncorrected number this used to print is 40 exactly (sqrt(B^2)):
+            //   the correction is a 10% move on a fixture designed so both
+            //   numbers are exact, which is what makes red-vs-green readable.
+            // FIXTURE 2 (B=5, A=30): var = 25.024438 < C = 300, so the
+            //   subtraction goes negative: the value CLAMPS at 0 and says so.
+            //   Uncorrected this printed 5 DN of "fixed pattern" that is
+            //   entirely the leftover of a 30 DN temporal swing averaged 4 ways.
+            struct FpnCase { double B, A; bool clamp; const char* what; };
+            const FpnCase CASES[2] = {
+                { 40.0, 30.0, false, "V27 sigma_fpn = sqrt(var_spatial,ddof1 - C), derived" },
+                {  5.0, 30.0, true,  "V27 ...and clamps at 0 when C exceeds the spread" },
+            };
+            for (const FpnCase& fc : CASES) {
+                closeAll();
+                const int W = 32, H = 32, NF = 4;
+                const double L = 1000.0;
+                App::SeqInfo si;
+                si.id = app.nextSeqId++;
+                si.name = "fpn fixture";
+                app.seqs.push_back(si);
+                for (int f = 0; f < NF; f++) {
+                    auto d = std::make_unique<ImageDoc>();
+                    d->name = "fpn_" + std::to_string(f) + ".npy";
+                    d->src->w = W; d->src->h = H; d->src->ch = 1;
+                    d->src->dtype = "f32";
+                    d->src->data.resize((size_t)W * H);
+                    for (int y = 0; y < H; y++)
+                        for (int x = 0; x < W; x++)
+                            d->px()[(size_t)y * W + x] =
+                                (float)(L + (x & 1 ? -fc.B : fc.B) + (f % 2 ? fc.A : -fc.A));
+                    d->syncMirrors();
+                    d->uid = app.nextUid++;
+                    d->seqId = si.id;
+                    d->seqIndex = f;
+                    app.images.push_back(std::move(d));
+                }
+                app.current = 0;
+                app.selectedAnn = 0;
+                recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+                const App::TemporalState& T2 = app.temporal[0];
+                // the derivation, as expressions, next to the assert that uses it
+                const double n = (double)W * H;                       // 1024 samples, 1 plane
+                const double stVar = 4.0 * fc.A * fc.A / (NF - 1.0);  // s_t,i^2, ddof = n_i-1
+                const double corr  = stVar / NF;                      // C = mean(s_t,i^2 / n_i)
+                const double sVar  = fc.B * fc.B * n / (n - 1.0);     // var_spatial(M), ddof=1
+                const double fVar  = sVar - corr;
+                const double fpnExpect  = fVar > 0 ? sqrt(fVar) : 0.0;
+                const double corrExpect = sqrt(corr);
+                const double sigTExpect = sqrt(stVar);
+                const double totExpect  = sqrt(stVar + std::max(0.0, fVar));
+                fprintf(stderr, "verifyselftest: V27 B=%.4g A=%.4g NF=%d n=%.0f: "
+                                "sigma_t %.9g (exp %.9g)  sigma_fpn %.9g (exp %.9g; "
+                                "uncorrected would be %.9g)  fpn_corr %.9g (exp %.9g)  "
+                                "clamped %d (exp %d)  sigma_tot %.9g (exp %.9g)\n",
+                        fc.B, fc.A, NF, n, T2.tempNoise[0], sigTExpect,
+                        T2.fixedPattern[0], fpnExpect, fc.B,
+                        T2.fpnCorr[0], corrExpect,
+                        (int)T2.fpnClamped[0], (int)fc.clamp,
+                        T2.totalNoise[0], totExpect);
+                check(T2.valid && T2.nPl == 1 && T2.frames == NF,
+                      "V27 fixture: one plane, all frames");
+                check(fabs(T2.tempNoise[0] - sigTExpect) < 1e-9,
+                      "V27 sigma_t is the +-A swing at ddof = n_i-1");
+                check(fabs(T2.fixedPattern[0] - fpnExpect) < 1e-9, fc.what);
+                check(fabs(T2.fpnCorr[0] - corrExpect) < 1e-9,
+                      "V27 the correction AMOUNT is reported, in DN");
+                check(T2.fpnClamped[0] == fc.clamp,
+                      "V27 the clamp is declared exactly when it fired");
+                check(fabs(T2.totalNoise[0] - totExpect) < 1e-9,
+                      "V27 sigma_tot is the quadrature sum of the CORRECTED pair");
+                // The export tells readers the uncorrected upper bound is
+                // recoverable per row as sqrt(sigma_fpn^2 + fpn_corr^2), so that
+                // claim is checked here rather than merely written. It holds
+                // only where nothing was clamped - a clamp DISCARDS the negative
+                // remainder by definition, which is precisely why it has to be
+                // declared instead of silently reported as 0.
+                if (!fc.clamp)
+                    check(fabs(sqrt(T2.fixedPattern[0] * T2.fixedPattern[0] +
+                                    T2.fpnCorr[0] * T2.fpnCorr[0]) - sqrt(sVar)) < 1e-9,
+                          "V27 sqrt(sigma_fpn^2 + fpn_corr^2) recovers the uncorrected bound");
+                closeAll();
+            }
         }
 
         {   // ---- V15: a folder stack's user-given name survives a session ---

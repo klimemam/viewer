@@ -91,6 +91,24 @@ struct RoiSide {
     std::string mute;            // empty = measurable; else WHY this side has no numbers
 };
 
+// The fold this side's frame stands for, as a column-name qualifier.
+//
+// docs/analysis-layers.md §3.2, amended 2026-08-09 for #57 judgment 2: the
+// Stack ROIs sigma column and the Temporal panel's sigma_fpn come off the SAME
+// accumulator (sum / sum^2 / cnt) and used to be the same number. They are not
+// any more - sigma_fpn now subtracts the temporal residual mean(s_t,i^2/n_i)
+// and declares the subtraction, while this column stays the plain spatial
+// sigma of whatever frame is on screen. The amendment is explicit that what
+// keeps them from being read as one number is the NAMES: this column wears the
+// fold ("sigma [DN] (mean_t)"), that row wears its correction.
+//
+// A frame that came from a file gets no tag - there is no fold to declare, and
+// a qualifier on an ordinary frame would claim one.
+static std::string roiFoldTag(const ImageDoc* d) {
+    if (!d || d->avgOfPath.empty()) return std::string();
+    return d->avgFold == FOLD_SUM ? " (sum_t)" : " (mean_t)";
+}
+
 // The user's ruling on issue #76 (2026-08-09): 「roiは共通」- ONE set of
 // rectangles serves every compared slot. The canvas has always drawn them that
 // way (the same ROIs on every pane, in A's coordinates); this is the numbers
@@ -187,6 +205,22 @@ static void roiStatTooltip(const std::vector<RoiCell>& cells, bool planesMixed) 
                         "from above and is not a measurement of it. A PRNU that means\n"
                         "what EMVA means needs a layer above the frame - a flat stack\n"
                         "and a dark stack (docs/flat-field-stats.md).");
+    // The one case where that bound has a named counterpart on screen: a frame
+    // average IS the time-folded picture the Temporal panel's sigma_fpn is
+    // measured on, off the same accumulator - and since #57 judgment 2 the two
+    // numbers deliberately differ by the temporal residual. Say which is which
+    // here, where someone is looking at both (docs/analysis-layers.md §3.2).
+    for (const RoiCell& c : cells)
+        if (c.ok && !roiFoldTag(c.side->doc).empty()) {
+            ImGui::TextDisabled("%s stands for a time fold%s: this sd is the PLAIN spatial\n"
+                                "sigma of the folded picture. The Temporal panel's sigma_fpn\n"
+                                "comes off the same accumulator with the temporal residual\n"
+                                "subtracted, so it is a SMALLER number on purpose - not a\n"
+                                "second opinion about this one.",
+                                multi ? c.side->letter.c_str() : "this frame",
+                                roiFoldTag(c.side->doc).c_str());
+            break;
+        }
     if (planesMixed)
         ImGui::TextDisabled("channel = all: the planes' level differences are in this sd.");
     ImGui::EndTooltip();
@@ -493,17 +527,26 @@ static void drawPanelRois() {
             // and a header clipped to "std / m..." would be the one column nobody
             // could identify from a screenshot. That holds per GROUP: the letter
             // above it says whose number it is, never what the number is.
+            // ...and the fold rides in the two spread columns' names, per SIDE:
+            // A can be a frame average while B is an ordinary frame, and a
+            // qualifier written over the whole table would say so of both.
+            const std::string ft = roiFoldTag(cols[i]->doc);
+            const std::string hSd = "std" + ft;
+            const std::string hPct = "std / mean [%]" + ft;
             if (laid) {
                 ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
-                ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthFixed, numColW());
-                ImGui::TableSetupColumn("std / mean [%]", ImGuiTableColumnFlags_WidthFixed,
-                                        ImGui::CalcTextSize("std / mean [%]").x);
+                ImGui::TableSetupColumn(hSd.c_str(), ImGuiTableColumnFlags_WidthFixed,
+                                        std::max(numColW(), ImGui::CalcTextSize(hSd.c_str()).x));
+                ImGui::TableSetupColumn(hPct.c_str(), ImGuiTableColumnFlags_WidthFixed,
+                                        ImGui::CalcTextSize(hPct.c_str()).x);
                 ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthFixed, numColW());
                 ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthFixed, numColW());
             } else {
                 ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-                ImGui::TableSetupColumn("std", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-                ImGui::TableSetupColumn("std / mean [%]", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+                ImGui::TableSetupColumn(hSd.c_str(), ImGuiTableColumnFlags_WidthStretch,
+                                        ft.empty() ? 1.0f : 1.4f);
+                ImGui::TableSetupColumn(hPct.c_str(), ImGuiTableColumnFlags_WidthStretch,
+                                        ft.empty() ? 1.5f : 2.0f);
                 ImGui::TableSetupColumn("min", ImGuiTableColumnFlags_WidthStretch, 1.0f);
                 ImGui::TableSetupColumn("max", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             }

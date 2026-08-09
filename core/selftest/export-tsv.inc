@@ -81,12 +81,27 @@
             check(prof4, "E1 profile stats: per-plane rows R/Gr/Gb/B");
         }
         check(has(tsv, "sigma_t [DN]") && has(tsv, "sigma_fpn [DN]") &&
-              has(tsv, "sigma_tot [DN]"), "E1 summary header units named");
+              has(tsv, "sigma_tot [DN]") && has(tsv, "fpn_corr [DN]") &&
+              has(tsv, "fpn_clamped"), "E1 summary header units named");
         check(has(tsv, "sigma_frame [DN]") && has(tsv, "sigma_col [%]") &&
               has(tsv, "sigma_row [%]") && has(tsv, "mean [DN]"),
               "E1 profile/per-frame header units named");
-        check(has(tsv, "no sigma_t^2/N subtraction"),
-              "E1 sigma_fpn states exactly what it is");
+        // #57 judgment 2 turned this assert around. It used to require the
+        // export to say "no sigma_t^2/N subtraction", which was TRUE of the
+        // binary and is now false of it: the subtraction is applied to the
+        // sigma_fpn row itself, so what the export owes a reader is the
+        // opposite statement - which correction, off which variance, and
+        // recoverably. An export that still carried the old sentence would be
+        // the failure docs/export-design.md exists to prevent (the file
+        // describing a number it no longer holds).
+        check(!has(tsv, "no sigma_t^2/N subtraction"),
+              "E1 the old 'no subtraction' claim is gone");
+        check(has(tsv, "temporal residual C subtracted") &&
+              has(tsv, "fpn_corr = sqrt(mean(s_t,i^2/n_i))") &&
+              has(tsv, "var_spatial(per-pixel temporal means, ddof=1)"),
+              "E1 sigma_fpn states exactly what it is: the corrected estimator");
+        check(has(tsv, "sqrt(sigma_fpn^2 + fpn_corr^2)"),
+              "E1 ...and how to get back to the uncorrected upper bound");
         // every section is a rectangle: all non-# lines in a section carry the
         // same number of cells as their header
         auto rect = [&](const std::string& d2, size_t from, size_t to, const char* what) {

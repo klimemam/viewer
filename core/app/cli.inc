@@ -1259,15 +1259,26 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 sum[i] += v; sum2[i] += v * v;
             }
         }
-        double N = m.frames, aM = 0, aM2 = 0, aV = 0;
+        double N = m.frames, aM = 0, aM2 = 0, aV = 0, aC = 0;
         for (size_t i = 0; i < samples; i++) {
             double mm = sum[i] / N;
+            double v = std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
             aM += mm; aM2 += mm * mm;
-            aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+            aV += v;
+            aC += v / N;                       // s_t,i^2 / n_i; no NaN in this fixture
         }
-        double refMean = aM / samples;
-        double refSt = sqrt(aV / samples);
-        double refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+        double ns = (double)samples;
+        double refMean = aM / ns;
+        double refSt = sqrt(aV / ns);
+        // The CORRECTED sigma_fpn (#57 judgment 2, docs/flat-field-stats.md (b)):
+        // var_spatial(M) at ddof=1 minus C = mean_i(s_t,i^2/n_i), clamped at 0.
+        // This reference exists to disagree with serve.cpp if serve.cpp drifts,
+        // so it is written from the settled formula rather than copied from it.
+        double refCorr = aC / ns;
+        double refVar = std::max(0.0, aM2 / ns - refMean * refMean) * (ns / (ns - 1.0));
+        double refFpn = sqrt(std::max(0.0, refVar - refCorr));
+        double refCorrDn = sqrt(refCorr);
+        double refClamp = refVar - refCorr < 0.0 ? 1.0 : 0.0;
         auto findNum = [&](const char* k) {
             for (const auto& it : mr.cols[0])
                 if (it.kind == 0 && it.key == k) return it.num;
@@ -1279,6 +1290,9 @@ static int remoteSelfTest(const char* exe, const char* path) {
         size_t bad3 = 0;
         struct { const char* k; double ref; } checks[] = {
             { "mean [DN]", refMean }, { "sigma_t [DN]", refSt }, { "sigma_fpn [DN]", refFpn },
+            // the correction and the clamp are part of the answer, so they are
+            // part of what the peer has to get right
+            { "fpn_corr [DN]", refCorrDn }, { "fpn_clamped", refClamp },
         };
         for (const auto& c : checks)
             if (rel(findNum(c.k), c.ref) > 1e-9) {

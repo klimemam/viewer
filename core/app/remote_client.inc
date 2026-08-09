@@ -489,6 +489,14 @@ static void pumpMeasure() {
             S.tempNoise[p] = mFindNum(d.res, ("sigma_t [DN]" + sfx).c_str());
             S.fixedPattern[p] = mFindNum(d.res, ("sigma_fpn [DN]" + sfx).c_str());
             S.totalNoise[p] = mFindNum(d.res, ("sigma_tot [DN]" + sfx).c_str());
+            // #57 judgment 2: sigma_fpn arrives CORRECTED, so the two numbers
+            // that make it readable arrive with it - how much was subtracted,
+            // and whether the subtraction hit the clamp. Which is why rp::VERSION
+            // went to 6: a v5 peer sends the uncorrected upper bound under the
+            // same key and neither of these, and the panel would then declare a
+            // correction that peer never applied.
+            S.fpnCorr[p] = mFindNum(d.res, ("fpn_corr [DN]" + sfx).c_str());
+            S.fpnClamped[p] = mFindNum(d.res, ("fpn_clamped" + sfx).c_str()) > 0.5;
         }
         if (const auto* fm = mFindSeries(d.res, "frame mean")) { S.idx = fm->xs; S.frameMean = fm->ys; }
         if (const auto* fs = mFindSeries(d.res, "frame std"))  { S.frameStd = fs->ys; }

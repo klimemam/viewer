@@ -38,7 +38,18 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // produces the new one, so the same folder reads differently depending on
 // which side listed it. Versioning the meaning is what makes the peer update
 // itself on connect.
-static const uint32_t VERSION = 5;
+//
+// 6: the MEANING again, and this time of a number people paste into reports.
+// MOP_TEMPORAL_STATS' `sigma_fpn [DN]` is now the CORRECTED quantity - the
+// temporal residual mean(s_t,i^2/n_i) subtracted, ddof=1 spatial variance,
+// clamped at 0 and saying so (#57 judgment 2, docs/flat-field-stats.md (b)) -
+// and the reply carries `fpn_corr [DN]` / `fpn_clamped` beside it. A v5 peer
+// answers the same key with the UNCORRECTED upper bound, which the panel would
+// then print under a label declaring a correction it never had: the same folder
+// measured here and there would differ by sigma_t^2/N with nothing saying why.
+// Wire format is unchanged (MEASURE carries named items), so this number exists
+// solely to make an installed peer update itself on connect.
+static const uint32_t VERSION = 6;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)

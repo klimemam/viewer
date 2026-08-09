@@ -29,8 +29,14 @@
             fprintf(stderr, "rtemporalselftest: need >= 2 npy under %s\n", dir.c_str());
             return 1;
         }
-        // independent reference: per-pixel f64 accumulation over the local files
-        double refMean = 0, refSt = 0, refFpn = 0;
+        // independent reference: per-pixel f64 accumulation over the local files.
+        // Since #57 judgment 2 the reference computes the CORRECTED sigma_fpn -
+        // this loop is the third implementation of the estimator and its job is
+        // to disagree with the other two if either drifts, so it has to be
+        // written against the settled formula and not against whichever of them
+        // is being tested today.
+        double refMean = 0, refSt = 0, refFpn = 0, refCorr = 0;
+        bool refClamp = false;
         {
             std::vector<double> sum, sum2;
             size_t samples = 0;
@@ -57,15 +63,24 @@
                 }
                 N++;
             }
-            double aM = 0, aM2 = 0, aV = 0;
+            double aM = 0, aM2 = 0, aV = 0, aC = 0;
             for (size_t i = 0; i < samples; i++) {
                 double mm = sum[i] / N;
+                double v = std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
                 aM += mm; aM2 += mm * mm;
-                aV += std::max(0.0, sum2[i] / N - mm * mm) * (N / (N - 1.0));
+                aV += v;
+                aC += v / N;                       // s_t,i^2 / n_i; here every n_i = N
             }
-            refMean = aM / samples;
-            refSt = sqrt(aV / samples);
-            refFpn = sqrt(std::max(0.0, aM2 / samples - refMean * refMean));
+            double ns = (double)samples;
+            refMean = aM / ns;
+            refSt = sqrt(aV / ns);
+            refCorr = aC / ns;                     // C = mean_i(s_t,i^2 / n_i)
+            // var_spatial(M) at ddof=1, minus C, clamped and DECLARED
+            // (docs/flat-field-stats.md (b))
+            double sVar = std::max(0.0, aM2 / ns - refMean * refMean) * (ns / (ns - 1.0));
+            refClamp = sVar - refCorr < 0.0;
+            refFpn = sqrt(std::max(0.0, sVar - refCorr));
+            refCorr = sqrt(refCorr);               // reported in DN, like sigma_fpn
         }
         // connect the browser, then fire the SAME call the group row's menu makes
         startRemote(rbMain(), "local://" + dir);
@@ -99,11 +114,15 @@
         } else {
             fprintf(stderr, "rtemporalselftest: sigma_t server %.12g vs ref %.12g "
                             "(rel %.3g), sigma_fpn %.12g vs %.12g (rel %.3g), "
+                            "fpn_corr %.12g vs %.12g (rel %.3g), clamped %d vs %d, "
                             "mean rel %.3g\n",
                     S.tempNoise[0], refSt, rel(S.tempNoise[0], refSt),
                     S.fixedPattern[0], refFpn, rel(S.fixedPattern[0], refFpn),
+                    S.fpnCorr[0], refCorr, rel(S.fpnCorr[0], refCorr),
+                    (int)S.fpnClamped[0], (int)refClamp,
                     rel(S.mean[0], refMean));
             if (rel(S.tempNoise[0], refSt) > 1e-9 || rel(S.fixedPattern[0], refFpn) > 1e-9 ||
+                rel(S.fpnCorr[0], refCorr) > 1e-9 || S.fpnClamped[0] != refClamp ||
                 rel(S.mean[0], refMean) > 1e-9) {
                 fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
                 ok = false;
@@ -115,6 +134,8 @@
         // stack. The peer's numbers are copied out first for the same reason -
         // app.srvTemporal is a single slot and this test is done reading it.
         const double srvSigT = S.tempNoise[0], srvFpn = S.fixedPattern[0];
+        const double srvCorr = S.fpnCorr[0], srvTot = S.totalNoise[0];
+        const bool srvClamp = S.fpnClamped[0];
         const int srvFrames = S.frames;
         if (ok) {
             auto chk = [&](bool cond, const char* what) {
@@ -138,24 +159,47 @@
                 ? sqrt((double)T.frames / (double)(T.frames - 1)) : 0.0;
             fprintf(stderr, "rtemporalselftest: P1 same stack both ways: local %d frame(s)/"
                             "%d plane(s) vs peer %d frame(s); sigma_t %.12g vs %.12g "
-                            "(rel %.3g); sigma_fpn %.12g vs %.12g (rel %.3g). "
+                            "(rel %.3g); sigma_fpn %.12g vs %.12g (rel %.3g); "
+                            "fpn_corr %.12g vs %.12g (rel %.3g); clamped %d vs %d. "
                             "sqrt(N/(N-1)) at N=%d is %.9g - a mismatch of exactly that "
                             "is the ddof split, not a rounding difference\n",
                     T.frames, T.nPl, srvFrames,
                     T.tempNoise[0], srvSigT, rel(T.tempNoise[0], srvSigT),
                     T.fixedPattern[0], srvFpn, rel(T.fixedPattern[0], srvFpn),
+                    T.fpnCorr[0], srvCorr, rel(T.fpnCorr[0], srvCorr),
+                    (int)T.fpnClamped[0], (int)srvClamp,
                     T.frames, ddofRatio);
             chk(T.valid && T.nPl == 1 && T.frames == srvFrames &&
                 T.frames == (int)files.size(),
                 "P1 fixture: the opened stack is the one the peer measured");
-            // 1e-9 relative, the tolerance this file already uses against its
-            // own float64 reference: the two sides run the SAME formula over
-            // the same f32 pixels in the same order, so anything a human would
-            // call a difference is orders of magnitude above this.
-            chk(rel(T.tempNoise[0], srvSigT) <= 1e-9,
+            // BIT-for-bit, not "close". The two sides run the same formula over
+            // the same f32 pixels in the same accumulation order, so there is no
+            // rounding budget to spend and no reason to grant one: an equality
+            // that holds today would be silently loosened by a tolerance the day
+            // one side reorders its arithmetic. (The 1e-9 relative check above
+            // is against the SEPARATE f64 reference, which does accumulate
+            // differently and has earned its tolerance.)
+            chk(T.tempNoise[0] == srvSigT,
                 "P1 local and peer report the SAME sigma_t for one stack");
-            chk(rel(T.fixedPattern[0], srvFpn) <= 1e-9,
-                "P2 ...and the same sigma_fpn, which the ddof split never touched");
+            chk(T.fixedPattern[0] == srvFpn,
+                "P2 ...and the same CORRECTED sigma_fpn, bit for bit");
+            // P3/P4 (#57 judgment 2): parity of the value alone is not parity of
+            // the measurement. sigma_fpn clamps at 0, and two sides that both
+            // clamp agree on 0 while agreeing on nothing - so the amount
+            // subtracted and the clamp flag are compared too, and they are what
+            // makes the agreement above mean something on a stack whose true
+            // fixed pattern is (as this fixture's is) essentially zero.
+            chk(T.fpnCorr[0] == srvCorr,
+                "P3 ...and the same correction amount, bit for bit");
+            chk(T.fpnClamped[0] == srvClamp,
+                "P4 ...and they agree on whether the clamp fired");
+            // P5: the row DERIVED from the other two. It is checked because it
+            // is derived - the peer built it as sqrt(st*st + fvar) off an
+            // already-square-rooted sigma_t, which is not the same binary64 as
+            // the viewer's sqrt(tvar + fvar), and no test had ever put the two
+            // beside each other to notice.
+            chk(T.totalNoise[0] == srvTot,
+                "P5 ...and the same sigma_tot, which is derived from both");
             closeAll();
         }
         fprintf(stderr, "rtemporalselftest: %s\n", ok ? "ok" : "FAILED");

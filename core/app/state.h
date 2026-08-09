@@ -1154,6 +1154,13 @@ struct App {
         // - which the panel then has to SAY, not hide.
         int nPl = 1;
         double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {}, mean[4] = {};
+        // the peer's half of the same declaration (serve.cpp runTemporalStats):
+        // the amount subtracted and whether it hit the clamp. Read off the reply
+        // by key like every other number here - the panel must be able to say
+        // "corrected by X, clamped" for a server row exactly as for a local one,
+        // or the two sources would print one label over two quantities.
+        double fpnCorr[4] = {};
+        bool fpnClamped[4] = {};
         std::vector<float> idx, frameMean, frameStd;
     } srvTemporal;
     // The same, for the compare B side. NEVER fired automatically: a server
@@ -1498,6 +1505,19 @@ struct App {
         size_t dropped = 0;                       // samples with < 2 valid frames
         std::vector<float> idx, frameMean, frameStd;
         double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {};
+        // #57 judgment 2 (docs/flat-field-stats.md (b)): sigma_fpn is the
+        // CORRECTED quantity - the temporal residual left in an n-frame mean is
+        // subtracted from the spatial variance. Both halves of that subtraction
+        // are part of the result, not implementation detail:
+        //   fpnCorr[p]    = sqrt(mean_i(s_t,i^2 / n_i)) in DN, so that
+        //                   sigma_fpn^2 = max(0, var_spatial(M) - fpnCorr^2)
+        //   fpnClamped[p] = the subtraction went negative and the value is 0
+        // A clamped sigma_fpn is a STATEMENT about the measurement ("no fixed
+        // pattern resolvable above this stack's own temporal floor"), and the
+        // canon's guard rule is explicit that a clamp is never silent
+        // (flat-field-stats.md (a) "0 でクランプし、クランプしたことを結果に出す").
+        double fpnCorr[4] = {};
+        bool fpnClamped[4] = {};
         bool valid = false;
         bool roiUsed = false;
     } temporal[2];                    // 0 = A, 1 = B (compare)

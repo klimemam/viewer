@@ -1,4 +1,67 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
+// ---- sigma_fpn, and the two things that make it readable -------------------
+// #57 judgment 2 (docs/flat-field-stats.md (b)) made the sigma_fpn ROW ITSELF
+// the corrected quantity. A corrected number that does not say what was taken
+// off it cannot be checked, and a clamped one that prints a bare 0 is worse
+// than useless - it reads as "this sensor has no fixed pattern" when what
+// happened is "this stack cannot see one under its own temporal floor". So the
+// amount and the clamp travel WITH the value, and this file says it once:
+// three tables draw these rows (local, server, server-detached) and they had
+// already drifted into two different NAMES for one quantity ("sigma_s" on
+// screen, "sigma_fpn" in the export and on the server's own table).
+static const char* FPN_TIP =
+    "sigma_fpn = spatial sigma of the time-averaged frame, ddof=1, MINUS the\n"
+    "temporal residual still in that mean:\n"
+    "    sigma_fpn^2 = max(0, var_spatial(mean) - fpn_corr^2)\n"
+    "    fpn_corr    = sqrt(mean(s_t,i^2 / n_i))\n"
+    "Averaging n frames drops the temporal noise by sqrt(n) and no further;\n"
+    "without the subtraction that leftover is read as fixed pattern (at n=16,\n"
+    "sigma_t=10 DN a true 5 DN pattern reads 5.59 DN).\n"
+    "Still includes scene detail unless the region is flat.\n"
+    "docs/flat-field-stats.md (b) - #57 judgment 2";
+
+// The four rows every Temporal table prints, with sigma_fpn's declaration.
+// A clamped plane says so IN ITS CELL: the canon's guard rule is that a clamp
+// is never a silent 0 (flat-field-stats.md (a)).
+static void temporalNoiseRows(int nPl, const double* sigT, const double* fpn,
+                              const double* corr, const bool* clamped,
+                              const double* tot) {
+    auto row = [&](const char* k, const double* v) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+        for (int p = 0; p < nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
+    };
+    row("temporal noise (sigma_t)", sigT);
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn(); ImGui::TextDisabled("fixed pattern (sigma_fpn)");
+    bool hov = ImGui::IsItemHovered();
+    for (int p = 0; p < nPl; p++) {
+        ImGui::TableNextColumn();
+        if (clamped[p]) ImGui::TextColored(AB_AMBER, "0 (clamped)");
+        else            textNum("%.6g", fpn[p]);
+        hov |= ImGui::IsItemHovered();
+    }
+    if (hov) ImGui::SetTooltip("%s", FPN_TIP);
+    row("  temporal residual subtracted (fpn_corr)", corr);
+    row("total (quadrature)", tot);
+}
+
+// ...and the sentence a clamped plane owes the reader, under the table.
+static void temporalClampNote(int nPl, const bool* clamped) {
+    std::string pl;
+    for (int p = 0; p < nPl; p++)
+        if (clamped[p]) {
+            if (!pl.empty()) pl += ", ";
+            pl += nPl > 1 ? LIN_PLANES[p] : "value";
+        }
+    if (pl.empty()) return;
+    ImGui::TextColored(AB_AMBER,
+        "sigma_fpn clamped at 0 (%s): the temporal residual is not below the "
+        "spatial spread,\nso this stack resolves no fixed pattern above its own "
+        "temporal floor. The 0 is a\nstatement about the measurement, not a flat "
+        "sensor - measure more frames or a flatter field.", pl.c_str());
+}
+
 // Server-computed temporal stats: shown for a remote stack under a policy that
 // lets the server compute. The numbers come over the wire in seconds; they are
 // never quietly recomputed locally (that would change a displayed measurement,
@@ -36,16 +99,11 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
             ImGui::TableSetupColumn(S.nPl > 1 ? LIN_PLANES[p] : "value",
                                     ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
-        auto row = [&](const char* k, const double* v) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-            for (int p = 0; p < S.nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
-        };
-        row("temporal noise (sigma_t)", S.tempNoise);
-        row("fixed pattern (sigma_fpn)", S.fixedPattern);
-        row("total (quadrature)", S.totalNoise);
+        temporalNoiseRows(S.nPl, S.tempNoise, S.fixedPattern, S.fpnCorr,
+                          S.fpnClamped, S.totalNoise);
         ImGui::EndTable();
     }
+    temporalClampNote(S.nPl, S.fpnClamped);
     if (!S.frameMean.empty()) {
         // the custom per-frame x axis applies to the server's series too: the
         // mapping is by frame number, and the server's x IS the frame number
@@ -150,17 +208,16 @@ static void drawBrowseTemporal() {
             ImGui::TableSetupColumn(S.nPl > 1 ? LIN_PLANES[p] : "value",
                                     ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
-        auto row = [&](const char* k, const double* v) {
+        {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-            for (int p = 0; p < S.nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
-        };
-        row("mean", S.mean);
-        row("temporal noise (sigma_t)", S.tempNoise);
-        row("fixed pattern (sigma_fpn)", S.fixedPattern);
-        row("total (quadrature)", S.totalNoise);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("mean");
+            for (int p = 0; p < S.nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", S.mean[p]); }
+        }
+        temporalNoiseRows(S.nPl, S.tempNoise, S.fixedPattern, S.fpnCorr,
+                          S.fpnClamped, S.totalNoise);
         ImGui::EndTable();
     }
+    temporalClampNote(S.nPl, S.fpnClamped);
     if (!S.frameMean.empty()) {
         float mn = FLT_MAX, mx = -FLT_MAX;
         for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
@@ -466,7 +523,12 @@ struct AbTemporal {
     bool roiUsed = false;
     int rx = 0, ry = 0, rw = 0, rh = 0;
     int nPl = 1;                      // CFA planes are never mixed, on either side
-    double sigT[4] = {}, sigS[4] = {}, sigTot[4] = {};
+    // sigS is sigma_fpn - the CORRECTED one (#57 judgment 2). sigCorr is what
+    // was subtracted (fpn_corr, in DN) and clamped[] says the printed 0 is a
+    // clamp. Both travel here so an A measured on a server and a B measured
+    // locally declare their correction the same way in one table.
+    double sigT[4] = {}, sigS[4] = {}, sigCorr[4] = {}, sigTot[4] = {};
+    bool clamped[4] = {};
     int frames = 0, expected = 0;
     const std::vector<float>* idx = nullptr;
     const std::vector<float>* mean = nullptr;
@@ -485,6 +547,7 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
         o.rx = S.rx; o.ry = S.ry; o.rw = S.rw; o.rh = S.rh;
         for (int p = 0; p < S.nPl; p++) {
             o.sigT[p] = S.tempNoise[p]; o.sigS[p] = S.fixedPattern[p];
+            o.sigCorr[p] = S.fpnCorr[p]; o.clamped[p] = S.fpnClamped[p];
             o.sigTot[p] = S.totalNoise[p];
         }
         o.frames = S.frames;
@@ -498,6 +561,7 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
         o.rx = T.rx; o.ry = T.ry; o.rw = T.roiUsed ? T.rw : 0; o.rh = T.roiUsed ? T.rh : 0;
         for (int p = 0; p < T.nPl; p++) {
             o.sigT[p] = T.tempNoise[p]; o.sigS[p] = T.fixedPattern[p];
+            o.sigCorr[p] = T.fpnCorr[p]; o.clamped[p] = T.fpnClamped[p];
             o.sigTot[p] = T.totalNoise[p];
         }
         o.frames = T.frames;
@@ -701,32 +765,52 @@ static std::string buildTemporalExport(char delim) {
     // ---- section 1: the stack statistics --------------------------------
     doc.comment("== temporal summary (stack statistics; sigma_t is a property of "
                 "the stack, never of a frame) ==");
+    // fpn_corr / fpn_clamped ride in the table rather than in a comment: they
+    // are per side AND per plane, which is a row shape, and a report that
+    // quotes sigma_fpn has to be able to quote what was taken off it from the
+    // same line (#57 judgment 2). They go AFTER sigma_tot so the three
+    // sigma_* columns stay adjacent - tools/verify/invariants.sh reads that
+    // triple as one header token.
     doc.row({ "side", "ch", "n", "N", "sigma_t [DN]", "sigma_fpn [DN]",
-              "sigma_tot [DN]", "source" });
-    bool anyLocal = false;
+              "sigma_tot [DN]", "fpn_corr [DN]", "fpn_clamped", "source" });
+    bool anyLocal = false, anyClamp = false;
     for (const TExpSide& s : sides) {
         if (!s.t.valid) continue;
         anyLocal |= !s.t.fromServer;
         std::string src = s.t.fromServer
             ? (s.srvHost.empty() ? std::string("server") : "server " + s.srvHost)
             : std::string("local");
-        for (int p = 0; p < s.t.nPl; p++)
+        for (int p = 0; p < s.t.nPl; p++) {
+            anyClamp |= s.t.clamped[p];
             doc.row({ s.letter, s.t.nPl > 1 ? LIN_PLANES[p] : "all",
                       std::to_string(s.t.frames),
                       std::to_string(std::max(s.t.expected, s.t.frames)),
                       expNum(s.t.sigT[p]), expNum(s.t.sigS[p]), expNum(s.t.sigTot[p]),
+                      expNum(s.t.sigCorr[p]), s.t.clamped[p] ? "yes" : "no",
                       src });
+        }
     }
     // The estimator is named because this table mixes local and server rows in
     // one column (`src`), and until #57 item 3 the two sides used different
     // ddof - a reader comparing a local row with a server row was comparing two
     // quantities under one heading. They are one quantity now, so the sentence
-    // that says which one belongs here.
+    // that says which one belongs here - and since #57 item 2 that sentence has
+    // to say that sigma_fpn is CORRECTED, because the same key named the
+    // uncorrected upper bound in every export written before this one.
     doc.comment("sigma_t = sqrt(mean per-pixel temporal variance, ddof=1 - the "
                 "same estimator local and server); sigma_fpn = "
-                "spatial sigma of the per-pixel temporal means (includes scene "
-                "detail unless the region is flat; no sigma_t^2/N subtraction); "
-                "sigma_tot = quadrature sum");
+                "sqrt(max(0, var_spatial(per-pixel temporal means, ddof=1) - "
+                "fpn_corr^2)) with fpn_corr = sqrt(mean(s_t,i^2/n_i)) - the "
+                "temporal residual C subtracted (docs/flat-field-stats.md (b), "
+                "#57 item 2); still includes scene detail unless the region is "
+                "flat; sigma_tot = quadrature sum");
+    doc.comment("the uncorrected upper bound this used to print is recoverable "
+                "per row as sqrt(sigma_fpn^2 + fpn_corr^2)");
+    if (anyClamp)
+        doc.comment("NOTE: sigma_fpn CLAMPED at 0 where fpn_clamped says yes - the "
+                    "temporal residual is not below the spatial spread, so that "
+                    "row resolves no fixed pattern above its own temporal floor. "
+                    "The 0 is a statement about the measurement, not a flat sensor.");
     if (anyLocal)
         doc.comment("local values are computed on a sampled grid (up to 40000 "
                     "samples, whole CFA cells); the per-frame section scans every "
@@ -1057,7 +1141,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     const int nPlanes = std::max(A.nPl, B.nPl);
     const ImGuiStyle& gst = ImGui::GetStyle();
     const float rowH = ImGui::GetTextLineHeight() + gst.CellPadding.y * 2;
-    const float tblWant = rowH * (3 * nPlanes + 1)      // + the header row
+    // FOUR rows per plane since #57 judgment 2: sigma_t, sigma_fpn, the
+    // fpn_corr that was subtracted from it, and the quadrature total. The
+    // correction is not a footnote - it is the number that makes the corrected
+    // one checkable - so it is reserved like any other row.
+    const float tblWant = rowH * (4 * nPlanes + 1)      // + the header row
                         + gst.ScrollbarSize             // ScrollX reserves one
                         + gst.CellPadding.y * 2;
     // ---- custom per-frame x axes, one per slot's stack. ONE plot has ONE x
@@ -1128,7 +1216,16 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     std::string slotDiv;    // slots whose follow-frame found no partner frame
     for (const TExtra& x : XS)
         if (x.diverged) { if (!slotDiv.empty()) slotDiv += ", "; slotDiv += x.letter; }
+    // a clamped sigma_fpn owes the reader a line, per side that clamped, and
+    // the chart below has to be told about it before the table takes its height
+    auto anyClamp = [](const AbTemporal& t) {
+        if (!t.valid) return false;
+        for (int p = 0; p < t.nPl; p++) if (t.clamped[p]) return true;
+        return false;
+    };
     int notices = 0;
+    if (anyClamp(A)) notices++;
+    if (anyClamp(B)) notices++;
     if (axAny && !axUse) notices++;
     if (!axBorrowed.empty()) notices++;
     if (g_abFollowDiverged) notices++;
@@ -1186,19 +1283,46 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         // plane split, canDelta is already false and the columns stand alone.
         const int nPl = nPlanes;   // the height reserved above counted these rows
         for (int p = 0; p < nPl; p++) {
-            char k1[64], k2[64], k3[64];
+            char k1[80], k2[80], k3[80], k4[80];
             const char* sfx = nPl > 1 ? LIN_PLANES[p] : "";
             snprintf(k1, sizeof k1, "temporal noise (sigma_t) %s", sfx);
-            snprintf(k2, sizeof k2, "fixed pattern (sigma_s) %s", sfx);
-            snprintf(k3, sizeof k3, "total (quadrature) %s", sfx);
+            // ONE name for one quantity: this table said sigma_s while the two
+            // single-side tables above it said sigma_fpn (#57 judgment 2 -
+            // docs/analysis-layers.md §3.2 leans on the names to keep the
+            // corrected row and the ROIs column apart, which needs the names to
+            // be the canon's).
+            snprintf(k2, sizeof k2, "fixed pattern (sigma_fpn) %s", sfx);
+            snprintf(k3, sizeof k3, "  temporal residual subtracted (fpn_corr) %s", sfx);
+            snprintf(k4, sizeof k4, "total (quadrature) %s", sfx);
             row(k1, A.sigT[p], B.sigT[p], false);
             row(k2, A.sigS[p], B.sigS[p], false);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
-                                  "includes scene detail unless the ROI is flat");
-            row(k3, A.sigTot[p], B.sigTot[p], false);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FPN_TIP);
+            row(k3, A.sigCorr[p], B.sigCorr[p], false);
+            row(k4, A.sigTot[p], B.sigTot[p], false);
         }
         ImGui::EndTable();
+    }
+    // A clamp is a property of ONE side's measurement, so it is named with its
+    // side - a delta column beside a clamped 0 is a difference against a bound,
+    // not against a fixed pattern, and the reader has to be told which side.
+    {
+        const AbTemporal* sides2[2] = { &A, &B };
+        static const char* letters2[2] = { "A", "B" };
+        for (int i = 0; i < 2; i++) {
+            const AbTemporal& t = *sides2[i];
+            if (!t.valid) continue;
+            std::string pl;
+            for (int p = 0; p < t.nPl; p++)
+                if (t.clamped[p]) {
+                    if (!pl.empty()) pl += ", ";
+                    pl += t.nPl > 1 ? LIN_PLANES[p] : "value";
+                }
+            if (!pl.empty())
+                ImGui::TextColored(AB_AMBER,
+                    "%s: sigma_fpn clamped at 0 (%s) - the temporal residual is not "
+                    "below the spatial spread, so no fixed pattern is resolved there",
+                    letters2[i], pl.c_str());
+        }
     }
     if (g_abFollowDiverged)
         ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
@@ -1564,22 +1688,16 @@ static void drawPanelTemporal() {
                     ImGui::TableSetupColumn(T.nPl > 1 ? LIN_PLANES[p] : "value",
                                             ImGuiTableColumnFlags_WidthFixed, numColW());
                 ImGui::TableHeadersRow();
-                auto row = [&](const char* k, const double* v) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
-                    for (int p = 0; p < T.nPl; p++) {
-                        ImGui::TableNextColumn();
-                        textNum("%.6g", v[p]);
-                    }
-                };
-                row("temporal noise (sigma_t)", T.tempNoise);
-                row("fixed pattern (sigma_s)", T.fixedPattern);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("spatial std of the time-averaged frame;\n"
-                                      "includes scene detail unless the ROI is flat");
-                row("total (quadrature)", T.totalNoise);
+                // The local table said "sigma_s" while the server table beside
+                // it and the export below it both said "sigma_fpn" - one
+                // quantity under two names, which is the confusion the amended
+                // §3.2 asks the NAMES to prevent. One name, and it is the
+                // canon's (docs/terminology.md).
+                temporalNoiseRows(T.nPl, T.tempNoise, T.fixedPattern, T.fpnCorr,
+                                  T.fpnClamped, T.totalNoise);
                 ImGui::EndTable();
             }
+            temporalClampNote(T.nPl, T.fpnClamped);
             // the same row the server emits: excluded, and how many. A silent
             // exclusion is only half of not folding them in.
             if (T.nonFinite || T.dropped)

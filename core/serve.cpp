@@ -1105,8 +1105,18 @@ static void sendMeasureReply(uint32_t framesUsed,
 }
 
 // Temporal noise vs fixed pattern: per-pixel mean/var over the frame range.
-// sigma_t = sqrt(mean per-pixel temporal variance), sigma_fpn = spatial sigma of
-// the per-pixel temporal means - the split every sensor evaluation starts from.
+// sigma_t = sqrt(mean per-pixel temporal variance); sigma_fpn = the spatial
+// sigma of the per-pixel temporal means with the temporal residual STILL IN
+// that mean subtracted (#57 judgment 2, docs/flat-field-stats.md (b)):
+//
+//     C        = mean_i(s_t,i^2 / n_i)              ... per pixel, per its own n_i
+//     sigma_fpn = sqrt(max(0, var_spatial(M) - C))  ... var ddof=1, clamp declared
+//
+// This function and the viewer's own recomputeTemporalIfNeeded are ONE
+// estimator with two transports (docs/analysis-layers.md §3.5), so the
+// arithmetic below is written in the same order as the local one - clamp before
+// scaling, correction accumulated per pixel - and rtemporal's P1..P4 compare
+// the two on the same stack rather than trusting that they look alike.
 static void runTemporalStats(const MeasureReqHead& head,
                              const std::vector<std::string>& paths,
                              const std::vector<RoiRect>& rois) {
@@ -1161,7 +1171,7 @@ static void runTemporalStats(const MeasureReqHead& head,
             fs.ys.push_back((float)(sn ? sqrt(std::max(0.0, s2 / (double)sn - m * m)) : 0.0));
         }
         const int nPl = head.cfaType ? 4 : 1;
-        double plM[4] = {}, plM2[4] = {}, plV[4] = {};
+        double plM[4] = {}, plM2[4] = {}, plV[4] = {}, plCorr[4] = {};
         size_t plC[4] = {};
         for (uint32_t y = 0; y < rh; y++)
             for (uint32_t x = 0; x < rw; x++) {
@@ -1173,27 +1183,62 @@ static void runTemporalStats(const MeasureReqHead& head,
                     double m = sum[i] / nI;
                     double var = std::max(0.0, sum2[i] / nI - m * m) * (nI / (nI - 1.0));
                     plM[p] += m; plM2[p] += m * m; plV[p] += var; plC[p]++;
+                    plCorr[p] += var / nI;      // s_t,i^2 / n_i, this pixel's own n_i
+
                 }
             }
         cols[c].push_back({ 0u, "frames", (double)src.count, {} });
         if (nonFinite)
             cols[c].push_back({ 0u, "non-finite samples (excluded)", (double)nonFinite, {} });
+        bool anyClamp = false;
         for (int p = 0; p < nPl; p++) {
             if (!plC[p]) continue;
             double cnt = (double)plC[p];
             double mean = plM[p] / cnt;
             double st = sqrt(plV[p] / cnt);
-            double fpn = sqrt(std::max(0.0, plM2[p] / cnt - mean * mean));
+            double corr = plCorr[p] / cnt;              // C = mean_i(s_t,i^2 / n_i)
+            // ddof=1 on the spatial variance, as the settled estimator writes it:
+            // subtracting an unbiased C from a biased variance leaves
+            // (sigma_fpn^2 + C)/n behind. See recomputeTemporalIfNeeded for the
+            // full note - the two sides carry the same reasoning because they
+            // have to carry the same arithmetic.
+            double pvar = cnt > 1.0
+                ? std::max(0.0, plM2[p] / cnt - mean * mean) * (cnt / (cnt - 1.0)) : 0.0;
+            double fvar = pvar - corr;
+            bool clamped = fvar < 0.0;
+            if (clamped) fvar = 0.0;
+            anyClamp |= clamped;
+            double fpn = sqrt(fvar);
             cols[c].push_back({ 0u, planeKey("mean [DN]", head.cfaType, p), mean, {} });
             cols[c].push_back({ 0u, planeKey("sigma_t [DN]", head.cfaType, p), st, {} });
             cols[c].push_back({ 0u, planeKey("sigma_fpn [DN]", head.cfaType, p), fpn, {} });
+            // sqrt(plV/cnt + fvar), NOT sqrt(st*st + fvar): st is already a
+            // sqrt, and squaring it back is not the identity in binary64 - so
+            // the old form could differ from the viewer's sqrt(tvar + fvar) in
+            // the last ulp, on a quantity the two sides are supposed to agree on
+            // exactly. Nothing had ever compared them, which is how it survived.
             cols[c].push_back({ 0u, planeKey("sigma_tot [DN]", head.cfaType, p),
-                                sqrt(st * st + fpn * fpn), {} });
+                                sqrt(plV[p] / cnt + fvar), {} });
+            // The correction is REPORTED, not merely applied: a reader has to be
+            // able to get back to the uncorrected upper bound
+            // (sqrt(sigma_fpn^2 + fpn_corr^2)) without re-measuring, and a
+            // clamped 0 has to say it is a clamp rather than a flat sensor.
+            cols[c].push_back({ 0u, planeKey("fpn_corr [DN]", head.cfaType, p),
+                                sqrt(corr), {} });
+            cols[c].push_back({ 0u, planeKey("fpn_clamped", head.cfaType, p),
+                                clamped ? 1.0 : 0.0, {} });
         }
         cols[c].push_back({ 1u, "method", 0.0,
             "per-pixel mean/var over " + std::to_string(src.count) +
             " frames; sigma_t = sqrt(mean unbiased temporal var), "
-            "sigma_fpn = spatial sigma of temporal means; non-finite excluded" +
+            "sigma_fpn = sqrt(max(0, var_spatial(temporal means, ddof=1) - "
+            "fpn_corr^2)) with fpn_corr = sqrt(mean(s_t,i^2/n_i)) - temporal "
+            "residual C subtracted (#57 item 2); non-finite excluded" +
+            std::string(anyClamp ? "; sigma_fpn CLAMPED at 0 on at least one "
+                                   "plane (see fpn_clamped): the temporal "
+                                   "residual is not below the spatial spread, "
+                                   "so no fixed pattern is resolved here"
+                                 : "; no clamp") +
             std::string(head.cfaType ? "; CFA planes" : "") + "; backend=cpu" });
         series.push_back(std::move(fm));
         series.push_back(std::move(fs));

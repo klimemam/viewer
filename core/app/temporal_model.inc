@@ -34,7 +34,10 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed;
     T.cfa = im->cfa; T.cfaPattern = im->cfaPattern; T.stackRev = kStackRev;
     T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
-    for (int p = 0; p < 4; p++) T.tempNoise[p] = T.fixedPattern[p] = T.totalNoise[p] = 0;
+    for (int p = 0; p < 4; p++) {
+        T.tempNoise[p] = T.fixedPattern[p] = T.totalNoise[p] = T.fpnCorr[p] = 0;
+        T.fpnClamped[p] = false;
+    }
     T.valid = false;
     // CFA planes are NEVER mixed in a statistic (docs/terminology.md). On a
     // mosaiced flat field the R/Gr/Gb/B level difference is hundreds of DN, so
@@ -98,10 +101,17 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     }
     if (used < 2) return;
     // per-sample temporal variance -> temporal noise; spatial spread of the
-    // time-averaged samples -> fixed pattern (DSNU/PRNU-like). Both are
-    // accumulated PER PLANE; with no mosaic there is one plane and this is the
-    // arithmetic it always was.
-    double tvarSum[4] = {}, pmSum[4] = {}, pmSum2[4] = {};
+    // time-averaged samples MINUS the temporal residual still in that mean ->
+    // fixed pattern. Both are accumulated PER PLANE; with no mosaic there is
+    // one plane.
+    //
+    // corrSum is the third accumulator #57 item 2 asks for and it costs one
+    // divide per sample: the correction is mean_i(s_t,i^2 / n_i), PER PIXEL,
+    // because n_i is per pixel here (NaN is excluded from its own pixel's
+    // population, never from the stack). mean(s_t^2)/mean(n) would be a
+    // different number the moment a pixel loses frames, and the accumulator
+    // already carries the per-pixel cnt, so there is nothing to buy.
+    double tvarSum[4] = {}, corrSum[4] = {}, pmSum[4] = {}, pmSum2[4] = {};
     size_t plc[4] = {};
     for (size_t k = 0; k < offs.size(); k++) {
         int p = plane[k];
@@ -124,6 +134,7 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         // two sides bit-comparable rather than merely close.
         double v = std::max(0.0, sum2[k] / n - m * m) * (n / (n - 1.0));
         tvarSum[p] += v;
+        corrSum[p] += v / n;             // s_t,i^2 / n_i, this pixel's own n_i
         pmSum[p] += m; pmSum2[p] += m * m;
         plc[p]++;
     }
@@ -133,11 +144,54 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         if (!plc[p]) continue;
         double n = (double)plc[p];
         double tvar = tvarSum[p] / n;
+        double corr = corrSum[p] / n;                     // C = mean_i(s_t,i^2 / n_i)
         double pmean = pmSum[p] / n;
-        double pvar = pmSum2[p] / n - pmean * pmean;
+        // ddof=1 on the SPATIAL variance too, as the settled estimator writes it
+        // (docs/flat-field-stats.md (b): "var は ddof=1", and (a)'s "ddof は全部
+        // ddof=1" is stated to carry into (b)/(c)). It is not decoration: the
+        // subtraction below is exact only against an UNBIASED spatial variance.
+        // E[S^2_ddof1] = sigma_fpn^2 + C, so S^2 - C is unbiased for sigma_fpn^2;
+        // the ddof=0 form has expectation (n-1)/n x (sigma_fpn^2 + C), which
+        // leaves (sigma_fpn^2 + C)/n behind after subtracting an unbiased C.
+        // n here is samples per plane, so the two forms differ by parts in
+        // 10^4 on a full frame and by percent on a small ROI - which is exactly
+        // where a fixed pattern is measured.
+        // (This is the sigma_fpn estimator, NOT the per-frame spatial sigma of
+        // one frame that board row "空間σの ddof がパネル間で不一致" is about:
+        // that is a different quantity in ROIs / canvas / histogram and is not
+        // touched here.)
+        // ddof=1 on the SPATIAL variance too, as the settled estimator writes it
+        // (docs/flat-field-stats.md (b): "var は ddof=1", and (a)'s "ddof は全部
+        // ddof=1" is stated to carry into (b)/(c)). It is not decoration: the
+        // subtraction below is exact only against an UNBIASED spatial variance.
+        // E[S^2_ddof1] = sigma_fpn^2 + C, so S^2 - C is unbiased for sigma_fpn^2;
+        // the ddof=0 form has expectation (n-1)/n x (sigma_fpn^2 + C), which
+        // leaves (sigma_fpn^2 + C)/n behind after subtracting an unbiased C.
+        // n here is samples per plane, so the two forms differ by parts in
+        // 10^4 on a full frame and by percent on a small ROI - which is exactly
+        // where a fixed pattern is measured.
+        // (This is the sigma_fpn estimator, NOT the per-frame spatial sigma of
+        // one frame that board row "空間σの ddof がパネル間で不一致" is about:
+        // that is a different quantity in ROIs / canvas / histogram and is not
+        // touched here.)
+        double pvar = n > 1.0
+            ? std::max(0.0, pmSum2[p] / n - pmean * pmean) * (n / (n - 1.0)) : 0.0;
+        // The correction itself (#57 judgment 2). Averaging N frames drops the
+        // temporal noise by sqrt(N) and no further, so the spatial spread of the
+        // mean image is sigma_fpn^2 + C and calling it sigma_fpn names an UPPER
+        // BOUND after the quantity. At N=16, sigma_t=10 DN a true 5 DN pattern
+        // reads 5.59 DN uncorrected.
+        double fvar = pvar - corr;
+        T.fpnClamped[p] = fvar < 0.0;   // said out loud below; never a silent 0
+        if (fvar < 0.0) fvar = 0.0;
         T.tempNoise[p] = sqrt(tvar);
-        T.fixedPattern[p] = sqrt(std::max(0.0, pvar));    // includes real scene detail
-        T.totalNoise[p] = sqrt(tvar + std::max(0.0, pvar));
+        T.fpnCorr[p] = sqrt(corr);      // in DN, so it reads beside sigma_fpn
+        T.fixedPattern[p] = sqrt(fvar);
+        // sigma_tot's DEFINITION is unchanged (flat-field-stats.md (b)): it is
+        // sqrt(<sigma_t^2> + sigma_fpn^2) as it always was. It only becomes the
+        // honest "expected spatial sigma of ONE frame" now - before the
+        // correction it counted sigma_t^2/N twice.
+        T.totalNoise[p] = sqrt(tvar + fvar);
     }
     T.valid = true;
 }
