@@ -290,6 +290,37 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     if (avgLost)
         fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
                         "not saved, because the frames they averaged are gone\n", avgLost);
+    // ---- preprocessor products: the RECIPE, for the same reason -------------
+    // docs/analysis-layers.md §5 raised the frame average's rule to the rule for
+    // every AnalysisPreProcessor product: no file, so the session carries the
+    // derivation and recomputes. ONE line per product stack (not per frame) -
+    // the record lives on the SeqInfo, keyed like an average's by the path of
+    // the SOURCE stack's first frame.
+    //
+    // The four numbers before the path are the spec, spelled out rather than
+    // packed: a session that could not say WHICH surface was removed would
+    // bring the stack back under a name claiming a band it might not have.
+    int dtLost = 0;
+    for (const auto& s : app.seqs) {
+        if (!s.dt.made()) continue;
+        if (s.dt.ofPath.empty()) { dtLost++; continue; }
+        bool live = false;
+        for (auto& o : app.images)
+            if (o->seqId != 0 && o->src->path == s.dt.ofPath &&
+                o->src->member == s.dt.ofMember) { live = true; break; }
+        if (!live) { dtLost++; continue; }
+        f << "detrend " << s.dt.spec.method << " " << s.dt.spec.degree << " "
+          << s.dt.spec.block << " " << (s.dt.spec.divide ? 1 : 0) << " "
+          << s.dt.ofPath << "\n";                   // path last: may contain spaces
+        if (!s.dt.ofMember.empty()) f << "refmember " << s.dt.ofMember << "\n";
+        // The node is renameable (docs/reader-analysisset.md's rule for every
+        // node), so the session owns the name the way seqname does.
+        f << "detrendname " << s.name << "\n";
+    }
+    if (dtLost)
+        fprintf(stderr, "session: %d detrend product(s) whose source stack is closed - "
+                        "not saved, because the frames they were computed from are gone\n",
+                dtLost);
     // ---- series (系列), after the image lines -------------------------------
     // A FLAT block with unique keys, on purpose: an older viewer skips every
     // line it does not know and still opens the session, and this one opens a
@@ -1706,7 +1737,7 @@ static std::string loadSession(const std::string& path) {
     // unknown KEY is simply skipped, and that viewer resolves by path exactly
     // as it does today. Strictly the line DIRECTLY above: a qualifier that can
     // drift onto a different line is not a key.
-    enum { RM_NONE, RM_SLOT, RM_AVG, RM_SERIES };
+    enum { RM_NONE, RM_SLOT, RM_AVG, RM_SERIES, RM_DETREND };
     int refFor = RM_NONE;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
@@ -1749,6 +1780,8 @@ static std::string loadSession(const std::string& path) {
                 app.cmpSlotRestore.back().member = m;
             else if (refTarget == RM_AVG && !app.avgRestore.empty())
                 app.avgRestore.back().member = m;
+            else if (refTarget == RM_DETREND && !app.dtRestore.empty())
+                app.dtRestore.back().member = m;
             else if (refTarget == RM_SERIES && curSeries >= 0 &&
                      !app.seriesRestore[curSeries].members.empty())
                 app.seriesRestore[curSeries].members.back().member = m;
@@ -1961,6 +1994,25 @@ static std::string loadSession(const std::string& path) {
         else if (key == "stacksum") {
             app.avgRestore.push_back({ restOfLine(ls), {}, FOLD_SUM, false, 0, 0, {} });
             refFor = RM_AVG;
+        }
+        // A preprocessor product's RECIPE (docs/analysis-layers.md §5): the
+        // stage's spec, then the SOURCE stack's head path. Resolved after
+        // everything is open, like the average above and for the same reason.
+        // An older viewer skips the key and opens the session without the
+        // product - which is the correct failure: it cannot make one.
+        else if (key == "detrend") {
+            App::DetrendRestore r;
+            int div = 0;
+            ls >> r.spec.method >> r.spec.degree >> r.spec.block >> div;
+            r.spec.divide = div != 0;
+            r.path = restOfLine(ls);
+            if (!r.path.empty() && r.spec.method != DTR_NONE) {
+                app.dtRestore.push_back(std::move(r));
+                refFor = RM_DETREND;               // a `refmember` may follow
+            }
+        }
+        else if (key == "detrendname") {
+            if (!app.dtRestore.empty()) app.dtRestore.back().name = restOfLine(ls);
         }
         // The recipe's generation record (§10.2): count, input tuple digest,
         // and when the saved picture was computed. Attaches to the recipe line

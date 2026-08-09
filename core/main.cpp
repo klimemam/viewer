@@ -115,6 +115,12 @@ App app;
 
 #include "app/temporal_model.inc"
 
+// The detrend STAGE (docs/flat-field-stats.md 判断6/7): pure, no app state,
+// and BEFORE setanalysis.inc because that file gets its cutoff wording and its
+// shading figure from here - one definition of what was done to the pixels,
+// and one spelling of how it is declared.
+#include "app/detrend.inc"
+
 #include "app/setanalysis.inc"
 
 #include "app/open_dispatch.inc"
@@ -162,6 +168,10 @@ static std::string fmtVal(float v, const std::string& dtype) {
 #include "ui/panel_temporal.inc"
 #include "ui/panel_rois.inc"
 #include "ui/panel_analysis.inc"
+// The detrend stage's PRODUCT (docs/analysis-layers.md §5). After
+// panel_projection.inc because it folds through computeStackStats - the one
+// accumulator - and before file_list.inc, which is where the stage is asked for.
+#include "app/preprocess.inc"
 
 #include "ui/modal_derive.inc"
 #include "ui/file_list.inc"
@@ -905,6 +915,8 @@ int main(int argc, char** argv) {
     #include "selftest/aset.inc"
 
     #include "selftest/setanalysis.inc"
+
+    #include "selftest/detrend.inc"
 
     #include "selftest/derive.inc"
 

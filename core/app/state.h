@@ -333,6 +333,42 @@ inline std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSo
 // warning, and both folds carry the exclusion count and the valid frame count.
 enum StackFold { FOLD_MEAN = 0, FOLD_SUM = 1 };
 
+// The detrend stage's parameters (docs/flat-field-stats.md 判断6/7, settled
+// 2026-08-09). Here rather than in core/app/detrend.inc for the reason
+// StackFold is here: SeqInfo carries one, and SeqInfo is declared below. The
+// arithmetic, and the reasoning behind every default, live in detrend.inc.
+//
+// A DEFAULT-CONSTRUCTED DetrendSpec IS RAW. That is 判断7 in one line: the
+// self-describing default is "did nothing", and the shading figure printed
+// beside every result is what stops that default from being a silent choice.
+// The other fields are the same judgment's "when it IS on": degree 2,
+// subtractive, per plane.
+enum DetrendMethod { DTR_NONE = 0, DTR_POLY = 1, DTR_BLOCKMED = 2 };
+struct DetrendSpec {
+    int  method = DTR_NONE;
+    int  degree = 2;
+    int  block  = 64;
+    bool divide = false;
+};
+// The record a PRODUCT of that stage carries (docs/analysis-layers.md §5: a
+// generated data object states its origin in its name and its note, holds no
+// file, and travels through a session as a RECIPE). It hangs off the produced
+// stack's SeqInfo, which is what a bound role resolves to - so a SetAnalyzer
+// run over this stack can state the cutoff its numbers were measured under
+// without anyone having to remember to pass it along.
+struct DetrendProduct {
+    DetrendSpec spec;                     // spec.method != DTR_NONE = a product
+    std::string ofPath, ofMember;         // the recipe: the SOURCE stack's head frame
+    std::string srcName, when;
+    int srcSeqId = 0, srcRev = 0;         // §10.1's key: which stack, which revision
+    bool stale = false;                   // latched by the reload walk, never cleared silently
+    int nPl = 1;
+    double ppBefore[4] = {}, ppAfter[4] = {};   // shading p-p, DN, per plane
+    double pctBefore[4] = {}, pctAfter[4] = {}; // ...as a % of the field centre
+    bool pctOk[4] = {};
+    bool made() const { return spec.method != DTR_NONE; }
+};
+
 // One membership: "this frame as seen by this stack". Pixels and provenance
 // live in *src; what stays here is per-membership (identity, position, display
 // range, interpretation) and per-view (texture) state.
@@ -762,6 +798,11 @@ struct App {
         // unit is never defaulted (unset is unset, never assumed).
         std::string axisName, axisUnit;
         std::vector<double> axisVals;     // axisVals[i] belongs to seqIndex i
+        // Empty on every stack that was OPENED. Filled only on a stack this
+        // program COMPUTED with the detrend stage (docs/flat-field-stats.md
+        // 判断6): the method, the window, the shading it measured before and
+        // after, and the recipe a session recomputes it from.
+        DetrendProduct dt;
         // NO level here. The value a stack was captured at is meaningless
         // without the parameter's NAME and UNIT, and both of those belong to
         // the series - so the value does too (Series::Member::value). Keeping
@@ -1409,6 +1450,17 @@ struct App {
         std::string when;
     };
     std::vector<AvgRestore> avgRestore;
+    // ...and the same shape for a detrend product (docs/analysis-layers.md §5:
+    // a preprocessor's output travels as a RECIPE, never as pixels). Same key
+    // as an average's - the SOURCE stack's head frame path (+ member) - and the
+    // same lazy resolution, for the same reason: at parse time a folder stack
+    // is one loose image with a queued rescan behind it. `name` is carried
+    // because the product is a renameable node and the session owns its name.
+    struct DetrendRestore {
+        DetrendSpec spec;
+        std::string path, member, name;
+    };
+    std::vector<DetrendRestore> dtRestore;
     // Series a session asked for, resolved LAZILY for the same reason: at parse
     // time the stacks do not exist yet (a folder stack is one loose image plus a
     // queued rescan), so a member cannot be looked up. Members are named by the

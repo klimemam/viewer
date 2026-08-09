@@ -97,12 +97,44 @@ static const SetAnalyzerDef kSetAnalyzers[SA_COUNT] = {
       "intercept is the point); only mu is dark-corrected" },
 };
 
-// The detrend stage (docs/flat-field-stats.md 判断6/7) is not built. Skipping an
-// unbuilt stage is legal; skipping it SILENTLY is not - "カットオフを必ず言う"
-// makes the cutoff a required field of the result, so the value and the spatial
-// band it was measured over never travel apart. Today every row declares the
-// same one, and the day a detrend lands this string is what changes.
-static const char* kSetCutoffRaw = "raw (no shading removal - the detrend stage is not built)";
+// "カットオフを必ず言う" (docs/flat-field-stats.md 約束1) makes the cutoff a
+// REQUIRED field of the result, so a value and the spatial band it was measured
+// over never travel apart. Stage 2 landed the field with one possible value;
+// the detrend stage (判断6/7) has since landed, and the wording now comes from
+// the stage itself (core/app/detrend.inc) rather than being written twice.
+//
+// The DEFAULT IS STILL RAW, and that is 判断7 rather than an omission: a
+// default cutoff quietly becomes the house standard, so the self-describing
+// default is "did nothing". What stops that from being a silent choice is the
+// shading figure printed beside every value below - measured whether or not
+// anything was removed, always with the same probe.
+static const std::string kSetCutoffRaw = detrendCutoffText(DetrendSpec{});
+
+// Which cutoff a bound member actually carries. A role resolves to a STACK, and
+// a stack that this program produced with the detrend stage carries the method
+// and the window on its own SeqInfo (docs/analysis-layers.md §5: the origin
+// travels with the product). So the cutoff of a result is a FACT ABOUT ITS
+// INPUTS, read off them here - never a switch on this analysis, which 判断6
+// forbids, and never a field somebody has to remember to set.
+static std::string setCutoffOfSeq(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || !si->dt.made()) return kSetCutoffRaw;
+    return detrendCutoffText(si->dt.spec) + " (from the preprocessor product \"" +
+           si->name + "\")";
+}
+// Two roles, two inputs, and they need not agree - so say both rather than
+// picking one. A pixel-wise subtraction between a detrended image and a raw
+// dark is a real thing to do by mistake, and the cutoff line is where it shows.
+static std::string setCutoffOfRoles(const std::vector<std::pair<std::string, int>>& roles) {
+    std::string s;
+    bool same = true;
+    for (size_t i = 1; i < roles.size(); i++)
+        if (setCutoffOfSeq(roles[i].second) != setCutoffOfSeq(roles[0].second)) same = false;
+    if (same && !roles.empty()) return setCutoffOfSeq(roles[0].second);
+    for (size_t i = 0; i < roles.size(); i++)
+        s += (i ? "; " : "") + roles[i].first + ": " + setCutoffOfSeq(roles[i].second);
+    return s;
+}
 
 // ---- the fold: one stack -> per-pixel mean M and per-pixel correction --------
 // The same accumulator as recomputeTemporalIfNeeded / computeStackStats /
@@ -120,6 +152,7 @@ static const char* kSetCutoffRaw = "raw (no shading removal - the detrend stage 
 struct SetFold {
     bool valid = false;
     std::string err;
+    int seqId = 0;                        // which stack: the cutoff is read off it
     int W = 0, H = 0, C = 0, nPl = 1;
     int cfa = 0, cfaPattern = 0;
     int frames = 0, expected = 0;         // n of N (the canon's mandatory pair)
@@ -134,6 +167,7 @@ struct SetFold {
 static bool setFoldStack(int seqId, SetFold& F) {
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) { F.err = "that stack is not open"; return false; }
+    F.seqId = seqId;
     F.name = si->name;
     F.expected = si->expectedFrames;
     std::vector<int> fr = framesOfSeq(seqId);
@@ -288,6 +322,17 @@ struct SetResult {
     double mu[4] = {};                   // PRNU: the level the ratio is against
     double sigmaD[4] = {};               // PRNU: the corrected fixed pattern, DN
     size_t samples[4] = {};
+    // THE SHADING FIGURE, 判断7's other half: "既定は「なし (raw)」... その代わり、
+    // シェーディング量は常に併記する ... 隣に shading [%] が立っていれば、
+    // 「除去すべきだったか」は読み手が判定できる - 既定 OFF が黙認にならない
+    // 仕掛けはこれ". Measured on the very picture this row's statistic is taken
+    // over, always with the same degree-2 probe (core/app/detrend.inc), so it
+    // means the same thing beside a raw row and beside a detrended one. Never
+    // conditional on anything: a figure that appears only sometimes cannot be
+    // what makes a default honest.
+    double shadePp[4] = {};              // p-p of the low-frequency component, DN
+    double shadePct[4] = {};             // ...as a % of the field centre
+    bool shadePctOk[4] = {};             // false = no level to take a ratio against
     // provenance the display may not drop (docs/analysis-layers.md §8)
     std::string cutoff = kSetCutoffRaw;
     std::string form;
@@ -299,6 +344,18 @@ struct SetResult {
     std::string sweep;
     int levels = 0;
 };
+
+// The figure, off a mean image the fold already built. The plane map is the
+// FOLD's own, not a fresh one, so the shading reported is the shading of
+// exactly the population the statistic beside it pooled.
+static void setShadingOf(SetResult& R, const std::vector<double>& img, const SetFold& F) {
+    DetrendReport S = detrendProbeT(img.data(), F.W, F.H, F.C, F.plane.data(), F.nPl);
+    for (int p = 0; p < R.nPl && p < 4; p++) {
+        R.shadePp[p] = S.pl[p].ppDn;
+        R.shadePct[p] = S.pl[p].pct;
+        R.shadePctOk[p] = S.pl[p].pctOk;
+    }
+}
 
 // The result's own name (canon invariant (a): "解析結果は自分の層と (set 解析
 // なら) set を名乗る"). docs/flat-field-stats.md (b) fixes the tag as
@@ -388,6 +445,14 @@ static SetResult runDirectDsnu(const App::ASet& S) {
         R.clamped[p] = f.clamped;
         R.samples[p] = (size_t)n[p];
     }
+    // The shading of the picture this row measured. On a dark the ratio to the
+    // centre usually has no level to be a ratio of, and the p-p carries it
+    // instead - which is the honest reading anyway: a dark's low-frequency
+    // structure (a temperature gradient) IS part of this quantity and is not
+    // something to remove (docs/flat-field-stats.md (b)). The figure is here so
+    // it can be SEEN, not so it can be subtracted.
+    setShadingOf(R, Fd.M, Fd);
+    R.cutoff = setCutoffOfSeq(Fd.seqId);
     R.used.emplace_back();
     setUseFromFold(R.used.back(), "dark", Fd);
     R.ok = true;
@@ -477,6 +542,18 @@ static SetResult runDirectPrnu(const App::ASet& S) {
         R.refusal = b;
         return R;
     }
+    // The shading of the picture the ratio was taken over: D, the difference
+    // image, not the raw flat. D is what var_spatial ran on, so D is what the
+    // figure beside it has to describe - and its centre level IS mu, so here
+    // the ratio to the centre is defined and reads as "this fraction of the
+    // signal is low-frequency illumination structure".
+    {
+        std::vector<double> D(Fi.M.size(), std::numeric_limits<double>::quiet_NaN());
+        for (size_t i = 0; i < D.size(); i++)
+            if (std::isfinite(Fi.M[i]) && std::isfinite(Fd.M[i])) D[i] = Fi.M[i] - Fd.M[i];
+        setShadingOf(R, D, Fi);
+    }
+    R.cutoff = setCutoffOfRoles({ { "image", Fi.seqId }, { "dark", Fd.seqId } });
     R.used.emplace_back();
     setUseFromFold(R.used.back(), "image", Fi);
     R.used.emplace_back();

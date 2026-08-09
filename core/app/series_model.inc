@@ -963,6 +963,7 @@ static void closeAll() {
     app.seqRestore.clear();
     app.pendingAvg.clear();           // they name stacks being thrown away...
     app.avgRestore.clear();           // ...and paths that will not be open either
+    app.dtRestore.clear();            // ...and the preprocessor recipes with them
     app.rbOpenQueue.clear();
     for (auto& bp : app.browsePanels) bp->pendingOpen.clear();
     app.ana.img = nullptr;

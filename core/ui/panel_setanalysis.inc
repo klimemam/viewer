@@ -102,13 +102,19 @@ static void setPanelRow(const SetResult& R) {
     // tooltip drifted apart for eleven weeks, and the scan in
     // --setanalysis-selftest would fail this file for writing one.
     const std::string colName = std::string(D.famous) + " [" + D.unit + "]";
-    if (ImGui::BeginTable("v", R.kind == SA_PRNU ? 6 : 5,
+    if (ImGui::BeginTable("v", R.kind == SA_PRNU ? 8 : 7,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("plane");
         ImGui::TableSetupColumn(colName.c_str());
         if (R.kind == SA_PRNU) ImGui::TableSetupColumn("sigma_d [DN]");
         ImGui::TableSetupColumn(R.kind == SA_PRNU ? "mu [DN]" : "mean n");
         ImGui::TableSetupColumn("fpn_corr [DN]");
+        // 判断7's other half, and the reason its "default = raw" is not a
+        // silent choice: the shading this value was measured THROUGH stands
+        // next to it, whether or not anything was removed. The reader decides
+        // whether raw was right, every time, from the same table.
+        ImGui::TableSetupColumn("shading [%]");
+        ImGui::TableSetupColumn("shading p-p [DN]");
         ImGui::TableSetupColumn("samples");
         ImGui::TableHeadersRow();
         for (int p = 0; p < R.nPl; p++) {
@@ -132,10 +138,24 @@ static void setPanelRow(const SetResult& R) {
                 ImGui::TableNextColumn(); ImGui::TextDisabled("-");
             }
             ImGui::TableNextColumn(); ImGui::Text("%.10g", R.corrDn[p]);
+            ImGui::TableNextColumn();
+            // never a ratio without a level: a dark has no centre level to be
+            // a percentage OF, and the p-p beside it is the figure that always
+            // exists (docs/flat-field-stats.md (a)'s "低周波成分の p-p / 中心比")
+            if (R.shadePctOk[p]) ImGui::Text("%.4g", R.shadePct[p]);
+            else                 ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); ImGui::Text("%.4g", R.shadePp[p]);
             ImGui::TableNextColumn(); ImGui::Text("%zu", R.samples[p]);
         }
         ImGui::EndTable();
     }
+    // Printed, not tooltipped: the figure is only load-bearing if the reader
+    // knows what band it is and that it did not move with the option.
+    ImGui::TextDisabled("shading = p-p of a degree-2 surface fitted to the picture this row "
+                        "measured, per plane, and\nthe same degree whether or not shading was "
+                        "removed. Removing it is a PRODUCT (Files > a stack >\nDetrend), never "
+                        "a switch here - a switch would make this column name a different "
+                        "quantity.");
     // What came off the number, said beside it. A corrected value that does not
     // state its correction cannot be checked - the same reason PR #127 put
     // fpn_corr next to sigma_fpn rather than in a release note.
@@ -417,8 +437,18 @@ static void drawPanelSetAnalysis() {
             ImGui::TextDisabled("  %s%s", aSetRoleText(r).c_str(), extra.c_str());
         }
         // the two required declarations: the spatial band the numbers were
-        // measured over, and WHICH estimator wrote them
-        ImGui::TextDisabled("  cutoff: %s", kSetCutoffRaw);
+        // measured over, and WHICH estimator wrote them. The cutoff is now
+        // per RESULT, because it is a fact about that result's inputs - a role
+        // bound to a detrend product carries its method and window here
+        // without anything on this panel having to ask.
+        bool anyOk = false;
+        for (int k = 0; k < SA_COUNT; k++)
+            if (g_setPanel.r[k].ok) {
+                anyOk = true;
+                ImGui::TextDisabled("  cutoff (%s): %s", kSetAnalyzers[k].key,
+                                    g_setPanel.r[k].cutoff.c_str());
+            }
+        if (!anyOk) ImGui::TextDisabled("  cutoff: %s", kSetCutoffRaw.c_str());
         for (int k = 0; k < SA_COUNT; k++)
             ImGui::TextDisabled("  %s: %s", kSetAnalyzers[k].key, kSetAnalyzers[k].form);
         ImGui::TextWrapped("These are tool-defined quantities. Nothing here has been "

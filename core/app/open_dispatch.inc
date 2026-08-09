@@ -623,6 +623,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         // is silent overwrite, and Recompute is the user's move.
         for (auto& rd : app.images)
             if (!rd->avgOfPath.empty() && rd->avgSeqId == sid) rd->avgStale = true;
+        // ...and the same event for a preprocessor product, which is the same
+        // kind of thing one layer up: a whole stack computed from this one, now
+        // describing pixels the disk no longer holds. Latched, not recomputed -
+        // remaking it is the user's move, from the source stack's own menu.
+        for (auto& ps : app.seqs)
+            if (ps.dt.made() && ps.dt.srcSeqId == sid) ps.dt.stale = true;
         // a server aggregate naming this stack now describes dead pixels:
         // re-fire it (same shape as seqMosaicChanged above)
         if (app.srvTemporal.seqId == sid) requestServerTemporal(sid, app.srvTemporal);

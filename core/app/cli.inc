@@ -31,6 +31,9 @@ static std::string g_asetSelftest;      // --aset-selftest <dir>: AnalysisSet tr
 static std::string g_setAnalysisSelftest; // --setanalysis-selftest <dir>: direct DSNU / PRNU
                                           // over a bound set (#57 判断4) + the famous-name
                                           // scan of the shipping sources, exit
+static std::string g_detrendSelftest;     // --detrend-selftest <dir>: the detrend
+                                          // AnalysisPreProcessor (#57 判断6/7) - the raw
+                                          // default, the shading figure, the product, exit
 // --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
 // window. It takes no directory because it needs no file: every fixture it
 // measures is analytic and built in memory (see roiStatsSelftest()).
@@ -468,6 +471,9 @@ static void printUsage() {
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
         "                              value, NaN exclusion, CFA planes, provenance\n"
+        "  --detrend-selftest <dir>    the detrend preprocessor stage (#57 judgment 6/7):\n"
+        "                              the raw default, the shading figure it always\n"
+        "                              prints, the product, and the product's recipe\n"
         "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
         "                              refcounts, Watch baselines\n"
         "  --media-selftest <dir>      PNG/JPEG/TIFF bit depth, channels and notes;\n"
@@ -629,6 +635,8 @@ static void parseCli(int argc, char** argv) {
             g_asetSelftest = next();               // handled in main()
         } else if (a == "--setanalysis-selftest") {
             g_setAnalysisSelftest = next();        // handled in main()
+        } else if (a == "--detrend-selftest") {
+            g_detrendSelftest = next();            // handled in main()
         } else if (a == "--derive-selftest") {
             g_deriveSelftest = next();             // handled in main()
         } else if (a == "--stackavg-selftest") {
