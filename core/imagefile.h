@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// The picture formats that are not .npy: PNG, JPEG, TIFF, OpenEXR.
+// The picture formats that are not .npy: PNG, JPEG, vendor RAW, TIFF, OpenEXR.
 //
 // THE SEAM IS THE DELIVERABLE. Which library decodes a PNG is a build-time
 // detail that this repository has already changed its mind about once (the
@@ -45,6 +45,15 @@
 //     statistics, silently, which is the failure mode this tool exists to
 //     avoid. A format whose pattern cannot be read reliably is refused, not
 //     guessed at.
+//
+//     Vendor RAW is the first format here that passes that test: a .DNG or a
+//     .NEF DECLARES its mosaic, so core/rawread.cpp sets `cfa` from the file
+//     and refuses the mosaics this viewer cannot name (X-Trans, Foveon) rather
+//     than flattening them into one it can. The same file also declares a black
+//     level, a white level and a bit depth - and those are SHOWN, in `note`,
+//     never applied: a NEF that declares black 0 with samples at 80 is a
+//     measured fact (docs/input-adapters.md §3.6.5), and a reader that
+//     subtracted the declared value would be wrong there and silent everywhere.
 // ---------------------------------------------------------------------------
 #include <cstddef>
 #include <cstdint>

@@ -55,8 +55,8 @@
             // not (#53, 2026-08-09 - the OFF path and the assert that pinned
             // it were removed together). A row that lost its decoder would
             // change this string and fail here.
-            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, OpenEXR, y4m",
-                  "M1 this build decodes PNG, JPEG, TIFF, OpenEXR and y4m");
+            check(imagefile::decodableFormats() == "PNG, JPEG, vendor RAW, TIFF, OpenEXR, y4m",
+                  "M1 this build decodes PNG, JPEG, vendor RAW, TIFF, OpenEXR and y4m");
             // Every extension the table dispatches on reaches the file dialog -
             // including, if a row ever has one again, a format that is listed
             // but absent: its refusal is more use than the raw dialog a
@@ -892,6 +892,190 @@
             }
         }
 
+        // ---- M29-M34: vendor RAW ---------------------------------------------
+        // The format that STATES what its numbers are. Everything else behind
+        // this seam has to be asked what it did to the samples; a RAW declares
+        // the CFA pattern, the black level, the white level and the bit depth
+        // in tags, and the only question worth testing is whether the numbers
+        // the FILE declared are the numbers that reached the document.
+        //
+        // The fixtures are synthetic DNGs (tools/gen_testdata.py): DNG is the
+        // one vendor RAW that can be written without a camera, and it declares
+        // those four things in exactly the tags a NEF or a CR3 does. What it
+        // cannot cover is a vendor DECOMPRESSOR, and that gap is named in
+        // docs/media-support.md §2.4 rather than papered over here.
+
+        // ---- M29: the samples are the sensor's counts ------------------------
+        // (y*W+x)*7 % 16384 went in. A reader that normalised to 0..1, that
+        // subtracted the declared black level of 512, or that handed back a
+        // demosaiced RGB preview all pass "it opened" and fail here.
+        {
+            ImageDoc* d = open1("sensor_rggb.dng");
+            bool shape = d && d->w == 64 && d->h == 48 && d->ch == 1 && d->dtype == "u16";
+            bool exact = shape;
+            if (shape)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)((i * 7) % 16384)) exact = false;
+            fprintf(stderr, "mediaselftest: M29 %s %dx%d %dch cfa=%d/%d min=%g max=%g\n",
+                    d ? "opened" : "NOT OPENED", d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0,
+                    d ? d->cfa : -1, d ? d->cfaPattern : -1, d ? d->vmin : 0.f, d ? d->vmax : 0.f);
+            fprintf(stderr, "mediaselftest: M29 note = \"%s\"\n",
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M29 a DNG is ONE frame of ONE channel: the mosaic, not a picture");
+            check(exact, "M29 every sample survives: (y*W+x)*7, unscaled and unsubtracted");
+            check(d && d->cfa == 1 && d->cfaPattern == 0,
+                  "M29 the document carries CFA=Bayer RGGB, so the planes are never mixed");
+            check(d && has(d->note, "CFA RGGB, read from the file"),
+                  "M29 ...and the note says the pattern was READ, not assumed");
+            check(d && has(d->note, "black level 512, SHOWN and not subtracted"),
+                  "M29 the black level the file declares is stated, not applied");
+            check(d && has(d->note, "white level 16383") && has(d->note, "16-bit samples"),
+                  "M29 the white level and the bit depth travel as declared");
+            check(d && has(d->note, "no demosaic") && has(d->note, "no white balance") &&
+                  has(d->note, "no colour matrix") && has(d->note, "no tone curve"),
+                  "M29 ...and what was NOT done to them is on screen too");
+            check(d && has(d->note, "LibRaw 0.22") && has(d->note, "DNG 1.4.0.0"),
+                  "M29 the library and the container version are named");
+        }
+
+        // ---- M30: the pattern comes from the FILE ----------------------------
+        // The one assertion that cannot be faked by a lucky default. Nothing in
+        // these pixels says GBRG - only tag 33422 does, and a reader that
+        // assumed RGGB (rule 3 of core/imagefile.h, the exact failure the CFA
+        // TIFF refusal exists for) produces plausible colour and wrong planes.
+        {
+            ImageDoc* d = open1("sensor_gbrg.dng");
+            bool exact = d && d->w == 64 && d->h == 48;
+            if (exact)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)((i * 3) % 1024)) exact = false;
+            fprintf(stderr, "mediaselftest: M30 cfaPattern=%d note=\"%s\"\n",
+                    d ? d->cfaPattern : -1, d ? d->note.c_str() : app.toast.c_str());
+            check(d && d->cfa == 1 && d->cfaPattern == 3,
+                  "M30 a file that says GBRG arrives as GBRG, not as the usual RGGB");
+            check(d && has(d->note, "CFA GBRG"), "M30 ...and the note says which");
+            check(d && has(d->note, "black level 64") && has(d->note, "white level 1023"),
+                  "M30 a different declared black and white travel with it");
+            check(exact, "M30 the samples are still the file's own");
+        }
+
+        // ---- M31: the Nikon case - shown, never subtracted -------------------
+        // docs/media-formats.md §4.7 measured a real NEF that DECLARES black
+        // level 0 while its darkest samples sit at 80. This fixture is that
+        // file: a reader that subtracted the declared black would be right
+        // nowhere and invisible everywhere, and one that "corrected" the 0 to
+        // the observed floor would have invented a number the file never said.
+        {
+            ImageDoc* d = open1("sensor_black0.dng");
+            bool exact = d && d->w == 64 && d->h == 48;
+            if (exact)
+                for (int i = 0; i < 64 * 48 && exact; i++)
+                    if (d->px()[i] != (float)(80 + (i * 7) % 227)) exact = false;
+            fprintf(stderr, "mediaselftest: M31 min=%g max=%g note=\"%s\"\n",
+                    d ? d->vmin : 0.f, d ? d->vmax : 0.f,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(d && has(d->note, "black level 0, SHOWN and not subtracted"),
+                  "M31 a declared black level of 0 is shown as 0");
+            check(d && d->vmin == 80 && d->vmax == 306,
+                  "M31 ...and the pixels still sit at 80..306, exactly as stored");
+            check(exact, "M31 every sample is the file's, with nothing taken off it");
+            check(d && !has(d->note, "80"),
+                  "M31 the note quotes the FILE's number and never the observed floor");
+        }
+
+        // ---- M32: the masked border is named, and not delivered --------------
+        // The raw frame is 64x48; the file says 52x40 of it at (6,4) is image.
+        // What is handed over is the window the file declares, because that is
+        // the window the declared CFA pattern is stated FOR - and the rest is
+        // named in the note rather than silently dropped.
+        {
+            ImageDoc* d = open1("sensor_masked.dng");
+            fprintf(stderr, "mediaselftest: M32 %dx%d px0=%g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? d->px()[0] : -1.f,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(d && d->w == 52 && d->h == 40,
+                  "M32 the visible frame the file declares is what opens");
+            check(d && d->px()[0] == (float)(4 * 64 + 6),
+                  "M32 ...starting at the pixel the file's ActiveArea points at");
+            check(d && has(d->note, "52x40 read out of a 64x48 raw frame at (6,4)"),
+                  "M32 and the masked border is named rather than quietly dropped");
+            check(d && d->cfaPattern == 0, "M32 the pattern is the one stated for THAT window");
+        }
+
+        // ---- M33: what this build does NOT read, named one by one ------------
+        // Each of these is a file LibRaw itself accepts as a RAW. The refusal
+        // has to name the thing - a codec, a mosaic - and never "unsupported".
+        {
+            struct Case { const char* file; const char* needle; const char* what; };
+            const Case cases[] = {
+                { "sensor_jpegxl.dng", "JPEG-XL compression (DNG 1.7)",
+                  "M33 a codec this build cannot decode is refused by NAME" },
+                { "sensor_jpegxl.dng", "Adobe DNG SDK",
+                  "M33 ...and says what decoding it would take" },
+                { "sensor_xtrans.dng", "non-Bayer mosaic",
+                  "M33 a 6x6 X-Trans mosaic is refused, not squeezed into RGGB" },
+                { "sensor_xtrans.dng", "X-Trans 6x6 pattern",
+                  "M33 ...naming the pattern the file actually declares" },
+            };
+            for (const Case& c : cases) {
+                ImageDoc* d = open1(c.file);
+                const std::string msg = app.toast;
+                fprintf(stderr, "mediaselftest: M33 %-19s -> \"%s\"\n", c.file, msg.c_str());
+                check(!d && app.images.empty() && has(msg, c.file) &&
+                      has(msg, "vendor RAW:") && has(msg, c.needle) &&
+                      has(msg, "choose a reader"), c.what);
+            }
+            // The refusal is still the affordance, exactly as for TIFF and EXR.
+            open1("sensor_xtrans.dng");
+            check(app.readerPanelOpen &&
+                  app.readerPickPath.find("sensor_xtrans.dng") != std::string::npos,
+                  "M33 a refused RAW raises the Reader panel on itself");
+            check(has(app.toast, "LibRaw 0.22"),
+                  "M33 ...and the refusal names the library that refused, with its version");
+
+            // A DNG header over bytes that are not one. The sniff cannot tell
+            // this from a real DNG - only the library can - so it must refuse
+            // as a broken vendor RAW rather than fall through to the raw dialog.
+            ImageDoc* b = open1("sensor_broken.dng");
+            fprintf(stderr, "mediaselftest: M33 broken -> \"%s\"\n", app.toast.c_str());
+            check(!b && app.images.empty() && has(app.toast, "sensor_broken.dng") &&
+                  has(app.toast, "vendor RAW:"),
+                  "M33 a truncated DNG is refused as a broken RAW, not as an unknown file");
+        }
+
+        // ---- M34: the dispatch, from both sides ------------------------------
+        // Most vendor RAW containers ARE TIFF files, so the vendor RAW row sits
+        // before the TIFF row and its sniff has to be exact in BOTH directions:
+        // a camera's file must not reach the TIFF reader, and a picture TIFF
+        // must not reach LibRaw. The second half is the one that could break
+        // silently, so it has a fixture of its own - a plain 16-bit TIFF that
+        // carries "NIKON CORPORATION" in tag 271 and no sub-image chain.
+        {
+            ImageDoc* t = open1("cameramade.tif");
+            fprintf(stderr, "mediaselftest: M34 cameramade.tif -> %s note=\"%s\"\n",
+                    t ? "opened" : "REFUSED", t ? t->note.c_str() : app.toast.c_str());
+            check(t && t->w == 64 && t->h == 48 && t->ch == 1 && t->dtype == "u16" &&
+                  t->cfa == 0,
+                  "M34 a picture TIFF that names a camera is still read as a TIFF");
+            check(t && has(t->note, "TIFF"),
+                  "M34 ...by the TIFF reader, which is the one that reads it");
+
+            // ...and the table itself, which is where the order lives.
+            const imagefile::Backend* dng = imagefile::forPath("x.dng");
+            const imagefile::Backend* tif = imagefile::forPath("x.tif");
+            const imagefile::Backend* raw = imagefile::forPath("x.raw");
+            check(dng && std::string(dng->format) == "vendor RAW" && dng->decode,
+                  "M34 .dng dispatches to the vendor RAW row, which has a decoder");
+            check(tif && std::string(tif->format) == "TIFF",
+                  "M34 .tif still dispatches to TIFF");
+            check(!raw,
+                  "M34 .raw is NOT claimed: it is this viewer's own headerless dialog");
+            check(has(imagefile::dialogPattern(), "*.nef") &&
+                  has(imagefile::dialogPattern(), "*.cr3") &&
+                  !has(imagefile::dialogPattern(), "*.raw "),
+                  "M34 the file dialog offers the vendor extensions and not *.raw");
+        }
+
         // ---- M8: the two other ways to be refused ---------------------------
         {
             ImageDoc* d = open1("broken.png");
@@ -908,7 +1092,7 @@
             // The list of formats in the sentence is COMPUTED from the table
             // (imagefile.cpp listFormats), so it grows when a row is added -
             // which is the point: this assert is what notices.
-            check(!d && has(msg, "not a PNG, JPEG, TIFF, OpenEXR or y4m file") &&
+            check(!d && has(msg, "not a PNG, JPEG, vendor RAW, TIFF, OpenEXR or y4m file") &&
                   has(msg, "68 65 6c 6c"),
                   "M8 a file that is none of them is refused with its first bytes");
         }

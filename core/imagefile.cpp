@@ -23,6 +23,7 @@
 
 #define STBI_NO_STDIO          // the caller has already read the bytes
 #include "stb_image.h"
+#include "rawread.h"
 #include "tiffread.h"
 #include "exrread.h"
 #include "y4mread.h"
@@ -174,6 +175,29 @@ const std::vector<Backend>& backends() {
     static const std::vector<Backend> B = {
         { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr, nullptr },
         { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr, nullptr },
+        // Vendor RAW sits BEFORE TIFF, and the order is the decision rather
+        // than an accident of when it was written.
+        //
+        // A .NEF, a .ARW, a .PEF and a .DNG ARE TIFF files - the same first
+        // four bytes a scanner's .tif has - so whichever of these two rows is
+        // asked first gets all of them. In this order rawSniff answers only for
+        // a file that says it is a camera's: a DNG version tag, a maker name
+        // beside a sub-image chain, or one of the containers that carries its
+        // own signature (core/rawread.h). Every TIFF the TIFF reader reads
+        // today therefore still reaches it, and the other order would send
+        // photographs off a camera to a reader that refuses them under the
+        // wrong format's name.
+        //
+        // ".raw" is deliberately NOT among these extensions. It belongs to this
+        // viewer's own headerless dialog, where the USER states the shape and
+        // the depth because the file carries no header to state them; handing
+        // it to a vendor library would be that library claiming to know
+        // something about a file that says nothing.
+        { "vendor RAW",
+          ".dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .orf .rw2 .rwl .raf "
+          ".pef .ptx .srw .3fr .fff .iiq .kdc .dcr .mrw .x3f .erf .mef .mos "
+          ".mdc .cap",
+          RAW_LIBRARY, rawSniff, rawDecode, nullptr, nullptr },
         // TIFF shipped for a while as a row with NO decoder, refusing by name.
         // What that row said is still the standard the reader behind it is held
         // to: TIFF is the only one of the three that carries measurements
