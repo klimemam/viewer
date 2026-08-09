@@ -98,16 +98,34 @@
             return R;
         };
         // Independent temporal noise over a stack: per-sample variance across
-        // the resident frames, on the same 40000-sample grid.
+        // the resident frames, on the same 40000-sample grid - and PER CFA
+        // PLANE, from the same rule refHistogram above is written from. "CFA
+        // planes are NEVER mixed in a statistic" (docs/terminology.md) is a
+        // rule about every statistic on a mosaiced frame, not about the
+        // histogram alone: on a mosaic sigma_t is four numbers, and pooling the
+        // four planes into one produces a quantity nothing on screen claims.
+        struct RefSigT {
+            int nPl = 1;
+            double sigT[4] = {};
+        };
         auto refSigmaT = [](const ImageDoc& im) {
+            RefSigT R;
             std::vector<int> f = framesOfSeq(im.seqId);
+            // a mosaic needs one whole cell to be a mosaic - the same condition
+            // the panel resolves nPl from, reached from the rule, not shared
+            const bool cfa = im.ch == 1 && im.cfa != 0;
+            const int cell = im.cfa == 2 ? 4 : 2;        // Quad Bayer repeats over 4x4
+            R.nPl = cfa && im.w >= cell && im.h >= cell ? 4 : 1;
             const size_t total = (size_t)im.w * im.h;
             const size_t step = std::max<size_t>(1, total / 40000);
             std::vector<size_t> offs;
+            std::vector<uint8_t> plane;                  // which plane each sample is
             for (int y = 0; y < im.h; y++)
                 for (int x = 0; x < im.w; x++) {
                     size_t p = (size_t)y * im.w + x;
-                    if (p % step == 0) offs.push_back(((size_t)y * im.w + x) * im.ch);
+                    if (p % step) continue;
+                    offs.push_back(((size_t)y * im.w + x) * im.ch);
+                    plane.push_back((uint8_t)(R.nPl == 1 ? 0 : cfaChannelAt(im, x, y)));
                 }
             std::vector<double> s1(offs.size(), 0), s2(offs.size(), 0);
             int used = 0;
@@ -122,13 +140,17 @@
                 }
                 if (any) used++;
             }
-            double tvar = 0;
-            if (used >= 2)
-                for (size_t k = 0; k < offs.size(); k++) {
-                    double m = s1[k] / used, v = s2[k] / used - m * m;
-                    tvar += v > 0 ? v : 0;
-                }
-            return offs.empty() ? 0.0 : sqrt(tvar / offs.size());
+            if (used < 2) return R;
+            double tvar[4] = {};
+            size_t n[4] = {};
+            for (size_t k = 0; k < offs.size(); k++) {
+                double m = s1[k] / used, v = s2[k] / used - m * m;
+                tvar[plane[k]] += v > 0 ? v : 0;
+                n[plane[k]]++;
+            }
+            for (int p = 0; p < R.nPl; p++)
+                if (n[p]) R.sigT[p] = sqrt(tvar[p] / n[p]);
+            return R;
         };
         // "byte-identical" as the plan means it: every number the panel puts on
         // screen, compared bit for bit. (Not memcmp over the whole struct - its
@@ -241,16 +263,26 @@
             for (int s = 0; s < R.nSeries; s++)
                 if (!relEq(R.mean[s], HB.mean[s], 1e-6) || !relEq(R.sd[s], HB.sd[s], 1e-6))
                     statEq = false;
-            double refSig = refSigmaT(*B);
+            RefSigT refSig = refSigmaT(*B);
+            const App::TemporalState& TB = app.temporal[1];
+            // every plane, not plane 0: on a mosaic the panel publishes four
+            // sigma_t and a check that reads only the first leaves three
+            // unmeasured
+            bool sigEq = refSig.nPl == TB.nPl;
+            for (int p = 0; p < refSig.nPl; p++)
+                if (!relEq(refSig.sigT[p], TB.tempNoise[p], 1e-6)) sigEq = false;
             fprintf(stderr, "abstatsselftest: B independent recompute: series=%d "
                             "sampled=%zu/%zu  mean0 %.12g vs %.12g  sd0 %.12g vs %.12g  "
-                            "sigma_t %.12g vs %.12g\n",
+                            "planes %d vs %d  sigma_t %.12g vs %.12g",
                     R.nSeries, R.sampled, HB.sampled, R.mean[0], HB.mean[0],
-                    R.sd[0], HB.sd[0], refSig, app.temporal[1].tempNoise[0]);
+                    R.sd[0], HB.sd[0], refSig.nPl, TB.nPl,
+                    refSig.sigT[0], TB.tempNoise[0]);
+            for (int p = 1; p < refSig.nPl; p++)
+                fprintf(stderr, " | %.12g vs %.12g", refSig.sigT[p], TB.tempNoise[p]);
+            fprintf(stderr, "\n");
             check(binsEq, "A2 B histogram bins match an independent pass exactly");
             check(statEq, "A2 B mean/sd match within 1e-6 relative");
-            check(relEq(refSig, app.temporal[1].tempNoise[0], 1e-6),
-                  "A2 B sigma_t matches within 1e-6 relative");
+            check(sigEq, "A2 B sigma_t matches within 1e-6 relative, every plane");
             // the two sides really are different data, or A2/A3 prove nothing
             check(memcmp(app.hist[0].bins, app.hist[1].bins, sizeof app.hist[0].bins) != 0,
                   "A2 fixture: A and B histograms actually differ");

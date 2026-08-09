@@ -16,7 +16,7 @@
 #   2. regenerates tools/testdata (deterministic, gitignored, never committed);
 #   3. asks the machine ONCE whether it can make the OpenGL context that every
 #      selftest not labelled `nogl` needs - the ones that drive real ImGui
-#      frames, five of the 34 today - because "there is no GL here" and "an
+#      frames, six of the 35 today - because "there is no GL here" and "an
 #      assert failed" are different events that used to look identical. The
 #      figures in this header are the only ones written down: what a given run
 #      actually did is the "ran N, skipped M" line it prints at the end, which
@@ -468,12 +468,12 @@ if [ -z "$quarantined" ]; then
 else
     echo "$quarantined" | sed 's/^/  /'
     cat <<'EOF'
-  why: docs/tasks.csv "abstats A2既知失敗" - the A2 assert (the B slot's cached
-       sigma_t against an independent recompute, 1e-6 relative) was recorded as
-       failing under --cfa bayer, cause never investigated. It passes 10/10 on
-       MinGW against merged main, so it is either already fixed or intermittent.
-       Re-enable it in CMakeLists.txt once somebody establishes which. It is
-       quarantined, NOT loosened: the assert is untouched.
+  why: read the block above the test's viewer_selftest() line in CMakeLists.txt.
+       The reason a test is out of the gate belongs beside the test, where the
+       person re-enabling it is already looking - a second copy here went stale
+       the moment the first one was investigated. A quarantine is never a
+       loosened assert: the assert stays exactly as written and only stops
+       running, and the block must say what would have to be true to lift it.
 EOF
 fi
 

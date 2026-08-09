@@ -89,7 +89,10 @@
 `--abstats-selftest <dir>`(既存 `--verify-selftest` と同じ `check()` 形式、GUI なし):
 (1) 2 stack を load、A=stack0/frame0、B=stack1 を `setCompareB`、`CmpSplit`+follow on →
 `hist[1].uid == B->uid` ほか両スロットが埋まる。(2) B の `bins` は selftest 内で B の画素から
-素朴に再計算した値と**完全一致**、mean/sd/σ_t は相対 1e-6 以内。(3) compare off で取った
+素朴に再計算した値と**完全一致**、mean/sd/σ_t は相対 1e-6 以内。σ_t は mosaic のとき
+**4 面すべて**を突き合わせる —— §5 の「plane は混ぜない」は全統計にかかる規約なので、
+4 面を 1 本に均した σ_t は画面のどこにも出ない量になる(`selftest.abstats-cfa-bayer` が
+1e-6 の 3200 倍で落ちていた原因はこれで、キャッシュキーではなかった)。(3) compare off で取った
 `hist[0]`/`proj[0]` と on 後の値が**バイト一致**(A は B の存在で変わらない)。
 (4) `gotoFrame(1)` ×5 で両スロットのキーが追従し、`temporal[1].seqId` はステップで変化しない。
 (5) サイズ違いの B で projection が「重ね不可」フラグを立て、ch 数違いで Δ 列が出ない。

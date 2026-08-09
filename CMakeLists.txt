@@ -464,9 +464,8 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Five of the tests below do (six counting the quarantined line at the bottom);
-# the other 27 take the --no-window startup path and need neither a display nor
-# this launcher.
+# Six of the tests below do; the other 29 take the --no-window startup path and
+# need neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_program(XVFB_RUN xvfb-run)
@@ -781,27 +780,30 @@ viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
                             --remote-exe $<TARGET_FILE:viewer-serve>)
 
-# ---- QUARANTINE -----------------------------------------------------------
-# Named, reasoned, and reported - never deleted and never loosened.
+# The same A/B statistics run over a MOSAICED stack: --cfa bayer makes every
+# 1-channel frame a Bayer frame, which is the case where the panels' rule "CFA
+# planes are never mixed in a statistic" (docs/terminology.md) is load-bearing.
+# It was quarantined (DISABLED) from 6308888 until the A2 mismatch it names was
+# understood; it is understood now and the test is back in the gate.
 #
-# docs/tasks.csv:73  "abstats A2既知失敗 / --cfa bayer併用時のB σ_t 1e-6不一致
-# (スイート外) / 原因未調査".  The A2 assert compares the B slot's cached
-# sigma_t against an independent recompute at 1e-6 relative; with --cfa bayer
-# it was recorded as mismatching. It is NOT reproducible on this build: 10 runs
-# out of 10 pass on MinGW against merged main, with both the generated and the
-# original hand-made multi/ fixture. So it is either already fixed by another
-# change or it is intermittent, and nobody has established which. Until someone
-# does, it stays out of the gate rather than being allowed to redden the matrix
-# at random. tools/run_selftests.sh prints this quarantine on every run.
-# The argument ORDER matters and was wrong here: --abstats-selftest consumes the
-# next token unconditionally (main.cpp next()), so "--cfa" became the selftest's
-# DIRECTORY and the CFA was never applied. The quarantined test was a strictly
-# weaker copy of selftest.abstats - identical A2 numbers, and 12 asserts skipped
-# because sibling fixtures resolved against "." - which is why it "passed 10/10".
-# Corrected, it fails 20/20, so it stays disabled until the defect it names is
-# fixed; the point of correcting it is that lifting the quarantine will now test
-# what the name says.
+# What it was: with --cfa bayer, A2's sigma_t comparison failed 20/20 at a
+# relative 3.2e-3 against its 1e-6 tolerance - cached 25.0850055866 vs the
+# selftest's independent recompute 25.0045948567. The reading recorded on the
+# board had the two sides the wrong way round and concluded that temporal[1]'s
+# cache key was missing the CFA setting. It is not: the key has carried cfa and
+# cfaPattern since it was written (core/app/state.h TemporalState). The number
+# that "exactly equals the CFA-off value" is the RECOMPUTE, not the cache -
+# because the selftest's own refSigmaT pooled all four planes into one sigma_t
+# and so measured the same thing with the mosaic on as with it off, while the
+# panel published four per-plane numbers. 25.085 is the R plane, and it always
+# was. The assert was never loosened: it is now made per plane, so the run
+# checks four numbers where it used to check one.
+#
+# THE ARGUMENT ORDER BELOW IS LOAD-BEARING. --abstats-selftest consumes the
+# next token unconditionally (core/app/cli.inc next()), so "--cfa" written
+# immediately after it becomes the selftest's DIRECTORY and the mosaic is never
+# applied to anything. That is what this line said until 6308888, and it is why
+# the quarantined test once "passed 10/10" - it was a weaker copy of
+# selftest.abstats with 12 asserts silently skipped against ".". --cfa goes
+# AFTER the directory; the run prints "series=4" when it took effect.
 viewer_selftest(abstats-cfa-bayer --abstats-selftest tools/testdata/multi --cfa bayer)
-set_tests_properties(selftest.abstats-cfa-bayer PROPERTIES
-  DISABLED TRUE
-  LABELS "selftest;quarantine")
