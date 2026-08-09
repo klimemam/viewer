@@ -463,6 +463,43 @@ static void sampleWindowGeometry(GLFWwindow* w) {
     app.winH = (int)lround(hh / s);
 }
 
+// One-time migration: the browser window was renamed "Remote" ->
+// "Browse###Remote". ImHashStr treats the ### part as the whole identity, so a
+// saved [Window][Remote] entry no longer matches and the panel would silently
+// lose its docked place. Rewrite the ini before ImGui reads it.
+//
+// Beside the file and then over it (writeFileAtomically), not an ofstream on
+// the target: this reads the WHOLE ini and writes the whole thing back, so the
+// truncate at the top of that write is the only copy of the user's docking
+// layout going away, and it is a startup path - a machine that dies while the
+// app is starting is not a rare shape of accident. The one thing this must
+// never do is turn "the Browse panel is in the wrong place" into "there is no
+// layout at all", and until now that is exactly the trade it made.
+//
+// No handshake, unlike the autosave (saveSession): nothing holds this file open
+// across the rename. ImGui reads the ini in ImFileLoadToMemory and writes it in
+// SaveIniSettingsToDisk, both of which open, do their business and close inside
+// the one call, and neither has run yet - the first read happens in the first
+// NewFrame, which is after this. Checked in the vendored copy rather than
+// assumed, because it is the assumption that cost #113 its one-line fix.
+static void migrateLayoutIni(const std::string& iniPath) {
+    if (iniPath.empty()) return;
+    std::string txt;
+    if (!readWholeFile(iniPath, txt)) return;
+    if (txt.find("[Window][Remote]") == std::string::npos) return;
+    size_t p;
+    while ((p = txt.find("[Window][Remote]")) != std::string::npos)
+        txt.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
+    std::string why;
+    if (!writeFileAtomically(iniPath, [&](std::ostream& f) { f << txt; }, &why))
+        // The panel comes up where the un-migrated entry puts it, which is the
+        // defect this migration exists to fix - and that is a great deal better
+        // than the layout being gone. Said once, in the log: it is startup,
+        // there is no window to toast into yet.
+        logMsg("panel layout NOT migrated: " + why +
+               " - the previous layout.ini is unchanged", true);
+}
+
 #include "selftest/util.inc"
 
 #include "selftest/anaprov.inc"
@@ -734,21 +771,7 @@ int main(int argc, char** argv) {
         }
         if (iniPath.empty()) { io.IniFilename = nullptr; app.resetLayout = true; }
     }
-    // One-time migration: the browser window was renamed "Remote" ->
-    // "Browse###Remote". ImHashStr treats the ### part as the whole identity,
-    // so a saved [Window][Remote] entry no longer matches and the panel would
-    // silently lose its docked place. Rewrite the ini before ImGui reads it.
-    if (!iniPath.empty()) {
-        std::string txt;
-        if (readWholeFile(iniPath, txt) &&
-            txt.find("[Window][Remote]") != std::string::npos) {
-            size_t p;
-            while ((p = txt.find("[Window][Remote]")) != std::string::npos)
-                txt.replace(p, strlen("[Window][Remote]"), "[Window][Browse###Remote]");
-            std::ofstream mf(pathFromUtf8(iniPath), std::ios::binary);
-            if (mf) mf << txt;
-        }
-    }
+    migrateLayoutIni(iniPath);   // before ImGui reads it; see the function
 
     float xs = 1, ys = 1;
     // 1.0 with no window: the scale is a property of the monitor the window
