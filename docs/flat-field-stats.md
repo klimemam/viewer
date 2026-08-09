@@ -170,7 +170,7 @@ N=16、σ_t=10 DN なら残差 2.5 DN。**二乗和で効く**ので、真の FP
 そのものを補正済みにする。** 確定時点の実装 (`recomputeTemporalIfNeeded` /
 `runTemporalStats`) は補正なしの「時間平均の空間σ」を σ_fpn と呼んでおり、
 それは名前が主張する量の推定量ではなく上界であった
-(**実装は PR #124 で着地 — 文末「適用ノート」**)。補正後:
+(**実装は PR #127 で着地 — 文末「適用ノート」**)。補正後:
 
 - `sigma_fpn [DN]` = 上式 (補正済み)。method 行 / TSV コメントに
   「temporal residual C subtracted」とクランプの有無を申告する。
@@ -606,7 +606,7 @@ Series Analysis パネル PR #102)。推定量はその下流に乗るだけな�
 - **判断3 の実装** — local (`core/app/temporal_model.inc`
   `recomputeTemporalIfNeeded`) の ddof=0 → ddof=1。**決定は済んでおり、コードは
   本書の外**。**着地済み: PR #123 (`925f0d3`)。**
-- **判断2 の実装 (σ_fpn の `−C` 補正)** — **着地済み: PR #124
+- **判断2 の実装 (σ_fpn の `−C` 補正)** — **着地済み: PR #127
   (`sigma-fpn-correction`)。** local (`recomputeTemporalIfNeeded`) と peer
   (`core/serve.cpp` `runTemporalStats`) の両方が
   `σ_fpn² = max(0, var_spatial(M, ddof=1) − mean(s_t,i²/n_i))` を計算し、
