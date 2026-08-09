@@ -160,20 +160,6 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         // one frame that board row "空間σの ddof がパネル間で不一致" is about:
         // that is a different quantity in ROIs / canvas / histogram and is not
         // touched here.)
-        // ddof=1 on the SPATIAL variance too, as the settled estimator writes it
-        // (docs/flat-field-stats.md (b): "var は ddof=1", and (a)'s "ddof は全部
-        // ddof=1" is stated to carry into (b)/(c)). It is not decoration: the
-        // subtraction below is exact only against an UNBIASED spatial variance.
-        // E[S^2_ddof1] = sigma_fpn^2 + C, so S^2 - C is unbiased for sigma_fpn^2;
-        // the ddof=0 form has expectation (n-1)/n x (sigma_fpn^2 + C), which
-        // leaves (sigma_fpn^2 + C)/n behind after subtracting an unbiased C.
-        // n here is samples per plane, so the two forms differ by parts in
-        // 10^4 on a full frame and by percent on a small ROI - which is exactly
-        // where a fixed pattern is measured.
-        // (This is the sigma_fpn estimator, NOT the per-frame spatial sigma of
-        // one frame that board row "空間σの ddof がパネル間で不一致" is about:
-        // that is a different quantity in ROIs / canvas / histogram and is not
-        // touched here.)
         double pvar = n > 1.0
             ? std::max(0.0, pmSum2[p] / n - pmean * pmean) * (n / (n - 1.0)) : 0.0;
         // The correction itself (#57 judgment 2). Averaging N frames drops the

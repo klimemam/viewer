@@ -326,6 +326,12 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 |---|---|---|---|
 | **DSNU [DN]** | `{"dark": Stack()}` | 時間 Mean (§5) → 空間σ (§3.2) | sc (+map) |
 | **PRNU (直接)** | `{"image": Stack(), "dark": Stack()}` | Mean → dark 減算 (§5) → σ/μ (§3.2) | sc (+map) |
+<!-- 【実装 2026-08-10 — PR #130】上の2行は着地した (map はまだ: 器は #49)。
+     「実装は 1–3 の再利用」は文字どおりで、DSNU は **dark stack に掛けた
+     補正済み sigma_fpn そのもの** — selftest がパネルの値と bit 単位で
+     一致することを確かめている。remote (§3.5 の「画素の居る側で走る」) は
+     未対応で、2つの stack をまたぐ MEASURE op を要するため別 PR が持つ。 -->
+
 | **DSNU / PRNU 分離** | `{"sweep": Series(), "dark": Stack()}` | level 毎 σ_fpn → σ_fpn²–μ² 線形回帰 | sc |
 | read noise (dark 実測) | `{"dark": Stack()}` | σ_t (§3.2 Temporal) | sc |
 | **暗電流 [DN/s]** | `{"darks": Series(unit=s/ms)}` | level 毎 Mean → 線形 fit (§3.3) | sc + cv |
@@ -358,7 +364,7 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 |---|---|---|---|
 | ROI の σ/mean (そのまま) | General / frame (ROIs 列) | **`std / mean [%]`** | **改名済み・main 済み** (`5d8cb72`。ユーザー裁定 2026-08-06、旧 `PRNU [σ %]`)。素の名前になり、General から有名名が消えた |
 | 9×9 ローパス残差の σ/mean | Specific / frame | `uniformity/prnu-fpn` の `prnu_pct` | 現名のまま。proxy と自己申告済み ([analyzers.md](analyzers.md))。改名は報告書の連続性を壊すだけ |
-| dark を引いた flat の固定パターン | **SetAnalyzer** | 裸の `PRNU` (+ set タグ: `— set: image n/N, dark n/N`) | 未実装。ここが「本物」の住所 |
+| dark を引いた flat の固定パターン | **SetAnalyzer** | 裸の `PRNU` (+ set タグ: `— set: image n/N, dark n/N`) | **着地済み (PR #130)**。Set Analysis パネル。タグは set 名も名乗る (不変条件 (a)) |
 | σ_fpn²(μ) フィットの傾き / 切片 | **SetAnalyzer** | 裸の `PRNU` / `DSNU` (+ set タグ: `— sweep: <series>, M levels`) | 未実装。加法・乗法の**分離**はここでしか出来ない ([flat-field-stats.md](flat-field-stats.md) (c)) |
 
 直接推定と分離フィットは**推定量が違う**ので、set タグがそのまま区別になる。

@@ -115,6 +115,8 @@ App app;
 
 #include "app/temporal_model.inc"
 
+#include "app/setanalysis.inc"
+
 #include "app/open_dispatch.inc"
 
 // ---------------------------------------------------------------- view helpers
@@ -163,6 +165,9 @@ static std::string fmtVal(float v, const std::string& dtype) {
 
 #include "ui/modal_derive.inc"
 #include "ui/file_list.inc"
+// after file_list: the Files selection (g_aSetSelId) is what picks this panel's
+// subject, exactly as the selection picks the layer for every General panel
+#include "ui/panel_setanalysis.inc"
 #include "ui/menus.inc"
 #include "app/cli.inc"
 
@@ -899,6 +904,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/aset.inc"
 
+    #include "selftest/setanalysis.inc"
+
     #include "selftest/derive.inc"
 
     #include "selftest/reload.inc"
@@ -1295,6 +1302,11 @@ int main(int argc, char** argv) {
             // session loader's ini migration.
             if (ImGui::Begin("Series Analysis###Linearity", &app.showSeriesAnalysis))
                 drawPanelSeriesAnalysis();
+            ImGui::End();
+        }
+        if (app.showSetAnalysis) {
+            ImGui::SetNextWindowSize(ImVec2(760 * uiScale, 460 * uiScale), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Set Analysis", &app.showSetAnalysis)) drawPanelSetAnalysis();
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small

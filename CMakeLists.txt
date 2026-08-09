@@ -830,6 +830,14 @@ viewer_selftest(verify      --verify-selftest tools/testdata/multi)
 # close semantics, session block + adopt. Fixtures are built by the test
 # itself under a scratch dir, so the argument is only a place to put them.
 viewer_selftest(aset        NOGL --aset-selftest tools/testdata)
+# The SetAnalyzers over a bound set (docs/flat-field-stats.md (b), #57 judgment
+# 4): direct DSNU / PRNU, every refusal path, and the scan that keeps the bare
+# famous names in one file. The argument is tools/testdata/multi, whose injected
+# fixed pattern is SHARED between its three stacks and is therefore ground truth
+# for both estimators; the exact-arithmetic fixtures are built in memory. The
+# scan walks the sources relative to WORKING_DIRECTORY, which viewer_selftest
+# already pins to the source root.
+viewer_selftest(setanalysis NOGL --setanalysis-selftest tools/testdata/multi)
 # ...and the same panel's NUMBERS, which are not a rectangle and so do not need
 # a display. V19 used to hold both, which put the PRNU column's arithmetic
 # behind a GL context and therefore on one runner of the three: it was measured

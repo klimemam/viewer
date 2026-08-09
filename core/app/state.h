@@ -788,7 +788,7 @@ struct App {
     // A defect that only one allocator can show is a defect that ships. Making
     // the invalidation unconditional costs one move of a handful of SeqInfo per
     // stack opened or closed - unmeasurable next to reading the frames - and
-    // buys the same failure on every platform, which the 36 selftests then see.
+    // buys the same failure on every platform, which the 37 selftests then see.
     //
     // Poisoning the outgoing elements is the diagnostic half: a stale read gets
     // id == StaleId and the name "<stale SeqInfo>" instead of plausible data,
@@ -1157,6 +1157,10 @@ struct App {
         uint64_t rev = 0, computedRev = 0;
     } lin;
     bool showSeriesAnalysis = false;
+    // The AnalysisSet layer's panel (docs/analysis-layers.md §2). Off by
+    // default like Series Analysis: it says nothing until a set exists, and
+    // sets are made deliberately.
+    bool showSetAnalysis = false;
     // Create / edit a series. ONE modal for both: the fields are identical and
     // "edit" is only "create with the boxes already ticked". The value column
     // is a SUGGESTION the user confirms - see drawSeriesModal.
