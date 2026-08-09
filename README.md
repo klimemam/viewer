@@ -5,13 +5,13 @@
 [![build](https://github.com/klimemam/viewer/actions/workflows/build.yml/badge.svg)](https://github.com/klimemam/viewer/actions)
 Windows / Linux / macOS ・ C++17 + Dear ImGui + GLFW ・ GPU 不要 ・ 単体バイナリ
 
-`.npy` / `.npz` / ヘッダ無し raw を、変換も中間ファイルも挟まずにそのまま開きます。
-表示用に丸められた画像ではなく、**元の数値**を扱います。連番は1つの **stack** として
-開き、フレーム間の統計や比較がそのまま効きます。
+`.npy` / `.npz` / ヘッダ無し raw / ベンダ RAW / TIFF / EXR などを、変換も中間ファイルも
+挟まずにそのまま開きます。表示用に丸められた画像ではなく、**元の数値**を扱います。
+連番は1つの **stack** として開き、フレーム間の統計や比較がそのまま効きます。
 
 足せる場所が3つあります:
 
-- **プラグイン** — 測定を C の共有ライブラリで足す (同梱7本)
+- **プラグイン** — 測定を C の共有ライブラリで足す (同梱7本。frame でも stack でも)
 - **リーダ** — 読めない形式を Python の関数1つで読ませる
 - **リモート** — 計算機側に peer を置き、ssh 越しに開く。回線を流れるのは
   見えている領域と測定結果だけ
@@ -51,16 +51,19 @@ win64\install_shortcut.cmd                    Windows
 
 ---
 
-## 用語 — frame / stack / series / batch
+## 用語 — frame / stack / series / AnalysisSet / batch
 
-この4語がこの道具の骨格で、パネルもファイルも測定もこの語彙で動きます。
-**包含は厳密**です (frame ⊂ stack ⊂ series ⊂ batch)。
+この5語がこの道具の骨格で、パネルもファイルも測定もこの語彙で動きます。
+包含は `frame ⊂ stack ⊂ series ⊂ AnalysisSet ⊂ batch` で**厳密**です。例外は1つ、
+**AnalysisSet のメンバ関係だけは包含ではなく束縛 (参照)** — 同じ dark を複数の set が
+参照できないと、「1回撮った dark を全解析で使う」が成立しないからです。
 
 | 語 | 何か | 例 |
 |---|---|---|
 | **frame** | 画面に見えている最小単位。1枚 | `dark_0007.npy` |
 | **stack** | **同一条件で繰り返し**撮った frame の集まり | `dark_0000‥0479` (480枚) |
 | **series** | **条件を振った** stack の集まり。振った量と単位を持つ | 露光 1,2,5,10,20 ms の5つの stack |
+| **AnalysisSet** | 解析の**入力の役割**を束ねたもの。データが dark 「である」のではなく、set の中で dark を**演じる** | `{"image": 10lx, "dark": dark}` |
 | **batch** | 一緒に開いたもの。構造の主張はしない | あるフォルダを開いた結果 |
 
 この区別が効くのはここです:
@@ -71,8 +74,11 @@ win64\install_shortcut.cmd                    Windows
 - **series の値 (露光・照度) と単位は series が持ちます**。stack にもアプリにも
   持たせません。単位が無ければフィットしません — 単位は推測しないからです
 - **batch は構造を主張しません**。「一緒に開いた」だけなので、閉じる単位に使えます
+- **役割は宣言です。推論しません** — フォルダ名や「level 0」から dark を推測して
+  束ねることはしません
 
 正典は [docs/terminology.md](docs/terminology.md) です (Close の意味論もそこ)。
+解析の層と4種の設計は [docs/analysis-layers.md](docs/analysis-layers.md)。
 
 ---
 
@@ -109,13 +115,20 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 |---|---|
 | **Histogram** | 分布。CFA なら R/Gr/Gb/B を**混ぜずに** |
 | **Projection** | 行・列の平均と σ。行 FPN / 列 FPN が見えます |
-| **Temporal** | stack のフレーム方向。**σ_t** と σ_s、フレームごとの平均の推移 |
-| **ROIs** | 矩形と点。mean / σ / min / max、そして n |
-| **Linearity** | series のフィット。EMVA 方式 (版を選べます) |
+| **Temporal** | stack のフレーム方向。**σ_t** と σ_fpn、フレームごとの平均の推移 |
+| **ROIs** | 矩形と点。mean / σ / min / max、そして n。比較中は blink で追随、side-by-side で横並び |
+| **Series Analysis** | series のフィット (旧 Linearity)。メンバは frame と stack の混在可 |
+| **Set Analysis** | AnalysisSet の SetAnalyzer。**DSNU / PRNU** と、掃引からの分離フィット |
 | **Analysis** | プラグインの測定結果 |
 
 数値には**必ず量と単位**が付きます。画素値は保存形式が何であれ [DN] です。
 部分的にしか読めていない stack は **n/N** と言います。
+
+stack を1枚に畳むときは **mean と sum を選べます**。NaN が混ざっていれば警告し、
+除外数と有効枚数を併記します (畳んだ結果は frame として series に入れられます)。
+σ_fpn は時間残差 `−mean(σ_t²/n)` を引いた**補正済み**の量で、補正量とクランプを
+申告します。**PRNU / DSNU の名は SetAnalyzer だけが名乗ります** — General の列は
+`std / mean [%]` のような中立な名前です。
 
 ### 比べる
 
@@ -138,7 +151,17 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 | `.npy` | `u1 i1 b1 u2 i2 u4 i4 f4 f8`、ビッグエンディアン、fortran order |
 | `.npz` | zip 内の各メンバ。名前は `file.npz:key`。画像でないメンバは開かず、フレーム数と長さの合う1次元配列は**軸として使えます** ([docs/npz-design.md](docs/npz-design.md)) |
 | `.bin` `.raw` `.yuv` `.dat` `.rggb` | ヘッダ無し。dtype・解釈 (gray/rgb/bayer/quad-bayer)・寸法・オフセット・クロップを指定 |
+| `.png` `.jpg` | 8/16-bit。値は保存されたまま、スケールもトーンカーブも掛けません |
+| `.tif` | 自前実装。8/16-bit 整数と 32-bit float、strip、LZW/Deflate/PackBits。**multi-page は stack** |
+| `.exr` | OpenEXR。**layer は別々の文書**になります (page = stack と区別します) |
+| `.y4m` | 実体は画像形式 (テキストヘッダ + 生プレーン) なので、フレーム列が stack になります |
+| ベンダ RAW | NEF / ARW / ORF / CR3 / RW2 / DNG ほか。**CFA モザイクを数えたまま**1面で読み、パターン・黒/白レベル・ビット深度は**申告どおり運びます** |
 | `.vsession` | 保存したセッション |
+
+**RAW は「見せて、引かない」**: 黒レベル 0 と申告しながら画素が 80 から始まるファイルが
+実在するので、宣言された値は note に載せるだけで**引き算はしません**。デモザイクも
+ホワイトバランスも色行列もトーンカーブも掛けません。読めないもの (X-Trans、JPEG-XL 圧縮
+DNG など) は**画素を展開する前に**理由を名指しして断ります。
 
 **配列の形の読み方**:
 
@@ -160,7 +183,9 @@ CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 (`--bayer-pattern` を後ろに置くと無視されます)。
 
 **書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
-PNG / JPEG / TIFF の**読み込みはありません**。
+
+**Browse の一覧は、ローカルでは「この viewer が読めるか」、リモートでは「この peer が
+配れるか」を訊きます** (peer は `.npy` のみ)。開けない行も消さずに残し、理由を言います。
 
 ### 読めない形式を読ませる — リーダ
 
@@ -222,8 +247,17 @@ viewer ssh://user@host                             ホームから
 | processor | 画素を作る | demosaic |
 | display | 表示のしかたを足す | falsecolor |
 
-analyzer は **peer 側でも同じものが走ります** — リモートの測定がローカルと同じ答えを
-返すのはこのためです。書き方は [docs/analyzers.md](docs/analyzers.md)。
+**ABI は v3** です。v1 / v2 のプラグインはそのまま動きます (版欄が無いので版は空欄のまま
+= 推測しません)。v3 で増えたのは:
+
+- **層で型の付いた解析** — frame だけでなく **stack をそのまま受け取れます**。フレームは
+  `get_frame` / `release_frame` で必要な分だけ引き、全部の常駐は約束しません
+- **版と headline の宣言** — 結果の出所行が `名前 <版> (dll名)` になります
+- **部分ロードの契約** — `min_frames` は**呼ぶ前に**ホストが裁く宣言、`frames`/`expected` は事実
+
+analyzer は **peer 側でも同じものが走ります**。リモート実行は **name + 版の等値**で
+照合し、食い違えば**両方の版を引用して断ります** — 黙ってローカルに振り替えることは
+しません。仕様は [docs/abi-v3.md](docs/abi-v3.md)、書き方は [docs/analyzers.md](docs/analyzers.md)。
 
 ---
 
@@ -242,7 +276,7 @@ analyzer は **peer 側でも同じものが走ります** — リモートの�
 
 ## セルフテスト
 
-22 本あり、CI が3つの OS で全部走らせます。手元でも同じものが1コマンドで走ります。
+40 本あり、CI が3つの OS で全部走らせます。手元でも同じものが1コマンドで走ります。
 
 ```
 tools/run_selftests.sh [build-dir]
@@ -250,7 +284,11 @@ tools/run_selftests.sh [build-dir]
 
 GUI を実際に描いてクリックを注入するものも含みます (Browse のキー操作、比較、タイル表示)。
 測定の不変条件 — **σ_t は stack の性質・CFA プレーンを混ぜない・部分ロードは n/N と言う** —
-は、この検査で守られています。
+は、この検査で守られています。加えて規則そのものを検査するものがあります: 有名名
+(PRNU/DSNU) が表の外に現れていないか、ローカルと peer が同じ数を返すか、走らなかった
+テストが黙っていないか。
+
+**走らなかったものは必ず名指しします** — skip も quarantine も、緑の中に埋もれません。
 
 ---
 
@@ -260,9 +298,13 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 |---|---|
 | [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
 | [docs/manual.md](docs/manual.md) | 操作の手引き |
+| [docs/analysis-layers.md](docs/analysis-layers.md) | AnalysisSet と解析の4種 (General / Specific / PreProcessor / SetAnalyzer) |
+| [docs/flat-field-stats.md](docs/flat-field-stats.md) | σ_fpn・DSNU・PRNU の推定量と detrend |
 | [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
 | [docs/input-adapters.md](docs/input-adapters.md) | リーダの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/reader-analysisset.md](docs/reader-analysisset.md) | リーダから AnalysisSet を書く |
 | [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
+| [docs/abi-v3.md](docs/abi-v3.md) | プラグイン ABI v3 の寸法と契約 |
 | [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
 | [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
 | [docs/tasks.csv](docs/tasks.csv) | 課題表 (対応済み / 進行中 / 残課題 / 暫定 / 要レビュー) |
@@ -286,8 +328,25 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 ```
 
-依存 (GLFW 3.4 / Dear ImGui 1.91.8-docking / miniz / portable-file-dialogs) は CMake が
-取ってきます。初回だけネットワークが要ります。`viewer` と `viewer-serve`、プラグイン、
-アイコンが同時に建ちます。
+依存 (GLFW 3.4 / Dear ImGui 1.91.8-docking / miniz / portable-file-dialogs / OpenEXR +
+Imath / LibRaw) は CMake が取ってきます。**初回はネットワークが要ります** — PNG・JPEG・
+TIFF は自前と同梱で読むので依存を増やしませんが、EXR と RAW は外部ライブラリです。
+`viewer` と `viewer-serve`、プラグイン、アイコンが同時に建ちます。
+
+MinGW / WinLibs 同梱の CMake は CA ストアを持たないので、取得が証明書エラーになったら
+CA バンドルを渡してください (環境変数の形は FetchContent のサブビルドに伝わりません):
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_TLS_CAINFO="C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"
+```
 
 テスト用の fixture は `python tools/gen_testdata.py` が生成します (numpy が要ります)。
+
+---
+
+## ライセンス
+
+Apache License 2.0 ([LICENSE](LICENSE))。同梱・リンクする第三者コードの表示義務は
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にまとめてあり、配布バイナリにも同梱します。
+LibRaw は CDDL-1.0 を選択しています (単一静的 exe を CI が自動公開する形態に LGPL の
+再リンク義務が合わないため)。
