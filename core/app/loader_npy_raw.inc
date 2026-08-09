@@ -381,6 +381,19 @@ static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     S.cropX += x; S.cropY += y;
     im.syncMirrors();
     im.dataRev++;
+    // dataRev is a MEMBERSHIP counter, and it unlatches every cache keyed on
+    // uid+dataRev. The stack's measurements are not keyed that way: sigma_t is
+    // computed over every member of the stack and keyed on
+    // (seqId, frames, stackRev, ROI, CFA), where the ROI carries the REFERENCE
+    // doc's dims - so a crop of any OTHER member moves nothing in that key
+    // while silently dropping that member out of the numbers (it no longer has
+    // the stack's shape). SeqInfo::stackRev is the stack's DATA revision
+    // (docs/reference-design.md §3.2) and a crop is a change to the stack's
+    // data, so it is bumped here - the same revision the reload walk bumps and
+    // the same one a reduced frame's (seqId, stackRev) provenance reads (§10.1),
+    // rather than a second answer to "have these pixels changed".
+    if (im.seqId != 0)
+        if (App::SeqInfo* si = seqInfo(im.seqId)) si->stackRev++;
     computeMinMax(im);
     im.texDirty = true;
     if (appliedX) *appliedX = x;

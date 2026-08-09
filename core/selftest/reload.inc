@@ -7,6 +7,9 @@
     //          unchanged - SeqInfo::stackRev in the temporal key is what lets a
     //          latched TemporalState notice the reload at all
     //   R9     forgetImage forgets the extra compare-slot states too
+    //   R24    a crop is a change to the STACK's data, so it moves the same
+    //          revision the temporal key reads - a member that no longer has
+    //          the stack's shape leaves its numbers, and they say so
     //   R12    frame-axis provenance (fileFrame) reloads the RIGHT frame, and
     //          refuses one the file no longer has
     if (!g_reloadSelftest.empty()) {
@@ -476,6 +479,49 @@
             check(landed->name == "queued" && landed->w == b0->src->w &&
                   landed->h == b0->src->h,
                   "R23 pumpSequence lands queued docs with fresh mirrors");
+        }
+        {   // ---- R24: a crop is a change to the STACK's data -------------------
+            // cropInPlace re-scopes ONE membership's pixels. A stack's temporal
+            // numbers are computed over every member, so a member that no longer
+            // has the stack's shape drops out of them - but the key is
+            // (seqId, frames, stackRev, ROI, CFA) and a crop of a member that is
+            // not the reference doc moves none of those: same stack, same frame
+            // count, same ROI (the REFERENCE doc's dims), same CFA. stackRev is
+            // the stack's DATA revision, and a crop is a change to the stack's
+            // data - so the crop bumps it, rather than this cache growing a
+            // second answer to "have these pixels changed".
+            std::string cstk = root + "/cropstk";
+            std::filesystem::create_directories(pathFromUtf8(cstk), ec);
+            for (int i = 0; i < 5; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "k_%03d.npy", i);
+                writeNpy2(cstk + "/" + nm, 4, 4, 100.0f + (float)i, 0);
+            }
+            std::vector<int> had;
+            for (const auto& s : app.seqs) had.push_back(s.id);
+            openFolder(cstk);
+            loadAll();
+            int seqK = 0;
+            for (const auto& s : app.seqs)
+                if (std::find(had.begin(), had.end(), s.id) == had.end()) seqK = s.id;
+            ImageDoc* k0 = docOf(seqK, 0);
+            ImageDoc* k2 = docOf(seqK, 2);
+            App::TemporalState T{};             // a slot keyed on k0, not on k2
+            if (k0) recomputeTemporalIfNeeded(k0, T);
+            double sigAll = T.tempNoise[0];     // five flat frames, 100..104
+            int srK = seqK ? seqInfo(seqK)->stackRev : -1;
+            bool cropped = k2 && cropInPlace(*k2, 0, 0, 2, 2);
+            if (k0) recomputeTemporalIfNeeded(k0, T);
+            fprintf(stderr, "reloadselftest: R24 crop of one member: stackRev %d->%d, "
+                            "sigma_t %.5f -> %.5f (5 frames -> the 4 that still "
+                            "have the stack's shape)\n",
+                    srK, seqK ? seqInfo(seqK)->stackRev : -1, sigAll, T.tempNoise[0]);
+            check(k0 && k2 && cropped && fabs(sigAll - 1.41421) < 0.001,
+                  "R24a fixture: five flat frames, one member cropped");
+            check(seqK && seqInfo(seqK)->stackRev == srK + 1,
+                  "R24b a crop bumps the stack's data revision");
+            check(fabs(T.tempNoise[0] - 1.58114) < 0.001,
+                  "R24c sigma_t is NOT the stale pre-crop five-frame value");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "reloadselftest: %s\n", ok ? "ok" : "FAILED");
