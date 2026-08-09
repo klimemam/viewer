@@ -181,7 +181,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 - **Reinterpret raw...**: RAW 由来の画像を画素フォーマットから読み直し(ダイアログ再表示、
   ビュー位置・ズームは維持)
 
-### 2.3b PNG / JPEG / TIFF / OpenEXR
+### 2.3b PNG / JPEG / ベンダ RAW / TIFF / OpenEXR
 
 そのまま開けます。**値は保存されたまま** —— 8bit は 0..255、16bit は 0..65535 [DN] で、
 **0..1 に正規化しません**。表示レンジの初期値だけがビット深度から決まります。
@@ -190,6 +190,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 |---|---|---|
 | **PNG** | 1/2/4/8/16 bit、grey / grey+alpha / RGB / RGBA / palette / interlace | **16bit がそのまま 16bit で入ります** |
 | **JPEG** | baseline / progressive、8bit | codec の YCbCr→RGB を通った値である旨が note に出ます |
+| **ベンダ RAW** | `.dng .cr2 .cr3 .nef .arw .orf .rw2 .raf .pef .srw` ほか(Canon / Nikon / Sony / Olympus / Panasonic / Fujifilm / Apple ProRAW …) | **センサが数えた CFA モザイクそのもの**が 1ch で入ります。デモザイクも WB もガンマも**しません**(下記) |
 | **TIFF** | 8/16bit 整数と **32bit float**、grey / grey+alpha / RGB / RGBA、II・MM 両方、strip、無圧縮 / PackBits / LZW / Deflate(predictor 付きも) | **複数ページは stack になります**(下記)。読めないものは**名指しで断ります** |
 | **OpenEXR** | half / float、scanline と 1レベル tiled、圧縮は全種(ZIP・PIZ・DWA など) | **シーンリニアの値をそのまま**入れます —— トーンマップも clamp もしません。**レイヤは1枚ずつ別の画像**になります(下記) |
 | **y4m** | progressive、8〜16bit の**輝度のみ**、Cmono / C420 / C422 / C444 など | **1ファイル = 1つの stack。** 非圧縮なので値は DN。他の動画形式は名指しで断ります(§2.3c) |
@@ -201,9 +202,11 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
   `TIFF page 2 of 3, 16-bit greyscale, LZW, Predictor 2 (horizontal differencing) undone,
   7 strips; values as stored, ...` のように。
   4bit 以下の PNG だけはデコーダが 0..255 へ展開する(×17 等)ので、**その倍率も note に出ます**
-- これらの形式は CFA を運ばない(TIFF の CFA ページは**断ります**)ので
-  **Bayer とは名乗りません**。モザイクとして扱いたい場合は Inspector の
-  **Interpret** か `--cfa`(=ユーザーの宣言)を使います
+- **PNG / JPEG / TIFF / OpenEXR は CFA を運ばない**(TIFF の CFA ページは
+  **断ります**)ので **Bayer とは名乗りません**。モザイクとして扱いたい場合は
+  Inspector の **Interpret** か `--cfa`(=ユーザーの宣言)を使います。
+  **ベンダ RAW だけは別**です —— ファイルがパターンを名乗るので、
+  開いた時点で **Bayer として、正しい並びで**入ります(下記)
 - **Browse パネル(このマシン)から開けます**。ダブルクリック(または Enter)で開き、
   **1クリックはプレビューではなく選択**です —— プレビューは間引いた 1タイルを
   サーバから貰う仕組みなので、ローカルの絵にはそれに当たる安価な読み方が無く、
@@ -212,6 +215,51 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
   配ります)。**行は消えません** —— 淡色の行にカーソルを乗せると理由が出ます。
   「Open as stack」「Open as frame average」「Temporal stats (server) for stack "…"」の
   3つはローカルでもサーバ経由なので、これらの形式には出ません
+
+**ベンダ RAW は「モザイクをそのまま」開きます。** カメラの `.NEF` や `.CR3` を
+開くと、**現像された写真ではなく、センサが数えた CFA モザイク**が 1ch の画像として
+入ります。デモザイク・ホワイトバランス・カラーマトリクス・トーンカーブは
+**1つもかかりません**(かける関数はこのビルドに**リンクすらされていません**)。
+
+ファイルが宣言している数は、**note に出るだけで、画素には適用しません**:
+
+```
+LibRaw 0.22.2 (nikon_load_raw()), Nikon 1 AW1; the CFA mosaic, one plane;
+CFA RGGB, read from the file; 12-bit samples as the file declares them;
+black level 0, SHOWN and not subtracted; white level 4095;
+4620x3082 read out of a 4620x3084 raw frame at (0,0) - the masked border the
+file excludes is not read; no demosaic, no white balance, no colour matrix,
+no tone curve; values as stored, no scaling or transfer curve applied
+```
+
+- **CFA パターンはファイルから読んだもの**です。RGGB を仮定しません。
+  なので per-plane の統計(4面を混ぜない、という規則)が最初から正しく効きます
+- **ブラックレベルは表示するだけで、引きません。** 上の実例のように
+  **「black level 0」と宣言しながら画素が 80 から始まる**機種が実在します。
+  引く実装はそこで間違い、他の全部で無言になります。引き算をしたければ、
+  それは**あなたが見て決めること**です
+- **可視領域だけ**を渡します。マスク境界(光学黒)は読みませんが、
+  **あることは note が言います**
+- 表示レンジの初期値は 16bit の既定(0..65535)なので、**12/14bit の RAW は
+  暗く見えます**。note のホワイトレベル(上の例なら 4095)を Display の白に
+  入れてください
+
+**ベンダ RAW が断るもの**(いずれも名指しで、`Open With a Reader...` へ誘導します):
+Nikon HE / HE\*(このビルドの LibRaw が復号しません)/ JPEG-XL の DNG
+(Adobe DNG SDK が要ります)/ GoPro VC-5(GPR SDK)/ X-Trans などの
+**非 Bayer モザイク** / Foveon X3 / すでに 3面・4面になっている RAW /
+float の DNG。
+
+```
+Nikon_Z8_HE.NEF: vendor RAW: Nikon High Efficiency (HE, NEFCompression 13):
+  LibRaw 0.22.2 does not decode it - upstream's own camera list says
+  "not supported yet" (LibRaw 0.22.2)
+  choose a reader to read it another way
+```
+
+**`.raw` はこれとは別**です。あれは**ヘッダの無い生バイト列**で、
+形と深度をあなたが宣言するダイアログのままです(§2.3 の raw ダイアログ)。
+カメラの RAW とは別の物なので、拡張子も取り違えません。
 
 **複数ページの TIFF は stack です。** 1ページ = 1フレームで、連番フォルダから
 できる stack とまったく同じもの(§2.4)—— 時間方向の解析も montage も効きます。

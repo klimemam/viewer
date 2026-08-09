@@ -166,7 +166,7 @@ read as   1 frame x 3 ch   (H,W,C)         [ re-read as... ]
 raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示するので、
 そもそも推測が無い — 今のままでよい。
 
-### 3.6 PNG / JPEG / TIFF / OpenEXR — 形を推測しない形式は、器に訊く
+### 3.6 PNG / JPEG / ベンダ RAW / TIFF / OpenEXR — 形を推測しない形式は、器に訊く
 
 **決定 (2026-08-04、ユーザー)**:
 
@@ -187,6 +187,7 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 |---|---|---|
 | PNG | stb_image 2.30 (1ヘッダ、MIT/PD、`third_party/stb/` に vendor) | 8/16bit、grey/GA/RGB/RGBA/palette |
 | JPEG | 同上 | baseline / progressive、8bit |
+| ベンダ RAW | LibRaw 0.22.2 (`core/rawread.cpp`、ソース直コンパイル) | `.dng .cr2 .cr3 .nef .arw .orf .rw2 .raf .pef .srw` ほか。**CFA モザイク 1面をそのまま**、パターン・ブラック・ホワイト・ビット深度は**ファイルの宣言のまま note へ**。デモザイクも WB も黒引きも**しない** (§3.6.5) |
 | TIFF | **自前** (`core/tiffread.cpp`、`tiffread 1`) | classic TIFF (magic 42)、II/MM 両方、strip、8/16bit 符号なし整数と 32bit IEEE float、grey (WhiteIsZero/BlackIsZero) と RGB (±alpha)、none/PackBits/LZW/Deflate、predictor 1/2、**複数ページ = stack** |
 | OpenEXR | 公式 OpenEXR 3.4.13 + Imath 3.2.2 (`core/exrread.cpp`、**常にリンクされる**) | scanline と 1レベル tiled、half/float、全圧縮 (NONE/RLE/ZIP/ZIPS/PIZ/PXR24/B44/DWA)、**レイヤ = document** |
 | y4m (YUV4MPEG2) | **自前** (`core/y4mread.cpp`、`y4mread 1`) | progressive、8〜16bit の**輝度プレーンのみ**、Cmono/C444/C422/C420/C411 (jpeg/mpeg2/paldv 込み)、**1ファイル = 1 stack**。他の動画コンテナは名指しで拒否 |
@@ -261,6 +262,8 @@ float に広げる。**断り文そのものが成果物**なので、エラー�
 **CFA の規則**: `cfa` は**読めたときだけ**立てる。PNG/JPEG は CFA を運ばず、
 TIFF は CFA ページを**断る**ので、この3形式はいずれも常に 0。`--cfa bayer` は
 ユーザーの宣言なので従来どおり効く (推測ではない)。
+**ベンダ RAW だけは違う** —— ファイルがパターンを名乗るので、そこから立てる
+(§3.6.5)。「読めたときだけ」の**読めた側の最初の1件**である。
 
 **Browse から開ける** (#111 で解決)。かつてここには「Browse の一覧には出ない」と
 書いてあったが、正確には**行は最初から出ていた** —— 淡色で、クリックにも
@@ -439,6 +442,194 @@ peer のもの。ローカルの絵にはその安価な部分デコードが無
 
 **`viewer-serve` は 1バイトも変わっていない** (media 3本と同じ前例)。この問題は
 最初から**クライアント側の述語**の問題だった。
+
+### 3.6.5 ベンダ RAW — ファイルが数値の意味を名乗る唯一の形式 (2026-08-10)
+
+**裁定 (2026-08-09、ユーザー、#52)**:
+
+> ベンダ Raw は reader で実装しろというのも酷なので native 対応しときたいなぁ
+
+`core/imagefile.h` の継ぎ目の内側 = native、reader = アダプタ、という線引きの上で
+**ベンダ RAW は native 側**に置く。実装は `core/rawread.cpp`、表の1行。
+
+#### 何を読むか — `raw_image` だけ
+
+`LibRaw::unpack()` が返す `rawdata.raw_image`、すなわち**センサが数えた CFA
+モザイク 1面**だけを取る。`dcraw_process()` も `dcraw_make_mem_image()` も
+**呼ばないどころかリンクされていない** (下の「ビルド」)。したがって:
+
+| ファイルが宣言するもの | どこへ行くか |
+|---|---|
+| CFA パターン | `Image::cfa = 1` と `cfaPattern` (RGGB/BGGR/GRBG/GBRG)。**読めた値**であって推測ではない |
+| ブラックレベル | **`note` に表示**。**引かない。** 面別 (`cblack`) があればそれも並べる |
+| ホワイトレベル | `note` |
+| ビット深度 | `note` (`color.raw_bps` = ファイルの宣言) |
+| 可視領域と raw フレームの差 | `note`。**マスク境界は読まない**が、あることは言う |
+| 画素 | `dtype = "u16"`、値は**カウントそのまま** |
+
+**なぜ黒を引かないか。** #52 の調査 (branch `media-format-strategy` の `docs/media-formats.md`) §4.7 の実測 ——
+Nikon 1 AW1 の NEF は**ブラックレベル 0 を宣言し、最も暗い画素が 80** だった。
+宣言値を引く実装はここで間違い、他の全部で無言である。逆に「観測した床の 80 を
+ブラックとして採用する」のは**ファイルが言っていない数を作る**ことで、正典が
+禁じている側。したがって **0 と表示し、80 を渡す**。
+`--media-selftest` の M31 がこれを assert している。
+
+**なぜ可視領域なのか。** LibRaw の `COLOR(row,col)` は**可視画像の座標**に対する
+答えである (`raw2image()` がまさにその添字でモザイクを読む)。raw フレーム全体を
+渡すなら別の原点のパターンを**こちらで導出**することになり、それは規則3
+(「読めるか、無いか。推測しない」) の禁じる算術である。マスク境界 (光学黒) は
+測定に価値があるが、**それを渡すのはパターンを自分で計算し直すこととセット**なので
+この PR の外に置き、note で「そこにある」と言うだけにした。
+
+#### 何を断るか — 名指しで
+
+```
+sensor_jpegxl.dng: vendor RAW: JPEG-XL compression (DNG 1.7): decoding it needs
+  the Adobe DNG SDK, which is not built into this viewer (LibRaw 0.22.2)
+  choose a reader to read it another way
+
+sensor_xtrans.dng: vendor RAW: a non-Bayer mosaic (LibRaw filters code 9, an
+  X-Trans 6x6 pattern): this viewer names four 2x2 Bayer orders and cannot
+  describe it, and describing it wrongly would make every per-plane statistic
+  wrong in silence (LibRaw 0.22.2)
+  choose a reader to read it another way
+```
+
+| 断るもの | 文面が名指しするもの |
+|---|---|
+| Nikon HE / HE\* | `Nikon High Efficiency (HE, NEFCompression 13)` + 「上流が not supported yet と書いている」 |
+| JPEG-XL DNG (1.7) | `Adobe DNG SDK` が要る |
+| GoPro VC-5 | `GPR SDK` が要る |
+| X-Trans などの非 Bayer | `filters` コードと 6x6 の別 |
+| Foveon X3 | 「画素ごとに 3つ積む器であってモザイクではない」 |
+| float DNG / 3面・4面 RAW | 「この reader が渡すのは CFA モザイクだけ」 |
+| `filters == 0` | 「ファイルが CFA を名乗っていない」 |
+| RGGB/BGGR/GRBG/GBRG 以外の 2x2 | 読めた4文字と `cdesc` を出す |
+
+**どれも復号前か、LibRaw 自身の返り値から**出る。`get_decoder_info()` は
+`unpack()` の前に呼べるので、復号できないコーデックは**1画素も触らずに**断れる。
+
+#### 振り分け — なぜ TIFF 行より前なのか
+
+**ベンダ RAW の器はたいてい TIFF である。** `.NEF` も `.ARW` も `.PEF` も `.DNG` も
+先頭 4バイトはスキャナの `.tif` と同じなので、**先に訊かれた行が全部持っていく**。
+そこで `rawSniff` は「ファイル自身がカメラのものだと言っているか」だけに答える:
+
+- 自前の署名を持つ器 —— CR3 (`ftypcrx`)、ORF (`IIRO`/`IIRS`/`MMOR`)、
+  RW2 (`IIU\0`)、RAF (`FUJIFILM`)、X3F (`FOVb`)、MRW (`\0MRM`)、CR2 (`CR` @8)
+- 素の TIFF —— **IFD0 に DNGVersion (50706) がある**、または
+  **Make (271) がカメラメーカ名で、かつ SubIFDs (330) がある**
+
+**両方を要求するのが要点**である。`cameramade.tif` (16bit グレー + `Make =
+"NIKON CORPORATION"`、SubIFD 無し) は TIFF リーダに届かなければならない ——
+そしてこれは机上の心配ではない: **LibRaw はその TIFF を喜んで「Bayer」として開く**
+(実測)。門が無ければ、測定用 16bit TIFF が推測パターンのモザイクとして開いていた。
+M34 がこの1件を守っている。
+
+`.raw` は**取らない**。あれはこの viewer 自身のヘッダ無しダイアログのもので、
+形も深度も人が宣言する —— ヘッダの無いファイルについてライブラリが
+「自分のほうが知っている」と言う場所ではない。
+
+#### ビルド — 4分の1だけコンパイルする
+
+LibRaw に CMakeLists は**無い** (`README.cmake`: 2014年に公式サポート終了)。
+なのでソースを直に並べる —— imgui と miniz にこの木がやっているのと同じこと。
+
+**そのうえで `src/demosaic` `src/postprocessing` `src/preprocessing` `src/write`
+を落とし、`*_ph.cpp` プレースホルダのほうを採る。** これは思いつきではなく
+**上流自身の `Makefile.devel.noppr2i` 構成**で、`*_ph.cpp` はまさにそのために
+存在する。効果は秒数より大きい:
+
+- `dcraw_process()` も全デモザイクも **`subtract_black()` も binary に無い**。
+  「デモザイクしない・宣言された黒を引かない」が**呼ばない約束**から
+  **リンクされていない事実**になる
+- LibRaw 内の第三者コード (DCB / FBDD demosaic、BSD 系) を**配布しない**ので
+  THIRD-PARTY-NOTICES が正しくあるべき対象が1つ減る
+- 素直に `src/**.cpp` を glob すると `*_ph.cpp` が実体版と**同じシンボル**を
+  定義して multiple definition で落ちる (実測4件)。プレースホルダ側を採るのは
+  その罠の裏返しであり、上流が支持している側でもある
+
+`LIBRAW_NOTHREADS` は**定義しない**。あれは `decoders_dcraw.cpp` のビット読みと
+`sony_decrypt()` の pad を関数内 static にする —— この viewer はフォルダの
+フレームを sequence loader のスレッドで復号しながら UI スレッドで別のファイルを
+開けるので、インスタンス毎 TLS の側が正しい。Windows では `ws2_32` が要る
+(メタデータパーサの `ntohl`/`htons`。この repo が初めてリンクするソケットライブラリ)。
+
+#### 実測コスト
+
+MinGW/GCC 16.1 UCRT、Ninja、Release、20 論理コア。**A/B/A/B/A/B と交互に、
+連続して 3 ペア**の clean cold build を測った (依存の取得時間は含まない ——
+両側とも同じローカルソースを使う)。**1 ペアでは足りなかった**: 別作業と並行して
+測った最初のペアは「増分なし」に見え、機械を空けて測り直したら +100 s 前後だった。
+中央値と幅で読むこと。
+
+| | なし (main 4a41302) | あり | 差 |
+|---|---|---|---|
+| configure | 9–10 s | 9–10 s | **0** |
+| **build (中央値)** | **307 s** (290 / 316 / 307) | **401 s** (405 / 391 / 401) | **+94 s (+31%)** |
+| `libraw_lib.a` (63 TU) | — | **1,320,272 B** | 単独 cold build 61.9 s (中央値、3回) |
+| `viewer.exe` | 12,506,742 B | **13,434,806 B** | **+928,064 B (+0.885 MiB、+7.4%)** |
+| `viewer-serve.exe` | 3,357,701 B | 3,357,701 B | **0 —— md5 まで同一** |
+
+同調査 §4.2 の予測 (+11.8 s / +0.95 MiB) との対応:
+
+- **バイナリは +0.885 MiB で、予測より小さい** —— demosaic と postprocessing を
+  落としたぶん。EXR の **+3.01 MiB の 3分の1以下**である。
+- **ビルド時間は予測の 8 倍**。予測は `libraw_lib` を**単体で**建てた 11.8 s で、
+  ここで測ったのは**すでに 20 コアを飽和させている cold build に足したときの
+  壁時計**である。63 TU (`crx.cpp` / `identify.cpp` / `cameralist.cpp` はどれも
+  大きい) が既存の臨界路と席を奪い合うので、単体の秒数はそのまま足せない。
+  **単体で測ると誤って安く見える**、というのがこの差の中身である。
+
+`viewer.exe` は clean build と incremental build で **md5 が一致**した
+(`-Wl,--no-insert-timestamp` の効果) ので、上のサイズは 1 回の偶然ではない。
+
+`viewer-serve` に載せないことは 1つの事実が保証している: あれは
+`core/imagefile.cpp` をコンパイルしない。上の byte 同一がその証拠で、
+Ubuntu 20.04 コンテナの手書き `g++` 1行も無傷である。
+
+#### fixture — 合成 DNG。そして合成できないもの
+
+`tools/gen_testdata.py` が `media/sensor_*.dng` を書く。**DNG はカメラ無しで
+書ける唯一のベンダ RAW** で、CFA パターン・ブラック・ホワイト・深度を
+NEF や CR3 と**同じタグ**で宣言する。だから「宣言した数が document に届くか」は
+リポジトリの中で完結して検証できる (M29-M34)。
+
+**合成できないのはベンダの伸張器**である。Canon のウェーブレット、Nikon の
+Huffman、Sony のデルタ、Panasonic の圧縮 —— これらは LibRaw のもので、
+CI では 1バイトも通らない。**そこは手で確かめた**。この PR で実際に開いた
+実機ファイル (すべて [raw.pixls.us](https://raw.pixls.us/) の CC0 データセット、
+**リポジトリには入れない**):
+
+| ファイル | 実測されたもの |
+|---|---|
+| `Nikon/1 AW1/_DSC0521.NEF` (12,781,061 B) | 4620x3082、RGGB、12bit、**black 0 / 画素 80..306** |
+| `Sony/DSC-HX95/DSC00018.ARW` (19,579,648 B) | 4928x3708、RGGB、14bit、black 800 |
+| `Olympus/E-M1MarkIII/_3160529.ORF` (63,433,262 B) | 10388x7792、RGGB、12bit、black 256 |
+| `Canon/EOS R5/Canon_EOS_R5_RAW_ISO_100_crop_dual.CR3` (30,435,672 B) | 5087x3391 を 5248x3510 から、black 511 + 面別、**2 shot と申告** |
+| Panasonic DC-GH5S `.RW2` (14,750,208 B) | 2776x2768、RGGB、14bit、black 511 |
+
+clean clone がこれを再現する手順:
+
+```sh
+curl -L -o aw1.NEF "https://raw.pixls.us/data/Nikon/1%20AW1/_DSC0521.NEF"
+# 以下同様。curl -L は必須 (/data/... は /download/data/... へ 301)
+```
+
+#### この PR が**やっていない**こと (切り口)
+
+- **EXIF を `meta` に載せない。** LibRaw は shutter / ISO / aperture / focal /
+  timestamp を追加ライブラリ 0 で出すが、`ImageDoc` に `meta` はまだ無い。
+  そして 同調査 §9.1 の実測 ——
+  **Olympus は aperture 0 / focal 0 を返す** —— のとおり、欠測が 0 として来る。
+  正典の「読めなければ**未設定**、0 ではない」に従い、**EXIF から series を
+  自動生成することは今後もしない**。載せるとしても `meta` へ、人が確定する提案として
+- **マスク境界 (光学黒) を渡さない** (上記の理由)
+- **表示レンジは dtype 由来のまま** (u16 → 0..65535)。14bit の RAW は暗く開く。
+  ファイルが言うホワイトレベルを初期レンジにするのは筋が良いが、
+  `defaultRange()` は dtype しか見ておらず、そこを変えるのは別件
+- **圧縮方式で振る舞いを変えない** (2026-08-03 のユーザー裁定、
+  同調査 §4.8)。可逆でも非可逆でも開いて `dn`
 
 ---
 

@@ -175,6 +175,83 @@ else()
   unset(_exr_excl)
 endif()
 
+# ---- LibRaw (vendor RAW) -----------------------------------------------------
+# The third block to read beside the two above, because it comes out a third
+# way: the library is not optional, it has no CMake at all, and only a QUARTER
+# of it is compiled.
+#
+# WHY A LIBRARY. Same rule as .exr, applied to a format that does not shrink
+# when you refuse things: "vendor RAW" is thirty makers' compression schemes,
+# and Canon's alone is an inverse wavelet transform. There is no small honest
+# reader here the way there is for TIFF (core/rawread.h).
+#
+# WHY IT IS NOT FETCHED AS A CMAKE PROJECT. LibRaw ships no CMakeLists.txt;
+# README.cmake says cmake has not been officially supported since 2014 and
+# points at a separate, unofficial repository. So its sources are compiled
+# straight into a target of ours - which is what this tree already does for
+# imgui (above) and miniz - and SOURCE_SUBDIR does-not-exist suppresses the
+# add_subdirectory the way the miniz and pfd blocks do.
+#
+# WHICH SOURCES, AND WHY IT IS THE INTERESTING PART. This does NOT compile
+# src/demosaic, src/postprocessing, src/preprocessing or src/write. That is not
+# a saving anyone invented here: it is upstream's own Makefile.devel.noppr2i
+# variant, and the *_ph.cpp placeholders that replace them exist to make it
+# buildable. What it buys is worth more than the seconds:
+#
+#   * dcraw_process(), dcraw_make_mem_image(), every demosaic and
+#     subtract_black() are NOT IN THE BINARY. The rule that this viewer never
+#     demosaics and never subtracts a declared black level stops being a rule
+#     about which function we call and becomes a fact about what was linked.
+#   * the DCB / FBDD demosaic code (third-party inside LibRaw, its own BSD-like
+#     licence) is not distributed at all, so THIRD-PARTY-NOTICES.md has one
+#     fewer thing to be right about.
+#   * a naive glob of src/**.cpp does not link: the *_ph.cpp placeholders define
+#     the SAME symbols as the real files (measured: 4 "multiple definition"
+#     errors). Taking the placeholders and dropping their counterparts is the
+#     other way out of that, and it is the one upstream supports.
+#
+# LIBRAW_NOTHREADS is deliberately NOT defined. It turns the bit-reader state
+# in decoders_dcraw.cpp and sony_decrypt()'s pad into function-local statics
+# shared by every thread; this viewer decodes a folder's frames on the sequence
+# loader's thread while the UI thread can be opening another file, so the
+# per-instance TLS form is the one that is correct here.
+#
+# OFFLINE: the standard override, like every other dependency here -
+#     -DFETCHCONTENT_SOURCE_DIR_LIBRAW=<LibRaw source tree>
+FetchContent_Declare(libraw
+  URL https://github.com/LibRaw/LibRaw/archive/refs/tags/0.22.2.zip
+  SOURCE_SUBDIR does-not-exist)
+FetchContent_MakeAvailable(libraw)
+
+file(GLOB_RECURSE LIBRAW_SRC ${libraw_SOURCE_DIR}/src/*.cpp)
+set(LIBRAW_KEEP "")
+foreach(f IN LISTS LIBRAW_SRC)
+  if(f MATCHES "/src/demosaic/")
+    continue()                                   # never called; never shipped
+  elseif(f MATCHES "/src/libraw_c_api\.cpp$")
+    continue()                                   # the C wrapper; this build is C++
+  elseif(f MATCHES "/src/(postprocessing|preprocessing|write)/")
+    if(NOT f MATCHES "_ph\.cpp$")
+      continue()                                 # the placeholder is the one kept
+    endif()
+  endif()
+  list(APPEND LIBRAW_KEEP ${f})
+endforeach()
+add_library(libraw_lib STATIC ${LIBRAW_KEEP})
+target_include_directories(libraw_lib PUBLIC ${libraw_SOURCE_DIR})
+target_compile_definitions(libraw_lib PUBLIC LIBRAW_NODLL)   # static, no dllimport
+# third-party: do not police its warnings, the same stance miniz and stb take.
+# core/rawread.cpp is OURS and stays under -Wall -Wextra.
+target_compile_options(libraw_lib PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/w>)
+if(WIN32)
+  # LibRaw's metadata parsers byte-swap with ntohl/htons, which on Windows live
+  # in winsock rather than in libc: 12 undefined references without this. It is
+  # the first socket library this project has ever linked, so it is named here
+  # rather than left to be discovered from a link error.
+  target_link_libraries(libraw_lib PUBLIC ws2_32)
+endif()
+
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -209,6 +286,7 @@ add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
                       core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
+                      core/rawread.cpp
                       core/y4mread.cpp core/stb_image_impl.c
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
@@ -235,7 +313,7 @@ set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
 # wrapper around it (core/imagefile.cpp) is OURS and stays under -Wall -Wextra.
 set_source_files_properties(core/stb_image_impl.c PROPERTIES
                             COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>;$<$<C_COMPILER_ID:MSVC>:/w>")
-target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads)
+target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads libraw_lib)
 # where the server pulls its own peer binary from (binaries branch)
 set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
