@@ -849,7 +849,7 @@ viewer [options] [files...]
 | 症状 | 原因と対処 |
 |---|---|
 | ターミナルで `cmake` が見つからない | インストール後に開いたままのターミナル/VSCode は**古い PATH を保持**している。VSCode を完全終了して再起動(タスクバー常駐も終了) |
-| configure が `SSL peer certificate ... was not OK` (status_code 60) で失敗 | MinGW/WinLibs 同梱の CMake は CA ストアを持たず、FetchContent の GitHub ダウンロードが検証エラーになる。**CA バンドルを指定**する:<br>`cmake -S . -B build -DCMAKE_TLS_CAINFO="C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"`<br>環境変数 `CMAKE_TLS_CAINFO` に同じ値を設定すれば以後不要(`CMAKE_TLS_VERIFY=0` での回避は非推奨) |
+| configure が `SSL peer certificate ... was not OK` (status_code 60) で失敗 | MinGW/WinLibs 同梱の CMake は CA ストアを持たず、FetchContent の GitHub ダウンロードが検証エラーになる。**CA バンドルを指定**する:<br>`cmake -S . -B build -DCMAKE_TLS_CAINFO="C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"`<br>**環境変数 `CMAKE_TLS_CAINFO` は効かない** —— 現行の CMake は FetchContent のサブビルドに伝播しないので、`-D` の形で毎回渡すか、キャッシュに残る build ディレクトリを使い回すこと(`CMAKE_TLS_VERIFY=0` での回避は非推奨) |
 | MinGW でのビルド例 | `cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release` → `cmake --build build-mingw` → `.\build-mingw\viewer.exe`(MSVC は必須ではない) |
 
 #### ビルドとネットワーク —— オフラインの clean clone について
