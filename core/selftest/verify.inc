@@ -1587,11 +1587,12 @@
                 { "a_hw.npy",   { 8, 8 },       1, 8, 8, 1 },   // (H,W)
                 // "a_mono"/"a_uv" and not "a_hw1"/"a_hw2": a_hw1..a_hw4 would be
                 // four NUMBERED SIBLINGS, and the sequence loader groups those
-                // into one stack - of four different shapes, which it then reads
-                // through the first member's geometry. This test is about the
-                // shape rule, and it must not manufacture a second subject by
-                // accident. (That the grouper mis-reads a mixed-shape run at all
-                // is its own defect, and not this change's to fix.)
+                // into one stack. It no longer STACKS four different shapes -
+                // a sibling that is not the reference frame's shape is refused
+                // by name now, and --picker-selftest UC7 is where that is
+                // asserted - but the names would still manufacture a second
+                // subject here (a stack, its refusals, and a load to wait for)
+                // in a test that is about the shape rule alone.
                 { "a_mono.npy", { 8, 8, 1 },    1, 8, 8, 1 },   // (H,W,1)  ONE mono frame
                 { "a_uv.npy",   { 8, 8, 2 },    1, 8, 8, 2 },   // (H,W,2)  ONE 2ch frame
                 { "a_hw3.npy",  { 8, 8, 3 },    1, 8, 8, 3 },   // (H,W,3)  colour

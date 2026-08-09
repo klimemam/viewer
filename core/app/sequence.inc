@@ -300,6 +300,13 @@ static void stopSequenceLoader() {
     app.seqReady.clear();
 }
 
+// "8x8 1ch" - the same three numbers, in the same order, that every stack line
+// already prints ("%dx%d %dch"), so a refusal and the log above it describe a
+// frame the same way.
+static std::string frameShapeText(int w, int h, int ch) {
+    return std::to_string(w) + "x" + std::to_string(h) + " " + std::to_string(ch) + "ch";
+}
+
 // Spawn the worker. The thread only decodes (no app state, no GL) and pushes
 // finished frames into seqReady; the UI thread integrates them in pumpSequence().
 static void startSequenceLoad(int imageIdx, const std::vector<std::string>& files,
@@ -366,8 +373,23 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             (int)files.size(), isRaw ? "raw recipe" : isPicture ? "picture file" : "npy");
     const size_t startBytes = residentImageBytes();
     const size_t budget = seqMemBudget();
-    const std::string refNote = ref->note;   // same recipe/shape as every sibling
-    app.seqThread = std::thread([jobs, isRaw, isPicture, recipe, startBytes, budget, refNote]() {
+    const std::string refNote = ref->note;   // the reference frame's recipe, which
+                                             // every frame that JOINS this stack
+                                             // shares - see refW/refH/refCh below,
+                                             // which is where "shares" stopped
+                                             // being an assumption
+    // docs/terminology.md: a stack is frames "同一条件で撮られた" with a time
+    // axis, and sigma_t / FPN / the per-frame table are only quantities if every
+    // frame is the same picture measured again. The grouper works on NAMES - it
+    // has to, because .raw and .bin declare nothing and peeking every header of
+    // a 300-file run would be a scan that reads the folder twice - so the shapes
+    // are not known until the frames are decoded, and THIS is where they first
+    // are. A sibling that is not this shape is refused by name, exactly as a
+    // multi-page TIFF refuses a page that is not page 1's shape (core/tiffread.cpp).
+    const int refW = ref->w, refH = ref->h, refCh = ref->ch;
+    const std::string refName = baseName(ref->src->path);
+    app.seqThread = std::thread([jobs, isRaw, isPicture, recipe, startBytes, budget, refNote,
+                                 refW, refH, refCh, refName]() {
         size_t bytes = startBytes;
         int failures = 0;
         double lastPost = 0;
@@ -424,6 +446,18 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                 } else {
                     doc = decodeNpy(j.path, err);
                 }
+            }
+            // ...and here it is: the shape the file turned out to hold, against
+            // the shape this stack IS. Turned into an ordinary decode failure
+            // rather than a special case, so it travels the one path that already
+            // says "n of N" - a stack that quietly took four different pictures
+            // is worse than one that says which file it left out and why.
+            if (doc && (doc->w != refW || doc->h != refH || doc->ch != refCh)) {
+                err = frameShapeText(doc->w, doc->h, doc->ch) + " and " + refName + " is " +
+                      frameShapeText(refW, refH, refCh) +
+                      ": a run of numbered files is a stack, and a stack's frames are "
+                      "one shape - open it on its own";
+                doc.reset();
             }
             if (!doc) {
                 if (++failures <= 3) {
