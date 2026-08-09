@@ -3,6 +3,13 @@
     // the server aggregate for a stack NOBODY OPENED must land in the Temporal
     // panel as a detached [not opened] result and match an independent local
     // computation to full float64 precision.
+    //
+    // ...and then P1/P2 (#57 item 3): the SAME stack measured the other way -
+    // opened, through the Temporal panel's own recomputeTemporalIfNeeded - must
+    // give the same sigma_t. "local" and "server" are a transport; sigma_t is
+    // one quantity, named once in docs/terminology.md and printed under one
+    // label on screen. Nothing in this file compared the two sides to each
+    // other before, which is how a ddof=0 / ddof=1 split lived here.
     if (!g_rtemporalSelftest.empty()) {
         std::string dir = g_rtemporalSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
@@ -101,6 +108,55 @@
                 fprintf(stderr, "rtemporalselftest: FAILED - mismatch vs reference\n");
                 ok = false;
             }
+        }
+        // ---- P1/P2: local vs peer, one stack, one number ---------------------
+        // Deliberately LAST: "no image is open" above is a real assertion about
+        // the detached result, and it has to be made before anything opens the
+        // stack. The peer's numbers are copied out first for the same reason -
+        // app.srvTemporal is a single slot and this test is done reading it.
+        const double srvSigT = S.tempNoise[0], srvFpn = S.fixedPattern[0];
+        const int srvFrames = S.frames;
+        if (ok) {
+            auto chk = [&](bool cond, const char* what) {
+                fprintf(stderr, "rtemporalselftest: %-58s %s\n", what, cond ? "PASS" : "FAIL");
+                if (!cond) ok = false;
+            };
+            app.seqLoadMode = 1;                  // one stack, no picker to answer
+            openFolder(dir);
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
+                if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    !app.folderPickOpen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            app.selectedAnn = 0;                  // whole frame: the peer sends no ROI
+            recomputeTemporalIfNeeded(cur(), app.temporal[0]);
+            const App::TemporalState& T = app.temporal[0];
+            const double ddofRatio = T.frames > 1
+                ? sqrt((double)T.frames / (double)(T.frames - 1)) : 0.0;
+            fprintf(stderr, "rtemporalselftest: P1 same stack both ways: local %d frame(s)/"
+                            "%d plane(s) vs peer %d frame(s); sigma_t %.12g vs %.12g "
+                            "(rel %.3g); sigma_fpn %.12g vs %.12g (rel %.3g). "
+                            "sqrt(N/(N-1)) at N=%d is %.9g - a mismatch of exactly that "
+                            "is the ddof split, not a rounding difference\n",
+                    T.frames, T.nPl, srvFrames,
+                    T.tempNoise[0], srvSigT, rel(T.tempNoise[0], srvSigT),
+                    T.fixedPattern[0], srvFpn, rel(T.fixedPattern[0], srvFpn),
+                    T.frames, ddofRatio);
+            chk(T.valid && T.nPl == 1 && T.frames == srvFrames &&
+                T.frames == (int)files.size(),
+                "P1 fixture: the opened stack is the one the peer measured");
+            // 1e-9 relative, the tolerance this file already uses against its
+            // own float64 reference: the two sides run the SAME formula over
+            // the same f32 pixels in the same order, so anything a human would
+            // call a difference is orders of magnitude above this.
+            chk(rel(T.tempNoise[0], srvSigT) <= 1e-9,
+                "P1 local and peer report the SAME sigma_t for one stack");
+            chk(rel(T.fixedPattern[0], srvFpn) <= 1e-9,
+                "P2 ...and the same sigma_fpn, which the ddof split never touched");
+            closeAll();
         }
         fprintf(stderr, "rtemporalselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();

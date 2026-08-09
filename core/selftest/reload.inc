@@ -152,7 +152,13 @@
             fprintf(stderr, "reloadselftest: R1 sigma_t=%.4f slot=%.4f hist mean=%.2f "
                             "fit=%s rows=%d\n", sig0, sigX0, hMean0,
                     app.lin.fitValid ? "ok" : "none", (int)app.lin.rows.size());
-            check(fabsf(sig0 - 1.41421f) < 0.01f && sigX0 == sig0 &&
+            // 1.58114, not the 1.41421 that stood here until #57 item 3. Stack
+            // a is five FLAT frames whose pixels are 0,1,2,3,4, so every pixel's
+            // population is exactly that: mean 2, sum of squared deviations
+            // 4+1+0+1+4 = 10. sqrt(10/5) = 1.414214 was ddof=0; sqrt(10/4) =
+            // 1.581139 is the ddof=1 the peer and computeStackStats always used.
+            // Ratio sqrt(5/4) = 1.118034, as it must be for a pure ddof move.
+            check(fabsf(sig0 - 1.58114f) < 0.01f && sigX0 == sig0 &&
                   fabs(hMean0 - 2.0) < 1e-4 && app.proj[0].uid == a2->uid &&
                   app.lin.fitValid && app.lin.rows.size() == 2,
                   "R1 pre: sigma_t / hist / proj / fit over the old pixels");
@@ -204,12 +210,18 @@
             float sigX1 = (float)app.temporalExtra[0].tempNoise[0];
             fprintf(stderr, "reloadselftest: R7 sigma_t pre=%.4f post=%.4f slot post=%.4f "
                             "(frame count and ROI unchanged)\n", sig0, sig1, sigX1);
-            check(fabsf(sig1 - 79.2126f) < 0.5f,
+            // 88.5624, not the 79.2126 that stood here until #57 item 3. a_002
+            // was rewritten from 2 to 200, so each pixel's five values are
+            // 0,1,200,3,4: mean 41.6, sum of squared deviations 31373.2.
+            // sqrt(31373.2/5) = 79.212625 was ddof=0; sqrt(31373.2/4) = 88.562407
+            // is ddof=1. Ratio sqrt(5/4) = 1.118034 again - the same factor as
+            // R1, which is the evidence that the reload walk itself did not move.
+            check(fabsf(sig1 - 88.5624f) < 0.5f,
                   "R7a A-slot sigma_t recomputed after the reload");
             // the hole (§3.2): same seqId, same frame count, same ROI, same CFA -
             // only SeqInfo::stackRev in the key can tell this cache its numbers
             // describe pixels that no longer exist
-            check(fabsf(sigX1 - 79.2126f) < 0.5f,
+            check(fabsf(sigX1 - 88.5624f) < 0.5f,
                   "R7b slot sigma_t is NOT the stale pre-reload value");
         }
         {   // ---- R8: stackRev ALONE unlatches the key (permanent mechanism
@@ -516,11 +528,24 @@
                             "sigma_t %.5f -> %.5f (5 frames -> the 4 that still "
                             "have the stack's shape)\n",
                     srK, seqK ? seqInfo(seqK)->stackRev : -1, sigAll, T.tempNoise[0]);
-            check(k0 && k2 && cropped && fabs(sigAll - 1.41421) < 0.001,
+            // Both numbers moved with #57 item 3, and they moved by DIFFERENT
+            // factors because the frame count is what changed here:
+            //   pre-crop  5 flat frames 100..104: deviations 4+1+0+1+4 = 10.
+            //             sqrt(10/5) = 1.414214 (ddof=0) -> sqrt(10/4) = 1.581139
+            //   post-crop the 4 that still have the stack's shape, 100,101,103,104:
+            //             deviations 4+1+1+4 = 10. sqrt(10/4) = 1.581139 (ddof=0)
+            //             -> sqrt(10/3) = 1.825742
+            // BEWARE the coincidence this creates: 1.581139 was the post-crop
+            // answer under ddof=0 and is the pre-crop answer under ddof=1. That
+            // is arithmetic, not a copied number - the two populations really do
+            // have the same sum of squared deviations and differ only in their
+            // divisor. R24c still says what it says: 1.825742 != 1.581139, so a
+            // cache that handed back the pre-crop value would still fail here.
+            check(k0 && k2 && cropped && fabs(sigAll - 1.58114) < 0.001,
                   "R24a fixture: five flat frames, one member cropped");
             check(seqK && seqInfo(seqK)->stackRev == srK + 1,
                   "R24b a crop bumps the stack's data revision");
-            check(fabs(T.tempNoise[0] - 1.58114) < 0.001,
+            check(fabs(T.tempNoise[0] - 1.82574) < 0.001,
                   "R24c sigma_t is NOT the stale pre-crop five-frame value");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);

@@ -717,7 +717,13 @@ static std::string buildTemporalExport(char delim) {
                       expNum(s.t.sigT[p]), expNum(s.t.sigS[p]), expNum(s.t.sigTot[p]),
                       src });
     }
-    doc.comment("sigma_t = sqrt(mean per-pixel temporal variance); sigma_fpn = "
+    // The estimator is named because this table mixes local and server rows in
+    // one column (`src`), and until #57 item 3 the two sides used different
+    // ddof - a reader comparing a local row with a server row was comparing two
+    // quantities under one heading. They are one quantity now, so the sentence
+    // that says which one belongs here.
+    doc.comment("sigma_t = sqrt(mean per-pixel temporal variance, ddof=1 - the "
+                "same estimator local and server); sigma_fpn = "
                 "spatial sigma of the per-pixel temporal means (includes scene "
                 "detail unless the region is flat; no sigma_t^2/N subtraction); "
                 "sigma_tot = quadrature sum");

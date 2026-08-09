@@ -144,8 +144,18 @@
             double tvar[4] = {};
             size_t n[4] = {};
             for (size_t k = 0; k < offs.size(); k++) {
-                double m = s1[k] / used, v = s2[k] / used - m * m;
-                tvar[plane[k]] += v > 0 ? v : 0;
+                double m = s1[k] / used;
+                // ddof=1 (#57 item 3). This reference divided by `used` while
+                // serve.cpp divided by used-1, so it agreed with the panel only
+                // because the PANEL was the side that was wrong - two copies of
+                // one mistake reading as a confirmation. The number this
+                // reference exists to check is defined once, in
+                // docs/stats-taxonomy.md, and the definition is the unbiased
+                // one; the whole point of computing it here rather than calling
+                // the panel's code is that it is written from the DEFINITION.
+                double v = std::max(0.0, s2[k] / used - m * m) *
+                           ((double)used / (double)(used - 1));
+                tvar[plane[k]] += v;
                 n[plane[k]]++;
             }
             for (int p = 0; p < R.nPl; p++)
