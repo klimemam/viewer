@@ -521,6 +521,8 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 #include "selftest/stackana.inc"
 
+#include "selftest/rplugin.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -546,6 +548,12 @@ int main(int argc, char** argv) {
         for (int i = 1; i + 1 < argc; i++)
             if (!strcmp(argv[i], "--remote-selftest"))
                 return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
+        // ...and the same for ABI v3 §10: it starts a peer of its own and must
+        // reach the standalone one for the identical reason - a client talking
+        // to itself cannot tell "the peer has that plugin" from "I do".
+        for (int i = 1; i + 1 < argc; i++)
+            if (!strcmp(argv[i], "--rplugin-selftest"))
+                return rpluginSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
     }
     // Asked before prefs are read and before an autosave slot is claimed: a
     // question ABOUT the machine must not alter the machine it is asking about.

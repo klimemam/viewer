@@ -301,7 +301,7 @@ viewer ssh://user@host/data/run42
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 5`、[core/remote_proto.h](../core/remote_proto.h))の状態。
+現時点(プロトコル `VERSION = 7`、[core/remote_proto.h](../core/remote_proto.h))の状態。
 **残っている制限だけ**を書く節です。済んだものを「これから」の顔で残さないこと —
 この節は一度それで嘘をつきました。
 
@@ -311,6 +311,7 @@ viewer ssh://user@host/data/run42
 | **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
 | **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む。ローカルの loader は元から Fortran を読めたので、リンク越しだけ拒否するのは不整合だった([docs/startup.md](startup.md) の「まだ出来ないこと」もそう言っている) |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
+| **`MOP_PLUGIN_ANALYZE`** | **実装済み**([docs/abi-v3.md](abi-v3.md) §10、`VERSION = 7`)。プラグインの **name + version が等値** のときだけ peer で走る。不一致は**両方の版を並べて拒否**し、黙って手元実行に振り替えない。frame / stack の両方に届き、stack は peer が1枚ずつ読んで `release_frame` で区画を返す(§9.2 の窓)。返答は peer 自身の帳簿(name / version / dll / フルパス)を provenance として運ぶ。version を宣言しない V1/V2 記述子は**照合できないので拒否**され、名前だけで一致する従来の `MOP_ANALYZER` に残る。`VIEWER_SERVE_PLUGINS` で peer のプラグイン探索先を足せる |
 | **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
 | **`ssh://` の CLI 配線** | **配線済み**。`openPath` が `ssh://` と `local://` を受け、`viewer ssh://host/path.npy`(ファイル)と `viewer ssh://host/~/dir`(接続してそこを Browse)の両方が起動パス。`--help` にも出る |
 | **LIST のファイルサイズ** | 64 bit。u32 の lo/hi 2 本で送る(`serve.cpp`、`remote_proto.h` の mtime と同じ形) |

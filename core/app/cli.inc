@@ -491,7 +491,10 @@ static void printUsage() {
         "                              overrides the canned action list)\n"
         "  --rtemporal-selftest <dir>  temporal analysis driven from the browser\n"
         "  --remote-selftest <file>    remote round trip against a peer started here;\n"
-        "                              pass --remote-exe to test viewer-serve itself\n",
+        "                              pass --remote-exe to test viewer-serve itself\n"
+        "  --rplugin-selftest <file>   plugin analysis on the peer (ABI v3 §10):\n"
+        "                              name+version parity, its refusals, and the\n"
+        "                              stack mouth pulled over the link\n",
         NPY_NATIVE_FORMS);
 }
 
@@ -663,6 +666,8 @@ static void parseCli(int argc, char** argv) {
             g_mediaSelftest = next();              // handled in main()
         } else if (a == "--remote-selftest") {
             next();
+        } else if (a == "--rplugin-selftest") {
+            next();                                // handled before startup, in main()
         } else if (a == "--remote-policy") {        // auto | local-fetch
             std::string v = next();
             if (v == "auto") app.procPolicy = App::PolAuto;

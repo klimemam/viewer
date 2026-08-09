@@ -968,6 +968,23 @@ viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
                             --remote-exe $<TARGET_FILE:viewer-serve>)
 
+# Plugin analysis over the link (ABI v3 §10): name+version parity, the refusals
+# that parity produces, and the stack mouth pulled frame by frame on the peer.
+# Same NOGL and same standalone-peer reasoning as selftest.remote above.
+#
+# The two ENV lines are what make it a test rather than a demonstration.
+# VIEWER_SERVE_PLUGINS points the PEER at the ABI fixture directory - a compute
+# node's plugins are not beside its binary, and the fixtures are deliberately
+# not shipped. VIEWER_SERVE_PIN_BUDGET_MB=1 is the arithmetic: bench_stack's
+# frames are 0.3125 MB, so the eight the test asks for cannot be resident at
+# once inside 1 MB, and the run only succeeds because the fixture releases each
+# frame and the peer's window really recycles the slot (docs/abi-v3.md §9.2).
+viewer_selftest(rplugin NOGL
+                ENV VIEWER_SERVE_PLUGINS=${VIEWER_ABITEST_PLUGIN_DIR}
+                ENV VIEWER_SERVE_PIN_BUDGET_MB=1
+                --rplugin-selftest tools/testdata/bench_stack.npy
+                --remote-exe $<TARGET_FILE:viewer-serve>)
+
 # The same A/B statistics run over a MOSAICED stack: --cfa bayer makes every
 # 1-channel frame a Bayer frame, which is the case where the panels' rule "CFA
 # planes are never mixed in a statistic" (docs/terminology.md) is load-bearing.
