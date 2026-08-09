@@ -904,6 +904,14 @@ viewer_selftest(anaprov     NOGL --anaprov-selftest)
 # decided. Registered here rather than folded into anaprov because a failure
 # should name the mouth it is about.
 viewer_selftest(stackana    NOGL --stackana-selftest)
+# The V3 migration of the five SHIPPED analyzers (docs/abi-v3.md §1). Same NOGL
+# and same in-memory reasoning as anaprov, and it deliberately loads NO fixture
+# directory: its subject is what a user actually gets from build/plugins, and a
+# twin standing in for one of them would prove something about the twin. Its own
+# test rather than a section of anaprov because its second claim - that no
+# result moved - is asserted by DIFFING its stdout across two commits, and a
+# failure of the first claim should not silence that output.
+viewer_selftest(bundled     NOGL --bundled-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 # #111. Pointed at media/ and not at rb/ on purpose: rb/ is where the picture
