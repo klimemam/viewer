@@ -45,7 +45,17 @@
 // one file, every result label is built from this table, and
 // --setanalysis-selftest scans the shipping sources to hold that true. Adding a
 // famous name anywhere else is a failing test, not a review comment.
-enum SetAnalyzerKind { SA_DSNU = 0, SA_PRNU = 1, SA_COUNT = 2 };
+enum SetAnalyzerKind {
+    SA_DSNU = 0, SA_PRNU = 1,     // the DIRECT pair, over Stack() roles (判断4)
+    SA_SEP_DSNU = 2,              // the separation fit's two outputs, from ONE
+    SA_SEP_PRNU = 3,              // OLS over a Series() role (判断5)
+    SA_COUNT = 4
+};
+// The rows that take Stack() roles only and run per selected set. The
+// separation fit is not one of them: it folds every level of a sweep, so it
+// runs when it is asked to (the Series Analysis panel's Compute, for the same
+// reason that panel has one).
+static const int kSetDirectCount = 2;
 
 // Every Stack role of every row here demands 2 frames: the correction is made
 // of s_t, and one frame has no s_t (docs/flat-field-stats.md (b)).
@@ -68,6 +78,23 @@ static const SetAnalyzerDef kSetAnalyzers[SA_COUNT] = {
       "per-pixel subtraction: D = M_image - M_dark, "
       "100 * sqrt(max(0, var_spatial(D) - C_image - C_dark)) / mu, var at ddof=1 "
       "(NOT the variance-difference form, which is a different quantity)" },
+    // The SAME two bare names over a DIFFERENT estimator, which is exactly why
+    // docs/analysis-layers.md §7 makes the set tag carry the difference: the
+    // direct pair measures one lit stack against one dark, this pair separates
+    // the level-independent term from the level-proportional one by fitting
+    // several levels. A table that prints both without their tags is the thing
+    // §7 forbids.
+    { "sep_dsnu", "DSNU", "DN",
+      { "sweep", "dark" },
+      "separation fit: unweighted OLS of the corrected sigma_fpn^2 on mu^2 over "
+      "the sweep's levels; this row is sqrt(max(0, intercept)) - the term that "
+      "does NOT scale with the level" },
+    { "sep_prnu", "PRNU", "%",
+      { "sweep", "dark" },
+      "separation fit: the same unweighted OLS; this row is "
+      "100 * sqrt(max(0, slope)) - the term proportional to mu. The lit levels "
+      "are NOT dark-subtracted (that would take the intercept away, and the "
+      "intercept is the point); only mu is dark-corrected" },
 };
 
 // The detrend stage (docs/flat-field-stats.md 判断6/7) is not built. Skipping an
@@ -219,6 +246,34 @@ static std::string setRoleRefusal(const App::ASet& S, const char* role, int* seq
     return "";
 }
 
+// The same resolution for a role whose schema says Series() - the separation
+// fit's "sweep". Written as its own function rather than a flag on the one
+// above, because the two schemas refuse OPPOSITE things: a Stack() role refuses
+// a series, a Series() role refuses a stack, and a sentence that has to say
+// which way round it is reads worse than two that each say one thing.
+static std::string setSeriesRoleRefusal(const App::ASet& S, const char* role,
+                                        int* seriesIdOut) {
+    *seriesIdOut = 0;
+    const App::ASetRole* r = aSetRoleNamed(S, role);
+    const std::string q = std::string("\"") + role + "\"";
+    if (!r)
+        return "this set has no " + q + " role - a role binding is declared, "
+               "never inferred";
+    if (!r->bound())
+        return q + " is unbound - " +
+               (r->reason.empty() ? std::string("no reason recorded") : r->reason);
+    if (r->seqId != 0)
+        return q + " is bound to a stack - this analysis takes a Series() role: "
+                   "one stack is ONE level, and separating the additive term "
+                   "from the multiplicative one needs 3";
+    if (r->frameUid != 0)
+        return q + " is bound to a frame - this analysis takes a Series() role: "
+                   "one frame is ONE level, and separating the additive term "
+                   "from the multiplicative one needs 3";
+    *seriesIdOut = r->seriesId;
+    return "";
+}
+
 // ---- the results -------------------------------------------------------------
 struct SetResult {
     int kind = SA_DSNU;
@@ -237,6 +292,12 @@ struct SetResult {
     std::string cutoff = kSetCutoffRaw;
     std::string form;
     std::vector<SetRoleUse> used;
+    // ...and, for a row whose input is a SWEEP, the settled second half of the
+    // tag: "- sweep: <series>, M levels" (docs/flat-field-stats.md (c),
+    // docs/analysis-layers.md §7). levels == 0 = this row took no sweep, and
+    // the clause does not appear.
+    std::string sweep;
+    int levels = 0;
 };
 
 // The result's own name (canon invariant (a): "解析結果は自分の層と (set 解析
@@ -247,6 +308,11 @@ struct SetResult {
 // report.
 static std::string setResultTag(const SetResult& R) {
     std::string s = " - set \"" + R.setName + "\":";
+    // The sweep clause comes FIRST because it is what tells this row apart from
+    // the direct row of the same name: the number of levels is the estimator's
+    // own n, and a reader who sees "4 levels" is not looking at a single pair.
+    if (R.levels > 0)
+        s += " sweep \"" + R.sweep + "\" " + std::to_string(R.levels) + " levels,";
     for (size_t i = 0; i < R.used.size(); i++) {
         s += i ? "," : "";
         s += " " + R.used[i].role + " " + std::to_string(R.used[i].n) + "/" +
@@ -419,6 +485,139 @@ static SetResult runDirectPrnu(const App::ASet& S) {
     return R;
 }
 
+// The DIRECT pair only (kind < kSetDirectCount). The separation fit is one
+// computation with two named outputs, so it has its own entry point below and
+// is never run twice to print two rows.
 static SetResult runSetAnalyzer(const App::ASet& S, int kind) {
     return kind == SA_PRNU ? runDirectPrnu(S) : runDirectDsnu(S);
+}
+
+// ---- the separation fit: {"sweep": Series(), "dark": Stack()} (#57 判断5) ----
+//
+// docs/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09, #57).
+// One flat level cannot tell an additive fixed pattern from a multiplicative
+// one; several levels can, because the two enter the SAME measured quantity
+// differently:
+//
+//     sigma_fpn^2(mu) = DSNU^2 + (PRNU*mu)^2
+//
+// which is a STRAIGHT LINE in mu^2. So the estimator is a linear regression,
+// not a non-linear fit: intercept = DSNU^2, slope = PRNU^2.
+//
+//   - UNWEIGHTED OLS (判断5, settled). A weight needs a per-point variance
+//     estimate that is itself noisy, and with M a handful of points a wrong
+//     weight distorts more than it helps. What checks the model here is the
+//     RESIDUAL DISPLAY, which is why every level's residual is a field of the
+//     result rather than something the panel may or may not draw.
+//   - per plane, always. Colour shading is a real phenomenon and pooling R with
+//     B would report the mosaic as fixed pattern (docs/terminology.md).
+//   - each level's sigma_fpn,l^2 is the (b) CORRECTED estimator, and it is the
+//     one setPlaneFpn already computes for the direct rows - the selftest
+//     proves that by comparing a level's value to the DSNU of the same stack
+//     bit for bit, rather than to a tolerance.
+//   - the lit levels are NOT dark-subtracted. Subtracting the dark takes the
+//     additive term away, and the additive term IS the intercept; measuring it
+//     is the whole reason this fit exists.
+//   - mu IS dark-corrected: mu_l = mean(M_l) - mean(M_dark). Run on raw means,
+//     the (mu+c)^2 cross term breaks the model. Note what this needs of the
+//     dark: a per-plane SCALAR. Nothing subtracts pixel from pixel here, so
+//     unlike the direct PRNU this analysis has no reason to demand one shape -
+//     what it does demand is that plane p means the same thing on both sides.
+//   - M >= 3. Two points fit a line exactly, so M = 2 always looks perfect and
+//     the residuals cannot check anything.
+//   - STACK members only. A frame member has no s_t, so the -C correction
+//     cannot be taken off it, and a sum-standing member is n x the mean's
+//     scale (docs/analysis-layers.md §3.3). Both are excluded, and the counts
+//     are said out loud - a quiet exclusion is how a sweep silently becomes a
+//     different sweep.
+static const char* kSepModel = "sigma_fpn^2 = DSNU^2 + (PRNU*mu)^2";
+// The assumption the two-parameter model rides on, carried IN the result
+// (docs/flat-field-stats.md (c): "無相関を仮定していることを結果の note に
+// 明記する"). It lives in this file with the famous names it uses.
+static const char* kSepNote =
+    "the additive and the multiplicative fixed pattern are assumed "
+    "UNCORRELATED. Correlated (column amplifiers do correlate them) the true "
+    "form is DSNU^2 + 2*rho*DSNU*PRNU*mu + (PRNU*mu)^2, and a two-parameter fit "
+    "cannot see the cross term - it lands inside both coefficients. The "
+    "per-level residuals below are what checks the model.";
+static const char* kSepSweepWarn =
+    "sweep the LIGHT, not the exposure time: swept by time, dark current moves "
+    "the additive term itself, the intercept stops being a constant and the "
+    "separation means nothing. Nothing here can check which was swept - the "
+    "series says what it is.";
+
+struct SepLevel {
+    int seqId = 0;
+    std::string member, headPath;
+    double value = std::numeric_limits<double>::quiet_NaN();  // the series' own
+    int n = 0, N = 0;                    // frames aggregated of frames expected
+    uint64_t nonFinite = 0;
+    size_t dropped = 0;
+    double mu[4] = {};                   // mean(M_l) - mean(M_dark), per plane
+    double fpnVar[4] = {};               // sigma_fpn,l^2, CORRECTED (the fit's y)
+    double fpnVarRaw[4] = {};            // ...and what it reads without the -C
+    double corr[4] = {};                 // C_l, this level's own
+    bool clamped[4] = {};                // the -C took it below 0: declared
+    size_t samples[4] = {};
+    double fit[4] = {}, resid[4] = {};   // filled once the line is known
+};
+struct SepSkip { std::string member, why; };
+
+struct SepFit {
+    bool ok = false;
+    std::string refusal;
+    std::string setName, seriesName, paramName, unit;
+    int nPl = 1, cfa = 0, cfaPattern = 0;
+    int members = 0, M = 0;              // sweep members seen / levels fitted
+    int exFrame = 0, exSum = 0, exShort = 0, exNotInc = 0, exNoValue = 0, exGone = 0;
+    std::vector<SepSkip> skipped;        // every exclusion, named and reasoned
+    std::vector<SepLevel> levels;        // the ones that ENTERED the fit
+    bool planeFit[4] = {};
+    std::string planeWhy[4];
+    double slope[4] = {}, inter[4] = {}, r2[4] = {}, rms[4] = {};
+    double slopeRaw[4] = {}, interRaw[4] = {};   // the same OLS with no -C
+    SetResult dsnu, prnu;                // the two named outputs of ONE fit
+    std::string cutoff = kSetCutoffRaw;
+    std::string note = kSepNote, sweepWarn = kSepSweepWarn;
+};
+
+// The census, out loud. ONE function so the screen, the M < 3 refusal and the
+// selftest cannot describe the same exclusion differently.
+static std::string sepLevelCensus(const SepFit& F) {
+    std::string s = "levels: " + std::to_string(F.M) + " of " +
+                    std::to_string(F.members) + " sweep member(s) used";
+    std::vector<std::string> ex;
+    auto add = [&](int n, const char* why) {
+        if (n) ex.push_back(std::to_string(n) + " " + why);
+    };
+    add(F.exFrame,  "frame member(s) - no time axis, so no -sigma_t^2/N correction");
+    add(F.exSum,    "standing as sum - a sum is n x the mean's scale");
+    add(F.exShort,  "stack(s) with fewer than 2 frames loaded - same reason as a frame");
+    add(F.exNotInc, "not included");
+    add(F.exNoValue, "with no value set");
+    add(F.exGone,   "whose member is gone");
+    if (ex.empty()) return s;
+    s += " - excluded: ";
+    for (size_t i = 0; i < ex.size(); i++) s += (i ? ", " : "") + ex[i];
+    return s;
+}
+
+static SepFit runSeparationFit(const App::ASet& S) {
+    // NOT BUILT YET. The registry row, the role schema, the result vessel and
+    // the naming are here; the estimator is what the next commit adds. Every
+    // caller therefore gets the same one line, and every F* assert of
+    // --setanalysis-selftest is red.
+    SepFit F;
+    F.setName = S.name;
+    for (int i = 0; i < 2; i++) {
+        SetResult& R = i ? F.prnu : F.dsnu;
+        R.kind = i ? SA_SEP_PRNU : SA_SEP_DSNU;
+        R.setName = S.name;
+        R.form = kSetAnalyzers[R.kind].form;
+    }
+    F.refusal = "the separation fit is not built yet";
+    F.dsnu.refusal = F.prnu.refusal = F.refusal;
+    (void)setSeriesRoleRefusal;      // the Series() resolver, waiting for a caller
+    (void)kSepModel;                 // ...and the caption the panel will print
+    return F;
 }

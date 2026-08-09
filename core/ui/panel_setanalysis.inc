@@ -150,11 +150,11 @@ static void drawPanelSetAnalysis() {
     ImGui::Separator();
     const uint64_t key = setPanelKey(*Sp);
     if (g_setPanel.cachedId != Sp->id || key != g_setPanel.key) {
-        for (int k = 0; k < SA_COUNT; k++) g_setPanel.r[k] = runSetAnalyzer(*Sp, k);
+        for (int k = 0; k < kSetDirectCount; k++) g_setPanel.r[k] = runSetAnalyzer(*Sp, k);
         g_setPanel.cachedId = Sp->id;
         g_setPanel.key = key;
     }
-    for (int k = 0; k < SA_COUNT; k++) setPanelRow(g_setPanel.r[k]);
+    for (int k = 0; k < kSetDirectCount; k++) setPanelRow(g_setPanel.r[k]);
     // ---- provenance: what a number pasted into a report has to carry ---------
     ImGui::Separator();
     if (ImGui::TreeNodeEx("provenance", ImGuiTreeNodeFlags_DefaultOpen)) {
