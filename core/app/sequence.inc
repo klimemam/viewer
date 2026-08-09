@@ -300,12 +300,9 @@ static void stopSequenceLoader() {
     app.seqReady.clear();
 }
 
-// "8x8 1ch" - the same three numbers, in the same order, that every stack line
-// already prints ("%dx%d %dch"), so a refusal and the log above it describe a
-// frame the same way.
-static std::string frameShapeText(int w, int h, int ch) {
-    return std::to_string(w) + "x" + std::to_string(h) + " " + std::to_string(ch) + "ch";
-}
+// (frameShapeText / stackShapeRefusal moved to core/app/util.inc: the remote
+// fetcher refuses the same disagreement in the same words, and util.inc is
+// above both transports. The rule is one rule, so it has one definition.)
 
 // Spawn the worker. The thread only decodes (no app state, no GL) and pushes
 // finished frames into seqReady; the UI thread integrates them in pumpSequence().
@@ -452,12 +449,10 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             // rather than a special case, so it travels the one path that already
             // says "n of N" - a stack that quietly took four different pictures
             // is worse than one that says which file it left out and why.
-            if (doc && (doc->w != refW || doc->h != refH || doc->ch != refCh)) {
-                err = frameShapeText(doc->w, doc->h, doc->ch) + " and " + refName + " is " +
-                      frameShapeText(refW, refH, refCh) +
-                      ": a run of numbered files is a stack, and a stack's frames are "
-                      "one shape - open it on its own";
-                doc.reset();
+            if (doc) {
+                std::string bad = stackShapeRefusal(doc->w, doc->h, doc->ch,
+                                                    refW, refH, refCh, refName);
+                if (!bad.empty()) { err = bad; doc.reset(); }
             }
             if (!doc) {
                 if (++failures <= 3) {

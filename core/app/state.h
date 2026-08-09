@@ -349,6 +349,13 @@ struct ImageDoc {
     int batchId = 0;                  // which 塊 (Files header) this belongs to
     bool preview = false;             // transient: not yet a registered open
     int remoteFrames = 1;             // frame-axis count, kept for promotion
+    // What the PEER says this frame is, from META - which is not what w/h say
+    // while a large frame is on screen as a decimated tile (remoteStep > 1).
+    // A folder stack compares its siblings against its head, and the head's
+    // full shape is the only one worth comparing against: the tile it is
+    // showing right now will be replaced by exactly these numbers. 0 = never
+    // came from a peer.
+    int remoteFullW = 0, remoteFullH = 0, remoteFullCh = 0;
     int cfa = 0;                      // 0 none, 1 Bayer, 2 Quad Bayer
     int cfaPattern = 0;               // index into CFA_PATTERNS
     bool cfaColorize = false;
@@ -724,6 +731,16 @@ struct App {
         int remotePort = 0;           // non-default ssh port, or 0
         std::vector<std::string> remoteFiles;
         int expectedFrames = 0;
+        // The shape this stack IS, and the frame that says so - the remote
+        // twin of the local loader's refW/refH/refCh (core/app/sequence.inc).
+        // A folder stack's frames are separate FILES on the peer, so nothing
+        // guarantees they agree; the local half refuses a numbered sibling of
+        // another shape and this half has to say the same thing. Set only for
+        // a remote FOLDER stack (attachRemoteStack): a frame-axis stack is one
+        // file with one META, so its frames cannot disagree and there is
+        // nothing to check. refW == 0 = no reference recorded, no check.
+        int refW = 0, refH = 0, refCh = 0;
+        std::string refName;
         int cfaType = 0, cfaPattern = 0;
         // Data revision of the stack AS A SET of pixels: the reload walk (§3.2)
         // bumps it whenever a member's source is swapped in place. Part of the

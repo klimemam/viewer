@@ -535,6 +535,152 @@
                 closeAll();
             }
         }
+        {   // ---- A REMOTE FOLDER WHOSE SHAPES DISAGREE IS NOT ONE STACK ------
+            // The local twin of this is --picker-selftest UC7 (PR #116): four
+            // numbered siblings group into one row, their shapes do not agree,
+            // and the sequence loader refuses the odd ones BY NAME instead of
+            // stacking four different pictures under one seqId. The frames that
+            // arrive over the LINK never learned it - pumpRemoteFetch took
+            // whatever the peer sent - so the SAME FOLDER was refused when it
+            // sat on this disk and silently stacked when it was reached through
+            // a peer. docs/terminology.md gives a stack a time axis either way,
+            // and sigma_t, the FPN split and the per-frame table are quantities
+            // only if every frame is the same picture measured again.
+            //
+            // Same fixtures as UC7, deliberately: (8,8), (8,8,3), (4,4), (8,8),
+            // so channels and grid are each a way of disagreeing and a check on
+            // one is not a check on the other, and so issue #71 - what a
+            // trailing axis of 1 or 2 means - is neither answered nor depended
+            // on, every reading of it agreeing about these three. Written into
+            // the per-test TMP directory for the reasons the hlenbomb block
+            // above gives: no other selftest scans it, and a fixture living
+            // apart from the rule it pins drifts away from it.
+            closeAll();
+            std::error_code shec;
+            std::filesystem::path shdir =
+                std::filesystem::temp_directory_path(shec) / "viewer_remoteshape";
+            std::filesystem::remove_all(shdir, shec);
+            std::filesystem::create_directories(shdir, shec);
+            std::vector<uint16_t> ramp(8 * 8 * 3);
+            for (size_t i = 0; i < ramp.size(); i++) ramp[i] = (uint16_t)(i * 13 + 7);
+            npyWriteFile((shdir / "rshape_1.npy").u8string(), "<u2",
+                         { 8, 8 }, ramp.data(), 64 * 2);
+            npyWriteFile((shdir / "rshape_2.npy").u8string(), "<u2",
+                         { 8, 8, 3 }, ramp.data(), 64 * 3 * 2);
+            npyWriteFile((shdir / "rshape_3.npy").u8string(), "<u2",
+                         { 4, 4 }, ramp.data(), 16 * 2);
+            npyWriteFile((shdir / "rshape_4.npy").u8string(), "<u2",
+                         { 8, 8 }, ramp.data(), 64 * 2);
+            std::string shpath = shdir.u8string();
+            std::replace(shpath.begin(), shpath.end(), '\\', '/');
+            remoteBrowseTo(rbMain(), shpath);
+            double sht = nowSec();
+            while (nowSec() - sht < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == shpath) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> shv = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+            const RbRow* shg = nullptr;
+            for (const auto& r : shv) if (r.isGroup()) { shg = &r; break; }
+            // The GROUPER is not the fix and must not become it: the peer reads
+            // names, four numbered files are one run, and .raw declares no
+            // geometry at all. So this is asserted, exactly as UC7 asserts it.
+            fprintf(stderr, "browseselftest: remote shape: peer groups %zu file(s) "
+                            "into %d row(s)\n", shg ? shg->e->members.size() : 0,
+                    shg ? 1 : 0);
+            if (!shg || shg->e->members.size() != 4) {
+                fprintf(stderr, "browseselftest: remote shape: four numbered files must "
+                                "still LIST as one group - the fix is not a name rule "
+                                "FAIL\n");
+                ok = false;
+            } else {
+                std::vector<std::string> shfiles;
+                for (const auto& m : shg->e->members) shfiles.push_back(shg->join(m));
+                auto drainFetch = [&](double budget) {
+                    double t = nowSec();
+                    while (nowSec() - t < budget) {
+                        pumpRemoteBrowse();
+                        pumpRemoteFetch();
+                        pumpRemoteOpenQueue();
+                        pumpSequenceAndQueue();
+                        if (loadingSettled() && app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                };
+                app.seqNote.clear();
+                openRemoteStack(B.host, shfiles, stackNameFor(B.dir, shg->e->name));
+                drainFetch(120.0);
+                int shid = app.seqs.empty() ? 0 : app.seqs.back().id;
+                std::vector<std::string> kept;
+                for (int idx : shid ? framesOfSeq(shid) : std::vector<int>())
+                    kept.push_back(baseName(app.images[idx]->src->path));
+                std::string keptTxt;
+                for (const auto& k : kept) keptTxt += (keptTxt.empty() ? "" : ",") + k;
+                int shExp = shid ? seqInfo(shid)->expectedFrames : 0;
+                fprintf(stderr, "browseselftest: remote shape: %zu doc(s), %zu stack(s), "
+                                "%zu of %d frame(s) [%s]\n", app.images.size(),
+                        app.seqs.size(), kept.size(), shExp, keptTxt.c_str());
+                if (app.images.size() != 2 || app.seqs.size() != 1 || kept.size() != 2 ||
+                    kept[0] != "rshape_1.npy" || kept[1] != "rshape_4.npy") {
+                    fprintf(stderr, "browseselftest: remote shape: the stack must hold the "
+                                    "two 8x8 1ch frames and NOTHING else FAIL\n");
+                    ok = false;
+                }
+                // ONE FILE is dropped, not the stack - and the drop rides the
+                // count that was already there. expectedFrames is what the Files
+                // row and the canvas footer print "n of N" from, so a stack two
+                // frames short says so on screen without a word being added.
+                if (shExp != 4 || kept.size() >= (size_t)shExp) {
+                    fprintf(stderr, "browseselftest: remote shape: the stack must still "
+                                    "expect 4 and say so (n of N) FAIL\n");
+                    ok = false;
+                }
+                // ...and it must SAY which files it left out, and why - the same
+                // sentence the local half prints, because it is the same rule.
+                const char* SHWANT[] = {
+                    "rshape_2.npy: 8x8 3ch and rshape_1.npy is 8x8 1ch: a run of numbered "
+                    "files is a stack, and a stack's frames are one shape - open it on "
+                    "its own",
+                    "rshape_3.npy: 4x4 1ch and rshape_1.npy is 8x8 1ch: a run of numbered "
+                    "files is a stack, and a stack's frames are one shape - open it on "
+                    "its own",
+                };
+                for (const char* w : SHWANT)
+                    if (app.seqNote.find(w) == std::string::npos) {
+                        fprintf(stderr, "browseselftest: remote shape: the refusal never "
+                                        "said\n  want: %s\n  said: %s FAIL\n",
+                                w, app.seqNote.c_str());
+                        ok = false;
+                    }
+                // The way out the refusal names has to exist over the link too:
+                // open the odd file itself and it opens as what it is.
+                closeAll();
+                openRemote(makeRemoteUrl(B.host, shfiles[1]));
+                drainFetch(60.0);
+                const ImageDoc* shalone = app.images.empty() ? nullptr : app.images[0].get();
+                fprintf(stderr, "browseselftest: remote shape: \"open it on its own\" -> "
+                                "%zu doc(s) %dx%d %dch\n", app.images.size(),
+                        shalone ? shalone->w : 0, shalone ? shalone->h : 0,
+                        shalone ? shalone->ch : 0);
+                if (app.images.size() != 1 || !shalone || shalone->w != 8 ||
+                    shalone->h != 8 || shalone->ch != 3) {
+                    fprintf(stderr, "browseselftest: remote shape: the refused file must "
+                                    "still open ALONE, as its own shape FAIL\n");
+                    ok = false;
+                }
+            }
+            closeAll();
+            app.seqNote.clear();
+            std::filesystem::remove_all(shdir, shec);    // ours: ours to remove
+            remoteBrowseTo(rbMain(), dir);               // leave the panel where it was
+            double shback = nowSec();
+            while (nowSec() - shback < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == dir) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
         {   // ---- #81: A MULTI-ROW SELECTION IS A SET OF STACKS ----------------
             // The reported defect, in the reporter's own numbers: eight frames
             // from each of three stacks came out as ONE average of twenty-four.

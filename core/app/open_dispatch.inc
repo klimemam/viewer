@@ -975,6 +975,12 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     S.remoteStep = step;
     doc->syncMirrors();
     doc->remoteFrames = (int)m.frames;
+    // The peer's own answer for this file, kept whether or not the tile above
+    // was decimated: w/h come from META (step never touches them) and the
+    // channel count from the tile that just landed, which is the number the
+    // full-resolution swap will also carry. A folder stack reads its reference
+    // shape off this - see attachRemoteStack.
+    doc->remoteFullW = (int)m.w; doc->remoteFullH = (int)m.h; doc->remoteFullCh = tch;
     doc->preview = asPreview;
     // --cfa applies to a remote 1ch frame exactly as it does to a local one:
     // openRemote never goes through addImage, so it had to be repeated here or
@@ -1119,6 +1125,17 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
     si.remoteHost = host;             // folder stack: one file per frame
     si.remotePort = port;
     si.expectedFrames = (int)files.size();
+    // The shape the siblings have to agree with, and the file that sets it -
+    // read from the PEER's META rather than from first->w/h, which are the
+    // dimensions of whatever tile is on screen (a big frame opens decimated).
+    // The frames land in pumpRemoteFetch, and that is where a disagreeing one
+    // is refused, exactly as the local loader's worker refuses a disagreeing
+    // numbered sibling. Falls back to the resident shape for a head that did
+    // not come through openRemote.
+    si.refW = first->remoteFullW > 0 ? first->remoteFullW : first->w;
+    si.refH = first->remoteFullW > 0 ? first->remoteFullH : first->h;
+    si.refCh = first->remoteFullW > 0 ? first->remoteFullCh : first->ch;
+    si.refName = baseName(files[headIdx]);
     si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
     for (const auto& f : files) si.remoteFiles.push_back(f);
     // where the user is standing, so the next session line is written from the

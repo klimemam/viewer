@@ -130,6 +130,34 @@ std::vector<PathSeg> pathSegments(const std::string& d) {
     }
     return segs;
 }
+// ---- a stack's frames are ONE shape -----------------------------------------
+// "8x8 1ch" - the same three numbers, in the same order, that every stack line
+// already prints ("%dx%d %dch"), so a refusal and the log above it describe a
+// frame the same way.
+static std::string frameShapeText(int w, int h, int ch) {
+    return std::to_string(w) + "x" + std::to_string(h) + " " + std::to_string(ch) + "ch";
+}
+// Does this frame belong in that stack? Empty = yes; otherwise the reason, in
+// the words core/tiffread.cpp refuses a disagreeing PAGE in.
+//
+// It lives HERE, above both transports, because there are two of them and the
+// rule is one rule. The local sequence loader learned it first (PR #116) and
+// the remote fetcher did not, so a folder of disagreeing shapes was refused
+// when it sat on this disk and stacked anyway when the same folder was reached
+// through a peer - docs/terminology.md gives a stack a TIME axis either way,
+// and sigma_t / FPN / the per-frame table are quantities only if every frame is
+// the same picture measured again. One definition means the two halves cannot
+// drift apart into two different promises about the same word.
+static std::string stackShapeRefusal(int w, int h, int ch,
+                                     int refW, int refH, int refCh,
+                                     const std::string& refName) {
+    if (w == refW && h == refH && ch == refCh) return std::string();
+    return frameShapeText(w, h, ch) + " and " + refName + " is " +
+           frameShapeText(refW, refH, refCh) +
+           ": a run of numbered files is a stack, and a stack's frames are "
+           "one shape - open it on its own";
+}
+
 static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
     float mag = powf(10.0f, floorf(log10f(std::max(raw, 1e-9f))));
     for (float m : {1.0f, 2.0f, 5.0f, 10.0f})

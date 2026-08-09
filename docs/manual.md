@@ -312,7 +312,9 @@ capture.mp4: MP4 (H.264/HEVC) needs a video codec this build does not link.
   stack は**時間軸**を持つ層なので(`terminology.md`)、形が揃っていなければ σ_t も
   FPN 分離も per-frame 表も意味を失います。**断られたファイルは単独で開けば普通に開き**、
   そのときはそれが先頭フレームになります。何枚中何枚読めたかは Files パネルに残ります
-  (複数ページ TIFF が形の違うページを断るのと同じ規則です → §2.3b)
+  (複数ページ TIFF が形の違うページを断るのと同じ規則です → §2.3b)。
+  **Browse から開いたリモートのフォルダも同じで、断り文も同じです** —— 同じフォルダが
+  ローカルとリモートで違う積まれ方をするのは、この道具では欠陥として扱います
 - **読み込むかの選択**: 既定は毎回確認。`File > Stack loading` で
   「毎回確認 / 常に読む / 読まない」を切替、モーダルの「remember my choice」でも設定される。
   CLI は `--stack ask|always|never`

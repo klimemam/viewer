@@ -206,10 +206,45 @@ static void pumpRemoteFetch() {
             // but the one job the worker was already running could not be
             // removed there - its result lands here and must be dropped, or a
             // closed stack regrows one orphan frame at a time.
-            if (d.seqId != 0 && !seqInfo(d.seqId)) continue;
+            App::SeqInfo* si = d.seqId != 0 ? seqInfo(d.seqId) : nullptr;
+            if (d.seqId != 0 && !si) continue;
+            // ...and the shape this frame turned out to hold, against the shape
+            // the stack IS. The local loader has refused a disagreeing numbered
+            // sibling since PR #116; the frames that arrive over the LINK went
+            // straight in, so the very same folder became one stack of four
+            // different pictures when it was reached through a peer instead of
+            // off this disk. Same rule, same sentence (stackShapeRefusal), and
+            // ONE FILE is dropped rather than the stack - the frame simply never
+            // lands, so the stack stays short of SeqInfo::expectedFrames and the
+            // "n of N" the Files row and the canvas footer already print says
+            // so, which is the remote half of "it travels the path that already
+            // says n of N".
+            //
+            // Here and not in rfWorker: the reference is a property of the STACK
+            // (it can be closed, and it is the UI thread's), and the shape is in
+            // the reply either way - a TILE answers with the frame's real
+            // dimensions, so nothing is fetched twice to learn it. What IS paid
+            // is the transfer of a frame that is then refused; the peer's META
+            // per sibling would be a round trip apiece to save it, on every
+            // stack, for the folders that do agree.
+            if (d.err.empty() && si && si->refW > 0) {
+                std::string bad = stackShapeRefusal(d.w, d.h, d.ch, si->refW, si->refH,
+                                                    si->refCh, si->refName);
+                if (!bad.empty()) d.err = baseName(d.name) + ": " + bad;
+            }
             if (!d.err.empty()) {
-                if (app.seqNote.empty())         // first error explains the gap
-                    app.seqNote = "remote: " + d.err;
+                // ONE note reaches the Files panel, so what goes in it is a
+                // choice. "The first error explains the gap" is true of a
+                // transport error - one dead link, reported once per frame -
+                // and false of a refusal, which names a different file and a
+                // different reason each time: a stack short two frames would
+                // have said why one of them was missing. So: distinct messages,
+                // capped at the local loader's three (sequence.inc's
+                // `if (++failures <= 3)`), and a repeat still collapses to the
+                // single line it always did.
+                if (app.seqNote.find(d.err) == std::string::npos &&
+                    std::count(app.seqNote.begin(), app.seqNote.end(), '\n') < 3)
+                    app.seqNote += "remote: " + d.err + "\n";
                 continue;
             }
             auto doc = std::make_unique<ImageDoc>();
