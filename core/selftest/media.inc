@@ -261,6 +261,33 @@
                   "M12 a reduced-resolution page is not a frame: one frame, full size");
             check(t && has(t->note, "reduced-resolution") && has(t->note, "NewSubfileType"),
                   "M12 ...and the note names the page that was left out, and why");
+
+            // A session writes ONE line per stack and rebuilds the frames from
+            // the file. That is exactly right for an in-file frame axis and
+            // exactly wrong if the writer had emitted one line per FRAME:
+            // three lines, three whole-file re-reads, nine frames. Asserted
+            // rather than reasoned about, because the count is the only thing
+            // that tells the two apart and it is silent when it is wrong.
+            closeAll();
+            openPath(root + "/stack3.tif");
+            const std::string sess =
+                (std::filesystem::temp_directory_path() / "viewer_mediatiffstack.vsession").u8string();
+            bool saved = app.images.size() == 3;
+            if (saved) saveSession(sess, true);
+            closeAll();
+            std::string lerr = loadSession(sess);
+            int sid2 = app.images.empty() ? 0 : app.images[0]->seqId;
+            bool back = lerr.empty() && app.images.size() == 3 && sid2 != 0;
+            if (back)
+                for (size_t i = 0; i < 3; i++)
+                    if (app.images[i]->seqId != sid2 ||
+                        app.images[i]->px()[0] != (float)(1000 * (i + 1))) back = false;
+            fprintf(stderr, "mediaselftest: M12 session restored %zu doc(s) err=\"%s\"\n",
+                    app.images.size(), lerr.c_str());
+            check(saved && back,
+                  "M12 a session that saved a 3-page TIFF reopens 3 frames of ONE stack");
+            std::error_code sec;
+            std::filesystem::remove(pathFromUtf8(sess), sec);
         }
 
         // ---- M13: byte order, and a float sample ----------------------------
