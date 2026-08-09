@@ -822,7 +822,8 @@ static void drawFileList() {
                     bool canRe = head.avgSeqId && seqInfo(head.avgSeqId);
                     if (!canRe)
                         for (const auto& q : app.images)
-                            if (q->seqId != 0 && q->src->path == head.avgOfPath) {
+                            if (q->seqId != 0 && q->src->path == head.avgOfPath &&
+                                q->src->member == head.avgOfMember) {
                                 canRe = true; break;
                             }
                     if (ImGui::MenuItem("Recompute from stack", nullptr, false, canRe))

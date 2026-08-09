@@ -358,6 +358,12 @@ static void pumpCompareSlotRestore() {
         ImageDoc* hit = nullptr;
         for (const auto& d : app.images) {
             if (d->src->path != w.path) continue;
+            // (path, member): two image members of one .npz are one path, and a
+            // slot that latched the first of them pinned the wrong picture -
+            // and took the second want down with it on the dup check. An empty
+            // want-member is a session written before the key: unconstrained,
+            // resolving exactly as it did then.
+            if (!w.member.empty() && d->src->member != w.member) continue;
             if (w.frame >= 0 && d->seqId != 0 && d->seqIndex != w.frame) continue;
             hit = d.get(); break;
         }

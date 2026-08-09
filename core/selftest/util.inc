@@ -33,6 +33,82 @@ static bool needWindow(const char* what) {
     return false;
 }
 
+// ---- fixtures no Python can be assumed for: .npy bytes, and an .npz ---------
+// Selftests build .npz fixtures BY HAND (the V25 rule: CI installs numpy and
+// nothing else, and a fixture that needs anything more is a fixture CI has
+// never seen). Two of them - the container groups in --aset-selftest and
+// --verify-selftest - each carried their own copy of this; a third copy was
+// what adding one more npz fixture would have cost, so it lives here instead.
+// Members are named WITHOUT the ".npy" the zip entry carries: that suffix is
+// the npz format's, not the array's, and every caller was appending it.
+static std::vector<uint8_t> selftestNpyBytes(const char* descr,
+                                             const std::vector<int64_t>& shape,
+                                             const void* data, size_t nbytes) {
+    std::string sh;
+    if (shape.empty()) sh = "()";
+    else if (shape.size() == 1) sh = "(" + std::to_string(shape[0]) + ",)";
+    else {
+        sh = "(";
+        for (size_t i = 0; i < shape.size(); i++)
+            sh += std::to_string(shape[i]) + (i + 1 < shape.size() ? ", " : "");
+        sh += ")";
+    }
+    std::string hdr = std::string("{'descr': '") + descr +
+                      "', 'fortran_order': False, 'shape': " + sh + ", }";
+    hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+    hdr += '\n';
+    std::vector<uint8_t> out;
+    const char magic[8] = { '\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00' };
+    out.insert(out.end(), magic, magic + 8);
+    out.push_back((uint8_t)(hdr.size() & 0xff));
+    out.push_back((uint8_t)(hdr.size() >> 8));
+    out.insert(out.end(), hdr.begin(), hdr.end());
+    const uint8_t* p = (const uint8_t*)data;
+    out.insert(out.end(), p, p + nbytes);
+    return out;
+}
+// a STORED (method 0) zip of those members - what np.savez writes
+static void selftestWriteNpz(const std::string& path,
+                             const std::vector<std::pair<std::string,
+                                                         std::vector<uint8_t>>>& mem) {
+    std::vector<uint8_t> z;
+    auto p16 = [&](uint32_t x) {
+        z.push_back((uint8_t)(x & 0xff));
+        z.push_back((uint8_t)((x >> 8) & 0xff));
+    };
+    auto p32 = [&](uint32_t x) {
+        for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+    };
+    std::vector<uint32_t> offs;
+    for (const auto& m : mem) {
+        const std::string nm = m.first + ".npy";
+        uint32_t crc = (uint32_t)mz_crc32(MZ_CRC32_INIT, m.second.data(), m.second.size());
+        offs.push_back((uint32_t)z.size());
+        p32(0x04034b50); p16(20); p16(0); p16(0); p16(0); p16(0);
+        p32(crc); p32((uint32_t)m.second.size()); p32((uint32_t)m.second.size());
+        p16((uint32_t)nm.size()); p16(0);
+        z.insert(z.end(), nm.begin(), nm.end());
+        z.insert(z.end(), m.second.begin(), m.second.end());
+    }
+    uint32_t cdOff = (uint32_t)z.size();
+    for (size_t i = 0; i < mem.size(); i++) {
+        const std::string nm = mem[i].first + ".npy";
+        uint32_t crc = (uint32_t)mz_crc32(MZ_CRC32_INIT, mem[i].second.data(),
+                                          mem[i].second.size());
+        p32(0x02014b50); p16(20); p16(20); p16(0); p16(0); p16(0); p16(0);
+        p32(crc); p32((uint32_t)mem[i].second.size()); p32((uint32_t)mem[i].second.size());
+        p16((uint32_t)nm.size()); p16(0); p16(0); p16(0); p16(0); p32(0);
+        p32(offs[i]);
+        z.insert(z.end(), nm.begin(), nm.end());
+    }
+    uint32_t cdSize = (uint32_t)z.size() - cdOff;   // before the EOCD
+    p32(0x06054b50); p16(0); p16(0);
+    p16((uint32_t)mem.size()); p16((uint32_t)mem.size());
+    p32(cdSize); p32(cdOff); p16(0);
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    f.write((const char*)z.data(), (std::streamsize)z.size());
+}
+
 // ---- --roistats-selftest: the ROI table's NUMBERS, anywhere ----------------
 // These assertions used to be the first half of --verify-selftest's V19, and
 // V19 needs a window, so they ran on exactly one runner of the three: Linux,

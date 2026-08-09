@@ -596,14 +596,22 @@ static void noteGroupStack(int token, int seqId) {
 // separates stacks in DIFFERENT batches, and the canon recommends reaching the
 // other arrangement too ("メンバを同じ batch へ移してから series を作る"): two
 // same-path stacks inside ONE batch are told apart by nothing but this list.
-static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
-                                 const std::vector<int>* taken = nullptr) {
+//
+// `member` is the other half of §6.2's identity: two image members of one .npz
+// share a first-frame path and nothing else can tell them apart, so a member
+// line that named one used to resolve onto whichever came first in list order.
+// Empty means unconstrained - a session written before that key resolves by
+// path exactly as it did then, and every non-container caller passes nothing.
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch,
+                                 const std::vector<int>* taken,
+                                 const std::string& member) {
     auto claimed = [&](int sid) {
         return taken && std::find(taken->begin(), taken->end(), sid) != taken->end();
     };
     int any = 0;
     for (const auto& d : app.images) {
         if (d->seqId == 0 || d->src->path != path || claimed(d->seqId)) continue;
+        if (!member.empty() && d->src->member != member) continue;
         if (preferBatch && d->batchId == preferBatch) return d->seqId;
         if (!any) any = d->seqId;
     }
@@ -614,10 +622,12 @@ static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
 // own path. Same disambiguation shape as seqIdOfFirstFramePath - prefer the
 // series' batch, never a doc an earlier member already claimed.
 static uint64_t uidOfFramePath(const std::string& path, int preferBatch,
-                               const std::vector<uint64_t>& taken) {
+                               const std::vector<uint64_t>& taken,
+                               const std::string& member = std::string()) {
     uint64_t any = 0;
     for (const auto& d : app.images) {
         if (d->seqId != 0 || d->preview || d->src->path != path) continue;
+        if (!member.empty() && d->src->member != member) continue;   // ...and WHICH member
         if (std::find(taken.begin(), taken.end(), d->uid) != taken.end()) continue;
         if (preferBatch && d->batchId == preferBatch) return d->uid;
         if (!any) any = d->uid;
@@ -651,7 +661,7 @@ static void resolveSeriesRestore() {
         std::vector<App::Series::Member> ms;
         for (const auto& m : R.members) {
             if (m.kind == 2) {      // a standalone frame member (§3.3)
-                uint64_t u = uidOfFramePath(m.path, bid, takenU);
+                uint64_t u = uidOfFramePath(m.path, bid, takenU, m.member);
                 const ImageDoc* fd = u ? frameMemberDoc(u) : nullptr;
                 // strict containment survives the round trip too, or not at all
                 if (!fd || fd->batchId != bid) { lost++; continue; }
@@ -663,7 +673,7 @@ static void resolveSeriesRestore() {
                 ms.push_back(mm);
                 continue;
             }
-            int sid = seqIdOfFirstFramePath(m.path, bid, &taken);
+            int sid = seqIdOfFirstFramePath(m.path, bid, &taken, m.member);
             if (!sid || batchOfStack(sid) != bid) { lost++; continue; }
             taken.push_back(sid);
             ms.push_back({ sid, m.value, m.include });
@@ -1127,7 +1137,8 @@ static bool avgIsStale(const ImageDoc* d) {
 // computed results, so this is how the program can still SAY it.
 static bool avgSamePicture(const ImageDoc* a, const ImageDoc* b) {
     return a && b && a != b && !a->avgOfPath.empty() &&
-           a->avgOfPath == b->avgOfPath && a->avgFold == b->avgFold &&
+           a->avgOfPath == b->avgOfPath && a->avgOfMember == b->avgOfMember &&
+           a->avgFold == b->avgFold &&
            a->avgSrcDigest != 0 && a->avgSrcDigest == b->avgSrcDigest &&
            a->avgSrcCount == b->avgSrcCount;
 }

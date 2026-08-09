@@ -68,10 +68,16 @@ seriesparam <param名>
 seriesunit <unit>        # 空 = 未設定
 serieskind <n>
 seriesmember <value|-> <0|1> <先頭フレームの path>   # 値 - = 未設定、順序どおり
+refmember <member>       # 直前の1行への限定。path が container の中を指すとき
+                         # だけ書く（.npz のメンバ名 / .exr のレイヤ名）
 seriesend
 ```
 
-- **メンバは path で参照**（§0 の `seqname` バグを踏まない）。解決は遅延: パース時は `app.seriesRestore` に積み、
+- **メンバは path で参照**（§0 の `seqname` バグを踏まない）。ただし path だけでは
+  **1つの .npz の2つの image メンバを区別できない** —— 区別するのは §6.2 の identity tuple の
+  もう半分 `FrameSource::member` だけなので、container の中を指すメンバ行には `refmember` が続く
+  （reference-design.md §5.2 の「直前の行への限定」と同じ形。無ければ今日どおり path だけで解決し、
+  旧セッションはそのまま開く）。解決は遅延: パース時は `app.seriesRestore` に積み、
   `pumpSequenceAndQueue()` で `seqRestore`/`seqQueue`/`seqReady` が空・`seqRunning` 偽になった時点で path→image→`seqId` を
   引いて構築。解決できなかったメンバは黙って捨てず件数を toast する。
 - 後方互換は両方向成立: 旧ビューアは未知キーを読み飛ばし、新ビューアは `series` ブロック無しのセッションを series 0 個で開く。

@@ -1148,6 +1148,177 @@
                   std::string(app.series[1].unit) == "ms");
             check("invariant 1: audit after two queued sweeps", audit());
         }
+
+        // ---- two members of ONE .npz: the cross-reference lines --------------
+        // Every line that names a doc from ELSEWHERE in the session file spoke
+        // bare path: `seriesmember`, `cmpslot`, `stackavg`. Two image members of
+        // one .npz share a path and are told apart by nothing but src->member
+        // (§6.2's identity tuple, the field PR #109 generalised), so on restore
+        // the first same-path stack in list order claimed every want: the series
+        // member at 0 lx landed on `bright`, the one at 100 lx on `dark`, and
+        // both "resolved" - the toast read clean, the fit was anchored on
+        // swapped axis values, and the next autosave froze the swap in. That is
+        // the "silently misplaced point on the axis the fit is taken against"
+        // resolveOnePendingSeries calls worse than a loss.
+        //
+        // The fixture opens `bright` FIRST so that list order and value order
+        // disagree - matching on path alone cannot then be right by accident.
+        {
+            closeAll();
+            std::error_code nec;
+            std::filesystem::path ndir =
+                std::filesystem::path(pathFromUtf8(g_seriesSelftest)) / "npzmember-scratch";
+            std::filesystem::create_directories(ndir, nec);
+            std::vector<uint16_t> pxD((size_t)3 * 64), pxB((size_t)3 * 64);
+            for (int f = 0; f < 3; f++)
+                for (int i = 0; i < 64; i++) {
+                    pxD[(size_t)f * 64 + i] = (uint16_t)(100 + f);   // mean 101
+                    pxB[(size_t)f * 64 + i] = (uint16_t)(900 + f);   // mean 901
+                }
+            const std::string npz = (ndir / "sweep.npz").u8string();
+            selftestWriteNpz(npz, {
+                { "dark",   selftestNpyBytes("<u2", { 3, 8, 8 }, pxD.data(), pxD.size() * 2) },
+                { "bright", selftestNpyBytes("<u2", { 3, 8, 8 }, pxB.data(), pxB.size() * 2) },
+            });
+            std::string e1 = loadNpz(npz, "bright");    // opened first, ON PURPOSE
+            std::string e2 = loadNpz(npz, "dark");
+            loadAll();
+            auto seqOfMember = [](const char* m) {
+                for (const auto& d : app.images)
+                    if (d->seqId != 0 && d->src->member == m) return d->seqId;
+                return 0;
+            };
+            auto memberOfSeq = [](int sid) {
+                std::vector<int> fr = framesOfSeq(sid);
+                return fr.empty() ? std::string() : app.images[fr.front()]->src->member;
+            };
+            int sB = seqOfMember("bright"), sD = seqOfMember("dark");
+            check("both .npz members opened, as two stacks of one file",
+                  e1.empty() && e2.empty() && sB && sD && sB != sD &&
+                  app.images.size() == 6);
+            if (sB && sD) {
+                int nb = newBatch(uniqueBatchName("npz sweep"));
+                moveStackToBatch(sB, nb);
+                moveStackToBatch(sD, nb);
+                int sid = newSeries(nb, "two members");
+                if (App::Series* Z = seriesById(sid)) {
+                    Z->paramName = "illuminance";
+                    snprintf(Z->unit, sizeof Z->unit, "lx");
+                }
+                addToSeries(sid, sD, 0.0);        // dark is the 0 lx point
+                addToSeries(sid, sB, 100.0);
+                // a compare slot pinned on frame 1 of DARK...
+                std::vector<int> fD = framesOfSeq(sD);
+                app.cmpExtra.clear();
+                app.cmpExtra.push_back(app.images[fD[1]]->uid);
+                // ...and a frame average of DARK (mean 101, so the picture
+                // itself says which member was folded: bright's is 901)
+                requestStackAverage(sD);
+                loadAll();
+                std::string ms = (ndir / "npzmember.vsession").u8string();
+                saveSession(ms, true);
+                std::string merr = loadSession(ms);
+                check("the two-member session reloaded", merr.empty());
+                loadAll();
+                double tm = nowSec();
+                while (nowSec() - tm < 120.0 &&
+                       (!app.seriesRestore.empty() || !app.avgRestore.empty() ||
+                        !app.pendingAvg.empty())) {
+                    pumpSequenceAndQueue();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                pumpCompareSlotRestore();
+                const App::Series* R = app.series.empty() ? nullptr : &app.series.front();
+                std::string at0, at100;
+                if (R)
+                    for (const auto& m : R->members) {
+                        if (m.value == 0.0) at0 = memberOfSeq(m.seqId);
+                        if (m.value == 100.0) at100 = memberOfSeq(m.seqId);
+                    }
+                std::string slotMember;
+                int slotFrame = -1;
+                for (uint64_t u : app.cmpExtra)
+                    for (const auto& d : app.images)
+                        if (d->uid == u) { slotMember = d->src->member; slotFrame = d->seqIndex; }
+                const ImageDoc* avg = nullptr;
+                for (const auto& d : app.images) if (!d->avgOfPath.empty()) avg = d.get();
+                double avgMean = 0;
+                if (avg) {
+                    for (float v : avg->px()) avgMean += v;
+                    avgMean /= (double)std::max<size_t>(1, avg->px().size());
+                }
+                fprintf(stderr, "seriesselftest: npz members: 0 lx -> '%s', 100 lx -> '%s'; "
+                                "compare slot on '%s' frame %d; average of '%s' = %.6g\n",
+                        at0.c_str(), at100.c_str(), slotMember.c_str(), slotFrame,
+                        avg ? memberOfSeq(avg->avgSeqId).c_str() : "-", avgMean);
+                check("a series member comes back on the .npz member it was on",
+                      at0 == "dark" && at100 == "bright");
+                check("a compare slot comes back on ITS member, at its frame",
+                      slotMember == "dark" && slotFrame == 1);
+                check("a frame average recomputes from the member it folded",
+                      avg && fabs(avgMean - 101.0) < 1e-9);
+                {   // ---- and the same file WITHOUT the new key ---------------
+                    // Every session written before `refmember` existed, and
+                    // every one an older viewer writes, is this file minus
+                    // those lines. It must open, and open no worse than it does
+                    // today: both members resolve, the slot lands, the recipe
+                    // recomputes. It cannot be BETTER - path alone cannot tell
+                    // the two members apart, which is the whole defect - so
+                    // what is asserted is "nothing lost, nothing refused".
+                    std::string body;
+                    {
+                        std::ifstream sf(pathFromUtf8(ms));
+                        std::stringstream s2; s2 << sf.rdbuf(); body = s2.str();
+                    }
+                    int stripped = 0;
+                    std::string old;
+                    {
+                        std::istringstream in(body);
+                        std::string l;
+                        while (std::getline(in, l)) {
+                            if (l.rfind("refmember ", 0) == 0) { stripped++; continue; }
+                            old += l;
+                            old += "\n";
+                        }
+                    }
+                    const std::string oldPath = (ndir / "npzmember-old.vsession").u8string();
+                    { std::ofstream of(pathFromUtf8(oldPath), std::ios::binary); of << old; }
+                    closeAll();
+                    std::string oerr = loadSession(oldPath);
+                    loadAll();
+                    double to = nowSec();
+                    while (nowSec() - to < 120.0 &&
+                           (!app.seriesRestore.empty() || !app.avgRestore.empty() ||
+                            !app.pendingAvg.empty())) {
+                        pumpSequenceAndQueue();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpCompareSlotRestore();
+                    const App::Series* O = app.series.empty() ? nullptr : &app.series.front();
+                    int oldAvgs = 0;
+                    for (const auto& d : app.images) if (!d->avgOfPath.empty()) oldAvgs++;
+                    // cmpExtra is uids and Close All does not clear it (dead
+                    // ones are pruned when the letters resolve), so count the
+                    // slots that actually point at an open doc
+                    int liveSlots = 0;
+                    for (uint64_t u : app.cmpExtra)
+                        for (const auto& d : app.images) if (d->uid == u) liveSlots++;
+                    fprintf(stderr, "seriesselftest: pre-refmember session (%d line(s) "
+                                    "stripped): err=\"%s\" %zu series, %d member(s), "
+                                    "%d live slot(s), %d average(s), %zu want(s) left\n",
+                            stripped, oerr.c_str(), app.series.size(),
+                            O ? (int)O->members.size() : -1, liveSlots, oldAvgs,
+                            app.cmpSlotRestore.size());
+                    check("a session written before refmember still opens",
+                          stripped == 4 && oerr.empty() && app.series.size() == 1);
+                    check("...losing no member, no slot and no recipe",
+                          O && O->members.size() == 2 && liveSlots == 1 &&
+                          oldAvgs == 1 && app.cmpSlotRestore.empty());
+                }
+            }
+            closeAll();
+            std::filesystem::remove_all(ndir, nec);
+        }
         fprintf(stderr, "seriesselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();

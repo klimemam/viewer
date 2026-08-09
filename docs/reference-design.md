@@ -261,6 +261,27 @@ compare のピンは今日 path+frame で復元され (`cmpslot` 4205 /
     cmpslotstack <stack name>         ... 直前の cmpslot 行への限定
     comparebstack <stack name>        ... compareb 行への限定
 
+**実装済み (2026-08-09)**: 同じ「直前の行への限定」の形で、path が**区別できない**
+もう一つの場合 —— 1つのファイルの中の**2枚の絵** —— を先に閉じた。path だけを話す
+**外部参照行は3つ**あり (`cmpslot` / `stackavg`・`stacksum` /
+`seriesmember`・`seriessum`・`seriesframe`)、1つの .npz の2つの image メンバは
+path が同一で、識別するのは §6.2 の identity tuple のもう半分 `FrameSource::member`
+だけ。3行とも `app.images` 順で最初に一致した stack を掴んでいたので、series の値が
+**入れ替わったまま「解決済み」**になり (fit の軸が狂い、次の autosave で固定される)、
+cmpslot は別のメンバに刺さり、stackavg は別のメンバを畳んでいた:
+
+    refmember <member>                ... 直前の外部参照行への限定 (.npz のメンバ名 /
+                                          .exr のレイヤ名)。member が空の doc には書かない
+
+- **キーは1つ**、3行で共用する。意味が同じものに3つの綴りを与えない。
+- **行の末尾に足さない**: 3行とも最後の欄が path (空白を含みうる) なので、追記すると
+  旧ビューアは "path member" を path として読み、参照ごと落とす。未知の**キー**なら
+  読み飛ばされ、その旧ビューアは今日どおり path だけで解決する。
+- 読む側は**直後の1行だけ**を限定する (`stackavggen` と同じ添え方)。member が空 =
+  無制限 = 今日の解決。だから `refmember` を持たない既存セッションは挙動が変わらない。
+- 識別子は**増やさない**: 使うのは PR #109 が npzMember から一般化した
+  `FrameSource::member` そのもの。#82 の (seqId, stackRev) とも §6.2 とも同じ語彙。
+
 `rbplace` とは**交わらない** (ブラウザは「見ている場所」でありデータではない —
 項目10 の裁定)。`seqname`/`seqframe`/`seqaxis*` は membership/stack の事実
 なので無傷。

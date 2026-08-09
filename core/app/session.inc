@@ -69,11 +69,16 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
     f << "cmprange " << app.compareRangeMode << "\n";
     // slots travel by the same NAME+frame pair B uses: uids do not survive a
-    // restart, and a path alone cannot tell two frames of one stack apart
+    // restart, and a path alone cannot tell two frames of one stack apart.
+    // `refmember` is the OTHER half a path cannot tell apart - two image
+    // members of one .npz (or two layers of one .exr) are one path and two
+    // pictures. See its parse in loadSession for why it is a companion line.
     for (uint64_t u : app.cmpExtra)
         for (const auto& d : app.images)
-            if (d->uid == u)
+            if (d->uid == u) {
                 f << "cmpslot " << (d->seqId != 0 ? d->seqIndex : -1) << " " << d->src->path << "\n";
+                if (!d->src->member.empty()) f << "refmember " << d->src->member << "\n";
+            }
     f << "abstats " << app.abStatsLayout << " " << app.histPlane << "\n";
     f << "roichannel " << app.roiChannel << "\n";
     f << "projstatlayout " << app.projStatLayout << " " << app.projDecimals << " "
@@ -240,7 +245,8 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         if (d->avgOfPath.empty()) continue;
         bool live = false;                    // its stack must still be open, or
         for (auto& o : app.images)            // there is nothing left to average
-            if (o->seqId != 0 && o->src->path == d->avgOfPath) { live = true; break; }
+            if (o->seqId != 0 && o->src->path == d->avgOfPath &&
+                o->src->member == d->avgOfMember) { live = true; break; }
         if (!live) { avgLost++; continue; }
         // Two keys, not one key plus a flag: an older viewer skips lines it
         // does not know (the series block's rule), so a sum saved here simply
@@ -249,6 +255,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // sum would come back as a mean: 1/n of itself under the same note.
         f << (d->avgFold == FOLD_SUM ? "stacksum " : "stackavg ")
           << d->avgOfPath << "\n";                  // path last: may contain spaces
+        // ...and WHICH member of that file, when the file has members: the
+        // recipe used to fold whichever stack of that path came first, so a
+        // session holding the mean of `dark` came back holding the mean of
+        // `bright` under dark's name. Directly after the line it qualifies.
+        if (!d->avgOfMember.empty()) f << "refmember " << d->avgOfMember << "\n";
         // The GENERATION record (§10.2), on its own line right after its
         // recipe (the reader attaches it to the last recipe line): the digest
         // of the input tuples this picture was folded from, how many, and
@@ -302,11 +313,12 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // and a frame member is "seriesframe", travelling by ITS OWN path
             // (the key a stack member's first frame already uses).
             const char* key2 = "seriesmember ";
-            std::string path;
+            std::string path, member;
             if (m.seqId != 0) {
                 std::vector<int> fr = framesOfSeq(m.seqId);
                 if (fr.empty()) { lostMembers++; continue; }
                 path = app.images[fr.front()]->src->path;
+                member = app.images[fr.front()]->src->member;
                 if (m.fold == FOLD_SUM) key2 = "seriessum ";
             } else {
                 // a computed frame (frame average) has no file, so it cannot
@@ -314,6 +326,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 const ImageDoc* fd = frameMemberDoc(m.frameUid);
                 if (!fd || fd->src->path.empty()) { lostMembers++; continue; }
                 path = fd->src->path;
+                member = fd->src->member;
                 key2 = "seriesframe ";
             }
             f << key2;
@@ -322,6 +335,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             if (std::isfinite(m.value)) f << fmtExact(m.value);
             else f << "-";                             // "-" = unset, NOT zero
             f << " " << (m.include ? 1 : 0) << " " << path << "\n";   // path last: spaces
+            // ...and which member of that file, when there is one: two 3-D
+            // members of one .npz are one path, and a value that lands on the
+            // wrong one is a misplaced point on the axis the fit is taken
+            // against - which resolveOnePendingSeries calls worse than a loss.
+            if (!member.empty()) f << "refmember " << member << "\n";
         }
         f << "seriesend\n";
     }
@@ -352,6 +370,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             if (std::isfinite(m.value)) f << fmtExact(m.value);
             else f << "-";
             f << " " << (m.include ? 1 : 0) << " " << m.path << "\n";
+            if (!m.member.empty()) f << "refmember " << m.member << "\n";
         }
         f << "seriesend\n";
     }
@@ -1662,6 +1681,19 @@ static std::string loadSession(const std::string& path) {
     int curSeries = -1;               // index into app.seriesRestore, -1 = outside a block
     int curSet = -1;                  // index into app.aSetRestore, same shape
     bool capturing = false;
+    // Which cross-reference line a `refmember` would qualify. The three lines
+    // that name a doc from ELSEWHERE in the file - cmpslot, stackavg/stacksum,
+    // seriesmember/seriessum/seriesframe - speak paths, and two image members
+    // of one .npz are one path; the member is the other half of §6.2's identity
+    // and the ONLY thing that tells them apart. It rides as a companion line
+    // (stackavggen's shape) rather than as a field, because appending a field
+    // to a line whose last field is a path would make an older viewer read
+    // "path member" as the path and lose the reference outright - where an
+    // unknown KEY is simply skipped, and that viewer resolves by path exactly
+    // as it does today. Strictly the line DIRECTLY above: a qualifier that can
+    // drift onto a different line is not a key.
+    enum { RM_NONE, RM_SLOT, RM_AVG, RM_SERIES };
+    int refFor = RM_NONE;
     auto settleCurrent = [&]() {
         if (capturing) { resolvedCurrent = app.current; capturing = false; }
     };
@@ -1675,6 +1707,8 @@ static std::string loadSession(const std::string& path) {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
         std::string key; ls >> key;
+        const int refTarget = refFor;   // only the line DIRECTLY above may be qualified
+        refFor = RM_NONE;
         if      (key == "gamma")   ls >> app.dispGamma;
         else if (key == "grid")  { int g = 0; ls >> g; app.showGrid = g != 0; }
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
@@ -1688,7 +1722,23 @@ static std::string loadSession(const std::string& path) {
         else if (key == "cmpslot")  { int fi = -1; ls >> fi;
                                       std::string pth; std::getline(ls, pth);
                                       if (!pth.empty() && pth[0] == ' ') pth.erase(0, 1);
-                                      if (!pth.empty()) app.cmpSlotRestore.push_back({ fi, pth }); }
+                                      if (!pth.empty()) {
+                                          app.cmpSlotRestore.push_back({ fi, pth, {} });
+                                          refFor = RM_SLOT;
+                                      } }
+        // The member half of the three path-keyed cross-references above/below
+        // (see refFor): it qualifies the line it follows and nothing else.
+        else if (key == "refmember") {
+            std::string m = restOfLine(ls);
+            if (m.empty()) continue;
+            if (refTarget == RM_SLOT && !app.cmpSlotRestore.empty())
+                app.cmpSlotRestore.back().member = m;
+            else if (refTarget == RM_AVG && !app.avgRestore.empty())
+                app.avgRestore.back().member = m;
+            else if (refTarget == RM_SERIES && curSeries >= 0 &&
+                     !app.seriesRestore[curSeries].members.empty())
+                app.seriesRestore[curSeries].members.back().member = m;
+        }
         // pre-tri-state prefs: the old bool maps onto "B uses A's" / "each own".
         // NOT onto the new default - it records a choice somebody actually made.
         else if (key == "cmpshare") { int on = 1; ls >> on; app.compareRangeMode = on ? 1 : 0; }
@@ -1889,10 +1939,14 @@ static std::string loadSession(const std::string& path) {
         // this path". Collected here and resolved after everything is open, for
         // exactly the reason the series block gives below - and taken again
         // rather than reloaded, because there is no file holding the answer.
-        else if (key == "stackavg")
-            app.avgRestore.push_back({ restOfLine(ls), FOLD_MEAN, false, 0, 0, {} });
-        else if (key == "stacksum")
-            app.avgRestore.push_back({ restOfLine(ls), FOLD_SUM, false, 0, 0, {} });
+        else if (key == "stackavg") {
+            app.avgRestore.push_back({ restOfLine(ls), {}, FOLD_MEAN, false, 0, 0, {} });
+            refFor = RM_AVG;                      // a `refmember` may follow
+        }
+        else if (key == "stacksum") {
+            app.avgRestore.push_back({ restOfLine(ls), {}, FOLD_SUM, false, 0, 0, {} });
+            refFor = RM_AVG;
+        }
         // The recipe's generation record (§10.2): count, input tuple digest,
         // and when the saved picture was computed. Attaches to the recipe line
         // just above (the writer keeps them adjacent); a record with no recipe
@@ -1959,7 +2013,8 @@ static std::string loadSession(const std::string& path) {
                 double val = parseSeriesValue(v.c_str());
                 if (v != "-" && !std::isfinite(val)) app.seriesRestore[curSeries].badValues++;
                 int mk = key == "seriessum" ? 1 : key == "seriesframe" ? 2 : 0;
-                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p, mk });
+                app.seriesRestore[curSeries].members.push_back({ val, inc != "0", p, mk, {} });
+                refFor = RM_SERIES;               // a `refmember` may follow
             }
         }
         // ---- analysisset block (docs/reader-analysisset.md §5.1): collected

@@ -365,7 +365,10 @@ struct ImageDoc {
     // for the same reason - paths round-trip, ids and names do not), and the
     // restore recomputes the mean once that stack is back. Empty on every frame
     // that came from a file, which is every other frame in the program.
-    std::string avgOfPath;
+    // avgOfMember is the other half of that key: two image members of one .npz
+    // share a path and are told apart by nothing else (§6.2's identity tuple),
+    // so a path-only recipe folded whichever of them came first.
+    std::string avgOfPath, avgOfMember;
     int avgFold = 0;                  // StackFold the recipe folds by. It rides
                                       // beside the path because the same line
                                       // must bring back the same QUANTITY - a
@@ -612,7 +615,11 @@ struct App {
     // eventually take.
     std::vector<uint64_t> cmpExtra;          // uids, in slot order (C, D, ...)
     uint64_t lastCompareBUid = 0;            // the B last CHOSEN, kept across compare being off
-    struct SlotWant { int frame; std::string path; };
+    // path + npz/exr member: the session's `cmpslot` line and the `refmember`
+    // that may follow it. An empty member is "the file itself, or an older
+    // session that could not say" - it matches any member, which is exactly
+    // what this resolved by before the key existed.
+    struct SlotWant { int frame; std::string path; std::string member; };
     std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
     int pendingCompare = -1;          // --compare, applied once two images exist
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
@@ -1262,6 +1269,7 @@ struct App {
     // queued rescan, so the stack this names does not exist yet.
     struct AvgRestore {
         std::string path;
+        std::string member;                                // ...of that file (refmember)
         int fold = FOLD_MEAN;                              // StackFold
         bool hasGen = false;                               // stackavggen was present
         int srcCount = 0;
@@ -1287,7 +1295,11 @@ struct App {
         // older viewer skips lines it does not know, so a sum declaration or a
         // frame member simply does not come back there - the right failure -
         // instead of a flag being dropped and a sum quietly reading as a mean.
-        struct M { double value; bool include; std::string path; int kind = 0; };
+        // member: the container member that path names, when the file has any
+        // (the `refmember` line). Empty = unconstrained, which is how every
+        // session written before that key resolves - by path alone.
+        struct M { double value; bool include; std::string path; int kind = 0;
+                   std::string member; };
         std::vector<M> members;
     };
     std::vector<SeriesRestore> seriesRestore;

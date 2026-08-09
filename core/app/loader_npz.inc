@@ -828,8 +828,11 @@ static const int VIEWER_NPZ_VERSION = 2;
 static std::string readerFileOf(const std::string& spec);   // fwd (§4.12, below)
 static std::string readerFuncOf(const std::string& spec);
 static std::string readerFor(const std::string& path);      // fwd (session.inc)
-static int seqIdOfFirstFramePath(const std::string& path, int preferBatch,
-                                 const std::vector<int>* taken);  // fwd (sequence.inc)
+// (the defaults live HERE, on the first declaration: sequence.inc's definition
+// is below two call sites that rely on them)
+static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
+                                 const std::vector<int>* taken = nullptr,
+                                 const std::string& member = std::string());  // fwd (sequence.inc)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
                                                      std::string& patternOut);  // fwd
 static std::string loadNpz(const std::string& path, const std::string& onlyMember,

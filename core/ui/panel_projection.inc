@@ -970,6 +970,10 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
     // same key Series members travel by, for the same reason (paths round-trip;
     // ids do not survive a session and names are renameable and not unique).
     const std::string firstPath = app.images[fr.front()]->src->path;
+    // ...and WHICH member of that file, when it has members: two 3-D members of
+    // one .npz share this path and §6.2's tuple tells them apart by nothing
+    // else, so a path-only recipe folded whichever of them came first.
+    const std::string firstMember = app.images[fr.front()]->src->member;
     // The INPUT TUPLE record (§10.2 / §6.2): one digest over the identity
     // tuple of every member the fold will read - (path or url, member,
     // fileFrame, remoteFrame, mtime, fsize), each statted at decode time, so
@@ -1088,6 +1092,7 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
         into->name = rName;
         into->note = note;
         into->avgOfPath = firstPath;
+        into->avgOfMember = firstMember;
         into->avgFold = fold;
         into->avgSeqId = seqId;
         into->avgStackRev = srcRev;
@@ -1131,6 +1136,7 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
     out->name = rName;
     out->note = note;
     out->avgOfPath = firstPath;
+    out->avgOfMember = firstMember;
     out->avgFold = fold;             // the recipe must round-trip its QUANTITY
     out->avgSeqId = seqId;           // the §10.1 key this doc will be judged by
     out->avgStackRev = srcRev;
@@ -1219,12 +1225,15 @@ static void requestStackAverage(int seqId, int fold) {
 static void pumpStackAverages() {
     if (app.pendingAvg.empty() && app.avgRestore.empty()) return;
     if (!loadingSettled()) return;
-    // A session's recipes name their stack by path; resolve them the moment
-    // everything is open, exactly as resolvePendingSeries does with members.
+    // A session's recipes name their stack by (path, member); resolve them the
+    // moment everything is open, exactly as resolvePendingSeries does with
+    // members. An empty member is a session written before that key: it matches
+    // any member, i.e. resolves exactly as it did then.
     for (const auto& p : app.avgRestore) {
         int found = 0;
         for (const auto& d : app.images)
-            if (d->seqId != 0 && d->src->path == p.path) { found = d->seqId; break; }
+            if (d->seqId != 0 && d->src->path == p.path &&
+                (p.member.empty() || d->src->member == p.member)) { found = d->seqId; break; }
         // the generation record rides to the reduction: the recompute is
         // where the fresh tuples exist to compare against it (§10.2)
         if (found) app.pendingAvg.push_back({ found, p.fold, p.hasGen,
@@ -1254,7 +1263,8 @@ static bool recomputeStackAverage(ImageDoc* m, std::string& err) {
     if (m->avgSeqId && seqInfo(m->avgSeqId)) seq = m->avgSeqId;
     else
         for (const auto& d : app.images)
-            if (d->seqId != 0 && d->src->path == m->avgOfPath) { seq = d->seqId; break; }
+            if (d->seqId != 0 && d->src->path == m->avgOfPath &&
+                d->src->member == m->avgOfMember) { seq = d->seqId; break; }
     if (!seq) {
         err = "the stack this frame was computed from is not open";
         return false;
