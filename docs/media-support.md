@@ -9,6 +9,38 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 
 ## 1. OpenEXR 対応
 
+> **状態: 実装済み (2026-08-09、#53)。以下の比較検討は当時のまま残す。**
+>
+> **この節の推奨 (tinyexr) はユーザーが覆し、公式 OpenEXR になった。** 残りの
+> 判断 —— channel マッピング、ロード時トーンマップなし、layer を npz member と
+> 同じ扱いにすること —— はそのまま生きている。変わったのは**提供元だけ**。
+>
+> 実装は `core/exrread.cpp`(`core/imagefile.h` の表の1行)。仕様と、読むもの・
+> 断るものの一覧は [input-adapters.md §3.6.2](input-adapters.md)。この節が
+> 「当面対象外」と書いた3つのうち **tiled は1レベルなら読む** ようになった
+> (格納形式にすぎず、リンク済みのライブラリが可逆に解くため)。deep と
+> multipart は名指しで断る。
+>
+> **実測コスト** (MinGW/GCC 16.1、Ninja、Release、`-j8`、同一マシンでの
+> ペア cold build。依存の取得時間は含まない —— 4つの既存依存は両側で同じ
+> ローカルソースを使い、OpenEXR+Imath+OpenJPH は「あり」側でソースから
+> ビルドされる):
+>
+> | | なし | あり | 差 |
+> |---|---|---|---|
+> | cold configure + build | 157 s | 314 s | **+157 s (+100%)** |
+> | `viewer.exe` | 9,141,893 B | 12,293,548 B | **+3,151,655 B (+3.01 MiB、+34.5%)** |
+> | `viewer-serve.exe` | 3,352,097 B | 3,352,097 B | **0 —— sha256 まで同一** |
+>
+> ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、cold tree でしか
+> 起きない。バイナリの増分は実コード(使わなければリンカが落とすため)。
+> `-DVIEWER_WITH_EXR=OFF` で両方ゼロに戻り、`.exr` は「形式としては残るが
+> このビルドには decoder が無い」と名指しで断る。
+>
+> **peer は形式を増やさない** (下の「remote への波及」の案 (a))。`viewer-serve`
+> が `core/imagefile.cpp` をコンパイルしないという1つの事実がそれを保証していて、
+> 上の byte 同一がその証拠。
+
 必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
 読むことだけ。deep / tiled / multipart は当面対象外。
 
