@@ -26,8 +26,12 @@ must not fall back to shape guessing.  Nothing already here changed meaning,
 so VERSION stays 1 (it moves when a FIELD changes meaning, not on additions).
 
 Returning a bare array is also allowed and is read exactly as the viewer reads a
-.npy natively -- (H,W) / (H,W,3|4) / (F,H,W) / (F,H,W,C).  Naming a type is what
-you do when you want to kill an ambiguity yourself.
+.npy natively -- (H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4).  The last axis is
+channels when it is FOUR OR FEWER, so a bare (H,W,1) comes back as one mono
+frame and (H,W,2) as one two-channel frame (issue #71); this file said "3|4"
+while the viewer, run_adapter.py and core/serve.cpp all said "4 or fewer", and
+an adapter author reading only this line would have expected a stack.  Naming a
+type is what you do when you want to kill an ambiguity yourself.
 
 Promises this file keeps (docs/input-adapters.md 4.10):
 
