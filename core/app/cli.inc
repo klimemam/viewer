@@ -1433,6 +1433,115 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 (int)(sizeof SWEEP / sizeof SWEEP[0]), badC ? "FAIL" : "ok");
         bad += badC ? 1 : 0;
     }
+    {   // ---- the REFUSAL, through both doors (issue #71 D4/D5) -------------
+        //
+        // The block above pins what the two doors ACCEPT. This one pins what
+        // they REJECT, which had drifted apart in its own way: the local door
+        // refuses a non-native shape by naming it and naming the four forms
+        // that would have worked (§3.2, asserted locally by V22c), while the
+        // peer said "unsupported .npy shape" and stopped. The same bad file was
+        // therefore a refusal with a destination through File > Open and a dead
+        // end through a peer - the half of #71 recorded as D4.
+        //
+        // The assert is deliberately not "the peer's message contains some
+        // words". It is that the LOCAL message STARTS WITH the peer's, which is
+        // the strongest form the two can be in while remaining honest: the same
+        // sentence about the same file, and the only thing the local door adds
+        // is the line about the reader picker - the way out that exists on this
+        // side and not yet on the other (D3). If someone edits one spelling
+        // without the other, this fails.
+        //
+        // D5 is the listing half. LIST carries FOUR dims, so a rank above four
+        // has no representation in them; the client used to clamp the rank to 4
+        // and Browse then showed a five-axis file as a four-axis shape that the
+        // loader would refuse by name. It now claims no shape at all, which is
+        // what fmtEntryShape renders as "-". The peer cannot currently send
+        // such an entry (it only sets LE_META after a parse that accepts rank
+        // 2, 3 and 4 only), so what this pins is the OTHER half: a file the
+        // loader refuses must not arrive in the listing wearing a shape.
+        std::error_code rec;
+        std::filesystem::path rdir =
+            std::filesystem::temp_directory_path(rec) / "viewer_refusal";
+        std::filesystem::remove_all(rdir, rec);
+        std::filesystem::create_directories(rdir, rec);
+        std::vector<uint16_t> rp16(2 * 3 * 4 * 5 * 6);
+        for (size_t i = 0; i < rp16.size(); i++) rp16[i] = (uint16_t)(i * 3 + 1);
+        struct Ref { const char* file; std::vector<int64_t> shape; bool ceiling;
+                     const char* why; };
+        // No DIGITS in these names, for the reason V22's ACCEPT table gives at
+        // length: "r_1d" and "r_5d" are numbered siblings, and the listing
+        // folds those into one synthetic stack entry - so neither would appear
+        // under its own name in the LIST check below, and the check would pass
+        // by finding nothing. (It did, until the names lost their digits.)
+        const Ref REFUSE[] = {
+            { "r_fiveaxes.npy",  { 2, 3, 4, 5, 6 }, false, "five axes: no native reading" },
+            { "r_oneaxis.npy",   { 12 },            false, "1-D is an axis, not a picture" },
+            { "r_chceiling.npy", { 2, 8, 8, 5 },    true,  "(F,H,W,C): C past the ceiling" },
+        };
+        size_t badR = 0;
+        for (const Ref& t : REFUSE) {
+            size_t n = 1;
+            for (int64_t d : t.shape) n *= (size_t)d;
+            std::string p = npyWriteFile((rdir / t.file).u8string(), "<u2", t.shape,
+                                         rp16.data(), n * 2);
+            // the peer's answer...
+            remote::Meta rm;
+            std::string perr;
+            bool popened = s.meta(p, rm, perr);
+            // ...and this door's, on the same bytes
+            closeAll();
+            std::string lerr = loadNpy(p);
+            bool lopened = lerr.empty() && cur() != nullptr;
+            // Neither door may open it, and the peer's sentence must be the
+            // local one's opening - identical for the ceiling refusal, which
+            // has no "choose a reader" line on either side.
+            bool bothRefuse = !popened && !lopened;
+            bool sameSentence = !perr.empty() && lerr.rfind(perr, 0) == 0;
+            bool namesShape = perr.find(npyShapeText(t.shape)) != std::string::npos;
+            bool namesForms = t.ceiling ||
+                              (perr.find("(H,W)") != std::string::npos &&
+                               perr.find("(H,W,C<=4)") != std::string::npos &&
+                               perr.find("(F,H,W)") != std::string::npos &&
+                               perr.find("(F,H,W,C<=4)") != std::string::npos);
+            bool ok = bothRefuse && sameSentence && namesShape && namesForms;
+            fprintf(stderr, "selftest: refusal %-15s peer=\"%s\"  (%s)\n",
+                    npyShapeText(t.shape).c_str(), perr.c_str(), t.why);
+            if (!ok)
+                fprintf(stderr, "selftest:   local=\"%s\"  bothRefuse=%d same=%d"
+                                " namesShape=%d namesForms=%d\n",
+                        lerr.c_str(), (int)bothRefuse, (int)sameSentence,
+                        (int)namesShape, (int)namesForms);
+            badR += ok ? 0 : 1;
+        }
+        // D5: none of those may appear in the listing wearing a shape.
+        {
+            std::vector<remote::Entry> ents;
+            std::string lerr2;
+            if (!s.list(rdir.u8string(), ents, lerr2)) {
+                fprintf(stderr, "selftest refusal LIST: %s\n", lerr2.c_str());
+                badR++;
+            } else {
+                for (const Ref& t : REFUSE) {
+                    const remote::Entry* me = nullptr;
+                    for (const auto& e : ents) if (e.name == t.file) me = &e;
+                    // The ceiling case IS a native rank, so the peer may well
+                    // describe it; what must never happen is a shape whose rank
+                    // is not the rank the file declares.
+                    bool listedHonestly =
+                        me && (!me->hasMeta ||
+                               me->ndim == (int)t.shape.size());
+                    fprintf(stderr, "selftest: listing %-15s shape column \"%s\"\n",
+                            t.file, me ? fmtEntryShape(*me).c_str() : "<missing>");
+                    badR += listedHonestly ? 0 : 1;
+                }
+            }
+        }
+        closeAll();
+        std::filesystem::remove_all(rdir, rec);
+        fprintf(stderr, "selftest: refusals name the shape, both doors: %s\n",
+                badR ? "FAIL" : "ok");
+        bad += badR ? 1 : 0;
+    }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
     return bad ? 1 : 0;

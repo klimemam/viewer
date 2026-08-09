@@ -418,11 +418,21 @@ static bool parseEntryV3(R& r, Entry& e) {
     if (d & rp::LE_META) {
         uint32_t dt = 0, nd = 0, fo = 0;
         if (!r.u32(dt) || !r.u32(nd)) return false;
-        for (uint32_t& v : e.dims) if (!r.u32(v)) return false;
+        for (uint32_t& v : e.dims) if (!r.u32(v)) return false;   // always 4 on the wire
         if (!r.u32(fo)) return false;
-        e.hasMeta = true;
+        // The wire carries FOUR dims. A rank above that cannot be represented
+        // in them, so it is not clamped to 4 - clamping printed a 5-D file into
+        // the listing as a four-axis shape that the loader would then refuse by
+        // name, a listing telling the user something the opener disagreed with
+        // (issue #71 D5). Today no peer can send it: core/serve.cpp only sets
+        // LE_META after a header parse that refuses any rank but 2, 3 or 4. So
+        // this is the guard for a peer that is newer, older or wrong, and the
+        // honest answer to a shape we cannot spell is to claim no shape at all
+        // - Browse renders that as "-" (fmtEntryShape) and the file still
+        // lists, with its name, size and mtime intact.
+        e.hasMeta = nd >= 1 && nd <= 4;
         e.dtype = rp::dtypeName(dt);
-        e.ndim = (int)std::min(nd, 4u);
+        e.ndim = (int)nd;
         e.fortran = fo != 0;
     }
     if (d & rp::LE_GROUP) {

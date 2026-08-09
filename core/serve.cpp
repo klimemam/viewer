@@ -159,7 +159,10 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     if (n.dtype == DT_COUNT) { err = "unsupported dtype " + descr; return false; }
     n.elemSize = dtypeSize(n.dtype);
 
-    std::vector<long long> dims;
+    // int64_t rather than long long so this vector is the type
+    // rp::npyShapeText takes: on Linux int64_t is `long`, so the two spellings
+    // are DIFFERENT types there even though they are the same on Windows.
+    std::vector<int64_t> dims;
     size_t open = hdr.find('(', sp), close = hdr.find(')', open);
     for (size_t i = open + 1; i < close; ) {
         while (i < close && (hdr[i] == ' ' || hdr[i] == ',')) i++;
@@ -176,12 +179,32 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     }
     else if (dims.size() == 4) { n.frames = (int)dims[0]; n.h = (int)dims[1];
                                  n.w = (int)dims[2]; n.ch = (int)dims[3]; }
-    else { err = "unsupported .npy shape"; return false; }
+    // §3.2, and the same sentence the local door uses (rp::npyNotNativeText).
+    // "unsupported .npy shape" named neither the shape that arrived nor the
+    // shapes that would have worked, so the SAME bad file was a refusal with a
+    // destination through File > Open and a dead end through a peer - the
+    // asymmetry issue #71 recorded as D4. V22c asserts this on the local side;
+    // R3 below asserts the peer says it too.
+    else { err = npyNotNativeText(dims); return false; }
+    // (F,H,W,C) IS a native form; C > 4 is this viewer's own ceiling, so it is
+    // said as a ceiling and not as "not a native form" - a different refusal
+    // deserves a different sentence. Word for word what the local door says
+    // (core/app/loader_npz.inc), for the D4 reason above: one file, one answer,
+    // whichever way it was opened.
+    if (n.ch > 4) {
+        err = npyShapeText(dims) + " would be " + std::to_string(n.ch) +
+              " channels: this viewer shows up to 4";
+        return false;
+    }
     // A malformed header must produce an error message, not a std::length_error
     // that terminates the peer: negative dims flow into size arithmetic as 2^64.
+    // Still one guard over every axis, but it NAMES the shape now: "unreasonable
+    // .npy shape" told a user nothing they could act on or report.
     if (n.w <= 0 || n.h <= 0 || n.w > (1 << 20) || n.h > (1 << 20) ||
-        n.ch < 1 || n.ch > 4 || n.frames < 1 || n.frames > (1 << 20)) {
-        err = "unreasonable .npy shape";
+        n.ch < 1 || n.frames < 1 || n.frames > (1 << 20)) {
+        err = npyShapeText(dims) + " has an axis this cannot read: "
+              "every axis must be at least 1, and H and W at most " +
+              std::to_string(1 << 20);
         return false;
     }
     // Per-axis element strides. C order: the last dimension is fastest.

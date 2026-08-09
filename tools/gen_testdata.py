@@ -48,11 +48,20 @@ np.save(out / "zone_be_f32.npy", zone.astype(">f4"))
 # testable at all.  The folder existed by hand and was therefore invisible to
 # CI (tools/testdata/ is gitignored and only this script fills it).
 #
-# hw1_ and hw2_ are the two shapes issue #71 is about: the last axis is 1 or 2,
-# where core/main.cpp (== 3 || == 4) and core/serve.cpp (<= 4) disagree today.
-# They are FIXTURES ONLY - nothing asserts on them yet, deliberately: asserting
-# would pick the side the issue exists to decide.  A mono capture saved as
-# img[:, :, None] is an ordinary thing for numpy code to produce.
+# hw1_ and hw2_ are the two shapes issue #71 was about: the last axis is 1 or 2,
+# where the local decoder (== 3 || == 4) and core/serve.cpp (<= 4) used to
+# disagree, so the same file opened as H frames of 1xW through File > Open and
+# as one WxH picture through a peer.  Settled 2026-08-05: the last axis is
+# CHANNELS when it is four or fewer, on both sides.  (H,W,1) is one mono frame
+# and (H,W,2) is one two-channel frame - which is what img[:, :, None] and
+# np.expand_dims(a, -1) produce, an ordinary thing for numpy code to save.
+#
+# These were laid down without asserts while the question was open.  The asserts
+# exist now and do NOT live here: they write their own fixtures inside the test
+# (V22 in core/selftest/verify.inc, and the "channel rule, both doors" sweep in
+# --remote-selftest), so they run on a machine that has never run this script.
+# These files stay because they are what a person reaches for when trying the
+# rule out by hand.
 shp = out / "shapes"
 shp.mkdir(exist_ok=True)
 sh_h, sh_w = 64, 80
