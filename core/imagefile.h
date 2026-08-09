@@ -155,4 +155,23 @@ std::string decodableFormats();
 // refusal is more useful than the raw-dialog fallback a filtered-out file gets.
 std::string dialogPattern();
 
+// The formats this build refuses OUTRIGHT, by name: the codec-bearing video
+// containers. "" when `path` is not one of them.
+//
+// Deliberately not rows in the table above, and the difference is the reason
+// rather than the mechanism. That table answers "what decodes this, and what
+// would it take to" - its `absent` state is a format this build COULD read if
+// something were linked, and its dispatch is by BYTES. These are formats this
+// build has decided not to read even though a library could: an 8-bit lossy
+// round trip destroys the measurement (docs/video-support.md §1 measured a
+// sigma_t of 40 DN16 coming back as 0.00), so linking a codec would not change
+// the answer. They are matched by NAME, they have no decoder to point at, and
+// putting twenty-one of them in the table would also march *.mp4 into
+// dialogPattern() and thus into the image file dialog - the opposite of what
+// this says.
+//
+// Implemented in core/y4mread.cpp, beside the one video container that IS read,
+// because the two halves of that decision only make sense together.
+std::string videoRefusal(const std::string& path);
+
 }  // namespace imagefile

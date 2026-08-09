@@ -1312,6 +1312,19 @@ static void openPath(const std::string& path) {
             toast("loaded " + baseName(path));
     } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
         openFolder(path);                     // dropping a folder loads every stack below it
+    } else if (!imagefile::videoRefusal(path).empty()) {
+        // A codec-bearing video container. Refused BY NAME, with the measured
+        // reason and the conversion that would be honest - and refused HERE,
+        // before the raw dialog, because that dialog would invite the operator
+        // to type a width and a height for an H.264 bitstream and would then
+        // show them a picture made of entropy-coded bytes.
+        //
+        // It is not a row in core/imagefile.h's table: see core/y4mread.h. The
+        // short of it is that the table decides by BYTES and answers "what
+        // would it take to read this", and these are refused by NAME for a
+        // reason that no library would change.
+        toast(baseName(path) + ": " + imagefile::videoRefusal(path), true);
+        openReaderPicker(path, imagefile::videoRefusal(path));
     } else {
         openRawDialogFor(path);
     }

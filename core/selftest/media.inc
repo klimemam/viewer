@@ -54,11 +54,11 @@
             // a suite that quietly passed with the format switched off would be
             // reporting on a viewer nobody ships.
 #ifdef VIEWER_WITH_EXR
-            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, OpenEXR",
-                  "M1 this build decodes PNG, JPEG, TIFF and OpenEXR");
+            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, OpenEXR, y4m",
+                  "M1 this build decodes PNG, JPEG, TIFF, OpenEXR and y4m");
 #else
-            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF",
-                  "M1 this build decodes PNG, JPEG and TIFF");
+            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, y4m",
+                  "M1 this build decodes PNG, JPEG, TIFF and y4m");
             check(imagefile::forPath("x.exr") && !imagefile::forPath("x.exr")->decode &&
                   imagefile::forPath("x.exr")->absent,
                   "M1 ...and .exr is still LISTED, with the reason there is no decoder");
@@ -728,6 +728,181 @@
         }
 #endif  // VIEWER_WITH_EXR
 
+        // ---- M24-M28: y4m, and the video this build will NOT read -----------
+        // docs/video-support.md is the argument; this is the enforcement of it.
+        // The question that decides whether a video may be loaded is not "can it
+        // be decoded" but "are the numbers still the numbers": an 8-bit lossy
+        // round trip turns a known sigma_t of 40 DN16 into 0.00 - not degraded,
+        // GONE - so a per-frame noise plot over such a stack measures the
+        // encoder. y4m is read because it is bit-exact; everything else is
+        // refused BY NAME with that measurement and the conversion that would be
+        // honest. Both halves are asserted, because the refusal is the larger
+        // half of what "reads video" means here.
+        //
+        // Frame f, pixel (x,y) = 1000 + 100f + 3x + y: the value names its own
+        // frame AND its own position, so "in presentation order" and
+        // "bit-exact" are one check instead of two.
+        {
+            auto vpix = [](int f, int x, int y) { return 1000 + 100 * f + 3 * x + y; };
+
+            // ---- M24: one file is ONE stack, and the samples are the samples --
+            closeAll();
+            app.toast.clear();
+            openPath(root + "/mono16.y4m");
+            const size_t n = app.images.size();
+            const int sid = n ? app.images[0]->seqId : 0;
+            bool oneStack = n == 5 && sid != 0;
+            if (oneStack)
+                for (size_t i = 0; i < n; i++)
+                    if (app.images[i]->seqId != sid || app.images[i]->seqIndex != (int)i)
+                        oneStack = false;
+            // COUNT the comparisons: "no sample mismatched" is vacuously true
+            // when no sample was reached, and a test that passes by not running
+            // is worse than no test.
+            bool exact = n == 5;
+            long cmp = 0;
+            if (exact)
+                for (int f = 0; f < 5; f++) {
+                    ImageDoc* d = app.images[(size_t)f].get();
+                    if (d->w != 16 || d->h != 8 || d->ch != 1 || d->dtype != "u16") {
+                        exact = false; break;
+                    }
+                    for (int y = 0; y < 8; y++)
+                        for (int x = 0; x < 16; x++) {
+                            if (d->sample(x, y, 0) != (float)vpix(f, x, y)) exact = false;
+                            cmp++;
+                        }
+                }
+            fprintf(stderr, "mediaselftest: M24 %zu doc(s) seq=%d compared=%ld/640 "
+                            "f0(0,0)=%g f4(0,0)=%g note=\"%s\"\n",
+                    n, sid, cmp, n ? app.images[0]->sample(0, 0, 0) : -1.f,
+                    n > 4 ? app.images[4]->sample(0, 0, 0) : -1.f,
+                    n ? app.images[0]->note.c_str() : app.toast.c_str());
+            check(oneStack, "M24 one y4m file is ONE stack of 5 frames, in presentation order");
+            check(exact && cmp == 640,
+                  "M24 ...and every sample is the sample that was written, 16-bit, unscaled");
+            check(n == 5 && app.images[1]->black == app.images[0]->black &&
+                  app.images[1]->white == app.images[0]->white,
+                  "M24 the frames share one display range, so they are comparable");
+            // "bit-exact" is what earns the [DN] label; the transfer curve is a
+            // SEPARATE claim this container does not make, and the note must not
+            // make it either - a linearity fit over these frames depends on it.
+            check(n && has(app.images[0]->note, "bit-exact") &&
+                  has(app.images[0]->note, "not assumed linear"),
+                  "M24 the note says exact, and says linear is NOT assumed");
+
+            // One frame is one picture. The stack rule must not mint a SeqInfo
+            // for a file that holds a single frame.
+            ImageDoc* one = open1("one.y4m");
+            check(one && app.images.size() == 1 && one->seqId == 0 && one->w == 16,
+                  "M24 a one-frame y4m is one frame, not a stack of one");
+
+            // ---- M25: chroma is present and NOT read -------------------------
+            // Making three full-resolution channels out of one sample per 2x2
+            // means interpolating, and an interpolated value is not a
+            // measurement. Luma only - and the note says the chroma was there.
+            {
+                ImageDoc* d = open1("sub420.y4m");
+                bool luma = d && d->ch == 1 && d->dtype == "u8" && app.images.size() == 5;
+                // an 8-bit plane holds the LOW byte of the fixture value
+                bool vals = luma && d->sample(1, 0, 0) == (float)(vpix(0, 1, 0) & 0xff);
+                fprintf(stderr, "mediaselftest: M25 C420 %zu doc(s) ch=%d note=\"%s\"\n",
+                        app.images.size(), d ? d->ch : -1,
+                        d ? d->note.c_str() : app.toast.c_str());
+                check(luma && vals, "M25 a subsampled y4m opens as luma only, 1 channel");
+                check(d && has(d->note, "NOT read") && has(d->note, "not a measurement"),
+                      "M25 ...and the note says the chroma was there and why it was left");
+
+                // C420paldv begins with the same letter as the pNN depth marker.
+                // Reading its depth as atoi("aldv") = 0 refused an ordinary
+                // 8-bit PAL-DV file as "a luma bit depth of 0".
+                ImageDoc* p = open1("paldv.y4m");
+                fprintf(stderr, "mediaselftest: M25 C420paldv ch=%d px(1,0)=%g \"%s\"\n",
+                        p ? p->ch : -1, p ? p->sample(1, 0, 0) : -1.f, app.toast.c_str());
+                check(p && p->ch == 1 && app.images.size() == 5 &&
+                      p->sample(1, 0, 0) == (float)(vpix(0, 1, 0) & 0xff),
+                      "M25 C420paldv reads as 8-bit, not as depth 0");
+            }
+
+            // ---- M26: n of N, because N is arithmetic ------------------------
+            // Frames are fixed-size, so the byte count says how many there were.
+            // This is the one format here where the tool knows exactly what it
+            // is missing, and docs/terminology.md forbids not saying so. N is
+            // what the SURVIVING bytes imply, not the length of the original
+            // capture: half of the 5-frame fixture is 2 whole frames and a third
+            // begun, so the honest report is "2 of 3" - claiming 5 would be
+            // inventing a number the file does not contain.
+            {
+                closeAll();
+                app.toast.clear();
+                openPath(root + "/cut.y4m");
+                const size_t got = app.images.size();
+                fprintf(stderr, "mediaselftest: M26 truncated -> %zu doc(s) note=\"%s\"\n",
+                        got, got ? app.images[0]->note.c_str() : app.toast.c_str());
+                check(got == 2, "M26 a y4m cut in half yields its 2 WHOLE frames");
+                check(got && has(app.images[0]->note, "2 of 3 frames"),
+                      "M26 ...and says 2 of 3 - what the bytes imply, not the 5 that were written");
+            }
+
+            // ---- M27: what y4m itself refuses, by name -----------------------
+            {
+                struct Case { const char* file; const char* needle; const char* what; };
+                const Case cases[] = {
+                    { "fields.y4m", "two instants",
+                      "M27 an interlaced y4m is refused: a frame that is two fields is two instants" },
+                    { "badcsp.y4m", "C777",
+                      "M27 a colour space this reader does not know is refused BY NAME" },
+                };
+                for (const Case& c : cases) {
+                    ImageDoc* d = open1(c.file);
+                    const std::string msg = app.toast;
+                    fprintf(stderr, "mediaselftest: M27 %-12s -> \"%s\"\n", c.file, msg.c_str());
+                    check(!d && app.images.empty() && has(msg, c.file) && has(msg, "y4m:") &&
+                          has(msg, c.needle) && has(msg, "choose a reader"), c.what);
+                }
+            }
+
+            // ---- M28: a lossy container is refused by name, reason, remedy ---
+            // Never a bare "cannot open", and never the RAW dialog - which would
+            // invite the operator to type a width and a height for an H.264
+            // bitstream and would then show them a picture made of entropy-coded
+            // bytes. The reason is a MEASUREMENT (docs/video-support.md §1), not
+            // an opinion about lossy compression.
+            {
+                ImageDoc* d = open1("capture.mp4");
+                const std::string msg = app.toast;
+                fprintf(stderr, "mediaselftest: M28 mp4 -> \"%s\"\n", msg.c_str());
+                check(!d && app.images.empty() && has(msg, "capture.mp4") &&
+                      has(msg, "H.264"),
+                      "M28 an .mp4 is refused, naming the codec family it would need");
+                check(has(msg, "40 DN16") && has(msg, "0.00"),
+                      "M28 ...with the MEASURED reason, not an opinion about lossy video");
+                check(has(msg, ".y4m") && has(msg, "ffmpeg -i"),
+                      "M28 ...and the conversion that would be honest, ready to paste");
+                check(!rawDlg.open,
+                      "M28 ...and the RAW geometry dialog is NOT offered for a bitstream");
+                check(app.readerPanelOpen &&
+                      app.readerPickPath.find("capture.mp4") != std::string::npos,
+                      "M28 a refused video raises the Reader panel on itself, like every refusal");
+
+                // A container that can hold a LOSSLESS codec says so: the answer
+                // for a .mov is not the same sentence as for a .webm, because
+                // one of them might have been DN all along.
+                ImageDoc* m = open1("capture.mp4");
+                (void)m;
+                const std::string mov = imagefile::videoRefusal("x/capture.mov");
+                const std::string webm = imagefile::videoRefusal("x/capture.webm");
+                fprintf(stderr, "mediaselftest: M28 mov mentions lossless=%d webm=%d\n",
+                        (int)(mov.find("LOSSLESS") != std::string::npos),
+                        (int)(webm.find("LOSSLESS") != std::string::npos));
+                check(mov.find("LOSSLESS") != std::string::npos &&
+                      webm.find("LOSSLESS") == std::string::npos,
+                      "M28 a container that MIGHT hold a lossless codec is told so; one that cannot is not");
+                check(imagefile::videoRefusal("x/frame_001.npy").empty(),
+                      "M28 ...and nothing that is not a video container is caught by this");
+            }
+        }
+
         // ---- M8: the two other ways to be refused ---------------------------
         {
             ImageDoc* d = open1("broken.png");
@@ -744,7 +919,7 @@
             // The list of formats in the sentence is COMPUTED from the table
             // (imagefile.cpp listFormats), so it grows when a row is added -
             // which is the point: this assert is what notices.
-            check(!d && has(msg, "not a PNG, JPEG, TIFF or OpenEXR file") &&
+            check(!d && has(msg, "not a PNG, JPEG, TIFF, OpenEXR or y4m file") &&
                   has(msg, "68 65 6c 6c"),
                   "M8 a file that is none of them is refused with its first bytes");
         }

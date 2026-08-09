@@ -198,7 +198,7 @@ add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
                       core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
-                      core/stb_image_impl.c
+                      core/y4mread.cpp core/stb_image_impl.c
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a

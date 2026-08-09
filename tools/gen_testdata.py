@@ -846,6 +846,81 @@ write_bigtiff_gray8(media / "big.tif", g8)
 (media / "broken.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
 (media / "notanimage.png").write_bytes(b"hello, this is not a picture\n")
 
+
+# ------------------------------------------------------------------ y4m ----
+# The one video container this build reads (docs/video-support.md). It is here
+# and not in tools/mkexr.cpp - and not shelled out to ffmpeg, which CI does not
+# have - because a y4m IS a text header plus raw planes: writing one from its
+# own samples is twenty lines, and that is the same property that makes it the
+# format whose numbers survive at all. If a fixture generator needed a codec,
+# the format would not belong in this viewer.
+#
+# Frame f, pixel (x,y) = 1000 + 100f + 3x + y. The value names its own FRAME and
+# its own POSITION, so "the frames are in presentation order" and "the samples
+# are bit-exact" are one check rather than two - a reader that returned the
+# frames reversed, or that swapped rows and columns, fails on the value.
+Y4W, Y4H, Y4N = 16, 8, 5
+
+
+def y4m_luma(f, bps):
+    b = bytearray()
+    for y in range(Y4H):
+        for x in range(Y4W):
+            v = 1000 + 100 * f + 3 * x + y
+            b.append(v & 0xFF)                    # y4m is little-endian
+            if bps == 2:
+                b.append((v >> 8) & 0xFF)
+    return bytes(b)
+
+
+def y4m_bytes(header, bps, chroma_bytes=0, frames=Y4N):
+    blob = header.encode("ascii")
+    for f in range(frames):
+        blob += b"FRAME\n" + y4m_luma(f, bps) + b"\x80" * chroma_bytes
+    return blob
+
+
+# 16-bit mono: the honest case. Bit-exact luma, so the values are DN.
+mono16 = y4m_bytes("YUV4MPEG2 W16 H8 F30:1 Ip A1:1 Cmono16 XCOLORRANGE=FULL\n", 2)
+(media / "mono16.y4m").write_bytes(mono16)
+
+# One frame is not a stack - it is one picture, and the seam must not mint a
+# SeqInfo for it.
+(media / "one.y4m").write_bytes(
+    y4m_bytes("YUV4MPEG2 W16 H8 F30:1 Ip A1:1 Cmono16\n", 2, frames=1))
+
+# Subsampled chroma: present in the file, NOT read. Luma only, said in the note.
+_sub = 2 * (Y4W // 2) * (Y4H // 2)
+(media / "sub420.y4m").write_bytes(
+    y4m_bytes("YUV4MPEG2 W16 H8 F30:1 Ip A1:1 C420jpeg\n", 1, _sub))
+
+# C420paldv is an ordinary 8-bit file whose suffix begins with the same letter
+# as the pNN bit-depth marker. Reading its depth as atoi("aldv") = 0 refused it
+# as "a luma bit depth of 0", so the digit test in y4mread.cpp is pinned by a
+# fixture rather than by eye.
+(media / "paldv.y4m").write_bytes(
+    y4m_bytes("YUV4MPEG2 W16 H8 F30:1 Ip A1:1 C420paldv\n", 1, _sub))
+
+# Refused: a frame that is two fields is two instants, so sigma_t over such a
+# stack is not a temporal noise.
+(media / "fields.y4m").write_bytes(
+    y4m_bytes("YUV4MPEG2 W16 H8 F30:1 It A1:1 Cmono\n", 1))
+
+# Refused: a colour space this reader does not know. Named, not "unsupported".
+(media / "badcsp.y4m").write_bytes(
+    y4m_bytes("YUV4MPEG2 W16 H8 F30:1 Ip A1:1 C777\n", 1))
+
+# Cut in half. N is ARITHMETIC from the byte count (the format declares no frame
+# count anywhere), so the honest report is what the SURVIVING bytes imply:
+# 56-byte header + 5 x 262-byte frames = 1366; half = 683; 627 body bytes =
+# 2 x 262 + 103, so 2 whole frames and a third begun -> "2 of 3", never "2 of 5".
+(media / "cut.y4m").write_bytes(mono16[: len(mono16) // 2])
+
+# Not a y4m at all, and not a picture either: the refusal for a codec-bearing
+# container is by NAME, so what is inside is irrelevant and this says so by
+# being obviously nothing.
+(media / "capture.mp4").write_bytes(b"\x00" * 4096)
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     if p.is_dir():
