@@ -15,9 +15,13 @@
 #      the run instead of quietly testing yesterday's exe;
 #   2. regenerates tools/testdata (deterministic, gitignored, never committed);
 #   3. asks the machine ONCE whether it can make the OpenGL context that every
-#      selftest not labelled `nogl` needs (today that is six of the 26 - the
-#      ones that drive real ImGui frames), because "there is no GL here" and
-#      "an assert failed" are different events that used to look identical;
+#      selftest not labelled `nogl` needs - the ones that drive real ImGui
+#      frames, five of the 34 today - because "there is no GL here" and "an
+#      assert failed" are different events that used to look identical. The
+#      figures in this header are the only ones written down: what a given run
+#      actually did is the "ran N, skipped M" line it prints at the end, which
+#      is computed from ctest and cannot go stale the way these can (they had,
+#      by six, until the audit that added the invariant check below);
 #   4. runs ctest, one line per selftest, printing the full output of any that
 #      fail - these tests say "NAME: assert text PASS/FAIL", and that text is
 #      what you need, not an exit code;
@@ -65,14 +69,14 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
 fi
 
 # ---- preflight: a display ---------------------------------------------------
-# Six selftests create a real GLFW window and an OpenGL context; the other 20
+# Five selftests create a real GLFW window and an OpenGL context; the other 29
 # take the --no-window startup path and want no display at all. Saying which
-# case this machine is in, once and up front, beats six identical "failed to
+# case this machine is in, once and up front, beats five identical "failed to
 # create window" failures further down.
 if [ "$(uname -s)" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if ! command -v xvfb-run >/dev/null 2>&1; then
-        # NOT fatal any more: the 20 windowless selftests still run and still
-        # gate here, and the probe below will name the six that cannot.
+        # NOT fatal any more: the 29 windowless selftests still run and still
+        # gate here, and the probe below will name the five that cannot.
         echo "run_selftests: headless Linux with no xvfb-run - the selftests that" >&2
         echo "run_selftests: need a window cannot run (they are named at the end)." >&2
         echo "run_selftests: to run everything: apt-get install -y xvfb, or set DISPLAY." >&2
@@ -294,7 +298,7 @@ echo "== OpenGL probe =="
 # rest are skipped by name. Nothing here knows which tests those are: the labels
 # come from ctest, so a test that stops needing a window starts running here the
 # moment CMakeLists.txt says NOGL, with no edit to this script.
-probe_out="$(ctest --test-dir "$build_dir" -C "$config" -L glprobe -V 2>&1)"
+probe_out="$(ctest --test-dir "$build_dir" -C "$config" -L "^glprobe$" -V 2>&1)"
 probe_rc=$?
 gl_reason="$(printf '%s\n' "$probe_out" | sed -n 's/.*no OpenGL context on this machine: //p' | head -1)"
 gl_ok="$(printf '%s\n' "$probe_out" | sed -n 's/.*OpenGL context OK: //p' | head -1)"
@@ -304,7 +308,7 @@ have_gl=1
 # was written and was never implemented, so the switch a developer would use to
 # check what Windows and macOS actually run did nothing at all - which is a
 # small version of the very thing it exists to catch. Three lines, here, so that
-# "21 ran, 6 skipped on the runners with no context" is something a developer
+# "29 ran, 5 skipped on the runners with no context" is something a developer
 # can MEASURE on a box that has one, instead of waiting for CI to say it.
 if [ -n "${VIEWER_FORCE_NO_GL:-}" ] && [ "${VIEWER_FORCE_NO_GL}" != "0" ]; then
     have_gl=0
@@ -341,7 +345,13 @@ fi
 # this file on purpose: the day a test stops needing a window it gains NOGL in
 # CMakeLists.txt and moves between these sets by itself.
 tests_labelled() {
-    ctest --test-dir "$build_dir" -C "$config" -N -L "$1" 2>/dev/null \
+    # ANCHORED. `ctest -L` takes a REGEX, not a name, so an unanchored `-L
+    # selftest` also selects `typo-selftest`, `selftest-slow` and anything else
+    # merely CONTAINING the word - measured, not assumed. Membership of the gate
+    # is meant to be a yes/no fact about a label, so it is asked as one; without
+    # the anchors a mislabelled test can join the run set by accident, which is
+    # the same silence as leaving it out, only pointing the other way.
+    ctest --test-dir "$build_dir" -C "$config" -N -L "^$1\$" 2>/dev/null \
         | sed -n 's/^ *Test *#[0-9]*: *//p'
 }
 minus() {                        # lines of $1 that are not whole lines of $2
@@ -356,6 +366,46 @@ quarantined="$(tests_labelled quarantine)"
 # Quarantined tests are DISABLED: reported below on their own terms, and neither
 # "ran" nor "skipped for want of GL".
 gated="$(minus "$all_tests" "$quarantined")"
+
+# ---- the labelling invariant, ASKED rather than trusted ---------------------
+# Both lists below are computed from `selftest`. `nogl` only chooses which
+# BRANCH a test runs in, so a test carrying `nogl` and not `selftest` is in
+# neither list in either branch: with a context it does not run and is not
+# named; without one it runs and is not named as having run. It is the single
+# hole in this script's promise that a test which did not run is never silent,
+# and it is not hypothetical - test_prnu sat in it from the day it was written
+# until 1d951d3, through every green run on three runners, and was found by
+# accident rather than by anything asking.
+#
+# ctest cannot ask this: labels are free-form strings and only this file knows
+# what they are supposed to mean here. So the question is asked here, once,
+# beside the two sets it decides between. CMakeLists.txt states the rule where
+# the tests are registered; this is the check that it held.
+stray_nogl="$(minus "$nogl_tests" "$all_tests")"
+if [ -n "$stray_nogl" ]; then
+    echo >&2
+    echo "run_selftests: MISLABELLED - carries 'nogl' but not 'selftest':" >&2
+    printf '%s\n' "$stray_nogl" | sed 's/^/run_selftests:     /' >&2
+    echo "run_selftests: such a test runs ONLY where there is no GL context, and" >&2
+    echo "run_selftests: is reported in neither the ran list nor the skipped one." >&2
+    echo "run_selftests: give it LABELS \"selftest;nogl\" in CMakeLists.txt - see" >&2
+    echo "run_selftests: THE LABELLING RULE above the hand-registered tests there." >&2
+    exit 1
+fi
+
+# ...and the other shape of the same silence: a registered test that is in no
+# run set at all - a typo'd label, a missing one, or a dependency that started
+# registering tests of its own into our ctest (the EXR subprojects are told
+# BUILD_TESTING=OFF for exactly that reason, which is a thing that can regress).
+# NAMED rather than fatal: unlike the case above it is not always a mistake,
+# and naming is all the promise requires. `glprobe` is the one legitimate
+# member - it answers the question this script asks before the suite, and
+# deliberately does not count as one of the tests.
+registered="$(ctest --test-dir "$build_dir" -C "$config" -N 2>/dev/null \
+              | sed -n 's/^ *Test *#[0-9]*: *//p')"
+in_a_run_set="$(printf '%s\n%s\n%s\n' "$all_tests" "$quarantined" "$(tests_labelled glprobe)" \
+                | grep -v '^$')"
+orphans="$(minus "$registered" "$in_a_run_set")"
 
 if [ "$have_gl" -eq 1 ]; then
     run_label=selftest
@@ -387,7 +437,7 @@ echo "== selftests =="
 # wall-clock budget (120-600 s); docs/verify-functional.md "1. 方法" records, in
 # the 決定性の担保 table, that running them at the same time trips those budgets
 # and produces false FAILs.
-ctest --test-dir "$build_dir" -C "$config" -L "$run_label" \
+ctest --test-dir "$build_dir" -C "$config" -L "^$run_label$" \
       --output-on-failure --no-tests=error
 rc=$?
 
@@ -425,6 +475,19 @@ else
        Re-enable it in CMakeLists.txt once somebody establishes which. It is
        quarantined, NOT loosened: the assert is untouched.
 EOF
+fi
+
+echo
+echo "== in no run set (NOT a gate - these did NOT run) =="
+# The counterpart of the quarantine block: a test ctest knows about that no
+# label puts in either branch. It cannot be silent even though it is not fatal.
+if [ -z "$orphans" ]; then
+    echo "  (none - every registered test is in a run set)"
+else
+    printf '%s\n' "$orphans" | sed 's/^/  /'
+    echo "  why: no 'selftest' label, so neither branch of the GL probe selects"
+    echo "       them. If one is ours, label it - CMakeLists.txt, THE LABELLING"
+    echo "       RULE above the hand-registered tests."
 fi
 
 echo

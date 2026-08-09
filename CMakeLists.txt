@@ -464,8 +464,8 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Six of the tests below do (seven counting the quarantined line at the bottom);
-# the other 20 take the --no-window startup path and need neither a display nor
+# Five of the tests below do (six counting the quarantined line at the bottom);
+# the other 27 take the --no-window startup path and need neither a display nor
 # this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -581,20 +581,42 @@ set_tests_properties(glprobe PROPERTIES
   LABELS glprobe
   TIMEOUT 300)
 
+# ---- THE LABELLING RULE, for tests registered by hand -----------------------
+# Everything above goes through viewer_selftest(), which gets this right by
+# construction. A test registered with a bare add_test() does not, and both
+# ways of getting it wrong have already happened once each, so the rule is
+# written here rather than left to be re-derived:
+#
+#     `selftest` is MEMBERSHIP - it is what puts a test in the gate.
+#     `nogl`     is a MODIFIER - it says the test also runs where there is no
+#                GL context. It ACCOMPANIES `selftest`; it never replaces it.
+#
+# So a hand-registered test that needs no window carries LABELS "selftest;nogl"
+# - both words - and one that draws carries "selftest" alone.
+#
+# WHY the asymmetry bites: tools/run_selftests.sh picks its run set by label,
+# `selftest` where a GL context exists and `nogl` where none does, and it
+# computes BOTH the ran list and the skipped list from `selftest`. A test
+# labelled `nogl` alone is therefore in neither list in either branch: it does
+# not run where there is a context (Linux CI under xvfb, and every developer
+# box with a working driver), and where there is none it runs unannounced.
+# That is precisely the one outcome that script exists to make impossible.
+#
+# It is no longer only a rule: run_selftests.sh refuses to run when a `nogl`
+# test is not also a `selftest`, and names any registered test that is in no
+# run set at all. Getting this wrong now stops the suite instead of emptying it.
+
 # Not a --*-selftest flag on the viewer binary, so it is registered by hand -
-# but it carries BOTH labels on purpose. run_selftests.sh picks its run set by
-# label: `selftest` when the machine has a GL context, `nogl` when it does not.
-# With `nogl` alone this test never ran on Linux CI (xvfb gives it a context, so
-# CI takes the `selftest` branch) and never ran on any developer box with a
-# working GL driver - and it appeared in neither the ran list nor the skipped
-# list, which is the one thing that script promises cannot happen.
+# but it carries BOTH labels, per the rule above. With `nogl` alone (as it was
+# until 1d951d3) this test never ran on Linux CI and never ran on any developer
+# box with a working GL driver, and appeared in neither count.
 add_test(NAME test_prnu COMMAND test_prnu)
 set_tests_properties(test_prnu PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
-# Same hand registration, same two labels, and for the same reason - this one
-# was written with `selftest` alone and would have repeated the bug above
-# exactly, on the other branch: it would have run everywhere a GL context
-# exists and nowhere else, silently, in neither list.
+# Same hand registration, same two labels, same rule. This one was written with
+# `selftest` alone, which is the OTHER way to get it wrong: it would have run
+# only where a GL context exists - Linux CI and nowhere else in the matrix -
+# while reading, on Windows and macOS, as a test that needed a window.
 add_test(NAME test_display_falsecolor COMMAND test_display_falsecolor)
 set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
