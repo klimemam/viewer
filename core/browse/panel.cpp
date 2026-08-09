@@ -112,6 +112,16 @@ static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
 // here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
 // BrowseInstance::cursor / sortCol / sortDesc.)
 
+// #111. The declaration in browse.h carries the argument; these two lines are
+// all there is to the fix at this level, and that is the point - the panel asks
+// the question its host makes true, and neither branch names a format.
+bool rbRowOpenable(const std::string& host, const std::string& name) {
+    return host.empty() ? viewerReadsName(name) : peerServesName(name);
+}
+std::string rbRowWhyNot(const std::string& host, const std::string& name) {
+    return host.empty() ? viewerRefusalFor(name) : peerRefusalFor(name);
+}
+
 static void rbAddRows(const App::BrowseInstance& I,
                       const std::string* dir, const std::vector<remote::Entry>& ents,
                       bool flat, bool tree, int depth, std::vector<RbRow>& out);
@@ -304,7 +314,12 @@ std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
         // panel's gate has already refused a selection containing one; dropping
         // them here as well keeps this function total, so a selftest may call it
         // on any view without first reproducing the gate.
-        if (r.ph || r.up || r.isDir() || !isNpyName(r.name())) continue;
+        //
+        // The PEER's question (#111), on a local listing too: a stack and its
+        // average are built by openRemoteStack / openStackForAverage, which go
+        // over the protocol whichever machine the files are on. A .png that a
+        // local Browse now opens is still not something this path can merge.
+        if (r.ph || r.up || r.isDir() || !peerServesName(r.name())) continue;
         Part* p = nullptr;
         for (auto& q : parts)
             if (q.row->e == r.e && q.row->dir == r.dir) { p = &q; break; }
@@ -929,7 +944,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
             // folder must not open it.
             return;
         }
-        if (!isNpyName(r.name())) return;
+        if (!rbRowOpenable(B.host, r.name())) return;
+        // #111: a PREVIEW is a decimated TILE, and the tile path is the peer's.
+        // A picture that only this machine reads has no cheap partial decode to
+        // make one out of - a 200 MB .exr would be fully decoded to fill a slot
+        // the next arrow key throws away. So on those rows a click SELECTS and
+        // the double-click opens, which is exactly what a folder row does; the
+        // listing never had a third behaviour for the reader to learn.
+        if (!peerServesName(r.name())) return;
         // Everything this needs is read out of the row BEFORE the open, as
         // VALUES: an RbRow is a pair of raw pointers into B.entries / the tree
         // cache, and `r` is a reference into a vector rebuilt every frame.
@@ -977,7 +999,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
             rbGoTo(I, r.full());
             return;
         }
-        if (!isNpyName(r.name())) return;
+        // #111: a row this panel cannot open says so rather than doing nothing.
+        // Silence was the old behaviour and it is unreadable - the row dims,
+        // the double-click lands, and the user is left deciding whether they
+        // missed. The sentence names the format and whose limit it is.
+        if (!rbRowOpenable(B.host, r.name())) {
+            g_browseHost.toast(r.name() + ": " + rbRowWhyNot(B.host, r.name()), true);
+            return;
+        }
         if (r.isGroup()) {
             g_browseHost.dropPreview();      // the poster frame did its job
             std::vector<std::string> files;
@@ -1353,7 +1382,11 @@ void drawPanelRemote(App::BrowseInstance& I) {
         for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
             if (!rbSel[i]) continue;
             const remote::Entry& e = *view[i].e;
-            if (!isNpyName(view[i].name())) {
+            // The PEER's question again (#111), and it stays that on a local
+            // listing: all three verbs below are served over the protocol.
+            // A local .png row is openable and still not stackable, which is
+            // why these two sentences say ".npy" and not "openable".
+            if (!peerServesName(view[i].name())) {
                 rbSelStackWhyNot = "only .npy files can form a stack";
                 rbSelAvgWhyNot = "only .npy files can be averaged";
                 rbSelTemporalOk = false;     // MEASURE is npy-only too
@@ -1421,11 +1454,17 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     std::string full = joinS(h.rel);
                     if (h.dir) {
                         rbGoTo(I, full);
-                    } else if (isNpyName(h.rel)) {
+                    } else if (rbRowOpenable(B.host, h.rel)) {
                         g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
                                                 false, 0);
                     } else {
-                        // not servable: at least go where it lives
+                        // not openable from here: say why, and at least go where
+                        // it lives. The navigation alone was the whole answer
+                        // until #111 - a hit that jumped somewhere instead of
+                        // opening, with nothing said about which of the two the
+                        // click had just done.
+                        g_browseHost.toast(baseName(h.rel) + ": " +
+                                           rbRowWhyNot(B.host, h.rel), true);
                         size_t sl = full.find_last_of('/');
                         rbGoTo(I, sl == std::string::npos || sl == 0 ? "/"
                                                                  : full.substr(0, sl));
@@ -1526,7 +1565,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
                     if (!rbSel[i]) continue;
                     const RbRow& r = view[i];
-                    if (r.ph || r.up || r.isDir() || !isNpyName(r.name())) {
+                    if (r.ph || r.up || r.isDir() || !rbRowOpenable(B.host, r.name())) {
                         skipped++;           // named below, never silent
                         continue;
                     }
@@ -1540,9 +1579,12 @@ void drawPanelRemote(App::BrowseInstance& I) {
                                                 false, 0);
                     }
                 }
+                // "not .npy" was the reason until #111 and is no longer the
+                // reason on a local listing, where the gate is the format table.
                 if (skipped)
                     g_browseHost.toast(std::to_string(skipped) +
-                                       " selected item(s) skipped (folders / not .npy)", true);
+                                       " selected item(s) skipped (folders, or not "
+                                       "openable from this panel)", true);
                 rbSel.assign(view.size(), 0);          // the selection is consumed
             } else if (rbCursor >= 0 && rbCursor < (int)view.size()) {
                 rbOpenRow(view[rbCursor]);
@@ -1753,11 +1795,22 @@ void drawPanelRemote(App::BrowseInstance& I) {
             std::string lb(2 + (size_t)r.depth * 3, ' ');
             lb += rname;
             if (r.isGroup()) lb += "   [" + std::to_string(e.frames) + " frames]";
-            bool servable = !r.ph && (r.isDir() || isNpyName(rname));   // (ph draws dimmed)
+            // #111: the row asks whichever of the two questions its host makes
+            // true, so a .png dims on an ssh listing and does NOT dim on a
+            // listing of this disk - where this process reads it.
+            bool servable = !r.ph && (r.isDir() || rbRowOpenable(B.host, rname));
             if (!servable) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             int ei = shown[row];
             bool isSel = ei < (int)rbSel.size() && rbSel[ei] != 0;
             bool rowClicked = ImGui::Selectable(lb.c_str(), isSel, ImGuiSelectableFlags_SpanAllColumns);
+            // ...and the dim says WHY on hover. The ruling on #111 was to SHOW
+            // what cannot be opened rather than drop it from the listing, and a
+            // row that is shown without its reason is only half of that: the
+            // reader can see the file is there and still cannot find out what
+            // is wrong with it. (`ph` is the "(listing...)" placeholder - it is
+            // dim because it is not a file yet, and has nothing to explain.)
+            if (!servable && !r.ph && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", rbRowWhyNot(B.host, rname).c_str());
             // The glyph gutter's geometry, shared by the drawing below and by
             // the tree's chevron HIT ZONE - the zone must split exactly where
             // the pixels say it does. All inside the leading spaces the label
@@ -2153,40 +2206,58 @@ void drawPanelRemote(App::BrowseInstance& I) {
                                           "shown in the Temporal panel - nothing opens,\n"
                                           "no pixel transfers. plane=all (no CFA split).");
                     ImGui::Separator();
-                } else if (isNpyName(rname)) {
+                } else if (rbRowOpenable(B.host, rname)) {
                     if (ImGui::MenuItem("Open"))
                         g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
                                                 false, 0);
-                    // one file as a stack: a frame-axis file becomes its frames
-                    if (ImGui::MenuItem("Open as stack"))
-                        g_browseHost.openRemoteStack(B.host, { full },
-                                                     stackNameFor(*r.dir, rname), B.port, 0);
-                    if (ImGui::MenuItem("Open as frame average"))
-                        g_browseHost.openStackForAverage(B.host, { full },
-                                                         stackNameFor(*r.dir, rname), B.port);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s", AVG_TIP);
-                    // an expanded frame still knows the sequence it came from
-                    if (r.member >= 0) {
-                        char sl[64];
-                        snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
-                        if (ImGui::MenuItem(sl)) {
-                            std::vector<std::string> files;
-                            for (const auto& m : e.members) files.push_back(r.join(m));
-                            g_browseHost.openRemoteStack(B.host, files,
-                                                         stackNameFor(*r.dir, e.name), B.port, 0);
-                        }
-                        snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
-                                 e.frames);
-                        if (ImGui::MenuItem(sl)) {
-                            std::vector<std::string> files;
-                            for (const auto& m : e.members) files.push_back(r.join(m));
-                            g_browseHost.openStackForAverage(B.host, files,
-                                                             stackNameFor(*r.dir, e.name), B.port);
-                        }
+                    // The stack verbs below are the PEER's, on a local listing
+                    // too (#111): a frame axis, a server-side mean and MEASURE
+                    // are all .npy shapes carried over the protocol. So a .png
+                    // that a local Browse now opens offers "Open" and nothing
+                    // else, rather than three more items that would each refuse
+                    // once picked.
+                    if (peerServesName(rname)) {
+                        // one file as a stack: a frame-axis file becomes its frames
+                        if (ImGui::MenuItem("Open as stack"))
+                            g_browseHost.openRemoteStack(B.host, { full },
+                                                         stackNameFor(*r.dir, rname), B.port, 0);
+                        if (ImGui::MenuItem("Open as frame average"))
+                            g_browseHost.openStackForAverage(B.host, { full },
+                                                             stackNameFor(*r.dir, rname), B.port);
                         if (ImGui::IsItemHovered())
                             ImGui::SetTooltip("%s", AVG_TIP);
+                        // an expanded frame still knows the sequence it came from
+                        if (r.member >= 0) {
+                            char sl[64];
+                            snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
+                            if (ImGui::MenuItem(sl)) {
+                                std::vector<std::string> files;
+                                for (const auto& m : e.members) files.push_back(r.join(m));
+                                g_browseHost.openRemoteStack(B.host, files,
+                                                             stackNameFor(*r.dir, e.name), B.port, 0);
+                            }
+                            snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
+                                     e.frames);
+                            if (ImGui::MenuItem(sl)) {
+                                std::vector<std::string> files;
+                                for (const auto& m : e.members) files.push_back(r.join(m));
+                                g_browseHost.openStackForAverage(B.host, files,
+                                                                 stackNameFor(*r.dir, e.name), B.port);
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", AVG_TIP);
+                        }
                     }
+                    ImGui::Separator();
+                } else if (!r.isDir() && !r.ph) {
+                    // #111: the row is HERE and cannot be opened, so the menu
+                    // says which - a disabled "Open" carrying the reason, in the
+                    // one place a user right-clicks to ask "what can I do with
+                    // this?". Dropping the item entirely would answer with a
+                    // menu that looks like it forgot.
+                    ImGui::MenuItem("Open", nullptr, false, false);
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", rbRowWhyNot(B.host, rname).c_str());
                     ImGui::Separator();
                 }
                 if (ImGui::MenuItem("Copy path")) {
@@ -2208,7 +2279,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
-            if (!r.ph && !r.isDir() && isNpyName(rname))
+            // The shape is the LIST reply's npy header peek, which the peer
+            // fills for .npy and for nothing else - so this is the PEER's
+            // question (#111), not the panel's. A row with no shape to report
+            // leaves the cell blank; a row that SHOULD have one and does not
+            // (a protocol-2 peer) prints "-", which is why this asks the name
+            // rather than e.hasMeta - the difference between the two IS the
+            // message.
+            if (!r.ph && !r.isDir() && peerServesName(rname))
                 ImGui::TextDisabled("%s", fmtEntryShape(e).c_str());
             ImGui::TableNextColumn();
             // blank, not zero: the group reply has no per-frame size or mtime

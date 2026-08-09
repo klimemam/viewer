@@ -329,7 +329,7 @@
             for (const auto& e : B.entries) {
                 if (e.dir) continue;
                 if (e.group && !e.members.empty()) { file = e.members[0]; break; }
-                if (isNpyName(e.name)) { file = e.name; break; }
+                if (peerServesName(e.name)) { file = e.name; break; }
             }
             if (file.empty()) {
                 fprintf(stderr, "browseselftest: sessions: no .npy under %s to open\n",
@@ -597,7 +597,9 @@
             for (size_t i = 0; i < rv2.size(); i++) {
                 if (rv2[i].up || rv2[i].isDir()) continue;
                 if (rv2[i].isGroup()) { selM[i] = 1; grp2++; }
-                else if (isNpyName(rv2[i].name())) { selM[i] = 1; loose++; }
+                // the PEER's question (#111): rbSelectionStacks partitions for
+                // openStackForAverage, which is served over the protocol
+                else if (peerServesName(rv2[i].name())) { selM[i] = 1; loose++; }
                 else other++;                       // notes.txt: never ticked
             }
             std::vector<RbAvgStack> mix = rbSelectionStacks(rv2, selM);
