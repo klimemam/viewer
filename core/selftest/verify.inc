@@ -21,6 +21,68 @@
             if (!cond) ok = false;
         };
 
+        // ---- WHERE THE SCRATCH GOES, AND WHY IT MOVED --------------------------
+        // Five blocks below write fixtures they build themselves. They used to
+        // write them into the folder UNDER TEST (<multi>/vfy-*-scratch, and one
+        // in its parent) and remove them at the END. A run that dies never
+        // reaches an end - PR #116's fail-first killed one on purpose - so the
+        // directory stayed, and the NEXT run's V12 scanned <multi>, found folder
+        // groups nobody made, and failed:
+        //
+        //     stack: vfy-native-scratch/a_hw3‥4.npy - 2 files (npy)
+        //     verifyselftest: V12 6 local stack(s): 1 without an expected count...
+        //
+        // ...and THAT run then cleaned up, so the run after it passed. A red that
+        // appears once and erases its own cause is the worst shape an
+        // intermittent can have, and this repo has already spent real days on
+        // exactly that class (the browse-keys diagnosis).
+        //
+        // So the scratch moves into the per-test TMP directory CMake hands every
+        // selftest (viewer_selftest(): TMP/TEMP/TMPDIR = <build>/selftest-tmp/
+        // <name>). That is the scheme the rest of the suite already uses -
+        // --picker-selftest UC7, --series-selftest's .npz members,
+        // --browse-selftest's hlenbomb - and it does more than tidy the leak: no
+        // selftest scans TMP, so a directory a crash leaves there cannot be read
+        // as data by anything, ever. Cleaning at the END was the defect; cleaning
+        // at the START of a block that still wrote under <multi> would leave a
+        // stray folder in front of V12 for as long as the block ran, and V12
+        // runs after two of these blocks.
+        //
+        // Each scratch is also cleared BEFORE it is written, not only after: a
+        // crash leaves files in TMP too, and a block should start from what it
+        // wrote, not from what the last run got as far as writing.
+        auto vfyScratch = [](const char* name) {
+            std::error_code ec;
+            std::filesystem::path p = std::filesystem::temp_directory_path(ec) / name;
+            std::filesystem::remove_all(p, ec);
+            std::filesystem::create_directories(p, ec);
+            return p;
+        };
+        {   // ...and the trees an OLDER build already poisoned heal here, once,
+            // before anything scans: exactly the five names this test used to
+            // write, removed from exactly where it used to write them. Nothing
+            // else is touched - a selftest that deletes directories it did not
+            // create is a worse hazard than the one being fixed.
+            // tools/gen_testdata.py rewrites multi/ from scratch on every full
+            // suite run, so this matters to a bare `ctest` - which is how the
+            // leak was found in the first place, and how it would be met again.
+            std::error_code lec;
+            const std::filesystem::path root(g_verifySelftest);
+            for (const char* legacy : { "vfy-session-scratch", "vfy-npz-scratch",
+                                        "vfy-native-scratch", "vfy-adapter-scratch" })
+                if (std::filesystem::exists(root / legacy, lec)) {
+                    fprintf(stderr, "verifyselftest: removing %s left by an aborted run\n",
+                            legacy);
+                    std::filesystem::remove_all(root / legacy, lec);
+                }
+            const std::filesystem::path up = root.parent_path() / "vfy-frameaxis-scratch";
+            if (std::filesystem::exists(up, lec)) {
+                fprintf(stderr, "verifyselftest: removing vfy-frameaxis-scratch left by "
+                                "an aborted run\n");
+                std::filesystem::remove_all(up, lec);
+            }
+        }
+
         // ---- V1: a stack whose frames are NOT contiguous in app.images ----
         reload();
         if (app.seqs.size() < 3) {
@@ -402,9 +464,7 @@
             uint64_t pvUid = app.previewUid;
             size_t nBefore = app.images.size();
             std::error_code sec;
-            std::filesystem::path sdir =
-                std::filesystem::path(g_verifySelftest) / "vfy-session-scratch";
-            std::filesystem::create_directories(sdir, sec);   // ours: ours to remove
+            std::filesystem::path sdir = vfyScratch("vfy-session-scratch");
             std::string spath = (sdir / "s.vsession").u8string();
             saveSession(spath, true);
             bool stillPreview = false;
@@ -1143,9 +1203,7 @@
             // the LAST axis, (4,8,8) ends in 8, and eight is not a channel
             // count, so it is four frames because that is what native means.
             std::error_code nec;
-            std::filesystem::path ndir =
-                std::filesystem::path(g_verifySelftest) / "vfy-npz-scratch";
-            std::filesystem::create_directories(ndir, nec);   // ours: ours to remove
+            std::filesystem::path ndir = vfyScratch("vfy-npz-scratch");
             // one .npy member as bytes
             auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
                                const void* data, size_t nbytes) {
@@ -1548,9 +1606,7 @@
         {
             closeAll();
             std::error_code vec;
-            std::filesystem::path vdir =
-                std::filesystem::path(g_verifySelftest) / "vfy-native-scratch";
-            std::filesystem::create_directories(vdir, vec);   // ours: ours to remove
+            std::filesystem::path vdir = vfyScratch("vfy-native-scratch");
             // one .npy FILE on disk from a shape and its bytes. V21 builds .npy
             // members inside a zip; these have to be loose files because the
             // rule under test is the FILE loader's, and loadNpy is its door.
@@ -1814,9 +1870,7 @@
         // skip out loud rather than failing when it is absent.
         {
             std::error_code aec;
-            std::filesystem::path adir =
-                std::filesystem::path(g_verifySelftest) / "vfy-adapter-scratch";
-            std::filesystem::create_directories(adir, aec);   // ours: ours to remove
+            std::filesystem::path adir = vfyScratch("vfy-adapter-scratch");
 
             auto npyBytes = [](const char* descr, const std::vector<int64_t>& shape,
                                const void* data, size_t nbytes) {
@@ -2427,10 +2481,8 @@
             // and a shared stack's sigma_t would go to zero). Scratch fixture in
             // a subdirectory this test creates - only what it made is removed.
             {
-                std::string fxroot = (std::filesystem::path(g_verifySelftest)
-                                          .parent_path() / "vfy-frameaxis-scratch").u8string();
+                std::string fxroot = vfyScratch("vfy-frameaxis-scratch").u8string();
                 std::error_code ec;
-                std::filesystem::create_directories(pathFromUtf8(fxroot), ec);
                 std::string mf = fxroot + "/movie.npy";
                 {   // 6 frames of 8x8 f32, pixel value = frame index
                     const int FR = 6, W = 8, H = 8;
