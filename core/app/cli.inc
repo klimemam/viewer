@@ -422,7 +422,16 @@ static void printUsage() {
         // All of them, always. docs/manual.md 9 promises this list is the canon,
         // and it said 8 of 22 for long enough that --verify-selftest could be
         // believed not to exist. Adding a flag means adding its line here.
-        "self-tests (load, check, print, exit; 0 = pass). ctest runs all 22:\n"
+        //
+        // It happened again, quietly, and was found by an audit rather than by
+        // anyone missing it: --reload-selftest had a parser, a ctest target and
+        // no line here, so the canon was one short for as long as that test has
+        // existed. The COUNT is gone with it - "all 22" was written when there
+        // were 22 and was never true again. A number here is a second copy of a
+        // fact that lives in CMakeLists.txt, and this is the second time that
+        // copy has gone stale; tools/run_selftests.sh prints the real one, per
+        // run, computed from ctest.
+        "self-tests (load, check, print, exit; 0 = pass). ctest runs every one:\n"
         "  --lin-selftest              linearity fit over the stacks given\n"
         "  --sweepfile-selftest <dir>  a sweep of ONE .npy per level: names + fit\n"
         "  --series-selftest <dir>     series (系列) model + invariants\n"
@@ -453,6 +462,9 @@ static void printUsage() {
         "                              refcounts, Watch baselines\n"
         "  --media-selftest <dir>      PNG/JPEG/TIFF bit depth, channels and notes;\n"
         "                              a multi-page TIFF as a stack, and the refusals\n"
+        "  --reload-selftest <dir>     a frame's FILE rewritten under a live stack:\n"
+        "                              the invalidation walk, the temporal key, the\n"
+        "                              registry re-key, the recorded npy reading\n"
         "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
         "  --browse-selftest <dir>     Browse panel behaviour\n"
         "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
