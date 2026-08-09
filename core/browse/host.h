@@ -63,7 +63,12 @@ struct PathSeg { std::string label, path; };   // moved from util.inc: the decl
 std::vector<PathSeg> pathSegments(const std::string& d);
 std::string pathRootOf(const std::string& d);
 std::string baseName(const std::string& p);
-bool isNpyName(const std::string& n);
+// #111: the two questions the one predicate `isNpyName` used to fold into one.
+// Definitions and the full argument live in core/ui/menus.inc.
+bool viewerReadsName(const std::string& n);          // ...this build can open
+bool peerServesName(const std::string& n);           // ...core/serve.cpp can serve
+std::string peerRefusalFor(const std::string& n);    // "" when the peer serves it
+std::string viewerRefusalFor(const std::string& n);  // "" when this build reads it
 void sortFramesNumerically(std::vector<std::string>& files);
 bool globListMatch(const char* list, const std::string& subject);
 std::string patternOfNames(std::vector<std::string> names);

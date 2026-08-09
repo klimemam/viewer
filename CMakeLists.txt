@@ -697,6 +697,11 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 viewer_selftest(anaprov     NOGL --anaprov-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
+# #111. Pointed at media/ and not at rb/ on purpose: rb/ is where the picture
+# formats are absent, and it is also where --browse-keys addresses rows BY INDEX
+# (tools/gen_testdata.py says so at length), so a .png added there would re-aim a
+# dozen assertions that have nothing to do with this.
+viewer_selftest(fmtgate     NOGL --fmtgate-selftest tools/testdata/media)
 viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
 # Windowless despite touching ImGui: its one call is GetClipboardText, and with
 # no backend installed ImGui's own default clipboard handler answers it (the

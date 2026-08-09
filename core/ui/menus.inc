@@ -577,15 +577,89 @@ static void drawMenuBar(GLFWwindow* win) {
     ImGui::EndMainMenuBar();
 }
 
+// ---- what can be opened, and BY WHOM (#111) ---------------------------------
+// Two questions, two predicates. They used to be one function - isNpyName - and
+// the Browse panel asked it for both, which is why five formats went missing at
+// once: a listing of THIS machine's disk was answering the PEER's question
+// about files that no peer ever had to touch. Per-format patches to that one
+// predicate would have re-lost the sixth format the day it landed.
+//
+//   can this VIEWER open it   -> the format table (core/imagefile.h) decides
+//   can this PEER serve it    -> core/serve.cpp reads .npy headers, full stop
+//
+// Neither of these names a format, and that is the property worth keeping: a
+// row added to imagefile's table appears in Browse with no edit here, and the
+// peer's limit moves only when core/serve.cpp moves.
+static bool extIsOneOf(const std::string& n, std::initializer_list<const char*> exts) {
+    std::string low = n;
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    for (const char* e : exts) {
+        size_t len = strlen(e);
+        // >=, not >: isNpyName accepted a file called exactly ".npy" (it tested
+        // size < 4 and then took the last four characters), and this is a
+        // refactor of that predicate, not a place to quietly retire one of its
+        // answers.
+        if (low.size() >= len && low.compare(low.size() - len, len, e) == 0) return true;
+    }
+    return false;
+}
+
+// Can THIS VIEWER open a file with this name? The format table answers for the
+// picture formats; .npy and .npz are added because they are core/main.cpp's own
+// doors and were never rows in that table.
+//
+// A format the table LISTS but this build cannot decode answers YES on purpose.
+// It is dispatched, and it refuses by name with the reason it is absent
+// (imagefile::Backend::absent) - which is the whole argument of imagefile.h's
+// header: a named refusal tells the reader what the situation is, and a file
+// quietly missing from a listing tells them nothing. dialogPattern() makes the
+// same call for the OS file dialog, and for the same reason.
+bool viewerReadsName(const std::string& n) {
+    if (extIsOneOf(n, { ".npy", ".npz" })) return true;
+    return imagefile::forPath(n) != nullptr;
+}
+
+// FRAME_001.NPY is still a .npy - the peer's own isNpySuffix (core/serve.cpp)
+// lower-cases the same way, and the two must agree or the client offers an open
+// the peer then refuses.
+bool peerServesName(const std::string& n) { return extIsOneOf(n, { ".npy" }); }
+
+// Why the peer will NOT serve this file; "" when it will. A sentence and not a
+// bool, because #111's ruling is that a remote listing SHOWS what the peer
+// cannot serve and says why - this repository refuses by name and never
+// silently omits (docs/input-adapters.md §3.2), and a row dimmed with no reason
+// is the silent omission wearing different clothes.
+std::string peerRefusalFor(const std::string& n) {
+    if (peerServesName(n)) return {};
+    std::string what;
+    if (const imagefile::Backend* b = imagefile::forPath(n)) what = b->format;
+    else if (extIsOneOf(n, { ".npz" })) what = ".npz";
+    if (what.empty())                     // nothing here reads it either
+        return "the peer serves .npy only";
+    // Named, reasoned, way out attached - the same three parts every refusal in
+    // §3.2 has. The way out is real: the file IS readable, just not over this
+    // link, so the sentence points at the door that does work.
+    return what + " is read on this machine, but the peer serves .npy only"
+           "\n  browse it locally (File > Browse Folder), or copy it here first";
+}
+
+// Why THIS VIEWER will not open it; "" when it will. The local half of the pair
+// above, and the reason a local Browse still dims some rows: a folder holds
+// more than pictures. A codec-bearing container gets its own measured refusal
+// (imagefile::videoRefusal) rather than this generic one, because "we do not
+// read .mp4" and "decoded 8-bit video is not DN" are different sentences and
+// only the second one answers the question the operator actually has.
+std::string viewerRefusalFor(const std::string& n) {
+    if (viewerReadsName(n)) return {};
+    std::string vid = imagefile::videoRefusal(n);
+    if (!vid.empty()) return vid;
+    return "not a name this viewer reads (*.npy *.npz " + imagefile::dialogPattern() + ")"
+           "\n  choose a reader to read it another way";
+}
+
 // File > Open Remote: the one dialog the OS cannot provide, because the files it
 // lists live on another machine. URL + peer path, both remembered in prefs.
-bool isNpyName(const std::string& n) {          // FRAME_001.NPY is still a .npy
-    if (n.size() < 4) return false;
-    std::string ext = n.substr(n.size() - 4);
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return ext == ".npy";
-}
 
 // File > Start Remote: ask for a host, not a path. Connecting first is what
 // removes the guesswork - once the session is up, the Files panel browses the

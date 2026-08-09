@@ -96,6 +96,23 @@ struct RbRow {
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
 
+// ---- #111: WHOSE disk is on screen decides which question a row asks ---------
+// A Browse panel showing THIS machine (empty host) is listing files this
+// process opens with its own loaders, so it asks the format table. A panel
+// showing a peer is listing files only that peer can reach, so it asks what the
+// peer serves. One predicate answered both, which is how .exr .y4m .png .jpg
+// and .tif came to be dead rows in a listing of the disk they were sitting on.
+//
+// The pair is here, not TU-internal, for the same reason rbBuildView is: the
+// NOGL selftests must drive the panel's own gate rather than a second copy of
+// it that can drift from what is drawn.
+bool rbRowOpenable(const std::string& host, const std::string& name);
+// ...and WHY NOT, for the row that says no; "" when it can be opened. Every
+// dimmed row has one of these on hover and says it again if it is clicked -
+// #111's ruling was to show what cannot be opened and name the reason, never
+// to drop it from the listing.
+std::string rbRowWhyNot(const std::string& host, const std::string& name);
+
 // Free functions so the headless (NOGL) selftests drive exactly what the panel
 // draws - the reason they are declared here and not kept TU-internal.
 std::vector<RbRow> rbBuildView(const App::BrowseInstance& I,

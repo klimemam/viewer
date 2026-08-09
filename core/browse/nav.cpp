@@ -575,7 +575,11 @@ void startRemote(App::BrowseInstance& I, const std::string& hostSpec) {
     std::string host, dir;
     int port = 0;
     rbParseSpec(hostSpec, host, port, dir);
-    if (dir.size() > 4 && isNpyName(dir)) {          // a pasted file path: open it
+    // A pasted FILE path opens; a pasted folder is browsed. #111: the question
+    // is "does this text name a file this viewer can open", which is the format
+    // table's - a pasted shot.exr used to be taken for a directory and browsed,
+    // and the listing of a file is empty.
+    if (dir.size() > 4 && viewerReadsName(dir)) {
         size_t s = dir.find_last_of('/');
         std::string parent = s == std::string::npos ? "~" : dir.substr(0, s);
         I.b = App::RemoteBrowse{};

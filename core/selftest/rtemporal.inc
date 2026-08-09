@@ -12,7 +12,9 @@
             std::error_code ec;
             for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec)) {
                 std::string n = e.path().filename().u8string();
-                if (isNpyName(n)) files.push_back(dir + "/" + n);
+                // the PEER's question (#111): MEASURE is served over the
+                // protocol, so this collects what the peer can measure
+                if (peerServesName(n)) files.push_back(dir + "/" + n);
             }
         }
         sortFramesNumerically(files);

@@ -9,6 +9,8 @@ static std::string g_closeSelftest;     // --close-selftest <dir>: close per sta
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
+static std::string g_fmtgateSelftest;   // --fmtgate-selftest <dir>: which listing asks
+                                        // which question (#111), print, exit
 static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel behaviour, exit
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack from stack, exit
@@ -454,6 +456,8 @@ static void printUsage() {
         "  --newwin-selftest <dir>     instance autosave slots + spawn line\n"
         "  --browse-selftest <dir>     Browse panel behaviour\n"
         "  --localbrowse-selftest <dir>  Browse against the local filesystem\n"
+        "  --fmtgate-selftest <dir>    which Browse listing asks which question:\n"
+        "                              what this build reads vs what the peer serves\n"
         "  --browse-keys-selftest <dir>  the Browse panel's KEYBOARD, replayed as real\n"
         "                              input into real frames (--browse-keys <script>\n"
         "                              overrides the canned action list)\n"
@@ -587,6 +591,8 @@ static void parseCli(int argc, char** argv) {
             g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--localbrowse-selftest") {
             g_localbrowseSelftest = next();        // handled in main()
+        } else if (a == "--fmtgate-selftest") {
+            g_fmtgateSelftest = next();            // handled in main()
         } else if (a == "--browse-selftest") {
             g_browseSelftest = next();             // handled in main()
         } else if (a == "--browse-keys-selftest") {

@@ -1,5 +1,12 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
 // ---------------------------------------------------------------- open dispatch
+// #111: openRemote routes a local:// file the peer cannot serve back to this
+// door, and it is defined further down. The two are deliberately not merged -
+// openPath is "what does this machine do with a path", openRemote is "what does
+// a peer do with a url", and the fix is that the second one now knows when the
+// answer is the first one.
+static void openPath(const std::string& path);
+
 static void openRawDialogFor(const std::string& path) {
     std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
     if (!f) { toast("cannot open: " + baseName(path), true); return; }
@@ -873,6 +880,38 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
         toast("expected ssh://user@host/path/to/file.npy", true);
         return false;
     }
+    // ---- #111: WHOSE READER --------------------------------------------------
+    // Everything below this block is the peer's protocol - META then TILE - and
+    // the peer reads .npy. That was fine while .npy was all the viewer read; it
+    // stopped being fine when core/imagefile.h gained PNG, JPEG, TIFF, OpenEXR
+    // and y4m, because a `local://` url names a file on THIS disk and this
+    // process has a reader for it. Sending it round through a peer that does
+    // not is the whole of the bug: five formats reachable from File > Open and
+    // dead from the Browse panel listing the very folder they sit in.
+    //
+    // ONE place, not one per call site. Every Browse open - a double-click, a
+    // search hit, Enter over a multi-selection, the row menu - mints a url with
+    // makeRemoteUrl and comes through here, so routing at the door means none
+    // of them had to learn the rule and none of them can drift from it.
+    if (!peerServesName(rpath)) {
+        if (host.empty() && viewerReadsName(rpath)) {
+            // A PREVIEW is a decimated tile and only the peer path makes one.
+            // The Browse click does not ask for one on these rows (see
+            // rbActivateRow); anything that does is told no rather than being
+            // handed a registered open it did not want.
+            if (asPreview) return false;
+            const size_t before = app.images.size();
+            openPath(rpath);              // the File > Open door, which SAYS what
+            return app.images.size() > before;   // it did - including refusals
+        }
+        // ssh://, or a name nothing here reads: refused BY NAME and before the
+        // round trip, with the reason and the way out. The peer's own answer to
+        // this file is "not a .npy file", which blames the file for a limit
+        // that belongs to the link.
+        toast(baseName(rpath) + ": " +
+              (host.empty() ? viewerRefusalFor(rpath) : peerRefusalFor(rpath)), true);
+        return false;
+    }
     if (asPreview) dropPreview();          // ONE slot: the next look replaces it
     // identity BEFORE the bytes (§6.2), the same discipline as every local
     // loader: for a local:// url the peer reads THIS disk, so stat it now -
@@ -1246,7 +1285,12 @@ static void openPath(const std::string& path) {
         // File > Start Remote does - which is what a desktop shortcut to a
         // machine passes, and what a half-remembered path pasted on the command
         // line usually is. startRemote keeps the ssh handshake off this thread.
-        if (isNpyName(path)) {
+        //
+        // #111: "names a file" is the format table's question, not the peer's.
+        // A local://.../shot.exr used to fall to the else and be BROWSED - the
+        // listing of a file, which is empty - and openRemote now knows which
+        // reader a url on this machine belongs to.
+        if (viewerReadsName(path)) {
             openRemote(path);
         } else {
             App::BrowseInstance& I = rbInstanceFor(path);   // never take an open listing

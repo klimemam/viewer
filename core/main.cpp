@@ -829,6 +829,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/localbrowse.inc"
 
+    #include "selftest/fmtgate.inc"
+
     #include "selftest/browse.inc"
 
     #include "selftest/rtemporal.inc"

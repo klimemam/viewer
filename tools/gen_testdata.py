@@ -401,6 +401,24 @@ if WANT_BENCH:
 media = out / "media"
 media.mkdir(exist_ok=True)
 
+# ...and ONE .npy in among them (#111). media/ already holds every format this
+# viewer reads plus one it refuses by name (capture.mp4); adding the format the
+# PEER reads makes it the whole matrix the Browse listing gate is decided over,
+# in one folder:
+#
+#   capture.npy   viewer reads it, peer serves it      -> openable either way
+#   *.png *.jpg *.tif *.exr *.y4m
+#                 viewer reads it, peer does NOT       -> openable LOCALLY only
+#   capture.mp4   neither reads it                     -> refused, by name, both
+#
+# --fmtgate-selftest browses this folder through the local peer and asserts all
+# three columns. Named to pair with capture.mp4 on purpose: same stem, opposite
+# answers, so a gate that keyed off anything but the extension would show it.
+# --media-selftest opens files here BY NAME and never iterates the folder, so
+# this file is invisible to it.
+np.save(media / "capture.npy",
+        (np.random.default_rng(1111).random((16, 16)) * 4095).astype(np.float32))
+
 
 def _png_chunk(tag, data):
     return (struct.pack(">I", len(data)) + tag + data +
