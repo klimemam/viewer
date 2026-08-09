@@ -519,6 +519,100 @@
                   "A9 a matching (setbatch, name) block ADOPTS - no second node");
         }
 
+        // ---- A12: a container is ONE unit and MANY session lines --------------
+        // The dedupe that keeps a container from being rebuilt once per line is
+        // an early return: line 1 builds the whole tree, lines 2..N find their
+        // pixels already here and do nothing. But a session line is not only an
+        // open - it carries that doc's range, LUT and mosaic reading - and after
+        // an early return `cur()` is still whatever the rebuild left selected,
+        // so every later line's display state landed on the FIRST line's doc
+        // (overwriting it) and the doc the line was actually about kept the
+        // container's defaults. Two stacks, two ranges, one file: the assert is
+        // that each stack comes back with its own.
+        //
+        // Here rather than in --verify-selftest's V25 (the other place that
+        // builds containers by hand) because this test is NOGL and therefore
+        // gates on all three runners; V25 needs a window and gates on one.
+        {
+            std::vector<uint16_t> pxD((size_t)3 * 64), pxB((size_t)3 * 64);
+            for (int f = 0; f < 3; f++)
+                for (int i = 0; i < 64; i++) {
+                    pxD[(size_t)f * 64 + i] = (uint16_t)(100 + f);
+                    pxB[(size_t)f * 64 + i] = (uint16_t)(900 + f);
+                }
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
+                { "__viewer",   i32Npy(1) },
+                { "__n",        i32Npy(3) },
+                { "__layer_0",  strNpy("batch") }, { "__parent_0", i32Npy(-1) },
+                { "__layer_1",  strNpy("stack") }, { "__parent_1", i32Npy(0) },
+                { "__name_1",   strNpy("dark") },
+                { "__pixels_1", npyB("<u2", { 3, 8, 8 }, pxD.data(), pxD.size() * 2) },
+                { "__layer_2",  strNpy("stack") }, { "__parent_2", i32Npy(0) },
+                { "__name_2",   strNpy("bright") },
+                { "__pixels_2", npyB("<u2", { 3, 8, 8 }, pxB.data(), pxB.size() * 2) },
+            };
+            std::string cpath = (adir / "a12.npz").u8string();
+            writeNpz2(cpath, cm);
+            closeAll();
+            std::string err = loadNpz(cpath);
+            drain();
+            // the stack name is the node's, plus the loader's " (3 frames)"
+            auto seqNamed = [](const char* nm) {
+                for (const auto& s : app.seqs) if (s.name.rfind(nm, 0) == 0) return s.id;
+                return 0;
+            };
+            int sD = seqNamed("dark"), sB = seqNamed("bright");
+            {
+                std::string nm;
+                for (const auto& s : app.seqs) nm += (nm.empty() ? "" : ", ") + s.name;
+                fprintf(stderr, "asetselftest: A12 open err=\"%s\" docs=%zu stacks=%zu "
+                                "[%s]\n", err.c_str(), app.images.size(), app.seqs.size(),
+                        nm.c_str());
+            }
+            check(err.empty() && app.images.size() == 6 && sD && sB && sD != sB,
+                  "A12 the two-stack container opens as two stacks of three");
+            if (sD && sB) {
+                // each stack left on a frame of its own, with a range and a LUT
+                // of its own: what the session line for that stack must carry
+                std::vector<int> fD = framesOfSeq(sD), fB = framesOfSeq(sB);
+                selectImage(fD[1]);
+                setRange(*app.images[fD[1]], 10.0f, 20.0f);
+                app.images[fD[1]]->displayLut = 0;
+                selectImage(fB[2]);
+                setRange(*app.images[fB[2]], 30.0f, 40.0f);
+                std::string sess = (adir / "a12.vsession").u8string();
+                saveSession(sess, true);
+                closeAll();
+                std::string serr = loadSession(sess);
+                drain();
+                int rD = seqNamed("dark"), rB = seqNamed("bright");
+                std::vector<int> gD = rD ? framesOfSeq(rD) : std::vector<int>();
+                std::vector<int> gB = rB ? framesOfSeq(rB) : std::vector<int>();
+                int offD = 0, offB = 0, offLut = 0;
+                for (int idx : gD) {
+                    const ImageDoc* d = app.images[idx].get();
+                    if (d->black != 10.0f || d->white != 20.0f) offD++;
+                    if (d->displayLut != 0) offLut++;
+                }
+                for (int idx : gB) {
+                    const ImageDoc* d = app.images[idx].get();
+                    if (d->black != 30.0f || d->white != 40.0f) offB++;
+                }
+                fprintf(stderr, "asetselftest: A12 restore err=\"%s\" docs=%zu "
+                                "dark %zu frame(s) %d off-range %d off-lut, "
+                                "bright %zu frame(s) %d off-range\n",
+                        serr.c_str(), app.images.size(), gD.size(), offD, offLut,
+                        gB.size(), offB);
+                check(serr.empty() && app.images.size() == 6 &&
+                          gD.size() == 3 && gB.size() == 3,
+                      "A12 the restore rebuilds the tree ONCE, six docs, two stacks");
+                check(!gD.empty() && offD == 0 && offLut == 0,
+                      "A12 the FIRST line's stack keeps its own range and LUT");
+                check(!gB.empty() && offB == 0,
+                      "A12 the SECOND line's stack gets ITS range, not the first's");
+            }
+        }
+
         // ---- A11: end to end - a READER returns a set, down the STREAM --------
         // The npz carrier is A1-A9's; the framed stream is the door a real
         // reader's result arrives through, and its role/refs lines deserve one

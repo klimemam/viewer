@@ -1608,6 +1608,27 @@ static void crashHandler(int sig) {
     raise(sig);
 }
 
+// The doc a session line names, by §6.2's identity minus the disk baseline -
+// (path, member). A container (and a reader's result) is ONE unit: the first
+// line that names its file rebuilds the whole tree, and the loader leaves
+// cur() on whichever doc it happened to finish with, so neither that line nor
+// any later one can assume cur() is the doc it is about.
+//
+// `from` is what keeps a file legitimately opened TWICE in one session apart:
+// a line that opened something looks only among the docs IT added, and only a
+// line that opened nothing (the already-here dedupe) searches the whole list.
+// A stack's frames all share both halves of the key; the first of them is
+// where the line's display state goes, and loadSession spreads it over the
+// stack from there. Previews are never in a session and never a target.
+static int sessionDocAt(const std::string& path, const std::string& member, size_t from) {
+    for (int i = (int)from; i < (int)app.images.size(); i++) {
+        const ImageDoc* d = app.images[i].get();
+        if (d->preview || d->src->path != path || d->src->member != member) continue;
+        return i;
+    }
+    return -1;
+}
+
 static std::string loadSession(const std::string& path) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read session file";
@@ -2041,6 +2062,7 @@ static std::string loadSession(const std::string& path) {
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
             std::string err;
+            const size_t docsBefore = app.images.size();   // "did this line open anything"
             if (kind == "raw3" || kind == "raw2" || kind == "raw") {
                 RawDialog d;
                 int le = 1, col = 0;
@@ -2113,6 +2135,26 @@ static std::string loadSession(const std::string& path) {
                         err = loadImageFile(p, pendingMember);
                     else
                         err = loadNpy(p, pendingRead);
+                }
+                // Point at the doc this line is ABOUT. For an ordinary file
+                // that is the one doc (or the head frame) the call just added,
+                // which is where cur() already is. For a container - or a
+                // reader's result - one call rebuilds every doc the file holds,
+                // and a later line adds nothing at all (the already-here
+                // dedupe), so cur() is whichever doc the rebuild finished with:
+                // without this, EVERY line of a two-stack container wrote its
+                // range, LUT, mosaic reading and crop onto that same doc, the
+                // last line won, and every other stack came back at the
+                // container's defaults. A line whose member the rebuild did not
+                // produce is a real loss - reported, never applied blind.
+                if (err.empty()) {
+                    int at = sessionDocAt(p, pendingMember, docsBefore);
+                    if (at < 0 && app.images.size() == docsBefore)
+                        at = sessionDocAt(p, pendingMember, 0);
+                    if (at >= 0) selectImage(at);
+                    else err = (pendingMember.empty() ? std::string("the pixels")
+                                                      : "member " + pendingMember) +
+                               " named by this line is not in what " + p + " opened";
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
