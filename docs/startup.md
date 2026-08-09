@@ -174,7 +174,7 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | 任意の組み合わせ | `Ctrl` / `Shift` + クリックで選んで「**Open N selected as stack**」。形が揃わない選択はボタンが押せず、理由が出ます(転送する前に分かります) |
 | **いま居るフォルダ**を丸ごと | 2 段目の **`open folder`**。行を選ぶのではなく、**いま中に居るフォルダ**を走査します(以前はフォルダ行の右クリックしか無く、ホームやルートに居ると自分の名前を探しに 1 階層戻る必要がありました) |
 | 別のフォルダを丸ごと | フォルダ行の右クリック「Open folder (all stacks below)」(パンくずの右クリックでも同じ) |
-| 開かずに時間統計 | 連番行の右クリック「Temporal stats (server)」、複数選択中なら同名のボタン |
+| 開かずに時間統計 | **連番行**の右クリック「Temporal stats (server) for stack "…"」。**1 回 = 1 stack** です(σ_t は stack の属性なので、複数選択からまとめて測る経路はありません。複数あるなら 1 つずつ) |
 
 キー割り当ては `H`(Keyboard Shortcuts)の「Browse panel」節にも出ます。
 
@@ -387,4 +387,7 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 なお **サーバ側の `MEASURE` は実装済み**です —— 塊を開くと転送を待たずにサーバ側で時間統計を
 計算し、`[server <ホスト>, N frames]` タグ付きで表示します
 (`File > Stack loading > Remote processing` で auto / server / local fetch を切替)。
-開いていない連番も、Browse パネルの「Temporal stats (server)」でそのまま測れます。
+開いていない連番も、Browse パネルの**連番行**の
+「Temporal stats (server) for stack "…"」でそのまま測れます(1 回 = 1 stack)。
+local で測っても server で測っても**同じ数**です —— 画素毎の時間分散は
+どちらも ddof=1(#57 項目3)。
