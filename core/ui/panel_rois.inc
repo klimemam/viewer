@@ -192,8 +192,14 @@ static void roiStatTooltip(const std::vector<RoiCell>& cells, bool planesMixed) 
         if (!c.s.valid)       { ImGui::TextDisabled("no samples here"); continue; }
         ImGui::Text("mean %.10g    sd %.10g   [DN]", c.s.mean, c.s.sd);
         ImGui::Text("min  %.10g    max %.10g   [DN]", c.s.mn, c.s.mx);
-        if (c.prOk) ImGui::Text("PRNU %.10g   [σ %%]  = sd / mean * 100", c.pr);
-        else ImGui::TextDisabled("PRNU: mean is not above 0, so sd / mean states nothing");
+        // The COLUMN was renamed out of the famous name in 5d8cb72; this
+        // tooltip, which is the same number seen closer up, kept printing the
+        // old one - so for eleven weeks the rule held in the header and broke
+        // one hover away. Both wear the column's name now, and
+        // --setanalysis-selftest's scan is what keeps them together.
+        if (c.prOk) ImGui::Text("std / mean %.10g   [%%]  = sd / mean * 100", c.pr);
+        else ImGui::TextDisabled("std / mean: mean is not above 0, so the ratio "
+                                 "states nothing");
         if (c.s.step > 1) ImGui::Text("n = %zu (sampled 1 row in %zu)", c.s.n, c.s.step);
         else              ImGui::Text("n = %zu (every row)", c.s.n);
         if (c.s.n < 2)
@@ -202,9 +208,10 @@ static void roiStatTooltip(const std::vector<RoiCell>& cells, bool planesMixed) 
     ImGui::TextDisabled("THIS ROI's sd over its own mean, as displayed:\n"
                         "one frame, no dark subtraction, no flat-field correction.\n"
                         "Temporal noise is inside it, so it bounds the fixed pattern\n"
-                        "from above and is not a measurement of it. A PRNU that means\n"
-                        "what EMVA means needs a layer above the frame - a flat stack\n"
-                        "and a dark stack (docs/flat-field-stats.md).");
+                        "from above and is not a measurement of it. The named\n"
+                        "fixed-pattern measurements live a layer above the frame -\n"
+                        "an image stack and a dark stack, bound as roles, in the\n"
+                        "Set Analysis panel (docs/flat-field-stats.md).");
     // The one case where that bound has a named counterpart on screen: a frame
     // average IS the time-folded picture the Temporal panel's sigma_fpn is
     // measured on, off the same accumulator - and since #57 judgment 2 the two

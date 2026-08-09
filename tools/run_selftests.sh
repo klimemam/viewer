@@ -16,7 +16,7 @@
 #   2. regenerates tools/testdata (deterministic, gitignored, never committed);
 #   3. asks the machine ONCE whether it can make the OpenGL context that every
 #      selftest not labelled `nogl` needs - the ones that drive real ImGui
-#      frames, six of the 36 today - because "there is no GL here" and "an
+#      frames, six of the 37 today - because "there is no GL here" and "an
 #      assert failed" are different events that used to look identical. The
 #      figures in this header are the only ones written down: what a given run
 #      actually did is the "ran N, skipped M" line it prints at the end, which
@@ -69,7 +69,7 @@ if [ ! -f "$build_dir/CMakeCache.txt" ]; then
 fi
 
 # ---- preflight: a display ---------------------------------------------------
-# Five selftests create a real GLFW window and an OpenGL context; the other 30
+# Six selftests create a real GLFW window and an OpenGL context; the other 31
 # take the --no-window startup path and want no display at all. Saying which
 # case this machine is in, once and up front, beats five identical "failed to
 # create window" failures further down.

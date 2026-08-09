@@ -457,6 +457,11 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("the series layer's analyses: linearity / PTC fit, read\n"
                                   "noise, SNR curve over one series (was \"Linearity\")");
+            ImGui::MenuItem("Set Analysis", nullptr, &app.showSetAnalysis);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("the analyses that need a role bound - a dark, an image.\n"
+                                  "Which data plays which part is declared in the set,\n"
+                                  "never guessed from a folder name");
             if (ImGui::MenuItem("Messages", nullptr, &app.showMessages)) app.msgUnreadErr = false;
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) {

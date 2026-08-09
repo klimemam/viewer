@@ -121,7 +121,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
       << (app.showRois ? 1 : 0) << " " << (app.showAnalysis ? 1 : 0) << " "
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
       << (app.showProjection ? 1 : 0) << " " << (app.showSeriesAnalysis ? 1 : 0) << " "
-      << (app.showRemote ? 1 : 0) << "\n";
+      << (app.showRemote ? 1 : 0) << " " << (app.showSetAnalysis ? 1 : 0) << "\n";
     // Browse places (docs/todo-open.md item 10, user decision A5: auto-
     // reconnect): one "rbplace <num> <url>" line per instance that stands
     // somewhere. placeUrl keeps the port. On load each instance reconnects
@@ -1811,11 +1811,12 @@ static std::string loadSession(const std::string& path) {
         else if (key == "panels") {
             // trailing fields are optional: sessions written before a panel
             // existed keep their meaning, and its default stays put
-            int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0, h2 = 0, i2 = 0;
-            ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2 >> h2 >> i2;
+            int a = 1, b = 1, c2 = 1, d2 = 1, e2 = 1, f2 = 1, g2 = 0, h2 = 0, i2 = 0, j2 = 0;
+            ls >> a >> b >> c2 >> d2 >> e2 >> f2 >> g2 >> h2 >> i2 >> j2;
             app.showFiles = a != 0; app.showInspector = b != 0; app.showRois = c2 != 0;
             app.showAnalysis = d2 != 0; app.showHistogram = e2 != 0; app.showTemporal = f2 != 0;
             app.showProjection = g2 != 0; app.showSeriesAnalysis = h2 != 0; app.showRemote = i2 != 0;
+            app.showSetAnalysis = j2 != 0;
         }
         else if (key == "rbplace") {
             // "<num> <url>": where a Browse instance stood (item 10, A5).

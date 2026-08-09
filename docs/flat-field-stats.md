@@ -622,9 +622,23 @@ Series Analysis パネル PR #102)。推定量はその下流に乗るだけな�
   **ROIs / Temporal の名前の分離** (`std (mean_t)` vs 申告つき `sigma_fpn`) を
   実装した。**文書が現物より先回りしない**という規約どおり、記述の更新は
   バイナリが変わるのと同じコミット群で行った。
-- **本書の残りの実装段は未着手** — 判断4 の直接 DSNU / PRNU、判断5 の分離
-  フィット、判断6/7 の detrend PreProcessor。「実装の進め方」の 2..6 がそれで、
-  それぞれ別 PR が持つ。
+- **判断4 の実装 (直接 DSNU / PRNU)** — **着地済み: PR #129
+  (`direct-dsnu-prnu`)。** SetAnalyzer 2行 (`core/app/setanalysis.inc`) が
+  束縛済み set の上で本節の式を計算し、結果は set 名と役割の n/N を名乗る
+  (`DSNU [DN] - set "<名前>": dark 5/5`)。住処は新設の **Set Analysis パネル**
+  (`core/ui/panel_setanalysis.inc`、Files の set ノード選択が対象を決める)。
+  拒否は本書の文言のまま5種 (役割未宣言 / 未束縛 / frame 役割 / series 役割 /
+  min_frames 2)、加えて形状不一致と μ≤0。**detrend は未実装なので cutoff は
+  `raw` と申告**する (約束1 — 結果構造体の必須フィールド)。
+  **有名名の規則は検査になった**: 裸の `PRNU` / `DSNU` は
+  `core/app/setanalysis.inc` の表にしか literal として存在せず、
+  `--setanalysis-selftest` が出荷ソースの UI 文字列を走査して守る。
+  同 PR がこの走査で見つけた**実在の違反**を直した — ROIs の列は `5d8cb72` で
+  改名済みだったが、その**ツールチップ**は `PRNU [σ %]` を出し続けていた。
+  **remote は未対応**: 集計は画素の居る側で走る線 (analysis-layers.md §3.5) の
+  実装は別 PR が持つ (2つの stack をまたぐ MEASURE op が要る)。
+- **本書の残りの実装段は未着手** — 判断5 の分離フィット、判断6/7 の detrend
+  PreProcessor。「実装の進め方」の 5..6 がそれで、それぞれ別 PR が持つ。
 
 ## 判断record (2026-08-09 確定 — もう「待ち」ではない)
 
