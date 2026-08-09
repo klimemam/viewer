@@ -45,6 +45,35 @@ struct StackAnalyzerPluginInfo {
 
 struct ProcessorPluginInfo { std::string name; psProcessorV1 v; };
 
+// ---- how an analyzer is CITED, spelled once for every mouth that cites one --
+//
+// Lives here, beside the ledger these two read from, for the reason
+// rp::npyNotNativeText lives in the header both doors include: a result
+// measured on a peer and the same result measured locally are read by one
+// person in one window, and a citation that differs by a space or a bracket
+// between the two reads as two different plugins. There were two mouths when
+// this was a static in panel_analysis.inc; §10 makes it four (status line,
+// tooltip, TSV/CSV comment, and the peer's ledger row coming back over the
+// wire), which is one more than a copy survives.
+//
+// The version is angle-bracketed and comes FIRST because a path may contain
+// spaces and a trailing token after one cannot be told from part of it. An
+// empty version is ABSENT, not blank: those descriptors are V1/V2, which have
+// no version field, and an empty <> would read as "declared nothing" where the
+// truth is "was never asked". Nothing here invents one.
+inline std::string analyzerCitation(const std::string& version, const std::string& file) {
+    return version.empty() ? file : "<" + version + "> " + file;
+}
+// The provenance line's tail: "name <version> (dll)" - what a screenshot has to
+// answer without the session around it. Same absence rule as above.
+inline std::string analyzerTag(const std::string& name, const std::string& version,
+                               const std::string& file) {
+    std::string s = name;
+    if (!version.empty()) s += " <" + version + ">";
+    if (!file.empty())    s += " (" + file + ")";
+    return s;
+}
+
 namespace plugin_host {
 
 // Scan each dir (non-recursive) for *.dll / *.so / *.dylib, load and register.

@@ -64,15 +64,11 @@ static std::string stripChannelPrefix(const std::string& key) {
     return key;                        // "mtf50 (cy/px)", "finite ratio": no prefix
 }
 
-// The citation the exports and the hover carry: the version the plugin
-// DECLARED, then the file the ledger witnessed. Version first and in angle
-// brackets so the line stays parseable - a path may contain spaces, and a
-// trailing token after one cannot be told from part of it. Empty version =
-// a V1/V2 analyzer, and the line is then byte-for-byte the stage-1 one: a
-// blank is a fact here, never a placeholder.
-static std::string analyzerCitation(const std::string& version, const std::string& dll) {
-    return version.empty() ? dll : "<" + version + "> " + dll;
-}
+// The citation the exports and the hover carry - `analyzerCitation` and the
+// provenance tail `analyzerTag` both live in core/plugin_host.h now, beside the
+// ledger they read, because ABI v3 §10 gave them a fourth caller that is not in
+// this file: the peer's own ledger row, arriving over the wire. A citation that
+// differs between a local run and a remote one reads as two different plugins.
 
 // The "Copy table (TSV)" document, built from the panel's cached state. A
 // function rather than button-local code for the buildTemporalExport reason:
@@ -296,9 +292,7 @@ static void drawPanelAnalysis() {
                 // an empty <> would read as "declared nothing" where the truth
                 // is "was never asked". Nothing here guesses one.
                 const auto& who = anas[app.anaSel];
-                ana.prov += "  |  " + who.name;
-                if (!who.version.empty()) ana.prov += " <" + who.version + ">";
-                if (!who.file.empty())    ana.prov += " (" + who.file + ")";
+                ana.prov += "  |  " + analyzerTag(who.name, who.version, who.file);
                 ana.provDll = who.path;
                 ana.provVer = who.version;
             }
