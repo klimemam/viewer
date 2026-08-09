@@ -313,6 +313,39 @@ set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
 # wrapper around it (core/imagefile.cpp) is OURS and stays under -Wall -Wextra.
 set_source_files_properties(core/stb_image_impl.c PROPERTIES
                             COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>;$<$<C_COMPILER_ID:MSVC>:/w>")
+
+# ---- no backend may build its decoder on the STACK --------------------------
+# A format backend wraps a library, and a library's context can be enormous:
+# sizeof(LibRaw) is 768,512 bytes, because imgdata.color alone carries a
+# 65536-entry tone curve and a 4102-entry black level, and the constructor
+# memsets all of it. `LibRaw R;` as a local was therefore a 770 KB stack frame -
+# and Windows gives the MAIN thread one megabyte (SizeOfStackReserve 0x100000,
+# what MSVC links and so what every shipped Windows build has) against Linux's
+# and macOS's eight.
+#
+# What made that a bug worth a gate rather than a tidy-up is that it did not
+# fail HERE. It failed as `selftest.media ***Exception: SegFault` on
+# windows-latest, on two branches that touched nothing near this path, while
+# main stayed green: whether 770 KB fit in what was left of the megabyte
+# depended on the caller's frame - `main`, which #includes every selftest body -
+# so the crash was a property of the binary's LAYOUT and any unrelated change
+# could flip it. Nothing in the source said which line was responsible.
+#
+# -Wframe-larger-than= is what says it. 64 KB against a measured worst case of
+# under 4 KB across all five backends at -O0, -O2 and -O3, so it has sixteen
+# times the headroom it needs and cannot misfire on an ordinary edit; the one
+# thing it catches is a library context that landed on the stack. It is an
+# ERROR, on the two platforms whose compilers can measure it - which are exactly
+# the two that never see the crash, and can now refuse to build the cause of it.
+# MSVC has no equivalent, so Windows keeps gating the way it always did: by
+# running the tests.
+if(NOT MSVC)
+  set_source_files_properties(
+    core/imagefile.cpp core/rawread.cpp core/tiffread.cpp
+    core/exrread.cpp core/y4mread.cpp
+    PROPERTIES COMPILE_OPTIONS
+    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Werror=frame-larger-than=65536>")
+endif()
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads libraw_lib)
 # where the server pulls its own peer binary from (binaries branch)
 set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING

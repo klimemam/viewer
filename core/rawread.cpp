@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 
 #include <libraw/libraw.h>
 
@@ -192,7 +193,38 @@ std::string unsupportedCodec(const char* decoder, const LibRaw& R) {
 // the seam is supposed to be able to refuse.
 static bool rawDecodeBody(const uint8_t* p, size_t n, std::vector<Image>& out,
                           std::string& err) {
-    LibRaw R;
+    // ON THE HEAP, and that is the whole of it: sizeof(LibRaw) is 768,512 bytes.
+    //
+    // A LibRaw is not an ordinary handle. Its context is the decoder's entire
+    // working state - imgdata.color alone carries a 65536-entry tone curve and
+    // a 4102-entry per-plane black level - and the constructor memsets all of
+    // it, so an instance as a LOCAL is three quarters of a megabyte of stack
+    // written on the way in. Windows gives the main thread ONE megabyte
+    // (SizeOfStackReserve 0x100000, which is what MSVC links and therefore what
+    // every shipped Windows build has); Linux and macOS give eight. So on
+    // Windows this frame alone was 75% of the thread's stack, and whether it
+    // fit depended on how much of that megabyte the caller had already spent -
+    // which for a selftest binary is `main`, whose frame carries every
+    // #include'd selftest body. That made the overflow a property of the
+    // BINARY'S LAYOUT rather than of this file: main survived, and two branches
+    // that touched nothing near this path (the Set Analysis separation fit, the
+    // detrend preprocessor) each died with STATUS_STACK_OVERFLOW (0xC00000FD)
+    // on the first .dng the media selftest opens, reported as `selftest.media
+    // ***Exception: SegFault` on windows-latest and nowhere else.
+    //
+    // Reproduced on unmodified main by linking the MinGW build with a 768 KB
+    // stack (-Wl,--stack,0xC0000): it dies at exactly that file, after M28's
+    // last assert and before M29's first. On the heap this frame measures 1,304
+    // bytes instead of 769,816, and what keeps it there is not this comment but
+    // -Werror=frame-larger-than=65536 on the five backend sources
+    // (CMakeLists.txt): the next context that lands on the stack does not
+    // compile on Linux or macOS, which is the check Windows cannot make.
+    //
+    // std::unique_ptr and not a `new` this function has to remember to delete:
+    // there are eleven `return false` paths below, and one of them is reached
+    // by a throw from the resize() further down.
+    std::unique_ptr<LibRaw> Rp(new LibRaw);
+    LibRaw& R = *Rp;
     // Nothing in imgdata.params is set, and that is deliberate: every one of
     // them steers dcraw_process(), which is not linked into this binary. The
     // only call made here is unpack(), whose output is the file's own samples.
