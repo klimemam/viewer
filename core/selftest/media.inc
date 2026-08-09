@@ -49,8 +49,25 @@
             fprintf(stderr, "mediaselftest: table = %zu format(s), decodable: %s\n",
                     imagefile::backends().size(), imagefile::decodableFormats().c_str());
             check(sound, "M1 every format either decodes or says why it does not");
+            // OpenEXR is the row that can be in EITHER state in a legitimate
+            // build, so which one it is here is asserted rather than assumed -
+            // a suite that quietly passed with the format switched off would be
+            // reporting on a viewer nobody ships.
+#ifdef VIEWER_WITH_EXR
+            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, OpenEXR",
+                  "M1 this build decodes PNG, JPEG, TIFF and OpenEXR");
+#else
             check(imagefile::decodableFormats() == "PNG, JPEG, TIFF",
                   "M1 this build decodes PNG, JPEG and TIFF");
+            check(imagefile::forPath("x.exr") && !imagefile::forPath("x.exr")->decode &&
+                  imagefile::forPath("x.exr")->absent,
+                  "M1 ...and .exr is still LISTED, with the reason there is no decoder");
+#endif
+            // Every extension the table dispatches on reaches the file dialog,
+            // including a format that is listed but absent: its refusal is more
+            // use than the raw dialog a filtered-out file would get.
+            check(has(imagefile::dialogPattern(), "*.exr"),
+                  "M1 .exr is offered by the file dialog whether or not it decodes");
         }
 
         // ---- M2: 16-bit PNG, sample for sample ------------------------------
@@ -381,6 +398,336 @@
             check(has(app.toast, "tiffread"), "M15 ...and the refusal names the reader that refused");
         }
 
+        // ---- M16-M23: OpenEXR ------------------------------------------------
+        // The format this seam exists for at the far end: .exr is the only one
+        // behind it whose samples are FLOAT and SCENE LINEAR, so there is no
+        // full scale, negatives are ordinary, and values above 1 are the point.
+        // Every assert below is therefore about the NUMBER and not about "it
+        // opened" - if anyone ever adds a tone curve, a gamma or a clamp to
+        // this load path, M16 is what stops it.
+        //
+        // The fixtures are written by `mkexr` at build time (CMakeLists.txt),
+        // not by tools/gen_testdata.py: PIZ is a wavelet and DWAB is a DCT, and
+        // those two are the entire reason the official library is linked rather
+        // than a hand-rolled reader. What that costs in honesty is stated:
+        // these files come from the same project as the reader, so this is a
+        // test of the viewer's INTERPRETATION - channels, layers, dtype,
+        // ranges, refusals - and not of byte-level parsing of a stranger's file.
+#ifndef VIEWER_WITH_EXR
+        // A LOUD skip, never a silent one. -DVIEWER_WITH_EXR=OFF is a supported
+        // configuration (no network, or a packager who does not want the
+        // dependency) and failing the suite for choosing it would punish the
+        // documented escape hatch - but the run must say that the coverage is
+        // absent, and why, every single time. Same rule as the quarantine block
+        // in CMakeLists.txt.
+        fprintf(stderr, "mediaselftest: M16-M23 SKIPPED - built without OpenEXR, so the "
+                        ".exr reader is NOT covered by this run "
+                        "(configure with -DVIEWER_WITH_EXR=ON to cover it)\n");
+#else
+        // ---- M16: the values arrive untouched --------------------------------
+        {
+            ImageDoc* d = open1("rgb_half.exr");
+            bool shape = d && d->w == 8 && d->h == 8 && d->ch == 3 && d->dtype == "f16";
+            // 12.5 survives only if nothing tone maps; -3.25 only if nothing
+            // clamps; 256 only if nothing normalises to 0..1.
+            bool exact = shape && d->sample(0, 0, 0) == 12.5f && d->sample(0, 0, 1) == 12.5f &&
+                         d->sample(3, 0, 0) == -3.25f && d->sample(2, 0, 0) == 256.0f;
+            // half(0.1) is NOT 0.1f. Widening a half to a float is lossless, so
+            // the assert is that we get half's number exactly - which is what
+            // "no loss on widening" actually means, and is a stronger statement
+            // than any tolerance would be.
+            // half(0.1) written out: 0.1 x 2^14 = 1638.4, and half keeps 11
+            // significant bits, so the stored number is 1638/16384 exactly.
+            // Spelled as a literal because main.cpp must not include an
+            // OpenEXR header - the seam's rule is that nothing outside
+            // core/imagefile.cpp and its backends does.
+            const float want01 = 0.0999755859375f;         // = 1638 / 16384
+            fprintf(stderr, "mediaselftest: M16 %dx%d %dch dtype=%s px=%.9g/%.9g/%.9g "
+                            "half(0.1)=%.9g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0, d ? d->dtype.c_str() : "-",
+                    d ? (double)d->sample(0, 0, 0) : 0.0, d ? (double)d->sample(3, 0, 0) : 0.0,
+                    d ? (double)d->sample(2, 0, 0) : 0.0, d ? (double)d->sample(4, 0, 0) : 0.0,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M16 an RGB half .exr is one 3-channel f16 frame");
+            check(exact, "M16 12.5 / -3.25 / 256 arrive EXACTLY: no tone map, no clamp, no scaling");
+            check(d && d->sample(4, 0, 0) == want01,
+                  "M16 a half that is not exact widens to exactly that half");
+            check(d && d->vmin == -3.25f && d->vmax == 256.0f,
+                  "M16 vmin/vmax are the data's own - a float format has no full scale");
+            check(d && d->black == d->vmin && d->white == d->vmax,
+                  "M16 the display range initialises from the data, not from 0..1");
+            check(d && has(d->note, "OpenEXR") && has(d->note, "half") &&
+                  has(d->note, "no scaling"),
+                  "M16 the note says what was read and what was NOT done to it");
+            check(d && d->src->fsize > 0, "M16 the Watch baseline is stamped (file, size)");
+
+            ImageDoc* f = open1("rgba_f32.exr");
+            fprintf(stderr, "mediaselftest: M16 f32 %dch dtype=%s px(5,0)=%.9g\n",
+                    f ? f->ch : 0, f ? f->dtype.c_str() : "-",
+                    f ? (double)f->sample(5, 0, 0) : 0.0);
+            check(f && f->ch == 4 && f->dtype == "f32",
+                  "M16 R,G,B,A float is 4 channels and records dtype f32");
+            check(f && f->sample(5, 0, 0) == 12345.6789f,
+                  "M16 ...and a float half could not have held round-trips exactly");
+        }
+
+        // ---- M17: a layer is a DOCUMENT, a page is a FRAME --------------------
+        // The distinction core/imagefile.h draws, asserted from both sides: a
+        // 3-page TIFF is ONE stack (M12) and a 2-layer .exr is TWO documents,
+        // because layers are named and need not share a shape while pages are
+        // ordered and do.
+        {
+            closeAll();
+            app.toast.clear();
+            openPath(root + "/layers.exr");
+            const size_t n = app.images.size();
+            std::string names, members;
+            for (const auto& d : app.images) {
+                names += (names.empty() ? "" : ", ") + d->name;
+                members += (members.empty() ? "" : ", ") + d->src->npzMember;
+            }
+            fprintf(stderr, "mediaselftest: M17 %zu doc(s): %s  members: %s  toast=\"%s\"\n",
+                    n, names.c_str(), members.c_str(), app.toast.c_str());
+            bool two = n == 2 && app.images[0]->src->npzMember == "diffuse" &&
+                       app.images[1]->src->npzMember == "specular" &&
+                       app.images[0]->name == "layers.exr:diffuse" &&
+                       app.images[1]->name == "layers.exr:specular" &&
+                       app.images[0]->ch == 3 && app.images[1]->ch == 3;
+            check(two, "M17 each layer becomes its own 3-channel document, named for it");
+            check(n == 2 && app.images[0]->seqId == 0 && app.images[1]->seqId == 0,
+                  "M17 ...and they are NOT a stack: layers are not a frame axis");
+            check(has(app.toast, "2 layers") && has(app.toast, "diffuse") &&
+                  has(app.toast, "specular"),
+                  "M17 two documents out of one file is said out loud, by name");
+
+            // A named layer beside loose channels: "diffuse" is RGB, and Z and
+            // mask are one plane each, because no order over them means
+            // anything and packing them as colour would be a guess.
+            closeAll();
+            openPath(root + "/mixed.exr");
+            std::string mm;
+            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->npzMember;
+            fprintf(stderr, "mediaselftest: M17 mixed %zu doc(s) members: %s\n",
+                    app.images.size(), mm.c_str());
+            // The ORDER is the file's own: an EXR ChannelList is sorted, so
+            // "Z" and "mask" (which sit in the base layer) come out around
+            // "diffuse.*" by plain byte order, and Z leads because 'Z' < 'd'.
+            // Asserted as it is rather than re-sorted into something prettier -
+            // a loader that reorders parts is a loader whose output no longer
+            // matches what the file says it holds.
+            check(app.images.size() == 3 && mm == "Z,mask,diffuse" &&
+                  app.images[0]->ch == 1 && app.images[1]->ch == 1 && app.images[2]->ch == 3,
+                  "M17 an RGB layer and two loose channels are 3 documents, 1+1+3 channels");
+
+            ImageDoc* y = open1("lum.exr");
+            check(y && app.images.size() == 1 && y->ch == 1 && y->src->npzMember == "Y",
+                  "M17 a lone Y is one 1-channel document naming the channel it is");
+        }
+
+        // ---- M18: a session brings back the layers it saved, and only those ---
+        // The count is the whole assert. The session writes one line per
+        // DOCUMENT with its member name, and each line re-reads the WHOLE file:
+        // if the member filter were ignored, restoring a 2-layer file would
+        // give 2 x 2 = 4 documents, and nothing on screen would say so.
+        {
+            closeAll();
+            openPath(root + "/layers.exr");
+            const std::string sess =
+                (std::filesystem::temp_directory_path() / "viewer_mediaexrlayers.vsession").u8string();
+            bool saved = app.images.size() == 2;
+            if (saved) saveSession(sess, true);
+            closeAll();
+            std::string lerr = loadSession(sess);
+            std::string mm;
+            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->npzMember;
+            fprintf(stderr, "mediaselftest: M18 restored %zu doc(s) members: %s err=\"%s\"\n",
+                    app.images.size(), mm.c_str(), lerr.c_str());
+            check(saved && lerr.empty() && app.images.size() == 2 && mm == "diffuse,specular",
+                  "M18 a session that saved 2 .exr layers reopens exactly those 2");
+            std::error_code sec;
+            std::filesystem::remove(pathFromUtf8(sess), sec);
+        }
+
+        // ---- M19: the compressed paths, which are the whole argument ---------
+        // docs/media-support.md §1 chose the official library over a hand-rolled
+        // reader because real .exr files are PIZ or DWA, and "NONE and ZIP only"
+        // would produce a stream of files that will not open. That reasoning is
+        // worth nothing unless the compressed paths are actually exercised.
+        // ZIP/ZIPS/RLE/PIZ are lossless, so they are asserted DN for DN against
+        // the uncompressed file; DWAB is lossy and is asserted close, never
+        // equal - claiming exactness for a lossy codec would be the same kind of
+        // lie this loader exists to avoid.
+        {
+            ImageDoc* p0 = open1("rgb_half.exr");
+            std::vector<float> plain;
+            if (p0) plain = p0->px();
+            for (const char* nm : { "comp_zip.exr", "comp_zips.exr",
+                                    "comp_rle.exr", "comp_piz.exr" }) {
+                ImageDoc* d = open1(nm);
+                bool same = d && !plain.empty() && d->px() == plain;
+                fprintf(stderr, "mediaselftest: M19 %-14s %zu doc(s) same=%d note=\"%s\"\n",
+                        nm, app.images.size(), (int)same,
+                        d ? d->note.c_str() : app.toast.c_str());
+                check(same, (std::string("M19 ") + nm +
+                             " decompresses to the identical samples").c_str());
+            }
+            ImageDoc* d = open1("comp_dwab.exr");
+            float got = d ? d->sample(0, 0, 0) : 0.0f;
+            fprintf(stderr, "mediaselftest: M19 DWAB px(0,0)=%.9g (lossy: 12.5 +/- 0.5)\n",
+                    (double)got);
+            check(d && d->ch == 3 && std::fabs(got - 12.5f) < 0.5f,
+                  "M19 DWAB (lossy) opens and is close - and is NOT asserted exact");
+            check(d && has(d->note, "lossy"),
+                  "M19 ...and the note says the compression was lossy, because the numbers moved");
+        }
+
+        // ---- M20: the data window is the picture -----------------------------
+        // A renderer that crops writes a data window smaller than the display
+        // window and not at the origin. OpenEXR addresses pixels in IMAGE
+        // coordinates, so the slice base is where pixel (0,0) WOULD sit - an
+        // address outside the buffer. Getting that arithmetic wrong shifts every
+        // pixel and still draws a picture, which is why it is asserted on values
+        // and not on dimensions alone.
+        {
+            ImageDoc* d = open1("window.exr");
+            bool shape = d && d->w == 8 && d->h == 8 && d->ch == 1;
+            bool vals = shape && d->sample(0, 0, 0) == 12.5f && d->sample(3, 0, 0) == -3.25f &&
+                        d->sample(2, 0, 0) == 256.0f && d->sample(7, 7, 0) == 31.5f;
+            fprintf(stderr, "mediaselftest: M20 %dx%d px(0,0)=%.9g px(7,7)=%.9g note=\"%s\"\n",
+                    d ? d->w : 0, d ? d->h : 0, d ? (double)d->sample(0, 0, 0) : 0.0,
+                    d ? (double)d->sample(7, 7, 0) : 0.0,
+                    d ? d->note.c_str() : app.toast.c_str());
+            check(shape, "M20 a data window at (5,3) gives an 8x8 document, not a 16x16 one");
+            check(vals, "M20 ...with the samples where they were written, not offset by (5,3)");
+            check(d && has(d->note, "display window"),
+                  "M20 ...and the note says these pixels are the data window inside a larger frame");
+        }
+
+        // ---- M21: tiled is READ; multi-resolution is refused ------------------
+        // Issue #53 left this open: the branch refused every tiled .exr although
+        // the library reads one transparently. Resolved here by splitting the
+        // question. Tiling is a STORAGE layout, undone losslessly by the code
+        // already linked, so refusing it would cost a user a file this build can
+        // open exactly right. A mip pyramid is not a layout: it is the same
+        // picture at several sizes, and choosing one silently would answer a
+        // question the file asked.
+        {
+            ImageDoc* t = open1("tiled.exr");
+            bool vals = t && t->ch == 1 && t->w == 8 &&
+                        t->sample(0, 0, 0) == 12.5f && t->sample(3, 0, 0) == -3.25f;
+            fprintf(stderr, "mediaselftest: M21 tiled %zu doc(s) note=\"%s\"\n",
+                    app.images.size(), t ? t->note.c_str() : app.toast.c_str());
+            check(vals, "M21 a one-level tiled .exr READS, to the same samples as the scanline one");
+            check(t && has(t->note, "tiled"),
+                  "M21 ...and the note says it was tiled, because that is a fact about the file");
+
+            ImageDoc* m = open1("mipmap.exr");
+            fprintf(stderr, "mediaselftest: M21 mipmap -> \"%s\"\n", app.toast.c_str());
+            check(!m && app.images.empty() && has(app.toast, "multi-resolution") &&
+                  has(app.toast, "mipmap"),
+                  "M21 a mipmapped .exr is refused: which level is the picture is not ours to pick");
+        }
+
+        // ---- M22: what is NOT read, named one by one -------------------------
+        // Every one of these is a VALID .exr that OpenEXR itself wrote and
+        // reads. A refusal that only passed because the file was malformed
+        // would prove nothing at all.
+        {
+            struct Case { const char* file; const char* needle; const char* what; };
+            const Case cases[] = {
+                { "chroma.exr",   "chroma-subsampled",
+                  "M22 chroma subsampling is refused, naming the channel" },
+                { "deep.exr",     "deep EXR",
+                  "M22 a deep .exr is refused: a deep pixel is a list, not a value" },
+                { "multipart.exr", "multi-part",
+                  "M22 a multi-part .exr is refused rather than one part chosen for the user" },
+                { "uintchan.exr", "UINT",
+                  "M22 a UINT channel is refused rather than widened into float" },
+            };
+            for (const Case& c : cases) {
+                ImageDoc* d = open1(c.file);
+                const std::string msg = app.toast;
+                fprintf(stderr, "mediaselftest: M22 %-15s -> \"%s\"\n", c.file, msg.c_str());
+                check(!d && app.images.empty() && has(msg, c.file) && has(msg, "OpenEXR:") &&
+                      has(msg, c.needle) && has(msg, "choose a reader"), c.what);
+            }
+            // The refusal is still the affordance: the Reader panel is raised on
+            // the file that could not be opened.
+            open1("deep.exr");
+            check(app.readerPanelOpen && app.readerPickPath.find("deep.exr") != std::string::npos,
+                  "M22 a refused .exr raises the Reader panel on itself");
+            check(has(app.toast, "OpenEXR "),
+                  "M22 ...and the refusal names the library that refused, with its version");
+
+            // Correct magic, then nothing. A truncated .exr is a different event
+            // from a file that was never one, and the sniff cannot tell them
+            // apart - only the decoder can, and it must say so rather than fall
+            // through to the raw dialog.
+            ImageDoc* b = open1("broken.exr");
+            fprintf(stderr, "mediaselftest: M22 broken -> \"%s\"\n", app.toast.c_str());
+            check(!b && app.images.empty() && has(app.toast, "broken.exr") &&
+                  has(app.toast, "OpenEXR:"),
+                  "M22 a truncated .exr is refused as a broken OpenEXR, not as an unknown file");
+        }
+
+        // ---- M23: a FOLDER of .exr is one stack -------------------------------
+        // One .exr is one frame; the frame axis comes from the FILES. The
+        // original branch asserted only that the folder SCANNED as one non-raw
+        // group - this drives the load as well, because "it scanned" and "the
+        // frames are the files' pixels, in order" are different claims and the
+        // second is the one a user depends on.
+        {
+            closeAll();
+            const std::string sdir = root + "/exrseq";
+            auto grp = scanFolderGroups(sdir);
+            fprintf(stderr, "mediaselftest: M23 %zu group(s) files=%zu isRaw=%d\n",
+                    grp.size(), grp.empty() ? (size_t)0 : grp[0].files.size(),
+                    grp.empty() ? -1 : (int)grp[0].isRaw);
+            check(grp.size() == 1 && grp[0].files.size() == 3 && !grp[0].isRaw,
+                  "M23 three .exr files scan as ONE group, and NOT as raw: they carry their shape");
+
+            // openFolder always raises the picker (it is where the file filter
+            // lives); a headless caller answers it with pickerAccept, which is
+            // the same drain loop --derive-selftest and --close-selftest use.
+            auto loadAll = [&]() {
+                double t0 = nowSec();
+                while (nowSec() - t0 < 120.0) {
+                    if (app.folderPickOpen && !app.folderPickRemote) pickerAccept();
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        !app.folderPickOpen) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            const int mode = app.seqLoadMode;
+            app.seqLoadMode = 1;                       // always load numbered runs
+            openFolder(sdir);
+            loadAll();
+            app.seqLoadMode = mode;
+            const size_t n = app.images.size();
+            int sid = n ? app.images[0]->seqId : 0;
+            bool oneStack = n == 3 && sid != 0;
+            if (oneStack)
+                for (size_t i = 0; i < n; i++)
+                    if (app.images[i]->seqId != sid) oneStack = false;
+            // f_000/f_001/f_002 were written 100 apart at pixel 0, so which
+            // file became which frame is readable from the pixels alone. (100
+            // and not 1000: 2012.5 is not representable in half and would come
+            // back 2012, which would make this assert about rounding instead of
+            // about ordering.)
+            bool order = n == 3;
+            if (order)
+                for (size_t i = 0; i < n; i++)
+                    if (app.images[i]->px()[0] != 12.5f + 100.0f * (float)i) order = false;
+            fprintf(stderr, "mediaselftest: M23 %zu doc(s) seq=%d px0 = %.9g / %.9g / %.9g\n",
+                    n, sid, n > 0 ? (double)app.images[0]->px()[0] : 0.0,
+                    n > 1 ? (double)app.images[1]->px()[0] : 0.0,
+                    n > 2 ? (double)app.images[2]->px()[0] : 0.0);
+            check(oneStack, "M23 ...and opening the folder gives ONE stack of 3 frames");
+            check(order, "M23 ...whose frames are the files' own pixels, in file order");
+        }
+#endif  // VIEWER_WITH_EXR
+
         // ---- M8: the two other ways to be refused ---------------------------
         {
             ImageDoc* d = open1("broken.png");
@@ -394,7 +741,11 @@
             d = open1("notanimage.png");
             msg = app.toast;
             fprintf(stderr, "mediaselftest: M8 not-an-image = \"%s\"\n", msg.c_str());
-            check(!d && has(msg, "not a PNG, JPEG or TIFF file") && has(msg, "68 65 6c 6c"),
+            // The list of formats in the sentence is COMPUTED from the table
+            // (imagefile.cpp listFormats), so it grows when a row is added -
+            // which is the point: this assert is what notices.
+            check(!d && has(msg, "not a PNG, JPEG, TIFF or OpenEXR file") &&
+                  has(msg, "68 65 6c 6c"),
                   "M8 a file that is none of them is refused with its first bytes");
         }
 

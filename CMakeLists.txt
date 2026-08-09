@@ -71,6 +71,99 @@ set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 # offline clean clone. So the only outside code TIFF uses is miniz, which was
 # already fetched for .npz, and THIRD-PARTY-NOTICES.md gains nothing to record.
 
+# ---- OpenEXR (official ASWF library) ---------------------------------------
+# ...and .exr is where that same reasoning comes out the OTHER way, which is why
+# both blocks are here to be read together.
+#
+# docs/media-support.md §1 studied this and recommended tinyexr; the user
+# overruled that and chose the official library. That decision stands and the
+# reason is the compression: a real .exr off a renderer is PIZ or DWA, and a
+# hand-rolled reader that did "NONE and ZIP" would produce a stream of files
+# that will not open. There is no small honest EXR reader the way there is a
+# small honest TIFF reader - the refusals do not shrink the format here, they
+# only remove the half of it that was worth having.
+#
+# So this is BY FAR the heaviest dependency in the tree, and the only one that
+# is neither a single file nor a header. Its measured cost is recorded in
+# docs/media-support.md §1 rather than left for someone to rediscover.
+#
+# Order of resolution, and why:
+#   1. find_package(OpenEXR) - a distro/vcpkg/brew OpenEXR is used as-is. A
+#      packager must never be made to download a second copy of a library the
+#      system already ships.
+#   2. FetchContent, pinned by URL (this repo's flavour: no git needed, the
+#      archive is what the pin means).
+# Imath is declared HERE rather than left to OpenEXR's own auto-fetch, which
+# uses GIT_REPOSITORY - that would need git on the build machine and would not
+# honour this repo's pinned-URL convention. OpenEXR checks `TARGET Imath::Imath`
+# before fetching, so declaring it first wins.
+#
+# OFFLINE: both honour the standard overrides, like the four above -
+#     -DFETCHCONTENT_SOURCE_DIR_IMATH=<imath source tree>
+#     -DFETCHCONTENT_SOURCE_DIR_OPENEXR=<openexr source tree>
+# With -DVIEWER_WITH_EXR=OFF the viewer builds exactly as before and .exr stays
+# a LISTED format with no decoder behind it (core/imagefile.h's `absent` state):
+# handed one, it says which build option is off. It never pretends.
+option(VIEWER_WITH_EXR "read .exr images (uses an installed OpenEXR, else fetches it)" ON)
+if(VIEWER_WITH_EXR)
+  find_package(OpenEXR 3.1 QUIET)
+  if(OpenEXR_FOUND)
+    message(STATUS "OpenEXR ${OpenEXR_VERSION}: using the installed copy (no download)")
+  else()
+    message(STATUS "OpenEXR: not installed - fetching v3.4.13 + Imath v3.2.2 "
+                   "(docs/media-support.md §1 carries the measured cost; "
+                   "-DVIEWER_WITH_EXR=OFF to skip)")
+    # Static, no install rules, no tools/examples/tests: we want the reader and
+    # nothing else. BUILD_TESTING is CTest's own switch and this repo turns
+    # enable_testing() on for its selftests, so it must be forced off for the
+    # subprojects or their test suites join our ctest run.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
+    set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_TOOLS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_TEST_LIBRARIES OFF CACHE BOOL "" FORCE)
+    set(OPENEXR_TEST_TOOLS OFF CACHE BOOL "" FORCE)
+    # 3.4 vendors libdeflate; forcing the internal one keeps the build
+    # reproducible instead of depending on whatever the host happens to have.
+    set(OPENEXR_FORCE_INTERNAL_DEFLATE ON CACHE BOOL "" FORCE)
+    # EXCLUDE_FROM_ALL on FetchContent_Declare is 3.28+. Without it the default
+    # target also builds OpenEXRUtil (deep/flat image helpers this viewer never
+    # calls). Guarded rather than raising cmake_minimum_required from 3.21.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+      set(_exr_excl EXCLUDE_FROM_ALL)
+    else()
+      set(_exr_excl "")
+    endif()
+    FetchContent_Declare(Imath
+      URL https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.zip
+      ${_exr_excl})
+    FetchContent_MakeAvailable(Imath)
+    # OpenEXRSetup.cmake runs find_package(Imath CONFIG) BEFORE it checks
+    # whether an Imath target already exists. With Imath declared here (at the
+    # top level) that search lands on _deps/imath-build/config/ImathConfig.cmake,
+    # which include()s an ImathTargets.cmake that is only written when
+    # IMATH_INSTALL is ON - a hard configure error. OpenEXR guards against
+    # exactly this with CMAKE_IGNORE_PATH, but it builds that path from ITS own
+    # binary dir, so it only covers an Imath that OpenEXR itself fetched.
+    # Suppressing the nested find is the honest fix: we have just supplied the
+    # Imath::Imath target it is looking for, so it must not look.
+    set(CMAKE_DISABLE_FIND_PACKAGE_Imath ON)
+    FetchContent_Declare(openexr
+      URL https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.4.13.zip
+      ${_exr_excl})
+    FetchContent_MakeAvailable(openexr)
+    unset(CMAKE_DISABLE_FIND_PACKAGE_Imath)
+    unset(_exr_excl)
+  endif()
+endif()
+
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -136,6 +229,16 @@ set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
 target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} ${stb_SOURCE_DIR})
+# Only the GUI binary reads .exr. viewer-serve deliberately does NOT link it:
+# the remote peer serves .npy only (docs/media-support.md §1, plan (a):
+# local-only until the loaders move to a shared TU), and the peer is the binary
+# that has to build on a bare compute server. TIFF held that line by living
+# behind core/imagefile.h, which viewer-serve does not compile; OpenEXR holds it
+# the same way, and the selftest evidence for both is the same one fact -
+# viewer-serve.exe is byte-identical across the change.
+if(VIEWER_WITH_EXR)
+  target_compile_definitions(viewer PRIVATE VIEWER_WITH_EXR)
+endif()
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
 endif()
@@ -299,6 +402,48 @@ if(MSVC)
   target_compile_options(test_display_falsecolor PRIVATE /W3)
 else()
   target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra)
+endif()
+
+# ---- the .exr fixtures -------------------------------------------------------
+# tools/gen_testdata.py writes every other media fixture from its own samples,
+# with numpy and struct and zlib. It cannot write these: PIZ is a wavelet and
+# DWAB is a DCT, and those two are the entire reason the official library is
+# linked at all - coverage that stopped at NONE and ZIP would stop exactly where
+# the argument starts.
+#
+# So the writer half of OpenEXR builds the fixtures, in a TOOL. Issue #53's
+# judgment item 2 was that the original branch did this inside viewer.exe, which
+# shipped OpenEXR's scanline, tiled and deep WRITERS to every user so that a
+# test could run. Here the product binary links the reader only, and the same
+# fixtures cost it nothing. Same pattern as `mkicon` above: a generated asset,
+# produced at build time by a host tool, never committed.
+#
+# It writes into the source tree because tools/testdata IS the fixture tree
+# (gitignored, regenerated, shared with gen_testdata.py, which creates its
+# media/ with exist_ok and so leaves these alone). The stamp lives inside that
+# tree so that deleting the tree regenerates them.
+if(VIEWER_WITH_EXR AND NOT CMAKE_CROSSCOMPILING)
+  add_executable(mkexr tools/mkexr.cpp)
+  target_link_libraries(mkexr PRIVATE OpenEXR::OpenEXR)
+  if(MSVC)
+    target_compile_options(mkexr PRIVATE /W3 /utf-8)
+  else()
+    target_compile_options(mkexr PRIVATE -Wall -Wextra)
+  endif()
+  set(VIEWER_EXR_FIXTURE_DIR ${CMAKE_SOURCE_DIR}/tools/testdata/media)
+  add_custom_command(
+    OUTPUT ${VIEWER_EXR_FIXTURE_DIR}/.exr-fixtures.stamp
+    COMMAND mkexr ${VIEWER_EXR_FIXTURE_DIR}
+    COMMAND ${CMAKE_COMMAND} -E touch ${VIEWER_EXR_FIXTURE_DIR}/.exr-fixtures.stamp
+    DEPENDS mkexr
+    COMMENT "writing the .exr fixtures for --media-selftest")
+  add_custom_target(viewer_exr_fixtures ALL
+                    DEPENDS ${VIEWER_EXR_FIXTURE_DIR}/.exr-fixtures.stamp)
+else()
+  # Never silent: --media-selftest skips its .exr block loudly for the same
+  # reason, and the two messages have to agree about why.
+  message(STATUS "no .exr fixtures (VIEWER_WITH_EXR=${VIEWER_WITH_EXR}): "
+                 "--media-selftest will skip its .exr asserts and say so")
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
