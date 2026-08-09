@@ -43,6 +43,16 @@ static int32_t takeAnalyzer2(void* ctx, const psAnalyzerV2* a) {
     g_fails++;
     return 1;
 }
+/* The stack mouth's seat (docs/abi-v3.md §5). A frame analyzer must never
+ * arrive here: the two seats are adjacent, so a one-slot offset error lands
+ * exactly in this function, and reaching it silently is precisely the failure
+ * an already-built dll would suffer. */
+static int32_t takeStackAnalyzer3(void* ctx, const psStackAnalyzerV3* a) {
+    (void)ctx; (void)a;
+    printf("abiprobe: FAIL - a v3 FRAME analyzer reached the STACK register slot\n");
+    g_fails++;
+    return 1;
+}
 static void hostLog(void* ctx, int32_t level, const char* msg) {
     (void)ctx; (void)level; (void)msg;
 }
@@ -56,7 +66,14 @@ static psHostApi makeHost(uint32_t abi, int takeSeat3) {
     h.struct_size = (uint32_t)sizeof(psHostApi);
     h.log = hostLog;
     if (abi >= 2) h.register_analyzer2 = takeAnalyzer2;
-    if (takeSeat3) h.register_analyzer3 = takeAnalyzer3;
+    if (takeSeat3) {
+        h.register_analyzer3 = takeAnalyzer3;
+        /* The v3 CORE is TWO seats since stage 2 (§2.2), so a host that has
+         * taken the frame one has taken this one as well - and filling it here
+         * is what makes an off-by-one-slot call land in a named function that
+         * says so, rather than in whatever zero happens to be next. */
+        h.register_stack_analyzer3 = takeStackAnalyzer3;
+    }
     return h;
 }
 
@@ -110,6 +127,14 @@ int main(void) {
         check(h3empty.register_analyzer3 == NULL &&
               h1.register_analyzer3 == NULL && h2.register_analyzer3 == NULL,
               "PR4 an untaken seat reads NULL on every host generation");
+        /* The same question for the seat stage 2 named. It matters most on the
+         * ABI-1 host: that struct was written before this field had a name, and
+         * the ONLY reason reading it is defined is that reserved fields have
+         * been zero-filled since v1. */
+        check(h3empty.register_stack_analyzer3 == NULL &&
+              h1.register_stack_analyzer3 == NULL &&
+              h2.register_stack_analyzer3 == NULL,
+              "PR4b ...including the stack seat, on an ABI-1 host that predates it");
     }
 
     /* ---- and the seat taken: it registers, once, with its declaration -- */
@@ -190,6 +215,16 @@ int main(void) {
               offsetof(psHostApi, register_analyzer3) ==
                   offsetof(psHostApi, register_analyzer2) + sizeof(void*),
               "PR13 register_analyzer3 IS the v2 header's reserved[0]");
+        /* Stage 2 spends the next seat. Naming one is not a version bump, and
+         * the price of that promise is that it may only ever be the NEXT one:
+         * anything else moves a slot an already-built dll calls by offset. */
+        check(offsetof(psHostApi, register_stack_analyzer3) ==
+                  offsetof(psHostApi, register_analyzer3) + sizeof(void*),
+              "PR13b register_stack_analyzer3 is the seat right after it");
+        check(sizeof(psStack) > 0 && sizeof(psStackAnalyzerV3) > 0 &&
+              offsetof(psStackAnalyzerV3, name) ==
+                  offsetof(psStackAnalyzerV3, _pad) + sizeof(uint32_t),
+              "PR13c psStackAnalyzerV3's _pad really does align the pointers");
         check(PS_ABI_VERSION == 3u, "PR14 PS_ABI_VERSION is 3");
     }
 

@@ -478,6 +478,12 @@ function(viewer_add_test_plugin name)
 endfunction()
 viewer_add_test_plugin(abi_v2_twin plugins/test/abi_v2_twin.c)
 viewer_add_test_plugin(abi_v3_twin plugins/test/abi_v3_twin.c)
+# ...and the third: a real STACK analyzer (ABI v3 §5), which is the only way to
+# test a mouth whose whole content is what happens DURING a call - who serves a
+# frame, how long it stays valid, what a NULL means. It carries three
+# descriptors because the gate (§6) is proved by a body that would shout if it
+# ever ran, and an out-of-range pull by one that must fail rather than invent.
+viewer_add_test_plugin(abi_stack_twin plugins/test/abi_stack_twin.c)
 
 # The first test binary that is not `viewer` itself. boxblur2d is static inside
 # analyzer_prnu.c and is pure arithmetic over a float buffer; reaching it through
@@ -842,6 +848,13 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # strings, not layout - and the same analytic in-memory fixture; the analyzers
 # themselves are the real dlls the build put in build/plugins.
 viewer_selftest(anaprov     NOGL --anaprov-selftest)
+# The stack mouth (ABI v3 §5) and the partial-load contract (§6). Same NOGL and
+# same in-memory reasoning as anaprov, and it loads the same plugins-abitest
+# directory: what a stack analyzer is handed, how long it may hold it, and the
+# order in which "may this run at all" and "what is it being run on" are
+# decided. Registered here rather than folded into anaprov because a failure
+# should name the mouth it is about.
+viewer_selftest(stackana    NOGL --stackana-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 # #111. Pointed at media/ and not at rb/ on purpose: rb/ is where the picture

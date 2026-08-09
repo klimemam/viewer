@@ -46,6 +46,13 @@ static bool g_abEqSelftest = false;
 // startup loaded from exeDir()/plugins.
 static bool g_anaProvSelftest = false;
 
+// --stackana-selftest: the STACK mouth of ABI v3 (§5) and the partial-load
+// contract (§6) - a real fixture dll pulling a real stack, the min_frames gate
+// refusing before the call, and n/N crossing as facts. Takes no directory and
+// no window for the --anaprov-selftest reasons: the stack is analytic and
+// built in memory, and every assertion is a number or a string.
+static bool g_stackAnaSelftest = false;
+
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
 // is enough for what the rows contain but blind to everything that only exists
@@ -591,6 +598,8 @@ static void parseCli(int argc, char** argv) {
             g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--anaprov-selftest") {
             g_anaProvSelftest = true;              // handled in main()
+        } else if (a == "--stackana-selftest") {
+            g_stackAnaSelftest = true;             // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {

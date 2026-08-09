@@ -51,6 +51,155 @@ static void ana2Series(void* ctx, const char* name, const char* xl, const char* 
     c->ana->series.push_back(std::move(s));
 }
 
+// ---- serving a stack to a plugin (docs/abi-v3.md §5.1, §9.1) ----------------
+//
+// The host end of the PULL mouth. In this build the answer to "where do the
+// frames live" is the easy one - §9.1: the viewer already holds every loaded
+// frame as resident float32, so get_frame returns a POINTER and costs nothing,
+// and release_frame has nothing to recycle. That is the first dividend of pull
+// over an array: today's shape went into the ABI unchanged, while the two
+// transports §9.2/§9.3 keep open (a bounded shared-memory window, peer-side
+// execution) stay reachable without another version.
+//
+// WHO OWNS WHAT DURING THE CALL:
+//   - the psFrame vector is built BEFORE analyze_stack and never touched
+//     again while it runs, so a pointer handed out stays valid for exactly as
+//     long as §5.1 promises - until analyze_stack returns;
+//   - the pixels stay the viewer's. A plugin gets const psFrame* and the ABI
+//     has never had a way to hand pixel ownership the other way;
+//   - psStack::name and psFrame::name are borrowed strings, valid for the call
+//     only. `name` below is this struct's own copy, NOT SeqInfo::name: the
+//     table reseats on every mutation (App::SeqTable, PR #128), so nothing
+//     here holds a SeqInfo* for one line longer than it takes to copy out of
+//     it - and certainly not across a plugin call;
+//   - App::images is not touched by any of this, and an ImageDoc lives behind
+//     a unique_ptr, so the docs themselves cannot move under the call either.
+struct StackServe {
+    std::vector<psFrame> fr;        // one per SERVED frame; index = stack order
+    std::vector<uint8_t> pinned;    // 1 = handed out, not released yet
+    std::string name;               // psStack::name points at THIS
+    // What the call actually did with the mouth. Not bookkeeping for its own
+    // sake: "did the plugin release what it took" is the difference between a
+    // window transport being possible later (§9.2) and not, and a refusal that
+    // was never even asked for is how §6's gate is proved to gate BEFORE the
+    // call rather than inside it.
+    uint64_t gets = 0, releases = 0, nulls = 0;
+    uint32_t held = 0, peakHeld = 0;
+    bool called = false;            // did analyze_stack run at all?
+};
+static const psFrame* stackServeGet(void* ctx, uint32_t index) {
+    StackServe* s = (StackServe*)ctx;
+    if (!s) return nullptr;
+    s->gets++;
+    // Out of range is a NULL, not a clamp and not a crash: §5.1 makes NULL the
+    // one honest failure, and a clamp would answer a question about frame 9
+    // with frame 2's pixels.
+    if (index >= s->fr.size()) { s->nulls++; return nullptr; }
+    if (!s->pinned[index]) { s->pinned[index] = 1; s->held++; }
+    if (s->held > s->peakHeld) s->peakHeld = s->held;
+    return &s->fr[index];
+}
+static void stackServeRelease(void* ctx, uint32_t index) {
+    StackServe* s = (StackServe*)ctx;
+    if (!s || index >= s->fr.size()) return;   // releasing nothing is not an error
+    s->releases++;
+    if (s->pinned[index]) { s->pinned[index] = 0; s->held--; }
+    // In-process this is where the work would be, and there is none: the frame
+    // was already resident before the plugin asked and stays resident after.
+    // A shared-memory host recycles the slot here (§9.2), which is the whole
+    // reason this mouth exists at all - and re-getting the same index is legal
+    // in both, so nothing is invalidated by a release.
+}
+
+// Run ONE stack analyzer over ONE open stack. Returns false with `err` set, and
+// `err` is always a sentence someone can act on - the two refusals below are
+// the host's own and never reach the plugin.
+//
+// THE ORDER IS THE CONTRACT (docs/abi-v3.md §6, 判断3). min_frames is a
+// DECLARATION and the host settles it BEFORE the call; frames/expected are
+// FACTS and the plugin reads them after it has been called. Neither replaces
+// the other: with the declaration alone, 8 of 24 is indistinguishable from 8
+// of 8 and the provenance line becomes a lie; with the facts alone, every
+// plugin reimplements the same refusal, differently.
+static bool runStackAnalyzer(const StackAnalyzerPluginInfo& sa, int seqId,
+                             const psRect* roi, const psAnalyzeSink3* sink,
+                             std::string& err, StackServe* serveOut = nullptr) {
+    err.clear();
+    // Copy out and let go. Everything this call needs from the stack table is
+    // two values, and holding the pointer for the length of a plugin call is
+    // exactly the defect PR #128 made unconditional across allocators.
+    std::string stackName;
+    int declaredExpected = 0;
+    if (const App::SeqInfo* si = seqInfo(seqId)) {
+        stackName = si->name;
+        declaredExpected = si->expectedFrames;
+    } else {
+        err = "that stack is not open";
+        return false;
+    }
+    // The served set, selected exactly as computeStackStats selects its own:
+    // a decimated remote preview is not this stack's pixels, and a frame of
+    // another shape cannot be served under a psStack that promises one w/h/ch.
+    // Excluded BEFORE `frames` is counted, which is what makes the header's
+    // "every served frame has this geometry" true rather than hopeful.
+    std::vector<int> fr = framesOfSeq(seqId);
+    const ImageDoc* first = nullptr;
+    std::vector<const ImageDoc*> use;
+    for (int idx : fr) {
+        const ImageDoc* d = app.images[idx].get();
+        if (d->src->remoteStep > 1 || d->px().empty()) continue;
+        if (!first) first = d;
+        if (d->w != first->w || d->h != first->h || d->ch != first->ch) continue;
+        use.push_back(d);
+    }
+    const uint32_t n = (uint32_t)use.size();
+    if (!n) {
+        err = "no frame of \"" + stackName + "\" is loaded yet";
+        return false;
+    }
+    // N: the declared size, never smaller than what is actually here. §5.1 -
+    // "frames < expected = partial load; never the reverse".
+    const uint32_t N = (uint32_t)std::max((int)n, declaredExpected);
+
+    // ---- the gate. BEFORE the call, and it is the whole of §6's first half.
+    if (n < sa.minFrames) {
+        err = sa.name + " needs at least " + std::to_string(sa.minFrames) +
+              " frames; \"" + stackName + "\" has " + std::to_string(n) +
+              (n < N ? " of " + std::to_string(N) : "") + " loaded";
+        return false;     // the plugin is not entered, and cannot be
+    }
+
+    StackServe local;
+    StackServe& sv = serveOut ? *serveOut : local;
+    sv.name = stackName;
+    sv.fr.clear();
+    sv.fr.reserve(n);
+    for (const ImageDoc* d : use) sv.fr.push_back(makeFrame(*d));
+    sv.pinned.assign(n, 0);
+
+    psStack st = {};
+    st.frames = n;
+    st.expected = N;                 // the FACTS, passed in - §6's second half
+    st.w = (uint32_t)first->w;
+    st.h = (uint32_t)first->h;
+    st.ch = (uint32_t)first->ch;
+    st.dtype = PS_DTYPE_F32;
+    st.name = sv.name.c_str();
+    st.meta_json = nullptr;
+    st.ctx = &sv;
+    st.get_frame = stackServeGet;
+    st.release_frame = stackServeRelease;
+
+    char perr[256] = { 0 };
+    sv.called = true;
+    int32_t rc = sa.v3.analyze_stack(&st, roi, sink, perr, sizeof perr);
+    if (rc != 0) {
+        err = perr[0] ? perr : "the analyzer failed without saying why";
+        return false;
+    }
+    return true;
+}
+
 // naming convention "category/name": drives the 2-level Analysis picker + Measure menu
 static void splitAnalyzerName(const std::string& full, std::string& cat, std::string& item) {
     size_t s = full.find('/');
