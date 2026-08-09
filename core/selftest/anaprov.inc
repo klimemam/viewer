@@ -17,6 +17,14 @@
 // and the analyzers are the real dlls startup loaded from exeDir()/plugins
 // before parseCli ran; a test against a fake registration would prove nothing
 // about the ledger, whose whole job is to witness the actual load.
+// A valid analyze() for the descriptors AP27 asks the host to REFUSE. It has
+// to be a real function pointer: validCommon rejects a NULL one, and then the
+// test would be watching the wrong rule turn a descriptor away.
+static int32_t anaProbeAnalyze(const psFrame*, const psRect*,
+                               const psAnalyzeSink3*, char*, size_t) {
+    return 0;
+}
+
 static int anaProvSelftest() {
     bool ok = true;
     auto check = [&](bool cond, const char* what) {
@@ -28,6 +36,21 @@ static int anaProvSelftest() {
     auto shutdown = [&]() {
         stopRbWorker(); stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker();
     };
+    // The ABI compatibility fixtures (#46 stage 2): two dlls carrying ONE
+    // measurement through the two register paths - V2, the shape every bundled
+    // analyzer uses, and V3 with a declared version. They live outside the
+    // shipped plugins directory precisely so that loading them is a deliberate
+    // act of this test rather than a change to what the viewer offers, and
+    // they are loaded HERE, through the same plugin_host::loadAll every other
+    // plugin goes through: a fixture registered by hand would prove nothing
+    // about the loader, which is the half of the ledger under test.
+    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins-abitest",
+                           plugin_host::exeDir() + "/../plugins-abitest" },
+                         [](const std::string& m, bool e) {
+                             fprintf(stderr, "anaprovselftest: load: %s%s\n",
+                                     e ? "ERROR " : "", m.c_str());
+                         });
+
     const auto& anas = plugin_host::analyzers();
     if (anas.empty()) {
         fprintf(stderr, "anaprovselftest: no analyzer plugins loaded - is "
@@ -77,13 +100,15 @@ static int anaProvSelftest() {
     }
     app.current = 0;
     app.anns.clear(); app.nextAnnId = 1; app.selectedAnn = 0;   // whole image
-    app.anaSel = sel;
-    app.anaRunRequest = true;          // exactly what the Measure menu sets
-
     // one frame of the REAL panel, with or without the backends - the
-    // roiStatsSelftest() recipe, see the NewFrame comment there
+    // roiStatsSelftest() recipe, see the NewFrame comment there. A lambda
+    // because the version half below measures the SAME fixture with three
+    // different analyzers, and the comparison is only worth anything if all
+    // three go through the identical path.
     ImGuiIO& io = ImGui::GetIO();
-    {
+    auto runPanel = [&](int which) {
+        app.anaSel = which;
+        app.anaRunRequest = true;      // exactly what the Measure menu sets
         if (g_haveWindow) {
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
@@ -102,7 +127,8 @@ static int anaProvSelftest() {
         drawPanelAnalysis();
         ImGui::End();
         ImGui::EndFrame();
-    }
+    };
+    runPanel(sel);
 
     const auto& ana = app.ana;
     fprintf(stderr, "anaprovselftest: prov: %s\n", ana.prov.c_str());
@@ -139,6 +165,128 @@ static int anaProvSelftest() {
           (anas[sel].file.empty() ||
            bt.find(anas[sel].file) == std::string::npos),
           "AP12 builtin results wear no plugin tag");
+
+    // ======================= #46 stage 2: the version ======================
+    // Stage 1 (above) answered "which file". The other half of the citation is
+    // the version, and it is the half the host CANNOT source itself: only the
+    // plugin knows what it calls itself, which is why it waited for an ABI
+    // field (docs/abi-v3.md §3.1, §11). What follows measures the same fixture
+    // with the V2 twin and the V3 twin - one measurement, two ABI paths - so
+    // "the version surfaces" and "V2 still works" are asked of the same grid.
+    int v2i = -1, v3i = -1;
+    for (int i = 0; i < (int)anas.size(); i++) {
+        if (anas[i].name == "abitest/twin-v2") v2i = i;
+        if (anas[i].name == "abitest/twin-v3") v3i = i;
+    }
+    check(v2i >= 0 && v3i >= 0,
+          "AP13 both ABI twins loaded (V2 and V3 registered side by side)");
+    // A missing fixture must REDDEN the checks it feeds, never skip them: a
+    // v3 registration the host declines is exactly the state this section is
+    // here to catch, and a guarded block would report it as twelve silences.
+    static const AnalyzerPluginInfo kAbsent{};
+    const AnalyzerPluginInfo& a2 = v2i >= 0 ? anas[v2i] : kAbsent;
+    const AnalyzerPluginInfo& a3 = v3i >= 0 ? anas[v3i] : kAbsent;
+
+    // ---- the ledger's new column ------------------------------------------
+    check(a3.abi == 3 && a3.version == "3.1.4-twin (2026-08-10)",
+          "AP14 ledger carries the V3 plugin's declared version, verbatim");
+    check(a3.headline == "mean",
+          "AP15 ledger carries the V3 plugin's declared headline key");
+    // and the invariant that makes the column trustworthy: a blank is a fact
+    // about the descriptor, not a gap the host may fill in later
+    bool blankV12 = true;
+    for (const auto& a : anas)
+        if (a.abi < 3 && !a.version.empty()) blankV12 = false;
+    check(blankV12 && a2.version.empty() && a2.abi == 2,
+          "AP16 every V1/V2 analyzer's version is EMPTY - nothing guessed");
+
+    // ---- the same measurement through both paths --------------------------
+    std::vector<std::string> k2, u2;
+    std::vector<std::vector<std::string>> val2;
+    std::string prov2, dll2, ver2, tsv2, tsv3;
+    std::vector<char> hl2;
+    bool err2 = false;
+    if (v2i >= 0) {
+        runPanel(v2i);
+        k2 = ana.keys; u2 = ana.units; val2 = ana.vals; hl2 = ana.headline;
+        prov2 = ana.prov; dll2 = ana.provDll; ver2 = ana.provVer;
+        tsv2 = buildAnalysisTsv();
+        err2 = ana.err.empty();
+        fprintf(stderr, "anaprovselftest: prov(v2): %s\n", prov2.c_str());
+    }
+    if (v3i >= 0) {
+        runPanel(v3i);
+        tsv3 = buildAnalysisTsv();
+        fputs(tsv3.c_str(), stdout);       // the V3 document, for eyeballs
+        fprintf(stderr, "anaprovselftest: prov(v3): %s\n", ana.prov.c_str());
+    }
+    check(err2 && v3i >= 0 && ana.err.empty(),
+          "AP17 both twins ran clean on the fixture");
+    check(v3i >= 0 && !k2.empty() &&
+          k2 == ana.keys && val2 == ana.vals && u2 == ana.units,
+          "AP18 V2 and V3 paths produce IDENTICAL rows, values and units");
+
+    // ---- where the version surfaces ---------------------------------------
+    // §11: the status line becomes `アナライザ名 <version> (dll名)`.
+    check(!a3.version.empty() &&
+          ana.prov.find(a3.name + " <" + a3.version + "> (" + a3.file + ")") !=
+              std::string::npos,
+          "AP19 status line reads 'name <version> (dll)' for a V3 analyzer");
+    check(!prov2.empty() &&
+          prov2.find(a2.name + " (" + a2.file + ")") != std::string::npos &&
+          prov2.find('<') == std::string::npos,
+          "AP20 ...and 'name (dll)' with NO version slot for a V2 one");
+    // the tooltip and the exports cite the same two things from the same two
+    // fields - the panel's tooltip is provVer + provDll verbatim
+    check(!a3.version.empty() && ana.provVer == a3.version &&
+          ana.provDll == a3.path,
+          "AP21 the grid keeps version + full path (tooltip / export)");
+    check(!dll2.empty() && ver2.empty() && dll2 == a2.path,
+          "AP22 ...and keeps the path with an empty version for V2");
+    check(!a3.version.empty() &&
+          tsv3.find("# plugin: <" + a3.version + "> " + a3.path + "\n") !=
+              std::string::npos,
+          "AP23 TSV '# plugin:' carries <version> then the full path");
+    check(!tsv2.empty() &&
+          tsv2.find("# plugin: " + a2.path + "\n") != std::string::npos,
+          "AP24 ...and is byte-for-byte the stage-1 line for a V2 analyzer");
+
+    // ---- headline: a declaration beats the host's table --------------------
+    // The host table (analyzerHeadlineSuffix) knows neither twin, so a flagged
+    // row can only have come from the descriptor.
+    {
+        int hl3 = -1, hl2n = 0;
+        for (int i = 0; i < (int)ana.keys.size(); i++)
+            if (i < (int)ana.headline.size() && ana.headline[i]) hl3 = i;
+        for (int i = 0; i < (int)hl2.size(); i++) if (hl2[i]) hl2n++;
+        check(v3i >= 0 && hl3 >= 0 && ana.keys[hl3] == "ch0.mean",
+              "AP25 the V3 headline accents the declared key, channel stripped");
+        check(!hl2.empty() && hl2n == 0,
+              "AP26 the V2 twin gets no headline - the host table declares none");
+    }
+
+    // ---- a v3 descriptor with no version is refused --------------------
+    // §3.1: declaring v3 IS declaring a version, so "no version" is a
+    // contradiction the host must not wave through. Asked of the real
+    // registration function, with the real analyzer list as the witness.
+    {
+        const psHostApi* api = plugin_host::hostApi();
+        size_t before = plugin_host::analyzers().size();
+        bool refused = api && api->register_analyzer3;
+        if (refused) {
+            psAnalyzerV3 bad{};
+            bad.abi_version = 3u;
+            bad.caps = PS_CAP_CPU;
+            bad.name = "abitest/no-version";
+            bad.analyze = anaProbeAnalyze;
+            bad.version = nullptr;
+            if (api->register_analyzer3(api->ctx, &bad) == 0) refused = false;
+            bad.version = "";
+            if (api->register_analyzer3(api->ctx, &bad) == 0) refused = false;
+        }
+        check(refused && plugin_host::analyzers().size() == before,
+              "AP27 a v3 descriptor with NULL/empty version is refused");
+    }
 
     fprintf(stderr, "anaprovselftest: %s\n", ok ? "ok" : "FAILED");
     shutdown();

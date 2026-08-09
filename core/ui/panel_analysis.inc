@@ -152,7 +152,7 @@ static void drawPanelAnalysis() {
                 psFrame f = makeFrame(*im);
                 char err[256] = { 0 };
                 int32_t rc;
-                if (anas[app.anaSel].isV2) {
+                if (anas[app.anaSel].abi == 2) {
                     AnaEmit2Ctx ectx = { &rows, &ana, (int)ana.cols.size(), colorIdx };
                     psAnalyzeSink2 sink = { &ectx, ana2Number, ana2Text, ana2Series, {} };
                     rc = anas[app.anaSel].v2.analyze(&f, roi, &sink, err, sizeof err);

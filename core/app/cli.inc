@@ -1112,7 +1112,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
         char perr[256];
         perr[0] = 0;
         int rc;
-        if (a.isV2) {
+        if (a.abi == 2) {
             psAnalyzeSink2 sk{ nullptr, mstNum, mstTxt, mstSer, {} };
             rc = a.v2.analyze(&fr, &roi, &sk, perr, sizeof perr);
         } else {
@@ -1178,7 +1178,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
             psRect roi2{ (uint32_t)(ref.w / 4), (uint32_t)(ref.h / 4),
                          (uint32_t)(ref.w / 2), (uint32_t)(ref.h / 2) };
             perr[0] = 0;
-            if (a.isV2) {
+            if (a.abi == 2) {
                 psAnalyzeSink2 sk{ nullptr, mstNum, mstTxt, mstSer, {} };
                 rc = a.v2.analyze(&fr2, &roi2, &sk, perr, sizeof perr);
             } else {

@@ -1352,7 +1352,7 @@ static void handleMeasure(Buf& in) {
         }
         perr[0] = 0;
         int32_t rc;
-        if (ana->isV2) {
+        if (ana->abi == 2) {
             psAnalyzeSink2 sink{ &ctx, mNum, mTxt, mSer, {} };
             rc = ana->v2.analyze(&fr, rp, &sink, perr, sizeof perr);
         } else {

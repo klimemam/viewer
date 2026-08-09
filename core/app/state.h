@@ -674,6 +674,11 @@ struct App {
         // tooltip and as a "# plugin:" comment in the TSV/CSV exports. Empty =
         // no plugin file known (a builtin result must never wear a false one).
         std::string provDll;
+        // ...and the version that dll DECLARED (#46 stage 2, ABI v3 §11).
+        // Verbatim, and empty whenever the analyzer is a V1/V2 descriptor -
+        // those carry no version field and the host does not invent one, so an
+        // empty string here means "not declared", never "unknown, probably 1.0".
+        std::string provVer;
         float runMs = 0;
         // presentation metadata, derived once per run (never in the draw loop):
         std::vector<int> colColor;             // ANN palette per column; -1 = neutral

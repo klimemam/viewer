@@ -383,6 +383,24 @@ viewer_add_plugin(analyzer_sharpness  plugins/analyzer_sharpness.c)
 viewer_add_plugin(analyzer_esfr       plugins/analyzer_esfr.c)
 viewer_add_plugin(proc_demosaic       plugins/proc_demosaic.c)
 
+# ---- ABI compatibility fixtures (test-only plugins, NOT shipped) ----
+# Two dlls carrying ONE measurement through the two ABI paths: registered as V2
+# (the shape every bundled analyzer uses) and as V3 with a declared version and
+# headline. They are built exactly like a shipped plugin - same warnings, same
+# visibility, same MODULE - because a fixture built to easier rules proves
+# nothing about what a user's plugin will do. They land in their own directory
+# so the viewer's analyzer list is unchanged; --anaprov-selftest loads it by
+# name, which is also how it can assert on both halves in one grid.
+set(VIEWER_ABITEST_PLUGIN_DIR ${CMAKE_BINARY_DIR}/plugins-abitest)
+function(viewer_add_test_plugin name)
+  viewer_add_plugin(${name} ${ARGN})
+  set_target_properties(${name} PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "$<1:${VIEWER_ABITEST_PLUGIN_DIR}>")
+  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/plugins/test)
+endfunction()
+viewer_add_test_plugin(abi_v2_twin plugins/test/abi_v2_twin.c)
+viewer_add_test_plugin(abi_v3_twin plugins/test/abi_v3_twin.c)
+
 # The first test binary that is not `viewer` itself. boxblur2d is static inside
 # analyzer_prnu.c and is pure arithmetic over a float buffer; reaching it through
 # the viewer would mean driving a whole PRNU analysis to assert on a low-pass
@@ -412,6 +430,21 @@ if(MSVC)
   target_compile_options(test_display_falsecolor PRIVATE /W3)
 else()
   target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra)
+endif()
+
+# The third, and the only one whose subject is not arithmetic: the probe rule
+# (docs/abi-v3.md §2.2) is a claim about hosts this repo does not contain - an
+# ABI-1 host, an ABI-2 host, a v3 host with the seat still empty. The test
+# builds those four hosts as structs and asks the real plugin what it does with
+# each, which no test driven through plugin_host can do: that one can only ever
+# present the single host this build happens to have.
+add_executable(test_abi_probe plugins/test/test_abi_probe.c)
+target_link_libraries(test_abi_probe PRIVATE ps_api)
+target_include_directories(test_abi_probe PRIVATE ${CMAKE_SOURCE_DIR}/plugins/test)
+if(MSVC)
+  target_compile_options(test_abi_probe PRIVATE /W3)
+else()
+  target_compile_options(test_abi_probe PRIVATE -Wall -Wextra)
 endif()
 
 # ---- the .exr fixtures -------------------------------------------------------
@@ -628,6 +661,11 @@ set_tests_properties(test_prnu PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 # while reading, on Windows and macOS, as a test that needed a window.
 add_test(NAME test_display_falsecolor COMMAND test_display_falsecolor)
 set_tests_properties(test_display_falsecolor PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
+
+# Third of the same kind, same two labels. It opens no file and needs no
+# fixture: its whole subject is four psHostApi structs it fills in itself.
+add_test(NAME test_abi_probe COMMAND test_abi_probe)
+set_tests_properties(test_abi_probe PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
 # through --no-window against this build, and the 20 below came back with output

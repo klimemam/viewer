@@ -26,6 +26,22 @@
 
 namespace fs = std::filesystem;
 
+// The v3 promise, asked of the compiler instead of trusted (docs/abi-v3.md
+// §2.1: "psHostApi の寸法は変わらない"). A third-party dll built against the v1
+// or v2 header is a fixed byte layout on someone's disk; v3 renames reserved
+// slots and adds structs, and MUST move nothing. If a future edit inserts a
+// field instead of taking a reserved seat, this is where it stops - at compile
+// time, in the host, rather than as garbage read out of an old plugin.
+static_assert(sizeof(psHostApi) == 2 * sizeof(uint32_t) + 15 * sizeof(void*),
+              "psHostApi changed size - every already-built plugin now reads "
+              "the wrong bytes (docs/abi-v3.md §2.1, §12)");
+static_assert(offsetof(psHostApi, register_analyzer2) ==
+                  2 * sizeof(uint32_t) + 7 * sizeof(void*),
+              "the v2 register slot moved - v2 plugins would call the wrong one");
+static_assert(offsetof(psHostApi, register_analyzer3) ==
+                  offsetof(psHostApi, register_analyzer2) + sizeof(void*),
+              "register_analyzer3 must be the v2 header's reserved[0], nothing else");
+
 namespace {
 
 std::vector<void*>               g_handles;
@@ -97,7 +113,7 @@ int32_t hostRegisterAnalyzer(void*, const psAnalyzerV1* a) {
     // here because no later moment can know it
     info.file = g_loading;
     info.path = g_loadingPath;
-    info.isV2 = false;
+    info.abi = 1;                     // version stays empty: V1 declares none
     info.v1 = *a;
     g_analyzers.push_back(std::move(info));
     return 0;
@@ -110,7 +126,7 @@ int32_t hostRegisterAnalyzer2(void*, const psAnalyzerV2* a) {
     info.desc = a->description ? a->description : "";
     info.file = g_loading;            // the ledger, same as the V1 register above
     info.path = g_loadingPath;
-    info.isV2 = true;
+    info.abi = 2;                     // version stays empty: V2 declares none
     info.v2 = *a;
     g_analyzers.push_back(std::move(info));
     return 0;
@@ -126,7 +142,9 @@ psHostApi g_api = {
     PS_ABI_VERSION, (uint32_t)sizeof(psHostApi), nullptr,
     hostLog, hostFrameAlloc, hostFrameFree,
     hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor,
-    hostRegisterAnalyzer2, {}
+    hostRegisterAnalyzer2,
+    nullptr,                          // register_analyzer3: seat not taken yet
+    {}
 };
 
 } // namespace

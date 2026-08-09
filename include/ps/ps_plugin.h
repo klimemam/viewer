@@ -1,6 +1,6 @@
-/* ps_plugin.h — viewer plugin ABI v2 (PS_ABI_VERSION below is the one truth).
+/* ps_plugin.h — viewer plugin ABI v3 (PS_ABI_VERSION below is the one truth).
  * Pure C header. This file IS the contract; never break it, only extend
- * via new V2 structs and the reserved fields. */
+ * via new V2/V3 structs and the reserved fields. */
 #ifndef PS_PLUGIN_H
 #define PS_PLUGIN_H
 
@@ -17,12 +17,35 @@
 extern "C" {
 #endif
 
-#define PS_ABI_VERSION 2u
+#define PS_ABI_VERSION 3u
 /* Host API version history:
  *   1 - display / analyzer / processor V1 structs
  *   2 - adds psAnalyzerV2 (emit_series curves + description) via
  *       psHostApi::register_analyzer2. V1 structs keep abi_version = 1
- *       and remain loadable forever. */
+ *       and remain loadable forever.
+ *   3 - layer-typed analyzers (docs/abi-v3.md): psAnalyzerV3 - the frame
+ *       descriptor, +version/+headline - over psAnalyzeSink3, registered
+ *       through psHostApi::register_analyzer3. V1/V2 structs and their two
+ *       register slots stay loadable forever; psHostApi does not change size.
+ *       The rest of v3 (psStack + psStackAnalyzerV3 §5, psSeriesAnalyzerV3
+ *       §7, emit_number_u / emit_map §8) arrives in the reserved seats below
+ *       and needs NO further version bump - see the probe rule. */
+
+/* THE PROBE RULE (docs/abi-v3.md §2.2) - why v3 is meant to be the last bump.
+ *
+ *   - abi_version >= 3 guarantees the v3 CORE and nothing else: the host has
+ *     register_analyzer3. Everything added afterwards arrives in a RESERVED
+ *     SEAT: a slot whose name and contract are written here while the host may
+ *     still leave it NULL.
+ *   - Reserved fields have been zero-filled by whoever creates the struct
+ *     since v1, so "is that seat taken?" is answerable by a plain NULL test -
+ *     safe even against an ABI-1 host, which zero-filled the same bytes.
+ *     A plugin MUST NULL-check every seat documented as possibly-NULL before
+ *     calling it, and must degrade rather than fail when one is empty.
+ *   - Taking a seat is NOT a version bump. The number changes only when the
+ *     MEANING of something that already exists changes.
+ *
+ * So: ask abi_version about the core, and NULL-probe everything else. */
 
 /* ---- enums (fixed values; never renumber) ---- */
 typedef enum psDtype {
@@ -139,6 +162,49 @@ typedef struct psAnalyzerV2 {
     void*       reserved[4];
 } psAnalyzerV2;
 
+/* -- Analyzer V3 (docs/abi-v3.md §3, §4): same one-frame signature as V2 -
+ * what is new is the descriptor's own fields and the sink type. -- */
+
+/* Sink for v3 analyze functions. The three emits below are byte-for-byte the
+ * sink2 ones, so a V2 analyzer's BODY ports over untouched; everything is
+ * still copied by the host during the call. V1/V2 sinks are frozen forever -
+ * this type is only ever handed to a v3 analyze(). */
+typedef struct psAnalyzeSink3 {
+    void* ctx;
+    void (*emit_number)(void* ctx, const char* key, double value);
+    void (*emit_text)  (void* ctx, const char* key, const char* value);
+    /* Named curve (SFR, OECF, ...). x may be NULL (host uses 0..n-1). */
+    void (*emit_series)(void* ctx, const char* name, const char* x_label,
+                        const char* y_label, const float* x, const float* y,
+                        uint32_t n);
+    /* Reserved seats (probe rule above), zero-filled. docs/abi-v3.md §8 spends
+     * the first two on the declared-unit scalar and the pixel-shaped result;
+     * until a host implements them they read NULL and emit_number carries the
+     * unit in the key name, which §8.2 keeps as the documented fallback. */
+    void* reserved[8];
+} psAnalyzeSink3;
+
+typedef struct psAnalyzerV3 {
+    uint32_t    abi_version;    /* = 3 (version of THIS struct)                  */
+    uint32_t    caps;           /* PS_CAP_CPU mandatory                          */
+    const char* name;           /* "category/name", static lifetime              */
+    const char* version;        /* REQUIRED, non-empty, static, UTF-8 free-form.
+                                   Carried VERBATIM: the host never parses,
+                                   orders or normalizes it, and compares it for
+                                   equality only. Declaring v3 IS declaring a
+                                   version - NULL or "" is refused at
+                                   registration (docs/abi-v3.md §3.1)            */
+    const char* description;    /* one-line precondition hint; may be NULL       */
+    const char* params_schema;  /* reserved: pass NULL (future: JSON Schema UI)  */
+    const char* headline;       /* the one key this analyzer exists to produce,
+                                   channel prefix ("ch0." / "R." ...) stripped;
+                                   the host accents that row. NULL = no headline
+                                   (docs/abi-v3.md §3.2)                         */
+    int32_t (*analyze)(const psFrame* in, const psRect* roi,
+                       const psAnalyzeSink3* sink, char* err, size_t err_cap);
+    void*       reserved[4];
+} psAnalyzerV3;
+
 struct psHostApi {
     uint32_t abi_version;       /* host ABI = PS_ABI_VERSION                     */
     uint32_t struct_size;       /* sizeof(psHostApi); forward-compat probe       */
@@ -154,13 +220,26 @@ struct psHostApi {
     int32_t (*register_processor)(void* ctx, const psProcessorV1* p);
     /* since host ABI 2 (was reserved[0]; NULL on ABI-1 hosts): */
     int32_t (*register_analyzer2)(void* ctx, const psAnalyzerV2* a);
-    void*    reserved[7];
+    /* since host ABI 3 (was reserved[0]; NULL on ABI-1/2 hosts - probe it).
+     * Renaming a reserved slot is how v2 added register_analyzer2 and it is
+     * why sizeof(psHostApi) and every v1/v2 offset are unchanged: a plugin
+     * built against ANY older header still finds its fields where they were. */
+    int32_t (*register_analyzer3)(void* ctx, const psAnalyzerV3* a);
+    /* Reserved seats, zero-filled. docs/abi-v3.md §12 spends them on the stack
+     * mouth (§5), the series mouth (§7.2 - shipped NULL on purpose) and, the
+     * last two deliberately unnamed, the kind 3/4 set mouths. Each gets its
+     * name here as it is implemented; a name appearing is not a version bump. */
+    void*    reserved[6];
 };
 
 /* Every plugin exports exactly one symbol:
  *   PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host);
  * Must return 0 on success. MUST check host->abi_version first and return
- * nonzero WITHOUT registering anything if host->abi_version < PS_ABI_VERSION. */
+ * nonzero WITHOUT registering anything if host->abi_version < PS_ABI_VERSION.
+ * That check is about the CORE the version number promises; the seats it does
+ * not promise are asked for by NULL test (probe rule above), and a plugin that
+ * wants to run on older hosts as well simply builds against the older header -
+ * those hosts keep loading it, forever. */
 typedef int32_t (*psRegisterPluginsFn)(const psHostApi* host);
 
 #ifdef __cplusplus
