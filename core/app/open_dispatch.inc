@@ -715,9 +715,15 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
     return msg;
 }
 
-// Temporal stats for a stack that is NOT opened: fired from the browser's group
-// row / multi-selection, so the answer to "is this set worth transferring?"
-// costs zero pixels. Runs on the MEASURE worker - the browse worker serializes
+// Temporal stats for ONE stack that is NOT opened: fired from the browser's
+// group row, so the answer to "is this set worth transferring?" costs zero
+// pixels. One stack per call, always - the multi-selection caller that used to
+// share this door flattened N stacks into one file list and got a sigma_t over
+// a time axis that never existed, and #107's ruling deleted it rather than
+// teaching it to refuse (sigma_t IS a stack's attribute, docs/terminology.md).
+// The frames of one group row are one stack by construction, which is why this
+// function needs no gate of its own.
+// Runs on the MEASURE worker - the browse worker serializes
 // behind LIST/SCAN and shares the browsing ssh session, so a 300-frame
 // aggregate there would freeze navigation. cfaType stays 0 on purpose:
 // guessing a mosaic for a file nobody opened would silently split the planes

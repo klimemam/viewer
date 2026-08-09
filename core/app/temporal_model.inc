@@ -108,8 +108,22 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         double n = (double)cnt[k];
         if (n < 2) continue;                    // not enough valid frames here
         double m = sum[k] / n;
-        double v = sum2[k] / n - m * m;
-        tvarSum[p] += v > 0 ? v : 0;
+        // ddof=1 (#57 item 3). This line divided by n and the two OTHER places
+        // that compute the same quantity - core/serve.cpp's runTemporalStats
+        // and computeStackStats - divide by n-1, so one stack's sigma_t came
+        // out sqrt(N/(N-1)) larger or smaller depending on WHERE it was
+        // measured: 6.9% at N=8, 3.3% at N=16. "local" and "server" are a
+        // transport, not a quantity, and the canon names sigma_t once
+        // (docs/terminology.md, docs/stats-taxonomy.md), so this is a parity
+        // repair and not a change of behaviour - the number this returned was
+        // simply the wrong one of two. The unbiased form is also what the
+        // -sigma_t^2/N correction of docs/flat-field-stats.md is written
+        // against; ddof=0 would leave it (N-1)/N short.
+        // Clamp BEFORE scaling, exactly as serve.cpp does: a rounding-negative
+        // variance is 0 either way, and doing it in the same order keeps the
+        // two sides bit-comparable rather than merely close.
+        double v = std::max(0.0, sum2[k] / n - m * m) * (n / (n - 1.0));
+        tvarSum[p] += v;
         pmSum[p] += m; pmSum2[p] += m * m;
         plc[p]++;
     }

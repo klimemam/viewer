@@ -210,8 +210,8 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
   フォルダ行と同じ「選ぶ → 開く」になります。
   **ssh 先の Browse では淡色**のまま開けません(サーバ `viewer-serve` は npy だけを
   配ります)。**行は消えません** —— 淡色の行にカーソルを乗せると理由が出ます。
-  「Open as stack」「Open as frame average」「Temporal stats (server)」の 3つは
-  ローカルでもサーバ経由なので、これらの形式には出ません
+  「Open as stack」「Open as frame average」「Temporal stats (server) for stack "…"」の
+  3つはローカルでもサーバ経由なので、これらの形式には出ません
 
 **複数ページの TIFF は stack です。** 1ページ = 1フレームで、連番フォルダから
 できる stack とまったく同じもの(§2.4)—— 時間方向の解析も montage も効きます。
@@ -550,9 +550,16 @@ channel = all の CFA/多チャンネルでは**面ごとのレベル差が σ �
 
 | 指標 | 意味 |
 |---|---|
-| temporal noise (σ_t) | 画素ごとの時間方向 std の平均 = **時間ノイズ** |
+| temporal noise (σ_t) | 画素ごとの時間方向 var(**ddof=1 の不偏分散**)の平均の √ = **時間ノイズ** |
 | fixed pattern (σ_s) | 時間平均画像の空間 std = **固定パターン**(平坦部でない場合は絵柄成分を含む) |
 | total (quadrature) | √(σ_t² + σ_s²) |
+
+**σ_t は 1 つの stack の量で、測る場所が変わっても数は変わりません。**
+このパネルで測っても、サーバ集計(下記)で測っても、Stack ROIs の蓄積器から
+出しても、画素毎の時間分散は ddof=1 の同じ式です(#57 項目3)。以前は
+このパネルだけが ddof=0 で、同じ stack が local と server で √(N/(N−1)) 倍
+(N=16 で 3.3%)食い違っていました。**local / server は転送路であって量では
+ありません。**
 
 加えて **frame number(横軸)vs ROI mean value(縦軸)** のグラフを表示(現在フレームの位置に
 マーカー)。フレーム間のドリフト・フリッカ確認に使えます。EMVA 1288 の温度/固定パターン分離と
@@ -573,8 +580,16 @@ channel = all の CFA/多チャンネルでは**面ごとのレベル差が σ �
   パネルの仕事になりました(条件を振った並びは定義上 series。docs/analysis-layers.md §3.3)
 - リモートの塊は**サーバ側で集計**され、`[server <ホスト>, N frames]` と出ます
   (`File > Stack loading > Remote processing` で切替)。
-  開いてすらいない連番も Browse パネルの「Temporal stats (server)」から測れて、
-  そのときは `not opened:` 付きで出ます
+  開いてすらいない連番も Browse パネルの**連番(group)行**を右クリックして
+  「Temporal stats (server) for stack "…"」から測れて、そのときは
+  `not opened:` 付きで出ます。**1 回 = 1 stack です** —— 複数行を選んでから
+  σ_t を計算する経路は**ありません**(2026-08-09 裁定, #107)。選択をまたいだ
+  σ_t は「別の時間軸のフレームを 1 本に混ぜた数」で、どの stack の測定値でも
+  ないためです(#81 の平均と同じ理由。ただし平均は「stack 毎に 1 枚」という
+  正しい答えがあったのに対し、σ_t には**選択の形をした答えが存在しない**ので
+  入口ごと消えました)。stack が 3 つあるなら 3 回測ってください。
+  複数行を選んだまま連番行を右クリックしてこの項目を選ぶと、**どの stack を
+  測ったかをトーストと Messages に残します**
 - compare が入っていると **A / B / delta の表**になります(§3c)
 
 ### 5.2c 塊を1枚に畳む(frame average / frame sum)

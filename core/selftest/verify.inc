@@ -490,8 +490,9 @@
         // docs/terminology.md's iron rule. The fixture is exact on purpose: a
         // Bayer stack in which every plane is perfectly flat and perfectly
         // stable except for a +-10 DN alternation, and the four planes sit at
-        // 100 / 400 / 400 / 900 DN. Per plane the truth is sigma_t = 10 and
-        // sigma_fpn = 0. Pooled, sigma_fpn becomes the spatial spread of the
+        // 100 / 400 / 400 / 900 DN. Per plane the truth is sigma_fpn = 0 and a
+        // sigma_t that is the +-10 DN swing read with the ddof the canon picked
+        // (see sigTExpect below). Pooled, sigma_fpn becomes the spatial spread of the
         // four LEVELS - sqrt(285000 - 450^2) = 287.228 DN of pure fabrication,
         // reported as fixed-pattern noise on a flat field.
         {
@@ -523,19 +524,34 @@
             app.selectedAnn = 0;
             recomputeTemporalIfNeeded(cur(), app.temporal[0]);
             const App::TemporalState& T = app.temporal[0];
+            // What sigma_t must be here, DERIVED rather than remembered. Each
+            // pixel's four values are L-10, L+10, L-10, L+10: mean L, sum of
+            // squared deviations 4 x 100 = 400. ddof=1 (#57 item 3, and what
+            // serve.cpp always did) divides by NF-1, so sigma_t =
+            // sqrt(400/3) = 10 x sqrt(4/3) = 11.5470054. The 10.0 that stood
+            // here was sqrt(400/4) - the ddof=0 answer, i.e. this square wave's
+            // POPULATION sigma. Both describe the same +-10 DN alternation;
+            // which one the panel prints is the estimator question #57 settled,
+            // and the fixture's amplitude is still the 10 DN the comment says.
+            // Written as an expression so the next reader can see where the
+            // divisor comes from instead of trusting five digits.
+            const double sigTExpect = 10.0 * sqrt((double)NF / (double)(NF - 1));
             double worstFpn = 0, worstSigT = 0;
             for (int p = 0; p < T.nPl; p++) {
                 worstFpn = std::max(worstFpn, fabs(T.fixedPattern[p]));
-                worstSigT = std::max(worstSigT, fabs(T.tempNoise[p] - 10.0));
+                worstSigT = std::max(worstSigT, fabs(T.tempNoise[p] - sigTExpect));
             }
             fprintf(stderr, "verifyselftest: V10 Bayer fixture (levels 100/400/400/900, "
-                            "+-10 DN in time): nPl=%d, sigma_t %.6g/%.6g/%.6g/%.6g, "
+                            "+-10 DN in time over %d frames): nPl=%d, sigma_t "
+                            "%.6g/%.6g/%.6g/%.6g (expected %.9g = 10 x sqrt(%d/%d)), "
                             "sigma_fpn %.6g/%.6g/%.6g/%.6g\n",
-                    T.nPl, T.tempNoise[0], T.tempNoise[1], T.tempNoise[2], T.tempNoise[3],
+                    NF, T.nPl, T.tempNoise[0], T.tempNoise[1], T.tempNoise[2], T.tempNoise[3],
+                    sigTExpect, NF, NF - 1,
                     T.fixedPattern[0], T.fixedPattern[1], T.fixedPattern[2], T.fixedPattern[3]);
             check(T.valid && T.nPl == 4, "V10 a mosaiced stack reports four planes");
             check(worstFpn < 1e-6, "V10 each plane's FPN is 0 on a per-plane-flat field");
-            check(worstSigT < 1e-6, "V10 each plane's sigma_t is the real 10 DN");
+            check(worstSigT < 1e-6,
+                  "V10 each plane's sigma_t is the +-10 DN alternation, ddof=1");
             // ...and the same pixels read as gray give the pooled number the
             // panel used to print, which is the inter-plane level spread and
             // nothing else. This also proves the mosaic is part of the cache

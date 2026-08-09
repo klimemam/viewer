@@ -48,7 +48,7 @@ class 列: S1 / TN / LM(+m = +meta、+r = +ref)。「実装」列は現在の所
 | e-SFR / MTF50 | S1 | 斜めエッジ ROI | cv+sc | plugin `iso12233/e-sfr` | シーン内容(エッジ)は前提だが入力は1枚 |
 | A−B 差分・画素比較 | S1+r | 1フレーム+**参照画像 B** | mp+sc | A/B compare(`\`) | B が参照データ。クラス上は +ref の最小例 |
 | defect pixel 検出(閾値法) | S1 | 1フレーム+閾値 | sc+mp | — | 簡易版は S1。dark/flat 基準の正式版は +ref |
-| **temporal noise σ_t** | **TN** | 同条件 ≥2 フレーム | sc | Temporal パネル / `MOP_TEMPORAL_STATS` | 画素毎時間 var の平均。stack の性質 |
+| **temporal noise σ_t** | **TN** | **1 つの stack**(同条件 ≥2 フレーム) | sc | Temporal パネル / `MOP_TEMPORAL_STATS` | 画素毎時間 var(**ddof=1**)の平均。stack の性質 |
 | FPN(σ_fpn = 時間平均の空間σ) | TN | 同上 | sc | 同上 | 平坦でなければ絵柄込み(注記あり) |
 | frame mean ドリフト / フリッカ | TN | 同上 | cv | Temporal パネルのグラフ | 横軸 frame、縦軸 ROI mean |
 | **per-frame ROI 統計テーブル** | TN(中身は S1×N) | 同上 | cv/表 | server `MOP_FRAME_ROI_STATS`(plane 毎 mean/var 系列) | §3 参照。Excel 貼り付け要求の正体 |
@@ -84,6 +84,25 @@ frame 番号 / plane 毎 mean / var(std) / min / max / percentile / クリップ
 要求されたら、テーブルの**フッター(stack 全体の行)**か別表に置く。
 唯一の例外的な見せ方は「先頭からフレーム i までの累積 σ_t」だが、それは
 明示的に別の列名(cumulative)を持つ別の統計として扱う。
+
+### 3.1 σ_t は「1 つの stack につき 1 つ」で、推定量も 1 つ
+
+同じカテゴリエラーが**逆向き**にも起きる。フレーム行に stack の量を置くのが
+誤りであるのと同様に、**複数の stack を 1 本の時間軸として σ_t を取るのも
+誤り**である。露光・ゲインの違う 3 つの stack(各 8 枚)を選んで 24 枚の
+σ_t を出しても、それは何の測定値でもない。したがって **σ_t の入口は常に
+「1 つの stack」**: 開いた stack の Temporal パネル、または Browse の
+**連番(group)行**の `Temporal stats (server) for stack "…"`。複数選択から
+σ_t を計算する暫定経路は**ユーザー裁定 (2026-08-09, #107) で削除**した
+(拒否ではなく削除 —— 正しく計算できる対象が存在しないため)。
+
+**推定量も 1 つ。** 画素毎の時間分散は **ddof=1(不偏)** で取る。local
+(`recomputeTemporalIfNeeded`)・server (`MOP_TEMPORAL_STATS`)・
+`computeStackStats` の 3 実装すべてが同じ式でなければならない
+(#57 項目3, 2026-08-09 裁定)。local だけが ddof=0 だった期間があり、同じ
+stack の σ_t が測る場所によって √(N/(N−1)) 倍(N=8 で 6.9%、N=16 で 3.3%)
+食い違っていた。**local / server は転送路であって量ではない。**
+`docs/flat-field-stats.md` の `− ⟨σ_t²⟩/N` 補正もこの ddof=1 を前提に書かれている。
 
 ## 4. リクエスト判定フロー
 

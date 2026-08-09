@@ -2268,9 +2268,11 @@ int main(int argc, char** argv) {
                                              g_navKeyYieldAtBlur = g_navKeyYielded; }
                     else if (a == "img0")  selectImage(0);
                     else if (a == "svtemp") {
-                        // what the group row's "Temporal stats (server)" context
-                        // item does - fired directly because a menu item cannot
-                        // be scripted, the focus consequences are identical
+                        // what the group row's "Temporal stats (server) for
+                        // stack ..." context item does - fired directly because
+                        // a menu item cannot be scripted, the focus consequences
+                        // are identical. ONE stack's files, which is now the
+                        // only shape this call has (#107).
                         if (!app.previewFiles.empty())
                             requestBrowseTemporal(app.previewHost, app.previewFiles,
                                                   "svtemp", app.previewPort);

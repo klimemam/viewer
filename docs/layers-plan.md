@@ -60,6 +60,15 @@
 
 ## 4. ブラウザから Temporal (開かずにサーバ集計)
 
+> **2026-08-09 裁定 (#107): 複数選択経路は削除。** 本節が計画した2つの入口のうち
+> **group 行のものだけが残る**(項目名は `Temporal stats (server) for stack "…"` に
+> 変更、measure する stack を名乗る)。複数選択は選択行を平坦化して 1 回の
+> `MOP_TEMPORAL_STATS` に渡していたため、3 stack × 8 枚が「24 枚の時間軸」の σ_t に
+> なっていた(#81 と同種)。ただし平均が「stack 毎に 1 枚」で直せたのに対し、σ_t は
+> 正典が **stack の属性**と定義する量そのもの (terminology.md) なので、選択の形をした
+> 正しい答えが存在しない。よって拒否ではなく**入口の削除**。以下の記述のうち
+> 「複数選択」に関する行(`peerVersion()<2` の無効化を含む)は失効している。
+
 - group 行の「Open as stack」直後に「Temporal stats (server)」。複数選択(≥2 npy)時は「Open N selected
   as stack」の隣にボタン 1 個。実行は **measure worker (`mEnqueue`)** — browse worker は LIST/SCAN で
   直列に詰まり、ブラウズ用 ssh セッションを共有しているので使わない。
