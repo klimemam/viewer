@@ -742,9 +742,9 @@ static std::string npzOpenMember(const std::string& path, const std::vector<uint
     std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead);
     if (!lErr.empty()) return lErr;
     for (size_t k = before; k < app.images.size(); k++) {
-        app.images[k]->src->npzMember = arrayName;   // identity for session restore
+        app.images[k]->src->member = arrayName;   // identity for session restore
         // Watch baseline (§2.1): the npz FILE is the local file these pixels
-        // came from - src->path already names it; npzMember keeps members
+        // came from - src->path already names it; member keeps members
         // distinct in the registry tuple (§6.2). Identity is complete only
         // HERE (loadNpyBuffer knows no member name), so this is where the
         // member either joins a resident source or registers its own.
@@ -1654,11 +1654,11 @@ static void resolveSetRef(App::ASetRole& r, int setId, int roleIdx, int batchId,
     for (const auto& d : app.images) {
         if (d->preview || d->src->path.empty()) continue;
         if (srcKeyPath(d->src->path) != key) continue;
-        if (!r.refMember.empty() && d->src->npzMember != r.refMember) continue;
-        if (r.refMember.empty() && !d->src->npzMember.empty() &&
-            std::find(membersOpen.begin(), membersOpen.end(), d->src->npzMember) ==
+        if (!r.refMember.empty() && d->src->member != r.refMember) continue;
+        if (r.refMember.empty() && !d->src->member.empty() &&
+            std::find(membersOpen.begin(), membersOpen.end(), d->src->member) ==
                 membersOpen.end())
-            membersOpen.push_back(d->src->npzMember);
+            membersOpen.push_back(d->src->member);
         const bool tuple = now.mtime != 0 && d->src->mtime == now.mtime &&
                            d->src->fsize == now.fsize;
         if (tuple && !hitTuple) hitTuple = d.get();
@@ -1859,7 +1859,7 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
         int cfaPat = v.cfa.empty() ? -1 : vnzCfaPattern(v.cfa, cfaKind);
         for (int k = 0; k < v.docCount; k++) {
             ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
-            d->src->npzMember = "__pixels_" + std::to_string(i);
+            d->src->member = "__pixels_" + std::to_string(i);
             // the CALLER's stat, taken before the origin's bytes were read
             // (identity before bytes, §6.2): a stat taken here, after the
             // multi-second container decode, could bind NEW disk state to OLD
@@ -2020,7 +2020,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
             // between the calls.
             for (const auto& d : app.images)
                 if (d->src->path == src &&
-                    d->src->npzMember.compare(0, 9, "__pixels_") == 0)
+                    d->src->member.compare(0, 9, "__pixels_") == 0)
                     return {};
         }
         return loadViewerNpz(zip, entries, vver, readerSpec, src, zipStat);
@@ -2183,7 +2183,7 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
         FrameSource& S = *im->src;
         S.path = path;
         S.fileFrame = page;         // which page of the FILE: identity and provenance
-        S.npzMember = img.member;   // ...and which NAMED part of it, when it has any
+        S.member = img.member;   // ...and which NAMED part of it, when it has any
         S.w = img.w; S.h = img.h; S.ch = img.ch;
         S.dtype = img.dtype;
         S.data = std::move(img.data);
@@ -2286,7 +2286,7 @@ static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
     im->name = baseName(path);
     FrameSource& S = *im->src;
     S.path = path;
-    S.npzMember = img.member;
+    S.member = img.member;
     S.w = img.w; S.h = img.h; S.ch = img.ch;
     S.dtype = img.dtype;
     S.data = std::move(img.data);
@@ -2345,7 +2345,7 @@ static std::string npyReReadLoss(const ImageDoc* d) {
 // screen exactly where it was.
 static std::string npyReReadAs(ImageDoc* d, int r) {
     if (!d || !d->src) return "no image";
-    const std::string path = d->src->path, member = d->src->npzMember;
+    const std::string path = d->src->path, member = d->src->member;
     if (path.empty()) return "these pixels have no file to read again";
     if (d->src->npyShape.empty()) return "not a .npy: there is no other reading of it";
     if (npyReadLabel(d->src->npyShape, r).empty())

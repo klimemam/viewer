@@ -91,10 +91,19 @@ struct FrameSource {
     std::string dtype;
     float vmin = 0, vmax = 1;         // data min/max
     std::string path;
-    std::string npzMember;            // array name when this came from a .npz
+    // This frame's name INSIDE its container file: a .npz array name, or an
+    // .exr layer. ONE field, because it is one idea - a named part of one file -
+    // and the session line, the Inspector row and the identity tuple below all
+    // key off it, so a parallel field would have meant a second copy of every
+    // one of them. It was called npzMember while .npz was the only container
+    // that had any; the session key, the sequence record and the tuple all
+    // already said "member", and only this declaration still said "npz".
+    // The WORD shown to the user is the container's own and comes from
+    // imagefile::Backend::partWord - never spelled out here.
+    std::string member;
     int fileFrame = 0;                // frame index within a multi-frame LOCAL file
                                       // (npy frame axis; npz members too). With path +
-                                      // npzMember it completes the provenance a reload
+                                      // member it completes the provenance a reload
                                       // re-decodes - remoteFrame is the remote twin
     // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
     // the shape the FILE declared, kept so the Inspector can compute which
@@ -175,7 +184,7 @@ inline std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // Entries are weak: a source whose last membership closes disappears from here
 // by itself, so the registry never keeps pixels alive.
 //
-// The tuple is (path-or-url, npzMember, frame-within-file, raw recipe, npy
+// The tuple is (path-or-url, member, frame-within-file, raw recipe, npy
 // reading, mtime, fsize). mtime+fsize are the point: a file that changed on
 // disk is a DIFFERENT tuple, so re-opening still reads the new bytes - sharing
 // never overrides "re-open reads the disk". The npy reading (§3.3, normalized
@@ -243,11 +252,11 @@ inline std::string srcIdentityKey(const FrameSource& s) {
         snprintf(t, sizeof t, "\n%d|%d\nnr%d\n%lld,%llu",
                  s.fileFrame, s.remoteFrame, npyKeyRead(s.npyShape, s.npyRead),
                  (long long)s.mtime, (unsigned long long)s.fsize);
-    // npzMember is LENGTH-PREFIXED: a zip may name a member anything, newlines
+    // member is LENGTH-PREFIXED: a zip may name a member anything, newlines
     // included, and an unescaped name could forge the field boundaries of this
     // key - two different tuples reading back as one string
     return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" +
-           std::to_string(s.npzMember.size()) + ":" + s.npzMember + t;
+           std::to_string(s.member.size()) + ":" + s.member + t;
 }
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed

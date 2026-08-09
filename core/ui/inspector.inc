@@ -572,7 +572,7 @@ static void drawInspector() {
         // name, and the members that are not pixels (exposure, gain, a note) are
         // the reason the file was written that way - so they belong beside it
         // rather than in a panel of their own (docs/npz-design.md §4 item 3).
-        if (!im->src->npzMember.empty()) {
+        if (!im->src->member.empty()) {
             // One FIELD holds the name, because "a named part inside one
             // container file" is one idea and the session, the identity tuple
             // and the Inspector all key off it. The WORD is the container's
@@ -582,7 +582,7 @@ static void drawInspector() {
             // what an .exr is.
             const imagefile::Backend* pb = imagefile::forPath(im->src->path);
             ImGui::TextDisabled("%-11s %s", pb && pb->partWord ? pb->partWord : "npz member",
-                                im->src->npzMember.c_str());
+                                im->src->member.c_str());
             for (const auto& e : app.npzMeta) {
                 if (e.path != im->src->path) continue;
                 if (e.items.empty()) break;

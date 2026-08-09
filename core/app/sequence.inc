@@ -100,7 +100,7 @@ static std::vector<SrcMapRow> srcMapRows() {
         r.bytes = S.data.size() * sizeof(float);
         r.w = S.w; r.h = S.h; r.ch = S.ch;
         r.preview = d->preview;
-        r.name = d->name; r.member = S.npzMember; r.path = S.path;
+        r.name = d->name; r.member = S.member; r.path = S.path;
         rows.push_back(std::move(r));
     }
     return rows;

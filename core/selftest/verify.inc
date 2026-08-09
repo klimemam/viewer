@@ -1277,7 +1277,7 @@
             int fabricated = 0;
             std::string fabNames;
             for (const auto& d : app.images)
-                if (d->src->npzMember == "exposure_ms" || d->src->npzMember == "gain") {
+                if (d->src->member == "exposure_ms" || d->src->member == "gain") {
                     fabricated++;
                     if (fabNames.size() < 90)
                         fabNames += (fabNames.empty() ? "" : ", ") + d->name +
@@ -1346,7 +1346,7 @@
             std::string v21lerr = loadSession(v21sess);
             loadAll();
             bool member = false;
-            for (const auto& d : app.images) if (d->src->npzMember == "data") member = true;
+            for (const auto& d : app.images) if (d->src->member == "data") member = true;
             App::SeqInfo* v21r = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
             bool raxOk = v21r && v21r->axisVals.size() == 4 &&
                          v21r->axisVals[3] == 12345.678901234567 &&
@@ -2680,7 +2680,7 @@
                 FrameSource& S = *pv->src;
                 S.path = a->src->path;
                 S.remoteUrl = "local://" + a->src->path;
-                S.npzMember = a->src->npzMember;
+                S.member = a->src->member;
                 S.fileFrame = a->src->fileFrame; S.remoteFrame = a->src->remoteFrame;
                 S.npyShape = a->src->npyShape; S.npyRead = a->src->npyRead;
                 S.mtime = a->src->mtime; S.fsize = a->src->fsize;

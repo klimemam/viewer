@@ -796,7 +796,7 @@ static void drawFileList() {
                     const imagefile::Backend* pic = S.path.empty() ? nullptr
                                                   : imagefile::forPath(S.path);
                     // container/reader members reload as a unit - see reloadSource
-                    const bool unit = S.npzMember.rfind("__pixels_", 0) == 0;
+                    const bool unit = S.member.rfind("__pixels_", 0) == 0;
                     const bool canReload = !remote && !S.path.empty() && !pic && !unit;
                     if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
                         pendingReloadImg = i;
@@ -986,7 +986,7 @@ static void drawFileList() {
                     // they do not make the stack reloadable on their own
                     else if (!S.path.empty() && imagefile::forPath(S.path)) anyPic = true;
                     // ...and container/reader members reload as a unit
-                    else if (S.npzMember.rfind("__pixels_", 0) == 0) anyUnit = true;
+                    else if (S.member.rfind("__pixels_", 0) == 0) anyUnit = true;
                     else if (!S.path.empty() || !S.remoteUrl.empty()) anyLocal = true;
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))

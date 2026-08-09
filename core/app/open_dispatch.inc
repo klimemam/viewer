@@ -409,7 +409,7 @@ static void seqMosaicChanged(const ImageDoc* im) {
 
 // ---- reload from disk (docs/reference-design.md §3.2) --------------------------
 // THE one place pixels are replaced in place. Re-decodes a source from its own
-// provenance (path + npzMember + fileFrame + raw recipe), swaps the result into
+// provenance (path + member + fileFrame + raw recipe), swaps the result into
 // the SAME FrameSource, then walks every membership that shares it: dataRev,
 // mirrors, forgetImage, texDirty per doc; stackRev, server-temporal re-fire and
 // the linearity rows per affected stack. Numbers share the fate of the pixels
@@ -455,7 +455,7 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     // A per-member reload is not wired - and without this refusal a reader's
     // .dat origin would fall into the npz branch below, whose npzList would
     // then blame "not a zip file" for a failure that never happened.
-    if (src->npzMember.rfind("__pixels_", 0) == 0) {
+    if (src->member.rfind("__pixels_", 0) == 0) {
         errOut = "container/reader members reload by re-opening the file";
         return false;
     }
@@ -484,20 +484,20 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                                            // with it (an unmoved key would let a
                                            // later open adopt pre-reload pixels)
         std::vector<uint8_t> npy;          // the .npy bytes, plain or extracted
-        if (!src->npzMember.empty()) {
+        if (!src->member.empty()) {
             std::vector<uint8_t> zip;
             if (!readFileBytes(fpath, zip)) { errOut = "cannot read file"; return false; }
             std::vector<NpzEntry> entries;
             if (!npzList(zip, entries, err)) { errOut = err; return false; }
             bool found = false;
             for (const auto& e : entries)
-                if (e.name == src->npzMember + ".npy") {
+                if (e.name == src->member + ".npy") {
                     if (!npzExtract(zip, e, npy, err)) { errOut = err; return false; }
                     found = true;
                     break;
                 }
             if (!found) {
-                errOut = "array \"" + src->npzMember + "\" is no longer in the file";
+                errOut = "array \"" + src->member + "\" is no longer in the file";
                 return false;
             }
         } else if (!readFileBytes(fpath, npy)) {
@@ -546,7 +546,7 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     {
         FrameSource idNew;            // identity only - no pixels are copied
         idNew.path = src->path; idNew.remoteUrl = src->remoteUrl;
-        idNew.npzMember = src->npzMember;
+        idNew.member = src->member;
         idNew.fileFrame = src->fileFrame; idNew.remoteFrame = src->remoteFrame;
         idNew.rawDtype = src->rawDtype; idNew.rawInterp = src->rawInterp;
         idNew.rawOffset = src->rawOffset; idNew.rawLE = src->rawLE;

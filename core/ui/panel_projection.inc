@@ -971,7 +971,7 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
     // ids do not survive a session and names are renameable and not unique).
     const std::string firstPath = app.images[fr.front()]->src->path;
     // The INPUT TUPLE record (§10.2 / §6.2): one digest over the identity
-    // tuple of every member the fold will read - (path or url, npzMember,
+    // tuple of every member the fold will read - (path or url, member,
     // fileFrame, remoteFrame, mtime, fsize), each statted at decode time, so
     // the record describes the pixels that actually went in, not whatever the
     // disk holds at some later moment. The member walk is computeStackStats's
@@ -993,7 +993,7 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
             const FrameSource& s = *d->src;
             digAdd(s.path.data(), s.path.size());
             digAdd(s.remoteUrl.data(), s.remoteUrl.size());
-            digAdd(s.npzMember.data(), s.npzMember.size());
+            digAdd(s.member.data(), s.member.size());
             digAdd(&s.fileFrame, sizeof s.fileFrame);
             digAdd(&s.remoteFrame, sizeof s.remoteFrame);
             digAdd(&s.mtime, sizeof s.mtime);

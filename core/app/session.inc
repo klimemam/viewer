@@ -147,7 +147,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
-        if (!d->src->npzMember.empty()) f << "member " << d->src->npzMember << "\n";
+        if (!d->src->member.empty()) f << "member " << d->src->member << "\n";
         // §3.3: the reading is the user's declaration and it sticks across
         // sessions. ADDITIVE, and written only when there IS a declaration - an
         // older viewer skips the unknown key and reloads natively, which is

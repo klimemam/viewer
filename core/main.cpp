@@ -1788,7 +1788,7 @@ int main(int argc, char** argv) {
                     bool other = a0->seqId != 0
                                ? d->seqId != a0->seqId
                                : (d->src->path != a0->src->path ||
-                                  d->src->npzMember != a0->src->npzMember);
+                                  d->src->member != a0->src->member);
                     if (other) { setCompareB(d.get()); break; }
                 }
                 if (!resolveB()) setCompareB(app.images[1].get());   // same file twice

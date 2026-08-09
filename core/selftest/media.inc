@@ -484,12 +484,12 @@
             std::string names, members;
             for (const auto& d : app.images) {
                 names += (names.empty() ? "" : ", ") + d->name;
-                members += (members.empty() ? "" : ", ") + d->src->npzMember;
+                members += (members.empty() ? "" : ", ") + d->src->member;
             }
             fprintf(stderr, "mediaselftest: M17 %zu doc(s): %s  members: %s  toast=\"%s\"\n",
                     n, names.c_str(), members.c_str(), app.toast.c_str());
-            bool two = n == 2 && app.images[0]->src->npzMember == "diffuse" &&
-                       app.images[1]->src->npzMember == "specular" &&
+            bool two = n == 2 && app.images[0]->src->member == "diffuse" &&
+                       app.images[1]->src->member == "specular" &&
                        app.images[0]->name == "layers.exr:diffuse" &&
                        app.images[1]->name == "layers.exr:specular" &&
                        app.images[0]->ch == 3 && app.images[1]->ch == 3;
@@ -506,7 +506,7 @@
             closeAll();
             openPath(root + "/mixed.exr");
             std::string mm;
-            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->npzMember;
+            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->member;
             fprintf(stderr, "mediaselftest: M17 mixed %zu doc(s) members: %s\n",
                     app.images.size(), mm.c_str());
             // The ORDER is the file's own: an EXR ChannelList is sorted, so
@@ -520,7 +520,7 @@
                   "M17 an RGB layer and two loose channels are 3 documents, 1+1+3 channels");
 
             ImageDoc* y = open1("lum.exr");
-            check(y && app.images.size() == 1 && y->ch == 1 && y->src->npzMember == "Y",
+            check(y && app.images.size() == 1 && y->ch == 1 && y->src->member == "Y",
                   "M17 a lone Y is one 1-channel document naming the channel it is");
         }
 
@@ -539,7 +539,7 @@
             closeAll();
             std::string lerr = loadSession(sess);
             std::string mm;
-            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->npzMember;
+            for (const auto& d : app.images) mm += (mm.empty() ? "" : ",") + d->src->member;
             fprintf(stderr, "mediaselftest: M18 restored %zu doc(s) members: %s err=\"%s\"\n",
                     app.images.size(), mm.c_str(), lerr.c_str());
             check(saved && lerr.empty() && app.images.size() == 2 && mm == "diffuse,specular",
