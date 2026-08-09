@@ -1391,20 +1391,22 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // selection of a 32x32 stack and a 64x64 stack was refused for a reason that
     // had stopped applying to this verb.
     std::string rbSelAvgWhyNot;
-    bool rbSelTemporalOk = B.peerVersion >= 2;
+    // (rbSelTemporalOk lived here - the peer-version and .npy gate for
+    // "Temporal stats (server) for N". It existed only to enable that item, so
+    // it went with it under #107; the group row's own temporal verb needs no
+    // version gate, because group rows only exist from protocol 3 on.)
     {
         const remote::Entry* first = nullptr;
         for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
             if (!rbSel[i]) continue;
             const remote::Entry& e = *view[i].e;
             // The PEER's question again (#111), and it stays that on a local
-            // listing: all three verbs below are served over the protocol.
+            // listing: both verbs below are served over the protocol.
             // A local .png row is openable and still not stackable, which is
             // why these two sentences say ".npy" and not "openable".
             if (!peerServesName(view[i].name())) {
                 rbSelStackWhyNot = "only .npy files can form a stack";
                 rbSelAvgWhyNot = "only .npy files can be averaged";
-                rbSelTemporalOk = false;     // MEASURE is npy-only too
                 continue;
             }
             if (!e.hasMeta) {
@@ -2132,26 +2134,21 @@ void drawPanelRemote(App::BrowseInstance& I) {
                             ImGui::SetTooltip("%s", AVG_TIP);
                     }
 
-                    snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
-                    ImGui::BeginDisabled(!rbSelTemporalOk);
-                    if (ImGui::MenuItem(lb)) {
-                        std::vector<std::string> files = rbSelFiles();
-                        // baseName("/") is empty; the folder at the root of a
-                        // filesystem is still called "/" on screen
-                        std::string leaf = baseName(B.dir);
-                        if (leaf.empty()) leaf = B.dir;
-                        g_browseHost.requestBrowseTemporal(B.host, files,
-                                              leaf + " (" + std::to_string(files.size()) +
-                                              " selected)", B.port);
-                    }
-                    ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(rbSelTemporalOk
-                            ? "sigma_t / sigma_fpn computed on the server over the\n"
-                              "selected files, shown in the Temporal panel - nothing\n"
-                              "opens and no pixel transfers"
-                            : "needs a protocol 2+ peer and .npy files only");
-
+                    // ("Temporal stats (server) for N" lived here. It flattened
+                    // the ticked rows into ONE file list and asked the peer for
+                    // one sigma_t over all of it - three stacks of eight became
+                    // a 24-long "time axis" that no camera ever exposed. Same
+                    // defect as #81, which the average above was rewritten to
+                    // avoid; but sigma_t is worse, because the canon does not
+                    // merely prefer per-stack here - it DEFINES sigma_t as a
+                    // stack's attribute (docs/terminology.md,
+                    // docs/analysis-layers.md 3.2). So there was no correct
+                    // thing for a multi-row selection to compute, and #107's
+                    // ruling is to delete the entry point rather than teach it
+                    // to refuse: the way to measure a stack is to open it AS a
+                    // stack. The verb survives on the group row below - in this
+                    // very menu, which is why the removal is not a dead end -
+                    // and on the Temporal panel of an opened stack.)
                     snprintf(lb, sizeof lb, "Copy %d path(s)", rbNSel);
                     if (ImGui::MenuItem(lb)) {
                         std::vector<std::string> files = rbSelFiles();
@@ -2206,7 +2203,21 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // the server aggregates WITHOUT opening: "is this set even
                     // worth transferring?" costs zero pixels this way. Group
                     // rows only exist from protocol 3 on, so no version gate.
-                    if (ImGui::MenuItem("Temporal stats (server)")) {
+                    //
+                    // The label NAMES THE STACK since #107 deleted the
+                    // multi-select entry point above. This item is what the
+                    // reader lands on instead, and it is reached from the same
+                    // right-click - including a right-click made while three
+                    // rows are ticked. An item called "Temporal stats (server)"
+                    // in a menu whose other verbs all say "N selected" reads as
+                    // the selection's; naming the stack is how the removal is
+                    // legible rather than silent. There is no selection-shaped
+                    // sigma_t to offer instead: the canon defines it as a
+                    // stack's attribute (docs/terminology.md).
+                    char tl[160];
+                    snprintf(tl, sizeof tl, "Temporal stats (server) for stack \"%s\"",
+                             e.name.c_str());
+                    if (ImGui::MenuItem(tl)) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         std::string leaf = B.dir;
@@ -2215,11 +2226,27 @@ void drawPanelRemote(App::BrowseInstance& I) {
                             leaf = leaf.substr(sl2 + 1);
                         g_browseHost.requestBrowseTemporal(B.host, files,
                                                            leaf + "/" + e.name, B.port);
+                        // ...and said AFTER the fact too when a selection was
+                        // standing, the way the frame-average ruling says its
+                        // count twice: the result lands in a panel that holds
+                        // one measurement, and the reader's previous gesture
+                        // was "I picked three of these". The line stays in the
+                        // Messages log after the toast fades.
+                        if (rbNSel > 1)
+                            g_browseHost.toast(
+                                "temporal stats: stack \"" + e.name + "\" only (" +
+                                std::to_string(e.frames) + " frames). sigma_t is a stack's "
+                                "attribute - " + std::to_string(rbNSel) +
+                                " selected rows are not one time axis", false);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server,\n"
-                                          "shown in the Temporal panel - nothing opens,\n"
-                                          "no pixel transfers. plane=all (no CFA split).");
+                        ImGui::SetTooltip("sigma_t / sigma_fpn computed on the server for\n"
+                                          "THIS stack, shown in the Temporal panel - nothing\n"
+                                          "opens and no pixel transfers. plane=all (no CFA\n"
+                                          "split). One stack per measurement: sigma_t is a\n"
+                                          "stack's attribute, so a multi-row selection has\n"
+                                          "no temporal verb - measure the stacks one at a\n"
+                                          "time, or open one and use the Temporal panel.");
                     ImGui::Separator();
                 } else if (rbRowOpenable(B.host, rname)) {
                     if (ImGui::MenuItem("Open"))
