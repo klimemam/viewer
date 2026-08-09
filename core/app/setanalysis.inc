@@ -603,10 +603,6 @@ static std::string sepLevelCensus(const SepFit& F) {
 }
 
 static SepFit runSeparationFit(const App::ASet& S) {
-    // NOT BUILT YET. The registry row, the role schema, the result vessel and
-    // the naming are here; the estimator is what the next commit adds. Every
-    // caller therefore gets the same one line, and every F* assert of
-    // --setanalysis-selftest is red.
     SepFit F;
     F.setName = S.name;
     for (int i = 0; i < 2; i++) {
@@ -615,9 +611,230 @@ static SepFit runSeparationFit(const App::ASet& S) {
         R.setName = S.name;
         R.form = kSetAnalyzers[R.kind].form;
     }
-    F.refusal = "the separation fit is not built yet";
-    F.dsnu.refusal = F.prnu.refusal = F.refusal;
-    (void)setSeriesRoleRefusal;      // the Series() resolver, waiting for a caller
-    (void)kSepModel;                 // ...and the caption the panel will print
+    auto refuse = [&F](const std::string& why) -> SepFit& {
+        F.refusal = why;
+        F.dsnu.refusal = why;
+        F.prnu.refusal = why;
+        return F;
+    };
+    int seriesId = 0, darkSeq = 0;
+    std::string why = setSeriesRoleRefusal(S, "sweep", &seriesId);
+    if (!why.empty()) return refuse(why);
+    why = setRoleRefusal(S, "dark", &darkSeq);
+    if (!why.empty()) return refuse(why);
+    const App::Series* Ser = seriesById(seriesId);
+    if (!Ser) return refuse("\"sweep\" names a series that is not open anymore");
+    F.seriesName = Ser->name;
+    F.paramName = Ser->paramName;
+    F.unit = Ser->unit;
+
+    // ---- the dark, which contributes ONE SCALAR PER PLANE ------------------
+    SetFold Fd;
+    if (!setFoldStack(darkSeq, Fd))
+        return refuse(Fd.err == "min_frames"
+            ? "\"dark\": needs >= 2 frames - \"" + Fd.name + "\" has " +
+              std::to_string(Fd.frames) + " of " + std::to_string(Fd.expected) + " loaded"
+            : "\"dark\": " + Fd.err);
+    double dSum[4] = {}, dN[4] = {};
+    for (size_t i = 0; i < Fd.M.size(); i++) {
+        if (!std::isfinite(Fd.M[i])) continue;
+        dSum[Fd.plane[i]] += Fd.M[i];
+        dN[Fd.plane[i]] += 1.0;
+    }
+    double darkMean[4];
+    for (int p = 0; p < 4; p++)
+        darkMean[p] = dN[p] > 0 ? dSum[p] / dN[p]
+                                : std::numeric_limits<double>::quiet_NaN();
+    F.nPl = Fd.nPl; F.cfa = Fd.cfa; F.cfaPattern = Fd.cfaPattern;
+
+    // ---- the levels --------------------------------------------------------
+    // Order of the tests is deliberate: what the member IS comes before what
+    // the user DECLARED about it, so "this can never be a level" and "you took
+    // this one out" never get reported as each other.
+    F.members = (int)Ser->members.size();
+    for (const auto& m : Ser->members) {
+        if (m.seqId == 0) {
+            const ImageDoc* fd = frameMemberDoc(m.frameUid);
+            if (!fd) { F.exGone++; continue; }
+            F.exFrame++;
+            F.skipped.push_back({ fd->name,
+                "a frame member has no time axis, so its s_t - and the "
+                "-sigma_t^2/N correction made of it - do not exist" });
+            continue;
+        }
+        const App::SeqInfo* si = seqInfo(m.seqId);
+        if (!si) { F.exGone++; continue; }
+        if (m.fold == FOLD_SUM) {
+            F.exSum++;
+            F.skipped.push_back({ si->name,
+                "stands as sum - a sum is n x the mean's scale, so its "
+                "sigma_fpn^2 and its mu are not the other levels' quantities" });
+            continue;
+        }
+        if (!m.include) {
+            F.exNotInc++;
+            F.skipped.push_back({ si->name, "not included (the series' own switch)" });
+            continue;
+        }
+        if (!std::isfinite(m.value)) {
+            F.exNoValue++;
+            F.skipped.push_back({ si->name,
+                "no value set - UNSET is not 0, and the series' rule is that it "
+                "does not enter a fit" });
+            continue;
+        }
+        SetFold Fl;
+        if (!setFoldStack(m.seqId, Fl)) {
+            if (Fl.err == "min_frames") {
+                F.exShort++;
+                F.skipped.push_back({ si->name,
+                    "needs >= 2 frames - " + std::to_string(Fl.frames) + " of " +
+                    std::to_string(Fl.expected) + " loaded" });
+                continue;
+            }
+            return refuse("\"sweep\" member \"" + si->name + "\": " + Fl.err);
+        }
+        // Planes, not pixels. mu takes a per-plane MEAN off the dark, so W x H
+        // may differ; what may not differ is what plane p means, or the two
+        // sides are not the same detector read the same way.
+        if (Fl.C != Fd.C || Fl.nPl != Fd.nPl || Fl.cfa != Fd.cfa ||
+            (Fl.cfa != 0 && Fl.cfaPattern != Fd.cfaPattern)) {
+            char b[288];
+            snprintf(b, sizeof b,
+                     "sweep member \"%s\" is %dch / %d plane(s) and \"dark\" is "
+                     "%dch / %d plane(s) - mu is a per-plane difference, so the "
+                     "planes have to mean the same thing on both sides",
+                     si->name.c_str(), Fl.C, Fl.nPl, Fd.C, Fd.nPl);
+            return refuse(b);
+        }
+        double s1[4] = {}, s2[4] = {}, cs[4] = {}, np[4] = {};
+        for (size_t i = 0; i < Fl.M.size(); i++) {
+            if (!std::isfinite(Fl.M[i])) continue;
+            const int p = Fl.plane[i];
+            s1[p] += Fl.M[i]; s2[p] += Fl.M[i] * Fl.M[i];
+            cs[p] += Fl.corr[i]; np[p] += 1.0;
+        }
+        SepLevel Lv;
+        Lv.seqId = m.seqId;
+        Lv.member = Fl.name;
+        Lv.headPath = Fl.headPath;
+        Lv.value = m.value;
+        Lv.n = Fl.frames; Lv.N = Fl.expected;
+        Lv.nonFinite = Fl.nonFinite; Lv.dropped = Fl.dropped;
+        for (int p = 0; p < F.nPl; p++) {
+            // the SAME per-plane arithmetic the direct rows use - not "the same
+            // formula", the same function
+            const SetPlaneFpn f = setPlaneFpn(s1[p], s2[p], cs[p], np[p]);
+            Lv.mu[p] = np[p] > 0 ? s1[p] / np[p] - darkMean[p]
+                                 : std::numeric_limits<double>::quiet_NaN();
+            Lv.fpnVar[p] = f.fvar;
+            Lv.fpnVarRaw[p] = f.var;
+            Lv.corr[p] = f.corr;
+            Lv.clamped[p] = f.clamped;
+            Lv.samples[p] = (size_t)np[p];
+        }
+        F.levels.push_back(std::move(Lv));
+    }
+    F.M = (int)F.levels.size();
+    if (F.M < 3)
+        return refuse("the sweep \"" + F.seriesName + "\" has " +
+                      std::to_string(F.M) + " usable level(s) - the separation "
+                      "needs 3 (two points fit a line exactly, so there is no "
+                      "residual left to check the model with). " +
+                      sepLevelCensus(F));
+
+    // ---- the OLS, per plane, unweighted (判断5) -----------------------------
+    // x = mu^2, y = the corrected sigma_fpn^2. Written in the centred form
+    // (Sxy/Sxx) rather than the normal-equation one: with mu ~ 3000 DN, x ~ 1e7
+    // and the raw form squares that again, which is a real loss of digits on a
+    // quantity whose intercept is the answer.
+    int fitted = 0;
+    for (int p = 0; p < F.nPl; p++) {
+        std::vector<double> xs, ys, yr;
+        for (const auto& L : F.levels) {
+            if (!std::isfinite(L.mu[p])) continue;
+            xs.push_back(L.mu[p] * L.mu[p]);
+            ys.push_back(L.fpnVar[p]);
+            yr.push_back(L.fpnVarRaw[p]);
+        }
+        if ((int)xs.size() < 3) {
+            F.planeWhy[p] = "fewer than 3 levels have a mu on this plane";
+            continue;
+        }
+        const double n = (double)xs.size();
+        double xb = 0, yb = 0, rb = 0;
+        for (size_t i = 0; i < xs.size(); i++) { xb += xs[i]; yb += ys[i]; rb += yr[i]; }
+        xb /= n; yb /= n; rb /= n;
+        double Sxx = 0, Sxy = 0, Sxr = 0;
+        for (size_t i = 0; i < xs.size(); i++) {
+            const double dx = xs[i] - xb;
+            Sxx += dx * dx;
+            Sxy += dx * (ys[i] - yb);
+            Sxr += dx * (yr[i] - rb);
+        }
+        if (!(Sxx > 0)) {
+            // every level landed at the same mu: there is one x, and one x
+            // cannot tell a constant from something proportional to it
+            F.planeWhy[p] = "every level lands at the same mu - one abscissa "
+                            "cannot separate a constant from a slope";
+            continue;
+        }
+        F.slope[p] = Sxy / Sxx;
+        F.inter[p] = yb - F.slope[p] * xb;
+        F.slopeRaw[p] = Sxr / Sxx;
+        F.interRaw[p] = rb - F.slopeRaw[p] * xb;
+        double ssr = 0, sst = 0;
+        for (size_t i = 0; i < xs.size(); i++) {
+            const double f = F.slope[p] * xs[i] + F.inter[p];
+            ssr += (ys[i] - f) * (ys[i] - f);
+            sst += (ys[i] - yb) * (ys[i] - yb);
+        }
+        F.rms[p] = sqrt(ssr / n);
+        F.r2[p] = sst > 0 ? 1.0 - ssr / sst
+                          : std::numeric_limits<double>::quiet_NaN();
+        F.planeFit[p] = true;
+        fitted++;
+        for (auto& L : F.levels) {
+            if (!std::isfinite(L.mu[p])) continue;
+            L.fit[p] = F.slope[p] * L.mu[p] * L.mu[p] + F.inter[p];
+            L.resid[p] = L.fpnVar[p] - L.fit[p];
+        }
+    }
+    if (!fitted) {
+        // no plane produced a line, so there is no number anywhere: the whole
+        // analysis refuses, in the first plane's own words
+        for (int p = 0; p < F.nPl; p++)
+            if (!F.planeWhy[p].empty()) return refuse(F.planeWhy[p]);
+        return refuse("the levels do not make a line on any plane");
+    }
+
+    // ---- the two named outputs ---------------------------------------------
+    // Both coefficients are variances, so both can come out negative on data
+    // whose fixed pattern is under the fit's own scatter. Clamped at 0 with the
+    // clamp DECLARED - the guard rule of docs/flat-field-stats.md (a), and the
+    // same one the direct rows follow.
+    for (int i = 0; i < 2; i++) {
+        SetResult& R = i ? F.prnu : F.dsnu;
+        R.nPl = F.nPl; R.cfa = F.cfa; R.cfaPattern = F.cfaPattern;
+        R.sweep = F.seriesName;
+        R.levels = F.M;
+        for (int p = 0; p < F.nPl; p++) {
+            if (!F.planeFit[p]) {
+                R.value[p] = R.uncorr[p] = std::numeric_limits<double>::quiet_NaN();
+                continue;
+            }
+            const double c = i ? F.slope[p] : F.inter[p];
+            const double cr = i ? F.slopeRaw[p] : F.interRaw[p];
+            const double k = i ? 100.0 : 1.0;
+            R.value[p] = k * sqrt(std::max(0.0, c));
+            R.uncorr[p] = k * sqrt(std::max(0.0, cr));
+            R.clamped[p] = c < 0.0;
+            R.samples[p] = (size_t)F.M;
+        }
+        R.used.emplace_back();
+        setUseFromFold(R.used.back(), "dark", Fd);
+        R.ok = true;
+    }
+    F.ok = true;
     return F;
 }
