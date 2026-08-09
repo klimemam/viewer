@@ -767,7 +767,106 @@ struct App {
         // the series - so the value does too (Series::Member::value). Keeping
         // it on the stack is what forced "one unit for the whole application".
     };
-    std::vector<SeqInfo> seqs;
+
+    // The open stacks. A CONTAINER of its own rather than a bare vector, for
+    // one reason: seqInfo() hands out a raw SeqInfo* into this storage, and the
+    // rule that governs that pointer (never hold it across an add or a remove -
+    // see seqInfo() in core/app/sequence.inc) can only be checked if every add
+    // and every remove goes through one place. `grep -n 'seqs\.' core` used to
+    // answer "where can this table move?" with a list that had to be re-derived
+    // by hand after every merge; the mutators are now exactly the three methods
+    // below (push_back / erase / clear), by construction.
+    //
+    // And they all RESEAT: each one builds a fresh buffer, moves the elements
+    // into it and lets the old one go, so a mutation ALWAYS invalidates every
+    // outstanding SeqInfo*. That is deliberate, and it is the whole point.
+    // std::vector reallocates only when it runs out of capacity, so whether a
+    // held pointer dangles depended on the standard library's growth factor:
+    // libstdc++ grows 2x and had spare room, MSVC grows 1.5x and did not - so
+    // the one bug of this class we have had (cc1ee8b) was invisible on the
+    // development machine and killed the process on Windows CI, with no output.
+    // A defect that only one allocator can show is a defect that ships. Making
+    // the invalidation unconditional costs one move of a handful of SeqInfo per
+    // stack opened or closed - unmeasurable next to reading the frames - and
+    // buys the same failure on every platform, which the 36 selftests then see.
+    //
+    // Poisoning the outgoing elements is the diagnostic half: a stale read gets
+    // id == StaleId and the name "<stale SeqInfo>" instead of plausible data,
+    // for as long as the freed block goes unreused. Best effort by nature (the
+    // memory is not ours after the swap) - reading it is still undefined, and
+    // holds() below is the defined way to ask.
+    struct SeqTable {
+        static constexpr int StaleId = -0x5EED;   // ids count up from 1: never real
+
+        using iterator = std::vector<SeqInfo>::iterator;
+        using const_iterator = std::vector<SeqInfo>::const_iterator;
+
+        size_t size()  const { return v_.size(); }
+        bool   empty() const { return v_.empty(); }
+        iterator begin() { return v_.begin(); }
+        iterator end()   { return v_.end(); }
+        const_iterator begin() const { return v_.begin(); }
+        const_iterator end()   const { return v_.end(); }
+        SeqInfo&       operator[](size_t i)       { return v_[i]; }
+        const SeqInfo& operator[](size_t i) const { return v_[i]; }
+        SeqInfo&       front()       { return v_.front(); }
+        const SeqInfo& front() const { return v_.front(); }
+        SeqInfo&       back()        { return v_.back(); }
+        const SeqInfo& back()  const { return v_.back(); }
+
+        // How many times this table has moved. A pointer taken when this read N
+        // is dangling the moment it reads anything else - which is what makes a
+        // "was it held across a mutation?" assertion writable at all.
+        unsigned long long rev() const { return rev_; }
+        // Does p still point at a live element? The defined way to ask, and the
+        // only one: comparing a stale pointer is fine, dereferencing it is not.
+        bool holds(const SeqInfo* p) const {
+            return p && p >= v_.data() && p < v_.data() + v_.size();
+        }
+
+        void push_back(const SeqInfo& s) {
+            std::vector<SeqInfo> fresh;
+            fresh.reserve(v_.size() + 1);
+            for (auto& e : v_) fresh.push_back(std::move(e));
+            fresh.push_back(s);
+            reseat_(fresh);
+        }
+        iterator erase(const_iterator it) {
+            if (v_.empty()) return v_.end();
+            const size_t at = (size_t)(it - v_.cbegin());
+            std::vector<SeqInfo> fresh;
+            fresh.reserve(v_.size() - 1);
+            for (size_t k = 0; k < v_.size(); k++)
+                if (k != at) fresh.push_back(std::move(v_[k]));
+            reseat_(fresh);
+            return v_.begin() + (ptrdiff_t)at;
+        }
+        void clear() {
+            std::vector<SeqInfo> fresh;
+            reseat_(fresh);
+        }
+
+      private:
+        // `fresh` holds the survivors; v_ holds the moved-from originals. Poison
+        // those, then swap - `fresh` dies at the caller's return and takes the
+        // old storage with it, so every SeqInfo* into it is now a freed pointer.
+        void reseat_(std::vector<SeqInfo>& fresh) {
+            for (auto& s : v_) {
+                s.id = StaleId;
+                s.name = "<stale SeqInfo>";     // short enough to stay inline
+                s.lastImageIdx = -1;
+                s.expectedFrames = s.stackRev = 0;
+                s.refW = s.refH = s.refCh = 0;
+                s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
+                s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();
+            }
+            v_.swap(fresh);
+            rev_++;
+        }
+        std::vector<SeqInfo> v_;
+        unsigned long long rev_ = 0;
+    };
+    SeqTable seqs;
     // A batch is the unit the Files panel groups by: created per OPEN ACTION
     // (not per folder - reopening the same folder makes a NEW batch), named
     // after the folder only as a starting value, renameable, session-saved.

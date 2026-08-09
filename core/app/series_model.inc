@@ -5,7 +5,8 @@
 // a time from a measurement set was the reported bug. Ctrl+Alt+W stays as the
 // one-frame escape hatch.
 static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence helpers below)
-static App::SeqInfo* seqInfo(int id);             // fwd
+static App::SeqInfo* seqInfo(int id);             // fwd - never hold what it
+                                    // returns across an open/close (sequence.inc)
 static void stopSequenceLoader();                 // fwd
 static void pruneEmptyBatches();                  // fwd (defined with the moves)
 // The value a stack's NAME suggests, and the text it was read out of. Declared

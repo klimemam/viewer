@@ -17,6 +17,8 @@
     //   D7     membership is the FILE LIST: matched-but-not-resident frames are
     //          counted, reported and left out - never fetched
     //   D8     range + hand-picked rules; new batch on request; no series joined
+    //   D11    a SeqInfo* held across an open or a close is invalidated - here,
+    //          on this platform, not only where the allocator chose to grow
     if (!g_deriveSelftest.empty()) {
         auto loadAll = [&]() {
             double t0 = nowSec();
@@ -293,6 +295,42 @@
             check(framesOfSeq(seqB).size() == 7, "D8 picking from B left B whole");
             check(seriesOfStack(seqB) != nullptr && seriesOfStack(nid) == nullptr,
                   "D8 the derived stack joins NO series (membership is explicit)");
+        }
+        {   // ---- D11: a SeqInfo* held across a mutation ALWAYS dangles --------
+            // The rule written over seqInfo() ("never hold it across an open or
+            // a close") is only a rule if breaking it fails HERE rather than at
+            // a customer. It used to be a fact about the allocator: D7 above
+            // records the day this exact push_back killed the Windows job while
+            // libstdc++'s spare capacity kept the same pointer usable on this
+            // box, so the defect was real for three weeks and visible nowhere.
+            // App::seqs reseats on every mutation now, and these two asserts are
+            // what says so on all three CI platforms.
+            //
+            // Nothing below DEREFERENCES the stale pointer - that is undefined
+            // however the table is implemented. holds() is the defined question,
+            // and asking it is the whole test.
+            const App::SeqInfo* held = seqInfo(seqA);
+            const unsigned long long rev0 = app.seqs.rev();
+            check(held != nullptr && app.seqs.holds(held),
+                  "D11 a pointer just returned by seqInfo() is live");
+            DerivePlan Pg = buildDerivePlan(seqB, DR_RANGE, 0, 0, 1, nullptr);
+            int gid = applyDerivePlan(Pg, false);
+            fprintf(stderr, "deriveselftest: D11 open: seqs.rev %llu -> %llu, held "
+                            "pointer %s, seqInfo(seqA) %s\n",
+                    rev0, app.seqs.rev(),
+                    app.seqs.holds(held) ? "STILL LIVE" : "invalidated",
+                    seqInfo(seqA) == held ? "unchanged" : "moved");
+            check(gid != 0 && app.seqs.rev() == rev0 + 1,
+                  "D11 opening a stack is one mutation of the stack table");
+            check(!app.seqs.holds(held) && seqInfo(seqA) != held,
+                  "D11 an open invalidates a pointer held across it");
+            const App::SeqInfo* held2 = seqInfo(seqA);
+            const unsigned long long rev1 = app.seqs.rev();
+            closeStack(gid);
+            check(app.seqs.rev() > rev1 && !app.seqs.holds(held2),
+                  "D11 a close invalidates one too - not just an open");
+            check(seqInfo(gid) == nullptr && seqInfo(seqA) != nullptr,
+                  "D11 the close took the right stack and left the others");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "deriveselftest: %s\n", ok ? "ok" : "FAILED");
