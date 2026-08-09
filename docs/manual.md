@@ -181,7 +181,7 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 - **Reinterpret raw...**: RAW 由来の画像を画素フォーマットから読み直し(ダイアログ再表示、
   ビュー位置・ズームは維持)
 
-### 2.3b PNG / JPEG(TIFF は現状 未対応)
+### 2.3b PNG / JPEG / TIFF
 
 そのまま開けます。**値は保存されたまま** —— 8bit は 0..255、16bit は 0..65535 [DN] で、
 **0..1 に正規化しません**。表示レンジの初期値だけがビット深度から決まります。
@@ -190,17 +190,38 @@ RAW ダイアログが開きます。指定は**直交する2軸**:
 |---|---|---|
 | **PNG** | 1/2/4/8/16 bit、grey / grey+alpha / RGB / RGBA / palette / interlace | **16bit がそのまま 16bit で入ります** |
 | **JPEG** | baseline / progressive、8bit | codec の YCbCr→RGB を通った値である旨が note に出ます |
-| **TIFF** | **無し** | 「この build には TIFF デコーダがありません」と**名指しで断ります** |
+| **TIFF** | 8/16bit 整数と **32bit float**、grey / grey+alpha / RGB / RGBA、II・MM 両方、strip、無圧縮 / PackBits / LZW / Deflate(predictor 付きも) | **複数ページは stack になります**(下記)。読めないものは**名指しで断ります** |
 
 - チャンネル数は npy と同じ規則: **grey は 1ch、RGBA は 4ch**(モノクロが 4ch に
   水増しされることはありません)
 - **何をして、何をしなかったかは Inspector の note に出ます** ——
-  `PNG greyscale, 16-bit; values as stored, no scaling or transfer curve applied` のように。
+  `PNG greyscale, 16-bit; values as stored, no scaling or transfer curve applied` や
+  `TIFF page 2 of 3, 16-bit greyscale, LZW, Predictor 2 (horizontal differencing) undone,
+  7 strips; values as stored, ...` のように。
   4bit 以下の PNG だけはデコーダが 0..255 へ展開する(×17 等)ので、**その倍率も note に出ます**
-- PNG/JPEG は CFA を運ばないので **Bayer とは名乗りません**。モザイクとして扱いたい
-  場合は Inspector の **Interpret** か `--cfa`(=ユーザーの宣言)を使います
+- これらの形式は CFA を運ばない(TIFF の CFA ページは**断ります**)ので
+  **Bayer とは名乗りません**。モザイクとして扱いたい場合は Inspector の
+  **Interpret** か `--cfa`(=ユーザーの宣言)を使います
 - **Browse パネルの一覧には出ません**(一覧とサーバ側統計は npy 前提)。
   File > Open・drag & drop・コマンドライン・セッション復元では開きます
+
+**複数ページの TIFF は stack です。** 1ページ = 1フレームで、連番フォルダから
+できる stack とまったく同じもの(§2.4)—— 時間方向の解析も montage も効きます。
+ただし **`NewSubfileType` が「縮小版」と名乗るページ(サムネイル)はフレームに
+数えません**。落としたことは note に出ます。ページごとに大きさや深さが違う
+ファイルは stack ではないので、**一部だけ開かずに断ります**。
+
+**TIFF が断るもの**(いずれもタグと値を名指しし、`Open With a Reader...` へ誘導します):
+BigTIFF / tiled / `PlanarConfiguration 2` / CCITT・JPEG・JPEG2000・LZMA・Zstd・WebP 圧縮 /
+palette・CMYK・YCbCr など / **CFA (photometric 32803)** / 1・4・12bit や符号付き整数や
+half / `Predictor 3`。とくに **CFA は「当てて開く」より断るほうを選んでいます** ——
+パターンを取り違えると色も面別統計も静かに間違うためです。
+
+```
+scan_tiled.tif: TIFF: tiled layout (TileWidth 256, TileLength 256): this build
+  reads strip layouts (tiffread 1, core/tiffread.cpp)
+  choose a reader to read it another way
+```
 
 設計と、ライブラリの差し替え方: [input-adapters.md §3.6](input-adapters.md)
 

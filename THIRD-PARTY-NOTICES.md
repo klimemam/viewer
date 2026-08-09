@@ -32,9 +32,11 @@ ls build/_deps/*/LICENSE*                          # the texts quoted below
 `viewer-serve` is the remote peer. It reads `.npy` only, so it links neither a
 window toolkit nor an image decoder - which is also why the Ubuntu 20.04
 compatibility rebuild in `build.yml` can still compile it with one `g++` line.
+Formats added to `viewer` are deliberately not added to it.
 
-The bundled plugins (`plugins/*.c`) and the reader harness shipped beside the
-binaries (`tools/import/*.py`) are this project's own code.
+The bundled plugins (`plugins/*.c`), the TIFF reader (`core/tiffread.cpp`) and
+the reader harness shipped beside the binaries (`tools/import/*.py`) are this
+project's own code, under the repository's own Apache-2.0 licence.
 
 ## Not bundled, and why it is worth saying
 
@@ -46,6 +48,12 @@ binaries (`tools/import/*.py`) are this project's own code.
   (`meiryo.ttc`, `NotoSansCJK`, Hiragino, ...) and falls back to Dear ImGui's
   embedded ProggyClean when it finds none. **No font file is redistributed**;
   the fallback is part of Dear ImGui and is covered by the MIT text below.
+- **libtiff.** TIFF is read, and libtiff is **not** linked: `core/tiffread.cpp`
+  is this project's own reader, and the only outside code behind it is miniz,
+  which is listed above and was already linked for `.npz`. So there is nothing
+  to attribute for TIFF - not because the obligation was overlooked, but
+  because there is no third party in that path at all. The reasoning for
+  writing rather than fetching one is in `core/tiffread.h`.
 - **Python, numpy** - the reader harness runs in the user's own interpreter.
   Nothing is shipped.
 - **zenity / kdialog** - portable-file-dialogs shells out to whatever the desktop

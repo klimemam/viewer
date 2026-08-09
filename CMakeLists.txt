@@ -63,6 +63,14 @@ FetchContent_MakeAvailable(pfd)
 #   SHA256 594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
 set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 
+# TIFF has NO third-party line here, and that is the decision rather than an
+# omission: core/tiffread.cpp is this project's own reader (see its header for
+# why). libtiff cannot be vendored the way stb_image was - it is a configured,
+# multi-file library - and fetching it would take away exactly the property the
+# block above exists to protect, on the machine of the person who most needs an
+# offline clean clone. So the only outside code TIFF uses is miniz, which was
+# already fetched for .npz, and THIRD-PARTY-NOTICES.md gains nothing to record.
+
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -96,7 +104,7 @@ target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
 add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/serve.cpp core/remote.cpp core/app_icon.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
-                      core/imagefile.cpp core/stb_image_impl.c
+                      core/imagefile.cpp core/tiffread.cpp core/stb_image_impl.c
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a

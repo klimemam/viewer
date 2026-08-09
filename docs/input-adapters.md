@@ -161,9 +161,9 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 
 | 形式 | いま読んでいるもの | 状態 |
 |---|---|---|
-| PNG | stb_image 2.30 (1ヘッダ、MIT/PD、FetchContent でハッシュ固定) | 8/16bit、grey/GA/RGB/RGBA/palette |
+| PNG | stb_image 2.30 (1ヘッダ、MIT/PD、`third_party/stb/` に vendor) | 8/16bit、grey/GA/RGB/RGBA/palette |
 | JPEG | 同上 | baseline / progressive、8bit |
-| TIFF | **無し** | **未実装。名指しで断る** (下記) |
+| TIFF | **自前** (`core/tiffread.cpp`、`tiffread 1`) | classic TIFF (magic 42)、II/MM 両方、strip、8/16bit 符号なし整数と 32bit IEEE float、grey (WhiteIsZero/BlackIsZero) と RGB (±alpha)、none/PackBits/LZW/Deflate、predictor 1/2、**複数ページ = stack** |
 
 **値の扱い — 宣言する、推測しない。**
 
@@ -174,9 +174,12 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 - **16bit が主役**。この分野の PNG は 8bit より 16bit のほうが多い。ファイルの
   ビット深度がどちらの経路を通るかを決めるのであって、8bit が「普通」で 16bit が
   その変種、という作りにはしない
-- **伝達特性は当てない**。PNG も JPEG も「この数字が何か」を名乗らないので、
+- **伝達特性は当てない**。PNG も JPEG も TIFF も「この数字が何か」を名乗らないので、
   viewer は**自分が何をしなかったか**を note に書く
-  (`values as stored, no scaling or transfer curve applied`)。Inspector に出る
+  (`values as stored, no scaling or transfer curve applied`)。Inspector に出る。
+  この一文は**継ぎ目 (`imagefile::decode`) が付ける**のであって、各デコーダが
+  付けるのではない —— 規則1の約束であってライブラリの事実ではないので、
+  新しいバックエンドが書き忘れることも、少し違う言い方をすることもできない
 - **唯一スケールが変わる場所は宣言する**: 1/2/4bit PNG はデコーダが 0..255 へ
   展開する (×255/×85/×17)。note が深度と倍率を名指しする
 - **JPEG は codec の色変換を通った値**である旨を note に書く (`YCbCr->RGB`)。
@@ -185,31 +188,60 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
   「常に RGBA でくれ」と頼めば実装は短くなるが、モノクロ画像が 4ch になり
   per-channel 統計が無意味になる
 
-**断り方は §3.2 の体裁のまま** (ファイル名・理由・次にすること)。3種類ある:
+**断り方は §3.2 の体裁のまま** (ファイル名・理由・次にすること)。理由は
+`imagefile::decode` が**形式名とリーダ名**を、呼び出し側が**ファイル名**を付ける:
 
 ```
-gray8.tif: TIFF is not read by this build
-  no TIFF decoder is linked in this build - TIFF carries 16-bit and float
-  samples and sometimes a CFA pattern, and this viewer will not guess at any of them
-  PNG and JPEG are read natively
+scan_tiled.tif: TIFF: tiled layout (TileWidth 256, TileLength 256): this build
+  reads strip layouts (tiffread 1, core/tiffread.cpp)
   choose a reader to read it another way
 ```
 
-**TIFF を実装しなかった理由**: TIFF は3つの中で唯一**測定値を運ぶ**器
-(16bit/float、黒レベル、CFA パターン) で、**中途半端に読むのは読まないより悪い**。
-LZW/deflate/tiled/planar/float と分岐が多く、CFA (`PhotometricInterpretation=32803`)
-のパターンを読み違えれば**色も per-plane 統計も静かに間違う**。したがって
-**RGGB と決め打ちして開くくらいなら断る**。器としては表に載っているので、
-libtiff を入れる日に変わるのは `Backend` の1行と関数1つだけである。
+### 3.6.1 TIFF — 読むもの・断るもの (2026-08-09)
 
-**CFA の規則**: `cfa` は**読めたときだけ**立てる。PNG/JPEG は CFA を運ばないので
-常に 0。`--cfa bayer` はユーザーの宣言なので従来どおり効く (推測ではない)。
+**複数ページ = stack。** `core/imagefile.h` がそう書いていたとおり、IFD 1つが
+frame 1枚になり、`loadImageFile` が `loadNpyBuffer` と同じ形で `App::SeqInfo` を
+組み立てる。**`NewSubfileType` bit 0 (縮小版=サムネイル) のページは frame では
+ない** —— 落としたことは残る frame の note が言う。ページ間で形が違うファイルは
+**stack ではないので断る** (黙って一部だけ開かない)。
+
+**読むもの**: classic TIFF (magic 42) / II・MM / strip / 8・16bit 符号なし整数と
+32bit IEEE float / grey (photometric 0・1) と RGB (2)、alpha 付きも可 /
+compression 1 (none)・5 (LZW)・8 と 32946 (Deflate)・32773 (PackBits) /
+predictor 1・2 / 1ページでも複数ページでも。
+
+**断るもの (すべて名指しで、タグと値を言う)**: BigTIFF (magic 43) / tiled
+(`TileWidth`) / `PlanarConfiguration 2` / CCITT・JPEG・JPEG2000・LZMA・Zstd・WebP
+などの compression / palette (photometric 3)・CMYK (5)・YCbCr (6) など /
+**CFA (photometric 32803) と linear raw (34892)** / 1・4・12bit や符号付き整数や
+half などの `BitsPerSample`×`SampleFormat` の組 / `Predictor 3` (float 用) /
+サンプルごとに幅や形式が違うファイル / ページ数 4096 超・総サンプル数 2^30 超。
+
+**なぜ「読めるだけ読む」ではないか**: TIFF は3形式で唯一**測定値を運ぶ**器
+(16bit/float、黒レベル、CFA パターン) で、**中途半端に読むのは読まないより悪い**。
+とくに CFA (`PhotometricInterpretation=32803`) のパターンを読み違えれば
+**色も per-plane 統計も静かに間違う**。したがって **RGGB と決め打ちして開くくらい
+なら断る** —— これは規則3そのもので、リーダが書かれた後も変わっていない。
+
+**なぜ自前で、libtiff ではないか**: libtiff は vendor できない (configure 前提の
+多ファイル構成) し、FetchContent は `third_party/stb/` を作ったときの決定
+—— *オフラインの clean clone がビルドできること* —— をそのまま壊す
+([CMakeLists.txt](../CMakeLists.txt) の stb ブロック)。そして上の「断るもの」を
+全部除いた後に残る仕事は小さい: IFD の鎖を歩き、strip を展開し、差分を戻し、
+float に広げる。**断り文そのものが成果物**なので、エラーコードを返す
+ライブラリより自分で書くほうが向いている。外部コードは **miniz のみ**
+(Deflate、`.npz` で既にリンク済み) で、THIRD-PARTY-NOTICES に足す行は無い。
+
+**CFA の規則**: `cfa` は**読めたときだけ**立てる。PNG/JPEG は CFA を運ばず、
+TIFF は CFA ページを**断る**ので、この3形式はいずれも常に 0。`--cfa bayer` は
+ユーザーの宣言なので従来どおり効く (推測ではない)。
 
 **既知の境界**: Browse パネル (`local://` peer 経由) の一覧は `isNpyName` で
 絞られており、peer (`core/serve.cpp`) は npy しか読まない。したがって
-**PNG/JPEG は Browse の一覧には出ない** — File > Open・drag & drop・
+**PNG/JPEG/TIFF は Browse の一覧には出ない** — File > Open・drag & drop・
 コマンドライン引数・セッション復元では開く。peer に配らせるのは別件
-(docs/media-support.md の (b) と同じ形になる)。
+(docs/media-support.md の (b) と同じ形になる)。**peer は形式を増やさない**
+のが EXR のときの前例で、TIFF もそれに従う (`viewer-serve` は npy のみ)。
 
 ---
 

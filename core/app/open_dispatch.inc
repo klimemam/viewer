@@ -1294,10 +1294,12 @@ static void openPath(const std::string& path) {
         else toast("session restored: " + baseName(path));
     } else if (imagefile::forPath(path)) {
         // PNG / JPEG / TIFF. The extension only chooses this door; what decodes
-        // is decided by the bytes behind it. A format that is listed but has no
-        // decoder in this build (TIFF) refuses HERE, by name and with a reason,
-        // instead of falling through to the raw dialog and asking a user who
-        // opened a .tif to type in its width.
+        // is decided by the bytes behind it. A file this build will not read -
+        // a format with no decoder, or a TIFF whose compression or layout this
+        // reader refuses - refuses HERE, by name and with a reason, instead of
+        // falling through to the raw dialog and asking a user who opened a .tif
+        // to type in its width. A multi-page TIFF becomes a stack in
+        // loadImageFile, so this door opens one file and may gain N documents.
         std::string err = loadImageFile(path);
         if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
         else toast("loaded " + baseName(path));

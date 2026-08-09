@@ -2135,42 +2135,86 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
     return {};
 }
 
-// A PICTURE FILE: PNG, JPEG - and TIFF, which refuses by name in this build.
-// The decoding is behind core/imagefile.h so that the library can be replaced
-// without this file learning its name; what comes back is the same Image the
-// .npy door produces, so everything downstream is unchanged.
+// A PICTURE FILE: PNG, JPEG, TIFF. The decoding is behind core/imagefile.h so
+// that the library can be replaced without this file learning its name; what
+// comes back is the same Image the .npy door produces, so everything downstream
+// is unchanged.
 //
 // It sits HERE, next to loadNpy, deliberately. The alternative - a second
 // "open a picture" path with its own document creation, its own note and its
 // own error wording - is how two doors to the same room drift apart, which
 // this file has already paid for once (loadNpy and the .npz member loop said
 // different things about a partial stack until they were made one function).
+//
+// ONE FILE IS NOT ALWAYS ONE PICTURE. A multi-page TIFF is a stack, and that is
+// this side's word for it (App::SeqInfo), not the decoder's: imagefile::decode
+// hands back several Images and the stack is built HERE, the same way
+// loadNpyBuffer builds one out of a frame axis. Deliberately the same shape as
+// that loop rather than a second one - the seq is registered before the frames
+// are added, every frame carries the head's range so they stay comparable, and
+// each frame records which page of the FILE it came from (§6.2's identity).
 static std::string loadImageFile(const std::string& path) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read file";
-    imagefile::Image img;
+    std::vector<imagefile::Image> imgs;
     std::string err;
-    if (!imagefile::decode(path, buf, img, err)) return err;
+    if (!imagefile::decode(path, buf, imgs, err)) return err;
 
-    auto im = std::make_unique<ImageDoc>();
-    im->name = baseName(path);
-    FrameSource& S = *im->src;
-    S.path = path;
-    S.w = img.w; S.h = img.h; S.ch = img.ch;
-    S.dtype = img.dtype;
-    S.data = std::move(img.data);
-    // npyShape stays empty on purpose: these formats declare their own axes, so
-    // there is no second reading of them to offer (§3.3's menu is computed from
-    // that shape, and an empty one means "no other reading exists").
-    im->note = img.note;
-    // Only what the decoder READ. No format here can be relied on to declare a
-    // CFA pattern, so none of them claims one - and --cfa still applies in
-    // addImage, because that is the user declaring it rather than us guessing.
-    im->cfa = img.cfa;
-    im->cfaPattern = img.cfaPattern & 3;
-    im->syncMirrors();
-    statSourceFile(S);              // the file on disk IS these pixels: Watch baseline
-    addImage(std::move(im));
+    const std::string label = baseName(path);
+    auto build = [&](imagefile::Image& img, int page) {
+        auto im = std::make_unique<ImageDoc>();
+        im->name = label;
+        FrameSource& S = *im->src;
+        S.path = path;
+        S.fileFrame = page;         // which page of the FILE: identity and provenance
+        S.w = img.w; S.h = img.h; S.ch = img.ch;
+        S.dtype = img.dtype;
+        S.data = std::move(img.data);
+        // npyShape stays empty on purpose: these formats declare their own axes, so
+        // there is no second reading of them to offer (§3.3's menu is computed from
+        // that shape, and an empty one means "no other reading exists").
+        im->note = img.note;
+        // Only what the decoder READ. No format here can be relied on to declare a
+        // CFA pattern, so none of them claims one - and --cfa still applies in
+        // addImage, because that is the user declaring it rather than us guessing.
+        im->cfa = img.cfa;
+        im->cfaPattern = img.cfaPattern & 3;
+        im->syncMirrors();
+        statSourceFile(S);          // the file on disk IS these pixels: Watch baseline
+        return im;
+    };
+
+    if (imgs.size() == 1) {
+        addImage(build(imgs[0], 0));
+        return {};
+    }
+
+    App::SeqInfo info;
+    info.id = app.nextSeqId++;
+    info.name = label + "  (" + std::to_string(imgs.size()) + " frames)";
+    app.seqs.push_back(info);
+    auto head = build(imgs[0], 0);
+    head->seqId = info.id;
+    head->seqIndex = 0;
+    const int firstIdx = (int)app.images.size();
+    addImage(std::move(head));
+    const ImageDoc* ref = app.images[firstIdx].get();
+    for (size_t f = 1; f < imgs.size(); f++) {
+        auto doc = build(imgs[f], (int)f);
+        doc->seqId = info.id;
+        doc->seqIndex = (int)f;
+        computeMinMax(*doc);
+        doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
+        doc->batchId = ref->batchId;                        // a stack is in ONE batch
+        doc->texDirty = true;
+        doc->uid = app.nextUid++;
+        app.imagesRev++;
+        app.images.push_back(std::move(doc));
+    }
+    for (auto& s : app.seqs)
+        if (s.id == info.id) s.lastImageIdx = firstIdx;
+    fprintf(stderr, "picture stack: %s - %zu frames (%dx%d %dch)\n", label.c_str(),
+            imgs.size(), ref->w, ref->h, ref->ch);
     return {};
 }
 

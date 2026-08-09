@@ -56,8 +56,8 @@ enum { MAX_DIM = 32768 };
 // One decoded picture: exactly the fields a FrameSource needs, and no others.
 // There is deliberately no frame axis here - PNG and JPEG hold one picture, and
 // a multi-page TIFF is a stack, which is the caller's word (App::SeqInfo) and
-// not a decoder's. When a backend that can do that arrives, it returns several
-// of these and the caller builds the stack the same way loadNpyBuffer does.
+// not a decoder's. That backend has arrived: it returns several of these and
+// the caller builds the stack the same way loadNpyBuffer does.
 struct Image {
     int w = 0, h = 0, ch = 1;      // ch: 1 grey, 2 grey+alpha, 3 RGB, 4 RGBA
     std::string dtype;             // "u8" / "u16": what the FILE stored, not what we hold
@@ -71,15 +71,21 @@ struct Image {
 //
 // `decode == nullptr` is a first-class state, not a hole: the format is known,
 // it is listed, it is dispatched to, and it refuses with `absent` - a sentence
-// naming what is missing and why. That is how TIFF ships today. The alternative
-// (leave TIFF out of the table) turns a .tif into "unknown file, try the raw
-// dialog", which tells the user nothing about the actual situation.
+// naming what is missing and why. That is how TIFF shipped until a reader was
+// written for it, and it is what any future format costs to LIST rather than
+// omit. The alternative (leave the format out of the table) turns its files
+// into "unknown file, try the raw dialog", which tells the user nothing about
+// the actual situation.
+//
+// `decode` fills a VECTOR because one file is not always one picture: a
+// multi-page TIFF holds a frame per page. Formats that hold exactly one push
+// exactly one, and the caller cannot tell the difference until it counts.
 struct Backend {
     const char* format;            // "PNG"
     const char* exts;              // ".png" - space separated, lower case, dot included
     const char* library;           // what is linked for it, version included; "" when absent
     bool (*sniff)(const uint8_t* p, size_t n);                 // magic bytes, never the name
-    bool (*decode)(const uint8_t* p, size_t n, Image& out, std::string& err);
+    bool (*decode)(const uint8_t* p, size_t n, std::vector<Image>& out, std::string& err);
     const char* absent;            // why there is no decoder; nullptr when there is one
 };
 
@@ -98,15 +104,19 @@ const Backend* forBytes(const uint8_t* p, size_t n);
 
 // Decode, or explain. `path` is used for the extension and for nothing else.
 //
+// One or more pictures, in file order. More than one means the file held more
+// than one, and what to do with that is the caller's decision and vocabulary:
+// several pictures out of one file are the frames of a stack.
+//
 // The error is the reason ALONE, in the register of docs/input-adapters.md
 // §3.2 - the caller prefixes the file name, exactly as the .npy door does, so
 // that one file's refusal is worded identically wherever it is raised:
 //
 //   holiday.png: not a PNG, JPEG or TIFF file (it starts 00 00 00 0c)
-//     PNG and JPEG are read natively; TIFF is not in this build
+//     PNG, JPEG and TIFF are read natively
 //     choose a reader to read it another way
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,
-            Image& out, std::string& err);
+            std::vector<Image>& out, std::string& err);
 
 // "PNG, JPEG" - the formats with a decoder behind them, for messages and for
 // the file dialog. Computed from the table, so it cannot go stale.

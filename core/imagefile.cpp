@@ -3,14 +3,17 @@
 // This is the ONLY translation unit that knows a decoder library exists. The
 // implementation of stb_image itself is in core/stb_image_impl.c, compiled with
 // warnings off the way miniz.c is - third-party code is not policed here, and
-// keeping it in its own file means this file IS held to -Wall -Wextra.
+// keeping it in its own file means this file IS held to -Wall -Wextra. The TIFF
+// reader in core/tiffread.cpp is OURS, so it is held to it too.
 //
 // To put a different library behind a format:
-//   1. write `static bool xxxDecode(const uint8_t*, size_t, Image&, std::string&)`;
+//   1. write `bool xxxDecode(const uint8_t*, size_t, std::vector<Image>&, std::string&)`;
 //   2. point that format's row in backends() at it;
 //   3. add the library to CMakeLists.txt and to THIRD-PARTY-NOTICES.
 // Nothing else in the program changes, because nothing else in the program has
-// ever seen the library's name outside the `library` field of that row.
+// ever seen the library's name outside the `library` field of that row. Step 3
+// is what TIFF skips, and only because its reader is this repository's own
+// code: there is no third party in it to notice.
 #include "imagefile.h"
 
 #include <cstdio>
@@ -18,6 +21,7 @@
 
 #define STBI_NO_STDIO          // the caller has already read the bytes
 #include "stb_image.h"
+#include "tiffread.h"
 
 namespace imagefile {
 
@@ -68,7 +72,13 @@ static const char* pngColourName(int colour) {
     return "an unknown colour type";
 }
 
-static bool stbDecode(const uint8_t* p, size_t n, Image& out, std::string& err) {
+static bool stbDecode(const uint8_t* p, size_t n, std::vector<Image>& images,
+                      std::string& err) {
+    // Exactly one picture: neither of these formats holds a second. The vector
+    // is the seam's shape, not a claim that stb might fill it twice.
+    images.clear();
+    images.emplace_back();
+    Image& out = images.back();
     int w = 0, h = 0, comp = 0;
     // This library takes the buffer length as an int. Truncating silently would
     // hand it a length that is not the file's, so the size is a refusal - one
@@ -138,12 +148,7 @@ static bool stbDecode(const uint8_t* p, size_t n, Image& out, std::string& err) 
         if (out.ch >= 3) note += ", RGB after the codec's YCbCr->RGB transform";
         else note += ", greyscale";
     }
-    // The sentence every one of these files needs and none of them carries. A
-    // PNG or a JPEG does not declare a transfer characteristic, an exposure or
-    // a black level: the numbers are whatever the writer put there. Saying what
-    // was NOT done is the only honest thing available - and it is what stops
-    // "0..255 of something" from silently becoming "0..1 of radiance".
-    out.note = note + "; values as stored, no scaling or transfer curve applied";
+    out.note = note;
     return true;
 }
 
@@ -152,20 +157,16 @@ const std::vector<Backend>& backends() {
     static const std::vector<Backend> B = {
         { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr },
         { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr },
-        // TIFF is listed WITHOUT a decoder, on purpose.
-        //
-        // It is the only one of the three that carries measurements: 16-bit and
-        // float samples, a black level, and sometimes a CFA pattern. Reading it
-        // approximately is worse than not reading it - a half-written TIFF
-        // reader that assumed RGGB where the file said GBRG would produce
-        // plausible pictures and wrong per-plane statistics, and nothing on
-        // screen would say so. So this build refuses by name, and the row stays
-        // here so that the day libtiff (or anything else) is linked, it is this
-        // one line and one function that change.
-        { "TIFF", ".tif .tiff", "", sniffTiff, nullptr,
-          "no TIFF decoder is linked in this build - TIFF carries 16-bit and float "
-          "samples and sometimes a CFA pattern, and this viewer will not guess at "
-          "any of them" },
+        // TIFF shipped for a while as a row with NO decoder, refusing by name.
+        // What that row said is still the standard the reader behind it is held
+        // to: TIFF is the only one of the three that carries measurements
+        // (16-bit and float samples, a black level, sometimes a CFA pattern),
+        // and reading it approximately is worse than not reading it. A reader
+        // that assumed RGGB where the file said GBRG would produce plausible
+        // pictures and wrong per-plane statistics with nothing on screen to say
+        // so - so core/tiffread.cpp REFUSES a CFA TIFF, by name, rather than
+        // open one. Everything else it will not read is refused the same way.
+        { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr },
     };
     return B;
 }
@@ -261,7 +262,7 @@ static std::string whatIsRead() {
 }
 
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,
-            Image& out, std::string& err) {
+            std::vector<Image>& out, std::string& err) {
     const uint8_t* p = bytes.data();
     const size_t n = bytes.size();
     const Backend* byName = forPath(path);
@@ -281,34 +282,49 @@ bool decode(const std::string& path, const std::vector<uint8_t>& bytes,
               whatIsRead() + CHOOSE_A_READER;
         return false;
     }
-    Image img;
+    std::vector<Image> got;
     std::string why;
-    if (!b->decode(p, n, img, why)) {
+    if (!b->decode(p, n, got, why) || got.empty()) {
+        if (why.empty()) why = "nothing came back from the decoder";
         err = std::string(b->format) + ": " + why + " (" + b->library + ")" + CHOOSE_A_READER;
         return false;
     }
-    // The same ceilings the .npy door applies, in the same words, because they
-    // are the viewer's limits and not the format's (core/main.cpp npyLayout).
-    if (img.w < 1 || img.h < 1) {
-        err = std::string(b->format) + ": no pixels in it" + CHOOSE_A_READER;
-        return false;
+    for (Image& img : got) {
+        // The same ceilings the .npy door applies, in the same words, because they
+        // are the viewer's limits and not the format's (core/main.cpp npyLayout).
+        if (img.w < 1 || img.h < 1) {
+            err = std::string(b->format) + ": no pixels in it" + CHOOSE_A_READER;
+            return false;
+        }
+        if (img.w > MAX_DIM || img.h > MAX_DIM) {
+            err = "unsupported image size";
+            return false;
+        }
+        if (img.ch < 1 || img.ch > 4) {
+            err = std::string(b->format) + " would be " + std::to_string(img.ch) +
+                  " channels: this viewer shows up to 4";
+            return false;
+        }
+        // The sentence every one of these files needs and none of them carries.
+        // A PNG, a JPEG or a TIFF does not declare a transfer characteristic,
+        // an exposure or a black level: the numbers are whatever the writer put
+        // there. Saying what was NOT done is the only honest thing available -
+        // and it is what stops "0..255 of something" from silently becoming
+        // "0..1 of radiance".
+        //
+        // It is appended HERE and not by each backend, because it is a promise
+        // the SEAM makes (rule 1) and not a fact about a library. A new backend
+        // therefore cannot forget it, and cannot word it slightly differently.
+        if (!img.note.empty()) img.note += "; ";
+        img.note += "values as stored, no scaling or transfer curve applied";
+        // A name that promised something else. Not an error - the bytes decoded -
+        // but a fact about this file that belongs on screen, because the next
+        // person to open it will believe the extension too.
+        if (byName && byName != b)
+            img.note = std::string("the name says ") + byName->format + " but the bytes are " +
+                       b->format + "; read as " + b->format + ". " + img.note;
     }
-    if (img.w > MAX_DIM || img.h > MAX_DIM) {
-        err = "unsupported image size";
-        return false;
-    }
-    if (img.ch < 1 || img.ch > 4) {
-        err = std::string(b->format) + " would be " + std::to_string(img.ch) +
-              " channels: this viewer shows up to 4";
-        return false;
-    }
-    // A name that promised something else. Not an error - the bytes decoded -
-    // but a fact about this file that belongs on screen, because the next
-    // person to open it will believe the extension too.
-    if (byName && byName != b)
-        img.note = std::string("the name says ") + byName->format + " but the bytes are " +
-                   b->format + "; read as " + b->format + ". " + img.note;
-    out = std::move(img);
+    out = std::move(got);
     return true;
 }
 
