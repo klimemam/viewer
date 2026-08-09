@@ -622,7 +622,7 @@ Series Analysis パネル PR #102)。推定量はその下流に乗るだけな�
   **ROIs / Temporal の名前の分離** (`std (mean_t)` vs 申告つき `sigma_fpn`) を
   実装した。**文書が現物より先回りしない**という規約どおり、記述の更新は
   バイナリが変わるのと同じコミット群で行った。
-- **判断4 の実装 (直接 DSNU / PRNU)** — **着地済み: PR #129
+- **判断4 の実装 (直接 DSNU / PRNU)** — **着地済み: PR #130
   (`direct-dsnu-prnu`)。** SetAnalyzer 2行 (`core/app/setanalysis.inc`) が
   束縛済み set の上で本節の式を計算し、結果は set 名と役割の n/N を名乗る
   (`DSNU [DN] - set "<名前>": dark 5/5`)。住処は新設の **Set Analysis パネル**
