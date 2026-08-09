@@ -34,18 +34,37 @@
         std::vector<int> fr = framesOfSeq(sid);
         int stackFrames = (int)fr.size();
         selectImage(fr[fr.size() / 2]);    // a MIDDLE frame: the reported bug
+        // Every temporal cache, not just the A slot. TemporalState is keyed on
+        // the STACK, so closing the stack is what has to empty it - and there
+        // are 2 + N of them: A, the compare B side, and one per lettered slot
+        // (docs/reference-design.md §3.2 hole 2). A close that emptied only
+        // slot 0 would leave a dead stack's sigma_t sitting under a letter,
+        // ready to be read the next time the panel drew a comparison. Latched
+        // here, deliberately, so "gone afterwards" is a fact about the close
+        // and not about a cache that was empty all along.
+        recomputeTemporalIfNeeded(app.images[fr[fr.size() / 2]].get(), app.temporal[0]);
+        app.temporal[1] = app.temporal[0];
+        app.temporalExtra.assign(2, app.temporal[0]);
+        bool latched = app.temporal[0].seqId == sid && app.temporal[1].seqId == sid &&
+                       app.temporalExtra[0].seqId == sid && app.temporalExtra[1].seqId == sid;
         closeCurrent();                    // Ctrl+W's path: must close the stack
         bool linResidue = false;
         for (const auto& r : app.lin.rows) if (r.seqId == sid) linResidue = true;
+        int tempResidue = 0;
+        if (app.temporal[0].seqId != -1) tempResidue++;
+        if (app.temporal[1].seqId != -1) tempResidue++;
+        for (const auto& T : app.temporalExtra) if (T.seqId != -1) tempResidue++;
         fprintf(stderr, "closeselftest: closeCurrent on mid frame of stack %d: "
                         "images %d->%d, seqs %d->%d, frames(seq)=%d, "
-                        "temporal.seqId=%d, lin rows for seq: %s\n",
+                        "temporal.seqId=%d, latched %d slot(s) before the close, "
+                        "%d still naming a stack, lin rows for seq: %s\n",
                 sid, imagesBefore, (int)app.images.size(), seqsBefore,
                 (int)app.seqs.size(), (int)framesOfSeq(sid).size(),
-                app.temporal[0].seqId, linResidue ? "RESIDUE" : "none");
+                app.temporal[0].seqId, latched ? 4 : 0, tempResidue,
+                linResidue ? "RESIDUE" : "none");
         if ((int)app.images.size() != imagesBefore - stackFrames ||
             (int)app.seqs.size() != seqsBefore - 1 || !framesOfSeq(sid).empty() ||
-            app.temporal[0].seqId != -1 || linResidue) {
+            !latched || tempResidue != 0 || linResidue) {
             fprintf(stderr, "closeselftest: FAILED - stack close left residue\n");
             ok = false;
         }
