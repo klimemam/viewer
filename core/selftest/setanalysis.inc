@@ -611,10 +611,14 @@
             }
             // (f) PRNU across two shapes
             {
-                int small = makeStack("small", 16, 16, NF,
-                                      [&](int x, int y, int f) {
-                                          (void)y; return L + x + (f % 2 ? 1.0 : -1.0); });
-                int sid = makeSet("R-shape", { { "image", good }, { "dark", small } });
+                // NOT `small`: <rpcndr.h>, which arrives with windows.h, is
+                // `#define small char`, so MSVC read the declaration as "int
+                // char" and this file stopped compiling on one of the three
+                // platforms. The stack's NAME can still say it.
+                int tiny = makeStack("small", 16, 16, NF,
+                                     [&](int x, int y, int f) {
+                                         (void)y; return L + x + (f % 2 ? 1.0 : -1.0); });
+                int sid = makeSet("R-shape", { { "image", good }, { "dark", tiny } });
                 SetResult R = runSetAnalyzer(setById(sid), SA_PRNU);
                 fprintf(stderr, "setanalysisselftest: S6f \"%s\"\n", R.refusal.c_str());
                 check(!R.ok && R.refusal ==
