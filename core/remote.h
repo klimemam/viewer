@@ -62,7 +62,15 @@ struct MeasureSeries {
 };
 struct MeasureResult {
     int serverLoc = 0;            // 0 = CPU, 1 = CUDA (provenance)
-    int framesUsed = 0;
+    int framesUsed = 0;           // n
+    // MOP_PLUGIN_ANALYZE only (docs/abi-v3.md §10/§11): WHO computed this, read
+    // off the PEER's ledger. Empty for every other op - a builtin aggregate
+    // wears no plugin tag, here for the same reason it wears none locally.
+    // These are the peer's strings and are never filled in from a local dll of
+    // the same name: a citation names the computer, and this machine did not
+    // compute it.
+    std::string provName, provVersion, provFile, provPath;
+    int expected = 0;             // N; framesUsed < expected = a partial stack
     std::vector<std::vector<MeasureItem>> cols;
     std::vector<MeasureSeries> series;
 };
@@ -73,6 +81,13 @@ struct MeasureReq {
     float black = 0, white = 1;
     std::vector<std::string> paths;   // >1 = one file per frame, in order
     std::string analyzer, params;     // empty for aggregate ops
+    // MOP_PLUGIN_ANALYZE only: what OUR descriptor declares, verbatim from the
+    // ledger, and "" when it declares nothing (a V1/V2 descriptor). Never a
+    // guess and never the dll's file-version resource - the peer refuses an
+    // undeclared version, and a fabricated one would turn that refusal into a
+    // false pass.
+    std::string analyzerVersion;
+    int target = 0;                   // rp::MeasureTarget: frame or stack
     struct Roi { int x = 0, y = 0, w = 0, h = 0; };
     std::vector<Roi> rois;            // empty = whole frame
 };

@@ -49,7 +49,23 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // measured here and there would differ by sigma_t^2/N with nothing saying why.
 // Wire format is unchanged (MEASURE carries named items), so this number exists
 // solely to make an installed peer update itself on connect.
-static const uint32_t VERSION = 6;
+//
+// 7: MOP_PLUGIN_ANALYZE - plugin analysis run on the peer under name+version
+// PARITY, with the peer's own ledger returned as provenance (docs/abi-v3.md
+// §10, #104 judgment 8). This is FRAMING, like 2 (adds MEASURE) and 3 (adds
+// GLOB/SCAN) and unlike 4/5/6: no answer a v6 peer already gives changes
+// meaning, and MOP_ANALYZER keeps computing exactly what it computed.
+//
+// It is numbered anyway, and for the reason those framing bumps were. A v6
+// peer answers the new op with "unknown measure op" - a refusal, correct, and
+// indistinguishable from the parity refusal this op exists to produce. §10's
+// whole content is that a refusal must say WHICH mismatch it is and never turn
+// into a silent local run, so "the peer is too old" has to be a sentence the
+// client can write BEFORE it sends, from a number, rather than a sentence it
+// guesses afterwards from an error string. That number is this one - and it is
+// also what makes an installed viewer-serve update itself on connect, which is
+// the reason a lab that copied the peer once ever sees the op at all.
+static const uint32_t VERSION = 7;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -85,12 +101,39 @@ enum MeasureOp : uint32_t {
     MOP_ANALYZER        = 0,   // run a named plugin analyzer on ONE frame
     MOP_TEMPORAL_STATS  = 1,   // per-pixel mean/var over N frames (noise vs FPN)
     MOP_FRAME_ROI_STATS = 2,   // per-frame per-ROI mean/var (PTC / linearity)
+    // docs/abi-v3.md §10. MOP_ANALYZER matches an analyzer by NAME, which is
+    // all there was to match on before #46 gave a descriptor a version: two
+    // machines with the same folder of dlls and different builds inside them
+    // answered the same question differently and nothing anywhere said so.
+    // This op carries the version too, refuses the pair when they differ
+    // (quoting both, never re-routing to a local run), reaches STACK analyzers
+    // as well as frame ones, and returns the peer's ledger row so the result
+    // can name the dll that actually computed it.
+    MOP_PLUGIN_ANALYZE  = 3,
+};
+
+// Which mouth of the plugin the request is aimed at (MOP_PLUGIN_ANALYZE only).
+// Not a flag on the name: a frame analyzer and a stack analyzer are separate
+// registrations with separate signatures on both sides (plugin_host.h), and
+// the list to look in is decided by what the caller ASKED for rather than by
+// finding a name in one list and hoping it meant that one.
+enum MeasureTarget : uint32_t {
+    MT_FRAME = 0,   // psAnalyzerV3::analyze on one frame
+    MT_STACK = 1,   // psStackAnalyzerV3::analyze_stack over the frame range
 };
 
 // Fixed head of the request; the variable part follows as
 //   [str path * nPaths][str analyzer][str paramsJson][{u32 x,y,w,h} * nRois]
 // nPaths > 1 means one file per frame, in sequence order. analyzer/params are
 // empty for the aggregate ops. nRois == 0 means whole frame.
+//
+// MOP_PLUGIN_ANALYZE appends, AFTER the rois:
+//   [str clientVersion]  what the CLIENT's descriptor declares; "" = a V1/V2
+//                        descriptor, which declares nothing (never a guess)
+//   [u32 target]         MeasureTarget
+// After, not before, so that not one byte moves for the three ops that came
+// first: an op a v6 peer knows is parsed by a v6 peer identically, and the op
+// it does not know it refuses on the op number before it reads this far.
 struct MeasureReqHead {
     uint32_t op;                 // MeasureOp
     uint32_t frame0, frameCount; // range in a frame-axis file; frameCount 0 = all
@@ -108,6 +151,16 @@ struct MeasureReqHead {
 //       per item: [u32 kind] [str key] (kind 0 ? [f64 value] : [str value])
 //   [u32 nSeries] per series: [str name][str xLabel][str yLabel]
 //       [u32 col][u32 hasX][u32 n] (hasX ? [f32*n xs]) [f32*n ys]
+//
+// MOP_PLUGIN_ANALYZE appends a provenance trailer, and it is the point of the
+// op as much as the numbers are (docs/abi-v3.md §10/§11): a remote measurement
+// used to arrive with no answer at all to "which plugin, which build, which
+// file" - the one thing #46 stage 1 gave every LOCAL result.
+//   [str name][str version][str file][str path]   the PEER's ledger row
+//   [u32 expected]                                N; framesUsed is n
+// The path is the peer's absolute path and is quoted as such - the client
+// writes NOTHING about its own dll of the same name here, because it did not
+// compute this and a citation names the computer.
 
 // shared sample-to-float conversion (defined in serve.cpp, linked everywhere)
 void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out);

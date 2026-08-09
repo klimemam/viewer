@@ -651,6 +651,18 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
 
 bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err) {
     if (peerVersion_ < 2) { err = "the remote peer is too old for MEASURE (update viewer-serve)"; return false; }
+    // Refused HERE, from the number, and never by sending and reading back
+    // "unknown measure op". §10's whole content is that a refusal must say
+    // which mismatch it is: an old peer and a parity mismatch are different
+    // problems with different fixes, and the one thing neither may become is a
+    // quiet local run.
+    if (q.op == rp::MOP_PLUGIN_ANALYZE && peerVersion_ < 7) {
+        err = "the remote peer is too old for plugin analysis: it speaks protocol " +
+              std::to_string(peerVersion_) + ", MOP_PLUGIN_ANALYZE needs 7 "
+              "(update viewer-serve). Nothing was measured - a plugin result is not "
+              "computed here and labelled as the peer's.";
+        return false;
+    }
     W w;
     rp::MeasureReqHead head{};
     head.op = (uint32_t)q.op;
@@ -668,6 +680,12 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     for (const auto& r : q.rois) {
         w.u32((uint32_t)std::max(0, r.x)); w.u32((uint32_t)std::max(0, r.y));
         w.u32((uint32_t)std::max(0, r.w)); w.u32((uint32_t)std::max(0, r.h));
+    }
+    // the parity block, last, so that the three older ops send the same bytes
+    // they always sent (remote_proto.h)
+    if (q.op == rp::MOP_PLUGIN_ANALYZE) {
+        w.str(q.analyzerVersion);
+        w.u32((uint32_t)q.target);
     }
     std::vector<uint8_t> reply;
     uint32_t type = 0;
@@ -705,6 +723,18 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
         s.col = (int)col;
         if (hasX && !r.f32v(s.xs, n)) { err = "bad MEASURE reply"; return false; }
         if (!r.f32v(s.ys, n)) { err = "bad MEASURE reply"; return false; }
+    }
+    if (q.op == rp::MOP_PLUGIN_ANALYZE) {
+        uint32_t expected = 0;
+        if (!r.str(out.provName) || !r.str(out.provVersion) || !r.str(out.provFile) ||
+            !r.str(out.provPath) || !r.u32(expected)) {
+            // A result with no provenance is refused rather than shown: the op
+            // exists to make "which build measured this" answerable, so a reply
+            // that cannot answer it has failed at the thing it was for.
+            err = "the peer answered a plugin analysis without provenance";
+            return false;
+        }
+        out.expected = (int)expected;
     }
     return true;
 }

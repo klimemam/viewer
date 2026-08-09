@@ -979,12 +979,36 @@ void mSer(void* c, const char* name, const char* xl, const char* yl,
 
 // Plugins load on the FIRST measure, not at startup: a session that only lists
 // and ships tiles should not pay for (or depend on) the plugin directory.
+//
+// VIEWER_SERVE_PLUGINS: extra directories, PATH-separated, searched as well as
+// the two beside the binary. A compute node is not a workstation - the peer is
+// often a single file copied into ~/bin while the plugins the lab actually runs
+// live on a shared mount - and until ABI v3 §10 that was invisible, because
+// MOP_ANALYZER's only failure was "analyzer not found" and nobody could tell
+// "wrong directory" from "wrong machine". It is also how a fixture directory is
+// reached without shipping fixtures, the same affordance VIEWER_SERVE_LAG_MS is.
 bool g_pluginsLoaded = false;
 void ensurePlugins() {
     if (g_pluginsLoaded) return;
     g_pluginsLoaded = true;
-    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins",
-                           plugin_host::exeDir() + "/../plugins" },
+    std::vector<std::string> dirs{ plugin_host::exeDir() + "/plugins",
+                                   plugin_host::exeDir() + "/../plugins" };
+    if (const char* extra = getenv("VIEWER_SERVE_PLUGINS")) {
+#ifdef _WIN32
+        const char sep = ';';         // ':' is a drive letter here, never a separator
+#else
+        const char sep = ':';
+#endif
+        std::string s = extra;
+        size_t i = 0;
+        while (i <= s.size()) {
+            size_t j = s.find(sep, i);
+            if (j == std::string::npos) j = s.size();
+            if (j > i) dirs.push_back(s.substr(i, j - i));
+            i = j + 1;
+        }
+    }
+    plugin_host::loadAll(dirs,
                          [](const std::string& m, bool) { fprintf(stderr, "%s\n", m.c_str()); });
 }
 }  // namespace
@@ -1076,9 +1100,18 @@ bool clampRoi(const NpyFile& n, const std::vector<RoiRect>& rois, uint32_t c,
 }
 }  // namespace
 
+// Who computed it, from the peer's OWN ledger (docs/abi-v3.md §10/§11). Empty
+// name = not a plugin op, and then not one byte of trailer is written: the
+// three ops that came before this one send the reply they always sent.
+struct MeasureProv {
+    std::string name, version, file, path;
+    uint32_t expected = 0;              // N; framesUsed is n
+};
+
 static void sendMeasureReply(uint32_t framesUsed,
                              const std::vector<std::vector<MItem>>& cols,
-                             const std::vector<MSeries>& series) {
+                             const std::vector<MSeries>& series,
+                             const MeasureProv* prov = nullptr) {
     Buf out;
     out.putU32(0);                              // serverLoc: CPU (CUDA slots in here)
     out.putU32(framesUsed);
@@ -1100,6 +1133,13 @@ static void sendMeasureReply(uint32_t framesUsed,
         out.putU32((uint32_t)s.ys.size());
         if (s.hasX) out.putBlob(s.xs.data(), s.xs.size() * 4);
         out.putBlob(s.ys.data(), s.ys.size() * 4);
+    }
+    if (prov) {
+        out.putStr(prov->name);
+        out.putStr(prov->version);
+        out.putStr(prov->file);
+        out.putStr(prov->path);
+        out.putU32(prov->expected);
     }
     sendMsg(MSG_OK, out);
 }
@@ -1319,6 +1359,362 @@ static void runFrameRoiStats(const MeasureReqHead& head,
     sendMeasureReply(src.count, cols, series);
 }
 
+// ---- plugin analysis on the peer (docs/abi-v3.md §10) ---------------------
+//
+// One frame, materialized as f32 exactly as the local host would, handed to
+// whichever descriptor generation registered the analyzer. Shared by
+// MOP_ANALYZER (name only, unchanged since it shipped) and MOP_PLUGIN_ANALYZE
+// (name AND version): the two ops differ in what they ADMIT and never in what
+// they compute, which is the only way "the same plugin measured it" survives
+// having two doors.
+static bool runFrameAnalyzerOn(const AnalyzerPluginInfo& ana,
+                               const MeasureReqHead& head,
+                               const std::vector<std::string>& paths,
+                               const std::vector<RoiRect>& rois,
+                               std::vector<std::vector<MItem>>& cols,
+                               std::vector<MSeries>& series,
+                               std::string& err) {
+    NpyFile n;
+    if (!parseNpyHeader(n, paths[0], err)) return false;
+    TileReq full{};
+    full.frame = head.frame0;
+    full.x = 0; full.y = 0; full.w = (uint32_t)n.w; full.h = (uint32_t)n.h;
+    full.step = 1;
+    std::vector<uint8_t> raw;
+    uint32_t ow = 0, oh = 0;
+    if (!readRegion(n, full, raw, ow, oh, err)) return false;
+    std::vector<float> pix((size_t)ow * oh * n.ch);
+    toFloatSamples(raw.data(), n.dtype, pix.size(), pix.data());
+    raw.clear();
+    raw.shrink_to_fit();
+
+    psFrame fr{};
+    fr.w = ow; fr.h = oh; fr.ch = (uint32_t)n.ch;
+    fr.dtype = PS_DTYPE_F32;
+    fr.loc = PS_MEM_CPU;
+    fr.data = pix.data();
+    fr.pitch_bytes = (size_t)ow * n.ch * sizeof(float);
+    fr.black = head.black; fr.white = head.white;
+    fr.cfa_type = (int32_t)head.cfaType;
+    fr.cfa_pattern = (int32_t)head.cfaPattern;
+    fr.pts_us = -1;
+    fr.name = paths[0].c_str();
+
+    uint32_t nCols = head.nRois ? head.nRois : 1;
+    cols.assign(nCols, {});
+    series.clear();
+    MSink ctx{ &cols, &series, 0 };
+    char perr[512];
+    for (uint32_t c = 0; c < nCols; c++) {
+        ctx.col = c;
+        psRect rr{};
+        const psRect* rp = nullptr;
+        if (head.nRois) {
+            rr.x = std::min(rois[c].x, fr.w); rr.y = std::min(rois[c].y, fr.h);
+            rr.w = std::min(rois[c].w, fr.w - rr.x); rr.h = std::min(rois[c].h, fr.h - rr.y);
+            rp = &rr;
+        }
+        perr[0] = 0;
+        int32_t rc;
+        // Three descriptor generations, one measurement path. The peer runs the
+        // SAME dlls the local host runs, so a v3 analyzer that only the local
+        // side could call would turn "MEASURE runs the same plugin on both
+        // sides" into a claim that quietly stopped being true.
+        if (ana.abi == 3) {
+            psAnalyzeSink3 sink{ &ctx, mNum, mTxt, mSer, {} };
+            rc = ana.v3.analyze(&fr, rp, &sink, perr, sizeof perr);
+        } else if (ana.abi == 2) {
+            psAnalyzeSink2 sink{ &ctx, mNum, mTxt, mSer, {} };
+            rc = ana.v2.analyze(&fr, rp, &sink, perr, sizeof perr);
+        } else {
+            psAnalyzeSink sink{ &ctx, mNum, mTxt };
+            rc = ana.v1.analyze(&fr, rp, &sink, perr, sizeof perr);
+        }
+        if (rc != 0) {
+            err = ana.name + ": " + (perr[0] ? perr : "analyzer failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+// A psStack served from the peer's own streaming reader (docs/abi-v3.md §9.3 +
+// §5.1). This is what pull was FOR: the local host returns a pointer because
+// every frame is already resident, and the peer - which holds nothing resident
+// and may be asked about 300 frames of 48 MB - reads frame i on demand and
+// gives the slot back on release_frame. §9.2's bounded window, on the peer,
+// with no new transport: the same FrameSource the aggregate ops stream through.
+//
+// Everything large is heap: the peer's main thread is the only thread it has,
+// and PR #133 is what a megabyte-class local costs on Windows.
+struct PeerStack {
+    FrameSource* src = nullptr;
+    uint32_t w = 0, h = 0, ch = 0, dtype = 0;
+    std::vector<std::vector<float>> pix;   // one per index; freed on release
+    std::vector<uint8_t> resident;         // 1 = pix[i] holds this frame's samples
+    std::vector<psFrame> fr;
+    std::vector<std::string> names;        // psFrame::name, stable for the call
+    std::vector<uint8_t> raw;              // scratch for one read, reused
+    size_t held = 0, budget = 0;
+    uint64_t gets = 0, releases = 0, peakHeld = 0;
+    std::string err;                       // why a NULL was a NULL, for the log
+};
+const psFrame* peerStackGet(void* ctx, uint32_t index) {
+    PeerStack* s = (PeerStack*)ctx;
+    if (!s) return nullptr;
+    s->gets++;
+    // Out of range is NULL, never a clamp: §5.1 makes NULL the one honest
+    // failure, and a clamp answers a question about frame 9 with frame 2.
+    if (index >= s->fr.size()) { s->err = "frame " + std::to_string(index) +
+                                          " is past the end of the stack"; return nullptr; }
+    if (s->resident[index]) return &s->fr[index];
+    const size_t samples = (size_t)s->w * s->h * s->ch;
+    const size_t bytes = samples * sizeof(float);
+    // The pin budget the ABI already anticipated ("frame lost, transport
+    // failure, PIN BUDGET EXCEEDED"). A plugin that never releases is correct
+    // and greedy (§5.1); on a workstation that costs nothing because the frames
+    // were resident anyway, and on a compute node it is the difference between
+    // a refusal and the OOM killer taking the ssh session with it.
+    if (s->held + bytes > s->budget) {
+        s->err = "pin budget exceeded at frame " + std::to_string(index) + " (" +
+                 std::to_string(s->budget >> 20) + " MB; release frames, or raise "
+                 "VIEWER_SERVE_PIN_BUDGET_MB on the peer)";
+        return nullptr;
+    }
+    uint32_t ow = 0, oh = 0;
+    if (!s->src->read(index, 0, 0, s->w, s->h, s->raw, ow, oh)) {
+        s->err = s->src->err;
+        return nullptr;
+    }
+    s->pix[index].resize(samples);
+    toFloatSamples(s->raw.data(), s->dtype, samples, s->pix[index].data());
+    s->resident[index] = 1;
+    s->held += bytes;
+    if (s->held > s->peakHeld) s->peakHeld = s->held;
+    s->fr[index].data = s->pix[index].data();
+    return &s->fr[index];
+}
+void peerStackRelease(void* ctx, uint32_t index) {
+    PeerStack* s = (PeerStack*)ctx;
+    if (!s || index >= s->fr.size()) return;   // releasing nothing is not an error
+    s->releases++;
+    if (!s->resident[index]) return;
+    // Here the mouth earns its keep. In-process this is a no-op; on the peer it
+    // is the recycle that lets a 300-frame stack be measured inside a window,
+    // and re-getting the same index afterwards is legal - it reads again.
+    s->held -= s->pix[index].size() * sizeof(float);
+    std::vector<float>().swap(s->pix[index]);
+    s->resident[index] = 0;
+    s->fr[index].data = nullptr;
+}
+size_t pinBudgetBytes() {
+    static size_t b = [] {
+        const char* e = getenv("VIEWER_SERVE_PIN_BUDGET_MB");
+        long mb = e ? atol(e) : 0;
+        if (mb < 1) mb = 1024;               // a stack's worth of a workstation
+        return (size_t)mb << 20;
+    }();
+    return b;
+}
+}  // namespace
+
+// The peer half of §5/§6 for a stack analyzer, in the order the contract fixes:
+// the gate is settled BEFORE the call, from the peer's own count of the frames
+// it will serve, and the facts (n, N) are passed in for the plugin to read
+// after it has been let in.
+static bool runStackAnalyzerOn(const StackAnalyzerPluginInfo& sa,
+                               const MeasureReqHead& head,
+                               const std::vector<std::string>& paths,
+                               const std::vector<RoiRect>& rois,
+                               std::vector<std::vector<MItem>>& cols,
+                               std::vector<MSeries>& series,
+                               uint32_t& framesUsed, uint32_t& expected,
+                               std::string& err) {
+    FrameSource src;
+    if (!src.init(head, paths)) { err = src.err; return false; }
+    const uint32_t n = src.count;
+    // N is what the PEER can count, and nothing more: the frames the file
+    // declares it holds (or the files it was handed). §10 says the partial-load
+    // facts are the peer's, not a number the client asserted about itself.
+    const uint32_t N = src.perFile ? (uint32_t)paths.size()
+                                   : std::max(n, (uint32_t)src.n.frames);
+    std::string what = paths[0];
+    { size_t sl = what.find_last_of("/\\"); if (sl != std::string::npos) what = what.substr(sl + 1); }
+
+    // ---- the gate, before the call, exactly as the local host words it
+    if (n < sa.minFrames) {
+        err = sa.name + " needs at least " + std::to_string(sa.minFrames) +
+              " frames; \"" + what + "\" has " + std::to_string(n) +
+              (n < N ? " of " + std::to_string(N) : "") + " on the peer";
+        return false;
+    }
+
+    PeerStack ps;
+    ps.src = &src;
+    ps.w = (uint32_t)src.n.w; ps.h = (uint32_t)src.n.h; ps.ch = (uint32_t)src.n.ch;
+    ps.dtype = src.n.dtype;
+    ps.budget = pinBudgetBytes();
+    ps.pix.resize(n);
+    ps.resident.assign(n, 0);
+    ps.names.resize(n);
+    ps.fr.assign(n, psFrame{});
+    for (uint32_t i = 0; i < n; i++) {
+        ps.names[i] = src.perFile ? paths[i]
+                                  : what + " #" + std::to_string(src.xBase() + i);
+        psFrame& f = ps.fr[i];
+        f.w = ps.w; f.h = ps.h; f.ch = ps.ch;
+        f.dtype = PS_DTYPE_F32;
+        f.loc = PS_MEM_CPU;
+        f.data = nullptr;                 // filled by get_frame, freed by release
+        f.pitch_bytes = (size_t)ps.w * ps.ch * sizeof(float);
+        f.black = head.black; f.white = head.white;
+        f.cfa_type = (int32_t)head.cfaType;
+        f.cfa_pattern = (int32_t)head.cfaPattern;
+        f.pts_us = -1;
+        f.name = ps.names[i].c_str();
+    }
+
+    psStack st = {};
+    st.frames = n;
+    st.expected = N;
+    st.w = ps.w; st.h = ps.h; st.ch = ps.ch;
+    st.dtype = PS_DTYPE_F32;
+    st.name = what.c_str();
+    st.meta_json = nullptr;
+    st.ctx = &ps;
+    st.get_frame = peerStackGet;
+    st.release_frame = peerStackRelease;
+
+    uint32_t nCols = head.nRois ? head.nRois : 1;
+    cols.assign(nCols, {});
+    series.clear();
+    MSink ctx{ &cols, &series, 0 };
+    char perr[512];
+    for (uint32_t c = 0; c < nCols; c++) {
+        ctx.col = c;
+        psRect rr{};
+        const psRect* rp = nullptr;
+        if (head.nRois) {
+            rr.x = std::min(rois[c].x, ps.w); rr.y = std::min(rois[c].y, ps.h);
+            rr.w = std::min(rois[c].w, ps.w - rr.x); rr.h = std::min(rois[c].h, ps.h - rr.y);
+            rp = &rr;
+        }
+        perr[0] = 0;
+        psAnalyzeSink3 sink{ &ctx, mNum, mTxt, mSer, {} };
+        int32_t rc = sa.v3.analyze_stack(&st, rp, &sink, perr, sizeof perr);
+        if (rc != 0) {
+            // The plugin's own sentence first; the peer's reason for a NULL is
+            // appended because from inside the plugin "get_frame returned NULL"
+            // is all there was to say, and which of the three NULLs it was is
+            // knowledge only this side has.
+            err = sa.name + ": " + (perr[0] ? perr : "the analyzer failed without saying why");
+            if (!ps.err.empty()) err += " [peer: " + ps.err + "]";
+            return false;
+        }
+    }
+    framesUsed = n;
+    expected = N;
+    return true;
+}
+
+// ---- parity (docs/abi-v3.md §10, #104 judgment 8) -------------------------
+//
+// name + version equality, and a mismatch is refused with BOTH versions on the
+// line and no fallback of any kind. The reasoning the spec records: a version
+// field (#46 stage 2) is what first made "is the peer the same instrument as
+// me?" a question that can be ASKED over a link. Before it, parity was
+// unmeasurable and the honest thing was to not claim it; now it is a
+// declaration that can be compared, so refusing to compare it would be a
+// choice.
+//
+// What it is NOT is a proof of identical arithmetic - two builds can declare
+// one version and differ. Neither side can measure ULP agreement over a pipe,
+// and the spec says so: this is the discipline of DECLARATION, the same one
+// the provenance line runs on. A wrong declaration is the plugin author's
+// fault and is visible; a missing one is nobody's fault and is not, which is
+// why the missing case is refused rather than waved through.
+static bool parityOk(const std::string& name, const std::string& clientVer,
+                     const AnalyzerPluginInfo* fa, const StackAnalyzerPluginInfo* sa,
+                     std::string& why) {
+    const std::string& peerVer  = fa ? fa->version : sa->version;
+    const std::string& peerFile = fa ? fa->file    : sa->file;
+    if (!clientVer.empty() && clientVer == peerVer) return true;
+    const std::string head = "plugin parity refused: \"" + name + "\" ";
+    if (clientVer.empty() || peerVer.empty()) {
+        why = head + (clientVer.empty() ? "declares no version on the client"
+                                        : "is <" + clientVer + "> on the client") +
+              " and " +
+              (peerVer.empty() ? "none on the peer" : "<" + peerVer + "> on the peer") +
+              " (" + peerFile + ")\n"
+              "  ABI v3 §10 matches name AND version, and a version that was never "
+              "declared cannot be matched.\n"
+              "  V1/V2 descriptors carry no version field - those reach the peer through "
+              "MOP_ANALYZER, which checks the name only and says so.";
+        return false;
+    }
+    why = head + "is <" + clientVer + "> on the client and <" + peerVer +
+          "> on the peer (" + peerFile + ")\n"
+          "  Neither version wins: this is not run with the peer's build, and it is not "
+          "handed back to the client to run here.\n"
+          "  A number from a plugin other than the one asked for is the failure this "
+          "check exists to make impossible.";
+    return false;
+}
+
+static void runPluginAnalyze(const MeasureReqHead& head,
+                             const std::vector<std::string>& paths,
+                             const std::vector<RoiRect>& rois,
+                             const std::string& analyzer,
+                             const std::string& clientVersion,
+                             uint32_t target) {
+    ensurePlugins();
+    const AnalyzerPluginInfo* fa = nullptr;
+    const StackAnalyzerPluginInfo* sa = nullptr;
+    std::string have;
+    if (target == MT_STACK) {
+        for (const auto& a : plugin_host::stackAnalyzers()) {
+            if (a.name == analyzer) sa = &a;
+            have += (have.empty() ? "" : ", ") + a.name;
+        }
+    } else {
+        for (const auto& a : plugin_host::analyzers()) {
+            if (a.name == analyzer) fa = &a;
+            have += (have.empty() ? "" : ", ") + a.name;
+        }
+    }
+    if (!fa && !sa) {
+        sendErr(std::string("plugin analysis refused: no ") +
+                (target == MT_STACK ? "stack" : "frame") + " analyzer named \"" +
+                analyzer + "\" on the peer (peer has: " +
+                (have.empty() ? "none" : have) + ")");
+        return;
+    }
+    std::string why;
+    if (!parityOk(analyzer, clientVersion, fa, sa, why)) { sendErr(why); return; }
+
+    std::vector<std::vector<MItem>> cols;
+    std::vector<MSeries> series;
+    std::string err;
+    MeasureProv prov;
+    uint32_t used = 1, expected = 1;
+    if (sa) {
+        if (!runStackAnalyzerOn(*sa, head, paths, rois, cols, series, used, expected, err)) {
+            sendErr(err); return;
+        }
+        prov.name = sa->name; prov.version = sa->version;
+        prov.file = sa->file; prov.path = sa->path;
+    } else {
+        if (!runFrameAnalyzerOn(*fa, head, paths, rois, cols, series, err)) {
+            sendErr(err); return;
+        }
+        prov.name = fa->name; prov.version = fa->version;
+        prov.file = fa->file; prov.path = fa->path;
+    }
+    prov.expected = expected;
+    sendMeasureReply(used, cols, series, &prov);
+}
+
 static void handleMeasure(Buf& in) {
     MeasureReqHead head{};
     if (in.rd + sizeof head > in.b.size()) { sendErr("bad MEASURE"); return; }
@@ -1342,6 +1738,21 @@ static void handleMeasure(Buf& in) {
 
     if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois); return; }
     if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois); return; }
+    if (head.op == MOP_PLUGIN_ANALYZE) {
+        // The parity block, read AFTER the rois so that nothing an older op
+        // parses moved. A truncated one is a bad request, not a parity failure:
+        // "no version arrived" and "no version was declared" are different
+        // claims and only the second one is the plugin author's.
+        std::string clientVersion;
+        uint32_t target = MT_FRAME;
+        if (!in.getStr(clientVersion) || !in.getU32(target)) {
+            sendErr("bad MEASURE parity block");
+            return;
+        }
+        if (target > MT_STACK) { sendErr("bad MEASURE target"); return; }
+        runPluginAnalyze(head, paths, rois, analyzer, clientVersion, target);
+        return;
+    }
     if (head.op != MOP_ANALYZER) { sendErr("unknown measure op"); return; }
 
     ensurePlugins();
@@ -1353,70 +1764,10 @@ static void handleMeasure(Buf& in) {
     }
     if (!ana) { sendErr("analyzer not found: " + analyzer + " (server has: " + have + ")"); return; }
 
-    // materialize the frame as f32, exactly as the local host would
-    NpyFile n;
-    std::string err;
-    if (!parseNpyHeader(n, paths[0], err)) { sendErr(err); return; }
-    TileReq full{};
-    full.frame = head.frame0;
-    full.x = 0; full.y = 0; full.w = (uint32_t)n.w; full.h = (uint32_t)n.h;
-    full.step = 1;
-    std::vector<uint8_t> raw;
-    uint32_t ow = 0, oh = 0;
-    if (!readRegion(n, full, raw, ow, oh, err)) { sendErr(err); return; }
-    std::vector<float> pix((size_t)ow * oh * n.ch);
-    toFloatSamples(raw.data(), n.dtype, pix.size(), pix.data());
-    raw.clear();
-    raw.shrink_to_fit();
-
-    psFrame fr{};
-    fr.w = ow; fr.h = oh; fr.ch = (uint32_t)n.ch;
-    fr.dtype = PS_DTYPE_F32;
-    fr.loc = PS_MEM_CPU;
-    fr.data = pix.data();
-    fr.pitch_bytes = (size_t)ow * n.ch * sizeof(float);
-    fr.black = head.black; fr.white = head.white;
-    fr.cfa_type = (int32_t)head.cfaType;
-    fr.cfa_pattern = (int32_t)head.cfaPattern;
-    fr.pts_us = -1;
-    fr.name = paths[0].c_str();
-
-    uint32_t nCols = head.nRois ? head.nRois : 1;
-    std::vector<std::vector<MItem>> cols(nCols);
+    std::vector<std::vector<MItem>> cols;
     std::vector<MSeries> series;
-    MSink ctx{ &cols, &series, 0 };
-    char perr[512];
-    for (uint32_t c = 0; c < nCols; c++) {
-        ctx.col = c;
-        psRect rr{};
-        const psRect* rp = nullptr;
-        if (head.nRois) {
-            rr.x = std::min(rois[c].x, fr.w); rr.y = std::min(rois[c].y, fr.h);
-            rr.w = std::min(rois[c].w, fr.w - rr.x); rr.h = std::min(rois[c].h, fr.h - rr.y);
-            rp = &rr;
-        }
-        perr[0] = 0;
-        int32_t rc;
-        // Three descriptor generations, one measurement path. The peer runs the
-        // SAME dlls the local host runs, so a v3 analyzer that only the local
-        // side could call would turn "MEASURE runs the same plugin on both
-        // sides" into a claim that quietly stopped being true.
-        if (ana->abi == 3) {
-            psAnalyzeSink3 sink{ &ctx, mNum, mTxt, mSer, {} };
-            rc = ana->v3.analyze(&fr, rp, &sink, perr, sizeof perr);
-        } else if (ana->abi == 2) {
-            psAnalyzeSink2 sink{ &ctx, mNum, mTxt, mSer, {} };
-            rc = ana->v2.analyze(&fr, rp, &sink, perr, sizeof perr);
-        } else {
-            psAnalyzeSink sink{ &ctx, mNum, mTxt };
-            rc = ana->v1.analyze(&fr, rp, &sink, perr, sizeof perr);
-        }
-        if (rc != 0) {
-            sendErr(analyzer + ": " + (perr[0] ? perr : "analyzer failed"));
-            return;
-        }
-    }
-
+    std::string err;
+    if (!runFrameAnalyzerOn(*ana, head, paths, rois, cols, series, err)) { sendErr(err); return; }
     sendMeasureReply(1, cols, series);
 }
 
