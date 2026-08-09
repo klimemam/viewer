@@ -2252,13 +2252,25 @@ static std::string loadSession(const std::string& path) {
                 // container's defaults. A line whose member the rebuild did not
                 // produce is a real loss - reported, never applied blind.
                 if (err.empty()) {
-                    int at = sessionDocAt(p, pendingMember, docsBefore);
-                    if (at < 0 && app.images.size() == docsBefore)
-                        at = sessionDocAt(p, pendingMember, 0);
-                    if (at >= 0) selectImage(at);
-                    else err = (pendingMember.empty() ? std::string("the pixels")
-                                                      : "member " + pendingMember) +
-                               " named by this line is not in what " + p + " opened";
+                    if (app.images.size() > docsBefore) {
+                        // it opened something: the line's doc is among what IT
+                        // added, never among the docs already here (a file may
+                        // legitimately be opened twice in one session). No
+                        // match means this door landed the pixels under
+                        // another name - leave cur() where the loader put it,
+                        // which is what every restore did before this branch
+                        // existed: never worse than today.
+                        int at = sessionDocAt(p, pendingMember, docsBefore);
+                        if (at >= 0) selectImage(at);
+                    } else {
+                        // it opened NOTHING and did not fail: the already-here
+                        // dedupe. Only a doc that is already open can be meant.
+                        int at = sessionDocAt(p, pendingMember, 0);
+                        if (at >= 0) selectImage(at);
+                        else err = (pendingMember.empty() ? std::string("the pixels")
+                                                          : "member " + pendingMember) +
+                                   " named by this line is not in what " + p + " rebuilt";
+                    }
                 }
                 if (err.empty()) {
                     cur()->cfa = std::clamp(cfa, 0, 2);
