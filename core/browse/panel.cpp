@@ -1033,6 +1033,21 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 g_browseHost.selectImage(i); // already registered: show it
                 return;
             }
+        // ...and the same question in the OTHER vocabulary (#111). A local
+        // picture is opened by openPath, so its document carries the plain path
+        // and no url at all - the loop above can never match one, and without
+        // this a second double-click on the same .png would open a second copy
+        // where a second double-click on a .npy shows the first. The panel must
+        // not behave differently per format at the same gesture.
+        if (B.host.empty() && !peerServesName(r.name())) {
+            const std::string p = r.full();
+            for (int i = 0; i < (int)app.images.size(); i++)
+                if (app.images[i]->src->remoteUrl.empty() &&
+                    app.images[i]->src->path == p && !app.images[i]->preview) {
+                    g_browseHost.selectImage(i);
+                    return;
+                }
+        }
         g_browseHost.dropPreview();          // a stale preview is not this row's
         g_browseHost.openRemote(u, false, 0);
     };
