@@ -13,7 +13,7 @@
     // media/ is the whole matrix in one folder (tools/gen_testdata.py):
     //
     //   capture.npy    viewer reads it, peer serves it   -> opens either way
-    //   *.png *.jpg *.tif *.y4m (*.exr)
+    //   *.png *.jpg *.tif *.exr *.y4m
     //                  viewer reads it, peer does NOT    -> opens LOCALLY
     //   capture.mp4    neither reads it                  -> refused, by name
     //
@@ -64,12 +64,10 @@
             { "gradient.jpg", false },
             { "gray8.tif",    false },
             { "one.y4m",      false },
-#ifdef VIEWER_WITH_EXR
-            // Conditional for the reason media.inc's M1 is: OpenEXR is the row
-            // that can legitimately be in either state, and a build without it
-            // has no .exr fixture to browse at all.
+            // Unconditional since #53's ruling: there is no build of this
+            // viewer without OpenEXR, so there is none without an .exr fixture
+            // in media/ either, and this row is as ordinary as the four above.
             { "rgb_half.exr", false },
-#endif
         };
 
         // ---- F1: listed AND openable, on this machine ------------------------

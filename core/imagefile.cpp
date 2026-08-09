@@ -184,17 +184,19 @@ const std::vector<Backend>& backends() {
         // so - so core/tiffread.cpp REFUSES a CFA TIFF, by name, rather than
         // open one. Everything else it will not read is refused the same way.
         { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr, nullptr },
-        // OpenEXR is the row that exercises BOTH first-class states of this
-        // table from one build option: with -DVIEWER_WITH_EXR=ON it points at
-        // core/exrread.cpp, and with OFF the same row still lists .exr, still
-        // sniffs it, still dispatches to it, and refuses with EXR_ABSENT naming
-        // the option. A user who turned the dependency off is told that; a user
-        // who never had it is not left with "unknown file, try the raw dialog".
+        // OpenEXR used to be the row that could be in either of this table's
+        // two states, because a build option could take its library away. That
+        // option is gone (#53, 2026-08-09: 「既定ONで。OFFにするパスは不要
+        // です」), so the row is an ordinary one - a format with a decoder -
+        // and `absent` is nullptr here for the same reason it is on the four
+        // rows around it. The state itself is still the table's (imagefile.h);
+        // it simply has no user at the moment, the way it had none before .exr
+        // arrived and TIFF's reader was written.
         //
         // It is also the only row whose parts are NAMED (partWord): an .exr
         // holds layers, which are documents, where a multi-page TIFF holds
         // pages, which are frames.
-        { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, EXR_DECODE, EXR_ABSENT, "exr layer" },
+        { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, exrDecode, nullptr, "exr layer" },
         // y4m is a VIDEO container in a picture-format table, and it belongs
         // here because after docs/video-support.md's question it is one: a text
         // header plus raw planes, no compression, no inter-frame prediction -

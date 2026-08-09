@@ -34,8 +34,13 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 >
 > ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、cold tree でしか
 > 起きない。バイナリの増分は実コード(使わなければリンカが落とすため)。
-> `-DVIEWER_WITH_EXR=OFF` で両方ゼロに戻り、`.exr` は「形式としては残るが
-> このビルドには decoder が無い」と名指しで断る。
+>
+> **この2つの数字を 0 に戻す方法はもう無い** (#53 の裁定、2026-08-09 ——
+> 「既定ONで。OFFにするパスは不要です」)。上の表の「なし」列は、この節が
+> 書かれた時点の測定として残す —— 再現できる構成ではない。`VIEWER_WITH_EXR`
+> option は削除済み。**代償**は「オフラインの clean clone が、システムに
+> OpenEXR/Imath が無いとビルドできない」こと (manual.md 付録「ビルドと
+> ネットワーク」、CMakeLists.txt の OpenEXR ブロック)。
 >
 > **peer は形式を増やさない** (下の「remote への波及」の案 (a))。`viewer-serve`
 > が `core/imagefile.cpp` をコンパイルしないという1つの事実がそれを保証していて、

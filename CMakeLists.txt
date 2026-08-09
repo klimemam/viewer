@@ -98,70 +98,81 @@ set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 # honour this repo's pinned-URL convention. OpenEXR checks `TARGET Imath::Imath`
 # before fetching, so declaring it first wins.
 #
-# OFFLINE: both honour the standard overrides, like the four above -
-#     -DFETCHCONTENT_SOURCE_DIR_IMATH=<imath source tree>
-#     -DFETCHCONTENT_SOURCE_DIR_OPENEXR=<openexr source tree>
-# With -DVIEWER_WITH_EXR=OFF the viewer builds exactly as before and .exr stays
-# a LISTED format with no decoder behind it (core/imagefile.h's `absent` state):
-# handed one, it says which build option is off. It never pretends.
-option(VIEWER_WITH_EXR "read .exr images (uses an installed OpenEXR, else fetches it)" ON)
-if(VIEWER_WITH_EXR)
-  find_package(OpenEXR 3.1 QUIET)
-  if(OpenEXR_FOUND)
-    message(STATUS "OpenEXR ${OpenEXR_VERSION}: using the installed copy (no download)")
+# THERE IS NO OFF SWITCH, and that is the ruling of #53 (2026-08-09): 「既定ON
+# で。OFFにするパスは不要です」. .exr is a format this viewer reads, not a
+# feature a build elects, so the fetch below is UNCONDITIONAL.
+#
+# The honest consequence, stated here rather than discovered: an OFFLINE CLEAN
+# CLONE CANNOT BUILD unless the machine already provides OpenEXR and Imath.
+# There is no longer a flag that drops the dependency, so the fetch is the only
+# other way to satisfy it. That is precisely the property the stb block above
+# protects and the property TIFF's own reader was written to keep (core/
+# tiffread.h), and it is the price the user accepted for reading real .exr.
+# Two things soften it, and both are load-bearing:
+#   1. find_package first (below). A machine with a system/vcpkg/brew OpenEXR
+#      never touches the network - which matters MORE now than it did when the
+#      flag existed, because it is the only escape that is left.
+#   2. the standard FetchContent overrides, like the four above -
+#        -DFETCHCONTENT_SOURCE_DIR_IMATH=<imath source tree>
+#        -DFETCHCONTENT_SOURCE_DIR_OPENEXR=<openexr source tree>
+#      point the build at trees that are already on the disk.
+# Vendoring the sources, or caching them in CI, would remove it outright; that
+# is a decision for the owner and not something this file may take on its own.
+find_package(OpenEXR 3.1 QUIET)
+if(OpenEXR_FOUND)
+  message(STATUS "OpenEXR ${OpenEXR_VERSION}: using the installed copy (no download)")
+else()
+  message(STATUS "OpenEXR: not installed - fetching v3.4.13 + Imath v3.2.2 "
+                 "(docs/media-support.md §1 carries the measured cost; "
+                 "FETCHCONTENT_SOURCE_DIR_* points this at a local tree)")
+  # Static, no install rules, no tools/examples/tests: we want the reader and
+  # nothing else. BUILD_TESTING is CTest's own switch and this repo turns
+  # enable_testing() on for its selftests, so it must be forced off for the
+  # subprojects or their test suites join our ctest run.
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
+  set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_INSTALL OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_INSTALL_TOOLS OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_TEST_LIBRARIES OFF CACHE BOOL "" FORCE)
+  set(OPENEXR_TEST_TOOLS OFF CACHE BOOL "" FORCE)
+  # 3.4 vendors libdeflate; forcing the internal one keeps the build
+  # reproducible instead of depending on whatever the host happens to have.
+  set(OPENEXR_FORCE_INTERNAL_DEFLATE ON CACHE BOOL "" FORCE)
+  # EXCLUDE_FROM_ALL on FetchContent_Declare is 3.28+. Without it the default
+  # target also builds OpenEXRUtil (deep/flat image helpers this viewer never
+  # calls). Guarded rather than raising cmake_minimum_required from 3.21.
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+    set(_exr_excl EXCLUDE_FROM_ALL)
   else()
-    message(STATUS "OpenEXR: not installed - fetching v3.4.13 + Imath v3.2.2 "
-                   "(docs/media-support.md §1 carries the measured cost; "
-                   "-DVIEWER_WITH_EXR=OFF to skip)")
-    # Static, no install rules, no tools/examples/tests: we want the reader and
-    # nothing else. BUILD_TESTING is CTest's own switch and this repo turns
-    # enable_testing() on for its selftests, so it must be forced off for the
-    # subprojects or their test suites join our ctest run.
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-    set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
-    set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_INSTALL OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_INSTALL_TOOLS OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_TEST_LIBRARIES OFF CACHE BOOL "" FORCE)
-    set(OPENEXR_TEST_TOOLS OFF CACHE BOOL "" FORCE)
-    # 3.4 vendors libdeflate; forcing the internal one keeps the build
-    # reproducible instead of depending on whatever the host happens to have.
-    set(OPENEXR_FORCE_INTERNAL_DEFLATE ON CACHE BOOL "" FORCE)
-    # EXCLUDE_FROM_ALL on FetchContent_Declare is 3.28+. Without it the default
-    # target also builds OpenEXRUtil (deep/flat image helpers this viewer never
-    # calls). Guarded rather than raising cmake_minimum_required from 3.21.
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
-      set(_exr_excl EXCLUDE_FROM_ALL)
-    else()
-      set(_exr_excl "")
-    endif()
-    FetchContent_Declare(Imath
-      URL https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.zip
-      ${_exr_excl})
-    FetchContent_MakeAvailable(Imath)
-    # OpenEXRSetup.cmake runs find_package(Imath CONFIG) BEFORE it checks
-    # whether an Imath target already exists. With Imath declared here (at the
-    # top level) that search lands on _deps/imath-build/config/ImathConfig.cmake,
-    # which include()s an ImathTargets.cmake that is only written when
-    # IMATH_INSTALL is ON - a hard configure error. OpenEXR guards against
-    # exactly this with CMAKE_IGNORE_PATH, but it builds that path from ITS own
-    # binary dir, so it only covers an Imath that OpenEXR itself fetched.
-    # Suppressing the nested find is the honest fix: we have just supplied the
-    # Imath::Imath target it is looking for, so it must not look.
-    set(CMAKE_DISABLE_FIND_PACKAGE_Imath ON)
-    FetchContent_Declare(openexr
-      URL https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.4.13.zip
-      ${_exr_excl})
-    FetchContent_MakeAvailable(openexr)
-    unset(CMAKE_DISABLE_FIND_PACKAGE_Imath)
-    unset(_exr_excl)
+    set(_exr_excl "")
   endif()
+  FetchContent_Declare(Imath
+    URL https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.zip
+    ${_exr_excl})
+  FetchContent_MakeAvailable(Imath)
+  # OpenEXRSetup.cmake runs find_package(Imath CONFIG) BEFORE it checks
+  # whether an Imath target already exists. With Imath declared here (at the
+  # top level) that search lands on _deps/imath-build/config/ImathConfig.cmake,
+  # which include()s an ImathTargets.cmake that is only written when
+  # IMATH_INSTALL is ON - a hard configure error. OpenEXR guards against
+  # exactly this with CMAKE_IGNORE_PATH, but it builds that path from ITS own
+  # binary dir, so it only covers an Imath that OpenEXR itself fetched.
+  # Suppressing the nested find is the honest fix: we have just supplied the
+  # Imath::Imath target it is looking for, so it must not look.
+  set(CMAKE_DISABLE_FIND_PACKAGE_Imath ON)
+  FetchContent_Declare(openexr
+    URL https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.4.13.zip
+    ${_exr_excl})
+  FetchContent_MakeAvailable(openexr)
+  unset(CMAKE_DISABLE_FIND_PACKAGE_Imath)
+  unset(_exr_excl)
 endif()
 
 add_library(imgui_lib STATIC
@@ -237,10 +248,7 @@ target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} 
 # behind core/imagefile.h, which viewer-serve does not compile; OpenEXR holds it
 # the same way, and the selftest evidence for both is the same one fact -
 # viewer-serve.exe is byte-identical across the change.
-if(VIEWER_WITH_EXR)
-  target_link_libraries(viewer PRIVATE OpenEXR::OpenEXR)
-  target_compile_definitions(viewer PRIVATE VIEWER_WITH_EXR)
-endif()
+target_link_libraries(viewer PRIVATE OpenEXR::OpenEXR)
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
 endif()
@@ -424,7 +432,7 @@ endif()
 # (gitignored, regenerated, shared with gen_testdata.py, which creates its
 # media/ with exist_ok and so leaves these alone). The stamp lives inside that
 # tree so that deleting the tree regenerates them.
-if(VIEWER_WITH_EXR AND NOT CMAKE_CROSSCOMPILING)
+if(NOT CMAKE_CROSSCOMPILING)
   add_executable(mkexr tools/mkexr.cpp)
   target_link_libraries(mkexr PRIVATE OpenEXR::OpenEXR)
   if(MSVC)
@@ -442,10 +450,12 @@ if(VIEWER_WITH_EXR AND NOT CMAKE_CROSSCOMPILING)
   add_custom_target(viewer_exr_fixtures ALL
                     DEPENDS ${VIEWER_EXR_FIXTURE_DIR}/.exr-fixtures.stamp)
 else()
-  # Never silent: --media-selftest skips its .exr block loudly for the same
-  # reason, and the two messages have to agree about why.
-  message(STATUS "no .exr fixtures (VIEWER_WITH_EXR=${VIEWER_WITH_EXR}): "
-                 "--media-selftest will skip its .exr asserts and say so")
+  # The one case left: a host tool cannot be RUN from a cross build, so the
+  # fixtures cannot be written here. Never silent about it - the reader is
+  # still linked and still read .exr, but M16-M23 have no files to open, so a
+  # cross build is not a build these asserts have been run against.
+  message(STATUS "cross-compiling: no .exr fixtures (a host tool cannot run here) - "
+                 "--media-selftest's .exr asserts have nothing to open")
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------

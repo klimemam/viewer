@@ -256,9 +256,10 @@ beauty.exr: OpenEXR: multi-part EXR (2 parts): each part is a separate image
   choose a reader to read it another way
 ```
 
-`.exr` の対応は `-DVIEWER_WITH_EXR=OFF` でビルドから外せます。外したビルドでも
-`.exr` は**形式として残り**、「このビルドは OFF で構成されている」と名指しで
-断ります(黙って「不明なファイル」にはなりません)。
+`.exr` はどのビルドでも読めます。かつては `-DVIEWER_WITH_EXR=OFF` で外せまし
+たが、その切り替えは廃止しました(2026-08-09)——「この viewer は `.exr` を
+読む」を、配布物ごとに違う話にしないためです。ビルドする側の代償は
+付録の「ビルドとネットワーク」を見てください。
 
 ### 2.3c 動画 — y4m だけ開きます(理由があります)
 
@@ -787,6 +788,32 @@ viewer [options] [files...]
 | ターミナルで `cmake` が見つからない | インストール後に開いたままのターミナル/VSCode は**古い PATH を保持**している。VSCode を完全終了して再起動(タスクバー常駐も終了) |
 | configure が `SSL peer certificate ... was not OK` (status_code 60) で失敗 | MinGW/WinLibs 同梱の CMake は CA ストアを持たず、FetchContent の GitHub ダウンロードが検証エラーになる。**CA バンドルを指定**する:<br>`cmake -S . -B build -DCMAKE_TLS_CAINFO="C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"`<br>環境変数 `CMAKE_TLS_CAINFO` に同じ値を設定すれば以後不要(`CMAKE_TLS_VERIFY=0` での回避は非推奨) |
 | MinGW でのビルド例 | `cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release` → `cmake --build build-mingw` → `.\build-mingw\viewer.exe`(MSVC は必須ではない) |
+
+#### ビルドとネットワーク —— オフラインの clean clone について
+
+`.exr` を外す `-DVIEWER_WITH_EXR=OFF` は**廃止しました**(2026-08-09)。
+**ビルドを切り替えるフラグはこのプロジェクトには1つもありません** ——
+`cmake -S . -B build && cmake --build build` が唯一の手順です。
+
+その**代償**を隠さずに書きます。OFF の道が無くなったので、OpenEXR + Imath の
+取得が**無条件**になりました。したがって:
+
+> **ネットワークの無い clean clone は、OpenEXR/Imath が既にそのマシンに
+> 入っていない限りビルドできません。**
+
+既存のチェックアウトは `build/_deps/` にキャッシュを持っているので影響を
+受けません。新規クローンだけの話です。逃げ道は2つあり、どちらも意図的に
+残してあります:
+
+| 状況 | どうなるか / どうするか |
+|---|---|
+| システム(distro / vcpkg / brew)に OpenEXR 3.1+ がある | `find_package` が先に走り、**ダウンロードは発生しません**。以前よりこれが重要になりました |
+| source tree がローカルにある | `cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_IMATH=<imath> -DFETCHCONTENT_SOURCE_DIR_OPENEXR=<openexr>` |
+
+これは TIFF が自前リーダになった理由(`core/tiffread.h`)と**逆向きの結論**
+です。EXR には「小さくて正直なリーダ」という選択肢が無いため、そちらを
+取りました。vendor 化や CI キャッシュでこの制約は消せますが、それは別の判断
+です。
 
 ## 11. ショートカット全表
 

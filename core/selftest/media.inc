@@ -49,25 +49,20 @@
             fprintf(stderr, "mediaselftest: table = %zu format(s), decodable: %s\n",
                     imagefile::backends().size(), imagefile::decodableFormats().c_str());
             check(sound, "M1 every format either decodes or says why it does not");
-            // OpenEXR is the row that can be in EITHER state in a legitimate
-            // build, so which one it is here is asserted rather than assumed -
-            // a suite that quietly passed with the format switched off would be
-            // reporting on a viewer nobody ships.
-#ifdef VIEWER_WITH_EXR
+            // The list is spelled out rather than counted: this is the only
+            // place that says WHICH formats a shipped binary reads, and .exr
+            // is named in it because there is no longer a build in which it is
+            // not (#53, 2026-08-09 - the OFF path and the assert that pinned
+            // it were removed together). A row that lost its decoder would
+            // change this string and fail here.
             check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, OpenEXR, y4m",
                   "M1 this build decodes PNG, JPEG, TIFF, OpenEXR and y4m");
-#else
-            check(imagefile::decodableFormats() == "PNG, JPEG, TIFF, y4m",
-                  "M1 this build decodes PNG, JPEG, TIFF and y4m");
-            check(imagefile::forPath("x.exr") && !imagefile::forPath("x.exr")->decode &&
-                  imagefile::forPath("x.exr")->absent,
-                  "M1 ...and .exr is still LISTED, with the reason there is no decoder");
-#endif
-            // Every extension the table dispatches on reaches the file dialog,
-            // including a format that is listed but absent: its refusal is more
-            // use than the raw dialog a filtered-out file would get.
+            // Every extension the table dispatches on reaches the file dialog -
+            // including, if a row ever has one again, a format that is listed
+            // but absent: its refusal is more use than the raw dialog a
+            // filtered-out file would get.
             check(has(imagefile::dialogPattern(), "*.exr"),
-                  "M1 .exr is offered by the file dialog whether or not it decodes");
+                  "M1 .exr is offered by the file dialog, from the table's own row");
         }
 
         // ---- M2: 16-bit PNG, sample for sample ------------------------------
@@ -413,17 +408,12 @@
         // these files come from the same project as the reader, so this is a
         // test of the viewer's INTERPRETATION - channels, layers, dtype,
         // ranges, refusals - and not of byte-level parsing of a stranger's file.
-#ifndef VIEWER_WITH_EXR
-        // A LOUD skip, never a silent one. -DVIEWER_WITH_EXR=OFF is a supported
-        // configuration (no network, or a packager who does not want the
-        // dependency) and failing the suite for choosing it would punish the
-        // documented escape hatch - but the run must say that the coverage is
-        // absent, and why, every single time. Same rule as the quarantine block
-        // in CMakeLists.txt.
-        fprintf(stderr, "mediaselftest: M16-M23 SKIPPED - built without OpenEXR, so the "
-                        ".exr reader is NOT covered by this run "
-                        "(configure with -DVIEWER_WITH_EXR=ON to cover it)\n");
-#else
+        //
+        // These eight ran behind an #ifdef until #53's ruling removed the OFF
+        // path, and with it the loud skip that stood here. There is no build of
+        // this viewer left in which .exr is unread, so there is no configuration
+        // in which this coverage may be announced as missing: it simply runs.
+        //
         // ---- M16: the values arrive untouched --------------------------------
         {
             ImageDoc* d = open1("rgb_half.exr");
@@ -726,7 +716,6 @@
             check(oneStack, "M23 ...and opening the folder gives ONE stack of 3 frames");
             check(order, "M23 ...whose frames are the files' own pixels, in file order");
         }
-#endif  // VIEWER_WITH_EXR
 
         // ---- M24-M28: y4m, and the video this build will NOT read -----------
         // docs/video-support.md is the argument; this is the enforcement of it.

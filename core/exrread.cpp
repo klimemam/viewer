@@ -19,8 +19,6 @@
 // by the name the format itself uses for it.
 #include "exrread.h"
 
-#ifdef VIEWER_WITH_EXR
-
 #include <cstring>
 
 #include <IexBaseExc.h>
@@ -37,21 +35,9 @@
 #include <OpenEXRConfig.h>
 #include <half.h>
 
-#endif  // VIEWER_WITH_EXR
-
 namespace imagefile {
 
-#ifndef VIEWER_WITH_EXR
-
-const char* const EXR_LIBRARY = "";
-const char* const EXR_ABSENT =
-    "this build was configured with -DVIEWER_WITH_EXR=OFF, so no OpenEXR is linked";
-bool (*const EXR_DECODE)(const uint8_t*, size_t, std::vector<Image>&, std::string&) = nullptr;
-
-#else
-
 const char* const EXR_LIBRARY = "OpenEXR " OPENEXR_VERSION_STRING;
-const char* const EXR_ABSENT = nullptr;
 
 namespace {
 
@@ -307,8 +293,13 @@ bool readLayer(Imf::InputFile& in, const Layer& L, const Imath::Box2i& dw,
     return true;
 }
 
-// (not named `decode`: imagefile::decode is the seam's own entry point, and an
-// overload of it one namespace down is a trap for the next reader)
+}  // namespace
+
+// The one function core/imagefile.cpp's table points at.
+//
+// (not named `decode`: imagefile::decode is the seam's own entry point, and
+// this lives in that same namespace, so the name would overload it - a trap
+// for the next reader. tiffDecode and y4mDecode are named the same way.)
 bool exrDecode(const uint8_t* p, size_t n, std::vector<Image>& out, std::string& err) {
     initThreads();
     std::vector<Layer> layers;
@@ -341,11 +332,5 @@ bool exrDecode(const uint8_t* p, size_t n, std::vector<Image>& out, std::string&
     }
     return true;
 }
-
-}  // namespace
-
-bool (*const EXR_DECODE)(const uint8_t*, size_t, std::vector<Image>&, std::string&) = &exrDecode;
-
-#endif  // VIEWER_WITH_EXR
 
 }  // namespace imagefile
