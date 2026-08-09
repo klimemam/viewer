@@ -1092,6 +1092,82 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     return true;
 }
 
+// The stack AROUND a remote frame that is already open: the SeqInfo, the
+// membership, and the background fetch for every other file of the folder.
+// Returns the seqId, 0 when there was nothing to make.
+//
+// Two callers, because there are two ways to arrive with the head frame open.
+// openRemoteStack below opens files[0] and calls this. A SESSION RESTORE
+// already has its head open when it reads `seqload` - and that head is the
+// frame the stack was LEFT on, which is usually not files[0] - so it calls
+// this directly rather than opening a second copy of frame 0. One place
+// decides what a remote folder stack is; the head's position in the list is a
+// parameter, not an assumption.
+static int attachRemoteStack(ImageDoc* first, const std::string& host,
+                             const std::vector<std::string>& files,
+                             const std::string& name, int port, int token) {
+    if (!first || files.empty()) return 0;
+    int headIdx = 0;
+    for (int i = 0; i < (int)files.size(); i++)
+        if (makeRemoteUrl(host, files[i], port) == first->src->path) { headIdx = i; break; }
+    App::SeqInfo si;
+    si.id = app.nextSeqId++;
+    // A scan names the stack by its folder ("10lx/frame_#.npy"): seven stacks
+    // all called frame_000.npy would be indistinguishable in every panel, and
+    // the linearity Auto-levels reads the level from exactly this name.
+    si.name = !name.empty() ? name : baseName(files[0]);
+    si.remoteHost = host;             // folder stack: one file per frame
+    si.remotePort = port;
+    si.expectedFrames = (int)files.size();
+    si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
+    for (const auto& f : files) si.remoteFiles.push_back(f);
+    // where the user is standing, so the next session line is written from the
+    // frame the stack was left on (startSequenceLoad records the same fact for
+    // a local folder stack; this path never did, so a restored remote stack
+    // saved its FIRST frame's state next time round whatever was on screen)
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i].get() == first) { si.lastImageIdx = i; break; }
+    app.seqs.push_back(si);
+    first->seqId = si.id;
+    first->seqIndex = headIdx;
+    noteGroupStack(token, si.id);
+    maybeRequestServerTemporal(si.id);
+    size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
+    if (first->src->remoteStep > 1)               // preview dims: scale the estimate
+        perFrame *= (size_t)first->src->remoteStep * first->src->remoteStep;
+    size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
+    int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
+    int queued = 0;
+    for (int i = 0; i < (int)files.size() && queued < fit; i++) {
+        if (i == headIdx) continue;               // it is already here
+        App::RFetchJob j;
+        j.url = makeRemoteUrl(host, files[i], port);
+        j.name = baseName(files[i]);
+        j.note = first->note;         // every file of the folder came from the same
+                                      // peer, so they say so identically or not at all
+        j.seqId = si.id;
+        j.seqIndex = i;
+        j.bytes = perFrame;
+        {   // per-file baseline: a folder stack's members are separate files,
+            // so each job stats ITS file (identity before bytes; 0/0 for ssh://)
+            FrameSource fs;
+            fs.remoteUrl = j.url;
+            statLocalUrl(fs);
+            j.mtime = fs.mtime; j.fsize = fs.fsize;
+        }
+        rfEnqueue(std::move(j));
+        queued++;
+    }
+    if (queued < (int)files.size() - 1) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "memory budget: fetching %d of %d frames\n"
+                 "(File > Stack loading > Memory budget)", queued + 1, (int)files.size());
+        app.seqNote = msg;
+    }
+    return si.id;
+}
+
 // A remote folder of numbered .npy files, opened as one stack: the first file
 // shows immediately, the rest arrive in the background and slot in as ordinary
 // local frames. Processing never moves - the pixels do, once each.
@@ -1115,52 +1191,47 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         noteGroupStack(token, first->seqId);
         return;
     }
-    App::SeqInfo si;
-    si.id = app.nextSeqId++;
-    // A scan names the stack by its folder ("10lx/frame_#.npy"): seven stacks
-    // all called frame_000.npy would be indistinguishable in every panel, and
-    // the linearity Auto-levels reads the level from exactly this name.
-    si.name = !name.empty() ? name : baseName(files[0]);
-    si.remoteHost = host;             // folder stack: one file per frame
-    si.remotePort = port;
-    si.expectedFrames = (int)files.size();
-    si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
-    for (const auto& f : files) si.remoteFiles.push_back(f);
-    app.seqs.push_back(si);
-    first->seqId = si.id;
-    first->seqIndex = 0;
-    noteGroupStack(token, si.id);
-    maybeRequestServerTemporal(si.id);
-    size_t perFrame = (size_t)first->w * first->h * first->ch * sizeof(float);
-    if (first->src->remoteStep > 1)               // preview dims: scale the estimate
-        perFrame *= (size_t)first->src->remoteStep * first->src->remoteStep;
-    size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
-    int fit = (int)std::min<size_t>(files.size() - 1, perFrame ? room / perFrame : 0);
-    for (int i = 1; i <= fit; i++) {
-        App::RFetchJob j;
-        j.url = makeRemoteUrl(host, files[i], port);
-        j.name = baseName(files[i]);
-        j.note = first->note;         // every file of the folder came from the same
-                                      // peer, so they say so identically or not at all
-        j.seqId = si.id;
-        j.seqIndex = i;
-        j.bytes = perFrame;
-        {   // per-file baseline: a folder stack's members are separate files,
-            // so each job stats ITS file (identity before bytes; 0/0 for ssh://)
-            FrameSource fs;
-            fs.remoteUrl = j.url;
-            statLocalUrl(fs);
-            j.mtime = fs.mtime; j.fsize = fs.fsize;
-        }
-        rfEnqueue(std::move(j));
+    attachRemoteStack(first, host, files, name, port, token);
+}
+
+// The siblings of a remote frame, from the PEER's own listing of its folder:
+// findSequenceSiblings' remote twin. It cannot be that function - that one
+// walks this filesystem with parent_path/directory_iterator and returns
+// nothing at all for an "ssh://..." or "local://..." url - and it must not be
+// a second grouping rule either, so it asks the peer, whose grouper is the one
+// the Browse panel's group rows already come from (and which shares
+// rp::patternWithExtent with the local scan, so a folder opened either way
+// produces the same stack name).
+//
+// Synchronous, on app.uiSession, exactly like the openRemote that just fetched
+// this frame's pixels a few lines earlier in the same restore - one LIST after
+// a META and a TILE.
+static bool remoteSequenceSiblings(const std::string& url,
+                                   std::vector<std::string>& filesOut,
+                                   std::string& nameOut, std::string& err) {
+    std::string host, rpath;
+    int port = 0;
+    if (!remote::parseUrl(url, host, rpath, &port)) { err = "not a remote url: " + url; return false; }
+    size_t sl = rpath.find_last_of('/');
+    if (sl == std::string::npos) { err = url + ": no folder to list"; return false; }
+    const std::string dir = sl == 0 ? std::string("/") : rpath.substr(0, sl);
+    const std::string base = rpath.substr(sl + 1);
+    if (!ensureUiSession(host, err, port)) return false;
+    std::vector<remote::Entry> entries;
+    if (!app.uiSession.list(dir, entries, err)) return false;
+    for (const auto& e : entries) {
+        if (!e.group || e.members.size() < 2) continue;
+        bool mine = false;
+        for (const auto& m : e.members) if (m == base) { mine = true; break; }
+        if (!mine) continue;
+        for (const auto& m : e.members)
+            filesOut.push_back(dir == "/" ? "/" + m : dir + "/" + m);   // RbRow::join
+        nameOut = stackNameFor(dir, e.name);
+        return true;
     }
-    if (fit < (int)files.size() - 1) {
-        char msg[160];
-        snprintf(msg, sizeof msg,
-                 "memory budget: fetching %d of %d frames\n"
-                 "(File > Stack loading > Memory budget)", fit + 1, (int)files.size());
-        app.seqNote = msg;
-    }
+    err = base + ": " + (host.empty() ? std::string(PEER_HERE) : host) +
+          " lists no sibling group for it in " + dir;
+    return false;
 }
 
 // fwd: needs computeStackStats, defined below. The fold defaults to mean -

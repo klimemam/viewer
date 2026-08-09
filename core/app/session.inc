@@ -2,6 +2,14 @@
 static bool openRemote(const std::string& url, bool asPreview, int frame);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
+// the two halves of restoring a REMOTE folder stack: ask the peer which files
+// are its siblings, then build the stack around the frame that is already open
+static bool remoteSequenceSiblings(const std::string& url,
+                                   std::vector<std::string>& filesOut,
+                                   std::string& nameOut, std::string& err);
+static int attachRemoteStack(ImageDoc* first, const std::string& host,
+                             const std::vector<std::string>& files,
+                             const std::string& name, int port, int token);
 // (makeRemoteUrl: extern since P7, declared in core/browse/host.h - which the
 // spine includes before this fragment - so no local redeclaration here.)
 // ---------------------------------------------------------------- session save/load
@@ -1667,6 +1675,11 @@ static std::string loadSession(const std::string& path) {
     app.selectedAnn = 0;
     app.annRev++;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
+    // ...and the other loss this file can suffer: the image line opened, but
+    // the STACK around it could not be rebuilt, so what came back is one frame
+    // where the session recorded many. Counted separately because it is a
+    // different sentence - the picture is here, the stack is not.
+    std::vector<std::string> stackFailures;
     int selAnnIndex = -1;
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     int pendingLut = -1;
@@ -2080,11 +2093,47 @@ static std::string loadSession(const std::string& path) {
             // only if that image actually loaded, and not when it is already a
             // stack (an in-file frame axis) - that would split it in two
             if (on && lastImageOk && cur() && !cur()->src->path.empty() && cur()->seqId == 0) {
-                std::string pat;
-                std::vector<std::string> files = findSequenceSiblings(cur()->src->path, pat);
-                // queued, not started: see App::seqRestore
-                if (files.size() >= 2)
-                    app.seqRestore.push_back({ cur()->uid, std::move(files), pat, {}, {}, {}, {} });
+                const std::string p = cur()->src->path;
+                const bool isRemote = p.compare(0, 6, "ssh://") == 0 ||
+                                      p.compare(0, 8, "local://") == 0;
+                if (isRemote) {
+                    // A folder stack whose frames live on a peer. Its siblings
+                    // are a LISTING, and findSequenceSiblings below walks THIS
+                    // filesystem: handed a url it returns nothing, so this
+                    // branch used to fall through doing nothing and saying
+                    // nothing. A thirty-frame sweep came back as one loose
+                    // frame with its name and its hand-typed axis gone, its
+                    // series member unresolvable, and a toast that read clean -
+                    // while the same folder opened through File > Open restored
+                    // perfectly, which made the difference look like the user's
+                    // mistake. Ask the peer for the folder, exactly as the
+                    // Browse row that opened it did, and hand the head to the
+                    // one function that knows what a remote folder stack is.
+                    std::vector<std::string> files;
+                    std::string nm, why;
+                    if (remoteSequenceSiblings(p, files, nm, why) && files.size() >= 2) {
+                        std::string host, rp;
+                        int port = 0;
+                        remote::parseUrl(p, host, rp, &port);
+                        attachRemoteStack(cur(), host, files, nm, port, 0);
+                    } else {
+                        stackFailures.push_back(why.empty() ? p + ": its folder could not "
+                                                              "be listed" : why);
+                    }
+                } else {
+                    std::string pat;
+                    std::vector<std::string> files = findSequenceSiblings(p, pat);
+                    // queued, not started: see App::seqRestore
+                    if (files.size() >= 2)
+                        app.seqRestore.push_back({ cur()->uid, std::move(files), pat,
+                                                   {}, {}, {}, {} });
+                    else
+                        // the same silence, on this disk: the folder is gone or
+                        // has lost its numbering, and the stack the file asked
+                        // for is one frame now. Say which.
+                        stackFailures.push_back(baseName(p) + ": no sibling frames beside "
+                                                              "it any more");
+                }
             }
         }
         else if (key == "ann") {
@@ -2289,6 +2338,16 @@ static std::string loadSession(const std::string& path) {
         for (size_t i = 0; i < failures.size() && i < 5; i++) msg += "  " + failures[i] + "\n";
         if (failures.size() > 5) msg += "  ...";
         toast(msg, true);
+    }
+    if (!stackFailures.empty()) {
+        std::string msg = std::to_string(stackFailures.size()) +
+                          " stack(s) came back as a single frame:\n";
+        for (size_t i = 0; i < stackFailures.size() && i < 5; i++)
+            msg += "  " + stackFailures[i] + "\n";
+        if (stackFailures.size() > 5) msg += "  ...";
+        toast(msg, true);
+        fprintf(stderr, "session: %zu stack(s) could not be rebuilt; the first is: %s\n",
+                stackFailures.size(), stackFailures.front().c_str());
     }
     g_sessionRestoring = false;        // deferred refs resolve at the drain gate
     markAllTexDirty();                 // gamma may have changed

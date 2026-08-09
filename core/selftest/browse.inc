@@ -405,6 +405,133 @@
                         got.c_str(), lvl, src.c_str(), multi.c_str(),
                         idOk ? "ok" : "FAIL");
                 if (!idOk) ok = false;
+
+                {   // ---- THE SAME STACK, THROUGH A SESSION --------------------
+                    // A folder stack opened from Browse is one doc per FILE, and
+                    // its membership lives only in SeqInfo::remoteFiles, which
+                    // the session never wrote. On restore the image line reopened
+                    // ONE url and `seqload 1` handed the head to
+                    // findSequenceSiblings - a local directory scan, which
+                    // returns nothing for an ssh:// or local:// url. So a
+                    // thirty-frame sweep came back as one loose frame, with its
+                    // name and its hand-typed axis gone and a series member
+                    // silently unresolvable - and nothing anywhere said so. The
+                    // same folder opened through File > Open restores correctly,
+                    // which is what made it read as the user's mistake.
+                    //
+                    // Whether the peer is reached over ssh or over a pipe is not
+                    // what this is about: local:// is the same url shape, the
+                    // same code path and the same listing, which is why the
+                    // whole remote side of the suite is tested through it.
+                    auto drainRemote = [&](double budget) {
+                        double t = nowSec();
+                        while (nowSec() - t < budget) {
+                            pumpRemoteBrowse();
+                            pumpRemoteFetch();
+                            pumpRemoteOpenQueue();
+                            pumpSequenceAndQueue();
+                            if (loadingSettled() && app.rfPending == 0 &&
+                                app.seqRestore.empty()) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        }
+                    };
+                    drainRemote(120.0);
+                    int sid0 = app.seqs.empty() ? 0 : app.seqs.back().id;
+                    size_t n0 = sid0 ? framesOfSeq(sid0).size() : 0;
+                    const char* RNAME = "10lx dark";
+                    if (sid0) seqInfo(sid0)->name = RNAME;      // the user's own name
+                    // ...and the frame the stack was left on, which is not the head
+                    if (n0 >= 3) selectImage(framesOfSeq(sid0)[2]);
+                    std::error_code rec;
+                    const std::string rsess =
+                        (std::filesystem::temp_directory_path(rec) /
+                         "viewer_browse_remotestack.vsession").u8string();
+                    saveSession(rsess, true);
+                    std::string rerr = loadSession(rsess);
+                    drainRemote(180.0);
+                    int sid1 = app.seqs.empty() ? 0 : app.seqs.back().id;
+                    std::vector<int> fr1 = sid1 ? framesOfSeq(sid1) : std::vector<int>();
+                    std::string name1 = sid1 ? seqInfo(sid1)->name : std::string();
+                    int urls = 0;
+                    for (const auto& d : app.images)
+                        if (d->src->path.rfind("local://", 0) == 0) urls++;
+                    fprintf(stderr, "browseselftest: remote folder stack through a "
+                                    "session: %zu frame(s) saved -> err=\"%s\", %zu doc(s) "
+                                    "(%d remote), %zu stack(s), %zu frame(s) in it, "
+                                    "name '%s'\n",
+                            n0, rerr.c_str(), app.images.size(), urls, app.seqs.size(),
+                            fr1.size(), name1.c_str());
+                    if (n0 < 3) {
+                        fprintf(stderr, "browseselftest: remote session: the fixture "
+                                        "gave only %zu frame(s)\n", n0);
+                        ok = false;
+                    }
+                    bool backOk = rerr.empty() && app.seqs.size() == 1 &&
+                                  fr1.size() == n0;
+                    fprintf(stderr, "browseselftest: remote folder stack restored whole: "
+                                    "%s\n", backOk ? "ok" : "FAIL");
+                    if (!backOk) ok = false;
+                    if (name1 != RNAME) {
+                        fprintf(stderr, "browseselftest: remote stack name after restore: "
+                                        "'%s' (wanted '%s') FAIL\n",
+                                name1.c_str(), RNAME);
+                        ok = false;
+                    }
+                    {   // frame ⊂ stack ⊂ batch, and the frame it was left on
+                        int offBatch = 0;
+                        for (int idx : fr1)
+                            if (!fr1.empty() && app.images[idx]->batchId !=
+                                                app.images[fr1.front()]->batchId) offBatch++;
+                        const ImageDoc* c = cur();
+                        bool posOk = c && c->seqId == sid1 && c->seqIndex == 2;
+                        fprintf(stderr, "browseselftest: restored remote stack: %d frame(s) "
+                                        "off-batch, standing on frame %d: %s\n",
+                                offBatch, c ? c->seqIndex : -1,
+                                (offBatch == 0 && posOk) ? "ok" : "FAIL");
+                        if (offBatch || !posOk) ok = false;
+                    }
+                    {   // ---- and when the folder CANNOT give the stack back ---
+                        // The other half of this defect was the silence: the old
+                        // code did nothing and said nothing, so a stack that came
+                        // back as one frame was indistinguishable from a stack
+                        // that had always been one frame. Point a session at a
+                        // remote file the peer groups with nothing (rb/dark.npy
+                        // is a lone file) and ask for a stack around it.
+                        const std::string lone =
+                            (std::filesystem::temp_directory_path(rec) /
+                             "viewer_browse_lonestack.vsession").u8string();
+                        {
+                            std::ofstream lf(pathFromUtf8(lone), std::ios::binary);
+                            lf << "viewer-session 1\n"
+                               << "image 0 1 npy3 0 0 0 0 0 0 0 local://" << dir
+                               << "/dark.npy\n"
+                               << "seqload 1\n";
+                        }
+                        size_t logBefore = app.msgLog.size();
+                        closeAll();
+                        std::string lerr2 = loadSession(lone);
+                        drainRemote(60.0);
+                        bool said = false;
+                        for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                            if (app.msgLog[i].text.find("came back as a single frame") !=
+                                    std::string::npos &&
+                                app.msgLog[i].text.find("dark.npy") != std::string::npos &&
+                                app.msgLog[i].err)
+                                said = true;
+                        fprintf(stderr, "browseselftest: a remote stack that cannot be "
+                                        "rebuilt: err=\"%s\" %zu doc(s), %zu stack(s), "
+                                        "reported=%d\n", lerr2.c_str(), app.images.size(),
+                                app.seqs.size(), (int)said);
+                        if (!lerr2.empty() || app.images.size() != 1 ||
+                            !app.seqs.empty() || !said) {
+                            fprintf(stderr, "browseselftest: the loss must be SAID, not "
+                                            "silently restored as one frame FAIL\n");
+                            ok = false;
+                        }
+                        std::filesystem::remove(std::filesystem::u8path(lone), rec);
+                    }
+                    std::filesystem::remove(std::filesystem::u8path(rsess), rec);
+                }
                 closeAll();
             }
         }
