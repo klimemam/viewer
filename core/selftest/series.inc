@@ -1166,8 +1166,14 @@
         {
             closeAll();
             std::error_code nec;
+            // In the per-test TEMP dir, NOT under the fixture tree: linset/ is
+            // counted (--lin asserts exactly 7 levels, --scan walks it), and a
+            // scratch folder left in there by a test that died would be an
+            // eighth level for a different test entirely. viewer_selftest()
+            // gives every test its own TMP, so this cannot collide either.
             std::filesystem::path ndir =
-                std::filesystem::path(pathFromUtf8(g_seriesSelftest)) / "npzmember-scratch";
+                std::filesystem::temp_directory_path(nec) / "viewer_npzmember_scratch";
+            std::filesystem::remove_all(ndir, nec);
             std::filesystem::create_directories(ndir, nec);
             std::vector<uint16_t> pxD((size_t)3 * 64), pxB((size_t)3 * 64);
             for (int f = 0; f < 3; f++)
