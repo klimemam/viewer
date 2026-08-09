@@ -28,6 +28,9 @@ static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk 
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
 static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
 static std::string g_asetSelftest;      // --aset-selftest <dir>: AnalysisSet transport/binding/session, exit
+static std::string g_setAnalysisSelftest; // --setanalysis-selftest <dir>: direct DSNU / PRNU
+                                          // over a bound set (#57 判断4) + the famous-name
+                                          // scan of the shipping sources, exit
 // --roistats-selftest: the ROI table's NUMBERS, through the real panel, with no
 // window. It takes no directory because it needs no file: every fixture it
 // measures is analytic and built in memory (see roiStatsSelftest()).
@@ -615,6 +618,8 @@ static void parseCli(int argc, char** argv) {
             g_verifySelftest = next();             // handled in main()
         } else if (a == "--aset-selftest") {
             g_asetSelftest = next();               // handled in main()
+        } else if (a == "--setanalysis-selftest") {
+            g_setAnalysisSelftest = next();        // handled in main()
         } else if (a == "--derive-selftest") {
             g_deriveSelftest = next();             // handled in main()
         } else if (a == "--stackavg-selftest") {

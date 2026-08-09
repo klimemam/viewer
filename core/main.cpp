@@ -115,6 +115,8 @@ App app;
 
 #include "app/temporal_model.inc"
 
+#include "app/setanalysis.inc"
+
 #include "app/open_dispatch.inc"
 
 // ---------------------------------------------------------------- view helpers
@@ -891,6 +893,8 @@ int main(int argc, char** argv) {
     #include "selftest/verify.inc"
 
     #include "selftest/aset.inc"
+
+    #include "selftest/setanalysis.inc"
 
     #include "selftest/derive.inc"
 
