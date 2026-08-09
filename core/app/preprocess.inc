@@ -95,6 +95,24 @@ static bool detrendStackProduct(int seqId, const DetrendSpec& sp, std::string& e
     }
     if (!ref) { err = "detrend: no frame of \"" + srcName + "\" is loaded yet"; return false; }
     const int W = ref->w, H = ref->h, C = ref->ch;
+    // A product is a SECOND copy of the pixels - that is what makes it ordinary
+    // data, and it is also what makes it expensive. The stack loader already
+    // stops at a budget rather than at an allocation failure (seqMemBudget), so
+    // this asks the same question before it starts rather than dying halfway
+    // with half a stack minted. Refused out loud, with both numbers.
+    {
+        const size_t need = (size_t)W * H * C * sizeof(float) * use.size();
+        const size_t room = seqMemBudget() - std::min(seqMemBudget(), claimedImageBytes());
+        if (need > room) {
+            char b[224];
+            snprintf(b, sizeof b,
+                     "detrend: the product would need %.1f GB and %.1f GB of the memory "
+                     "budget is left - a product is a second copy of the pixels",
+                     need / 1073741824.0, room / 1073741824.0);
+            err = b;
+            return false;
+        }
+    }
     const int refCfa = ref->cfa, refCfaPat = ref->cfaPattern, refLut = ref->displayLut;
     const bool refColorize = ref->cfaColorize;
     const float refBlack = ref->black, refWhite = ref->white;
