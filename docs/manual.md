@@ -469,6 +469,20 @@ stack の時間軸を畳んで **1枚の frame** として開けます。畳み�
 | Files で stack 行を右クリック > **Open frame sum** | sum(画素ごとの時間和) |
 | Browse の各「Open as frame average」/ Temporal の同名ボタン | mean(名前どおり平均のみ) |
 
+- **average は stack の中で完結します**(2026-08-05 の裁定)。Browse で複数行を
+  選んで「Open N selected as ... frame averages」を選ぶと、**選んだ stack の数だけ
+  平均が開きます** — 3 stack を選べば 3 枚で、24 枚を混ぜた 1 枚ではありません。
+  露出やゲインの違う別 stack のフレームは**同じ時間軸に居ない**ので、混ぜた平均は
+  もっともらしく見えて意味がありません。メニュー項目自体が「(one per stack)」と
+  枚数を先に言い、実行後にも枚数をトーストで言います
+  - 内訳の決まり: **連番行(group)= その stack 全部** / **展開したフレーム行 =
+    その stack のうち選んだ枚数だけ**(1 stack 内で N 枚選べば従来どおり 1 枚) /
+    **単独の .npy 行 = それ自身**(その行を単独で右クリックしたときと同じ結果)
+  - 「stack ではないファイルどうしを平均したい」ときは、先に
+    **Open N selected as stack** で 1 つの stack として開き、それを平均してください
+    (「これらは 1 つの stack だ」と宣言する一手が要る、という意味です)
+  - 形の違う stack を混ぜて選んでも平均は通ります(1 つに束ねないので)。
+    束ねる **Open N selected as stack** のほうは従来どおり形の一致が要ります
 - 結果は stack ではなく **frame** です(Files では単発 frame として batch に
   ぶら下がります)。なので Histogram / Projection / ROIs がそのまま効きます —
   時間平均画像の空間 σ は σ_fpn そのもの

@@ -107,6 +107,36 @@ void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
 void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
                     int firstRow, std::vector<int>& out);
 
+// ---- #81: a multi-row selection is a SET OF STACKS ---------------------------
+// One element of it: the files of ONE stack and the name that stack answers to.
+// The frame average used to flatten the ticked rows into a single file list and
+// take one mean over the lot, so eight frames from each of three stacks came
+// out as ONE picture of twenty-four - a mean across three time axes, wearing a
+// name (patternOfNames over all 24 basenames) that made them look like one
+// stack. 2026-08-05, the user's ruling: 「average はあくまでも stack で完結する」.
+//
+// So the selection is PARTITIONED by the stack each row belongs to, and every
+// part is averaged on its own. The partition asks each row the same question
+// its own right-click menu asks:
+//   * a group row        -> that stack, all of its frames;
+//   * expanded frame rows-> their stack, the frames you actually ticked (this
+//                           is the case that was already right: N frames of ONE
+//                           stack are ONE average, and stay one);
+//   * a plain .npy row   -> itself, its own frame axis, exactly as that row's
+//                           "Open as frame average" would open it.
+// Rows that can never be a stack (folders, "..", non-.npy) are dropped here;
+// the panel's gate refuses the whole selection before that can matter.
+//
+// Free function, like rbBuildView above, so the NOGL selftests partition the
+// same rows the panel draws. It decides nothing about VIEWING - it hands back
+// file lists and names, which is all the seam ever carried.
+struct RbAvgStack {
+    std::string name;                  // stackNameFor(): what it opens as
+    std::vector<std::string> files;    // natural frame order, ready to open
+};
+std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
+                                          const std::vector<char>& sel);
+
 // deferred panel actions - see panel.cpp rbDefer for the ownership story. The
 // selftests queue through the same door the panel does, so the door is here.
 void rbDefer(std::function<void()> f);

@@ -408,6 +408,216 @@
                 closeAll();
             }
         }
+        {   // ---- #81: A MULTI-ROW SELECTION IS A SET OF STACKS ----------------
+            // The reported defect, in the reporter's own numbers: eight frames
+            // from each of three stacks came out as ONE average of twenty-four.
+            // rb/scanroot is exactly that shape - 10lx, 20lx, 40lx, eight frames
+            // each - and it is also the cruellest version of it, because all
+            // twenty-four members are called frame_000.npy..frame_007.npy. The
+            // old code took patternOfNames over those basenames and got
+            // "frame_???.npy", so three stacks came out under one plausible
+            // name: the picture did not merely mean nothing, it said it came
+            // from somewhere it did not.
+            //
+            // Driven through the same functions the panel draws with -
+            // rbBuildView for the rows, rbSelectionStacks for the partition,
+            // openStackForAverage for each open - so this passes only if the
+            // menu item does.
+            // Wait for `want` averages - and STOP WAITING once the loaders have
+            // been idle a while with fewer than that, or a failing run spends
+            // the whole budget proving something it already knows.
+            auto settle = [&](int want) {
+                double t = nowSec(), calm = 0;
+                while (nowSec() - t < 120.0) {
+                    pumpRemoteBrowse();
+                    pumpRemoteFetch();
+                    pumpRemoteOpenQueue();
+                    pumpSequenceAndQueue();     // pumpStackAverages rides in here
+                    int n = 0;
+                    for (const auto& d : app.images) if (!d->avgOfPath.empty()) n++;
+                    bool idle = loadingSettled() && app.pendingAvg.empty();
+                    if (idle && n >= want) break;
+                    if (!idle) calm = 0;
+                    else if (!calm) calm = nowSec();
+                    else if (nowSec() - calm > 2.0) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            auto averages = [&]() {
+                std::vector<const ImageDoc*> v;
+                for (const auto& d : app.images) if (!d->avgOfPath.empty()) v.push_back(d.get());
+                return v;
+            };
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : ", ") + n;
+                return s;
+            };
+            // Three stacks in ONE view: the tree, with the three level folders
+            // expanded. (Three group rows cannot appear in a flat LISTING -
+            // they live in three directories - and the tree is how a user
+            // reaches them without navigating away from the first two.)
+            std::string scanroot = dir + "/scanroot";
+            remoteBrowseTo(rbMain(), scanroot);
+            double tS = nowSec();
+            while (nowSec() - tS < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == scanroot && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            const std::vector<std::string> lvs = { "10lx", "20lx", "40lx" };
+            for (const auto& lv : lvs) {
+                rbTreeExpand(rbMain(), scanroot + "/" + lv);
+                double t1 = nowSec();
+                while (nowSec() - t1 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (rbMain().treeCache.count(scanroot + "/" + lv)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            std::vector<RbRow> tv = rbBuildView(rbMain(), &B.dir, B.entries, false, true);
+            std::vector<char> sel(tv.size(), 0);
+            int ticked = 0;
+            for (size_t i = 0; i < tv.size(); i++)
+                if (tv[i].isGroup()) { sel[i] = 1; ticked++; }
+            std::vector<RbAvgStack> parts = rbSelectionStacks(tv, sel);
+            // What the partition claims, before a single pixel moves.
+            std::vector<std::string> pNames;
+            int totalFiles = 0;
+            bool eight = parts.size() == lvs.size(), homed = !parts.empty();
+            for (size_t k = 0; k < parts.size(); k++) {
+                pNames.push_back(parts[k].name + " x" + std::to_string(parts[k].files.size()));
+                totalFiles += (int)parts[k].files.size();
+                if (parts[k].files.size() != 8) eight = false;
+                // every file of a part comes from that part's OWN folder: this
+                // is the assertion the old one-list code cannot satisfy at any
+                // size, because it had one list
+                if (k < lvs.size() && parts[k].name.rfind(lvs[k] + "/", 0) != 0) homed = false;
+                for (const auto& f : parts[k].files)
+                    if (k < lvs.size() &&
+                        f.rfind(scanroot + "/" + lvs[k] + "/", 0) != 0) homed = false;
+            }
+            bool distinct = true;
+            for (size_t a = 0; a < parts.size(); a++)
+                for (size_t b = a + 1; b < parts.size(); b++)
+                    if (parts[a].name == parts[b].name) distinct = false;
+            bool partOk = ticked == 3 && parts.size() == 3 && eight && homed &&
+                          distinct && totalFiles == 24;
+            fprintf(stderr, "browseselftest: #81 partition: %d group row(s) ticked in "
+                            "%s -> %d stack(s) [%s], %d file(s) total, names distinct=%d, "
+                            "each under its own folder=%d: %s\n",
+                    ticked, scanroot.c_str(), (int)parts.size(), say(pNames).c_str(),
+                    totalFiles, distinct ? 1 : 0, homed ? 1 : 0, partOk ? "ok" : "FAIL");
+            if (!partOk) ok = false;
+            // ...and now open them, because a partition that nothing acts on is
+            // not the bug. THREE averages must appear, each over its own eight
+            // frames, each named for the stack it is the mean of.
+            closeAll();
+            for (const auto& s : parts) openStackForAverage(B.host, s.files, s.name, B.port);
+            settle((int)parts.size());
+            std::vector<const ImageDoc*> avg = averages();
+            std::vector<std::string> aNames;
+            bool counts = avg.size() == 3, named = avg.size() == 3;
+            std::vector<int> srcSeqs;
+            for (const auto* d : avg) {
+                aNames.push_back(d->name + " [" + std::to_string(d->avgSrcCount) + "]");
+                if (d->avgSrcCount != 8) counts = false;
+                srcSeqs.push_back(d->avgSeqId);
+            }
+            for (const auto& lv : lvs) {              // one average per level, by name
+                int hits = 0;
+                for (const auto* d : avg) if (d->name.rfind(lv + "/", 0) == 0) hits++;
+                if (hits != 1) named = false;
+            }
+            // ...and each of them is the mean of a DIFFERENT stack: the #82
+            // provenance every average carries is what makes that checkable.
+            bool ownStack = srcSeqs.size() == 3;
+            for (size_t a = 0; a < srcSeqs.size(); a++) {
+                if (!srcSeqs[a] || !seqInfo(srcSeqs[a])) ownStack = false;
+                for (size_t b = a + 1; b < srcSeqs.size(); b++)
+                    if (srcSeqs[a] == srcSeqs[b]) ownStack = false;
+            }
+            bool openOk = counts && named && ownStack && (int)app.seqs.size() == 3;
+            fprintf(stderr, "browseselftest: #81 opens: 3 stacks selected -> %d average(s) "
+                            "[%s] over %d stack(s), 8 frames each=%d, one per level=%d, "
+                            "each from its own stack=%d: %s\n",
+                    (int)avg.size(), say(aNames).c_str(), (int)app.seqs.size(),
+                    counts ? 1 : 0, named ? 1 : 0, ownStack ? 1 : 0,
+                    openOk ? "ok" : "FAIL");
+            if (!openOk) ok = false;
+            closeAll();
+            rbTreeForget(rbMain());
+            // The case that was ALREADY right, pinned so the fix cannot
+            // overshoot into it: N frames picked inside ONE stack are ONE
+            // average, of exactly those frames, and they still are.
+            remoteBrowseTo(rbMain(), scanroot + "/10lx");
+            double t2 = nowSec();
+            while (nowSec() - t2 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == scanroot + "/10lx" && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> fv3 = rbBuildView(rbMain(), &B.dir, B.entries, true, false);
+            std::vector<char> sel1(fv3.size(), 0);
+            int members = 0;
+            for (size_t i = 0; i < fv3.size(); i++)
+                if (fv3[i].member >= 0) { sel1[i] = 1; members++; }
+            std::vector<RbAvgStack> one = rbSelectionStacks(fv3, sel1);
+            for (const auto& s : one) openStackForAverage(B.host, s.files, s.name, B.port);
+            settle((int)one.size());
+            std::vector<const ImageDoc*> a1 = averages();
+            bool oneOk = one.size() == 1 && members == 8 && one[0].files.size() == 8 &&
+                         a1.size() == 1 && a1[0]->avgSrcCount == 8 &&
+                         a1[0]->name.rfind("10lx/", 0) == 0;
+            fprintf(stderr, "browseselftest: #81 one stack stays one: %d frame row(s) of "
+                            "10lx ticked -> %d stack(s) of %d file(s) -> %d average(s) "
+                            "'%s' over %d frame(s): %s\n",
+                    members, (int)one.size(), one.empty() ? 0 : (int)one[0].files.size(),
+                    (int)a1.size(), a1.empty() ? "" : a1[0]->name.c_str(),
+                    a1.empty() ? 0 : a1[0]->avgSrcCount, oneOk ? "ok" : "FAIL");
+            if (!oneOk) ok = false;
+            closeAll();
+            // THE MIXED SELECTION, which the issue left open and this change
+            // decides: a row that is not part of a stack is its OWN stack, and
+            // is averaged the way its own right-click menu would average it.
+            // rb's root is the fixture for it - one 24-frame group plus the two
+            // loose .npy files - and the answer is three parts, not one heap and
+            // not two. Nothing here is merged that the listing did not already
+            // show as one thing.
+            remoteBrowseTo(rbMain(), dir);
+            double t3 = nowSec();
+            while (nowSec() - t3 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == dir && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> rv2 = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+            std::vector<char> selM(rv2.size(), 0);
+            int grp2 = 0, loose = 0, other = 0;
+            for (size_t i = 0; i < rv2.size(); i++) {
+                if (rv2[i].up || rv2[i].isDir()) continue;
+                if (rv2[i].isGroup()) { selM[i] = 1; grp2++; }
+                else if (isNpyName(rv2[i].name())) { selM[i] = 1; loose++; }
+                else other++;                       // notes.txt: never ticked
+            }
+            std::vector<RbAvgStack> mix = rbSelectionStacks(rv2, selM);
+            std::vector<std::string> mNames;
+            int fromGroup = 0, fromLoose = 0;
+            for (const auto& s : mix) {
+                mNames.push_back(s.name + " x" + std::to_string(s.files.size()));
+                if (s.files.size() == 24) fromGroup++;
+                else if (s.files.size() == 1) fromLoose++;
+            }
+            bool mixOk = grp2 == 1 && loose == 2 && other == 1 && mix.size() == 3 &&
+                         fromGroup == 1 && fromLoose == 2;
+            fprintf(stderr, "browseselftest: #81 mixed selection in %s: 1 group row + "
+                            "%d loose .npy ticked (%d non-.npy row left out) -> %d stack(s) "
+                            "[%s] (%d whole group, %d on their own): %s\n",
+                    dir.c_str(), loose, other, (int)mix.size(), say(mNames).c_str(),
+                    fromGroup, fromLoose, mixOk ? "ok" : "FAIL");
+            if (!mixOk) ok = false;
+            closeAll();
+        }
         {   // A CANCELLED SCAN'S LATE REPLY. openPickerWith does not merely
             // raise a modal: it clears app.folderPick and resets the picker's
             // root, filter, merge and sweep fields. So the reply from an

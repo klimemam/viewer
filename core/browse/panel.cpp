@@ -276,6 +276,66 @@ void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& show
     std::reverse(out.begin(), out.end());        // outermost first, as drawn
 }
 
+// ---- #81: the ticked rows, partitioned into the stacks they belong to --------
+// See browse.h for the ruling this implements. The whole of the fix is here:
+// the caller no longer gets ONE file list to take ONE mean over, it gets one
+// entry per stack, and it opens each of them. Nothing about a mean, a frame or
+// a pixel is decided in this file - the seam still carries file lists and
+// names, only now it carries the right number of them.
+//
+// The partition key is the ENTRY, not the directory and not the name. That is
+// what makes the two halves fall out of one rule: expanded frames of a stack
+// all point at their group's entry, so ticking eight of them gives one part;
+// three group rows are three entries, so they give three. In tree mode the
+// three may sit in three different folders whose members are all called
+// frame_000.npy - the entry pointer tells them apart where the name cannot.
+std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
+                                          const std::vector<char>& sel) {
+    struct Part {
+        const RbRow* row = nullptr;         // any row of this stack: joins paths
+        bool whole = false;                 // the GROUP row itself was ticked
+        std::vector<std::string> names;     // the frame / file names ticked
+    };
+    std::vector<Part> parts;
+    for (size_t i = 0; i < view.size() && i < sel.size(); i++) {
+        if (!sel[i]) continue;
+        const RbRow& r = view[i];
+        // "(listing...)", "..", folders and non-.npy can never be a stack. The
+        // panel's gate has already refused a selection containing one; dropping
+        // them here as well keeps this function total, so a selftest may call it
+        // on any view without first reproducing the gate.
+        if (r.ph || r.up || r.isDir() || !isNpyName(r.name())) continue;
+        Part* p = nullptr;
+        for (auto& q : parts)
+            if (q.row->e == r.e && q.row->dir == r.dir) { p = &q; break; }
+        if (!p) { parts.push_back(Part{ &r, false, {} }); p = &parts.back(); }
+        if (r.isGroup()) p->whole = true;   // the group row means all its frames
+        else p->names.push_back(r.name());
+    }
+    std::vector<RbAvgStack> out;
+    for (const Part& p : parts) {
+        const remote::Entry& e = *p.row->e;
+        const std::vector<std::string>& names = p.whole ? e.members : p.names;
+        if (names.empty()) continue;
+        RbAvgStack s;
+        for (const auto& n : names) s.files.push_back(p.row->join(n));
+        sortFramesNumerically(s.files);     // frame order is a fact, not a sort
+        // The name, by the same rule the row's own menu item uses - which is
+        // what stops three stacks from coming out under one borrowed name.
+        // A subset of a stack's frames is named for what was picked, because
+        // that is what the mean is over; taking all of them (either way of
+        // saying so) is the stack itself, so it keeps the stack's name.
+        if (e.group)
+            s.name = p.whole || names.size() == e.members.size()
+                   ? stackNameFor(*p.row->dir, e.name)
+                   : stackNameFor(*p.row->dir, patternOfNames(names));
+        else
+            s.name = stackNameFor(*p.row->dir, names.front());   // a lone .npy row
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 // ---- deferred panel actions -------------------------------------------------
 // Every row the listing draws is an RbRow: RAW POINTERS into that instance's
 // b.entries and into its tree cache, held in a `view` vector that is rebuilt
@@ -1279,6 +1339,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
         return files;
     };
     std::string rbSelStackWhyNot;        // empty = the selection can stack
+    // ...and the frame average's OWN gate, which is not the same question (#81).
+    // "Open N selected as stack" MERGES the ticked rows into one stack, so every
+    // one of them has to have the same shape or the stack is ragged. The average
+    // no longer merges anything: it is one mean per stack, and two stacks of
+    // different shapes each average perfectly well. Sharing one gate meant a
+    // selection of a 32x32 stack and a 64x64 stack was refused for a reason that
+    // had stopped applying to this verb.
+    std::string rbSelAvgWhyNot;
     bool rbSelTemporalOk = B.peerVersion >= 2;
     {
         const remote::Entry* first = nullptr;
@@ -1287,12 +1355,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
             const remote::Entry& e = *view[i].e;
             if (!isNpyName(view[i].name())) {
                 rbSelStackWhyNot = "only .npy files can form a stack";
+                rbSelAvgWhyNot = "only .npy files can be averaged";
                 rbSelTemporalOk = false;     // MEASURE is npy-only too
                 continue;
             }
             if (!e.hasMeta) {
-                rbSelStackWhyNot = "shape unknown - the peer is protocol 2 "
-                                   "(File > Update remote peer)";
+                rbSelStackWhyNot = rbSelAvgWhyNot =
+                    "shape unknown - the peer is protocol 2 "
+                    "(File > Update remote peer)";
                 continue;
             }
             if (!first) { first = &e; continue; }
@@ -1301,9 +1371,11 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 rbSelStackWhyNot = "selected files differ: " + fmtEntryShape(*first) +
                                    " vs " + fmtEntryShape(e);
         }
-        if (rbNSel < 2) rbSelStackWhyNot = "select two or more files (Ctrl / Shift + click)";
+        if (rbNSel < 2)
+            rbSelStackWhyNot = rbSelAvgWhyNot =
+                "select two or more files (Ctrl / Shift + click)";
     }
-    
+
     // (The protocol-mismatch warning was a conditional full-width orange row
     // here. It is a FACT about the connection that is rarely true and never
     // urgent - exactly the kind of thing the bottom status line was added to
@@ -1918,7 +1990,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 // alone - the pointer beats the ticks, or a menu would act on
                 // something the user is not pointing at.
                 if (isSel && rbNSel >= 2) {
-                    char lb[64];
+                    char lb[96];   // the average item names its stack count too
                     snprintf(lb, sizeof lb, "Open %d selected as stack", rbNSel);
                     if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
                     if (ImGui::MenuItem(lb)) {
@@ -1946,23 +2018,51 @@ void drawPanelRemote(App::BrowseInstance& I) {
                             : "frames stack in natural name order (frame_2 before "
                               "frame_10), NOT the text order this listing is showing");
 
-                    // the same selection as ONE frame - the same gate, because
-                    // it is the same open followed by a mean over it
-                    snprintf(lb, sizeof lb, "Open %d selected as frame average", rbNSel);
-                    if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
+                    // ...and the same selection AVERAGED, which is where it stops
+                    // being the same operation (#81). Above merges the ticked
+                    // rows into one stack; a mean cannot follow it across, so
+                    // this one asks rbSelectionStacks how many stacks are really
+                    // ticked and opens one average per stack. The COUNT is in the
+                    // label, before the click, because "3 stacks -> 3 averages"
+                    // is the whole ruling and it used to be invisible: the item
+                    // said "average" and delivered one picture whether you had
+                    // picked one stack or five.
+                    std::vector<RbAvgStack> avgStacks = rbSelectionStacks(view, rbSel);
+                    const int nAvg = (int)avgStacks.size();
+                    if (nAvg > 1)
+                        snprintf(lb, sizeof lb, "Open %d selected as %d frame averages"
+                                                " (one per stack)", rbNSel, nAvg);
+                    else
+                        snprintf(lb, sizeof lb, "Open %d selected as frame average", rbNSel);
+                    if (!rbSelAvgWhyNot.empty()) ImGui::BeginDisabled();
                     if (ImGui::MenuItem(lb)) {
-                        std::vector<std::string> files = rbSelFiles();
-                        sortFramesNumerically(files);
-                        std::vector<std::string> bases;
-                        for (const auto& f : files) bases.push_back(baseName(f));
-                        g_browseHost.openStackForAverage(B.host, files,
-                                            stackNameFor(B.dir, patternOfNames(bases)), B.port);
+                        for (const auto& s : avgStacks)
+                            g_browseHost.openStackForAverage(B.host, s.files, s.name, B.port);
+                        // Said again AFTER the fact, because the opens are
+                        // asynchronous and land one at a time: without this the
+                        // only evidence of how the selection was read is however
+                        // many pictures eventually appear.
+                        if (nAvg > 1)
+                            g_browseHost.toast(std::to_string(nAvg) + " stacks selected -> " +
+                                               std::to_string(nAvg) +
+                                               " frame averages, one per stack", false);
                         rbSel.assign(view.size(), 0);
                     }
-                    if (!rbSelStackWhyNot.empty()) ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("%s", rbSelStackWhyNot.empty()
-                            ? AVG_TIP : rbSelStackWhyNot.c_str());
+                    if (!rbSelAvgWhyNot.empty()) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        if (!rbSelAvgWhyNot.empty())
+                            ImGui::SetTooltip("%s", rbSelAvgWhyNot.c_str());
+                        else if (nAvg > 1)
+                            ImGui::SetTooltip(
+                                "ONE AVERAGE PER STACK - %d of them here, opened side\n"
+                                "by side. Frames from different stacks are not on the\n"
+                                "same time axis, so they are never folded into one\n"
+                                "mean. To average files that are NOT one stack, use\n"
+                                "\"Open %d selected as stack\" above and average that.\n\n%s",
+                                nAvg, rbNSel, AVG_TIP);
+                        else
+                            ImGui::SetTooltip("%s", AVG_TIP);
+                    }
 
                     snprintf(lb, sizeof lb, "Temporal stats (server) for %d", rbNSel);
                     ImGui::BeginDisabled(!rbSelTemporalOk);
