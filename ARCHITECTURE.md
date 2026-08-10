@@ -405,7 +405,12 @@ GUI を出さず、stderr に `<name>selftest: ...` を出して 0/1 で終了�
 CI (`.github/workflows/build.yml`) は **windows / ubuntu / macos の3面マトリクス**で
 ビルドし、Linux でのみ `xvfb-run ./build/viewer --bench 120 ...` を回して
 フレーム時間の中央値が 50ms を超えないことだけを見ます (ランナーはソフトウェア GL
-なので、これは破滅的退行の門であってベンチマークではありません)。
+なので、これは破滅的退行の門であってベンチマークではありません)。あわせて
+`--bench` 自身が出す **パネル被覆行** (`benchcov: ... PASS`) も見ます —— 開いた
+パネルのうち実際に描かれたものを数えて名乗る行で、選択されていないドックタブは
+`ImGui::Begin` が false を返して何も描かないため、これが無いと「フレーム時間」が
+自分の名乗るより小さい仕事の数字になり得ます (ba40ba8〜PR #142 が実際にそれ)。
+同じ表明は `selftest.benchcov` として3面マトリクスの中にもあります。
 
 **セルフテストは3面すべてで走ります** (`tools/run_selftests.sh` が CI と手元の
 共通入口)。22本のうち実 ImGui フレームを描く5本 (`browse-keys` / `abstats` /

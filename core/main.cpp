@@ -715,18 +715,34 @@ int main(int argc, char** argv) {
     bool benchTiles = false;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-tiles")) benchTiles = true;
-    // --bench-panels: dock Projection, Histogram and Temporal side by side for
-    // the bench instead of tabbing them, so all three DRAW. The default layout
-    // puts them in one node, and ImGui::Begin returns false for a tab that is
-    // not selected - so a bench on the default layout pays for exactly one of
-    // the three, whichever happens to lead. docs/ab-stats-plan.md's A/B
-    // measurement is specified with Histogram AND Projection showing, and until
-    // ba40ba8 it got that by accident, from whatever layout.ini the machine
-    // running the bench happened to have. That is why f424dae's numbers could
-    // not be re-taken: a scripted run is now correctly isolated from the user's
-    // layout, which also isolated it from the arrangement being measured. This
-    // flag names the arrangement instead of inheriting it.
-    bool benchPanels = false;
+    // Dock Projection, Histogram and Temporal SIDE BY SIDE for the bench rather
+    // than tabbing them, so all three DRAW - and do it by default, for every
+    // --bench run, which is what this line changed.
+    //
+    // The ordinary layout puts the three in one dock node, and ImGui::Begin
+    // returns false for a tab that is not selected, so a bench laid out that
+    // way paid for exactly ONE of the three - whichever tab the node happened
+    // to select. That was the bench's default from ba40ba8 (which correctly
+    // stopped scripted runs reading the user's layout.ini, and thereby stopped
+    // them inheriting the arrangement being measured) until here, and it made
+    // every default-layout frame time about a fifth of the work it named.
+    // 020b196 added --bench-panels so a run could at least NAME the
+    // arrangement; leaving it opt-in left the wrong answer as the easy one.
+    //
+    // Why the bench may differ from the app's default layout at all: the bench
+    // already forces every panel OPEN (see benchFrames below) because it is
+    // measuring the cost of drawing them, not reproducing a user's session.
+    // Where they sit is the same kind of decision as whether they are open, and
+    // the honest arrangement is the one where each panel it opened is visible.
+    // The user's layout is untouched - a scripted run neither reads nor writes
+    // it - and the coverage assert at the end of the run is what keeps this
+    // true if the layout code changes again.
+    //
+    // --bench-panels is still accepted, and still means what it says: the
+    // recorded commands in docs/ab-stats-plan.md 1 and on the task board all
+    // carry it, and a flag that names the arrangement is worth keeping even
+    // once the default agrees with it.
+    bool benchPanels = benchFrames > 0;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-panels")) benchPanels = true;
     app.exePath = argv[0];
@@ -1298,7 +1314,7 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Inspector", right);
             // tab order = dock order; Projection leads, and the explicit
             // focus below makes it the SELECTED tab, not merely the leftmost
-            if (benchPanels) {          // --bench-panels: all three at once
+            if (benchPanels) {          // every --bench run: all three at once
                 ImGuiID bp1 = bottom, bp2, bp3;
                 bp2 = ImGui::DockBuilderSplitNode(bp1, ImGuiDir_Right, 0.66f, nullptr, &bp1);
                 bp3 = ImGui::DockBuilderSplitNode(bp2, ImGuiDir_Right, 0.50f, nullptr, &bp2);

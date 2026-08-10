@@ -130,6 +130,16 @@ jobs:
           xvfb-run -a ./build/viewer --bench 120 --stack never --compare wipe \
                    tools/testdata/bench_big.npy tools/testdata/bench_stack.npy 2>&1 | tee bench.log
           grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
+          # ...and that the frames rendered contain what the number claims. The
+          # run prints the panels its measured frames drew and exits non-zero
+          # when a panel it OPENED never did (an unselected dock tab draws
+          # nothing, which is how this gate spent from ba40ba8 to PR #142
+          # watching a fifth of the work). The pipe into tee above swallows that
+          # exit status, so the verdict is read from the log instead of relied
+          # on: a gate that quotes a frame time has to check that time's scope.
+          grep -q "^benchcov: .* PASS$" bench.log \
+            || { echo "the bench measured fewer panels than it opened:"; \
+                 grep -E "^bench: (panels|OPEN)|^benchcov:" bench.log; exit 1; }
           # catastrophic-regression gate only: CI runners use software GL and are
           # noisy, so this is not a micro-benchmark
           med=$(sed -n 's/.*median=\([0-9.]*\)ms.*/\1/p' bench.log)
