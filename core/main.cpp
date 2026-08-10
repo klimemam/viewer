@@ -1988,6 +1988,14 @@ static bool g_watchSuppressed = false;
                 // thing this line lets through is a fact that is already true
                 // and is waiting for pumpWatch to put it on screen.
                 working |= watchFindingsPending();
+                // ...and §9's half of the same argument. An automatic reload is
+                // armed by a finding that is ALREADY on screen and runs on the
+                // next frame, so at 0 fps that next frame has to happen. Asked
+                // as "is a reload DUE" and never as "is one armed": a stack
+                // waiting on a measurement answers false, so a long measurement
+                // cannot turn the idle into a spin (§11.6's lesson), and with
+                // Auto-reload off - the default - this is false always.
+                working |= watchAutoDue();
                 // ...and §2's second row, which is the ONE place this feature
                 // costs the idle loop anything. A Browse panel that is on screen
                 // re-lists its folder every few seconds, and the enqueue is a UI

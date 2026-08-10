@@ -886,6 +886,23 @@ struct App {
                                           // The line does not expire; the toast
                                           // does, so it is fired once and the
                                           // line carries the fact from then on.
+        // ---- §9: what an AUTOMATIC reload did to this stack ------------------
+        // The one thing in this program that moves a number with no click, so
+        // the record of it is the LOUDEST thing Watch writes and not the
+        // quietest: what reloaded, at what time, and what it did to the
+        // membership - the whole reloadStackFromDisk summary, verbatim, the
+        // same sentence the toast carried.
+        //
+        // It does NOT expire, for seqNote's reason doubled: a toast fades, and
+        // the user did not even ask for this one. It is replaced by the next
+        // automatic reload of the same stack, cleared by a MANUAL Reload of it
+        // (the user has taken the wheel) or by the little x on the line. Empty
+        // = no automatic reload has ever touched this stack.
+        //
+        // NOT saved in a session, for reloadFailed's reason: a restore re-reads
+        // every member from today's disk, so a carried-over note would describe
+        // an event that has no bearing on the frames that came back.
+        std::string autoReloadNote;
         // Per-frame X axis for the Temporal chart: what frame i physically IS
         // (elapsed time, exposure, temperature). NAME + UNIT + one value per
         // frame - a bare list of numbers cannot label an axis, so all three
@@ -999,6 +1016,7 @@ struct App {
                 s.reloadFirstErr.clear(); s.reloadWhen.clear();
                 s.watchFound = watch::Finding{};
                 s.watchToasted = false;
+                s.autoReloadNote.clear();
                 s.refW = s.refH = s.refCh = 0;
                 s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
                 s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();
@@ -1297,6 +1315,21 @@ struct App {
     // listing every five seconds on a thread that is asleep the rest of the
     // time). Persisted in prefs.txt.
     bool watchEnabled = true;
+    // File > Watch > "Auto-reload a stack when its files change" (§9), and it
+    // is the ONE setting in this feature that can move a number without a
+    // click - every stage before it only ever SAID something. Hence:
+    //
+    //   DEFAULT OFF, and narrower than the switch above it. The settled
+    //   semantics are "notify, then a manual Reload" (ruling A6, 2026-07-30);
+    //   auto-update is opt-in and this is the opt. With it off, a finding
+    //   behaves exactly as it did before this existed (--watch-selftest W39).
+    //   IT LIVES UNDER watchEnabled. There is nothing to act on without a
+    //   finding, so Watch off is auto off - one switch governs noticing and
+    //   this one governs acting on what was noticed.
+    //
+    // Persisted in prefs.txt beside watchfiles, in that toggle's shape
+    // (docs/settings-inventory.md 9 is still open; this pre-empts nothing).
+    bool watchAutoReload = false;
     // §2's interval, in seconds, as a value rather than a literal so
     // --watch-selftest never has to live through one. prefs is §9's "later".
     double watchIntervalSec = 5.0;

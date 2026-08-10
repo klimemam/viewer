@@ -291,8 +291,32 @@ static void drawMenuBar(GLFWwindow* win) {
                               "seconds and SAY when a file has changed, appeared or\n"
                               "gone - under the stack's row in Files, in amber, with a\n"
                               "Reload beside it.\n\n"
-                              "Nothing is re-read without that click: what is on screen\n"
-                              "is what was measured until you say otherwise.");
+                              "By itself this changes nothing: what is on screen is what\n"
+                              "was measured until you press that Reload, or until you\n"
+                              "switch the item below on.");
+        // ---- §9: the narrower switch, and the ONLY one that acts -------------
+        // Default OFF and deliberately not the same item: what is above notices,
+        // this acts. Under it in the menu because it is under it in fact - with
+        // Watch off there is no finding to act on, so it is greyed rather than
+        // silently inert.
+        if (ImGui::MenuItem("  Auto-reload a stack when its files change", nullptr,
+                            &app.watchAutoReload, app.watchEnabled))
+            app.prefsDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "OFF by default. With it on, a stack whose files have settled at a\n"
+                "new state is re-read WITHOUT a click - the same Reload the amber\n"
+                "line offers, run for you one frame after the line appears.\n\n"
+                "What it does not do:\n"
+                "  - it never touches a stack whose pixels are the peer's (re-open\n"
+                "    the folder from Browse for those);\n"
+                "  - it waits while that stack is being measured, loaded or dragged,\n"
+                "    rather than moving the pixels under the answer;\n"
+                "  - after a reload that refuses a member it stops for that stack\n"
+                "    and leaves it to you.\n\n"
+                "Every automatic reload leaves a line on the stack in Files saying\n"
+                "what it did and when, and the same sentence in Messages. Nothing\n"
+                "here expires.");
         ImGui::Separator();
 #if defined(__APPLE__)
         if (ImGui::MenuItem("Quit", "Cmd+Q")) glfwSetWindowShouldClose(win, 1);

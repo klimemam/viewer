@@ -950,6 +950,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "wheelzoom " << (app.wheelZoomPlain ? 1 : 0) << "\n";
     f << "fitonswitch " << (app.fitOnSwitch ? 1 : 0) << "\n";
     f << "watchfiles " << (app.watchEnabled ? 1 : 0) << "\n";
+    f << "watchauto " << (app.watchAutoReload ? 1 : 0) << "\n";
     f << "seqload " << app.seqLoadMode << "\n";
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
@@ -1052,6 +1053,10 @@ static void loadPrefs() {
         else if (key == "wheelzoom")   { ls >> v; app.wheelZoomPlain = v != 0; }
         else if (key == "fitonswitch") { ls >> v; app.fitOnSwitch = v != 0; }
         else if (key == "watchfiles")  { ls >> v; app.watchEnabled = v != 0; }
+        // §9. A prefs.txt written before this existed has no such line, so the
+        // in-class default (OFF) is what an upgrading user gets - which is the
+        // only answer: nobody has opted in to anything by upgrading.
+        else if (key == "watchauto")   { ls >> v; app.watchAutoReload = v != 0; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
         else if (key == "lowbandwidth"){ ls >> v; app.lowBandwidth = v != 0; }

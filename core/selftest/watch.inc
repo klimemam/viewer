@@ -943,6 +943,263 @@
             }
         }
 
+        // ======================================================================
+        //  W39-W45: §9 - AUTO-RELOAD.
+        //
+        //  Every stage of Watch before this one only ever SAID something. This
+        //  one changes a number with no click, so the assertions are shaped
+        //  around that and not around the happy path:
+        //
+        //    W39  the default is OFF, and it is PROVABLY off - a confirmed
+        //         finding, two frames of the drain, and not one pixel moves.
+        //    W40  ...and the same standing finding with the switch ON does
+        //         reload it. Without this pair W39 is "the drain does nothing".
+        //    W41  the frame that SAYS is not the frame that DOES (§9's "put the
+        //         line up, then run on the next frame") - which is exactly the
+        //         order pumpWatch calls watchAutoDrain and watchIntegrate in.
+        //    W42  the record it LEAVES: #56's mark, the n-of-N line and a note
+        //         on the stack that does not expire. An automatic reload has to
+        //         be LOUDER than a manual one, because nobody asked for it.
+        //    W43  work in flight: a measurement of this stack defers it.
+        //    W44  a refused automatic reload DISARMS auto for that stack, and
+        //         only a manual Reload that succeeds re-arms it.
+        //    W45  the sentence, with no filesystem at all.
+        //
+        //  Its own fixture folder, for W25's reason: the folders above have
+        //  been rewritten, emptied and refilled by 400 lines of other cases.
+        //  Every change here moves mtime BACKWARDS by two days with the size
+        //  untouched (§11.5: a same-size rewrite inside the clock's 15.6 ms
+        //  granularity is invisible, and this test must not race that), so the
+        //  stack stays 4x4 throughout and the only thing moving is content.
+        // ======================================================================
+        closeAll();
+        const std::string aut = root + "/auto";
+        std::filesystem::create_directories(pathFromUtf8(aut), ec);
+        auto autName = [](int i) {
+            char b[32];
+            snprintf(b, sizeof b, "a_%03d.npy", i);
+            return std::string(b);
+        };
+        // Write member i with value v, and give it an mtime NO OTHER WRITE IN
+        // THIS SECTION HAS. Two days into the past plus one hour per write: the
+        // size never moves (4x4 f32 throughout), so mtime is the only thing that
+        // can carry the change, and §11.5's hole is exactly that two rewrites
+        // inside the clock's 15.6 ms granularity are indistinguishable - which
+        // two of these are, since the whole section runs in a few milliseconds.
+        // Counting hours is not a workaround for the limit; it is how a test
+        // about auto-reload avoids being a test about timestamp resolution.
+        int autBump = 0;
+        auto autWrite = [&](int i, float v) {
+            writeNpy2(aut + "/" + autName(i), 4, 4, v);
+            bumpMtime(aut + "/" + autName(i), -48 - (++autBump));
+        };
+        for (int i = 0; i < 5; i++) writeNpy2(aut + "/" + autName(i), 4, 4, 200.0f + (float)i);
+        openFolder(aut);
+        loadAll();
+        int as = 0;
+        for (const auto& s : app.seqs) if (!s.name.empty()) { as = s.id; break; }
+        std::map<int, WatchSet> ast;
+        std::vector<App::WatchDone> aout;
+        auto apoll = [&]() {
+            aout.clear();
+            return watchPollRound(watchTargetsNow(), ast, aout);
+        };
+        auto aintegrate = [&]() {
+            {
+                std::lock_guard<std::mutex> lk(app.watchMtx);
+                app.watchDone = aout;
+            }
+            watchIntegrate();
+        };
+        // "the disk has settled on a change" in one call: §4 needs two readings
+        // that agree, so two polls, and then the UI thread's integration.
+        auto aSettle = [&]() { apoll(); apoll(); aintegrate(); };
+        auto pxOf = [&](int index) {
+            ImageDoc* d = memberDoc(as, index);
+            return d ? d->px()[0] : -1.0f;
+        };
+        {   // ---- W39: the default is OFF, and OFF means NOTHING happens -------
+            check(as != 0 && (int)framesOfSeq(as).size() == 5 && !app.watchAutoReload,
+                  "W39 (setup) a 5-frame stack, and auto-reload is OFF by default");
+            autWrite(2, 42.0f);                    // 202 -> 42 on disk, same size
+            aSettle();
+            check(seqWatchNote(as) == "1 file(s) changed on disk (a_002.npy)",
+                  "W39b (setup) the amber line says the file moved, as it always did");
+            const int rev0 = seqInfo(as) ? seqInfo(as)->stackRev : -1;
+            // BEFORE the drains, or this asserts nothing: with the switch on, the
+            // drains would have reloaded the stack and cleared the finding, and
+            // an empty armed list afterwards would then mean "already done".
+            check(watchAutoArmed().empty() && !watchAutoDue(),
+                  "W39c OFF: a CONFIRMED finding arms nothing - no work, not a veto");
+            watchAutoDrain();
+            watchAutoDrain();                      // two frames, not one
+            // The pixels in memory are STILL 202: what is on screen is what was
+            // measured, which is the whole of ruling A6 and is what "opt-in"
+            // has to mean when the thing being opted into is this.
+            check(pxOf(2) == 202.0f && seqInfo(as) && seqInfo(as)->stackRev == rev0 &&
+                  seqInfo(as)->autoReloadNote.empty() &&
+                  seqWatchNote(as) == "1 file(s) changed on disk (a_002.npy)",
+                  "W39d ...and two frames of the drain later, not a pixel has moved");
+        }
+        {   // ---- W40: ON, and the SAME finding reloads --------------------------
+            // The anti-vacuity half of W39. Nothing about the disk or the finding
+            // changes here - only the switch - so anything W40 sees is the switch.
+            const int rev0 = seqInfo(as) ? seqInfo(as)->stackRev : -1;
+            app.watchAutoReload = true;
+            check(watchAutoArmed().size() == 1 && watchAutoArmed()[0] == as &&
+                  !watchAutoRefusal(as) && !watchAutoBusy(as) && watchAutoDue(),
+                  "W40 ON: the standing finding arms this stack and a round is due");
+            watchAutoDrain();
+            check(pxOf(2) == 42.0f && seqInfo(as) && seqInfo(as)->stackRev > rev0,
+                  "W40b ...and one drain re-read it: the frame holds the disk's pixels");
+            check(seqWatchNote(as).empty() && !watchAutoDue(),
+                  "W40c ...and the line is gone, because it has stopped being true");
+        }
+        {   // ---- W41/W42: SAY on one frame, ACT on the next - and say what it did
+            // The membership moves as well as the pixels, which is the case that
+            // matters: a stack quietly measuring a different set of frames than
+            // it did a second ago is the whole failure mode of this stage.
+            std::error_code e2;
+            std::filesystem::remove(pathFromUtf8(aut + "/" + autName(3)), e2);
+            autWrite(5, 205.0f);
+            aSettle();
+            // ...the frame that SAYS. pumpWatch calls watchAutoDrain BEFORE
+            // watchIntegrate for exactly this: the line is on screen for a frame
+            // before anything acts on it, so what happened is readable where it
+            // was announced.
+            check(seqWatchNote(as) == "1 file(s) appeared in the folder (a_005.npy), "
+                                      "1 file(s) no longer exist (a_003.npy)" &&
+                  members(as) == "0:a_000.npy 1:a_001.npy 2:a_002.npy "
+                                 "3:a_003.npy 4:a_004.npy",
+                  "W41 the frame that SAYS it has not also done it");
+            const size_t logWas = app.msgLog.size();
+            watchAutoDrain();
+            check(members(as) == "0:a_000.npy 1:a_001.npy 2:a_002.npy "
+                                 "3:a_004.npy 4:a_005.npy" &&
+                  seqInfo(as) && seqInfo(as)->expectedFrames == 5,
+                  "W41b ...and the next frame's drain rebuilt the membership");
+            // ---- W42: the RECORD. A toast expires and nobody asked for this
+            // reload, so the note is latched on the stack and states the whole
+            // summary - both names, both counts, and n of N.
+            const std::string note = seqInfo(as) ? seqInfo(as)->autoReloadNote
+                                                 : std::string();
+            fprintf(stderr, "watchselftest: W42 note: %s\n", note.c_str());
+            check(note.compare(0, 14, "auto-reloaded ") == 0 &&
+                  note.find("1 file(s) appeared in the folder (a_005.npy)") !=
+                      std::string::npos &&
+                  note.find("1 file(s) no longer exist (a_003.npy)") != std::string::npos &&
+                  note.find("5 of 5 frame(s), was 5") != std::string::npos,
+                  "W42 the note names the time, both directions and n of N");
+            check(app.msgLog.size() > logWas && !app.msgLog.empty() &&
+                  app.msgLog.back().text.find(note) != std::string::npos &&
+                  app.msgLog.back().text.find(seqInfo(as)->name) == 0,
+                  "W42b ...and the same sentence is in Messages, named by stack");
+            check(seqWatchNote(as).empty() && !seqInfo(as)->autoReloadNote.empty(),
+                  "W42c the amber finding goes; the record of what was done stays");
+        }
+        {   // ---- W43: work in flight - a measurement is not swapped underneath --
+            // The decision (§15): an automatic reload WAITS. It does not cancel
+            // the measurement and it does not run beside it; the finding stays on
+            // the row, and the reload happens on a later frame.
+            autWrite(1, 55.0f);
+            aSettle();
+            check(seqWatchNote(as) == "1 file(s) changed on disk (a_001.npy)" &&
+                  pxOf(1) == 201.0f,
+                  "W43 (setup) a confirmed change, and the old pixels still resident");
+            const bool wasPending = app.srvTemporal.pending;
+            const int wasSeq = app.srvTemporal.seqId;
+            app.srvTemporal.pending = true;
+            app.srvTemporal.seqId = as;
+            check(watchAutoBusy(as) != nullptr && !watchAutoDue() &&
+                  watchAutoArmed().size() == 1,
+                  "W43b a sigma_t of THIS stack is in flight: armed, but not due");
+            watchAutoDrain();
+            watchAutoDrain();
+            check(pxOf(1) == 201.0f &&
+                  seqWatchNote(as) == "1 file(s) changed on disk (a_001.npy)",
+                  "W43c two frames pass and nothing moves - the line stays up");
+            // ANTI-VACUITY: the same stack, the same finding, the measurement
+            // done. Without this, W43c is "auto-reload stopped working".
+            app.srvTemporal.pending = wasPending;
+            app.srvTemporal.seqId = wasSeq;
+            check(!watchAutoBusy(as) && watchAutoDue(),
+                  "W43d ...and the moment it finishes the stack is due again");
+            watchAutoDrain();
+            check(pxOf(1) == 55.0f && seqWatchNote(as).empty(),
+                  "W43e ...and the very next frame re-reads it");
+        }
+        {   // ---- W44: a REFUSED automatic reload disarms this stack --------------
+            // Without this the loop is real and it is hourly: the reload refuses,
+            // watchReloadNow clears the finding, the worker re-reports the same
+            // difference on its next round, and auto reloads again - every five
+            // seconds, for the rest of the session. #56's latch already records
+            // exactly the state that must stop it, so it is the latch that is
+            // asked rather than a second counter beside it.
+            {   // a_004 exists and will not read
+                std::ofstream g(pathFromUtf8(aut + "/" + autName(4)), std::ios::binary);
+                g << "not a npy file at all";
+            }
+            bumpMtime(aut + "/" + autName(4), -48 - (++autBump));   // its own hour
+            aSettle();
+            check(seqWatchNote(as) == "1 file(s) changed on disk (a_004.npy)" &&
+                  !watchAutoRefusal(as),
+                  "W44 (setup) a member that will not read, and auto is still armed");
+            watchAutoDrain();
+            const std::string note = seqInfo(as) ? seqInfo(as)->autoReloadNote
+                                                 : std::string();
+            fprintf(stderr, "watchselftest: W44 note: %s\n", note.c_str());
+            check(seqInfo(as) && seqInfo(as)->reloadFailed == 1 && *seqReloadMark(as) &&
+                  note.find(SEQ_RELOAD_FAIL_TOKEN) != std::string::npos,
+                  "W44b the automatic reload leaves #56's mark, and the note says so");
+            check(watchAutoRefusal(as) != nullptr,
+                  "W44c ...and this stack is DISARMED: one attempt, never a retry loop");
+            // ...and it stays disarmed through a further, unrelated change. The
+            // finding IS standing and nothing else is in the way, so the empty
+            // armed list below is the disarming and not an idle assertion:
+            // a_000 moved, and a_004 still differs from a baseline the refused
+            // reload never advanced, which is two.
+            autWrite(0, 77.0f);
+            aSettle();
+            watchAutoDrain();
+            watchAutoDrain();
+            check(pxOf(0) == 200.0f && seqInfo(as)->autoReloadNote == note &&
+                  seqWatchNote(as) == "2 file(s) changed on disk" &&
+                  watchAutoArmed().empty() && !watchAutoBusy(as),
+                  "W44d a later change on a disarmed stack is NOT auto-reloaded");
+            // ANTI-VACUITY: a manual Reload that succeeds is what re-arms it, and
+            // the note goes because the user has taken the wheel. 444 and not 204
+            // on purpose - a value the frame could already be holding would let a
+            // reload that did nothing pass this line.
+            writeNpy2(aut + "/" + autName(4), 4, 4, 444.0f);
+            watchReloadNow(as, false);
+            check(seqInfo(as) && seqInfo(as)->reloadFailed == 0 && !*seqReloadMark(as) &&
+                  pxOf(3) == 444.0f && pxOf(0) == 77.0f &&   // frame 3 IS a_004
+                                                             // (a_003 left in W41)
+                  seqInfo(as)->autoReloadNote.empty() && !watchAutoRefusal(as),
+                  "W44e a manual Reload that succeeds clears the mark and re-arms");
+            autWrite(1, 88.0f);
+            aSettle();
+            watchAutoDrain();
+            check(pxOf(1) == 88.0f && !seqInfo(as)->autoReloadNote.empty(),
+                  "W44f ...and the next change is automatic again");
+            app.watchAutoReload = false;
+        }
+        {   // ---- W45: the sentence, with no filesystem and no stack -------------
+            check(watch::autoReloadText("14:32:07", "reloaded 5 frame(s), 0 failed",
+                                        false) ==
+                    "auto-reloaded 14:32:07 - reloaded 5 frame(s), 0 failed",
+                  "W45 the sentence an automatic reload latches on the stack");
+            // The compare pin is uid-keyed, so a rebuild that renumbers frames
+            // leaves it alone (§12.5) - but a pin on a frame whose FILE IS GONE
+            // is dropped, and that is a number moving with nobody's click. It is
+            // therefore said out loud rather than left to be noticed.
+            check(watch::autoReloadText("09:00:01", "reloaded 4 frame(s), 0 failed",
+                                        true) ==
+                    "auto-reloaded 09:00:01 - reloaded 4 frame(s), 0 failed"
+                    " - the compare pin was on a frame that is gone",
+                  "W45b ...and it says when the compare pin went with a gone frame");
+        }
+
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "watchselftest: %s\n", ok ? "ok" : "FAILED");

@@ -423,4 +423,34 @@ inline std::string rebuildText(const Rebuild& r, int before, int resident, int e
            std::to_string(expected) + " frame(s), was " + std::to_string(before);
 }
 
+// ---- §9: the line an AUTOMATIC reload leaves on the stack -------------------
+//
+// The same discipline as findingText and rebuildText - ONE spelling, read by the
+// Files panel and by --watch-selftest - but the reason it exists is different
+// and is worth stating, because it is the whole of what makes §9 safe:
+//
+//   NOBODY PRESSED ANYTHING. A manual Reload has a click behind it, so its toast
+//   is a receipt for something the reader already knows happened. An automatic
+//   one has no click, so the toast is the ONLY notice - and a toast expires.
+//   The record therefore has to outlive it, and it carries the reload's WHOLE
+//   summary verbatim rather than a shortened version of it: `summary` is what
+//   reloadStackFromDisk returned, which already states the frames re-read, the
+//   refusals with #56's mark, the membership names and the n-of-N. A second,
+//   friendlier wording of that would be a second opinion about what happened.
+//
+//   WHEN, because "a number moved" is unanswerable without it. Local wall clock,
+//   the same as SeqInfo::reloadWhen.
+//
+// `pinDropped` is the one thing the summary genuinely does not carry. A compare
+// pin is a uid - a membership identity - so a rebuild that renumbers frames
+// leaves it exactly where it was (§12.5); but a pin on a frame whose FILE IS GONE
+// goes the way closing that frame takes it, and that is a comparison ending with
+// nobody's click on it. It gets a clause of its own.
+inline std::string autoReloadText(const std::string& when, const std::string& summary,
+                                  bool pinDropped) {
+    std::string s = "auto-reloaded " + when + " - " + summary;
+    if (pinDropped) s += " - the compare pin was on a frame that is gone";
+    return s;
+}
+
 }   // namespace watch

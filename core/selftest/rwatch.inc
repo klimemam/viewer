@@ -685,6 +685,43 @@
                       " - Reload in Files to re-read them",
                   "R13d ...while a local stack keeps the line it always had");
         }
+        {   // ---- R16: §9's Auto-reload does not reach a peer either -------------
+            // The same fact as R13, one layer up and with more at stake: R13 is
+            // about a button that would refuse if pressed, and this is about a
+            // program that would press it. §6's rebuild is local-only today, so
+            // an automatic reload of a peer's stack would refuse every member
+            // and latch #56's (reload failed) onto a stack where nothing failed
+            // - once every fifteen seconds, and with nobody having clicked.
+            //
+            // ONE predicate for both halves (watchAutoRefusal reads
+            // watchReloadOffered), so the panel's greyed-out line and the thing
+            // that decides not to act cannot come to disagree about one stack.
+            const bool wasAuto = app.watchAutoReload;
+            app.watchAutoReload = true;
+            // A STANDING FINDING first, exactly the one watchIntegrate would have
+            // put here. Arming is a state ("this stack's files have moved and it
+            // has not been reloaded since"), so without one there is nothing to
+            // refuse and R16c would pass on a program that had never heard of
+            // peers.
+            if (App::SeqInfo* si = seqInfo(seq)) {
+                si->watchFound = watch::Finding{};
+                si->watchFound.srcMoved = true;
+                si->watchFound.host = "this machine";
+                si->watchFound.members = 5;
+            }
+            check(seqInfo(seq) && seqInfo(seq)->watchFound.any() && app.watchAutoReload,
+                  "R16 (setup) the peer's stack has a standing finding, auto is ON");
+            const char* why = watchAutoRefusal(seq);
+            check(why && std::string(why).find("Browse") != std::string::npos,
+                  "R16b auto-reload refuses a peer's stack and names what does work");
+            // ANTI-VACUITY, locally: the ONLY thing holding it back is that
+            // refusal. Nothing is in flight over it and the switch is on, so an
+            // empty armed list here is the origin's doing and not an idle test.
+            check(watchAutoArmed().empty() && !watchAutoDue() && !watchAutoBusy(seq),
+                  "R16c ...so a standing finding never arms it, and nothing else stops it");
+            if (App::SeqInfo* si = seqInfo(seq)) si->watchFound = watch::Finding{};
+            app.watchAutoReload = wasAuto;
+        }
 
         dropSeq(seq);
         closeAll();

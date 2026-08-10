@@ -298,6 +298,8 @@ static void drawFileList() {
     // Reload from disk, deferred like the rest: reloadSource's walk calls
     // forgetImage while the row loop still holds this frame's cached indices.
     int pendingReloadImg = -1, pendingReloadSeq = 0;
+    int pendingAckAutoSeq = 0;  // §9: the x on an auto-reload note. Deferred too:
+                                // the note is drawn inside the same row walk.
     int pendingRecomputeImg = -1;   // Recompute from stack (§10.1): forgetImage
                                     // again, on the reduced frame itself
     // Set commands, deferred for the same reason: the walk iterates
@@ -1231,6 +1233,38 @@ static void drawFileList() {
                       ImGui::SetTooltip("%s", tip.c_str());
                   }
                   }
+                  // ---- §9: ...and what the PROGRAM is about to do about it ---
+                  // Only when Auto-reload is on, and then always: "reloading
+                  // automatically", or the reason it is holding off. A stack
+                  // that is armed and silent for four seconds while a
+                  // measurement finishes must not look like a stack the feature
+                  // has forgotten.
+                  if (std::string an = watchAutoNote(wsi->id); !an.empty()) {
+                      ImGui::SameLine();
+                      ImGui::TextDisabled("%s", an.c_str());
+                  }
+                  ImGui::Unindent(ImGui::GetFontSize());
+              }
+              // ---- §9: what an AUTOMATIC reload already DID to this stack ----
+              // Amber, latched, and it outlives the finding that caused it -
+              // which is the whole point. The manual case needs no such line
+              // (the click is its own notice, and the toast is a receipt); this
+              // one is the only durable answer to "these numbers are not the
+              // ones I was reading a minute ago".
+              if (!wsi->autoReloadNote.empty()) {
+                  ImGui::Indent(ImGui::GetFontSize());
+                  ImGui::PushStyleColor(ImGuiCol_Text, WATCH_AMBER32);
+                  ImGui::TextUnformatted(wsi->autoReloadNote.c_str());
+                  ImGui::PopStyleColor();
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("x##autoack")) pendingAckAutoSeq = wsi->id;
+                  if (ImGui::IsItemHovered())
+                      ImGui::SetTooltip(
+                          "Clear this line.\n\n"
+                          "The reload it describes is not undone and is not "
+                          "forgotten:\nthe same sentence is in Messages, the frame "
+                          "count is on\nthe row above, and a reload that refused a "
+                          "member leaves\nits own mark there.");
                   ImGui::Unindent(ImGui::GetFontSize());
               }
           }
@@ -1435,22 +1469,14 @@ static void drawFileList() {
             toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
         }
     }
-    if (pendingReloadSeq) {
-        int failed = 0;
-        std::string msg = reloadStackFromDisk(pendingReloadSeq, &failed);
-        toast(msg, failed > 0);
-        // The Watch line (§5) said "the files behind these pixels have moved",
-        // and the operation it offered has just run: drop it HERE rather than
-        // waiting for the worker to notice, so the answer to a click is not two
-        // polls late. The worker re-seeds from the fresh stat on its own round
-        // and agrees; a member the reload REFUSED still differs from the
-        // baseline, so its finding comes straight back - which is correct, and
-        // is the difference between clearing a fact and clearing a statement
-        // that has stopped being true.
-        if (App::SeqInfo* si = seqInfo(pendingReloadSeq)) {
-            si->watchFound = watch::Finding{};
-            si->watchToasted = false;
-        }
+    // ONE reload path (watch-design §9): this is watchAutoDrain's own call with
+    // automatic=false. The toast, the clearing of the Watch line and the record
+    // it leaves all live in watchReloadNow, so the click and the program cannot
+    // come to do two different things - which is the failure §9 is most exposed
+    // to, because the second one is the one nobody watches.
+    if (pendingReloadSeq) watchReloadNow(pendingReloadSeq, false);
+    if (pendingAckAutoSeq) {
+        if (App::SeqInfo* si = seqInfo(pendingAckAutoSeq)) si->autoReloadNote.clear();
     }
     if (pendingRecomputeImg >= 0 && pendingRecomputeImg < (int)app.images.size()) {
         std::string err;   // success toasts inside (the reduction's own voice)

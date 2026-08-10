@@ -605,6 +605,224 @@ static bool watchReloadOffered(int seqId) {
     return false;
 }
 
+// ============================================================================
+//  §9: AUTO-RELOAD - the first thing in this feature that MOVES A NUMBER
+//  ============================================================================
+//
+// Everything above only ever SAYS something. This acts, and with nobody's click
+// behind it, so the whole of it is arranged around three rules:
+//
+//   1. DEFAULT OFF, and off means off. The settled semantics are "notify, then a
+//      manual Reload" (ruling A6); this is the opt-in and nothing else changes.
+//      --watch-selftest W39 drives a confirmed finding past two frames of the
+//      drain with the switch untouched and asserts that not a pixel moved.
+//
+//   2. ONE RELOAD PATH. What runs is reloadStackFromDisk - the very function
+//      the [Reload] button calls, with every guard §12 and §13 put in it: the
+//      departures are taken before reloadSource so a gone file is not a refusal
+//      (§12.1), the rule is the one recorded at the open so a subset stack is
+//      not re-grown (§12.2), a member the rule un-names but whose file is there
+//      STAYS (§12.3), a named file that will not decode is n/N and not a failure
+//      (§12.4), and a rebuild NEVER empties a stack (§12.5). A second reload path
+//      for the automatic case would be a second set of those decisions, and the
+//      one that is wrong is always the one nobody is looking at.
+//
+//   3. LOUDER, NEVER QUIETER. The user did not ask, so the evidence has to be
+//      MORE than a manual reload leaves, not less: the same toast (which lands
+//      in Messages), the same #56 mark, the same n-of-N on the Files row, AND a
+//      note latched on the stack that does not expire (SeqInfo::autoReloadNote).
+//
+// What it deliberately does NOT do is decide anything about WHICH findings are
+// worth acting on. "Only reload when files changed, not when they vanished"
+// would be a second policy sitting beside §6's, and the two would drift.
+
+// Is this stack eligible for an AUTOMATIC reload at all? nullptr = yes; a
+// reason, in the words the screen uses, when not.
+//
+// Two refusals, and neither is about the switch:
+//
+//   THE PEER. §6's rebuild is local-only (§13.6), so reloadSource would refuse
+//   every member of a remote-backed stack by name and #56's (reload failed)
+//   would land on a stack where nothing failed - once every fifteen seconds,
+//   automatically. The predicate is watchReloadOffered, the same one the panel
+//   asks before drawing the button, so the thing that acts and the thing that
+//   offers cannot come to disagree about one stack.
+//
+//   A RELOAD THAT ALREADY REFUSED. Without this the retry loop is real and it
+//   never stops: the reload refuses a member, watchReloadNow clears the finding,
+//   the worker re-reports the same difference on its next round (the refused
+//   member's baseline never advanced - that is exactly right, and file_list
+//   says so), and the automatic reload fires again. Every five seconds. #56's
+//   latch already records precisely the state that must stop it and is cleared
+//   by precisely the event that should restart it - a reload of the whole stack
+//   in which every member succeeds - so it is the latch that is asked rather
+//   than a second counter kept beside it. One attempt, then the mark, then the
+//   person.
+static const char* watchAutoRefusal(int seqId) {
+    if (!watchReloadOffered(seqId))
+        return "these pixels are the peer's - re-open the folder from Browse";
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (si && si->reloadFailed > 0)
+        return "the last reload of this stack refused a member - Reload it by hand";
+    return nullptr;
+}
+
+// Is something IN FLIGHT that this reload must not run underneath? nullptr = no.
+//
+// THE DECISION (§15): an automatic reload WAITS. It does not cancel the work and
+// it does not run beside it - the finding stays on the row, the amber line stays
+// up, and the reload happens on a later frame. Silently swapping the pixels
+// under a running measurement is the one failure this stage could introduce that
+// no later reading of the screen would ever reveal, because the number would
+// look perfectly ordinary.
+//
+// Waiting is safe to do here for a reason worth writing down: every condition
+// below is one the main loop ALREADY keeps frames coming for (seqRunning,
+// mPending, rfPending are all terms of its `busy`), so the frame that ends the
+// work is a frame, and watchAutoDue is asked again in it. Nothing has to be
+// remembered and nothing can be forgotten.
+//
+// A COMPARE PIN IS NOT ON THIS LIST, and that is a decision and not an omission.
+// A pin is a uid - a membership identity - so it survives a renumbering (§12.5),
+// and the compare readout is recomputed from the current pixels every frame, so
+// there is no accumulating number to leave a seam in. The one thing a pin CAN
+// lose is its frame, when that frame's file is gone; that is not prevented (the
+// alternative is to keep measuring a file that does not exist) but it is SAID,
+// in autoReloadText's own clause.
+static const char* watchAutoBusy(int seqId) {
+    // ---- this stack in particular ------------------------------------------
+    if (app.srvTemporal.pending && app.srvTemporal.seqId == seqId)
+        return "a server-side sigma_t of this stack is running";
+    if (app.srvTemporalB.pending && app.srvTemporalB.seqId == seqId)
+        return "a server-side sigma_t of this stack is running (compare B)";
+    for (const App::PendingAvg& p : app.pendingAvg)
+        if (p.seqId == seqId) return "a frame average of this stack is queued";
+    if (app.seqLoadingId == seqId && (app.seqRunning || seqReadyPending()))
+        return "frames are still loading into this stack";
+    // ---- ...and the workers whose jobs do not carry a stack ------------------
+    // A measure job names FILES, not a seqId (App::MJob), so "is this one about
+    // that stack?" has no answer here - and the answer that matters is about the
+    // RESULT, which is filed against a stack and a frame count. Same for a
+    // full-resolution fetch, which replaces pixels in place. Both are seconds
+    // long and both keep the frame loop awake, so waiting them out costs one
+    // round of the poll interval at most.
+    if (app.mPending > 0)  return "a measurement is in flight";
+    if (app.rfPending > 0) return "a frame fetch is in flight";
+    if (app.seqRunning || seqReadyPending() || !app.seqQueue.empty())
+        return "frames are still loading";
+    // A drag is a measurement being AIMED. temporal_model.inc already holds off
+    // its own recompute for exactly this (`app.annBusy && T.seqId == ...`), and
+    // moving the pixels under the rectangle somebody is dragging is worse.
+    if (app.annBusy) return "an ROI or annotation drag is in progress";
+    return nullptr;
+}
+
+// The stacks a standing finding has ARMED. Not a queue: "this stack's files have
+// moved and it has not been reloaded since" is a STATE, and it is already
+// written down (SeqInfo::watchFound), so it is asked of the stacks rather than
+// remembered beside them. A queue would have to be kept in step with every
+// close, every manual Reload, every switch and every finding that stopped being
+// true - four ways to hold a stale seqId, and the symptom of holding one is a
+// reload of something the user never saw a line about.
+//
+// It also means flipping the switch ON arms whatever is already on the board:
+// the worker only speaks when a statement CHANGES (§3), so a queue filled at
+// detection time would leave every stack that was already amber unreloaded
+// until its files happened to move a second time.
+static std::vector<int> watchAutoArmed() {
+    std::vector<int> out;
+    if (!app.watchEnabled || !app.watchAutoReload) return out;
+    for (const App::SeqInfo& si : app.seqs)
+        if (si.watchFound.any() && !watchAutoRefusal(si.id)) out.push_back(si.id);
+    return out;
+}
+
+// The idle-skip chain's term, in rbAnyPollDue's shape (§14.2): it asks whether a
+// reload is DUE, never whether one is armed. A stack that is armed but waiting
+// on a measurement answers false, so a long measurement cannot turn the 0 fps
+// idle into a spin - which is §11.6's lesson, and the one thing this feature
+// could break that nobody would report as a bug.
+static bool watchAutoDue() {
+    for (int s : watchAutoArmed())
+        if (!watchAutoBusy(s)) return true;
+    return false;
+}
+
+// THE reload, and there is one of it: the [Reload] button calls this with
+// automatic=false and §9's drain calls it with true. What differs is only what is
+// SAID afterwards - the operation is byte for byte the same one, which is the
+// point (rule 2 above).
+static void watchReloadNow(int seqId, bool automatic) {
+    const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
+    // §12.5's other half: a pin on a frame that VANISHES is dropped by
+    // closeImages, exactly as closing that frame drops it. Sampled across the
+    // call, because the summary reloadStackFromDisk returns is about files and
+    // this is about a comparison that has just ended.
+    const uint64_t pinWas = app.compareBUid;
+    int failed = 0;
+    std::string msg = reloadStackFromDisk(seqId, &failed);
+    const bool pinDropped = pinWas != 0 && app.compareBUid != pinWas;
+    if (automatic) {
+        char ts[32] = "";
+        time_t now = time(nullptr);
+        if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%H:%M:%S", lt);
+        msg = watch::autoReloadText(ts, msg, pinDropped);
+    }
+    if (App::SeqInfo* si = seqInfo(seqId)) {
+        // The record, latched (rule 3). A manual reload CLEARS it: the user has
+        // taken the wheel, and a note about what the program did behind them
+        // stops being the thing they need to read.
+        si->autoReloadNote = automatic ? msg : std::string();
+        // The Watch line (§5) said "the files behind these pixels have moved",
+        // and the operation it offered has just run: drop it HERE rather than
+        // waiting for the worker to notice, so the answer to a click is not two
+        // polls late. The worker re-seeds from the fresh stat on its own round
+        // and agrees; a member the reload REFUSED still differs from the
+        // baseline, so its finding comes straight back - which is correct, and
+        // is the difference between clearing a fact and clearing a statement
+        // that has stopped being true. (It is also why an automatic reload that
+        // refused must disarm the stack - see watchAutoRefusal.)
+        si->watchFound = watch::Finding{};
+        si->watchToasted = false;
+    }
+    // Named by STACK when it was automatic. A manual reload was a click on one
+    // row and needs no label; this one arrives out of nowhere, and a toast that
+    // does not say whose numbers just moved is not a notice.
+    toast(automatic ? name + ": " + msg : msg, failed > 0);
+}
+
+// The reload the LAST frame armed. Called at the head of pumpWatch and therefore
+// BEFORE watchIntegrate, which is §9's "put the line up, then run on the next
+// frame" spelled as an order of two calls: a finding integrated in frame N is on
+// screen for frame N's draw, and this runs it at the head of N + 1. What
+// happened is then readable in the same place it was announced.
+static void watchAutoDrain() {
+    for (int seqId : watchAutoArmed()) {
+        // Re-asked per stack: the reload above this one in the list may have
+        // closed frames, and seqInfo()'s rule is that a pointer is never held
+        // across anything.
+        const App::SeqInfo* si = seqInfo(seqId);
+        if (!si || !si->watchFound.any()) continue;
+        if (watchAutoRefusal(seqId) || watchAutoBusy(seqId)) continue;
+        watchReloadNow(seqId, true);
+    }
+}
+
+// What the Files line adds when this stack is armed but cannot run yet. "" when
+// there is nothing to add. It is a separate string from the finding on purpose:
+// seqWatchNote states what the DISK did, and this states what the program is
+// about to do about it, which are two facts and not one.
+static std::string watchAutoNote(int seqId) {
+    if (!app.watchEnabled || !app.watchAutoReload) return {};
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || !si->watchFound.any()) return {};
+    if (const char* why = watchAutoRefusal(seqId))
+        return std::string(" - auto-reload cannot: ") + why;
+    if (const char* why = watchAutoBusy(seqId))
+        return std::string(" - auto-reload is waiting: ") + why;
+    return " - reloading automatically";
+}
+
 // The SENTENCE, and it is THE guard: the Files panel draws this string and
 // --watch-selftest asserts this string, so there is no second opinion to drift
 // (seqReloadNote's discipline). "" = this stack has nothing to say.
@@ -640,9 +858,13 @@ static void watchIntegrate() {
         // §5: one toast, and the line stays. A toast expires; "3 file(s)
         // changed on disk" must not (seqNote's precedent). What it tells the
         // reader to DO is watchActionText's, because a peer's stack has no
-        // [Reload] to press.
+        // [Reload] to press - unless §9 is on, in which case what to do is not
+        // the reader's business and the toast says what is about to happen
+        // instead. Telling somebody to press a button the program is already
+        // pressing for them is how a setting gets forgotten.
+        const std::string an = watchAutoNote(d.seqId);
         toast(si->name + ": " + watch::findingText(d.found) +
-              watchActionText(!d.found.host.empty()));
+              (an.empty() ? watchActionText(!d.found.host.empty()) : an));
     }
 }
 
@@ -662,8 +884,16 @@ static void pumpWatch() {
         // idle-skip chain permanently and turns the 0 fps idle into a
         // continuous 12 fps for the rest of the session.
         watchIntegrate();
+        // ...but NOTHING IS RELOADED on the way out. The findings are facts and
+        // are kept; an automatic reload is an ACTION, and the switch that was
+        // just thrown is the one that governs acting. watchAutoArmed answers
+        // empty while watchEnabled is false, so this is a statement about what
+        // the next frame will not do rather than a line of code.
         return;
     }
+    // §9: the reload the LAST frame armed, before this frame integrates anything
+    // new. See watchAutoDrain - the order of these two calls IS the rule.
+    watchAutoDrain();
     {   // What to watch, refreshed from the open stacks. It walks the stacks and
         // not the pixels, but pumpWatch runs once per FRAME and a frame can be
         // 120 Hz - so it is rebuilt on the three events that can change it and
