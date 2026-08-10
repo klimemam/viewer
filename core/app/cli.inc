@@ -46,6 +46,13 @@ static std::string g_detrendSelftest;     // --detrend-selftest <dir>: the detre
 // measures is analytic and built in memory (see roiStatsSelftest()).
 static bool g_roiStatsSelftest = false;
 
+// --roi-export-selftest: the ROIs table as a DOCUMENT (issue #67) - the
+// sectioned format docs/export-design.md 2 confirmed, and above all the
+// rectangle the table carries as a value (x/y/w/h as columns). Takes no
+// directory and no window for the --roistats-selftest reasons: analytic
+// fixtures, and every assertion is a string. See roiExportSelftest().
+static bool g_roiExportSelftest = false;
+
 // --abeq-selftest: A and B (and a letter past B) on ONE document - the
 // comparison people set up on purpose, to confirm the two sides agree. Takes no
 // directory for the same reason as --roistats-selftest, and is windowless for
@@ -485,6 +492,8 @@ static void printUsage() {
         "  --aset-selftest <dir>       AnalysisSet: transport, Ref binding, session\n"
         "  --roistats-selftest         the ROI table's numbers and its std/mean column,\n"
         "                              through the real panel, on analytic fixtures\n"
+        "  --roi-export-selftest       the ROIs table as a document: sections, and\n"
+        "                              the rectangle carried as x/y/w/h columns\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
         "                              coinciding, through the real panel\n"
         "  --anaprov-selftest          analyzer results name the plugin dll that\n"
@@ -636,6 +645,8 @@ static void parseCli(int argc, char** argv) {
             g_exportTsvSelftest = next();          // handled in main()
         } else if (a == "--roistats-selftest") {
             g_roiStatsSelftest = true;             // handled in main()
+        } else if (a == "--roi-export-selftest") {
+            g_roiExportSelftest = true;            // handled in main()
         } else if (a == "--abeq-selftest") {
             g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--anaprov-selftest") {

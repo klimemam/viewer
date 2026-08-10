@@ -594,6 +594,8 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 #include "selftest/util.inc"
 
+#include "selftest/roi-export.inc"
+
 #include "selftest/anaprov.inc"
 
 #include "selftest/stackana.inc"
@@ -1000,6 +1002,11 @@ int main(int argc, char** argv) {
     // matrix rather than only on the one that has a GL context - see
     // roiStatsSelftest(), and V19 below for the half of it that does draw.
     if (g_roiStatsSelftest) return roiStatsSelftest();
+
+    // The same panel's table as a DOCUMENT (issue #67), including the rectangle
+    // it is the only table to carry as a value. Windowless for the roistats
+    // reasons and one more: buildRoiExport() draws no frame at all.
+    if (g_roiExportSelftest) return roiExportSelftest();
 
     // A and B on one document. Windowless for the same reason - what it asserts
     // is what the Statistics panel PRINTS, and that is CPU on both sides of the

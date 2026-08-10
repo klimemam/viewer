@@ -387,6 +387,7 @@ GUI を出さず、stderr に `<name>selftest: ...` を出して 0/1 で終了�
 | `--newwin-selftest <dir>` | autosave の枠取り、stale lock の回収、復旧の提示、secondary が prefs を書かないこと、`newWindowArgv` が組む argv の完全一致 |
 | `--export-selftest <dir>` | 画を外に出す経路をバイト列で。PNG の IHDR、montage の寸法と CFA 位相、タイル0が frame0 の ROI と画素一致 |
 | `--export-tsv-selftest <dir>` | Temporal 統一エクスポートの文字列 — 見出し、素性行、単位、n-of-N、領域の申告、CSV 方言、フレーム軸の往復 |
+| `--roi-export-selftest` | ROIs の表を文書として (#67)。座標規約の申告、`x/y/w/h` が列であること、All 行が side 自身のフレーム、収まらない side の `-` と理由、plane 行と pooled `all`、ASCII、コンボ非反映 |
 | `--framestats-selftest` | per-frame TSV を stdout に出す (numpy で再現するための golden 出力。内部アサート無し) |
 | `--range-selftest <dir>` | A/B の表示レンジの全組み合わせ、軸の命名、追従、auto の再フィット |
 | `--picker-selftest <dir>` | picker の5ユースケース (merge、フィルタ、トップフォルダ毎の batch、単一フレーム) |

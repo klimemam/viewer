@@ -558,6 +558,7 @@ struct App {
     std::unique_ptr<pfd::save_file> saveDlg;
     std::unique_ptr<pfd::save_file> csvDlg;    // Analysis > Export curves (CSV)
     std::unique_ptr<pfd::save_file> texportDlg; // Temporal > Save (CSV)...
+    std::unique_ptr<pfd::save_file> roiExportDlg; // ROIs > Save (CSV)... (#67)
     std::unique_ptr<pfd::save_file> pngDlg;    // Image > Save view as PNG
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
@@ -569,6 +570,7 @@ struct App {
                                                // change while the OS dialog is open
     std::string pendingTexport;                // Temporal export, same rule: built at
                                                // click time, written when the dialog lands
+    std::string pendingRoiExport;              // ROI export (#67), same rule again
     bool showHelp = false, showAbout = false;
     // hover state (image coords, -1 = none)
     int hoverX = -1, hoverY = -1;
@@ -1715,8 +1717,8 @@ struct App {
     };
     std::unique_ptr<ReaderJob> rdJob;
     bool anyFileDialog() const {      // see the note on csvDlg
-        return openDlg || saveDlg || csvDlg || texportDlg || pngDlg || folderDlg ||
-               rdOpenDlg || rdFolderDlg || rdNewDlg;
+        return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
+               folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)
