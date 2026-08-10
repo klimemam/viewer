@@ -156,8 +156,18 @@ jobs:
             # miniz.c is C: compiling it as C++ turns its tentative definitions
             # into redefinition errors, so it gets its own gcc pass
             gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
+            # core/version.cpp, and -Ibuild/generated for the header the cmake
+            # build above wrote there. MOP_SET_FOLD returns the peer version as
+            # PROVENANCE - "which build folded this", which is what #46 asks of
+            # a built-in, since a built-in has no dll to name instead. It is
+            # written into the reply and NEVER compared, so it cannot become a
+            # parity refusal (PR #135) and it costs this list exactly one file.
+            # This list is the whole definition of the compat binary, so keep it
+            # minimal - but a symbol the peer genuinely needs belongs in it.
             g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -Icore -Iinclude -Ibuild/_deps/miniz-src \
-                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp /tmp/miniz.o \
+                -Ibuild/generated \
+                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
+                /tmp/miniz.o \
                 -o build/viewer-serve \
                 -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
             for f in plugins/*.c; do

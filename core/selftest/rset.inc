@@ -533,6 +533,13 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
               "RS14 a fold-form MISMATCH is refused, with BOTH forms on the line");
         check(!ok5 && mr.cols.empty() && mr.provName.empty(),
               "RS15 ...and NOTHING was folded - no sums, no quiet local fallback");
+        // PR #135's lesson, asked of this refusal: no BUILD-DERIVED string may
+        // appear in it. A parity check on one makes two peers that agree about
+        // every line refuse each other, and even quoting a version beside a
+        // form mismatch tells the reader the build is what differed. The peer
+        // version is provenance and rides in the reply, where RS13 finds it.
+        check(!ok5 && e5.find(viewerVersion()) == std::string::npos,
+              "RS15b ...and quotes no build string - a version is never matched");
         // ...and an undeclared form, which two absences must not make a match.
         q.foldForm.clear();
         remote::MeasureResult m6;

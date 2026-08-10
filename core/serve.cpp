@@ -1505,25 +1505,36 @@ static void putShade(std::vector<MItem>& col, int nPl, const DetrendReport& S) {
 // dll here and no descriptor to version, so what is matched is the FORM the
 // fold declares - see core/setfold.h for why that, and not the viewer version,
 // is the thing whose equality makes the answer mean one thing.
+//
+// NOT ONE BUILD-DERIVED STRING APPEARS IN THIS REFUSAL, and that is the point
+// PR #135 paid for on the plugin side: an equality check on a build-derived
+// string makes two peers that agree about every line refuse each other, which
+// is the accident parity exists to prevent, arriving from the other side. The
+// version this peer was built from is real provenance and it travels in the
+// reply trailer, where it is never compared - naming it here would invite the
+// reader to think the BUILD is what mismatched, when what mismatched is
+// printed in full immediately above.
 static bool setFoldParityOk(const std::string& clientForm, uint32_t join, std::string& why) {
     const std::string mine = setfold::foldForm(join);
     if (!clientForm.empty() && clientForm == mine) return true;
     const std::string head = "set fold parity refused: the fold ";
     if (clientForm.empty()) {
-        why = head + "declares nothing on the client and is\n  <" + mine +
-              ">\n  on the peer (viewer " + viewerVersion() + ")\n"
+        why = head + "declares nothing on the client and is\n  <" + mine + ">\n  on the peer\n"
               "  A set analyzer is a built-in, so there is no descriptor version to "
               "match: what is matched is the FORM the fold declares, and a form that "
               "was never declared cannot be matched.";
         return false;
     }
     why = head + "is\n  <" + clientForm + ">\n  on the client and\n  <" + mine +
-          ">\n  on the peer (viewer " + viewerVersion() + ")\n"
+          ">\n  on the peer\n"
           "  Neither form wins: this is not folded with the peer's build, and it is "
           "not handed back to the client to fold here.\n"
           "  A set analyzer's name is worn by more than one estimator, so a fold "
           "that is not the one the row was named for is the failure this check "
-          "exists to make impossible.";
+          "exists to make impossible.\n"
+          "  The two builds' VERSIONS are not what differ here and are deliberately "
+          "not quoted: a version is provenance, it rides in the reply, and it is "
+          "never matched - two peers one commit apart fold identically.";
     return false;
 }
 
@@ -1628,6 +1639,11 @@ static void runSetFold(const MeasureReqHead& head,
     }
     // #46's 計算者欄 for a built-in: the viewer version, and no dll, because
     // there is none and that absence is the statement.
+    //
+    // This is the ONE place the peer's build string is used, and it is a
+    // provenance field: it is written into the reply, printed beside the row,
+    // and NEVER compared. That separation is the whole reason it is safe to
+    // put a build-derived string on this wire at all (PR #135).
     MeasureProv prov;
     prov.name = "set fold (built-in)";
     prov.version = viewerVersion();
