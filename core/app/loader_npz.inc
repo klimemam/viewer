@@ -158,11 +158,17 @@ static std::string npyWriteFile(const std::string& path, const char* descr,
 // A reading of an array. Never inferred beyond NR_NATIVE; the others exist only
 // because someone chose them in the Inspector. VALUES ARE WRITTEN TO SESSIONS:
 // append, never renumber.
+//
+// The numbers now live in core/remote_proto.h, because since protocol 9 a
+// reading is also something this client SENDS (issue #124): the same four
+// values name the same four readings on the peer, and two lists of four
+// constants is exactly the shape of the bug #71 was. These names stay so that
+// every call site reads unchanged.
 enum NpyRead {
-    NR_NATIVE = 0,   // no choice recorded: §3.1 decides from rank + last axis
-    NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
-    NR_HWC    = 2,   // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
-    NR_CHW    = 3,   // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
+    NR_NATIVE = rp::NR_NATIVE,   // no choice recorded: §3.1 decides from rank + last axis
+    NR_STACK  = rp::NR_STACK,    // leading axis is frames: (F,H,W) / (F,H,W,C)
+    NR_HWC    = rp::NR_HWC,      // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
+    NR_CHW    = rp::NR_CHW,      // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
 };
 
 // The four forms, spelled the way §3.2 spells them to a user.
@@ -181,17 +187,13 @@ static const char* const NPY_NATIVE_FORMS = rp::NPY_NATIVE_FORMS;
 // Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
 // -1 = "this reading has no such axis". False = r does not apply to this rank,
 // which is how impossible readings are kept off the menu (§3.3).
+//
+// The body moved to core/remote_proto.h with the enum, for the same reason: the
+// menu is computed HERE and served THERE, so if the two ends disagreed about
+// which axis "(C,H,W)" names, the viewer would show pixels under a label that
+// is a lie. This name stays as the local spelling of it.
 static bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) {
-    iF = iH = iW = iC = -1;
-    switch (r) {
-    case NR_STACK:
-        if (rank == 3) { iF = 0; iH = 1; iW = 2;           return true; }
-        if (rank == 4) { iF = 0; iH = 1; iW = 2; iC = 3;   return true; }
-        return false;
-    case NR_HWC: if (rank == 3) { iH = 0; iW = 1; iC = 2; return true; } return false;
-    case NR_CHW: if (rank == 3) { iC = 0; iH = 1; iW = 2; return true; } return false;
-    }
-    return false;
+    return rp::npyReadAxes(rank, r, iF, iH, iW, iC);
 }
 
 // §3.1, entire: rank, then the last axis, then stop. NR_NATIVE for a rank that
@@ -211,10 +213,14 @@ static bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) 
 // codebase is already 1..4 rather than {3,4}. What this costs is a stack of
 // frames 1 to 4 pixels wide, which §3.1 wrote off as not a real thing, and
 // which §3.3 can say again per file anyway.
+//
+// The two lines that implement it moved to core/remote_proto.h alongside the
+// axis rule and for the same reason - core/serve.cpp had a hand-written copy of
+// this exact test, and a copy is what let "3|4" outlive the rule. The argument
+// above is the record of WHY the ceiling is 4; the header is only where the
+// comparison now lives.
 static int npyNativeRead(const std::vector<int64_t>& shape) {
-    if (shape.size() == 3) return shape[2] <= 4 ? NR_HWC : NR_STACK;
-    if (shape.size() == 4) return NR_STACK;
-    return NR_NATIVE;
+    return rp::npyNativeRead(shape);
 }
 
 // Registry identity (§6.2, declared above srcIdentityKey): the reading that
@@ -242,10 +248,11 @@ int npyKeyRead(const std::vector<int64_t>& shape, int npyRead) {
 // the user has to leave in order to act on.
 static std::string npyNotNative(const std::vector<int64_t>& shape) {
     // The first two lines are rp::npyNotNativeText - the same two the peer
-    // sends, from the same place. The third is this door's alone: it is the
-    // one with a reader picker to send the user to (issue #71 D3 leaves the
-    // remote half without one), and a promise is only worth making where it
-    // can be kept.
+    // sends, from the same place. The third is this door's alone, and still is
+    // after #124 gave the remote half §3.3: the reader picker is a modal
+    // window and the peer has no window, and a refusal is a document that
+    // never opened, so there is nothing on that side for the line to point at.
+    // A promise is only worth making where it can be kept.
     return rp::npyNotNativeText(shape) +
            "\n  choose a reader to read it another way";
 }
@@ -261,19 +268,29 @@ static bool npyLayout(const std::vector<int64_t>& shape, const std::vector<int64
     F = 1; sf = 0; H = W = C = 1; sh = sw = sc = 0;
     const size_t rank = shape.size();
     auto addNote = [&](const std::string& s) { note = note.empty() ? s : note + ", " + s; };
+    // A remembered choice that no longer fits (the file was rewritten with a
+    // different rank) falls back to native and SAYS it did - restoring a session
+    // must not quietly apply a reading to an array it cannot mean.
+    //
+    // Ahead of the rank switch, not inside the 3-or-4 arm where it used to sit,
+    // so that rank 2 gets the sentence as well: (H,W) has no choice to make and
+    // was silently ignoring a declaration. That silence became visible when the
+    // peer learned to serve a declared reading (issue #124) - it has to give the
+    // same answer as this door for the same file, and "one door says nothing,
+    // the other refuses" is the disagreement #71 was.
+    int r = npyRead;
+    {
+        int a, b, c, d;
+        if (r != NR_NATIVE && !npyReadAxes(rank, r, a, b, c, d)) {
+            addNote("re-read choice does not fit " + npyShapeText(shape) + "; read natively");
+            r = NR_NATIVE;
+        }
+    }
     if (rank == 2) {                    // (H,W): one frame, one channel, no choice
         H = shape[0]; sh = strides[0];
         W = shape[1]; sw = strides[1];
     } else if (rank == 3 || rank == 4) {
         int iF, iH, iW, iC;
-        int r = npyRead;
-        // A remembered choice that no longer fits (the file was rewritten with a
-        // different rank) falls back to native and SAYS it did - restoring a
-        // session must not quietly apply a reading to an array it cannot mean.
-        if (r != NR_NATIVE && !npyReadAxes(rank, r, iF, iH, iW, iC)) {
-            addNote("re-read choice does not fit " + npyShapeText(shape) + "; read natively");
-            r = NR_NATIVE;
-        }
         if (r == NR_NATIVE) r = npyNativeRead(shape);
         npyReadAxes(rank, r, iF, iH, iW, iC);
         if (iF >= 0) { F = shape[iF]; sf = strides[iF]; }
@@ -299,8 +316,7 @@ static bool npyLayout(const std::vector<int64_t>& shape, const std::vector<int64
     // said as a ceiling and not as "not a native form" - a different sentence
     // because it is a different refusal.
     if (C > 4) {
-        err = npyShapeText(shape) + " would be " + std::to_string(C) +
-              " channels: this viewer shows up to 4";
+        err = rp::npyChannelCeilingText(shape, C);
         return false;
     }
     if (F > 1) addNote("frame axis");
@@ -2358,9 +2374,59 @@ static std::string npyReReadAs(ImageDoc* d, int r) {
     if (!d || !d->src) return "no image";
     const std::string path = d->src->path, member = d->src->member;
     if (path.empty()) return "these pixels have no file to read again";
+    const std::string url = d->src->remoteUrl;
+    // BEFORE "not a .npy". A document opened through a peer older than protocol
+    // 9 has an empty npyShape too - not because the file has no shape, but
+    // because that peer has no way to say it (issue #124). Answering "not a
+    // .npy" there would blame the file for a limit that belongs to the link,
+    // which is the same mistake #111 fixed on the other side of this function.
+    if (!url.empty() && d->src->remoteProto > 0 && d->src->remoteProto < 9)
+        return rp::npyReReadTooOldText(d->src->remoteProto);
     if (d->src->npyShape.empty()) return "not a .npy: there is no other reading of it";
     if (npyReadLabel(d->src->npyShape, r).empty())
-        return npyShapeText(d->src->npyShape) + " cannot be read that way";
+        return rp::npyNotThatWayText(d->src->npyShape);
+    // A document opened through a peer re-reads THERE (issue #124). Same
+    // sentence in front of it, same confirm, same loss notice - the difference
+    // is only which door the second decode goes through, and it has to be the
+    // peer's, because the point of the link is that the pixels never crossed it
+    // in the first place.
+    if (!url.empty()) {
+        const int oldSeqR = d->seqId;
+        const uint64_t oldUidR = d->uid;
+        const int cfaR = d->cfa, patR = d->cfaPattern, lutR = d->displayLut;
+        const bool colR = d->cfaColorize;
+        const int batchR = d->batchId;
+        const size_t beforeR = app.images.size();
+        const int prevBatchR = app.loadBatchId;
+        app.loadBatchId = batchR;
+        const bool quietWasR = g_quietLoad;
+        g_quietLoad = true;
+        // Frame 0, not the frame that happens to be on screen: a different
+        // reading is a different frame axis (48 frames of 1x40 where there was
+        // one 40x48 picture), so "the frame the user was on" names nothing in
+        // the array they are about to get.
+        const bool okR = openRemote(url, false, 0, r);
+        g_quietLoad = quietWasR;
+        app.loadBatchId = prevBatchR;
+        if (!okR || app.images.size() == beforeR)
+            return "the peer could not read it that way";   // nothing was closed
+        std::vector<ImageDoc*> madeR;
+        for (size_t k = beforeR; k < app.images.size(); k++) madeR.push_back(app.images[k].get());
+        if (oldSeqR != 0) closeStack(oldSeqR);
+        else {
+            for (size_t k = 0; k < app.images.size(); k++)
+                if (app.images[k]->uid == oldUidR) { closeImages({ (int)k }); break; }
+        }
+        for (ImageDoc* m : madeR) {
+            m->cfa = cfaR; m->cfaPattern = patR; m->cfaColorize = colR;
+            m->displayLut = lutR;
+            m->texDirty = true;
+        }
+        for (size_t k = 0; k < app.images.size(); k++)
+            if (app.images[k].get() == madeR[0]) { app.current = (int)k; break; }
+        app.imagesRev++;
+        return {};
+    }
     // What belongs to the FILE and not to the reading travels across; the range
     // does not, because a different reading is a different set of pixels.
     const int cfa = d->cfa, pat = d->cfaPattern, lut = d->displayLut, batch = d->batchId;

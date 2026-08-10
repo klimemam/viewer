@@ -80,7 +80,36 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // parity refusal this op exists to produce. With the number the client refuses
 // BEFORE it sends, names which mismatch it is, and never turns a too-old peer
 // into a quiet local fold over pixels it would have had to fetch.
-static const uint32_t VERSION = 8;
+//
+// 9: the §3.3 escape hatch reaches a document opened through a peer (issue
+// #124). META now carries the shape the FILE DECLARED, and META and TILE both
+// take a DECLARED READING of it, so the peer can serve "(48,40,1) read as
+// (F,H,W)" and not only the reading its own rule picked.
+//
+// The two bumps before this one were both about a refusal being ILLEGIBLE - a
+// v7 peer answering "unknown measure op" cannot be told apart from a parity
+// refusal or a typo. This one is the opposite failure and, for a user, the
+// worse one: there would be NO refusal. The reading is appended after TileReq
+// exactly the way MOP_PLUGIN_ANALYZE's fields are appended after
+// MeasureReqHead - so that not one byte moves for a request an older peer
+// already understands - and the consequence of that layout is that a v8 peer
+// reads the head it knows, never reads the four bytes behind it, and answers
+// SUCCESSFULLY with the native reading. The user declares "read this mono
+// (H,W,1) capture as a stack", the same single 40x48 frame comes back, and the
+// Inspector then labels those pixels with the reading that was asked for. A
+// silent wrong answer wearing the right label is not a degraded escape hatch;
+// it is worse than the blank line #124 was filed about, because the blank line
+// at least says nothing.
+//
+// So the number is what lets the client refuse BEFORE it sends and name which
+// mismatch it is - the same discipline 7 and 8 established, reached from the
+// other direction. It is also what makes the REPLY readable: without it, "no
+// shape trailer on this META" cannot be told from "this file has no shape to
+// declare", and the Inspector would have to guess which silence it was looking
+// at. And it is, as ever, what makes an installed viewer-serve update itself on
+// connect, which is the only reason a lab that copied the peer once ever sees
+// the feature at all.
+static const uint32_t VERSION = 9;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -263,6 +292,14 @@ struct Header {
 // roughly the pixels it can actually show: `step` is the sample stride, chosen so
 // that one returned sample is about one screen pixel (step ~ 1/zoom). A 4000x3000
 // frame fitted into a 1000px-tall pane travels as 1334x1000, not as 12 Mpx.
+//
+// Since protocol 9 the request is [str path][TileReq][u32 read] (NpyRead): the
+// frame index, the rect and the step are all coordinates INSIDE a reading, so
+// the reading has to travel with them or they mean a different region than the
+// caller meant. Appended after the struct, for the reason every append in this
+// header is - a request an older peer understands must not move by one byte -
+// and gated on the version at the client for the reason the VERSION note gives:
+// an older peer does not refuse the trailer, it silently never reads it.
 struct TileReq {
     uint32_t frame;             // frame index within the file (0 for a plain image)
     uint32_t x, y, w, h;        // region in source pixels
@@ -332,14 +369,106 @@ inline std::string npyShapeText(const std::vector<int64_t>& shape) {
 //
 // Two lines, not three. The local door adds a third ("choose a reader to read
 // it another way") because openReaderPicker is there to receive it; the peer
-// does not, because a document opened through a peer has no reader picker yet
-// (issue #71 D3 - FrameSource::npyShape is only ever set by the local decoder).
-// Promising a way out that the remote half does not have would be worse than
-// the dead end it replaces, so the peer stops at the two lines it can keep.
+// does not, because the picker is a modal window and the peer has no window.
+// The escape hatch itself is no longer local-only - §3.3's Inspector line and
+// its re-reading reach a remote document since protocol 9 (issue #124) - but a
+// refusal is a document that never opened, and there is nothing on the remote
+// side for that third line to point AT. Promising a way out that the remote
+// half does not have would be worse than the dead end it replaces, so the peer
+// stops at the two lines it can keep.
 inline std::string npyNotNativeText(const std::vector<int64_t>& shape) {
     return (shape.empty() ? std::string("a scalar")
                           : "shape " + npyShapeText(shape)) +
            " is not a native form\n  native reads " + std::string(NPY_NATIVE_FORMS);
+}
+
+// ---- HOW an array is read, spelled once for both doors ---------------------
+//
+// docs/input-adapters.md §3.3, the successor to --npy-axis: the shape rule
+// (§3.1) decides, and where it guessed wrong the user DECLARES a different
+// reading per file. The declaration used to exist only in this process, because
+// only the local decoder ever knew a file's shape; since protocol 9 it crosses
+// the wire (issue #124), which is what puts these four numbers and the axis
+// rule underneath them in the header BOTH binaries include.
+//
+// That placement is #71's lesson rather than tidiness. The "3|4" spelling
+// outlived the rule it described precisely because core/serve.cpp kept a COPY
+// of it, and a declared reading is the same hazard doubled: the client computes
+// the menu from the shape, the peer serves what the menu offered, and if the
+// two disagree about which axis a reading names, the viewer shows pixels under
+// a label that is a lie. One definition, both sides.
+//
+// VALUES ARE WRITTEN TO SESSION FILES and now to the wire: append, never
+// renumber.
+enum NpyRead : uint32_t {
+    NR_NATIVE = 0,   // no choice recorded: §3.1 decides from rank + last axis
+    NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
+    NR_HWC    = 2,   // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
+    NR_CHW    = 3,   // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
+};
+
+// Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
+// -1 = "this reading has no such axis". False = r does not apply to this rank,
+// which is how impossible readings are kept off the menu (§3.3) and how a
+// declaration that cannot mean anything is refused rather than approximated.
+inline bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) {
+    iF = iH = iW = iC = -1;
+    switch (r) {
+    case NR_STACK:
+        if (rank == 3) { iF = 0; iH = 1; iW = 2;           return true; }
+        if (rank == 4) { iF = 0; iH = 1; iW = 2; iC = 3;   return true; }
+        return false;
+    case NR_HWC: if (rank == 3) { iH = 0; iW = 1; iC = 2; return true; } return false;
+    case NR_CHW: if (rank == 3) { iC = 0; iH = 1; iW = 2; return true; } return false;
+    }
+    return false;
+}
+
+// §3.1, entire: rank, then the last axis, then stop. NR_NATIVE for a rank that
+// has no reading at all (1-D, 5-D and up) - the caller refuses those by name.
+// The last axis is CHANNELS when it is 4 OR FEWER; the argument for the ceiling
+// and against "3 or 4" is issue #71 and is written out over the local caller in
+// core/app/loader_npz.inc. Settled; this is only where it now LIVES, so that
+// the peer reads it out of the same line the client does instead of out of a
+// copy that once drifted for months.
+inline int npyNativeRead(const std::vector<int64_t>& shape) {
+    if (shape.size() == 3) return shape[2] <= 4 ? NR_HWC : NR_STACK;
+    if (shape.size() == 4) return NR_STACK;
+    return NR_NATIVE;
+}
+
+// A DECLARED reading this shape cannot carry. Different from §3.2's refusal:
+// that one is about a file nothing can open, this one is about an instruction
+// that does not fit a file which opens perfectly well. Reached from a session
+// restored against a rewritten file, and from a peer answering a client whose
+// menu was computed on a different shape than the one on its disk.
+inline std::string npyNotThatWayText(const std::vector<int64_t>& shape) {
+    return npyShapeText(shape) + " cannot be read that way";
+}
+
+// (F,H,W,C) IS a native form; C > 4 is this viewer's own ceiling, so it is said
+// as a ceiling and not as "not a native form" - a different refusal deserves a
+// different sentence. Both doors say it, and since protocol 9 the peer says it
+// about a DECLARED reading too ("read (8,8,5) as (C,H,W)" is 8 channels), so
+// the one spelling lives here rather than being typed out on each side.
+inline std::string npyChannelCeilingText(const std::vector<int64_t>& shape, int64_t ch) {
+    return npyShapeText(shape) + " would be " + std::to_string(ch) +
+           " channels: this viewer shows up to 4";
+}
+
+// The peer predates the declared reading (issue #124). Written BEFORE anything
+// is sent, from the number the peer announced in HELLO, for the reason the
+// VERSION note above gives at length: an older peer does not refuse this
+// request, it answers it with the wrong pixels. So the client has to be the one
+// that refuses, and it has to say which mismatch it is - "your peer is old",
+// not "that shape cannot be read that way", which is what the user would
+// otherwise conclude from an escape hatch that appears to do nothing.
+inline std::string npyReReadTooOldText(int peerVersion) {
+    return "the remote peer is too old to read a .npy another way: it speaks "
+           "protocol " + std::to_string(peerVersion) + ", a declared reading needs " +
+           std::to_string(VERSION) + " (update viewer-serve). Nothing was re-read - "
+           "the peer would have returned the reading it chose itself, under the "
+           "name of the one you asked for.";
 }
 
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.
@@ -441,12 +570,47 @@ inline std::string patternWithExtent(const std::string& pattern,
            pattern.substr(qe);
 }
 
+// META request: [str path], and since protocol 9 [u32 read] (NpyRead).
+//
+// The reading is on the REQUEST and not merely on TILE because META's whole job
+// is to say how big the picture is before a pixel moves, and a reading changes
+// exactly that: (48,40,1) is one 40x48 frame read natively and 48 frames of
+// 1x40 read as a stack. Asking META natively and re-deriving the geometry here
+// would put the layout rule on both sides of the link again with nothing
+// checking that they agree - which is the fault #71 spent a release on. The
+// peer is asked what it will SERVE, and then serves it.
+//
 // META reply: what the client needs to lay out the image before any pixel moves.
+// Since protocol 9 the fixed struct is followed by
+//   [u32 ndim][u32 dims[4]]   declaration order, 0-padded
+// when flags & MR_SHAPE - the shape the FILE declared, before any
+// interpretation, the same fields and the same spelling LIST already uses.
+// Appended AFTER the struct rather than added to it so that a v8 client reading
+// a v9 peer's reply parses byte for byte what it always parsed and simply stops
+// early.
+//
+// Without it the client knows w/h/ch/frames and nothing about the array they
+// came from, so it can neither print §3.3's "read as" line nor compute which
+// OTHER readings the shape permits - the whole of issue #124. ndim is 2, 3 or 4
+// (the peer accepts no other rank), so four dims hold it exactly; a shape that
+// does not fit is sent as no shape at all rather than as a clamped one, the
+// rule PR #121 settled for the listing.
+enum MetaFlags : uint32_t {
+    MR_SHAPE = 1,   // the declared-shape trailer follows
+    // The DECLARED reading did not fit this rank, so the peer used native. The
+    // local decoder's answer to the same case is a fallback plus the note "re-
+    // read choice does not fit (...); read natively" (core/app/loader_npz.inc),
+    // and the two doors have to answer one file one way - so the peer does the
+    // same thing and says which it did, rather than refusing where the other
+    // door opens. The client turns this bit into that note, verbatim, and keeps
+    // the declaration on the source exactly as the local decoder does.
+    MR_READ_FELL_BACK = 2,
+};
 struct MetaRep {
     uint32_t w, h, ch;
     uint32_t dtype;
     uint32_t frames;            // 1 for a plain image, N for a frame axis
-    uint32_t flags;
+    uint32_t flags;             // MetaFlags
 };
 
 }  // namespace rp
