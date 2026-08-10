@@ -2700,6 +2700,64 @@
             closeAll();
         }
 
+        // ---- V28: every compare mode the app HAS can be asked for ------------
+        // The settings audit (#50) found that `--compare` accepted
+        // off|wipe|split|diff and nothing else, so CmpFlip - offered in the
+        // menu as "Blink (flip A/B in place)" - was the one compare mode no
+        // script could start in. That is not a missing feature, it is a gap
+        // between two lists that nobody was comparing.
+        //
+        // So the assertion is over the ENUM, not over a spelling: every value
+        // App::Cmp* can hold must have a name the parser accepts. A sixth
+        // compare mode added tomorrow fails here until it can be requested,
+        // which is the only day that is cheap. The enum's range is stated here
+        // rather than derived, because an enum in C++ cannot be walked - and
+        // the anti-vacuity check below is what stops that constant from
+        // quietly becoming a lie.
+        {
+            const int MODES[] = { App::CmpOff, App::CmpWipe, App::CmpSplit,
+                                  App::CmpDiff, App::CmpFlip };
+            std::string missing;
+            for (int m : MODES) {
+                bool found = false;
+                for (const auto& e : COMPARE_MODE_NAMES) if (e.mode == m) found = true;
+                if (!found) missing += (missing.empty() ? "" : ", ") + std::to_string(m);
+            }
+            if (!missing.empty())
+                fprintf(stderr, "verifyselftest: V28 compare mode(s) with no name: %s\n",
+                        missing.c_str());
+            check(missing.empty(),
+                  "V28 every compare mode has a name --compare accepts");
+
+            // Anti-vacuity: MODES must cover the enum's real span. CmpFlip is
+            // the largest value the enum defines, so a list that stops short of
+            // it - the exact mistake this test exists to catch - is caught here
+            // instead of passing with four modes checked out of five.
+            check((int)(sizeof MODES / sizeof MODES[0]) == App::CmpFlip + 1 &&
+                      MODES[App::CmpFlip] == App::CmpFlip,
+                  "V28 the mode list spans the enum, 0..CmpFlip (anti-vacuity)");
+
+            // The word the menu uses is the word the flag takes: a user who
+            // read "Blink" in the menu must not have to know the enum is
+            // called CmpFlip. Both are accepted; only one has to be guessable.
+            check(compareModeFromName("blink") == App::CmpFlip &&
+                      compareModeFromName("flip") == App::CmpFlip,
+                  "V28 the menu's word and the enum's word both reach CmpFlip");
+            check(compareModeFromName("side") == App::CmpSplit,
+                  "V28 the pre-existing alias still parses");
+            check(compareModeFromName("nonesuch") == -1 &&
+                      compareModeFromName("") == -1,
+                  "V28 an unknown mode is refused rather than defaulted");
+
+            // The refusal lists every mode ONCE - it is the only place a user
+            // is told what the choices are, so an alias printed beside its own
+            // canonical name would read as two different modes.
+            std::string list = compareModeNameList();
+            fprintf(stderr, "verifyselftest: V28 --compare refusal lists: %s\n", list.c_str());
+            check(list == "off|wipe|split|diff|blink",
+                  "V28 the refusal names every mode, canonical spelling, no aliases");
+        }
+
         // ---- V26: the Messages panel past its own cap -------------------------
         // msgLog holds 300 and then drops from the front, so its SIZE is 300 for
         // message 300 and for message 3000 alike. The panel used to key its

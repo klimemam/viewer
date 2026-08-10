@@ -1,5 +1,44 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ハーネス基盤
 // ---------------------------------------------------------------- CLI
+
+// The compare modes --compare accepts, as ONE table. The parser, the error
+// message and --help all read it, so a mode cannot be spelled in one of them
+// and missing from another - which is exactly how CmpFlip came to be the one
+// compare mode a script could not ask for while the menu offered it as
+// "Blink (flip A/B in place)". V26 asserts every App::Cmp* value appears here.
+//
+// The canonical name is the FIRST entry for a mode (that is the one --help
+// prints); later entries for the same mode are aliases kept because scripts
+// use them.
+struct CompareModeName { const char* name; int mode; };
+static const CompareModeName COMPARE_MODE_NAMES[] = {
+    { "off",   App::CmpOff   },
+    { "wipe",  App::CmpWipe  },
+    { "split", App::CmpSplit },
+    { "side",  App::CmpSplit },     // alias: predates "split", scripts use it
+    { "diff",  App::CmpDiff  },
+    { "blink", App::CmpFlip  },     // the menu's word
+    { "flip",  App::CmpFlip  },     // the enum's word, and the menu's parenthetical
+};
+static int compareModeFromName(const std::string& v) {
+    for (const auto& e : COMPARE_MODE_NAMES) if (v == e.name) return e.mode;
+    return -1;
+}
+// "off|wipe|split|diff|blink" - canonical names only, in table order, so the
+// refusal and --help say the same thing without a second list to maintain.
+static std::string compareModeNameList() {
+    std::string s;
+    for (const auto& e : COMPARE_MODE_NAMES) {
+        bool canonical = true;
+        for (const auto& f : COMPARE_MODE_NAMES) {
+            if (&f == &e) break;
+            if (f.mode == e.mode) { canonical = false; break; }
+        }
+        if (canonical) s += (s.empty() ? "" : "|") + std::string(e.name);
+    }
+    return s;
+}
+
 static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_rangeSelftest;      // --range-selftest <dir with 2 stacks>
@@ -435,7 +474,10 @@ static void printUsage() {
         "  --remote-policy <p>         where a measurement runs: auto (default, on the\n"
         "                              server) | local-fetch (pull tiles, measure here)\n"
         "  --serve                     BE that peer: answer requests on stdin/stdout\n"
-        "  --compare <off|wipe|split|diff>  A/B compare the first two images given\n"
+        "  --compare <mode>            A/B compare the first two images given.\n"
+        "                              Modes are listed by --compare with an\n"
+        "                              unknown one, from the same table the\n"
+        "                              parser reads (off|wipe|split|diff|blink)\n"
         "  --bench <frames>            render N frames offscreen, print frame-time stats, exit\n"
         "  --bench-tiles               ...with A, B and two extra slots tiled side by\n"
         "                              side, and report the panes the canvas drew\n"
@@ -731,13 +773,11 @@ static void parseCli(int argc, char** argv) {
             app.remoteExe = next();
         } else if (a == "--mem-budget") {          // GB the stack loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
-        } else if (a == "--compare") {             // off | wipe | split
+        } else if (a == "--compare") {
             std::string v = next();
-            if (v == "wipe") cliCompare = App::CmpWipe;
-            else if (v == "split" || v == "side") cliCompare = App::CmpSplit;
-            else if (v == "diff") cliCompare = App::CmpDiff;
-            else if (v == "off") cliCompare = App::CmpOff;
-            else fprintf(stderr, "--compare expects off|wipe|split|diff\n");
+            int m = compareModeFromName(v);
+            if (m >= 0) cliCompare = m;
+            else fprintf(stderr, "--compare expects %s\n", compareModeNameList().c_str());
         } else if (a == "--zoom") {
             zoom = (float)atof(next().c_str()); haveZoom = true;
         } else if (a == "--center") {
