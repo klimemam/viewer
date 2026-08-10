@@ -552,9 +552,17 @@ static void drawInspector() {
         // values all fit says nothing at all, and an f64 file written from
         // float32 data says nothing either. This panel does not warn about
         // dtypes; it reports a measurement.
-        if (im->src->f32loss.any()) {
+        //
+        // The GUARD IS THE STRING, not a second predicate beside it.
+        // f32LossNote() returns "" exactly when there is nothing to say, so
+        // asking `.any()` here would be a second opinion on the same question -
+        // one this panel could hold while the sentence disagreed, and one no
+        // test could reach without driving a frame. Written this way, what
+        // --precision-selftest asserts (empty for a file that fits, and the
+        // exact wording for one that does not) IS the condition on this line.
+        if (std::string loss = rp::f32LossNote(im->src->f32loss, im->dtype); !loss.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
-            ImGui::TextWrapped("%s", rp::f32LossNote(im->src->f32loss, im->dtype).c_str());
+            ImGui::TextWrapped("%s", loss.c_str());
             ImGui::PopStyleColor();
         }
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
