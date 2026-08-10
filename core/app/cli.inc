@@ -67,6 +67,7 @@ static std::string g_sweepFileSelftest; // --sweepfile-selftest <dir>: one .npy 
 static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slots + spawn line, exit
 static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
+static std::string g_watchSelftest;     // --watch-selftest <dir>: the change-detection rule, exit
 static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
 static std::string g_fmtRegSelftest;    // --fmtreg-selftest <dir>: every format's place in the
                                         // source registry and the reload walk (§6.2 / §3.2), exit
@@ -550,6 +551,9 @@ static void printUsage() {
         "                              prints, the product, and the product's recipe\n"
         "  --srcmap-selftest <dir>     which document holds which pixels: shared sources,\n"
         "                              refcounts, Watch baselines\n"
+        "  --watch-selftest <dir>      the source files changed on disk (項目20): the\n"
+        "                              not-equal rule, the two readings that must agree,\n"
+        "                              appeared / vanished, and the baseline\n"
         "  --media-selftest <dir>      PNG/JPEG/TIFF bit depth, channels and notes;\n"
         "                              a multi-page TIFF as a stack, and the refusals\n"
         "  --reload-selftest <dir>     a frame's FILE rewritten under a live stack:\n"
@@ -751,6 +755,8 @@ static void parseCli(int argc, char** argv) {
             g_reloadSelftest = next();             // handled in main()
         } else if (a == "--srcmap-selftest") {
             g_srcmapSelftest = next();             // handled in main()
+        } else if (a == "--watch-selftest") {
+            g_watchSelftest = next();              // handled in main()
         } else if (a == "--media-selftest") {
             g_mediaSelftest = next();              // handled in main()
         } else if (a == "--fmtreg-selftest") {

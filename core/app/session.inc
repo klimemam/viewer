@@ -949,6 +949,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "dragpans " << (app.dragPans ? 1 : 0) << "\n";
     f << "wheelzoom " << (app.wheelZoomPlain ? 1 : 0) << "\n";
     f << "fitonswitch " << (app.fitOnSwitch ? 1 : 0) << "\n";
+    f << "watchfiles " << (app.watchEnabled ? 1 : 0) << "\n";
     f << "seqload " << app.seqLoadMode << "\n";
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
@@ -1050,6 +1051,7 @@ static void loadPrefs() {
         else if (key == "dragpans")    { ls >> v; app.dragPans = v != 0; }
         else if (key == "wheelzoom")   { ls >> v; app.wheelZoomPlain = v != 0; }
         else if (key == "fitonswitch") { ls >> v; app.fitOnSwitch = v != 0; }
+        else if (key == "watchfiles")  { ls >> v; app.watchEnabled = v != 0; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
         else if (key == "lowbandwidth"){ ls >> v; app.lowBandwidth = v != 0; }

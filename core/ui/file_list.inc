@@ -1162,6 +1162,47 @@ static void drawFileList() {
               !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
               ImGui::IsKeyPressed(ImGuiKey_F2, false))
               ImGui::OpenPopup("seqctx");
+          // ---- Watch (docs/watch-design.md §5) --------------------------------
+          // The stack's files moved on disk. Amber, directly under the header
+          // row, and it does NOT expire: the toast that fired once already has,
+          // and "3 file(s) changed on disk" is the kind of fact seqNote's
+          // comment is about ("A toast expires; '60 of 300' must not").
+          //
+          // AFTER the context menu on purpose, and this is not cosmetic:
+          // BeginPopupContextItem binds to the LAST item drawn, so a widget
+          // between the row and it would give the stack's right-click menu to
+          // this line. Same reason the #56 outline is a draw-list rectangle.
+          //
+          // It says what is on disk, never what these pixels are: the frames in
+          // memory are exactly what they were, which is why the sentence is
+          // about FILES and the button is the way to act on it.
+          if (const App::SeqInfo* wsi = seqInfo(head.seqId)) {
+              std::string wn = seqWatchNote(head.seqId);
+              if (!wn.empty()) {
+                  ImGui::Indent(ImGui::GetFontSize());
+                  ImGui::PushStyleColor(ImGuiCol_Text, WATCH_AMBER32);
+                  ImGui::TextUnformatted(wn.c_str());
+                  ImGui::PopStyleColor();
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Reload##watch")) pendingReloadSeq = wsi->id;
+                  // What Reload will and will not do, stated where the click is.
+                  // Re-reading the frames this stack HAS is reference-design
+                  // §3.2 and is shipped; changing which files are members is
+                  // watch-design §6 and is not, so a stack whose folder gained
+                  // or lost a file is told the truth rather than left to infer
+                  // it from a frame count that did not move.
+                  if (ImGui::IsItemHovered()) {
+                      std::string tip = "Re-read every frame of this stack from disk.\n"
+                                        "Numbers computed from the old pixels are dropped.";
+                      if (wsi->watchFound.appeared || wsi->watchFound.vanished)
+                          tip += "\n\nThis stack's MEMBERSHIP does not change: a file that\n"
+                                 "appeared or vanished is not added or removed by Reload -\n"
+                                 "open the folder again for that.";
+                      ImGui::SetTooltip("%s", tip.c_str());
+                  }
+                  ImGui::Unindent(ImGui::GetFontSize());
+              }
+          }
           // No frame slider here: it used to appear under the active row, and a
           // row that grows on selection makes the whole list jump - the scrub bar
           // lives at the bottom of the Image View now, where the frames are.
@@ -1367,6 +1408,18 @@ static void drawFileList() {
         int failed = 0;
         std::string msg = reloadStackFromDisk(pendingReloadSeq, &failed);
         toast(msg, failed > 0);
+        // The Watch line (§5) said "the files behind these pixels have moved",
+        // and the operation it offered has just run: drop it HERE rather than
+        // waiting for the worker to notice, so the answer to a click is not two
+        // polls late. The worker re-seeds from the fresh stat on its own round
+        // and agrees; a member the reload REFUSED still differs from the
+        // baseline, so its finding comes straight back - which is correct, and
+        // is the difference between clearing a fact and clearing a statement
+        // that has stopped being true.
+        if (App::SeqInfo* si = seqInfo(pendingReloadSeq)) {
+            si->watchFound = watch::Finding{};
+            si->watchToasted = false;
+        }
     }
     if (pendingRecomputeImg >= 0 && pendingRecomputeImg < (int)app.images.size()) {
         std::string err;   // success toasts inside (the reduction's own voice)

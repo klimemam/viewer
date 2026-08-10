@@ -210,31 +210,40 @@ std::string stackNameFor(const std::string& dir, const std::string& pattern) {
 // Siblings = files whose names differ ONLY in one digit field. The field is
 // chosen by which one actually varies in the folder, so "shot_0007_1920x1080.raw"
 // groups on 0007 and not on the resolution.
-static std::vector<std::string> findSequenceSiblings(const std::string& path,
-                                                     std::string& patternOut) {
+//
+// THE RULE, over names already in hand: no filesystem, no directory_iterator.
+// findSequenceSiblings below is this function plus one listing, and the split
+// exists because Watch re-derives a stack's membership every few seconds
+// (docs/watch-design.md §1: "the member list is taken again with the SAME
+// function the open used") over a listing it has ALREADY taken - §2 wants one
+// listing per directory per poll however many stacks live in it, and calling
+// the IO version per stack would take one apiece. Splitting it also puts the
+// grouping rule itself under test with no fixture directory at all.
+//
+// `headName` and `names` are BASENAMES; the result is the subset of `names`
+// that belongs to the head's stack, ordered by the numeric field.
+static std::vector<std::string> siblingNamesAmong(const std::string& headName,
+                                                  const std::vector<std::string>& names,
+                                                  std::string& patternOut) {
     std::vector<std::string> out;
-    std::error_code ec;
-    std::filesystem::path p = pathFromUtf8(path);
-    std::filesystem::path dir = p.parent_path();
-    if (dir.empty() || !std::filesystem::is_directory(dir, ec)) return out;
-    const std::string stem = p.stem().u8string(), ext = p.extension().u8string();
+    const std::filesystem::path hp = pathFromUtf8(headName);
+    const std::string stem = hp.stem().u8string(), ext = hp.extension().u8string();
     std::vector<NameSeg> segs = segmentName(stem);
 
     // candidate files: same extension, same segment structure, all text segments equal
-    struct Cand { std::vector<NameSeg> segs; std::string path; };
+    struct Cand { std::vector<NameSeg> segs; std::string name; };
     std::vector<Cand> cands;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        std::error_code ec2;
-        if (!e.is_regular_file(ec2)) continue;
-        if (e.path().extension().u8string() != ext) continue;
-        std::vector<NameSeg> s2 = segmentName(e.path().stem().u8string());
+    for (const std::string& n : names) {
+        const std::filesystem::path np = pathFromUtf8(n);
+        if (np.extension().u8string() != ext) continue;
+        std::vector<NameSeg> s2 = segmentName(np.stem().u8string());
         if (s2.size() != segs.size()) continue;
         bool ok = true;
         for (size_t k = 0; k < segs.size() && ok; k++) {
             if (segs[k].digit != s2[k].digit) ok = false;
             else if (!segs[k].digit && segs[k].s != s2[k].s) ok = false;
         }
-        if (ok) cands.push_back({ std::move(s2), e.path().u8string() });
+        if (ok) cands.push_back({ std::move(s2), n });
     }
     if (cands.size() < 2) return out;
 
@@ -268,7 +277,7 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
         for (size_t m = 0; m < segs.size(); m++)
             if ((int)m != best && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
         if (!same) continue;
-        found.emplace_back(atoll(c.segs[best].s.c_str()), c.path);
+        found.emplace_back(atoll(c.segs[best].s.c_str()), c.name);
     }
     if (found.size() < 2) return out;
     std::sort(found.begin(), found.end());
@@ -278,16 +287,34 @@ static std::vector<std::string> findSequenceSiblings(const std::string& path,
         // every all-digit sequence name in the picker ('?' also reads as glob)
         patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
     patternOut += ext;
-    std::vector<std::string> bases;
-    bases.reserve(found.size());
-    for (auto& f : found) {
-        out.push_back(f.second);
-        bases.push_back(baseName(f.second));
-    }
+    out.reserve(found.size());
+    for (auto& f : found) out.push_back(f.second);
     // ...then say what the '?' run actually spans. Same function the peer runs
     // (rp::patternWithExtent): a folder opened locally and the same folder
     // listed over ssh must produce the identical stack name.
-    patternOut = rp::patternWithExtent(patternOut, bases);
+    patternOut = rp::patternWithExtent(patternOut, out);
+    return out;
+}
+
+// ...and the same rule with the listing taken here. The paths it returns are
+// built exactly as directory_iterator built them (dir / name), so what callers
+// see is byte-identical to what this function returned before the rule was
+// split out above.
+static std::vector<std::string> findSequenceSiblings(const std::string& path,
+                                                     std::string& patternOut) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    std::filesystem::path p = pathFromUtf8(path);
+    std::filesystem::path dir = p.parent_path();
+    if (dir.empty() || !std::filesystem::is_directory(dir, ec)) return out;
+    std::vector<std::string> names;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        std::error_code ec2;
+        if (!e.is_regular_file(ec2)) continue;
+        names.push_back(e.path().filename().u8string());
+    }
+    for (const std::string& n : siblingNamesAmong(p.filename().u8string(), names, patternOut))
+        out.push_back((dir / pathFromUtf8(n)).u8string());
     return out;
 }
 

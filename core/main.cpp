@@ -127,6 +127,10 @@ App app;
 #include "app/setanalysis_remote.inc"
 
 #include "app/open_dispatch.inc"
+// Watch (docs/watch-design.md): after open_dispatch because the [Reload] its
+// line offers is that file's reloadStackFromDisk, and after sequence.inc
+// because the membership it re-derives every poll uses that file's sibling rule.
+#include "app/watch.inc"
 
 // ---------------------------------------------------------------- view helpers
 static bool tileEngaged();   // fwd: defined with the tile geometry below
@@ -996,6 +1000,8 @@ int main(int argc, char** argv) {
     #include "selftest/newwin.inc"
 
     #include "selftest/srcmap.inc"
+
+    #include "selftest/watch.inc"
 
     #include "selftest/media.inc"
 
@@ -1948,6 +1954,12 @@ int main(int argc, char** argv) {
                 // sits perfectly still until the user does something else. The
                 // write lives in the frame body, so the frame has to happen.
                 working |= g_geomWriteDue;
+                // ...and the same argument for a Watch finding (watch-design
+                // §3). The worker polls on its OWN timer and never wakes the UI
+                // to do it - that is what keeps the 0 fps idle - so the only
+                // thing this line lets through is a fact that is already true
+                // and is waiting for pumpWatch to put it on screen.
+                working |= watchFindingsPending();
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
@@ -1960,14 +1972,17 @@ int main(int argc, char** argv) {
             app.pendingLayout.clear();
         }
         if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {   // minimised: draw nothing
+            app.watchPaused = true;    // ...and poll nothing (watch-design §2)
             glfwWaitEvents();
             continue;
         }
+        app.watchPaused = false;
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpMeasure();                // integrate server-side measurement results
         pumpRemoteBrowse();           // connect/list results from the browse worker
         pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
+        pumpWatch();                  // source files that moved on disk (項目20)
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
@@ -3012,6 +3027,7 @@ int main(int argc, char** argv) {
     stopRemoteFetcher();
     stopMeasureWorker();
     stopRbWorker();
+    stopWatchWorker();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
