@@ -221,6 +221,69 @@ static void rbAddRows(const App::BrowseInstance& I,
 //
 // Directories sort before files under every key: this is a browser, not a
 // table of numbers.
+// Where the keyboard cursor lands after the listing under it changed. Called
+// once per panel frame, before the keys are read - and called directly by the
+// selftest, which is the only way to assert this without a keyboard.
+//
+// The cursor follows the ROW, not the revision. `B.rev` bumps on EVERY listing
+// that arrives (nav.cpp: a refresh, a queued duplicate for the folder we are
+// already in, a reconnect), and keying the cursor on it dropped the cursor to
+// "no row" every time - the same folder, the same nine rows, and the cursor
+// gone. That is what the intermittent browse-keys failure of 2026-08-05 was
+// (docs/diagnostics/browse-keys-cursor-20260805.txt): the `down` had worked,
+// and a second listing of the same directory arrived before the check and
+// undid it. The capture says rows=9 either side, which is exactly the case a
+// rev-keyed cursor cannot tell from a new place.
+//
+// A DIFFERENT place still clears it: arriving somewhere new with a cursor on
+// row 4 of the place you left is not a cursor, it is a leftover.
+//
+// Matching is by name, not by entry pointer: a re-listing replaces every
+// remote::Entry, so the pointers the flat/tree branch below compares are all
+// dangling across a rev bump. (Within one listing they are stable, which is
+// why that branch can and does use them - it is comparing two views of the
+// same entries.)
+void rbCursorFollow(App::BrowseInstance& I, const std::vector<RbRow>& view) {
+    const App::RemoteBrowse& B = I.b;
+    std::string place = B.host + "|" + B.dir;
+    std::string sig = place + "|" + std::to_string(B.rev);
+    if (sig != I.curSig) {
+        bool samePlace = !I.curSig.empty() &&
+                         I.curSig.compare(0, I.curSig.rfind('|'), place) == 0 &&
+                         I.curSig.rfind('|') == place.size();
+        I.curSig = sig;
+        int was = I.cursor;
+        I.cursor = -1;
+        if (samePlace && was >= 0 && !I.cursorKey.empty()) {
+            for (size_t i = 0; i < view.size(); i++)
+                if (view[i].full() == I.cursorKey) { I.cursor = (int)i; break; }
+            I.cursorScroll = I.cursor >= 0;
+        }
+        if (I.cursor < 0) I.cursorKey.clear();
+    }
+    else if (I.curFlat != I.flat || I.curTree != I.tree) {
+        // follow the row across a grouped/flat or list/tree toggle
+        std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, I.curFlat, I.curTree);
+        const remote::Entry* was = I.cursor >= 0 && I.cursor < (int)old.size()
+                                 ? old[I.cursor].e : nullptr;
+        I.cursor = -1;
+        if (was)
+            for (size_t i = 0; i < view.size(); i++)
+                if (view[i].e == was) { I.cursor = (int)i; break; }
+        I.cursorScroll = I.cursor >= 0;
+    }
+    I.curFlat = I.flat;
+    I.curTree = I.tree;
+    if (I.cursor >= (int)view.size()) I.cursor = -1;
+    // Remember WHICH row, every frame, so the next listing has something to
+    // look for. Recorded here rather than where the cursor is assigned: the
+    // row draw is under a clipper, so a cursor scrolled out of view would
+    // otherwise stop being remembered precisely when it is furthest from the
+    // eye.
+    if (I.cursor >= 0) I.cursorKey = view[I.cursor].full();
+    else               I.cursorKey.clear();
+}
+
 void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
                         std::vector<int>& shown) {
     std::stable_sort(shown.begin(), shown.end(), [&](int ia, int ib) {
@@ -1518,27 +1581,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // stepping under the listing, which owns different keys entirely.
     int& rbCursor = I.cursor;          // row index, or -1 = no cursor yet
     bool& rbCursorScroll = I.cursorScroll;  // bring it into view this frame
-    {
-        std::string& curSig = I.curSig;
-        bool& curFlat = I.curFlat;
-        bool& curTree = I.curTree;
-        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
-        if (sig != curSig) { curSig = sig; rbCursor = -1; }
-        else if (curFlat != I.flat || curTree != I.tree) {
-            // follow the row across a grouped/flat or list/tree toggle
-            std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, curFlat, curTree);
-            const remote::Entry* was = rbCursor >= 0 && rbCursor < (int)old.size()
-                                     ? old[rbCursor].e : nullptr;
-            rbCursor = -1;
-            if (was)
-                for (size_t i = 0; i < view.size(); i++)
-                    if (view[i].e == was) { rbCursor = (int)i; break; }
-            rbCursorScroll = rbCursor >= 0;
-        }
-        curFlat = I.flat;
-        curTree = I.tree;
-        if (rbCursor >= (int)view.size()) rbCursor = -1;
-    }
+    rbCursorFollow(I, view);
     int rbCursorPos = -1;                // ...where it sits on SCREEN
     for (int k = 0; k < (int)shown.size(); k++) if (shown[k] == rbCursor) rbCursorPos = k;
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&

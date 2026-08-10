@@ -227,6 +227,10 @@ struct Instance {
     // one it was aimed at - see rbNavGesture in drawPanelRemote.
     int navChain = 0;
     std::string curSig;           // host|dir|rev the cursor was built for
+    // The NAME under the cursor, so the cursor can be found again after a
+    // re-listing replaces every entry. A path, not an index: indices move when
+    // a file appears or goes away, which is exactly when a refresh happens.
+    std::string cursorKey;
     bool curFlat = false, curTree = false;
     // sort spec, stashed from the table one frame late (see RB_COL_NAME)
     int sortCol = 0;              // RB_COL_NAME

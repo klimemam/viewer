@@ -1090,6 +1090,88 @@
                     txtFrames != stacked ? 1 : 0, ordOk ? "ok" : "FAIL");
             if (!ordOk) ok = false;
         }
+        {   // CURSOR ACROSS A RE-LISTING. The keyboard cursor was keyed on
+            // host|dir|REV, and B.rev bumps on every listing that arrives -
+            // including a second listing of the folder the panel is already
+            // standing in. The same nine rows would come back and the cursor
+            // would be gone, which is the intermittent browse-keys failure
+            // captured on 2026-08-05 (down worked; a duplicate listing landed
+            // before the check and undid it). Driven through rbCursorFollow -
+            // the function the panel calls - because a NOGL run cannot press a
+            // key, and a flaky GUI test is what let this hide for four
+            // sightings.
+            std::string cdir = dir + "/scanroot/10lx";
+            remoteBrowseTo(rbMain(), cdir);
+            double tc = nowSec();
+            while (nowSec() - tc < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == cdir && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            auto viewNow = [&]() {
+                return rbBuildView(rbMain(), &B.dir, B.entries, rbMain().flat, rbMain().tree);
+            };
+            std::vector<RbRow> v0 = viewNow();
+            rbCursorFollow(rbMain(), v0);          // as the first panel frame does
+            // Put the cursor on a REAL listing row - the first one that is not
+            // the ".." parent. ".." exists in every listing of every folder, so
+            // a cursor parked there would be "found again" by a match that
+            // proves nothing about the entries the re-listing replaced.
+            // Anti-vacuity: a listing with no such row cannot lose a cursor,
+            // and would pass every check below without testing anything.
+            int row0 = -1;
+            for (size_t i = 0; i < v0.size(); i++) if (!v0[i].up) { row0 = (int)i; break; }
+            bool haveRows = row0 >= 0;
+            rbMain().cursor = row0;
+            rbCursorFollow(rbMain(), v0);          // records the name under it
+            std::string key0 = rbMain().cursorKey;
+            std::string name0 = haveRows ? v0[row0].name() : std::string();
+            uint64_t rev0 = B.rev;
+
+            // the same place, listed again - a refresh, or the duplicate the
+            // capture caught
+            remoteBrowseTo(rbMain(), cdir);
+            double tc2 = nowSec();
+            while (nowSec() - tc2 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == cdir && !B.entries.empty() && B.rev != rev0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> v1 = viewNow();
+            rbCursorFollow(rbMain(), v1);
+            int keptIdx = rbMain().cursor;
+            std::string keptName = keptIdx >= 0 && keptIdx < (int)v1.size()
+                                 ? v1[keptIdx].name() : std::string();
+            bool bumped = B.rev != rev0;
+
+            // a DIFFERENT place must still clear it: a cursor on row 0 of the
+            // folder you left is a leftover, not a cursor
+            std::string other = dir + "/scanroot";
+            remoteBrowseTo(rbMain(), other);
+            double tc3 = nowSec();
+            while (nowSec() - tc3 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == other && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> v2 = viewNow();
+            rbCursorFollow(rbMain(), v2);
+            int awayIdx = rbMain().cursor;
+
+            bool curOk = haveRows && bumped && !key0.empty() &&
+                         keptIdx >= 0 && keptName == name0 && awayIdx < 0;
+            fprintf(stderr, "browseselftest: cursor across a re-listing of %s: "
+                            "rows=%zu row0=%d key='%s' rev %llu->%llu bumped=%d; after: "
+                            "cursor=%d name='%s' (want '%s'); after moving away: "
+                            "cursor=%d: %s\n",
+                    cdir.c_str(), v0.size(), row0, key0.c_str(),
+                    (unsigned long long)rev0, (unsigned long long)B.rev, bumped ? 1 : 0,
+                    keptIdx, keptName.c_str(), name0.c_str(), awayIdx,
+                    curOk ? "ok" : "FAIL");
+            if (!curOk) ok = false;
+            rbMain().cursor = -1;
+            rbMain().cursorKey.clear();
+        }
         {   // PORT. A non-default ssh port used to survive only inside the
             // browse worker: makeRemoteUrl dropped it, and that string is what
             // becomes ImageDoc::path, RFetchJob::url, MJob::url and the session
