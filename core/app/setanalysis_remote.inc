@@ -248,16 +248,14 @@ static std::string setPeerSeparation(remote::Session& s, const std::string& setN
                 std::to_string(Fl.expected) + " loaded" });
             continue;
         }
-        if (Fl.C != DK.C || Fl.nPl != DK.nPl || Fl.cfa != DK.cfa ||
-            (Fl.cfa != 0 && Fl.cfaPattern != DK.cfaPattern)) {
-            char b[288];
-            snprintf(b, sizeof b,
-                     "sweep member \"%s\" is %dch / %d plane(s) and \"dark\" is "
-                     "%dch / %d plane(s) - mu is a per-plane difference, so the "
-                     "planes have to mean the same thing on both sides",
-                     Fl.member.c_str(), Fl.C, Fl.nPl, DK.C, DK.nPl);
-            sepRefuse(F, b);
-            return F.refusal;
+        // The SAME sentence the local runner produces, by being the same
+        // function: a shape refusal that reads differently on the two
+        // transports would be a refusal about a machine, not about the data.
+        {
+            const std::string bad = sepShapeRefusal(
+                Fl.member, Fl.W, Fl.H, Fl.C, Fl.nPl, Fl.cfa, Fl.cfaPattern,
+                DK.W, DK.H, DK.C, DK.nPl, DK.cfa, DK.cfaPattern);
+            if (!bad.empty()) { sepRefuse(F, bad); return F.refusal; }
         }
         SepLevel Lv;
         Lv.member = Fl.member;

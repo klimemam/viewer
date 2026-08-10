@@ -679,6 +679,11 @@
         //   F7  the result names its set, its sweep and M
         //   F8  cutoff, estimator form, and the uncorrelatedness note are
         //       required fields that are actually filled
+        //   F9  a sweep member and the dark that are not one shape: REFUSED,
+        //       with both shapes on the line (確定 2026-08-10, #57)
+        //   F10 a dark that ALSO stands as a level of its own sweep: allowed,
+        //       numerically the intercept's anchor (mu exactly 0, y bit for bit
+        //       the direct row's), and the overlap SAID (確定 2026-08-10, #57)
         //
         // Every fixture below is EXACT: the pixel values are integers under
         // 2^24, the accumulators are integers under 2^53, and the temporal
@@ -1159,6 +1164,248 @@
                               "planes have to mean the same thing on both sides",
                           "F6g mismatched planes are refused, and BOTH are named");
                 }
+                closeAll();
+            }
+
+            {   // ---- F9: the sweep and the dark are not one shape -----------
+                // 確定 2026-08-10 (#57): 「dark, sweep の WxH 不一致は拒否」.
+                //
+                // This is the case F6g's plane check lets straight through: the
+                // member below has the SAME channel count and the SAME plane
+                // map as the dark and differs only in W x H - and the fit's
+                // arithmetic does not care, because mu takes a per-plane SCALAR
+                // off the dark and nothing subtracts pixel from pixel. It would
+                // have computed. That is exactly why it needed a ruling rather
+                // than a bug report, and why the refusal says so in its own
+                // sentence instead of implying the sum could not be formed.
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                std::vector<SM> ms;
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    ms.push_back({ makeLevel(nm, mu0[i], Bl), 0, mu0[i] / gainDN,
+                                   true, FOLD_MEAN });
+                }
+                ms.push_back({ makeStack("half", Wf / 2, Hf / 2, NFs,
+                                         [&](int x, int y, int f) {
+                                             return sweepPix(2560.0, Bl, x, y, f);
+                                         }),
+                               0, 20.0, true, FOLD_MEAN });
+                const int dseq = makeDark("dark", NFs);
+                const int sid = makeSepSet("R-size",
+                                           makeSeries("halfsize", "illuminance", "lx", ms),
+                                           dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+                fprintf(stderr, "setanalysisselftest: F9 \"%s\"\n", F.refusal.c_str());
+                check(!F.ok && F.refusal ==
+                          "sweep member \"half\" is 16x16x1ch and \"dark\" is "
+                          "32x32x1ch - the sweep and the dark have to be one shape. "
+                          "Nothing here subtracts pixel from pixel, so this would "
+                          "have computed; a dark that is not the sweep's own size is "
+                          "a MIS-BINDING, and a number computed off one reads exactly "
+                          "like a number computed off the right dark.",
+                      "F9 a WxH mismatch between sweep and dark is refused");
+                // PR #121's lesson, as a test rather than as a review comment: a
+                // refusal that does not name what it refused is a dead end.
+                check(F.refusal.find("16x16x1ch") != std::string::npos &&
+                      F.refusal.find("32x32x1ch") != std::string::npos,
+                      "F9 ...and BOTH shapes are on the line, not just the fact of "
+                      "a mismatch");
+                check(!F.dsnu.ok && !F.prnu.ok && F.dsnu.refusal == F.refusal &&
+                      F.prnu.refusal == F.refusal,
+                      "F9 ...on the fit and on both rows it would have named");
+                closeAll();
+            }
+
+            {   // ---- F10: the dark ALSO standing as a level -----------------
+                // 確定 2026-08-10 (#57): 「dark が sweep のメンバを兼ねるは、
+                // そう Analysis Set を作ったら許容」.
+                //
+                // The dark here IS this sweep's zero: the same construction with
+                // mu0 = 0 and the LEVELS' own additive pattern, because a dark
+                // that is level 0 of the same detector carries the pattern the
+                // levels carry. Two things then follow, and both are asserted
+                // rather than described:
+                //
+                //   mu = mean(M_dark) - mean(M_dark) = 0 EXACTLY. Not "about 0":
+                //   the same stack folded twice by the same function gives the
+                //   same accumulator, so the subtraction is of a number from
+                //   itself. The comparison below is ==.
+                //
+                //   y  = the dark's own corrected sigma_fpn^2 = (32^2 + 576)*rr
+                //        - 576, which is the intercept of F1's line. So the four
+                //   points are exactly collinear INCLUDING the one at x = 0, the
+                //   fit is F1's line read off one more measurement, and the
+                //   anchor's own y is the intercept:
+                //        intercept = 1025.56402737   ->  DSNU 32.0244286 DN
+                //        slope     = 1/1023          ->  PRNU 3.12652700 %
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                const int dseq = makeLevel("dark", 0.0, Bl);
+                std::vector<SM> ms;
+                ms.push_back({ dseq, 0, 0.0, true, FOLD_MEAN });   // ...standing at 0 lx
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    ms.push_back({ makeLevel(nm, mu0[i], Bl), 0, mu0[i] / gainDN,
+                                   true, FOLD_MEAN });
+                }
+                const int sid = makeSepSet("anchored",
+                                           makeSeries("lx sweep", "illuminance", "lx", ms),
+                                           dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+                const double interExp = (Bl * Bl + Cl) * rr - Cl;
+                const double slopeExp = qg * qg * rr;
+                fprintf(stderr,
+                        "setanalysisselftest: F10 M=%d  intercept %.9g (exp %.9g)  "
+                        "slope %.12g (exp %.12g)  dsnu %.9g  prnu %.9g%%\n"
+                        "setanalysisselftest: F10 anchor: mu %.17g  y %.17g  "
+                        "resid %.7g  intercept %.17g\n",
+                        F.M, F.ok ? F.inter[0] : 0.0, interExp,
+                        F.ok ? F.slope[0] : 0.0, slopeExp,
+                        F.ok ? F.dsnu.value[0] : -1.0, F.ok ? F.prnu.value[0] : -1.0,
+                        F.ok && F.M == 4 ? F.levels[0].mu[0] : -1.0,
+                        F.ok && F.M == 4 ? F.levels[0].fpnVar[0] : -1.0,
+                        F.ok && F.M == 4 ? F.levels[0].resid[0] : -1.0,
+                        F.ok ? F.inter[0] : 0.0);
+                check(F.ok && F.M == 4,
+                      "F10 a dark that is also a level is ACCEPTED, and counts as one");
+                check(F.ok && F.M == 4 && F.levels[0].mu[0] == 0.0,
+                      "F10 ...its mu is EXACTLY 0 - the same fold minus itself");
+                check(F.ok && fabs(F.inter[0] - interExp) < 1e-6 &&
+                      fabs(F.slope[0] - slopeExp) < 1e-15,
+                      "F10 ...and the line is F1's, derived by hand, one point richer");
+                bool zeroResid = F.ok && F.M == 4;
+                for (const auto& L : F.levels)
+                    if (fabs(L.resid[0]) > 1e-6) zeroResid = false;
+                check(zeroResid,
+                      "F10 ...with the anchor ON the line: no residual anywhere");
+                check(F.ok && F.M == 4 &&
+                      fabs(F.inter[0] - F.levels[0].fpnVar[0]) < 1e-6,
+                      "F10 ...and the intercept IS the anchor's own measurement");
+                // ...and that measurement is the direct row's, bit for bit - the
+                // F2 idiom, because the anchor is a DSNU by another name.
+                if (F.ok && F.M == 4) {
+                    int sD = makeSet("as dark", { { "dark", dseq } });
+                    SetResult D = runSetAnalyzer(*aSetById(sD), SA_DSNU);
+                    fprintf(stderr, "setanalysisselftest: F10 anchor sigma_fpn %.17g  "
+                                    "direct %.17g (exp %.9g)\n",
+                            sqrt(F.levels[0].fpnVar[0]), D.value[0], sqrt(interExp));
+                    check(D.ok && sqrt(F.levels[0].fpnVar[0]) == D.value[0],
+                          "F10 ...which is the direct row's own number, bit for bit");
+                    check(D.ok && fabs(D.value[0] - sqrt(interExp)) < 1e-9,
+                          "F10 ...and both are sqrt(intercept) = 32.0244286 DN");
+                }
+                // ---- the overlap, SAID -------------------------------------
+                fprintf(stderr, "setanalysisselftest: F10 \"%s\"\n",
+                        setResultTitle(F.dsnu).c_str());
+                fprintf(stderr, "setanalysisselftest: F10 %s\n", F.dualNote.c_str());
+                check(F.ok && F.M == 4 && F.levels[0].isDark && !F.levels[1].isDark &&
+                      !F.levels[2].isDark && !F.levels[3].isDark,
+                      "F10 the level that is the dark is the one marked, and only it");
+                check(F.alsoDark.size() == 1 && F.alsoDark[0] == "dark",
+                      "F10 ...and the fit names it");
+                check(setResultTitle(F.dsnu) ==
+                          "DSNU [DN] - set \"anchored\": sweep \"lx sweep\" 4 levels "
+                          "(level \"dark\" is also the dark role), dark 5/5",
+                      "F10 the TAG says the same stack plays two parts");
+                check(setResultTitle(F.prnu) ==
+                          "PRNU [%] - set \"anchored\": sweep \"lx sweep\" 4 levels "
+                          "(level \"dark\" is also the dark role), dark 5/5",
+                      "F10 ...on both named rows, so a quoted number carries it");
+                check(F.dualNote.find("ONE STACK, TWO ROLES") != std::string::npos &&
+                      F.dualNote.find("\"dark\"") != std::string::npos &&
+                      F.dualNote.find("its mu is exactly 0") != std::string::npos &&
+                      F.dualNote.find("counted twice") != std::string::npos,
+                      "F10 ...and the result explains the double duty in full");
+                closeAll();
+            }
+
+            {   // ---- F10b: the anchor is a MEASUREMENT, not a free pass -----
+                // The same double duty with the dark's OWN pattern (8 DN, not
+                // the levels' 32). The anchor is then a real point that does not
+                // sit on the levels' line, and the fit says so rather than
+                // absorbing it: its y moves by
+                //     d = (Bd^2 - Bl^2) * rr = (64 - 1024) * 1024/1023
+                // and nothing else does, so the perturbed fit follows from the
+                // unperturbed one by the OLS influence identity - a different
+                // route to the answer than the implementation's sums, and the
+                // same identity F4 uses, applied at x = 0 this time:
+                //     slope'  = slope + d*(x0-xb)/Sxx
+                //     inter'  = inter + d*(1/4 - xb*(x0-xb)/Sxx)
+                //     resid_0 =  d*(1 - 1/4 - (x0-xb)^2/Sxx)
+                //     resid_j = -d*(1/4 + (xj-xb)(x0-xb)/Sxx)      j = 1,2,3
+                // This is what "allowed" has to mean to be worth allowing: the
+                // anchor carries the fit's weight like any other level (the fit
+                // is unweighted, 判断5), so a dark that is not the levels' zero
+                // pulls the additive term DOWN and leaves the largest residual
+                // in the table. It is visible, not silent.
+                closeAll();
+                const double mu0[3] = { 512.0, 1152.0, 2048.0 };
+                const int dseq = makeDark("dark", NFs);        // Bd = 8
+                std::vector<SM> ms;
+                ms.push_back({ dseq, 0, 0.0, true, FOLD_MEAN });
+                char nm[32];
+                for (int i = 0; i < 3; i++) {
+                    snprintf(nm, sizeof nm, "L%d", i);
+                    ms.push_back({ makeLevel(nm, mu0[i], Bl), 0, mu0[i] / gainDN,
+                                   true, FOLD_MEAN });
+                }
+                const int sid = makeSepSet("anchored, other dark",
+                                           makeSeries("lx sweep", "illuminance", "lx", ms),
+                                           dseq);
+                SepFit F = runSeparationFit(*aSetById(sid));
+                const double x[4] = { 0.0, mu0[0] * mu0[0], mu0[1] * mu0[1],
+                                      mu0[2] * mu0[2] };
+                double xb = 0;
+                for (int i = 0; i < 4; i++) xb += x[i];
+                xb /= 4.0;
+                double Sxx = 0;
+                for (int i = 0; i < 4; i++) Sxx += (x[i] - xb) * (x[i] - xb);
+                const double d = (Bd * Bd - Bl * Bl) * rr;
+                const double inter0 = (Bl * Bl + Cl) * rr - Cl;
+                const double slope0 = qg * qg * rr;
+                const double interP = inter0 + d * (0.25 - xb * (x[0] - xb) / Sxx);
+                const double slopeP = slope0 + d * (x[0] - xb) / Sxx;
+                double rE[4];
+                rE[0] = d * (1.0 - 0.25 - (x[0] - xb) * (x[0] - xb) / Sxx);
+                for (int j = 1; j < 4; j++)
+                    rE[j] = -d * (0.25 + (x[j] - xb) * (x[0] - xb) / Sxx);
+                fprintf(stderr,
+                        "setanalysisselftest: F10b intercept %.9g (exp %.9g)  slope "
+                        "%.12g (exp %.12g)\n"
+                        "setanalysisselftest: F10b residuals %.7g / %.7g / %.7g / %.7g "
+                        "(exp %.7g / %.7g / %.7g / %.7g)\n"
+                        "setanalysisselftest: F10b dsnu %.9g (the levels alone would "
+                        "read %.9g)\n",
+                        F.ok ? F.inter[0] : 0.0, interP, F.ok ? F.slope[0] : 0.0, slopeP,
+                        F.ok && F.M == 4 ? F.levels[0].resid[0] : 0.0,
+                        F.ok && F.M == 4 ? F.levels[1].resid[0] : 0.0,
+                        F.ok && F.M == 4 ? F.levels[2].resid[0] : 0.0,
+                        F.ok && F.M == 4 ? F.levels[3].resid[0] : 0.0,
+                        rE[0], rE[1], rE[2], rE[3],
+                        F.ok ? F.dsnu.value[0] : -1.0, sqrt(inter0));
+                check(F.ok && F.M == 4, "F10b the double duty still fits, four levels");
+                check(F.ok && fabs(F.inter[0] - interP) < 1e-6,
+                      "F10b the intercept is the influence identity's, applied at x=0");
+                check(F.ok && fabs(F.slope[0] - slopeP) < 1e-12,
+                      "F10b ...and so is the slope");
+                bool res = F.ok && F.M == 4;
+                for (int i = 0; i < 4 && res; i++)
+                    if (fabs(F.levels[i].resid[0] - rE[i]) > 1e-6) res = false;
+                check(res, "F10b ...and every level's residual, the anchor's included");
+                check(F.ok && F.M == 4 && fabs(F.levels[0].resid[0]) > 100.0 &&
+                      fabs(F.levels[0].resid[0]) > fabs(F.levels[1].resid[0]) &&
+                      fabs(F.levels[0].resid[0]) > fabs(F.levels[2].resid[0]) &&
+                      fabs(F.levels[0].resid[0]) > fabs(F.levels[3].resid[0]),
+                      "F10b a dark that is not the levels' zero leaves the LARGEST "
+                      "residual - it shows, it is not absorbed");
+                check(F.ok && F.dsnu.value[0] < 0.85 * sqrt(inter0),
+                      "F10b ...and it moves the additive term, which is the anchor "
+                      "doing its job rather than being ignored");
+                check(F.alsoDark.size() == 1 && F.levels[0].isDark,
+                      "F10b ...and the overlap is stated here too");
                 closeAll();
             }
         }

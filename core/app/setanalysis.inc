@@ -392,7 +392,27 @@ struct SetResult {
     // the clause does not appear.
     std::string sweep;
     int levels = 0;
+    // ONE STACK, TWO ROLES. A stack bound as the "dark" may ALSO stand as a
+    // level of the sweep - 確定 2026-08-10 (#57): 「dark が sweep のメンバを
+    // 兼ねるは、そう Analysis Set を作ったら許容」. Allowed, and therefore
+    // SAID: the canon's invariant (a) has a result name its layer and its set,
+    // and a stack playing two parts in one estimate is exactly the kind of
+    // fact a report must not have to reconstruct from the level table. Empty =
+    // no overlap, and the clause does not appear.
+    std::vector<std::string> alsoDark;
 };
+
+// The tag's overlap clause. Its own function, beside the tag that uses it, for
+// sepLevelCensus' reason: the tag, the panel and the selftest must not be able
+// to describe the same double duty differently.
+static std::string sepDualClause(const std::vector<std::string>& names) {
+    if (names.empty()) return "";
+    std::string s = names.size() == 1 ? " (level " : " (levels ";
+    for (size_t i = 0; i < names.size(); i++)
+        s += (i ? ", " : "") + std::string("\"") + names[i] + "\"";
+    s += names.size() == 1 ? " is also the dark role)" : " are also the dark role)";
+    return s;
+}
 
 // The result's own name (canon invariant (a): "解析結果は自分の層と (set 解析
 // なら) set を名乗る"). docs/flat-field-stats.md (b) fixes the tag as
@@ -406,7 +426,8 @@ static std::string setResultTag(const SetResult& R) {
     // the direct row of the same name: the number of levels is the estimator's
     // own n, and a reader who sees "4 levels" is not looking at a single pair.
     if (R.levels > 0)
-        s += " sweep \"" + R.sweep + "\" " + std::to_string(R.levels) + " levels,";
+        s += " sweep \"" + R.sweep + "\" " + std::to_string(R.levels) + " levels" +
+             sepDualClause(R.alsoDark) + ",";
     for (size_t i = 0; i < R.used.size(); i++) {
         s += i ? "," : "";
         s += " " + R.used[i].role + " " + std::to_string(R.used[i].n) + "/" +
@@ -731,9 +752,65 @@ static const char* kSepSweepWarn =
     "separation means nothing. Nothing here can check which was swept - the "
     "series says what it is.";
 
+// ONE STACK, TWO ROLES, said in full - 確定 2026-08-10 (#57): 「dark が sweep の
+// メンバを兼ねるは、そう Analysis Set を作ったら許容」. The tag carries the short
+// clause (sepDualClause); this is the paragraph under it, and it exists because
+// "allowed" is not the same statement as "understood": a reader who sees a level
+// whose mu is 0 is owed the reason, and the reason is that this level IS the
+// dark. Built here so the panel and the selftest cannot word it differently.
+static std::string sepDualNote(const std::vector<std::string>& names,
+                               const std::string& sweep) {
+    if (names.empty()) return "";
+    const bool one = names.size() == 1;
+    std::string who;
+    for (size_t i = 0; i < names.size(); i++)
+        who += (i ? ", " : "") + std::string("\"") + names[i] + "\"";
+    return "ONE STACK, TWO ROLES: " + who + (one ? " stands" : " stand") +
+           " as a level of the sweep \"" + sweep + "\" AND " + (one ? "is" : "are") +
+           " the \"dark\" every level's mu is measured against. That is allowed "
+           "because this AnalysisSet was BUILT that way - a role binding is "
+           "declared, never inferred - and it is not merely tolerated: the dark is "
+           "the INTERCEPT'S OWN ANCHOR. Its mu is exactly 0, so its corrected "
+           "sigma_fpn^2 enters the OLS at x = 0, which is the abscissa DSNU^2 is "
+           "read off. Nothing is counted twice: as the dark it contributes a "
+           "per-plane MEAN to every level's mu, and as a level it contributes its "
+           "own sigma_fpn^2 and nothing else. It carries no extra weight either "
+           "(the fit is unweighted), so a dark whose own fixed pattern is not the "
+           "levels' shows up as a RESIDUAL instead of quietly moving the answer.";
+}
+
+// Shape, between one sweep member and the dark. ONE function, called by the
+// local runner AND by the peer client, because a refusal that reads differently
+// on the two transports is a refusal about a machine rather than about data -
+// and until now the sentence existed twice, once in each file, with nothing
+// holding the two copies together.
+//
+//   PLANES. mu is a per-plane difference, so plane p has to mean the same thing
+//   on both sides, or the two are not one detector read one way. PR #131's
+//   sentence, moved and not rewritten.
+static std::string sepShapeRefusal(const std::string& member,
+                                   int W, int H, int C, int nPl, int cfa, int cfaPattern,
+                                   int dW, int dH, int dC, int dPl, int dCfa, int dCfaPattern) {
+    (void)W; (void)H; (void)dW; (void)dH;
+    const std::string q = "sweep member \"" + member + "\" is ";
+    auto planes = [](int c, int pl) {
+        return std::to_string(c) + "ch / " + std::to_string(pl) + " plane(s)";
+    };
+    if (C != dC || nPl != dPl || cfa != dCfa || (cfa != 0 && cfaPattern != dCfaPattern))
+        return q + planes(C, nPl) + " and \"dark\" is " + planes(dC, dPl) +
+               " - mu is a per-plane difference, so the planes have to mean the "
+               "same thing on both sides";
+    return "";
+}
+
 struct SepLevel {
     int seqId = 0;
     std::string member, headPath;
+    // ...and this level IS the stack bound as the "dark" (確定 2026-08-10).
+    // Carried per level rather than recomputed from names, because the fact is
+    // about the BINDING and the binding is known only where the level was
+    // gathered - which is a different place on each transport.
+    bool isDark = false;
     double value = std::numeric_limits<double>::quiet_NaN();  // the series' own
     int n = 0, N = 0;                    // frames aggregated of frames expected
     uint64_t nonFinite = 0;
@@ -764,6 +841,11 @@ struct SepFit {
     SetResult dsnu, prnu;                // the two named outputs of ONE fit
     std::string cutoff = kSetCutoffRaw;
     std::string note = kSepNote, sweepWarn = kSepSweepWarn;
+    // the double duty, if there is one: the names for the tag's clause, and the
+    // paragraph that says what it means. Both composed in sepComposeFit out of
+    // the levels themselves, so a transport cannot fill one and forget the other.
+    std::vector<std::string> alsoDark;
+    std::string dualNote;
 };
 
 // The census, out loud. ONE function so the screen, the M < 3 refusal and the
@@ -829,6 +911,13 @@ static SepFit& sepRefuse(SepFit& F, const std::string& why) {
 // nothing here ever wanted a picture.
 static SepFit& sepComposeFit(SepFit& F, const SetRoleFold& dark) {
     F.M = (int)F.levels.size();
+    // The double duty, read off the levels that ENTERED - one place, so a
+    // transport cannot fill the tag's clause and forget the paragraph, or the
+    // other way round. An excluded member is not a level and plays no part.
+    F.alsoDark.clear();
+    for (const auto& L : F.levels)
+        if (L.isDark) F.alsoDark.push_back(L.member);
+    F.dualNote = sepDualNote(F.alsoDark, F.seriesName);
     if (F.M < 3)
         return sepRefuse(F, "the sweep \"" + F.seriesName + "\" has " +
                             std::to_string(F.M) + " usable level(s) - the separation "
@@ -911,6 +1000,7 @@ static SepFit& sepComposeFit(SepFit& F, const SetRoleFold& dark) {
         R.nPl = F.nPl; R.cfa = F.cfa; R.cfaPattern = F.cfaPattern;
         R.sweep = F.seriesName;
         R.levels = F.M;
+        R.alsoDark = F.alsoDark;       // ...so the ROW says it, not just the panel
         for (int p = 0; p < F.nPl; p++) {
             if (!F.planeFit[p]) {
                 R.value[p] = R.uncorr[p] = std::numeric_limits<double>::quiet_NaN();
@@ -1013,18 +1103,13 @@ static SepFit runSeparationFit(const App::ASet& S) {
             }
             return refuse("\"sweep\" member \"" + si->name + "\": " + Fl.err);
         }
-        // Planes, not pixels. mu takes a per-plane MEAN off the dark, so W x H
-        // may differ; what may not differ is what plane p means, or the two
-        // sides are not the same detector read the same way.
-        if (Fl.C != Fd.C || Fl.nPl != Fd.nPl || Fl.cfa != Fd.cfa ||
-            (Fl.cfa != 0 && Fl.cfaPattern != Fd.cfaPattern)) {
-            char b[288];
-            snprintf(b, sizeof b,
-                     "sweep member \"%s\" is %dch / %d plane(s) and \"dark\" is "
-                     "%dch / %d plane(s) - mu is a per-plane difference, so the "
-                     "planes have to mean the same thing on both sides",
-                     si->name.c_str(), Fl.C, Fl.nPl, Fd.C, Fd.nPl);
-            return refuse(b);
+        // What this level and the dark have to agree about - the ONE function
+        // the peer client calls too (sepShapeRefusal).
+        {
+            const std::string bad = sepShapeRefusal(
+                Fl.name, Fl.W, Fl.H, Fl.C, Fl.nPl, Fl.cfa, Fl.cfaPattern,
+                Fd.W, Fd.H, Fd.C, Fd.nPl, Fd.cfa, Fd.cfaPattern);
+            if (!bad.empty()) return refuse(bad);
         }
         // the same reduction the peer runs, by being the same function
         setfold::PlaneAcc acc[4];
