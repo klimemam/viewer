@@ -816,6 +816,12 @@ static std::string watchAutoNote(int seqId) {
     if (!app.watchEnabled || !app.watchAutoReload) return {};
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si || !si->watchFound.any()) return {};
+    // The PEER refusal is already the whole of what this line says
+    // (watchActionText: "re-open the folder from Browse to re-read it"), so
+    // repeating it under a second heading would print one folder's instruction
+    // twice in one sentence. What is left is the refusal the line does NOT
+    // otherwise carry: this stack's automatic reload has stopped.
+    if (!watchReloadOffered(seqId)) return {};
     if (const char* why = watchAutoRefusal(seqId))
         return std::string(" - auto-reload cannot: ") + why;
     if (const char* why = watchAutoBusy(seqId))
