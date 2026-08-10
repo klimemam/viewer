@@ -386,10 +386,13 @@ struct F32Loss {
                                       : (d < 0 ? -d : d);
         if (rel > worstRel) { worstRel = rel; from = exact; to = (double)held; }
     }
-    void merge(const F32Loss& o) {
-        inexact += o.inexact; total += o.total;
-        if (o.worstRel > worstRel) { worstRel = o.worstRel; from = o.from; to = o.to; }
-    }
+    // Deliberately no merge(): every census belongs to ONE array, and the two
+    // places that were tempting to fold - a preview replaced by its full frame,
+    // and a stack folded into a frame average - are both wrong to fold. The
+    // preview's samples are a subset of the full frame's, so a sum would count
+    // pixels twice; the average's pixels are a computation and not any file's
+    // values at all. The preview case replaces wholesale (remote_client.inc);
+    // the average is a named gap.
 };
 
 // 2^24: the largest integer float32 holds exactly, and therefore the point from
