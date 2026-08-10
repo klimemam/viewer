@@ -37,6 +37,14 @@ struct BrowseHost {
     void (*openPickerWith)(std::vector<App::PendingGroup> groups, const std::string& displayRoot,
                            const std::string& stripRoot, bool remoteMode,
                            const std::string& host, int port);
+    // #148: "Open Folder (all stacks below)" when the folder is on THIS disk.
+    // The same door a dropped folder and File ▸ Open Folder… go through -
+    // scanFolderGroups, which asks core/imagefile.h and therefore sees every
+    // format this build reads, into the same picker openPickerWith raises.
+    // Behind the seam because the scan is a viewer decision (what can be
+    // opened) and not a Browse one (what can be listed); remoteScanFolder
+    // chooses between this and the peer by whether the host is empty.
+    void (*openFolder)(const std::string& path);
     void (*openReaderPicker)(const std::string& path, const std::string& why);
     // File > Browse Folder (Local)...'s dialog, shared by the empty state's
     // button. Not one of S3's 55 marks, but the same class of call - a viewer
@@ -49,7 +57,7 @@ struct BrowseHost {
     void (*stepPreviewFrame)(int delta);
 };
 // Filled once, statically, in core/main.cpp - the spine is the only TU that
-// can see all fourteen targets.
+// can see all fifteen targets.
 extern const BrowseHost g_browseHost;
 
 // ---- viewer-side helpers the browse TUs call BY NAME -------------------------
