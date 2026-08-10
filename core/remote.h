@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "remote_proto.h"            // rp::F32Loss - tile()'s narrowing census
 
 namespace remote {
 
@@ -173,9 +174,14 @@ public:
     // (converted from the source dtype) plus the decimated dimensions. The rect
     // and the frame index are coordinates INSIDE `read`, so it must be the same
     // reading the meta() that sized this request was asked for.
+    // `loss` (optional) receives what the LAST step cost. The wire carries the
+    // source dtype, so pixels arrive exact and are narrowed to float32 here and
+    // nowhere else (remote_proto.h rp::F32Loss) - a caller that builds a
+    // FrameSource must take this, or the same file read over a link would say
+    // nothing where the local door says how many samples it could not hold.
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-              std::string& err, int read = 0);
+              std::string& err, int read = 0, rp::F32Loss* loss = nullptr);
     // run analysis where the data is; only the emitted results travel
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
 

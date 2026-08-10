@@ -599,17 +599,40 @@ bool Session::meta(const std::string& path, Meta& out, std::string& err, int rea
 
 // Convert the served dtype to the float samples the viewer works in. This is the
 // same normalisation the local loaders do, kept in one place.
-static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<float>& out) {
+//
+// It is also where the LINK's exactness ends. remote_proto.h's opening
+// paragraph says pixels cross "in the source dtype (so pixel values stay
+// exact)" - true, and true right up to this function, which then throws the
+// exactness away to satisfy FrameSource::data. So the census the local decoder
+// keeps has to be kept here too, or a u32 file would name its unrepresentable
+// samples when opened from disk and say nothing when opened from a peer.
+static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<float>& out,
+                    rp::F32Loss* loss = nullptr) {
     out.resize(n);
     switch (dtype) {
         case rp::DT_U8:  for (size_t i = 0; i < n; i++) out[i] = (float)src[i]; break;
         case rp::DT_I8:  for (size_t i = 0; i < n; i++) out[i] = (float)((const int8_t*)src)[i]; break;
         case rp::DT_U16: for (size_t i = 0; i < n; i++) out[i] = (float)((const uint16_t*)src)[i]; break;
         case rp::DT_I16: for (size_t i = 0; i < n; i++) out[i] = (float)((const int16_t*)src)[i]; break;
-        case rp::DT_U32: for (size_t i = 0; i < n; i++) out[i] = (float)((const uint32_t*)src)[i]; break;
-        case rp::DT_I32: for (size_t i = 0; i < n; i++) out[i] = (float)((const int32_t*)src)[i]; break;
+        // u4 / i4 / f8: the three that do not fit. (double) is exact for every
+        // uint32_t and int32_t, so observe() compares against the peer's value
+        // and not a second approximation of it.
+        case rp::DT_U32: for (size_t i = 0; i < n; i++) {
+                             double e = (double)((const uint32_t*)src)[i];
+                             if (loss) loss->observe(e);
+                             out[i] = (float)e;
+                         } break;
+        case rp::DT_I32: for (size_t i = 0; i < n; i++) {
+                             double e = (double)((const int32_t*)src)[i];
+                             if (loss) loss->observe(e);
+                             out[i] = (float)e;
+                         } break;
         case rp::DT_F32: memcpy(out.data(), src, n * 4); break;
-        case rp::DT_F64: for (size_t i = 0; i < n; i++) out[i] = (float)((const double*)src)[i]; break;
+        case rp::DT_F64: for (size_t i = 0; i < n; i++) {
+                             double e = ((const double*)src)[i];
+                             if (loss) loss->observe(e);
+                             out[i] = (float)e;
+                         } break;
         default: std::fill(out.begin(), out.end(), 0.0f); break;
     }
 }
@@ -633,7 +656,7 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-                   std::string& err, int read) {
+                   std::string& err, int read, rp::F32Loss* loss) {
     if (!readServable(read, err)) return false;
     W wr;
     wr.str(serverPath(path));
@@ -677,7 +700,7 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     }
     outW = (int)rep.w; outH = (int)rep.h; outCh = (int)rep.ch;
     dtype = rp::dtypeName(rep.dtype);
-    toFloat(raw.data(), rep.dtype, (size_t)rep.w * rep.h * rep.ch, out);
+    toFloat(raw.data(), rep.dtype, (size_t)rep.w * rep.h * rep.ch, out, loss);
     return true;
 }
 

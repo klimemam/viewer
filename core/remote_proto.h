@@ -13,6 +13,8 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>                   // snprintf, for exactNum
+#include <stdlib.h>                  // strtod, for exactNum's round-trip check
 #include <string>
 #include <vector>
 
@@ -329,6 +331,111 @@ static inline size_t dtypeSize(uint32_t t) {
 }
 const char* dtypeName(uint32_t t);
 uint32_t dtypeFromName(const char* s);
+
+// ---- WHAT FLOAT32 COST, measured rather than assumed ------------------------
+//
+// The viewer holds pixels as float32 (FrameSource::data). float32 carries a
+// 24-bit significand, so three of the dtypes the loaders accept do not fit in
+// it: u4 and i4 above 2^24 (16777216) land on a DIFFERENT integer, and f8
+// loses digits unconditionally - and can lose the whole number, since 1e300
+// becomes inf and 1e-300 becomes 0.
+//
+// docs/input-adapters.md §4.8 already fixes the rule for this situation:
+// something that does not fit is converted AND THE CONVERSION IS RECORDED IN
+// THE NOTE. It says it about bfloat16. It was never said about u32/i32/f64,
+// which is the defect - not the narrowing itself (that is a storage decision)
+// but the SILENCE about it. The same paragraph also claims "an integer rides
+// onto f32 with its value intact", which is false above 2^24; this is what
+// makes it true or, where it cannot be, audible.
+//
+// So the claim is MEASURED, per array, at the one place the exact value is
+// still in hand - the conversion itself:
+//
+//   * an f8 file whose values all happen to fit (small integers, or numbers
+//     that were float32 before someone widened them) gets NO warning, because
+//     nothing was lost. A hedge that fires on the dtype would cry wolf on
+//     exactly the files that are fine.
+//   * a u4 file with one sample at 2^24+1 says "1 of N", and names it.
+//
+// It lives HERE because four places narrow and they must all say the same
+// thing: the local .npy/.npz decoder, the raw decoder, the remote client
+// (core/remote.cpp toFloat - the wire carries the source dtype exactly, so the
+// loss there is entirely this last step) and the peer's own pre-measure
+// conversion (core/serve.cpp toFloatSamples). A second copy of "did this
+// survive" is a second answer to it.
+struct F32Loss {
+    uint64_t inexact = 0;      // samples float32 cannot hold
+    uint64_t total   = 0;      // samples examined
+    double   from    = 0;      // the sample that moved furthest, as the FILE holds it
+    double   to      = 0;      //   ...and as this program holds it
+    double   worstRel = -1;    // its relative deviation; -1 = nothing seen yet
+
+    bool any() const { return inexact != 0; }
+    // One sample, exact as the file holds it. Call ONLY for dtypes that can
+    // lose (u4 / i4 / f8): u1/i1/u2/i2/f4/b1 are exact in float32 by
+    // construction and must not pay a branch per pixel for a question whose
+    // answer is known.
+    void observe(double exact) {
+        total++;
+        const float held = (float)exact;
+        if (exact != exact) return;                  // NaN stays NaN: nothing lost
+        if ((double)held == exact) return;
+        inexact++;
+        const double d = (double)held - exact;
+        const double rel = exact != 0 ? (d < 0 ? -d : d) / (exact < 0 ? -exact : exact)
+                                      : (d < 0 ? -d : d);
+        if (rel > worstRel) { worstRel = rel; from = exact; to = (double)held; }
+    }
+    void merge(const F32Loss& o) {
+        inexact += o.inexact; total += o.total;
+        if (o.worstRel > worstRel) { worstRel = o.worstRel; from = o.from; to = o.to; }
+    }
+};
+
+// 2^24: the largest integer float32 holds exactly, and therefore the point from
+// which an integer in hand can no longer be traced back to the file's. It is
+// the boundary for the callers that have only the float left - fmtVal's, which
+// is handed one and asked to print it - and the test there is >=, not >: 2^24
+// is representable, but 2^24+1 rounds onto it (ties to even), so a float
+// holding exactly 2^24 is already ambiguous. 2^24-1 is not.
+static const double F32_EXACT_INT_MAX = 16777216.0;   // 2^24
+
+// A double printed so that reading it back gives the same double, and with no
+// more digits than that needs. 15/16/17 in order is the portable spelling of
+// std::to_chars' shortest round trip (which libc++ did not carry until LLVM 14,
+// and this builds on three toolchains). It matters because these strings are
+// the EVIDENCE: "the file holds 1.0000000001" is the whole sentence, and
+// %.17g would print 1.0000000000999999 and make the viewer look like the liar.
+inline std::string exactNum(double v) {
+    char b[40];
+    for (int p = 15; p <= 17; p++) {
+        snprintf(b, sizeof b, "%.*g", p, v);
+        if (strtod(b, nullptr) == v) return b;
+    }
+    return b;
+}
+
+// The sentence the Inspector prints. Empty when nothing was lost - a line that
+// says "0 samples were harmed" is noise, and this file's whole point is that a
+// claim must be earned.
+//
+// It quotes the RELATIVE deviation and one sample at that deviation, because
+// "how far off" is the question and absolute DN cannot answer it across
+// magnitudes: 16777217 -> 16777216 is one DN and 6e-8 of the value, while
+// 4294967295 -> 4294967296 is also one DN and 2e-10 of it. Relative also ranks
+// the one case that is not about digits at all - a finite f64 that becomes inf
+// is an infinite relative deviation and therefore always the quoted one.
+inline std::string f32LossNote(const F32Loss& L, const std::string& dtype) {
+    if (!L.any()) return {};
+    char rel[32];
+    snprintf(rel, sizeof rel, "%.2g", L.worstRel);
+    return dtype + " does not fit in float32: " +
+           std::to_string((unsigned long long)L.inexact) + " of " +
+           std::to_string((unsigned long long)L.total) +
+           " sample(s) are NOT the value the file holds (worst " + rel +
+           " of the value: " + exactNum(L.from) + " is held as " + exactNum(L.to) +
+           ") - every number shown for those samples is this program's, not the file's";
+}
 
 // ---- how a .npy shape is SAID, spelled once for both doors -----------------
 //

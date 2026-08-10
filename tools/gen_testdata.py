@@ -1134,6 +1134,39 @@ write_tiff(media / "cameramade.tif",
                       extra=[(271, 2, b"NIKON CORPORATION\0"),
                              (272, 2, b"NIKON Z 8\0")])])
 
+# precision/ - the three dtypes float32 cannot hold, for a HUMAN. u4 and i4
+# above 2^24 land on a different integer and f64 loses digits, and until these
+# existed the fixture tree carried no file of any of those dtypes at all: every
+# .npy here was u8/u16/f32, which is exactly the set that survives, so nothing
+# in the tree could be opened to see the problem.
+#
+# --precision-selftest deliberately does NOT read these. It writes its own
+# copies under a scratch subdirectory (the stackavg discipline) so it cannot be
+# made to pass by a fixture drifting - a test whose expected numbers are
+# arithmetic must own the bytes those numbers are about. These are for opening
+# in the real window: the Inspector's amber line and the "~" on a marked value
+# are the two things a screenshot in an issue needs.
+prec = fresh(out / "precision")
+np.save(prec / "u4_boundary.npy", np.array([
+    [0, 1, 65535, 16777215],                        # every one exact
+    [16777216, 16777217, 16777218, 16777219],       # 2^24, then odd/even alternate
+    [33554432, 33554433, 33554434, 33554436],       # past 2^25 the step is 2, then 4
+    [4294967295, 4000000001, 2147483647, 123456789],
+], np.uint32))
+np.save(prec / "i4_boundary.npy", np.array(
+    [[-16777216, -16777217, 16777217, -2147483648]], np.int32))
+# f64: the tenth digit, and then the range - 1e300 is a finite measurement that
+# becomes inf, which is the failure that survives "it is only the last digits".
+np.save(prec / "f8_digits.npy", np.array(
+    [[1.0000000001, 1.0, np.pi, 0.1]], np.float64))
+np.save(prec / "f8_range.npy", np.array(
+    [[1e300, 1e-300, -1e300, 1.0]], np.float64))
+# ...and the control: same dtypes, values that fit. Opening these must produce
+# no amber line and no marked value, or the declaration is a hedge on the dtype
+# rather than a measurement of the array.
+np.save(prec / "u4_fits.npy", np.array([[0, 4095, 65535, 16777215]], np.uint32))
+np.save(prec / "f8_fits.npy", np.array([[0.0, 1.0, 0.5, 1024.25]], np.float64))
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     if p.is_dir():

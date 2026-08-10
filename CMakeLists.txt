@@ -809,7 +809,7 @@ else()
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
-# The binary carries 25 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# The binary carries 26 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
 # script to get exactly what CI got. There is no second copy of the argument
 # lists anywhere - adding a test here adds it to CI.
@@ -824,7 +824,7 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Six of the tests below do; the other 36 take the --no-window startup path and
+# Six of the tests below do; the other 37 take the --no-window startup path and
 # need neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -985,7 +985,7 @@ add_test(NAME test_abi_probe COMMAND test_abi_probe)
 set_tests_properties(test_abi_probe PROPERTIES LABELS "selftest;nogl" TIMEOUT 60)
 
 # Which of these carry NOGL was MEASURED, not reasoned about: every one was run
-# through --no-window against this build, and the 20 below came back with output
+# through --no-window against this build, and the 21 below came back with output
 # byte-identical to the same test with a window (the load-progress line
 # "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
@@ -1135,6 +1135,12 @@ viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
 # sum) under a scratch subdirectory and asserts the VALUES, the way
 # --roistats-selftest does rather than the way a menu-item test would.
 viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
+# The values float32 cannot hold (u32/i32 above 2^24, and f64) and what the
+# viewer shows for them. Same discipline and same NOGL reasoning as stackavg: it
+# writes its own u4/i4/f8 .npy fixtures under a scratch subdirectory - the whole
+# subject is dtypes no other fixture in the tree carries - and every assertion
+# is a number or the string a panel prints, so it gates on all three runners.
+viewer_selftest(precision   NOGL --precision-selftest tools/testdata)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # (frame-lin retired with the §3.3 migration: the frame-axis linearity fit

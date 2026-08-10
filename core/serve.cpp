@@ -1013,6 +1013,16 @@ static void handleTile(Buf& in) {
 // the whole point is that a statistic over gigabytes of frames crosses the wire
 // as a few hundred bytes, immediately, while any pixel transfer runs in parallel.
 
+// The peer's own narrowing, and the one of the four that does NOT yet report
+// what it cost. u4/i4/f8 lose here exactly as they do in remote.cpp's toFloat
+// (rp::F32Loss says how, and the local decoders, the raw decoder and the remote
+// client all measure it) - but a census raised here has no way home: a MEASURE
+// reply carries emitted results, and saying "3 of 4000000 samples are not the
+// file's" would need a field in that reply and therefore rp::VERSION 8. What
+// covers the user today is that the DOCUMENT is opened through TILE, whose
+// census does travel, so the Inspector already declares the loss for the very
+// pixels these statistics were taken from. Left as a named gap rather than a
+// silent one; it is judgment item 3 of the precision report.
 void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out) {
     switch (dtype) {
         case DT_U8:  for (size_t i = 0; i < n; i++) out[i] = (float)src[i]; break;

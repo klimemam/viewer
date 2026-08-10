@@ -99,7 +99,7 @@ static void rfWorker() {
                 // swap that fetched the native reading of a document declared
                 // (F,H,W) would replace the preview with a different array.
                 if (!ses.tile(rpath, job.frame, 0, 0, 1 << 30, 1 << 30, 1,
-                              d.data, w, h, ch, d.dtype, err, job.npyRead)) {
+                              d.data, w, h, ch, d.dtype, err, job.npyRead, &d.f32loss)) {
                     d.err = err;
                 } else {
                     d.w = w; d.h = h; d.ch = ch;
@@ -296,6 +296,7 @@ static void pumpRemoteFetch() {
             S.w = d.w; S.h = d.h; S.ch = d.ch;
             S.data = std::move(d.data);
             S.vmin = d.vmin; S.vmax = d.vmax;
+            S.f32loss = d.f32loss;    // measured on the worker; see RFetchDone
             doc->syncMirrors();
             // §6.2: the same url+frame may already be resident (the same remote
             // folder opened twice) - the arrival grafts as a second membership
@@ -346,6 +347,12 @@ static void pumpRemoteFetch() {
         S.remoteStep = 1;
         S.remoteErr.clear();
         S.vmin = d.vmin; S.vmax = d.vmax;        // measured on the worker
+        S.f32loss = d.f32loss;    // ...and so was this: the preview's census was
+                                  // over the decimated samples, and these are
+                                  // different pixels. Replaced wholesale with
+                                  // the rest of them, never merged - the two
+                                  // counts overlap, and a sum of them would be
+                                  // a number no array ever had.
         S.rev++;      // in-place pixel replacement (§2.2's "reload" family):
                       // stage 1's only rev writer; the invalidation walk is stage 5
         // §6.2: remoteStep=1 just made this source shareable, and it was

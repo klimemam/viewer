@@ -34,6 +34,7 @@
 // core/ itself is not on the viewer target's include path.
 #include "../ui_theme.h"             // ui_theme::VariantDark
 #include "../remote.h"               // remote::Session / Entry / ScanGroup / GlobHit / MeasureResult
+#include "../remote_proto.h"         // rp::F32Loss - what float32 cost THESE pixels
 #include "../adapter.h"              // adapter::Run (App::ReaderJob)
 #include "../browse/browse_state.h"  // browse::Instance and the rb types (P7 §3);
                                      // App aliases them below, so every existing
@@ -90,6 +91,12 @@ struct FrameSource {
     int w = 0, h = 0, ch = 1;
     std::string dtype;
     float vmin = 0, vmax = 1;         // data min/max
+    // What holding these pixels as float32 COST, measured by whichever decoder
+    // narrowed them (rp::F32Loss, core/remote_proto.h). Zeroed for every dtype
+    // float32 holds exactly, which is all of them but u32 / i32 / f64 - so an
+    // .any() here is a fact about THIS array, never a guess from its dtype.
+    // The Inspector prints it; fmtVal marks the individual values it covers.
+    rp::F32Loss f32loss;
     std::string path;
     // This frame's name INSIDE its container file: a .npz array name, or an
     // .exr layer. ONE field, because it is one idea - a named part of one file -
@@ -1380,6 +1387,10 @@ struct App {
         int npyRead = 0;              // the reading it was fetched under, back
         int remoteProto = 0;          // from the job: a minted sibling records
         std::vector<int64_t> npyShape;// the same three facts its head does
+        // ...and what float32 cost THESE samples, measured on the worker where
+        // the peer's exact bytes still existed. It cannot be recomputed on the
+        // UI thread - by then the only copy is the float one.
+        rp::F32Loss f32loss;
     };
     std::atomic<uint32_t> rfGen{ 0 };
     std::thread rfThread;

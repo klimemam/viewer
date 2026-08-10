@@ -151,11 +151,44 @@ static void fitToCanvas(ImVec2 canvasSize) {
     app.view.center = ImVec2(w * 0.5f, h * 0.5f);
 }
 
+// One pixel value, printed. THE DIGITS MUST BE EARNED.
+//
+// An integer dtype prints "%.0f", which spells every digit of the float it is
+// handed and therefore claims all of them. float32 carries a 24-bit
+// significand, so it holds every integer up to 2^24 and then starts landing on
+// the wrong one: a u32 file holding 16777217 arrives here as 16777216.0f and
+// used to print "16777217"'s neighbour as if it were the file's number, and a
+// file holding 4294967295 printed "4294967296" - a value a u32 cannot even
+// take. Silently. That is the defect: not that the viewer narrows (that is a
+// storage decision, and rp::F32Loss measures what it costs), but that the
+// narrowed number was presented with the authority of an exact one.
+//
+// So from the boundary up, the digits get a "~". The marker means "this
+// program cannot vouch for these digits", and the boundary is where that
+// becomes true - which is AT 2^24 and not above it. 2^24 itself is exactly
+// representable, but so is nothing between it and 2^24+2, so a file holding
+// 2^24+1 rounds (ties to even) onto exactly 2^24 and is then indistinguishable
+// from a file that really held 2^24. 2^24-1 has no such neighbour and is
+// unambiguous. The rule is therefore |v| >= 2^24, and it is about what can be
+// CONCLUDED from the float in hand, never about what the file happened to say -
+// 16777218 is representable and is still marked, because the program cannot
+// know it was not 16777217. u8/u16/i8/i16/bool can never reach the boundary, so
+// nothing but u32/i32 is ever marked.
+//
+// The float branch is left alone: %.5g claims five significant digits and
+// float32 carries about seven, so it over-claims nothing. What f64 loses is
+// therefore not visible HERE (it is in the ROI mean, the histogram bins and
+// every export) and is declared per array instead, by the Inspector, from the
+// census the decoders recorded.
 static std::string fmtVal(float v, const std::string& dtype) {
     char b[64];
     if (dtype == "u8" || dtype == "u16" || dtype == "i8" || dtype == "i16" ||
         dtype == "u32" || dtype == "i32" || dtype == "bool")
-        snprintf(b, 64, "%.0f", v);
+        // Only a FINITE value past the boundary is marked. "nan" and "inf"
+        // already say they are not a measurement, and "~nan" would be a marker
+        // on a word rather than on digits.
+        snprintf(b, 64, std::isfinite(v) && fabsf(v) >= (float)rp::F32_EXACT_INT_MAX
+                            ? "~%.0f" : "%.0f", v);
     else
         snprintf(b, 64, "%.5g", v);
     return b;
@@ -954,6 +987,13 @@ int main(int argc, char** argv) {
     #include "selftest/fmtreg.inc"
 
     #include "selftest/stackavg.inc"
+
+    // The values a float32 cannot hold, and what is shown for them. Beside
+    // stackavg because it is the same kind of test - fixtures whose expected
+    // answer is arithmetic, asserted on the NUMBER and never on a menu item -
+    // and after it because stackavg's "a sum float32 cannot carry" fixture is
+    // the nearest neighbour this claim has in the tree.
+    #include "selftest/precision.inc"
 
     #include "selftest/abstats.inc"
 

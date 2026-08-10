@@ -536,6 +536,27 @@ static void drawInspector() {
         }
         ImGui::TextDisabled("min %s / max %s", fmtVal(im->vmin, im->dtype).c_str(),
                             fmtVal(im->vmax, im->dtype).c_str());
+        // What holding these pixels as float32 COST (rp::F32Loss). Amber, the
+        // house colour for "this is being shown, and something about it is not
+        // what you would assume" - the same ink the stale-frame line below
+        // uses, for a neighbouring reason: there the picture is old, here the
+        // numbers are not the file's.
+        //
+        // Directly under min/max on purpose. Those two are the first numbers
+        // read off this panel and the two most likely to be at the extreme of
+        // the range, which is exactly where a u32 stops fitting - and both of
+        // them are printed through fmtVal, so a marked "~" appears one line
+        // above the sentence that explains it.
+        //
+        // It appears only when the census is non-empty, so a u32 file whose
+        // values all fit says nothing at all, and an f64 file written from
+        // float32 data says nothing either. This panel does not warn about
+        // dtypes; it reports a measurement.
+        if (im->src->f32loss.any()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
+            ImGui::TextWrapped("%s", rp::f32LossNote(im->src->f32loss, im->dtype).c_str());
+            ImGui::PopStyleColor();
+        }
         if (!im->note.empty()) ImGui::TextWrapped("%s", im->note.c_str());
         // §10.1: a stale reduced frame must say so where its provenance is
         // read. Amber, the A/B panels' stale ink - one vocabulary for "this

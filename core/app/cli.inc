@@ -15,6 +15,8 @@ static std::string g_browseSelftest;    // --browse-selftest <dir>: Browse panel
 static std::string g_verifySelftest;    // --verify-selftest <dir>: close/batch corners, exit
 static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack from stack, exit
 static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean as a frame, exit
+static std::string g_precisionSelftest; // --precision-selftest <dir>: the u32/i32/f64 values a
+                                        // float32 cannot hold, and what is shown for them, exit
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -672,6 +674,8 @@ static void parseCli(int argc, char** argv) {
             g_deriveSelftest = next();             // handled in main()
         } else if (a == "--stackavg-selftest") {
             g_stackAvgSelftest = next();           // handled in main()
+        } else if (a == "--precision-selftest") {
+            g_precisionSelftest = next();          // handled in main()
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {

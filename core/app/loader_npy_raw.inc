@@ -51,6 +51,12 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
         for (int i = 0; i < n; i++) r = (r << 8) | ((v >> (8 * i)) & 0xff);
         return r;
     };
+    // What this decode costs by being float32, measured on the way past
+    // (rp::F32Loss). Only u4 / i4 / f8 can lose anything - u1/i1/b1/u2/i2/f4
+    // are exact in float32 by construction - so only they pay the branch, and
+    // the census `total` is then the count of samples that COULD have lost
+    // rather than of every sample read, which is what the note wants to say.
+    rp::F32Loss loss;
     auto getVal = [&](size_t i) -> float {
         const uint8_t* p = raw + i * esize;
         switch (esize) {
@@ -66,12 +72,19 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
             uint32_t u; memcpy(&u, p, 4);
             if (be) u = (uint32_t)bswap(u, 4);
             if (code == "f4") { float f; memcpy(&f, &u, 4); return f; }
-            return code == "i4" ? (float)(int32_t)u : (float)u;
+            // (double) is exact for every uint32_t and int32_t, so the census
+            // is comparing against the file's own value and not a second
+            // approximation of it.
+            const double exact = code == "i4" ? (double)(int32_t)u : (double)u;
+            loss.observe(exact);
+            return (float)exact;
         }
         case 8: {
             uint64_t u; memcpy(&u, p, 8);
             if (be) u = bswap(u, 8);
-            double d; memcpy(&d, &u, 8); return (float)d;
+            double d; memcpy(&d, &u, 8);
+            loss.observe(d);
+            return (float)d;
         }
         }
         return 0;
@@ -115,6 +128,19 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
         for (int64_t x = 0; x < W; x++)
             for (int64_t c = 0; c < C; c++)
                 S.data[di++] = getVal((size_t)(frameIdx * sf + y * sh + x * sw + c * sc));
+    // ...and what that cost, recorded on the SOURCE rather than appended to the
+    // note. Two reasons, and both are about it being a fact per array:
+    //   * the note is stack-constant by construction here (it comes from the
+    //     SHAPE) and open_dispatch.inc requires it to stay that way, while this
+    //     census is genuinely per frame - frame 3 of a u32 stack can hold a
+    //     value frame 2 does not;
+    //   * the remote door cannot use the note at all for the same reason, and a
+    //     fact that is worded one way locally and another over a link is the
+    //     shape of issue #71.
+    // So it rides on FrameSource - shared with the registry, copied by
+    // cloneSource, and printed by the Inspector from rp::f32LossNote, which is
+    // the ONE wording all four narrowing sites answer with.
+    S.f32loss = loss;
     im->syncMirrors();
     return im;
 }
@@ -232,6 +258,10 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
     const uint8_t* p = buf.data() + d.offset;
     bool le = d.littleEndian;
 
+    // Same census as the .npy door (rp::F32Loss): the raw dialog's f64 is the
+    // same narrowing arriving through a different mouth, and a fact that is
+    // stated in one door and silent in the other is worse than either.
+    rp::F32Loss loss;
     auto rd = [&](size_t i) -> float {   // one sample, any dtype/endian -> float
         const uint8_t* q = p + i * elem;
         switch (d.dtype) {
@@ -245,7 +275,9 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
         case RD_F64: {
             uint64_t u = 0;
             for (int b = 0; b < 8; b++) u |= (uint64_t)q[le ? b : 7 - b] << (8 * b);
-            double v; memcpy(&v, &u, 8); return (float)v;
+            double v; memcpy(&v, &u, 8);
+            loss.observe(v);
+            return (float)v;
         }
         }
         return 0;
@@ -289,6 +321,7 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
         im->note = std::string(d.interp == RI_QUAD ? "Quad Bayer " : "Bayer ")
                  + CFA_PATTERNS[im->cfaPattern] + " " + RAW_DTYPE_NAMES[d.dtype];
     }
+    S.f32loss = loss;                 // the f64 raw dtype's census; see decodeNpyBuffer
     S.rawDtype = d.dtype;             // remember raw params: sessions + reinterpret
     S.rawInterp = d.interp;
     S.rawOffset = d.offset;

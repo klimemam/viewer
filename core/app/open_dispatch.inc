@@ -1058,8 +1058,9 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     std::vector<float> px;
     int tw = 0, th = 0, tch = 0;
     std::string dt;
+    rp::F32Loss tloss;                        // what float32 cost these pixels
     if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err,
-                            npyRead)) {
+                            npyRead, &tloss)) {
         toast("remote: " + err, true);
         return false;
     }
@@ -1077,6 +1078,12 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     S.dtype = dt;
     S.w = tw; S.h = th; S.ch = tch;
     S.data = std::move(px);
+    // What float32 cost THESE samples. A decimated first view examines only the
+    // samples it fetched, and says so by counting them - "3 of 40000" from a
+    // preview and "3 of 4000000" from the full frame are both true statements
+    // about the pixels on screen, which is the only array anyone can read a
+    // number off. pumpRemoteFetch replaces this wholesale with the full frame's.
+    S.f32loss = tloss;
     // §3.3 over the link (issue #124). npyShape is what the PEER's META said the
     // file declares - empty from a peer older than protocol 9, which is the
     // honest value and the one the Inspector distinguishes from "not a .npy".
