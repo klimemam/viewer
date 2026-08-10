@@ -1703,6 +1703,17 @@ static void pollFileDialog() {           // called once per frame from the main 
         app.texportDlg.reset();
         app.pendingTexport.clear();
     }
+    if (app.roiExportDlg && app.roiExportDlg->ready(0)) {
+        std::string p = app.roiExportDlg->result();
+        if (!p.empty()) {
+            if (p.find('.') == std::string::npos) p += ".csv";
+            std::ofstream f(pathFromUtf8(p), std::ios::binary);
+            if (f) { f << app.pendingRoiExport; toast("ROI statistics exported: " + baseName(p)); }
+            else toast("cannot write: " + baseName(p), true);
+        }
+        app.roiExportDlg.reset();
+        app.pendingRoiExport.clear();
+    }
     if (app.pngDlg && app.pngDlg->ready(0)) {
         std::string p = app.pngDlg->result();
         if (!p.empty()) {

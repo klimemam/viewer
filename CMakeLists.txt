@@ -1086,6 +1086,14 @@ viewer_selftest(detrend     NOGL --detrend-selftest tools/testdata)
 # PRNU cell, same probe - a frame with no backend under it. Analytic fixtures
 # built in memory, so it needs no fixture directory.
 viewer_selftest(roistats    NOGL --roistats-selftest)
+# ...and the same table as a DOCUMENT (issue #67). It had no clipboard surface
+# at all: readable on screen, unreachable from a report. The subject is the
+# STRING the two buttons produce - the sectioned format docs/export-design.md 2
+# confirmed, and the rectangle this table alone carries as a value (x/y/w/h as
+# columns, in the convention documented in 10). Windowless for the roistats
+# reasons and one more: the builder draws no frame at all. Analytic in-memory
+# fixtures, so it needs no fixture directory.
+viewer_selftest(roi-export  NOGL --roi-export-selftest)
 # A and B (and a letter past B) on ONE document: the Statistics panel must draw
 # BOTH sides, coinciding, rather than fold them into one. Same NOGL reasoning as
 # roistats - it asserts what the panel prints, not where it landed - and the

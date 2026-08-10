@@ -108,6 +108,30 @@ static std::string roiFoldTag(const ImageDoc* d) {
     if (!d || d->avgOfPath.empty()) return std::string();
     return d->avgFold == FOLD_SUM ? " (sum_t)" : " (mean_t)";
 }
+// The same statement as a CELL, for the export. A document with a `side` column
+// cannot wear the qualifier in its header the way the panel does - the fold is
+// per side, and a header is not - so it rides in a column and is named on every
+// row, which is where it is read there. docs/analysis-layers.md §3.2's norm is
+// "畳み方を名乗ること", the naming and not the spelling, and this is that same
+// naming in the shape a rectangle allows.
+static std::string roiFoldCell(const ImageDoc* d) {
+    if (!d || d->avgOfPath.empty()) return "-";
+    return d->avgFold == FOLD_SUM ? "sum_t" : "mean_t";
+}
+
+// The channel selector's item lists, at file scope: the combo offers them, and
+// the export's provenance names the one that is showing. Two copies would be
+// two answers to "what is channel 2 called".
+static const char* ROI_CFA_SEL[5] = { "all", "R", "Gr", "Gb", "B" };
+static const char* ROI_CH_SEL[5]  = { "all", "ch0", "ch1", "ch2", "ch3" };
+static int roiMaxSel(const ImageDoc& im) {
+    return im.ch == 1 && im.cfa != 0 ? 4 : std::min(im.ch, 4);
+}
+static const char* roiChannelName(const ImageDoc& im, int chSel) {
+    if (chSel < 0) return "all";
+    const int c = std::clamp(chSel, 0, std::max(1, roiMaxSel(im)) - 1);
+    return im.ch == 1 && im.cfa != 0 ? ROI_CFA_SEL[c + 1] : ROI_CH_SEL[c + 1];
+}
 
 // The user's ruling on issue #76 (2026-08-09): 「roiは共通」- ONE set of
 // rectangles serves every compared slot. The canvas has always drawn them that
@@ -135,11 +159,37 @@ static bool roiSideCovers(const ImageDoc& d, const App::Ann& a) {
 // end falls through to the "every channel" arm and POOLS the planes - a number
 // that looks like a plane's and is the mosaic's. A side that cannot honour the
 // selection prints nothing rather than something else.
-static bool roiSidePlane(const ImageDoc& a, const ImageDoc& d) {
-    if (app.roiChannel < 0) return true;             // "all" is askable anywhere
+// `chSel` is a parameter rather than app.roiChannel because the EXPORT asks this
+// question once per plane (it carries all of them, whatever the combo shows)
+// while the panel asks it once, about the plane on screen.
+static bool roiSidePlane(const ImageDoc& a, const ImageDoc& d, int chSel) {
+    if (chSel < 0) return true;                      // "all" is askable anywhere
     const bool ca = a.ch == 1 && a.cfa != 0, cd = d.ch == 1 && d.cfa != 0;
     if (ca != cd) return false;
-    return cd ? app.roiChannel < 4 : app.roiChannel < d.ch;
+    return cd ? chSel < 4 : chSel < d.ch;
+}
+
+// The sides this panel measures, resolved exactly as the Statistics panel's
+// are. ONE construction, because the table and its export must never disagree
+// about who is on screen - a second list here would be a second answer to the
+// question "what is C" (docs/compare-n.md §10). The channel-specific mute is
+// NOT applied here: it is the panel's, about the plane it is showing, and the
+// export has no single plane to be muted about.
+static std::vector<RoiSide> roiSidesFor(ImageDoc* im) {
+    pumpCompareSlotRestore();
+    std::vector<RoiSide> sides;
+    sides.push_back({ im, "A", abDocLabel(im), false, slotInk(0), std::string() });
+    if (ImageDoc* Bim = abStatsB())
+        sides.push_back({ Bim, "B", abDocLabel(Bim), g_abFollowDiverged, slotInk(1),
+                          std::string() });
+    for (const ResolvedSlot& rs : resolveSlots()) {
+        if (!rs.doc) continue;
+        sides.push_back({ rs.doc, slotName(rs.idx), abDocLabel(rs.doc), rs.diverged,
+                          slotInk(rs.idx + 2),
+                          rs.doc->w < 1 || rs.doc->h < 1 || rs.doc->px().empty()
+                              ? std::string("no pixels loaded yet") : std::string() });
+    }
+    return sides;
 }
 
 // One side's numbers for one row: what the cells print, and - when they print
@@ -296,6 +346,281 @@ static bool g_roiRowProbeOn = false;
 // in none of them is the panel dropping a slot without saying so.
 static std::string g_roiSideProbe;
 
+// One side's numbers for one row of the table, on one plane. `a` null = the
+// "All (whole image)" row, whose target is each side's OWN frame: "all" is a
+// per-image target and not a rectangle, so it is the one row every side can
+// always answer. Lifted out of the panel because the export asks the very same
+// question - for every plane instead of for the one on screen - and a second
+// implementation would be a second set of numbers under one panel's name.
+static RoiCell roiCellOf(const ImageDoc& ref, const RoiSide& sd, const App::Ann* a,
+                         int chSel) {
+    RoiCell c;
+    c.side = &sd;
+    if (!sd.mute.empty()) { c.why = sd.mute; return c; }
+    if (!roiSidePlane(ref, *sd.doc, chSel)) {
+        c.why = std::string("channel \"") + roiChannelName(ref, chSel) +
+                "\" is not a plane of this frame";
+        return c;
+    }
+    if (a && !roiSideCovers(*sd.doc, *a)) {
+        char b[64];
+        snprintf(b, sizeof b, "outside this frame (%dx%d)", sd.doc->w, sd.doc->h);
+        c.why = b;
+        return c;
+    }
+    c.ok = true;
+    if (!a)                c.s = roiBasicStats(*sd.doc, 0, 0, sd.doc->w, sd.doc->h, chSel);
+    else if (a->type == 0) c.s = roiBasicStats(*sd.doc, a->x, a->y, a->w, a->h, chSel);
+    c.prOk = roiPrnuPct(c.s, &c.pr);
+    return c;
+}
+
+// ---- the ROIs table as a document (docs/export-design.md 10, issue #67) ----
+// This table had no clipboard surface at all: every number in it was readable
+// on screen and unreachable from a report. What makes it different from every
+// other table the viewer exports is that it carries WHERE the measurement was
+// taken - the rectangle - as a value; on screen a row shows a name and a
+// "WxH @X,Y", and a copy that dropped the geometry would paste numbers nobody
+// could place. So x / y / w / h are COLUMNS here, next to the statistics, and
+// the document states its coordinate convention in its own header.
+//
+// The format is the one issue #61 confirmed for the Temporal export: '#'-headed
+// sections, each section itself a complete rectangle, %.9g, ASCII, and the
+// display's settings (the decimals, the channel combo) deliberately NOT applied
+// - the screen is for scanning, a file is for reproduction. Same ExportDoc,
+// same expCell, same expNum: this is that format applied, not a second one.
+//
+// TWO sections rather than one wide product, which is exactly the decision §2
+// confirmed: a ROI row is a POPULATION (mean, std, min, max, n) and a POI row
+// is a VALUE. Folding them into one rectangle would put five permanently empty
+// columns on every pin.
+
+// The plane rows a region is asked for: A's planes BY NAME (the panel's rule -
+// "Gr" on a mosaic and "ch1" on a three-plane frame are not the same
+// measurement), and the pooled row LAST, named 'all'. The pooled population is
+// a different measurement and never a fifth plane, which is the Projection
+// section's rule one panel over.
+static std::vector<std::pair<int, std::string>> roiExportPlanes(const ImageDoc& ref) {
+    std::vector<std::pair<int, std::string>> out;
+    const bool cfa = ref.ch == 1 && ref.cfa != 0;
+    const int nPl = cfa ? 4 : std::min(ref.ch, 4);
+    if (nPl > 1)
+        for (int p = 0; p < nPl; p++)
+            out.push_back({ p, cfa ? CFA_CH_NAMES[p] : ROI_CH_SEL[p + 1] });
+    out.push_back({ -1, "all" });
+    return out;
+}
+
+static std::string buildRoiExport(char delim) {
+    ImageDoc* im = cur();
+    if (!im) return std::string();
+    std::vector<RoiSide> sides = roiSidesFor(im);
+    if (sides.empty()) return std::string();
+    ExportDoc doc(delim);
+
+    // ---- provenance: a number without it cannot go in a report --------------
+    doc.comment("ROI / POI statistics");
+    {
+        char ts[32] = "";
+        time_t now = time(nullptr);
+        if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+        doc.comment(std::string("app: viewer ") + viewerVersion() + "  |  generated: " + ts);
+    }
+    {
+        std::string s = "sides: ";
+        for (size_t i = 0; i < sides.size(); i++) {
+            if (i) s += ", ";
+            s += sides[i].letter;
+        }
+        doc.comment(s);
+    }
+    for (const RoiSide& sd : sides) {
+        const ImageDoc* d = sd.doc;
+        char b[512];
+        snprintf(b, sizeof b, "%s: %s%s  |  path: %s", sd.letter.c_str(),
+                 sd.label.c_str(), avgIsStale(d) ? " (stale)" : "",
+                 d->src->path.empty() ? "-" : d->src->path.c_str());
+        doc.comment(b);
+        // a computed frame has no path to cite: its note carries the recipe,
+        // the count and when it was computed, so the whole statement travels
+        if (d->src->path.empty() && !d->note.empty())
+            doc.comment(sd.letter + ": " + d->note);
+        if (avgIsStale(d))
+            doc.comment("NOTE: side " + sd.letter + ": (stale) - the source stack was "
+                        "reloaded after this frame was computed; these numbers "
+                        "describe the OLD pixels (Recompute to refresh)");
+        std::string cfa = d->cfa
+            ? std::string(CFA_PATTERNS[d->cfaPattern & 3]) + (d->cfa == 2 ? " quad" : "") + " (4 planes)"
+            : std::string("none");
+        snprintf(b, sizeof b, "%s: %dx%d %s  |  CFA: %s  |  frame fold: %s",
+                 sd.letter.c_str(), d->w, d->h, d->dtype.c_str(), cfa.c_str(),
+                 roiFoldCell(d).c_str());
+        doc.comment(b);
+        if (!sd.mute.empty())
+            doc.comment("NOTE: side " + sd.letter + ": " + sd.mute);
+    }
+    // THE statement this table turns on. A pasted rectangle means nothing until
+    // the file says which corner it names and which way its axes run, and this
+    // is not a thing to be inferred from four integers at the far end of a
+    // report. Both spellings of the inclusivity are given because both are read.
+    doc.comment("coordinates: x,y = the ROI's TOP-LEFT pixel, 0-based, x to the "
+                "right and y downwards (row 0 is the top row of the image); w,h "
+                "are its size in pixels, so the region is the pixels x..x+w-1 by "
+                "y..y+h-1 - half-open, [x, x+w) x [y, y+h). These are exactly the "
+                "numbers the panel prints as \"WxH @X,Y\" and the x/y/w/h editor "
+                "takes (docs/export-design.md 10)");
+    doc.comment("the ROIs are ONE shared set of rectangles, in A's coordinates "
+                "(issue #76): every side is measured over the same region. A side "
+                "whose frame does not contain it says so in its note column "
+                "instead of reporting the clamped intersection. The 'All (whole "
+                "image)' row is each side's OWN frame, which is why the region is "
+                "a value of the row and not a line in this header");
+    doc.comment(std::string("panel channel selector: ") +
+                roiChannelName(*im, app.roiChannel) +
+                " - the export carries every plane whatever the selector says, "
+                "the same reason the display's decimals do not apply "
+                "(docs/export-design.md 3): the screen is for scanning, a file "
+                "is for reproduction");
+
+    // ---- section 1: the regions --------------------------------------------
+    doc.comment("== ROI statistics (one row per side x region x plane; the region "
+                "travels with the numbers) ==");
+    doc.row({ "side", "roi", "x", "y", "w", "h", "ch", "fold", "mean [DN]",
+              "std [DN]", "std / mean [%]", "min [DN]", "max [DN]", "n", "stride",
+              "note" });
+    const std::vector<std::pair<int, std::string>> planes = roiExportPlanes(*im);
+    bool anyPooled = false, anyDash = false, anyRatioHeld = false;
+    for (const RoiSide& sd : sides) {
+        // side-major, and within a side the panel's own row order: the All row,
+        // then the annotations in the order they were placed. The file comes out
+        // the same way whatever the panel is doing with its column groups - the
+        // rule docs/export-design.md 3.2 fixes for the Projection walk.
+        auto emit = [&](const App::Ann* a, const std::string& name) {
+            const int rx = a ? a->x : 0, ry = a ? a->y : 0;
+            const int rw = a ? a->w : sd.doc->w, rh = a ? a->h : sd.doc->h;
+            for (const auto& pl : planes) {
+                const RoiCell c = roiCellOf(*im, sd, a, pl.first);
+                const bool v = c.ok && c.s.valid;
+                auto n9 = [&](double x) { return v ? expNum(x) : std::string("-"); };
+                if (pl.first < 0 && planes.size() > 1) anyPooled = true;
+                if (!v) anyDash = true;
+                if (v && !c.prOk) anyRatioHeld = true;
+                doc.row({ sd.letter, name, std::to_string(rx), std::to_string(ry),
+                          std::to_string(rw), std::to_string(rh), pl.second,
+                          roiFoldCell(sd.doc),
+                          n9(c.s.mean), n9(c.s.sd),
+                          c.prOk ? expNum(c.pr) : std::string("-"),
+                          n9(c.s.mn), n9(c.s.mx),
+                          v ? std::to_string(c.s.n) : std::string("-"),
+                          v ? std::to_string(c.s.step) : std::string("-"),
+                          c.ok ? (c.s.valid ? std::string() : std::string("no samples here"))
+                               : c.why });
+            }
+        };
+        emit(nullptr, "All (whole image)");
+        for (const App::Ann& a : app.anns)
+            if (a.type == 0) emit(&a, a.label);
+    }
+    doc.comment("std is the PLAIN spatial sigma (ddof=0) of ONE frame as "
+                "displayed: no dark subtraction, no flat-field correction. "
+                "Temporal noise is inside it, so it BOUNDS the fixed pattern from "
+                "above and is not a measurement of it (docs/flat-field-stats.md); "
+                "the named fixed-pattern measurements live a layer above the "
+                "frame. The Temporal panel's sigma_fpn comes off the same "
+                "accumulator with the temporal residual subtracted and is a "
+                "SMALLER number on purpose - not a second opinion about this one "
+                "(docs/analysis-layers.md 3.2, #57 item 2)");
+    doc.comment("n is the number of samples the row's numbers rest on, and stride "
+                "is the row step that produced it (1 = every row): a large region "
+                "is decimated to bound the cost per ROI, and on a mosaic the step "
+                "is rounded up to whole CFA cells so that each landing covers a "
+                "cell. n = 1 makes std exactly 0 by definition");
+    if (anyRatioHeld)
+        doc.comment("'std / mean [%]' is this row's own std over its own mean x "
+                    "100. It is withheld ('-') where the mean is not above 0: a "
+                    "ratio to a level needs a level, and zero is not one");
+    if (anyPooled)
+        doc.comment("ch = all pools every plane into ONE population, so the "
+                    "planes' level differences are inside that std - a different "
+                    "measurement, and never a fifth plane. It cannot be recovered "
+                    "by averaging the plane rows");
+    if (anyDash)
+        doc.comment("a row whose numbers are all '-' could not be measured on that "
+                    "side; the note column says why, on the row itself");
+
+    // ---- section 2: the pins ------------------------------------------------
+    doc.comment("== POI values (one pixel: a VALUE, not a population - its own "
+                "section rather than five empty columns on every pin) ==");
+    doc.row({ "side", "poi", "x", "y", "ch", "value [DN]", "note" });
+    bool anyPoi = false;
+    for (const RoiSide& sd : sides)
+        for (const App::Ann& a : app.anns) {
+            if (a.type != 1) continue;
+            anyPoi = true;
+            const ImageDoc* d = sd.doc;
+            if (!sd.mute.empty() || !roiSideCovers(*d, a)) {
+                char b[64];
+                snprintf(b, sizeof b, "outside this frame (%dx%d)", d->w, d->h);
+                doc.row({ sd.letter, a.label, std::to_string(a.x), std::to_string(a.y),
+                          "-", "-", sd.mute.empty() ? std::string(b) : sd.mute });
+                continue;
+            }
+            // A pixel of a mosaic belongs to exactly ONE plane and the row names
+            // it; a pixel of a multi-channel frame has one value per channel and
+            // gets a row each. Neither is the channel combo's business - a value
+            // is not a statistic, and nothing here is being selected.
+            const bool cfa = d->ch == 1 && d->cfa != 0;
+            for (int c = 0; c < (cfa ? 1 : d->ch); c++) {
+                std::string nm = cfa ? CFA_CH_NAMES[cfaChannelAt(*d, a.x, a.y)]
+                                     : (d->ch > 1 ? "ch" + std::to_string(c)
+                                                  : std::string("all"));
+                doc.row({ sd.letter, a.label, std::to_string(a.x), std::to_string(a.y),
+                          nm, expNum(d->sample(a.x, a.y, c)), std::string() });
+            }
+        }
+    if (!anyPoi) doc.comment("(no pins placed)");
+    return doc.out;
+}
+
+// The ROIs panel's export surface: one builder, two sinks - the pair the
+// Temporal panel has, in the same words, because it is the same act.
+static void roiExportButtons() {
+    if (ImGui::SmallButton("Copy (TSV)")) {
+        std::string s = buildRoiExport('\t');
+        if (s.empty()) toast("nothing to export", true);
+        else {
+            ImGui::SetClipboardText(s.c_str());
+            toast("ROI statistics copied (TSV)");
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("every row of this table as ONE tab-separated document\n"
+                          "with a provenance header - the region each row measures\n"
+                          "(x / y / w / h) beside its numbers, every section a\n"
+                          "rectangle, for Excel. Covers every compare side and\n"
+                          "every plane, whatever the channel box is showing.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(app.roiExportDlg != nullptr);
+    if (ImGui::SmallButton("Save (CSV)...")) {
+        std::string s = buildRoiExport(',');
+        if (s.empty()) toast("nothing to export", true);
+        else if (!pfd::settings::available())
+            toast("no file-dialog backend found (install zenity or kdialog)", true);
+        else {
+            // built NOW: the numbers may change while the OS dialog is open
+            app.pendingRoiExport = std::move(s);
+            app.roiExportDlg = std::make_unique<pfd::save_file>(
+                "Save ROI statistics (CSV)", "roi_stats.csv",
+                std::vector<std::string>{ "CSV (*.csv)", "*.csv" });
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the same document as Copy (TSV), comma-separated,\n"
+                          "to a file - the content is built when you click,\n"
+                          "exactly like Export curves.");
+}
+
 static void drawPanelRois() {
     if (g_roiRowProbeOn) g_roiRowProbe.clear();
     g_roiSideProbe.clear();
@@ -304,16 +629,15 @@ static void drawPanelRois() {
 
     // channel selector keeps the table to a fixed, readable width
     bool cfa = im->ch == 1 && im->cfa != 0;
-    static const char* CFA_SEL[5] = { "all", "R", "Gr", "Gb", "B" };
-    static const char* CH_SEL[5] = { "all", "ch0", "ch1", "ch2", "ch3" };
-    int maxSel = cfa ? 4 : std::min(im->ch, 4);
+    const char* const* CFA_SEL = ROI_CFA_SEL;
+    const char* const* CH_SEL = ROI_CH_SEL;
+    int maxSel = roiMaxSel(*im);
     // maxSel - 1 on BOTH sides: the CFA arm used to clamp to maxSel, so a
     // restored roichannel of 4 stuck at 4 - one past the last plane. That reads
     // CFA_SEL[5] off the end of the array and matches no plane, so every row in
     // the table would print "-" with nothing saying why.
     app.roiChannel = std::clamp(app.roiChannel, -1, maxSel - 1);
-    const char* curSel = app.roiChannel < 0 ? "all"
-                                            : (cfa ? CFA_SEL[app.roiChannel + 1] : CH_SEL[app.roiChannel + 1]);
+    const char* curSel = roiChannelName(*im, app.roiChannel);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
     if (ImGui::BeginCombo("channel", curSel)) {
         if (ImGui::Selectable("all", app.roiChannel < 0)) app.roiChannel = -1;
@@ -325,6 +649,11 @@ static void drawPanelRois() {
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear all")) { app.anns.clear(); app.selectedAnn = 0; app.annRev++; }
     ImGui::SameLine();
+    // ...and the way off this screen (issue #67). Beside Clear all rather than
+    // under the table: the two things you do to the SET of ROIs belong together,
+    // and a button below the rows would move as the table grew.
+    roiExportButtons();
+    ImGui::SameLine();
     ImGui::TextDisabled("(R: drag = ROI, P: click = pin)");
     ImGui::Separator();
 
@@ -335,23 +664,13 @@ static void drawPanelRois() {
     // and a uid lookup would lose the letter. A slot that resolves onto A's own
     // document keeps its own side, for the reason --abeq-selftest pins: two
     // letters on one image is a COINCIDENCE to be shown, not folded away.
-    pumpCompareSlotRestore();
-    std::vector<RoiSide> sides;
-    sides.push_back({ im, "A", abDocLabel(im), false, slotInk(0), std::string() });
-    if (ImageDoc* Bim = abStatsB())
-        sides.push_back({ Bim, "B", abDocLabel(Bim), g_abFollowDiverged, slotInk(1),
-                          std::string() });
-    for (const ResolvedSlot& rs : resolveSlots()) {
-        if (!rs.doc) continue;
-        sides.push_back({ rs.doc, slotName(rs.idx), abDocLabel(rs.doc), rs.diverged,
-                          slotInk(rs.idx + 2),
-                          rs.doc->w < 1 || rs.doc->h < 1 || rs.doc->px().empty()
-                              ? std::string("no pixels loaded yet") : std::string() });
-    }
+    std::vector<RoiSide> sides = roiSidesFor(im);
     // The channel selection is A's, and it has to NAME a plane on a side before
-    // that side may print one. Muted here, once, rather than per row.
+    // that side may print one. Muted here, once, rather than per row - and here
+    // rather than in roiSidesFor, because the plane on screen is the panel's
+    // business and not the export's (that one carries them all).
     for (RoiSide& sd : sides)
-        if (sd.mute.empty() && !roiSidePlane(*im, *sd.doc))
+        if (sd.mute.empty() && !roiSidePlane(*im, *sd.doc, app.roiChannel))
             sd.mute = std::string("channel \"") + curSel + "\" is not a plane of this frame";
     {
         std::string all;
@@ -456,26 +775,11 @@ static void drawPanelRois() {
         drawABBand(sides[shown].letter.c_str(), sides[shown].label, sides[shown].stale);
 
     // ---- the table ----------------------------------------------------------
-    // One side's numbers for one row. `a` null = the "All (whole image)" row,
-    // whose target is each side's OWN frame: "all" is a per-image target and not
-    // a rectangle, so it is the one row every side can always answer.
+    // The cells are roiCellOf's, on the plane the combo is showing - the export
+    // asks the same function for every plane, so the two can never print
+    // different numbers for one region.
     auto cellOf = [&](const RoiSide& sd, const App::Ann* a) {
-        RoiCell c;
-        c.side = &sd;
-        if (!sd.mute.empty()) { c.why = sd.mute; return c; }
-        if (a && !roiSideCovers(*sd.doc, *a)) {
-            char b[64];
-            snprintf(b, sizeof b, "outside this frame (%dx%d)", sd.doc->w, sd.doc->h);
-            c.why = b;
-            return c;
-        }
-        c.ok = true;
-        if (!a)                c.s = roiBasicStats(*sd.doc, 0, 0, sd.doc->w, sd.doc->h,
-                                                   app.roiChannel);
-        else if (a->type == 0) c.s = roiBasicStats(*sd.doc, a->x, a->y, a->w, a->h,
-                                                   app.roiChannel);
-        c.prOk = roiPrnuPct(c.s, &c.pr);
-        return c;
+        return roiCellOf(*im, sd, a, app.roiChannel);
     };
     // the five numeric columns of one side, in the order the header names them
     auto areaCells = [&](const RoiCell& c) {
