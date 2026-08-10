@@ -442,9 +442,15 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
                 const char* pn = cfa ? CFA_CH_NAMES[p] : (C > 1 ? CHN[p] : "");
                 std::string sfx = *pn ? std::string("_") + pn : std::string();
                 h.push_back("mean" + sfx + " [DN]");
-                h.push_back("sigma" + sfx + " [DN]");
-                h.push_back("sigma_col" + sfx + " [%]");
-                h.push_back("sigma_row" + sfx + " [%]");
+                // Each sigma names its ddof (stats-taxonomy.md 8, ruling 4).
+                // Two conventions sit next to each other in this row: `sigma`
+                // is the region's own pixels (ddof=0) and sigma_col / sigma_row
+                // are the sigma of the column and row MEANS (ddof=1). In the
+                // column NAME, not a comment - the documented way to read this
+                // file is pandas with comment='#'.
+                h.push_back("sigma" + sfx + " [DN](ddof=0)");
+                h.push_back("sigma_col" + sfx + " [%](ddof=1)");
+                h.push_back("sigma_row" + sfx + " [%](ddof=1)");
             }
             doc.row(h);
         }
@@ -469,8 +475,27 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
         if (ax.custom) r.insert(r.begin() + 1, expNum(ax.at(d->seqIndex)));
         for (int p = 0; p < nPl; p++) {
             double m = cnt[p] ? sum[p] / (double)cnt[p] : 0.0;
+            // ddof=0 (stats-taxonomy.md §8 判断1). This was the ONE site out of
+            // twelve computing the region's own sigma with ddof=1, and it made
+            // this panel disagree with ITSELF: the frame-std graph beside it
+            // (temporal_model.inc, T.frameStd) is ddof=0, so the same sigma of
+            // the same frame printed two numbers depending on whether it was
+            // read off the plot or off the export.
+            //
+            // The region's pixels ARE the region: "how much does this area
+            // vary" is a settled value, not an estimate of a wider population,
+            // and there is no n-1 to divide by. The panels that ask it also
+            // SUBSAMPLE (200k / 1M stride samples, whole mosaic cells, so the
+            // samples correlate with column FPN) - so ddof=1 cannot deliver the
+            // unbiasedness it charges for. The peer is already on ddof=0 for
+            // this quantity, so this line is also what makes local and peer
+            // agree without touching the wire.
+            //
+            // NOTE the sibling below (profCv) is NOT this quantity and keeps
+            // ddof=1: sigma of the row/column MEANS is a part of an estimator
+            // (判断2). This function holds one of each.
             double var = cnt[p] > 1
-                ? std::max(0.0, sum2[p] / (double)cnt[p] - m * m) * (cnt[p] / (cnt[p] - 1.0)) : 0.0;
+                ? std::max(0.0, sum2[p] / (double)cnt[p] - m * m) : 0.0;
             auto profCv = [&](const std::vector<double>& S, const std::vector<uint32_t>& N,
                               size_t off, int n) {
                 double ps = 0, ps2 = 0; int pc = 0;
@@ -845,8 +870,10 @@ static std::string buildTemporalExport(char delim) {
                               "numbers; reduce = %s) ==", reduce);
         doc.comment(b);
     }
-    doc.row({ "side", "ch", "mean [DN]", "sigma_frame [DN]", "sigma_row [DN]",
-              "sigma_col [DN]", "sigma_frame [%]", "sigma_row [%]", "sigma_col [%]",
+    doc.row({ "side", "ch", "mean [DN]", "sigma_frame [DN](ddof=0)",
+              "sigma_row [DN](ddof=1)", "sigma_col [DN](ddof=1)",
+              "sigma_frame [%](ddof=0)", "sigma_row [%](ddof=1)",
+              "sigma_col [%](ddof=1)",
               "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]" });
     bool anyAllRow = false;
     for (const TExpSide& s : sides) {

@@ -488,8 +488,30 @@ static void drawPanelProjection() {
             } else tsv += "; whole image";
             const char* pmodes[3] = { "mean", "max", "min" };
             tsv += std::string("; reduce=") + pmodes[std::clamp(app.projMode, 0, 2)] + "; DN\n";
-            tsv += "side\tch\tmean\tsigma_frame\tsigma_row\tsigma_col\t"
-                   "sigma_frame_pct\tsigma_row_pct\tsigma_col_pct\t"
+            // Provenance (stats-taxonomy.md §8 判断5). This is the ONE export
+            // surface that could not say which build produced it, and it is
+            // also the surface whose sigma_row / sigma_col change meaning with
+            // this release (ddof 0 -> 1). A number in a report has to be
+            // traceable to the convention it was computed under; the app
+            // version is what carries that. Temporal already had this form.
+            {
+                char ts[32] = "";
+                time_t now = time(nullptr);
+                if (struct tm* lt = localtime(&now))
+                    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+                tsv += std::string("# app: viewer ") + viewerVersion() +
+                       "  |  generated: " + ts + "\n";
+            }
+            // Every sigma column names its own ddof (判断4). Two conventions now
+            // stand side by side in this very row - sigma_frame is the region's
+            // own pixels (ddof=0, a settled value) and sigma_row / sigma_col are
+            // the sigma of the row and column MEANS (ddof=1, a part of an
+            // estimator) - and without the declaration the reader has no way to
+            // tell them apart. It goes in the COLUMN NAME rather than a comment
+            // because the documented way to read these files is pandas with
+            // comment='#', which would drop exactly this line.
+            tsv += "side\tch\tmean\tsigma_frame(ddof=0)\tsigma_row(ddof=1)\tsigma_col(ddof=1)\t"
+                   "sigma_frame_pct(ddof=0)\tsigma_row_pct(ddof=1)\tsigma_col_pct(ddof=1)\t"
                    "pp_frame\tpp_row\tpp_col\n";
             int nRows = 0;
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {

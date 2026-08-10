@@ -132,6 +132,108 @@
             check(tsv.find(pb, p3) != npos, "E1 per-frame block: resident n of N");
         }
 
+        // ---- E11: the per-frame sigma is ddof=0, and every sigma column says
+        // which ddof it is (stats-taxonomy.md §8 判断1/4/7) -------------------
+        //
+        // 判断7 exists because this number was UNPINNED: --framestats-selftest
+        // prints the table and leaves verification to an outside numpy script,
+        // and the checks above match column names by substring. Changing the
+        // per-frame sigma from ddof=1 to ddof=0 therefore passed the whole
+        // suite in silence - which is exactly the state a convention change
+        // must not be made in.
+        //
+        // The assertion recomputes the number rather than quoting one: walk the
+        // same pixels the export walks (whole image, every pixel - the per-frame
+        // loop does NOT subsample) and build both conventions. Then the export
+        // must equal the ddof=0 one and must NOT equal the ddof=1 one. The
+        // second half is the anti-vacuity guard: the two differ by
+        // sqrt(n/(n-1)), so on a large plane they agree to ~7 digits, and a test
+        // that only checked "equals ddof=0" would pass under either convention.
+        {
+            // The E1 document, built before any later block moves the
+            // region, the ROI or the compare slots: this assertion is about
+            // the DEFAULT reading (whole frame). Rebuilding it further down
+            // compares a ROI export against a whole-frame recompute - which
+            // is exactly how this test failed the first time it ran.
+            const std::string& t = tsv;
+            size_t pf = t.find("# == per-frame statistics");
+            // header line of the per-frame section
+            size_t hs = pf == npos ? npos : t.find('\n', pf) + 1;
+            while (hs != npos && hs < t.size() && t[hs] == '#') hs = t.find('\n', hs) + 1;
+            std::string header = hs == npos ? std::string() : t.substr(hs, t.find('\n', hs) - hs);
+            std::vector<std::string> cols;
+            for (size_t i = 0, j; i <= header.size(); i = j + 1) {
+                j = header.find('\t', i);
+                if (j == std::string::npos) j = header.size();
+                cols.push_back(header.substr(i, j - i));
+                if (j == header.size()) break;
+            }
+            // every sigma column declares a ddof (判断4)
+            int sigCols = 0, declared = 0;
+            for (const auto& c : cols)
+                if (c.compare(0, 5, "sigma") == 0) {
+                    sigCols++;
+                    if (c.find("(ddof=") != npos) declared++;
+                }
+            fprintf(stderr, "texportselftest: E11 per-frame header: %d sigma column(s), "
+                            "%d declare a ddof\n", sigCols, declared);
+            check(sigCols >= 3 && declared == sigCols,
+                  "E11 every sigma column names its ddof (and there are some)");
+
+            // the first data row of the section = frame 0
+            size_t rs = hs == npos ? npos : t.find('\n', hs) + 1;
+            std::string row = rs == npos ? std::string() : t.substr(rs, t.find('\n', rs) - rs);
+            std::vector<std::string> vals;
+            for (size_t i = 0, j; i <= row.size(); i = j + 1) {
+                j = row.find('\t', i);
+                if (j == std::string::npos) j = row.size();
+                vals.push_back(row.substr(i, j - i));
+                if (j == row.size()) break;
+            }
+            // the first plane's plain sigma column, by NAME - "sigma_R [DN]..."
+            // and never "sigma_col..." / "sigma_row...", which are the OTHER
+            // convention and sit right beside it
+            int si = -1;
+            for (size_t i = 0; i < cols.size(); i++)
+                if (cols[i].compare(0, 6, "sigma_") == 0 &&
+                    cols[i].compare(0, 10, "sigma_col") != 0 &&
+                    cols[i].compare(0, 10, "sigma_row") != 0) { si = (int)i; break; }
+            if (si < 0)                        // no CFA suffix: the column is "sigma [DN]..."
+                for (size_t i = 0; i < cols.size(); i++)
+                    if (cols[i].compare(0, 6, "sigma ") == 0) { si = (int)i; break; }
+
+            // recompute, over the first frame, plane 0, whole image
+            ImageDoc* f0 = app.images.empty() ? nullptr : app.images[fr.front()].get();
+            double s = 0, s2 = 0; size_t n = 0;
+            if (f0)
+                for (int y = 0; y < f0->h; y++)
+                    for (int x = 0; x < f0->w; x++)
+                        for (int c = 0; c < f0->ch; c++) {
+                            int p = f0->cfa ? cfaChannelAt(*f0, x, y) : std::min(c, 0);
+                            if (p != 0) continue;
+                            double v = f0->px()[((size_t)y * f0->w + x) * f0->ch + c];
+                            if (!std::isfinite(v)) continue;
+                            s += v; s2 += v * v; n++;
+                        }
+            double m = n ? s / n : 0.0;
+            double v0 = n > 1 ? std::max(0.0, s2 / n - m * m) : 0.0;      // ddof=0
+            double v1 = v0 * (n / (n - 1.0));                             // ddof=1
+            double got = si >= 0 && si < (int)vals.size() ? atof(vals[si].c_str()) : -1.0;
+            char e0[48], e1[48];
+            snprintf(e0, sizeof e0, "%.9g", sqrt(v0));
+            snprintf(e1, sizeof e1, "%.9g", sqrt(v1));
+            fprintf(stderr, "texportselftest: E11 frame 0 plane 0: n=%zu exported=%s "
+                            "ddof0=%s ddof1=%s (ratio %.9g)\n",
+                    n, si >= 0 ? vals[si].c_str() : "(no column)", e0, e1,
+                    v0 > 0 ? sqrt(v1 / v0) : 0.0);
+            check(si >= 0 && n > 1 && got > 0, "E11 fixture: a sigma column and real pixels");
+            check(si >= 0 && vals[si] == e0,
+                  "E11 the per-frame sigma is the ddof=0 value, to the last digit");
+            check(std::string(e0) != std::string(e1),
+                  "E11 ...and the two conventions are distinguishable here (anti-vacuity)");
+        }
+
+
         // ---- E2: numbers are the panel's state formatted, not re-derived ----
         const App::TemporalState& T = app.temporal[0];
         check(T.valid && T.seqId == sid && T.nPl == 4, "E2 fixture: temporal state valid, 4 planes");

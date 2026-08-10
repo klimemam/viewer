@@ -185,9 +185,22 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                     for (x = 0; x < pw; x++) a += plane[(size_t)y * pw + x];
                     m1[y] = (float)(a / pw);
                 }
+                /* ddof=1 (stats-taxonomy.md section 8, ruling 2): these are the
+                   sigma of the row / column MEANS, the same quantity the canon
+                   calls A and B, so they follow the estimator convention and
+                   not the descriptive one.
+
+                   RESERVATION, stated because it is easy to over-claim here:
+                   d is a DETRENDED residual (m1 - m2, m2 being the boxblurred
+                   low band), so the mean was already removed by the detrend and
+                   sum(d^2)/n is not "variance about the mean". A boxblur
+                   consumes more than one degree of freedom, so n-1 is what the
+                   ruling says but is not demonstrably the unbiased denominator
+                   for this estimator. It is applied for consistency with A and
+                   B; it is not a claim that these two numbers are unbiased. */
                 boxblur1d(m1, m2, ph);
                 for (y = 0; y < ph; y++) { double d = m1[y] - m2[y]; rowFpn += d * d; }
-                rowFpn = sqrt(rowFpn / ph);
+                rowFpn = ph > 1 ? sqrt(rowFpn / (ph - 1)) : 0.0;
                 for (x = 0; x < pw; x++) {
                     double a = 0;
                     for (y = 0; y < ph; y++) a += plane[(size_t)y * pw + x];
@@ -195,7 +208,7 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                 }
                 boxblur1d(m1, m2, pw);
                 for (x = 0; x < pw; x++) { double d = m1[x] - m2[x]; colFpn += d * d; }
-                colFpn = sqrt(colFpn / pw);
+                colFpn = pw > 1 ? sqrt(colFpn / (pw - 1)) : 0.0;   /* ddof=1, see above */
             }
             snprintf(key, sizeof key, "%s.row_fpn_pct", names[b]);
             sink->emit_number(sink->ctx, key, rowFpn / mean * 100.0);

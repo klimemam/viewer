@@ -750,7 +750,20 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             }
             if (!n) continue;
             st.mean = sum / n;
-            double var = sum2 / n - st.mean * st.mean;
+            // ddof=1 (stats-taxonomy.md §8 判断2). These are the row and column
+            // MEANS, not the pixels: sigma of them is A and B of the flat-field
+            // decomposition T = sigma_p^2 + A + B, and flat-field-stats.md fixes
+            // A and B at ddof=1 with a reason - taking T at ddof=0 puts an
+            // O(1/W) inconsistency back. Leaving these at ddof=0 would mean the
+            // decomposition, when it lands, either does not add up or silently
+            // moves numbers that have already shipped.
+            //
+            // n here is the PROFILE LENGTH - the number of columns or rows, two
+            // orders below the pixel count - so unlike the region sigma this is
+            // a difference you can see: +2.4e-2 % over a full frame, +6.9 % at
+            // n=8, +41 % at n=2 (a 3x3 ROI on a Bayer plane).
+            double var = n > 1 ? (sum2 / n - st.mean * st.mean) * ((double)n / (n - 1.0))
+                               : 0.0;
             st.sd = sqrt(var > 0 ? var : 0);
             st.mn = mn; st.mx = mx;
             st.pp = mx - mn;
