@@ -164,3 +164,23 @@ static float niceStep(float raw) {   // smallest 1/2/5*10^k >= raw
         if (m * mag >= raw) return m * mag;
     return 10.0f * mag;
 }
+
+// Set or clear an environment variable for a CHILD this process is about to
+// start. The only callers are selftests that need a peer built differently from
+// the one they already have - VIEWER_SERVE_PROTOCOL, which makes `viewer --serve`
+// BE an older peer (announcing the lower number in HELLO and refusing everything
+// that number predates), so a "your peer is too old" refusal is exercised in the
+// gate instead of by keeping an old binary on somebody's disk.
+//
+// Here, in the file everything includes, because two selftests need it now
+// (--rset-selftest for MOP_SET_FOLD's v7 gate, --remote-selftest for the
+// declared reading's v8 one) and a second copy of a #ifdef is a second thing to
+// get wrong on one of the three platforms.
+static void selftestSetEnv(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else       unsetenv(name);
+#endif
+}

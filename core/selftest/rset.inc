@@ -86,13 +86,10 @@ static bool rsetSameResult(const SetResult& A, const SetResult& B, std::string& 
     return true;
 }
 
+// (the body moved to core/app/util.inc when --remote-selftest needed the same
+// seam for the protocol-9 gate; one #ifdef, not two)
 static void rsetSetEnv(const char* name, const char* value) {
-#if defined(_WIN32)
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1);
-    else       unsetenv(name);
-#endif
+    selftestSetEnv(name, value);
 }
 
 static int rsetSelfTest(const char* exe, const char* dirArg) {

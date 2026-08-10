@@ -1612,6 +1612,352 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 badR ? "FAIL" : "ok");
         bad += badR ? 1 : 0;
     }
+    {   // ---- §3.3's escape hatch, through a peer (issue #124) ---------------
+        //
+        // The two blocks above pin what the doors accept and what they refuse.
+        // This one pins the third case, which had no remote half at all: the
+        // file OPENED, and it opened the wrong way round. docs/input-adapters.md
+        // §3.3 built the way out of that - the Inspector says how the array was
+        // read and offers the other readings the shape permits - and §4.13.1
+        // decided remote is in from v1, but FrameSource::npyShape was only ever
+        // set by the local decoder, so through a peer there was no line and no
+        // menu.
+        //
+        // (H,W,1) is the shape to aim it at, and it is the same fixture #71
+        // used, for the same reason: it is what img[:, :, None] writes, it is
+        // exactly one mono capture, and the rule now reads it as one 40x48
+        // frame - correctly, but a stack of 48 one-pixel-wide lines IS what
+        // some scripts mean by it, and §3.3 is how that is said per file. So it
+        // is a shape with two honest readings and a real reason to choose.
+        //
+        // THREE asserts, and the order is the argument of the issue:
+        //
+        //   RA1  the peer says what the FILE declares, not what it made of it.
+        //        Without a shape on the wire nothing below is possible, and
+        //        this is the whole of the META change.
+        //   RA2  the menu computed from the peer's shape is the SAME menu as
+        //        the one computed from the local decoder's. Not "a menu" - the
+        //        same one, entry for entry, in order. A remote document that
+        //        offered a different set of readings than the same file opened
+        //        from File > Open would be a second rule, which is #71 again.
+        //   RA3  choosing one CHANGES WHAT TILE RETURNS, and returns what the
+        //        local decoder returns for that same declaration - geometry
+        //        and every pixel. This is the assert that fails against a peer
+        //        that reads the trailer and ignores it, which is the state a
+        //        version bump exists to make impossible: the fault it catches
+        //        is not a refusal but a plausible wrong picture.
+        //
+        // Fixtures written here rather than read from tools/testdata, for the
+        // reasons the channel-rule block states: that tree is generated and
+        // gitignored, and a fixture living apart from the rule it pins drifts.
+        std::error_code aec;
+        std::filesystem::path adir =
+            std::filesystem::temp_directory_path(aec) / "viewer_readas";
+        std::filesystem::remove_all(adir, aec);
+        std::filesystem::create_directories(adir, aec);
+        std::vector<uint16_t> aramp(48 * 40);
+        for (size_t i = 0; i < aramp.size(); i++) aramp[i] = (uint16_t)(i * 7 + 3);
+        const std::vector<int64_t> ashape = { 48, 40, 1 };
+        std::string ap = npyWriteFile((adir / "readas_hw1.npy").u8string(), "<u2",
+                                      ashape, aramp.data(), aramp.size() * 2);
+        size_t badA = 0;
+        remote::Meta am;
+        std::string aerr;
+        if (!s.meta(ap, am, aerr)) {
+            fprintf(stderr, "selftest READAS META: %s\n", aerr.c_str());
+            badA++;
+        } else {
+            // RA1: the declared shape crossed the wire.
+            bool shapeOk = am.shape == ashape;
+            fprintf(stderr, "selftest: read-as RA1 peer META declares %s (wanted %s)"
+                            " : %s\n",
+                    am.shape.empty() ? "no shape" : npyShapeText(am.shape).c_str(),
+                    npyShapeText(ashape).c_str(), shapeOk ? "ok" : "FAIL");
+            badA += shapeOk ? 0 : 1;
+
+            // RA2: the same menu on both sides. The local side's shape comes
+            // from the decoder that actually read the file, not from the
+            // fixture's declaration, so this compares two ANSWERS rather than
+            // one answer against the question.
+            closeAll();
+            std::string alerr = loadNpy(ap);
+            std::vector<int64_t> lshape;
+            if (alerr.empty() && cur()) lshape = cur()->src->npyShape;
+            std::vector<int> popts = npyReadOptions(am.shape), lopts = npyReadOptions(lshape);
+            bool menuOk = !popts.empty() && popts == lopts;
+            std::string pl, ll;
+            for (int o : popts) pl += (pl.empty() ? "" : " | ") + npyReadLabel(am.shape, o);
+            for (int o : lopts) ll += (ll.empty() ? "" : " | ") + npyReadLabel(lshape, o);
+            fprintf(stderr, "selftest: read-as RA2 peer offers [%s]\n"
+                            "selftest: read-as RA2 local offers [%s]  : %s\n",
+                    pl.c_str(), ll.c_str(), menuOk ? "ok" : "FAIL");
+            badA += menuOk ? 0 : 1;
+
+            // RA3: every reading the menu offers, served by the peer and
+            // compared with the local decoder under the same declaration. The
+            // NATIVE entry is in the sweep too - it is the control: if the peer
+            // ignored the declaration entirely, native would still agree and
+            // only the declared entry would fail, which is precisely the shape
+            // of the "silent wrong answer" the version bump is about.
+            for (int r : lopts) {
+                closeAll();
+                std::string rerr = loadNpy(ap, r);
+                const ImageDoc* lref2 = cur();
+                if (!rerr.empty() || !lref2) {
+                    fprintf(stderr, "selftest READAS local %s: %s\n",
+                            npyReadLabel(lshape, r).c_str(),
+                            rerr.empty() ? "nothing opened" : rerr.c_str());
+                    badA++;
+                    continue;
+                }
+                const int lframes2 = (int)app.images.size();
+                remote::Meta rm2;
+                std::string merr;
+                if (!s.meta(ap, rm2, merr, r)) {
+                    fprintf(stderr, "selftest READAS peer META %s: %s\n",
+                            npyReadLabel(lshape, r).c_str(), merr.c_str());
+                    badA++;
+                    continue;
+                }
+                std::vector<float> got2;
+                int gw2 = 0, gh2 = 0, gc2 = 0;
+                std::string gd2;
+                if (!s.tile(ap, 0, 0, 0, rm2.w, rm2.h, 1, got2, gw2, gh2, gc2, gd2, merr, r)) {
+                    fprintf(stderr, "selftest READAS peer TILE %s: %s\n",
+                            npyReadLabel(lshape, r).c_str(), merr.c_str());
+                    badA++;
+                    continue;
+                }
+                bool geom2 = lframes2 == rm2.frames && lref2->w == rm2.w &&
+                             lref2->h == rm2.h && lref2->ch == rm2.ch;
+                size_t mism2 = 0;
+                for (int y = 0; y < gh2; y++)
+                    for (int x = 0; x < gw2; x++)
+                        for (int ci = 0; ci < gc2; ci++)
+                            if (got2[((size_t)y * gw2 + x) * gc2 + ci] != lref2->sample(x, y, ci))
+                                mism2++;
+                bool ok2 = geom2 && mism2 == 0;
+                fprintf(stderr, "selftest: read-as RA3 %-22s local %d frame(s) %dx%d %dch"
+                                " == peer %d frame(s) %dx%d %dch, %zu pixel mismatch(es)"
+                                " : %s\n",
+                        npyReadLabel(lshape, r).c_str(), lframes2, lref2->w, lref2->h,
+                        lref2->ch, rm2.frames, rm2.w, rm2.h, rm2.ch, mism2,
+                        ok2 ? "ok" : "FAIL");
+                badA += ok2 ? 0 : 1;
+            }
+            // ...and the two readings really are two different pictures. An
+            // agreement between two identical answers proves nothing, and this
+            // is the line that says the sweep above was not vacuous.
+            if (lopts.size() > 1) {
+                remote::Meta m0, m1;
+                std::string e0, e1;
+                bool two = s.meta(ap, m0, e0, lopts[0]) && s.meta(ap, m1, e1, lopts[1]) &&
+                           (m0.frames != m1.frames || m0.w != m1.w || m0.h != m1.h ||
+                            m0.ch != m1.ch);
+                fprintf(stderr, "selftest: read-as RA3 the choice CHANGES the answer:"
+                                " %d frame(s) %dx%d %dch vs %d frame(s) %dx%d %dch : %s\n",
+                        m0.frames, m0.w, m0.h, m0.ch, m1.frames, m1.w, m1.h, m1.ch,
+                        two ? "ok" : "FAIL");
+                badA += two ? 0 : 1;
+            }
+        }
+        // ---- RA6: the two ways a DECLARATION can be wrong ------------------
+        // Neither is reachable from the menu - npyReadOptions only offers what
+        // the shape permits - so what reaches them is a SESSION line pointing
+        // at a file that was rewritten under it. Both doors have to answer the
+        // same, and they answer differently from each other:
+        //
+        //   does not FIT the rank   ->  read natively, and say so. Not a
+        //                               refusal: the local decoder opens it,
+        //                               so a peer that refused would make the
+        //                               same session restore succeed here and
+        //                               fail there.
+        //   fits but breaks the ceiling -> refused, in the ceiling's own words
+        //                               ((48,40,1) as (C,H,W) is 48 channels).
+        {
+            // (H,W) has no reading to declare at all, so NR_STACK cannot fit.
+            std::vector<int64_t> f2 = { 8, 8 };
+            std::vector<uint16_t> b2(64);
+            for (size_t i = 0; i < b2.size(); i++) b2[i] = (uint16_t)(i * 5 + 1);
+            std::string p2 = npyWriteFile((adir / "readas_hw.npy").u8string(), "<u2",
+                                          f2, b2.data(), b2.size() * 2);
+            remote::Meta fm;
+            std::string fe;
+            bool pOk = s.meta(p2, fm, fe, NR_STACK);
+            closeAll();
+            std::string le2 = loadNpy(p2, NR_STACK);
+            const ImageDoc* ld2 = cur();
+            const std::string want = "re-read choice does not fit (8, 8); read natively";
+            bool fbOk = pOk && fm.readFellBack && fm.frames == 1 && fm.w == 8 && fm.h == 8 &&
+                        le2.empty() && ld2 && ld2->w == 8 && ld2->h == 8 &&
+                        (int)app.images.size() == 1 && ld2->note.find(want) != std::string::npos;
+            fprintf(stderr, "selftest: read-as RA6 (8,8) declared (F,H,W): peer %d frame(s)"
+                            " %dx%d fellBack=%d, local note \"%s\" : %s\n",
+                    fm.frames, fm.w, fm.h, (int)fm.readFellBack,
+                    ld2 ? ld2->note.c_str() : "<no doc>", fbOk ? "ok" : "FAIL");
+            badA += fbOk ? 0 : 1;
+
+            // ...and the ceiling, which IS a refusal, in the same words on both
+            // sides - the sentence PR #121 put in remote_proto.h, now said
+            // about a declared reading and not only about a file's own shape.
+            remote::Meta cm2;
+            std::string ce2;
+            bool pRef = !s.meta(ap, cm2, ce2, NR_CHW);
+            closeAll();
+            std::string lce = loadNpy(ap, NR_CHW);
+            bool lRef = !lce.empty() && !cur();
+            bool ceilOk = pRef && lRef && ce2 == lce &&
+                          ce2.find("48 channels") != std::string::npos;
+            fprintf(stderr, "selftest: read-as RA6 (48,40,1) declared (C,H,W):\n"
+                            "  peer  \"%s\"\n  local \"%s\"  : %s\n",
+                    ce2.c_str(), lce.c_str(), ceilOk ? "ok" : "FAIL");
+            badA += ceilOk ? 0 : 1;
+            closeAll();
+        }
+        // ---- RA5: the same thing as a DOCUMENT -----------------------------
+        // RA1-RA3 are about the wire and the peer. This is the sentence the
+        // issue actually makes - "a doc opened through a peer has no read as
+        // line and no re-read as" - so it opens one through a peer and asks the
+        // document, not the session: the shape openRemote recorded, the menu
+        // the Inspector would compute from it, and then npyReReadAs, which is
+        // the button. It has to go through openRemote/npyReReadAs rather than
+        // assert on the pieces, because "the peer can serve it" and "the
+        // Inspector can reach it" were two different halves of the gap and
+        // either one alone leaves a menu that cannot act.
+        {
+            const std::string savedExe = app.remoteExe;
+            app.remoteExe = exe;                 // the standalone peer, as everywhere
+            closeAll();
+            const std::string url = "local://" + ap;
+            size_t badD = 0;
+            if (!openRemote(url)) {
+                fprintf(stderr, "selftest READAS openRemote failed\n");
+                badD++;
+            } else {
+                ImageDoc* rd = cur();
+                std::vector<int> dopts = rd ? npyReadOptions(rd->src->npyShape)
+                                            : std::vector<int>();
+                bool haveLine = rd && rd->src->npyShape == ashape &&
+                                rd->src->remoteProto == (int)rp::VERSION &&
+                                dopts.size() == 2;
+                fprintf(stderr, "selftest: read-as RA5 remote doc %dx%d %dch declares %s,"
+                                " peer v%d, %d reading(s) : %s\n",
+                        rd ? rd->w : 0, rd ? rd->h : 0, rd ? rd->ch : 0,
+                        rd && !rd->src->npyShape.empty()
+                            ? npyShapeText(rd->src->npyShape).c_str() : "no shape",
+                        rd ? rd->src->remoteProto : 0, (int)dopts.size(),
+                        haveLine ? "ok" : "FAIL");
+                badD += haveLine ? 0 : 1;
+                // ...and the button WORKS: same file, same url, read the other
+                // way, and the document that comes back is the one the local
+                // decoder produces for that declaration.
+                std::string re = rd ? npyReReadAs(rd, NR_STACK) : "no doc";
+                ImageDoc* rd2 = cur();
+                bool reOk = re.empty() && rd2 && rd2->src->npyRead == NR_STACK &&
+                            rd2->w == 1 && rd2->h == 40 && rd2->ch == 1 &&
+                            rd2->remoteFrames == 48 &&
+                            rd2->src->remoteUrl == url;   // still the peer's, not fetched here
+                fprintf(stderr, "selftest: read-as RA5 re-read as (F,H,W) -> %dx%d %dch,"
+                                " %d frame(s), npyRead=%d%s : %s\n",
+                        rd2 ? rd2->w : 0, rd2 ? rd2->h : 0, rd2 ? rd2->ch : 0,
+                        rd2 ? rd2->remoteFrames : 0, rd2 ? rd2->src->npyRead : -1,
+                        re.empty() ? "" : ("  err=\"" + re + "\"").c_str(),
+                        reOk ? "ok" : "FAIL");
+                badD += reOk ? 0 : 1;
+                // and back, because a declaration must be unmakeable: §3.3's
+                // menu is a way to say it again, not a one-way door.
+                std::string back = rd2 ? npyReReadAs(rd2, NR_HWC) : "no doc";
+                ImageDoc* rd3 = cur();
+                bool backOk = back.empty() && rd3 && rd3->w == 40 && rd3->h == 48 &&
+                              rd3->src->npyRead == NR_HWC;
+                fprintf(stderr, "selftest: read-as RA5 ...and back to (H,W,C) ->"
+                                " %dx%d %dch : %s\n",
+                        rd3 ? rd3->w : 0, rd3 ? rd3->h : 0, rd3 ? rd3->ch : 0,
+                        backOk ? "ok" : "FAIL");
+                badD += backOk ? 0 : 1;
+            }
+            // The (F,H,W) reading made this a 48-frame stack, so it enqueued 47
+            // sibling fetches AND fired the server-side temporal measurement
+            // openRemote fires for any frame axis. Both own a thread; a
+            // joinable std::thread reaching its destructor is std::terminate,
+            // so a test that opens a remote stack has to end the workers it
+            // started, exactly as --rset-selftest ends the sequence loader.
+            stopRemoteFetcher();
+            stopMeasureWorker();
+            closeAll();
+            app.uiSession.stop();
+            app.remoteExe = savedExe;
+            badA += badD;
+        }
+        // ---- RA4: a peer that predates it says so -------------------------
+        // Not a thought experiment about an old peer: an old peer, on this
+        // disk, refusing - and refused BEFORE the request is sent, from the
+        // number it announced, because an old peer would NOT refuse it. It
+        // would answer with its own reading of the array under the name of the
+        // one that was asked for, and there is no error string anywhere in that
+        // exchange for the client to notice afterwards.
+        {
+            selftestSetEnv("VIEWER_SERVE_PROTOCOL", "8");
+            remote::Session old;
+            std::string eo;
+            if (!old.start("", exe, eo)) {
+                fprintf(stderr, "selftest READAS old peer: %s\n", eo.c_str());
+                badA++;
+            } else {
+                remote::Meta om;
+                std::string e8;
+                bool refused = !old.meta(ap, om, e8, NR_STACK);
+                // ...and it is still a usable peer for everything it CAN do:
+                // the file opens, and the "read as" line has nothing to say
+                // because a v8 META carries no shape.
+                std::string e8b;
+                bool stillWorks = old.meta(ap, om, e8b) && om.w == 40 && om.h == 48 &&
+                                  om.shape.empty();
+                bool ok8 = old.peerVersion() == 8 && refused && stillWorks &&
+                           e8.find("too old") != std::string::npos &&
+                           e8.find("protocol 8") != std::string::npos &&
+                           e8.find("needs 9") != std::string::npos;
+                fprintf(stderr, "selftest: read-as RA4 old peer (v%d) refusal:\n  %s\n"
+                                "selftest: read-as RA4 ...and it still opens natively"
+                                " (%dx%d, no shape declared): %s\n",
+                        old.peerVersion(), e8.c_str(), om.w, om.h, ok8 ? "ok" : "FAIL");
+                badA += ok8 ? 0 : 1;
+                old.stop();
+                // ...and as a DOCUMENT the sentence is the same one. A doc
+                // opened through a v8 peer has an empty npyShape, which is also
+                // what a .png has - so the branch order matters, and this is
+                // what pins it: the answer must be "your peer is too old", not
+                // "not a .npy", which would blame the file for the link's
+                // limit. The Inspector reads its line off the same call.
+                const std::string savedExe8 = app.remoteExe;
+                app.remoteExe = exe;
+                closeAll();
+                app.uiSession.stop();
+                selftestSetEnv("VIEWER_SERVE_PROTOCOL", "8");
+                bool opened8 = openRemote("local://" + ap);
+                ImageDoc* d8 = cur();
+                std::string say8 = d8 ? npyReReadAs(d8, NR_STACK) : "no doc";
+                bool doc8 = opened8 && d8 && d8->src->remoteProto == 8 &&
+                            d8->src->npyShape.empty() && d8->w == 40 && d8->h == 48 &&
+                            say8.find("too old") != std::string::npos &&
+                            say8.find("protocol 8") != std::string::npos &&
+                            say8.find("not a .npy") == std::string::npos &&
+                            (int)app.images.size() == 1;   // nothing was closed
+                fprintf(stderr, "selftest: read-as RA4 doc through a v8 peer says:\n"
+                                "  \"%s\"  : %s\n", say8.c_str(), doc8 ? "ok" : "FAIL");
+                badA += doc8 ? 0 : 1;
+                closeAll();
+                app.uiSession.stop();
+                app.remoteExe = savedExe8;
+            }
+            selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+        }
+        closeAll();
+        std::filesystem::remove_all(adir, aec);
+        fprintf(stderr, "selftest: read as / re-read as, through a peer: %s\n",
+                badA ? "FAIL" : "ok");
+        bad += badA ? 1 : 0;
+    }
     fprintf(stderr, "selftest: %llu bytes received from the peer\n",
             (unsigned long long)s.bytesReceived());
     return bad ? 1 : 0;
