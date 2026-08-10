@@ -599,13 +599,41 @@ static void drawInspector() {
         // docs/input-adapters.md §3.3. The successor to --npy-axis: what the
         // viewer decided is on screen, and the ways out are computed from the
         // actual shape, so a reading this array cannot support is never offered.
+        //
+        // A peer older than protocol 9 cannot say what the file declares, so
+        // npyShape is empty and every line below is unreachable - which would
+        // leave exactly the blank #124 was filed about, now with a REASON that
+        // exists and is not being shown. So the reason is shown. "-" and not a
+        // guessed shape: the client genuinely does not know, and inventing one
+        // from w/h/ch would be the interpretation talking, not the file.
+        if (im->src->npyShape.empty() && !im->src->remoteUrl.empty() &&
+            im->src->remoteProto > 0 && im->src->remoteProto < 9) {
+            ImGui::TextDisabled("read as   -   (this peer speaks protocol %d and does "
+                                "not say)", im->src->remoteProto);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", rp::npyReReadTooOldText(im->src->remoteProto).c_str());
+        }
         if (!im->src->npyShape.empty()) {
             const std::vector<int64_t>& shp = im->src->npyShape;
             const int nowRead = im->src->npyRead != NR_NATIVE ? im->src->npyRead
                                                              : npyNativeRead(shp);
             ImGui::TextDisabled("read as   %s", npyReadLabel(shp, nowRead).c_str());
             std::vector<int> opts = npyReadOptions(shp);
-            if (opts.size() > 1) {
+            // A peer that predates protocol 9 can say what the file declares -
+            // that is what puts the line above on screen at all - and cannot
+            // serve a different reading of it (issue #124). The menu is
+            // therefore NOT drawn, and what replaces it is the reason, because
+            // the one thing worse than the blank this issue was filed about is
+            // a control that looks live and does nothing. Said here rather than
+            // discovered on click: an affordance that refuses after the fact
+            // has already cost the user the gesture.
+            const int proto = im->src->remoteProto;
+            const bool peerTooOld = !im->src->remoteUrl.empty() && proto > 0 && proto < 9;
+            if (opts.size() > 1 && peerTooOld) {
+                ImGui::TextDisabled("re-read as...   not from this peer");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", rp::npyReReadTooOldText(proto).c_str());
+            } else if (opts.size() > 1) {
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.75f);
                 if (ImGui::BeginCombo("##reread", "re-read as...",
                                       ImGuiComboFlags_NoArrowButton)) {

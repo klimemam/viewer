@@ -193,7 +193,15 @@ static void logMsg(const std::string& msg, bool err = false) {
 
 static void toast(const std::string& msg, bool err = false) {
     app.toast = msg; app.toastErr = err;
-    app.toastUntil = ImGui::GetTime() + (err ? 6.0 : 2.5);
+    // ImGui::GetTime() dereferences the current context, and there are code
+    // paths with NO context: the windowless selftests (--remote-selftest and
+    // the other NOGL runs) drive real open/close machinery with no ImGui at
+    // all, and every one of them was one toast away from a segfault - which is
+    // what a selftest exercising openRemote found. The MESSAGE still lands in
+    // the log below, so a headless run loses only the fading overlay it has no
+    // window to fade in.
+    app.toastUntil = ImGui::GetCurrentContext() ? ImGui::GetTime() + (err ? 6.0 : 2.5)
+                                                : 0.0;
     // A toast fades after six seconds, which is not long enough to paste it into
     // a bug report. Every message is kept here and shown, selectable, in the
     // Messages panel.

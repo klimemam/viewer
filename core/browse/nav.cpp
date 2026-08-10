@@ -347,7 +347,7 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
         if (!I.pendingOpen.empty()) {   // a url was pasted with the host
             std::string u = I.pendingOpen;
             I.pendingOpen.clear();
-            g_browseHost.openRemote(u, false, 0);
+            g_browseHost.openRemote(u, false, 0, 0);
         }
     }
 }

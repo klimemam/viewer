@@ -23,7 +23,8 @@ static const char* peerTag(const std::string& host) {
 std::string peerLabel(const std::string& host) {
     return host.empty() ? std::string(PEER_HERE) : host;
 }
-static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0);
+static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0,
+                       int npyRead = 0 /*rp::NR_NATIVE*/);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
@@ -83,6 +84,8 @@ static void rfWorker() {
         d.gen = job.gen;
         d.bytes = job.bytes;
         d.mtime = job.mtime; d.fsize = job.fsize;
+        d.npyRead = job.npyRead; d.remoteProto = job.remoteProto;
+        d.npyShape = job.npyShape;
         std::string host, rpath, err;
         int port = 0;
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
@@ -92,8 +95,11 @@ static void rfWorker() {
             if (d.err.empty()) {
                 int w = 0, h = 0, ch = 0;
                 // the server clamps the rect, so "huge" means "the whole frame"
+                // ...under the reading the OPEN was made with: a full-resolution
+                // swap that fetched the native reading of a document declared
+                // (F,H,W) would replace the preview with a different array.
                 if (!ses.tile(rpath, job.frame, 0, 0, 1 << 30, 1 << 30, 1,
-                              d.data, w, h, ch, d.dtype, err)) {
+                              d.data, w, h, ch, d.dtype, err, job.npyRead)) {
                     d.err = err;
                 } else {
                     d.w = w; d.h = h; d.ch = ch;
@@ -147,6 +153,18 @@ static void rfEnqueue(App::RFetchJob job) {
     if (!app.rfThread.joinable()) app.rfThread = std::thread(rfWorker);
 }
 
+// The §3.3 facts a sibling frame inherits from the head of its stack (issue
+// #124): the declared shape, the reading, and the peer's protocol. One helper
+// rather than a copy at each of the three places a stack is built, because a
+// stack whose frames disagreed about the reading would not be one array read N
+// times - it would be two arrays in one Files row.
+static void rfInheritRead(App::RFetchJob& j, const ImageDoc* head) {
+    if (!head || !head->src) return;
+    j.npyRead = head->src->npyRead;
+    j.remoteProto = head->src->remoteProto;
+    j.npyShape = head->src->npyShape;
+}
+
 static void requestFullRemote(const ImageDoc* d, bool low = false) {
     if (d->src->remoteUrl.empty() || d->src->remoteStep <= 1) return;
     {
@@ -172,6 +190,9 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     App::RFetchJob j;
     j.url = d->src->remoteUrl; j.frame = d->src->remoteFrame; j.uid = d->uid;
     j.low = low;
+    j.npyRead = d->src->npyRead;          // the declaration the preview was made
+    j.remoteProto = d->src->remoteProto;  // under: the full frame is the SAME array
+    j.npyShape = d->src->npyShape;
     // the full frame REPLACES the decimated one, so only the growth is new
     {
         size_t have = d->px().size() * sizeof(float);
@@ -262,6 +283,15 @@ static void pumpRemoteFetch() {
             S.path = d.url;
             S.remoteUrl = d.url;
             S.remoteFrame = d.frame;
+            // §3.3's three facts, the same on every frame of the stack: the
+            // array's declared shape, the reading it is being read under, and
+            // whether the peer can serve another one. The Inspector's "read as"
+            // line is a property of the FILE, so it must not appear and vanish
+            // as the user steps frames - the same rule `note` follows two lines
+            // above, for the same reason.
+            S.npyShape = d.npyShape;
+            S.npyRead = d.npyRead;
+            S.remoteProto = d.remoteProto;
             S.dtype = d.dtype;
             S.w = d.w; S.h = d.h; S.ch = d.ch;
             S.data = std::move(d.data);

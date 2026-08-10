@@ -23,7 +23,11 @@ struct BrowseHost {
     // the browse side had. Behind the seam the browse TUs touch no window API.
     void (*wakeUi)();
     // ---- registered opens (the viewer's open dispatch) ----------------------
-    bool (*openRemote)(const std::string& url, bool asPreview, int frame);
+    // npyRead is rp::NpyRead and is 0 from every browse call site: Browse opens
+    // a file, and "read it another way" is a thing said to a document that is
+    // already open (docs/input-adapters.md §3.3, Inspector). The parameter is
+    // here only because the pointer has to have the function's type.
+    bool (*openRemote)(const std::string& url, bool asPreview, int frame, int npyRead);
     void (*openRemoteStack)(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);
     void (*openStackForAverage)(const std::string& host, const std::vector<std::string>& files,

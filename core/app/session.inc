@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: session/prefs
-static bool openRemote(const std::string& url, bool asPreview, int frame);   // fwd (defaults: first decl)
+static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
 // the two halves of restoring a REMOTE folder stack: ask the peer which files
@@ -2259,9 +2259,15 @@ static std::string loadSession(const std::string& path) {
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
                 bool isRemote = p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
                 if (isRemote) {
-                    // a remote image has no local file to decode: reconnect instead
+                    // a remote image has no local file to decode: reconnect
+                    // instead - carrying the §3.3 reading the line recorded,
+                    // which since #124 is a thing a remote document can have.
+                    // A restore that dropped it would silently hand back the
+                    // peer's own reading of an array the user had said was
+                    // being read wrong, which is the one outcome §3.3 exists to
+                    // prevent ("以後その doc はその読み方で扱われる").
                     size_t before = app.images.size();
-                    openRemote(p);
+                    openRemote(p, false, 0, pendingRead);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
                     // §4.12: a file that was read by an adapter is read by that

@@ -122,6 +122,13 @@ struct FrameSource {
     std::string remoteUrl;
     int remoteFrame = 0;
     int remoteStep = 1;
+    // The protocol the peer announced when these pixels were opened; 0 = these
+    // are not a peer's pixels. Recorded rather than asked again at draw time
+    // because the Inspector has to know, for THIS document, whether §3.3's
+    // re-reading can be served - and the answer must not change because the
+    // session was later pointed at a different host. Below rp::VERSION it is
+    // what the "read as" line says INSTEAD of a menu (issue #124).
+    int remoteProto = 0;
     std::string remoteErr;            // background fetch failed; preview is all we have
     // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
     int rawDtype = -1, rawInterp = 0, rawOffset = 0;
@@ -1346,6 +1353,16 @@ struct App {
         int64_t mtime = 0;            // local:// only: the disk baseline statted at
         uint64_t fsize = 0;           // ENQUEUE (identity before bytes) - the minted
                                       // sibling binds to the OPEN's stat epoch
+        // The §3.3 reading this stack is being read under, and the shape it was
+        // read from (issue #124). Both travel with the JOB, exactly as `note`
+        // does and for the same reason: the frames of one stack must be the
+        // same reading as its head, and a sibling that fetched itself natively
+        // while the head was declared would be a stack of two different arrays.
+        // The peer's protocol rides along so a minted sibling carries the same
+        // answer to "can this be re-read" as the head does.
+        int npyRead = 0;              // rp::NpyRead
+        int remoteProto = 0;
+        std::vector<int64_t> npyShape;
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -1360,6 +1377,9 @@ struct App {
         size_t bytes = 0;             // what was committed for it, to give back
         int64_t mtime = 0;            // the job's enqueue-time disk baseline
         uint64_t fsize = 0;           // (local:// only) - see RFetchJob
+        int npyRead = 0;              // the reading it was fetched under, back
+        int remoteProto = 0;          // from the job: a minted sibling records
+        std::vector<int64_t> npyShape;// the same three facts its head does
     };
     std::atomic<uint32_t> rfGen{ 0 };
     std::thread rfThread;

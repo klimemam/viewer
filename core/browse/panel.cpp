@@ -976,7 +976,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
         std::string u = makeRemoteUrl(B.host, target, B.port);
         bool live = true;
         if (pv && pv->src->remoteUrl == u) g_browseHost.selectImage(app.current);
-        else live = g_browseHost.openRemote(u, true, 0);
+        else live = g_browseHost.openRemote(u, true, 0, 0);
         // only when there IS a preview: a scrub bar over nothing re-runs the
         // failing open on every press of its buttons and of , / .
         if (!live) return;
@@ -1049,7 +1049,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 }
         }
         g_browseHost.dropPreview();          // a stale preview is not this row's
-        g_browseHost.openRemote(u, false, 0);
+        g_browseHost.openRemote(u, false, 0, 0);
     };
     // ---- row 2: the toolbar. Narrow the listing down, and say so when the
     // listing's shape is not the default. Everything else is in the "..." menu
@@ -1473,7 +1473,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                         rbGoTo(I, full);
                     } else if (rbRowOpenable(B.host, h.rel)) {
                         g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
-                                                false, 0);
+                                                false, 0, 0);
                     } else {
                         // not openable from here: say why, and at least go where
                         // it lives. The navigation alone was the whole answer
@@ -1593,7 +1593,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                                         stackNameFor(*r.dir, r.e->name), B.port, 0);
                     } else {
                         g_browseHost.openRemote(makeRemoteUrl(B.host, r.full(), B.port),
-                                                false, 0);
+                                                false, 0, 0);
                     }
                 }
                 // "not .npy" was the reason until #111 and is no longer the
@@ -2251,7 +2251,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 } else if (rbRowOpenable(B.host, rname)) {
                     if (ImGui::MenuItem("Open"))
                         g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
-                                                false, 0);
+                                                false, 0, 0);
                     // The stack verbs below are the PEER's, on a local listing
                     // too (#111): a frame axis, a server-side mean and MEASURE
                     // are all .npy shapes carried over the protocol. So a .png

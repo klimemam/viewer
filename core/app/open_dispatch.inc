@@ -884,7 +884,7 @@ int UiThreadStall::depth = 0;
 // so a failed open left a scrub bar with 2+ entries and previewUid == 0 - a
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
-static bool openRemote(const std::string& url, bool asPreview, int frame) {
+static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
     UiThreadStall stallCredit;      // see above: a blocked frame is not the user's
     std::string host, rpath;
     int port = 0;
@@ -938,8 +938,24 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     // into one ssh stdin desynchronise the stream permanently, and the worker's
     // stop() would free the pipe under this thread's blocking read.
     if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return false; }
+    // The DECLARED reading (§3.3), and it goes to META as well as to TILE: a
+    // reading changes the geometry, so asking META natively and re-deriving
+    // w/h/ch/frames here would put the layout rule on both sides of the link
+    // with nothing checking they agree - which is what #71 cost a release.
+    // Session::meta refuses a declaration a v8 peer cannot serve BEFORE sending.
     remote::Meta m;
-    if (!app.uiSession.meta(rpath, m, err)) { toast("remote: " + err, true); return false; }
+    if (!app.uiSession.meta(rpath, m, err, npyRead)) { toast("remote: " + err, true); return false; }
+    // The peer fell back to native because the declaration does not fit this
+    // shape - a session line against a file whose rank changed under it. The
+    // local decoder's answer is a note and nothing else: the DECLARATION is
+    // still remembered on the source (a rank that changed once may change back,
+    // and forgetting it would silently discard what the user said), and
+    // srcIdentityKey normalises it through npyKeyRead so it does not key a
+    // tuple it did not produce. Same sentence, same two decisions, here.
+    std::string readNote;
+    if (m.readFellBack)
+        readNote = "re-read choice does not fit " + rp::npyShapeText(m.shape) +
+                   "; read natively";
     frame = std::clamp(frame, 0, std::max(0, (int)m.frames - 1));
 
     // First view: the whole frame decimated to something a screen can show. A
@@ -948,7 +964,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     std::vector<float> px;
     int tw = 0, th = 0, tch = 0;
     std::string dt;
-    if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err)) {
+    if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err,
+                            npyRead)) {
         toast("remote: " + err, true);
         return false;
     }
@@ -966,6 +983,16 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     S.dtype = dt;
     S.w = tw; S.h = th; S.ch = tch;
     S.data = std::move(px);
+    // §3.3 over the link (issue #124). npyShape is what the PEER's META said the
+    // file declares - empty from a peer older than protocol 9, which is the
+    // honest value and the one the Inspector distinguishes from "not a .npy".
+    // npyRead is the declaration this open was made under; it is also part of
+    // the identity tuple (srcIdentityKey -> npyKeyRead), so two readings of one
+    // remote url are two residents and never silently share pixels, exactly as
+    // two readings of one local file are.
+    S.npyShape = m.shape;
+    S.npyRead = npyRead;
+    S.remoteProto = app.uiSession.peerVersion();
     // The Inspector prints a non-empty note as a LINE OF ITS OWN, directly above
     // the Interpret combo. A note the head frame carries and its siblings do not
     // makes that line appear and vanish as the user steps the stack, and every
@@ -981,6 +1008,10 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
     doc->note = "remote";
     if (!host.empty()) doc->note += " " + host;
     if (m.frames > 1) doc->note += "  -  " + std::to_string(m.frames) + " frames";
+    // ...and it is stack-constant like the rest of this line, which is why the
+    // fallback notice goes HERE rather than into a toast: it describes the
+    // FILE, and it travels to every sibling frame through RFetchJob::note.
+    if (!readNote.empty()) doc->note += "  -  " + readNote;
     doc->uid = app.nextUid++;
     S.remoteUrl = url;
     S.remoteFrame = frame;
@@ -1094,6 +1125,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             j.bytes = perFrame;       // committed against the budget until it lands
             j.mtime = urlStat.mtime;  // the open's stat epoch rides to every frame
             j.fsize = urlStat.fsize;
+            rfInheritRead(j, first);  // ...and so does the reading it is read under
             rfEnqueue(std::move(j));
         }
         if (fit < m.frames - 1) {
@@ -1104,9 +1136,13 @@ static bool openRemote(const std::string& url, bool asPreview, int frame) {
             app.seqNote = msg;
         }
     }
-    // a file on this disk was not fetched "from" anywhere
-    toast(host.empty() ? "opened " + baseName(rpath)
-                       : "opened " + baseName(rpath) + " from " + host);
+    // a file on this disk was not fetched "from" anywhere.
+    // g_quietLoad: a §3.3 re-read drives this open and says "read as ..." itself
+    // when it finishes (pumpReRead), so an "opened X" beside it would be two
+    // toasts for one gesture, the second one describing the wrong thing.
+    if (!g_quietLoad)
+        toast(host.empty() ? "opened " + baseName(rpath)
+                           : "opened " + baseName(rpath) + " from " + host);
     return true;
 }
 
@@ -1184,6 +1220,7 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
             statLocalUrl(fs);
             j.mtime = fs.mtime; j.fsize = fs.fsize;
         }
+        rfInheritRead(j, first);
         rfEnqueue(std::move(j));
         queued++;
     }
@@ -1370,6 +1407,7 @@ static void promotePreview(ImageDoc* d) {
             j.bytes = perFrame;
             j.mtime = d->src->mtime;  // the promoted open's stat epoch (see above)
             j.fsize = d->src->fsize;
+            rfInheritRead(j, d);
             rfEnqueue(std::move(j));
             q++;
         }
