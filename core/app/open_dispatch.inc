@@ -553,13 +553,18 @@ static bool invalidateStackDerived(int sid) {
 // Shape-change policy: reload means "same frame, new values". If the file now
 // holds different w/h/ch/dtype the reload PROCEEDS - what is on disk is a fact,
 // not an error - the mirrors resync and *noteOut says what changed, so the
-// caller's notice can. What DOES refuse: no local file behind the pixels
-// (remote-backed / montage / plugin output), an unreadable or undecodable file,
-// a vanished named part (an .npz member, an .exr layer), and a picture index
-// past the file's new picture count - an .npy frame, a TIFF page or a y4m
-// frame that no longer exists, and there is no "same frame" to give new values
-// to. On any failure the source is untouched: old pixels stay, never a
-// half-swap.
+// caller's notice can. What DOES refuse: no origin behind the pixels at all
+// (a montage, a plugin output), an unreadable or undecodable file, a peer that
+// does not answer, a vanished named part (an .npz member, an .exr layer), and a
+// picture index past the file's new picture count - an .npy frame, a TIFF page,
+// a y4m frame or a peer's frame that no longer exists, and there is no "same
+// frame" to give new values to. On any failure the source is untouched: old
+// pixels stay, never a half-swap.
+//
+// A PEER's pixels are NOT on that list (watch-design §16): the walk has the
+// peer's own "stat it and read it again" - META then TILE, on the connection
+// the open used - so a remote-backed source reloads, and fails only when the
+// link does.
 //
 // WHICH DECODER re-reads the file is decided by what the PIXELS are, in that
 // order, and never by the file name alone: a reader/container member first (it
