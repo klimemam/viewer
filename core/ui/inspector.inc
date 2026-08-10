@@ -324,7 +324,15 @@ static void textNum(const char* fmt, double v) {
 // setting is that a COLUMN is uniform, so the format is decided in one place
 // rather than at each of the twenty call sites.
 static void textStat(double v) {
-    char fmt[8];
+    // 16, not 8. What goes in here is "%.", an int, and "f" - and an int is up
+    // to eleven characters ("-2147483648"), which is fourteen plus the NUL. The
+    // buffer only fitted because projDecimals is clamped to 0..6, and that clamp
+    // is written in two OTHER files (the session reader and the panel's combo),
+    // so this line was correct at a distance: nothing here says the value is
+    // small, and the compiler cannot see the promise. Sizing it for the whole
+    // range of the type moves the guarantee to where the write is, and no value
+    // an int can hold truncates the format now. -Wformat-truncation= found it.
+    char fmt[16];
     if (app.projDecimals < 0) snprintf(fmt, sizeof fmt, "%%.6g");
     else                      snprintf(fmt, sizeof fmt, "%%.%df", app.projDecimals);
     textNum(fmt, v);
