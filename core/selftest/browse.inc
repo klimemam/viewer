@@ -1414,19 +1414,37 @@
                 // ANTI-VACUITY: with the worker free the very same call DOES
                 // issue one, and exactly one - "it never polls at all" passes
                 // B3 on its own.
+                bool quietBefore;
+                {
+                    std::lock_guard<std::mutex> lk(I.mtx);
+                    quietBefore = I.done.empty();
+                }
                 I.polledAt = clk - 99.0;
                 const bool free1 = rbPollRound(I, clk, FR);
                 const bool free2 = rbPollRound(I, clk, FR);   // same instant: not due
-                int kinds = 0, mine = 0;
-                std::string aimedAt;
-                {
-                    std::lock_guard<std::mutex> lk(I.mtx);
-                    kinds = (int)I.queue.size();
-                    for (const auto& j : I.queue)
-                        if (j.kind == App::RbPoll) { mine++; aimedAt = j.dir; }
+                // WHAT went out is read off the ANSWER, not off the queue. The
+                // enqueue wakes the worker, so by the time this thread looks the
+                // job may already be gone from the queue and not yet in `done` -
+                // which is exactly what happened on the Windows runner the first
+                // time this was written (B3b FAIL with everything else green).
+                // The reply carries the job's own kind and dir, so waiting for
+                // it asks the same question with no race in it. `pollPending` is
+                // still set, because only the pump clears it and this loop does
+                // not pump: one poll issued, one outstanding.
+                App::RbResult got;
+                bool answered = false;
+                double tb = nowSec();
+                while (nowSec() - tb < 60.0) {
+                    {
+                        std::lock_guard<std::mutex> lk(I.mtx);
+                        if (!I.done.empty()) { got = I.done.front(); answered = true; }
+                    }
+                    if (answered) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                check(free1 && !free2 && I.pollsIssued == was + 1 && kinds == 1 &&
-                      mine == 1 && aimedAt == I.b.dir,
+                check(free1 && !free2 && I.pollsIssued == was + 1 && I.pollPending &&
+                      quietBefore && answered && got.kind == App::RbPoll &&
+                      got.dir == I.b.dir,
                       "B3b ...and a free worker issues ONE round, of THIS dir, per "
                       "interval");
                 settle();
