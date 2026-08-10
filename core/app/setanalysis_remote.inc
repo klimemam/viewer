@@ -260,6 +260,13 @@ static std::string setPeerSeparation(remote::Session& s, const std::string& setN
         SepLevel Lv;
         Lv.member = Fl.member;
         Lv.headPath = Fl.headPath;
+        // ONE STACK, TWO ROLES (確定 2026-08-10, #57). No seqId crossed the
+        // wire and none had to: what the peer was asked to fold is a list of
+        // FILES, so "the same stack" is the same files in the same order -
+        // which is exactly the identity the fold itself has. Same fact as the
+        // local runner's seqId test, asked in the only vocabulary this side
+        // has.
+        Lv.isDark = levels[i].role.paths == dark.paths;
         Lv.value = levels[i].value;
         Lv.n = Fl.frames; Lv.N = Fl.expected;
         Lv.nonFinite = Fl.nonFinite; Lv.dropped = Fl.dropped;

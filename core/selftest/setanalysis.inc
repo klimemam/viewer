@@ -1316,7 +1316,7 @@
                       "F10 ...on both named rows, so a quoted number carries it");
                 check(F.dualNote.find("ONE STACK, TWO ROLES") != std::string::npos &&
                       F.dualNote.find("\"dark\"") != std::string::npos &&
-                      F.dualNote.find("its mu is exactly 0") != std::string::npos &&
+                      F.dualNote.find("mu is exactly 0") != std::string::npos &&
                       F.dualNote.find("counted twice") != std::string::npos,
                       "F10 ...and the result explains the double duty in full");
                 closeAll();

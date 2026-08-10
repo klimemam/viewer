@@ -733,6 +733,13 @@ static SetResult runSetAnalyzer(const App::ASet& S, int kind) {
 //     because a dark that is not the sweep's size is a mis-binding and the
 //     number it produces is indistinguishable from a good one. sepShapeRefusal
 //     below is the whole of it, and it names both shapes.
+//   - a level that IS the dark is allowed (確定 2026-08-10, #57: 「dark が
+//     sweep のメンバを兼ねるは、そう Analysis Set を作ったら許容」). It is the
+//     intercept's own anchor: mu = 0 exactly, y = the dark's corrected
+//     sigma_fpn^2, which is the quantity the intercept estimates. Nothing
+//     INFERS it - level-0-is-dark stays closed to linearity's back-compat - so
+//     it happens only when the set was built that way, and when it does the
+//     result says so (sepDualNote, and the tag's own clause).
 //   - M >= 3. Two points fit a line exactly, so M = 2 always looks perfect and
 //     the residuals cannot check anything.
 //   - STACK members only. A frame member has no s_t, so the -C correction
@@ -1150,6 +1157,12 @@ static SepFit runSeparationFit(const App::ASet& S) {
         Lv.seqId = m.seqId;
         Lv.member = Fl.name;
         Lv.headPath = Fl.headPath;
+        // ONE STACK, TWO ROLES (確定 2026-08-10, #57). Locally the question is
+        // a seqId, because a set binds stacks and this member is one of them.
+        // Nothing INFERS the overlap the other way round - a level is never
+        // promoted to the dark - so this only ever reads true for a set that
+        // was built to say it.
+        Lv.isDark = m.seqId == darkSeq;
         Lv.value = m.value;
         Lv.n = Fl.frames; Lv.N = Fl.expected;
         Lv.nonFinite = Fl.nonFinite; Lv.dropped = Fl.dropped;
