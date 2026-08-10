@@ -227,12 +227,20 @@ struct Instance {
     // one it was aimed at - see rbNavGesture in drawPanelRemote.
     int navChain = 0;
     std::string curSig;           // host|dir|rev the cursor was built for
+    // The NAME under the cursor, so the cursor can be found again after a
+    // re-listing replaces every entry. A path, not an index: indices move when
+    // a file appears or goes away, which is exactly when a refresh happens.
+    std::string cursorKey;
     bool curFlat = false, curTree = false;
     // sort spec, stashed from the table one frame late (see RB_COL_NAME)
     int sortCol = 0;              // RB_COL_NAME
     bool sortDesc = false;
     // multi-select, by row index; sig says which listing it was built for
     std::vector<char> sel;
+    // the NAMES of the ticked rows, for the same reason cursorKey exists: a
+    // re-listing replaces every entry, so nothing that is a pointer or an
+    // index survives it
+    std::vector<std::string> selKeys;
     int selAnchor = -1;
     bool selFlat = false, selTree = false;
     std::string selSig;
