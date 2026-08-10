@@ -2282,6 +2282,7 @@
             std::vector<App::ReaderMemo> memoSnapshot = app.readerMemo;
             std::vector<std::string> bmSnapshot = app.rbBookmarks;
             std::vector<std::string> rcSnapshot = app.rbRecents;
+            std::vector<std::string> placeSnapshot = app.readerPlaces;   // §4.13.2
             {
                 std::string pyWhy;
                 std::string py = adapter::findPython(app.pythonExe, pyWhy);
@@ -2434,6 +2435,33 @@
                               "V25m the session records the source file, not the cache");
                         check(back, "V25m reopening the session reads it through the reader");
                     }
+
+                    // ---- V25n: a reader found through a REGISTERED place -----
+                    // §4.13.2 / issue #51, end to end and with Python actually
+                    // starting: the spec names no path at all, so the only way
+                    // this file can be located is the registered place. Before
+                    // registration existed, a bare name reached run_adapter.py
+                    // and died there as an import error about a module nobody
+                    // could point at.
+                    {
+                        std::vector<std::string> ps = app.readerPlaces;
+                        app.readerPlaces.clear();
+                        std::string bare = "vfy_reader.py:load";
+                        closeAll();
+                        std::string unreg = openWithReader(srcPath, bare);
+                        app.readerPlaces.push_back(dispPath(adir.u8string()));
+                        closeAll();
+                        std::string reg = openWithReader(srcPath, bare);
+                        fprintf(stderr, "verifyselftest: V25n bare spec: unregistered=\"%s\" "
+                                        "registered err=\"%s\" %zu doc(s)\n",
+                                unreg.substr(0, 120).c_str(), reg.c_str(), app.images.size());
+                        check(!unreg.empty() &&
+                                  unreg.find("no registered place") != std::string::npos,
+                              "V25n an unregistered reader is refused, by name");
+                        check(reg.empty() && app.images.size() == 6,
+                              "V25n the same reader, registered, is found and read");
+                        app.readerPlaces = ps;
+                    }
                 }
             }
 
@@ -2466,9 +2494,172 @@
                 check(capped && cappedOnRead, "V25k the memory is bounded at 64 (LRU)");
                 check(lru, "V25k the least recently chosen entry is the one dropped");
             }
+            // ---- V25o: the search path itself (§4.13.2, issue #51) -----------
+            // Everything here is filesystem and string work, so it runs on every
+            // machine whether or not V25h found a Python. Four questions, and
+            // the first three are the ones the issue asked: is a reader in a
+            // SECOND registered place found, does an unregistered one fail
+            // LEGIBLY (naming every place looked in), and is a place that has
+            // gone away reported rather than dropped.
+            {
+                std::vector<std::string> psave = app.readerPlaces;
+                std::error_code pec;
+                std::filesystem::path pA = adir / "placeA", pB = adir / "placeB",
+                                      pL = adir / "lone",   pG = adir / "ghost";
+                for (const auto& d : { pA, pB, pL, pG })
+                    std::filesystem::create_directories(d, pec);
+                auto put = [&](const std::filesystem::path& p) {
+                    std::ofstream f(pathFromUtf8(p.u8string()), std::ios::binary);
+                    f << "def load(path):\n    return None\n";
+                };
+                put(pA / "alpha.py");
+                put(pB / "alpha.py");            // the same NAME in two places
+                put(pB / "beta.py");
+                put(pL / "solo.py");
+                std::string dA = dispPath(pA.u8string()), dB = dispPath(pB.u8string()),
+                            dG = dispPath(pG.u8string()),
+                            dSolo = dispPath((pL / "solo.py").u8string());
+
+                app.readerPlaces.clear();
+                std::string rwhy;
+                bool addedA = registerReaderPlace(pA.u8string(), &rwhy);
+                bool addedB = registerReaderPlace(pB.u8string(), &rwhy);
+                bool addedF = registerReaderPlace((pL / "solo.py").u8string(), &rwhy);
+                bool dupRefused = !registerReaderPlace(pA.u8string(), &rwhy);
+                bool ghostRefused = !registerReaderPlace((adir / "never").u8string(), &rwhy);
+
+                // 1. the SECOND place is searched at all - the whole defect
+                ReaderLookup beta = resolveReaderFile("beta.py:load");
+                check(addedA && addedB && addedF && dupRefused && ghostRefused,
+                      "V25o a folder and a file register once each; a path that is not "
+                      "there is refused");
+                fprintf(stderr, "verifyselftest: V25o beta -> \"%s\"\n",
+                        dispPath(beta.file).c_str());
+                check(dispPath(beta.file) == dispPath((pB / "beta.py").u8string()),
+                      "V25o a reader in the SECOND registered place is found");
+                // a FILE is a place too (the ruling said file OR folder)
+                ReaderLookup solo = resolveReaderFile("solo.py:load");
+                check(dispPath(solo.file) == dSolo,
+                      "V25o a registered FILE offers its one reader");
+
+                // 2. the refusal names every place it looked in - a list, not a
+                //    single guess. The shipped folder is on that list too.
+                ReaderLookup none = resolveReaderFile("nowhere.py:load");
+                std::string rep = none.why;
+                bool listsAll = rep.find(dA) != std::string::npos &&
+                                rep.find(dB) != std::string::npos &&
+                                rep.find(dSolo) != std::string::npos;
+                std::string script = runAdapterScript();
+                if (!script.empty())
+                    listsAll = listsAll &&
+                               rep.find(dispPath((pathFromUtf8(script).parent_path() /
+                                                  "adapters").u8string())) != std::string::npos;
+                fprintf(stderr, "verifyselftest: V25o refusal:\n%s\n", rep.c_str());
+                check(none.file.empty() && listsAll &&
+                          rep.find("no registered place") != std::string::npos,
+                      "V25o an unregistered reader is refused and every place looked in "
+                      "is named");
+
+                // 3. a registered place that has gone away is REPORTED
+                registerReaderPlace(pG.u8string(), &rwhy);
+                std::filesystem::remove_all(pG, pec);
+                std::string ghostRep = readerPlacesReport(readerSearchPath());
+                bool ghostSaid = ghostRep.find(dG) != std::string::npos &&
+                                 ghostRep.find("MISSING") != std::string::npos;
+                fprintf(stderr, "verifyselftest: V25o after the folder went away:\n%s\n",
+                        ghostRep.c_str());
+                check(ghostSaid,
+                      "V25o a registered place that no longer exists is reported, not dropped");
+                bool stillListed = app.readerPlaces.size() == 4;
+
+                // 4. the ORDER is the setting: first match wins, the loser is
+                //    named, and moving the place moves the answer.
+                ReaderLookup a1 = resolveReaderFile("alpha.py:load");
+                bool wonA = dispPath(a1.file) == dispPath((pA / "alpha.py").u8string()) &&
+                            a1.shadowed.size() == 1 &&
+                            dispPath(a1.shadowed[0]) == dispPath((pB / "alpha.py").u8string());
+                moveReaderPlace(1, -1);                       // B above A
+                ReaderLookup a2 = resolveReaderFile("alpha.py:load");
+                bool wonB = dispPath(a2.file) == dispPath((pB / "alpha.py").u8string());
+                fprintf(stderr, "verifyselftest: V25o alpha: first=\"%s\" shadowed=%zu "
+                                "after reorder=\"%s\"\n",
+                        dispPath(a1.file).c_str(), a1.shadowed.size(),
+                        dispPath(a2.file).c_str());
+                check(wonA, "V25o the first place holding a name wins, and the loser is named");
+                check(wonB, "V25o reordering the places changes which one wins");
+
+                // 5. the places survive a prefs round trip, in order - and the
+                //    single folder they replaced is read as the first place, so
+                //    an existing prefs.txt keeps finding what it found.
+                savePrefs();
+                std::vector<std::string> wrote = app.readerPlaces;
+                app.readerPlaces.clear();
+                loadPrefs();
+                bool roundTrip = app.readerPlaces == wrote;
+                {
+                    std::string pp = prefsPath();
+                    std::string body;
+                    { std::ifstream pf(pathFromUtf8(pp)); std::stringstream s2;
+                      s2 << pf.rdbuf(); body = s2.str(); }
+                    bool writesPlaces = body.find("readerplace " + dB) != std::string::npos;
+                    bool writesOldKey = body.find("readerdir ") != std::string::npos;
+                    // the migration, exercised: an old key, read once, becomes a place
+                    std::ofstream of(pathFromUtf8(pp), std::ios::binary | std::ios::app);
+                    of << "readerdir " << dispPath((adir / "legacy").u8string()) << "\n";
+                    of.close();
+                    app.readerPlaces.clear();
+                    loadPrefs();
+                    bool migrated = !app.readerPlaces.empty() &&
+                                    app.readerPlaces.back() ==
+                                        dispPath((adir / "legacy").u8string());
+                    fprintf(stderr, "verifyselftest: V25o prefs: roundtrip=%d places=%d "
+                                    "oldkey=%d migrated=%d listed=%d\n",
+                            (int)roundTrip, (int)writesPlaces, (int)writesOldKey,
+                            (int)migrated, (int)stillListed);
+                    check(roundTrip && writesPlaces && !writesOldKey && stillListed,
+                          "V25o the places survive a prefs round trip, in order, under "
+                          "the new key");
+                    check(migrated, "V25o the single folder they replaced is read as a place");
+                }
+
+                // 6. registration cannot change how a remembered file opens.
+                //    The memory holds a PATH, and a path never goes through the
+                //    search - so adding a place is additive by construction.
+                {
+                    std::string data = (adir / "kept.dat").u8string();
+                    std::string mine = (adir / "mine_alpha.py").u8string();
+                    put(pathFromUtf8(mine));
+                    rememberReader(data, mine + ":load");
+                    app.readerPlaces.clear();
+                    registerReaderPlace(pA.u8string(), &rwhy);
+                    ReaderLookup kept = resolveReaderFile(readerFor(data));
+                    bool unchanged = dispPath(kept.file) == dispPath(mine);
+                    // ...and when the remembered reader is GONE, it is reported,
+                    // never swapped for a same-named file that happens to be
+                    // registered. §4.13: only an explicitly chosen reader runs.
+                    put(pA / "mine_alpha.py");
+                    std::filesystem::remove(pathFromUtf8(mine), pec);
+                    ReaderLookup gone = resolveReaderFile(readerFor(data));
+                    bool reported = gone.file.empty() &&
+                                    gone.why.find("not there any more") != std::string::npos &&
+                                    gone.why.find(dispPath(
+                                        (pA / "mine_alpha.py").u8string())) != std::string::npos;
+                    fprintf(stderr, "verifyselftest: V25o memory: unchanged=%d gone:\n%s\n",
+                            (int)unchanged, gone.why.c_str());
+                    check(unchanged,
+                          "V25o registering a place does not change a remembered reader");
+                    check(reported,
+                          "V25o a remembered reader that is gone is reported, and a "
+                          "same-named registered one is offered, not substituted");
+                    forgetReader(data);
+                }
+                app.readerPlaces = psave;
+            }
+
             app.readerMemo = memoSnapshot;      // the user's prefs, as we found them
             app.rbBookmarks = bmSnapshot;
             app.rbRecents = rcSnapshot;
+            app.readerPlaces = placeSnapshot;
             savePrefs();
 
             std::filesystem::remove_all(adir, aec);

@@ -2310,23 +2310,9 @@ static void openReaderPicker(const std::string& path, const std::string& why) {
     }
 }
 
-// The adapters that ship with the viewer, beside the harness that runs them.
-static std::vector<std::string> shippedReaders() {
-    std::vector<std::string> out;
-    std::string script = runAdapterScript();
-    if (script.empty()) return out;
-    std::error_code ec;
-    std::filesystem::path d = pathFromUtf8(script).parent_path() / "adapters";
-    if (!std::filesystem::is_directory(d, ec)) return out;
-    for (const auto& e : std::filesystem::directory_iterator(d, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        std::filesystem::path p = e.path();
-        if (p.extension() != ".py") continue;
-        out.push_back(p.u8string());
-    }
-    std::sort(out.begin(), out.end());
-    return out;
-}
+// (The adapters that ship with the viewer are no longer a list of their own:
+//  they are the last place on the search path, and readerSearchPath() in
+//  session.inc is the one thing that knows where they are - §4.13.2.)
 
 // Write the starting template to `dest` and open it. Every failure here used to
 // come out as "could not write the template to <dest>", which names the
@@ -2389,40 +2375,85 @@ static void drawReaderPanel() {
     ImGui::TextDisabled("A reader is a Python function you write. It is handed this "
                         "path and returns pixels, or Frame / Stack / Series / Batch.");
 
-    std::vector<std::string> shipped = shippedReaders();
-    if (!shipped.empty() && ImGui::TreeNodeEx("##shipped", ImGuiTreeNodeFlags_SpanAvailWidth,
-                                              "shipped with the viewer (%d)",
-                                              (int)shipped.size())) {
-        for (const auto& s : shipped) {
-            if (ImGui::Selectable(baseName(s).c_str()))
-                snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", s.c_str());
-        }
-        ImGui::TreePop();
-    }
-    // A folder of the user's own readers (§4.13.0 "ローカル"). Remembered in
-    // prefs, because the second reader someone writes lives beside the first.
-    if (ImGui::TreeNodeEx("##local", ImGuiTreeNodeFlags_SpanAvailWidth, "your readers%s",
-                          app.readerLocalDir[0] ? "" : " (no folder chosen)")) {
-        if (ImGui::SmallButton("Choose folder...") && !app.rdFolderDlg) {
+    // §4.13.2: the places, in search order, and what is in each. ONE list,
+    // because "where does the viewer look?" and "what can I pick?" are the same
+    // question - they used to be two half-answers (a shipped tree and one local
+    // folder), which is how a person with readers in two places ended up with
+    // nowhere to say so.
+    const std::vector<ReaderPlaceView>& places = readerPlacesForUi();
+    // First-match-wins, made visible: the winner of a name is the first place
+    // that has it, so anything later carrying that name is marked as shadowed
+    // rather than quietly losing.
+    std::map<std::string, std::string> firstOf;
+    for (const auto& v : places)
+        for (const auto& f : v.readers)
+            firstOf.emplace(baseName(f), f);
+    int nreg = (int)app.readerPlaces.size();
+    if (ImGui::TreeNodeEx("##places", ImGuiTreeNodeFlags_SpanAvailWidth |
+                                      ImGuiTreeNodeFlags_DefaultOpen,
+                          "where readers are looked for (%d registered)", nreg)) {
+        if (ImGui::SmallButton("Add folder...") && !app.rdFolderDlg) {
             app.rdFolderMode = 0;
             app.rdFolderDlg = std::make_unique<pfd::select_folder>("Folder of readers", ".");
         }
-        if (app.readerLocalDir[0]) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", app.readerLocalDir);
-            std::error_code lec;
-            std::filesystem::path ld = pathFromUtf8(app.readerLocalDir);
-            int shown = 0;
-            if (std::filesystem::is_directory(ld, lec))
-                for (const auto& e : std::filesystem::directory_iterator(ld, lec)) {
-                    if (!e.is_regular_file(lec) || e.path().extension() != ".py") continue;
-                    shown++;
-                    if (ImGui::Selectable(e.path().filename().u8string().c_str()))
-                        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s",
-                                 e.path().u8string().c_str());
-                }
-            if (!shown) ImGui::TextDisabled("no .py files in that folder");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Add file...") && !app.rdOpenDlg) {
+            app.rdOpenMode = 2;
+            app.rdOpenDlg = std::make_unique<pfd::open_file>(
+                "Reader to register (.py)", ".", std::vector<std::string>{ "Python", "*.py" });
         }
+        ImGui::SameLine();
+        ImGui::TextDisabled("searched in this order; the first match wins");
+        int drop = -1, up = -1, down = -1;
+        for (size_t i = 0; i < places.size(); i++) {
+            const ReaderPlace& p = places[i].place;
+            ImGui::PushID((int)i);
+            if (!p.shipped) {
+                ImGui::BeginDisabled(i == 0);
+                if (ImGui::SmallButton("^")) up = (int)i;
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(i + 1 >= (size_t)nreg);
+                if (ImGui::SmallButton("v")) down = (int)i;
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) drop = (int)i;
+                ImGui::SameLine();
+            }
+            // A place that has gone away is SAID, in the colour the refusals
+            // use, not dropped: the user put it there, and a share that is
+            // offline this morning is back this afternoon.
+            char lbl[64];
+            if (!p.exists)    snprintf(lbl, sizeof lbl, "MISSING");
+            else if (p.isDir) snprintf(lbl, sizeof lbl, "folder, %d reader(s)", p.readers);
+            else              snprintf(lbl, sizeof lbl, "file");
+            if (ImGui::TreeNodeEx("##pl", ImGuiTreeNodeFlags_SpanAvailWidth, "%s  (%s%s)",
+                                  dispPath(p.path).c_str(), lbl,
+                                  p.shipped ? ", ships with the viewer" : "")) {
+                if (!p.exists)
+                    ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1),
+                                       "registered, but not there now");
+                for (const auto& f : places[i].readers) {
+                    auto w = firstOf.find(baseName(f));
+                    bool shadowed = w != firstOf.end() && w->second != f;
+                    if (ImGui::Selectable(baseName(f).c_str()))
+                        snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", f.c_str());
+                    if (shadowed) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(shadowed by %s)", dispPath(w->second).c_str());
+                    }
+                }
+                if (p.exists && p.isDir && p.readers == 0)
+                    ImGui::TextDisabled("no .py files in that folder");
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (places.empty())
+            ImGui::TextDisabled("nowhere yet - register the folder your readers are in");
+        if (up >= 0)   moveReaderPlace((size_t)up, -1);
+        if (down >= 0) moveReaderPlace((size_t)down, +1);
+        if (drop >= 0) unregisterReaderPlace((size_t)drop);
         ImGui::TreePop();
     }
     // What has been used before: applying one reader to a run of files is the
@@ -2572,6 +2603,16 @@ static void drawReaderList() {
         std::string why;
         std::string py = adapter::findPython(app.pythonExe, why);
         ImGui::TextDisabled("python: %s", py.empty() ? why.c_str() : py.c_str());
+        // §4.13.2: the same list the refusal prints. "Where does it look?" is
+        // asked here as often as "which file opens differently", and answering
+        // it only inside an error message means you have to fail to find out.
+        if (ImGui::TreeNodeEx("##where", ImGuiTreeNodeFlags_SpanAvailWidth,
+                              "where readers are looked for (%d registered)",
+                              (int)app.readerPlaces.size())) {
+            ImGui::TextUnformatted(readerPlacesReport(readerSearchPath()).c_str());
+            ImGui::TextDisabled("add and reorder them in the Reader panel");
+            ImGui::TreePop();
+        }
         ImGui::Separator();
         if (app.readerMemo.empty()) {
             ImGui::TextDisabled("nothing remembered yet");

@@ -1724,7 +1724,15 @@ static void pollFileDialog() {           // called once per frame from the main 
         int mode = app.rdOpenMode;
         app.rdOpenDlg.reset();
         if (!sel.empty()) {
+            std::string why;
             if (mode == 1) openReaderPicker(sel[0], "");
+            // §4.13.2: a single FILE is a place too - the ruling said file OR
+            // folder, and the odd reader in a scratch directory is the case that
+            // has no folder worth registering.
+            else if (mode == 2) {
+                if (registerReaderPlace(sel[0], &why)) toast("registered: " + dispPath(sel[0]));
+                else toast(why, true);
+            }
             else snprintf(app.readerPickFile, sizeof app.readerPickFile, "%s", sel[0].c_str());
         }
     }
@@ -1733,9 +1741,10 @@ static void pollFileDialog() {           // called once per frame from the main 
         int mode = app.rdFolderMode;
         app.rdFolderDlg.reset();
         if (!d.empty()) {
+            std::string why;
             if (mode == 1) openReaderPicker(d, "");
-            else { snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", d.c_str());
-                   savePrefs(); }
+            else if (registerReaderPlace(d, &why)) toast("registered: " + dispPath(d));
+            else toast(why, true);
         }
     }
     if (app.rdNewDlg && app.rdNewDlg->ready(0)) {
