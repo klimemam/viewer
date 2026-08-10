@@ -1255,3 +1255,25 @@ viewer_selftest(rset NOGL --rset-selftest tools/testdata
 # selftest.abstats with 12 asserts silently skipped against ".". --cfa goes
 # AFTER the directory; the run prints "series=4" when it took effect.
 viewer_selftest(abstats-cfa-bayer --abstats-selftest tools/testdata/multi --cfa bayer)
+
+# The BENCH ITSELF, as a test - no --*-selftest flag, because the subject is
+# the benchmark and not a routine it calls. `viewer --bench N` now prints the
+# panels its measured frames actually drew and exits non-zero when a panel it
+# OPENED never drew, so running it is the assert (core/main.cpp, panelBegin /
+# "bench: panels measured").
+#
+# What it catches, and did: from ba40ba8 - which correctly stopped scripted
+# runs reading the user's layout.ini - until the default was fixed, the default
+# bench layout docked Projection, Histogram and Temporal into ONE dock node as
+# tabs. ImGui::Begin returns false for the two that are not selected, so the
+# frame times covered one panel of the three and read 5x too fast (2.25 ms
+# against 12.61 ms on the same machine and the same fixture). Nothing failed;
+# the number was simply smaller than the thing it named.
+#
+# No NOGL: the whole subject is what a real docking layout does to a real
+# frame, which is exactly what cannot be computed without a window. Small and
+# fast on purpose - 24 frames over the 0.08 Mpx stack the remote test already
+# uses - because it asserts COVERAGE, not speed. The frame-time gate in
+# .github/workflows/build.yml stays the place where the number itself is
+# watched.
+viewer_selftest(benchcov --bench 24 --stack always tools/testdata/bench_stack.npy)

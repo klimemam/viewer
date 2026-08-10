@@ -267,6 +267,47 @@ static void redrawNow() {
     g_drawFrame();
     g_inFrame = false;
 }
+// ---- bench coverage: which panels the measured frames actually PAID FOR ------
+// `ImGui::Begin` returns false for a window that is not visible - the unselected
+// tab of a dock node being the case that matters here - and a panel whose Begin
+// returned false costs the frame nothing. So a bench that opens nine panels and
+// then measures frames in which three of them are tabbed behind one another
+// reports a number for LESS WORK THAN IT NAMES, and nothing in its output says
+// so. That is what happened after ba40ba8: scripted runs correctly stopped
+// reading the user's layout.ini, which also stopped them inheriting the
+// arrangement being measured, and the default layout docks Projection,
+// Histogram and Temporal into one node as tabs. Every default `--bench` run
+// from then until this commit paid for exactly one of the three.
+//
+// The cure is not to trust the layout code - it is to COUNT. Every panel the
+// bench opens goes through panelBegin() instead of ImGui::Begin, each benched
+// frame records whether the panel drew, and the bench prints the list beside
+// its timings and FAILS when a panel it opened never drew. A benchmark that
+// cannot name its own scope will be read as covering more than it did; one
+// that names it wrongly is worse still, so the naming is measured, not
+// declared.
+static bool g_benchMeasuring = false;      // true only while a BENCHED frame draws
+struct BenchPanelCov { int open = 0, drew = 0; };
+static std::map<std::string, BenchPanelCov> g_benchCov;   // panel title -> counts
+static std::vector<std::string> g_benchCovOrder;          // ...in first-draw order
+// The label is ImGui's, id and all; the report says the part before "###",
+// because that is the panel's NAME and the id behind it is bookkeeping
+// ("Series Analysis###Linearity", see the panel's own comment).
+static bool panelBegin(const char* label, bool* open, ImGuiWindowFlags flags = 0) {
+    bool vis = ImGui::Begin(label, open, flags);
+    if (g_benchMeasuring) {
+        const char* hash = strstr(label, "###");
+        std::string name = hash ? std::string(label, (size_t)(hash - label)) : label;
+        auto it = g_benchCov.find(name);
+        if (it == g_benchCov.end()) {
+            g_benchCovOrder.push_back(name);
+            it = g_benchCov.emplace(name, BenchPanelCov{}).first;
+        }
+        it->second.open++;
+        if (vis) it->second.drew++;
+    }
+    return vis;
+}
 static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
@@ -1280,7 +1321,7 @@ int main(int argc, char** argv) {
             ImGui::SetWindowSize("Analysis", ImVec2(560 * uiScale, 420 * uiScale));
         }
 
-        if (app.showFiles) { if (ImGui::Begin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
+        if (app.showFiles) { if (panelBegin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
         // Browse: N windows, one per instance. Instance 1 is "Browse###Remote"
         // (the singleton's id, so layouts and the dock builder keep working)
         // and only ever HIDES - View > Panels > Browse and the session's
@@ -1346,16 +1387,16 @@ int main(int argc, char** argv) {
             if (ImGui::Begin("Messages", &app.showMessages)) drawMessagesPanel();
             ImGui::End();
         }
-        if (ImGui::Begin("Image View", nullptr, ImGuiWindowFlags_NoScrollbar |
+        if (panelBegin("Image View", nullptr, ImGuiWindowFlags_NoScrollbar |
                                                 ImGuiWindowFlags_NoScrollWithMouse))
             drawCanvas(ImGui::GetContentRegionAvail());
         ImGui::End();
         if (app.showInspector) {
-            if (ImGui::Begin("Inspector", &app.showInspector)) drawInspector();
+            if (panelBegin("Inspector", &app.showInspector)) drawInspector();
             ImGui::End();
         }
         if (app.showHistogram) {
-            if (ImGui::Begin("Histogram", &app.showHistogram)) drawPanelHistogram();
+            if (panelBegin("Histogram", &app.showHistogram)) drawPanelHistogram();
             ImGui::End();
         }
         if (app.showTemporal) {
@@ -1370,11 +1411,11 @@ int main(int argc, char** argv) {
                 app.focusTemporal = false;
                 app.focusRemote = true;
             }
-            if (ImGui::Begin("Temporal", &app.showTemporal)) drawPanelTemporal();
+            if (panelBegin("Temporal", &app.showTemporal)) drawPanelTemporal();
             ImGui::End();
         }
         if (app.showProjection) {
-            if (ImGui::Begin("Projection", &app.showProjection)) drawPanelProjection();
+            if (panelBegin("Projection", &app.showProjection)) drawPanelProjection();
             ImGui::End();
         }
         if (app.showSeriesAnalysis) {
@@ -1383,7 +1424,7 @@ int main(int argc, char** argv) {
             // says the layer (docs/analysis-layers.md §3.3 renamed the panel):
             // the Browse###Remote precedent, so saved docking survives via the
             // session loader's ini migration.
-            if (ImGui::Begin("Series Analysis###Linearity", &app.showSeriesAnalysis))
+            if (panelBegin("Series Analysis###Linearity", &app.showSeriesAnalysis))
                 drawPanelSeriesAnalysis();
             ImGui::End();
         }
@@ -1395,13 +1436,13 @@ int main(int argc, char** argv) {
         if (app.showRois) {   // min size: the table stays readable even if dragged small
             ImGui::SetNextWindowSizeConstraints(ImVec2(460 * uiScale, 300 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
-            if (ImGui::Begin("ROIs", &app.showRois)) drawPanelRois();
+            if (panelBegin("ROIs", &app.showRois)) drawPanelRois();
             ImGui::End();
         }
         if (app.showAnalysis) {
             ImGui::SetNextWindowSizeConstraints(ImVec2(420 * uiScale, 260 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
-            if (ImGui::Begin("Analysis", &app.showAnalysis)) drawPanelAnalysis();
+            if (panelBegin("Analysis", &app.showAnalysis)) drawPanelAnalysis();
             ImGui::End();
         }
 
@@ -2840,7 +2881,13 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+        // Exactly the frames whose time is kept below are the frames whose
+        // panel coverage is counted: one flag, set either side of the one draw
+        // this iteration makes, so the two can never come to describe different
+        // sets of frames.
+        g_benchMeasuring = benchFrames && !benchWarm;
         redrawNow();
+        g_benchMeasuring = false;
         if (benchFrames && !benchWarm) {
             glFinish();               // include GPU work in the measurement
             benchMs.push_back((nowSec() - frameT0) * 1000.0);
@@ -2856,6 +2903,45 @@ int main(int argc, char** argv) {
                 "bench: frames=%zu mean=%.2fms median=%.2fms p95=%.2fms max=%.2fms (%.0f fps median)\n",
                 s.size(), sum / s.size(), s[s.size() / 2], s[(size_t)(s.size() * 0.95)],
                 s.back(), 1000.0 / std::max(s[s.size() / 2], 1e-6));
+    }
+    // ---- and WHAT the frames above contain ---------------------------------
+    // Printed for every bench run, right under the timings, because a frame
+    // time is meaningless without the list of panels that frame drew - and
+    // because the scope has to travel with the number wherever it is quoted.
+    // The failure is hard: a panel the run OPENED but that never drew means the
+    // number above is smaller than the thing it claims to measure, and a
+    // benchmark that is quietly wrong is worse than one that is missing.
+    int benchCovBad = 0;
+    if (benchFrames) {
+        std::string drew, missing;
+        int nPanels = 0;
+        for (const std::string& n : g_benchCovOrder) {
+            const BenchPanelCov& c = g_benchCov[n];
+            nPanels++;
+            if (c.drew == c.open && c.drew > 0) {
+                drew += (drew.empty() ? "" : ", ") + n;
+            } else {
+                char frac[48];
+                snprintf(frac, sizeof frac, " (drew in %d of %d)", c.drew, c.open);
+                missing += (missing.empty() ? "" : ", ") + n + frac;
+                benchCovBad++;
+            }
+        }
+        fprintf(stderr, "bench: panels measured over %zu benched frame(s): %s\n",
+                benchMs.size(), drew.empty() ? "(none)" : drew.c_str());
+        if (benchCovBad) {
+            fprintf(stderr, "bench: OPEN BUT NEVER DRAWN: %s\n", missing.c_str());
+            fprintf(stderr,
+                    "bench: the frame times above cover %d of the %d panel(s) this run "
+                    "opened - ImGui::Begin returns false for a panel that is not "
+                    "visible (an unselected dock TAB is the usual cause), so their "
+                    "cost is not in the number.\n",
+                    nPanels - benchCovBad, nPanels);
+        }
+        fprintf(stderr, "benchcov: %-64s %s\n",
+                "every panel the bench opened drew in every benched frame",
+                benchCovBad ? "FAIL" : "PASS");
+        fflush(stderr);
     }
     if (benchTiles) {
         fprintf(stderr, "benchtiles: drawCanvas tiled %d pane(s) on the last frame "
@@ -2890,5 +2976,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "browsekeys: FAILED (the action list did not finish)\n");
         return 1;
     }
-    return 0;
+    // A bench that measured less than it opened exits non-zero: that is what
+    // makes the coverage line an ASSERT rather than a remark nobody reads, and
+    // it is what selftest.benchcov in CMakeLists.txt asks of it.
+    return benchCovBad ? 1 : 0;
 }
