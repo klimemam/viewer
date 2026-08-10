@@ -1312,8 +1312,15 @@ int main(int argc, char** argv) {
             ImGui::DockBuilderDockWindow("Browse###Remote", left);   // tabbed with Files
             ImGui::DockBuilderDockWindow("Image View", center);
             ImGui::DockBuilderDockWindow("Inspector", right);
-            // tab order = dock order; Projection leads, and the explicit
-            // focus below makes it the SELECTED tab, not merely the leftmost
+            // Tab order = dock order, so Projection leads. The SetWindowFocus
+            // below was written to make it the SELECTED tab as well - but that
+            // is not what comes out: with the three tabbed, the bench's
+            // coverage probe measured HISTOGRAM as the panel that drew, every
+            // frame, and Projection as one that never did. Recorded rather than
+            // corrected, because which tab leads is a UI question and the bench
+            // no longer depends on the answer (it lays all three out side by
+            // side, above), and because a comment asserting the opposite of
+            // what was measured is how the wrong number got believed.
             if (benchPanels) {          // every --bench run: all three at once
                 ImGuiID bp1 = bottom, bp2, bp3;
                 bp2 = ImGui::DockBuilderSplitNode(bp1, ImGuiDir_Right, 0.66f, nullptr, &bp1);
@@ -1404,7 +1411,7 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
         if (panelBegin("Image View", nullptr, ImGuiWindowFlags_NoScrollbar |
-                                                ImGuiWindowFlags_NoScrollWithMouse))
+                                              ImGuiWindowFlags_NoScrollWithMouse))
             drawCanvas(ImGui::GetContentRegionAvail());
         ImGui::End();
         if (app.showInspector) {
