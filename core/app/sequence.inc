@@ -2609,7 +2609,12 @@ static void drawReaderList() {
         if (ImGui::TreeNodeEx("##where", ImGuiTreeNodeFlags_SpanAvailWidth,
                               "where readers are looked for (%d registered)",
                               (int)app.readerPlaces.size())) {
-            ImGui::TextUnformatted(readerPlacesReport(readerSearchPath()).c_str());
+            // The snapshot, not a live walk: this is drawn every frame while the
+            // node is open, and one of these places can be a share whose stat()
+            // blocks for seconds. Same rule as the Reader panel.
+            std::vector<ReaderPlace> pv;
+            for (const auto& v : readerPlacesForUi()) pv.push_back(v.place);
+            ImGui::TextUnformatted(readerPlacesReport(pv).c_str());
             ImGui::TextDisabled("add and reorder them in the Reader panel");
             ImGui::TreePop();
         }
