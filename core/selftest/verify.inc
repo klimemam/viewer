@@ -997,6 +997,40 @@
                         gotVar, mv, between, wantVar);
                 check(fabs(gotVar - wantVar) < wantVar * 1e-3 + 1e-9,
                       "V17 pooled variance = within-plane + between-plane");
+                // ...and none of the above can see the case CFA hides. The
+                // pooled row lives in slot 4 BY NAME - that is what keeps it
+                // from being a fifth plane - but the passes were driven by a
+                // COUNT, nSeries + allRow, which names slot 4 only when nSeries
+                // is 4. It is 4 for CFA and 3 for every RGB image, so ticking
+                // "all" on an RGB image wrote a slot nothing had sized: an
+                // out-of-range write, and the viewer went down on the click.
+                // Three planes with flat, distinct levels, so the pooled answer
+                // is arithmetic: (1000 + 2000 + 3000) / 3 = 2000.
+                {
+                    auto rgb = std::make_unique<ImageDoc>();
+                    rgb->name = "v17rgb";
+                    rgb->src->w = 64; rgb->src->h = 64; rgb->src->ch = 3;
+                    rgb->src->dtype = "u16";
+                    rgb->src->data.resize((size_t)64 * 64 * 3);
+                    static const float LV3[3] = { 1000.0f, 2000.0f, 3000.0f };
+                    for (int y = 0; y < 64; y++)
+                        for (int x = 0; x < 64; x++)
+                            for (int c = 0; c < 3; c++)
+                                rgb->px()[((size_t)y * 64 + x) * 3 + c] = LV3[c];
+                    rgb->syncMirrors();
+                    rgb->uid = app.nextUid++;
+                    App::ProjState T3{};
+                    recomputeProjectionIfNeeded(rgb.get(), T3);
+                    fprintf(stderr, "verifyselftest: V17 RGB + all: planes=%d allRow=%d "
+                                    "pooled slot n=%zu mean=%.9g (want 2000)\n",
+                            T3.nSeries, T3.allRow ? 1 : 0, T3.h[4].size(), T3.fStat[4].mean);
+                    check(T3.nSeries == 3 && T3.allRow && T3.h[4].size() == 64 &&
+                          T3.v[4].size() == 64,
+                          "V17 a 3-plane image fills the pooled SLOT, not slot nSeries");
+                    check(T3.fStat[4].valid && T3.fStat[4].mean == 2000.0 &&
+                          T3.hStat[4].valid && T3.hStat[4].mean == 2000.0,
+                          "V17 ...and its pooled mean is the three levels averaged");
+                }
                 im0->cfa = savedCfa; im0->cfaPattern = savedPat;
                 app.projAllRow = savedAll;
             }

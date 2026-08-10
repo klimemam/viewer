@@ -559,15 +559,30 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // mix, and only when asked for
     P.allRow = app.projAllRow && P.nSeries > 1;
     P.seriesNames[4] = "all";
-    const int nAcc = P.nSeries + (P.allRow ? 1 : 0);   // rows the passes fill
+    // WHICH slots the passes fill, not how many. The pooled row is slot 4 by
+    // NAME whatever nSeries is - that is the whole point of it not being a
+    // fifth plane - so a count is only ever right when nSeries happens to be 4.
+    // `nSeries + allRow` was that count: for a 3-plane RGB image with "all"
+    // ticked it read 4, sized slots 0..3, and then the pass wrote slot 4, whose
+    // vectors had never been sized and whose counter row did not exist. An
+    // out-of-range write, on a checkbox, on every non-CFA image with more than
+    // one plane - the viewer died the moment it was ticked. CFA hid it because
+    // there nSeries IS 4 and the count is accidentally the right answer.
+    int fillSlot[5], nAcc = 0;
+    for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
+    if (P.allRow) fillSlot[nAcc++] = 4;
 
-    for (int s = 0; s < nAcc; s++) {
+    // ...and everything below is indexed BY SLOT, never by position, so the
+    // five-slot arrays and the loops cannot drift apart again.
+    std::vector<std::vector<int>> hN(5), vN(5);
+    for (int i = 0; i < nAcc; i++) {
+        const int s = fillSlot[i];
         P.h[s].assign(rw, 0.0f);
         P.v[s].assign(rh, 0.0f);
+        hN[s].assign(rw, 0);
+        vN[s].assign(rh, 0);
     }
     if (!P.allRow) { P.h[4].clear(); P.v[4].clear(); P.fStat[4] = {}; P.hStat[4] = {}; P.vStat[4] = {}; }
-    std::vector<std::vector<int>> hN(nAcc, std::vector<int>(rw, 0));
-    std::vector<std::vector<int>> vN(nAcc, std::vector<int>(rh, 0));
     // region moments, gathered from the SAME samples the H pass visits (every
     // column, every step-th row) - so the region sigma and the profile sigmas
     // describe one and the same set of pixels
@@ -577,7 +592,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     double fMx[5] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
     bool useMax = app.projMode == 1, useMin = app.projMode == 2;
     if (useMax || useMin)
-        for (int s = 0; s < nAcc; s++) {
+        for (int i = 0; i < nAcc; i++) {
+            const int s = fillSlot[i];
             std::fill(P.h[s].begin(), P.h[s].end(), useMax ? -FLT_MAX : FLT_MAX);
             std::fill(P.v[s].begin(), P.v[s].end(), useMax ? -FLT_MAX : FLT_MAX);
         }
@@ -631,7 +647,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         for (int x = 0; x < rw; x += step)
             for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
-    for (int s = 0; s < nAcc; s++) {
+    for (int i = 0; i < nAcc; i++) {
+        const int s = fillSlot[i];
         for (int x = 0; x < rw; x++) {
             if (!hN[s][x]) { P.h[s][x] = std::numeric_limits<float>::quiet_NaN(); continue; }
             if (!useMax && !useMin) P.h[s][x] /= hN[s][x];
@@ -646,7 +663,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
-    for (int s = 0; s < nAcc; s++) {
+    for (int i = 0; i < nAcc; i++) {
+        const int s = fillSlot[i];
         App::ProjState::Stats& f = P.fStat[s];
         f = {};
         if (!fN[s]) continue;
@@ -660,7 +678,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // statistics OF THE PROFILE itself: the spread of column means is column FPN,
     // the spread of row means is row FPN / banding - that is the number people
     // actually want out of a projection, and eyeballing a curve cannot give it.
-    for (int s = 0; s < nAcc; s++) {
+    for (int i = 0; i < nAcc; i++) {
+        const int s = fillSlot[i];
         for (int axis = 0; axis < 2; axis++) {
             const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
             App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
