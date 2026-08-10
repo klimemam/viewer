@@ -1187,17 +1187,28 @@ static void drawFileList() {
                   if (ImGui::SmallButton("Reload##watch")) pendingReloadSeq = wsi->id;
                   // What Reload will and will not do, stated where the click is.
                   // Re-reading the frames this stack HAS is reference-design
-                  // §3.2 and is shipped; changing which files are members is
-                  // watch-design §6 and is not, so a stack whose folder gained
-                  // or lost a file is told the truth rather than left to infer
-                  // it from a frame count that did not move.
+                  // §3.2; rebuilding WHICH files are its members is watch-design
+                  // §6, and the second half is not the same for every stack -
+                  // only a stack whose membership IS its folder's sibling rule
+                  // takes a file that appeared (§11.4). A stack that will not is
+                  // told so here rather than left to infer it from a frame count
+                  // that did not move.
                   if (ImGui::IsItemHovered()) {
-                      std::string tip = "Re-read every frame of this stack from disk.\n"
+                      std::string tip = "Re-read every frame of this stack from disk,\n"
+                                        "and rebuild which files are its members.\n"
                                         "Numbers computed from the old pixels are dropped.";
-                      if (wsi->watchFound.appeared || wsi->watchFound.vanished)
-                          tip += "\n\nThis stack's MEMBERSHIP does not change: a file that\n"
-                                 "appeared or vanished is not added or removed by Reload -\n"
-                                 "open the folder again for that.";
+                      if (wsi->watchFound.vanished)
+                          tip += "\n\nA file that is gone LEAVES this stack - it is not a\n"
+                                 "frame that failed to read - and n of N says the new "
+                                 "numbers.";
+                      if (wsi->watchFound.appeared)
+                          tip += wsi->ruleHead.empty()
+                              ? "\n\nA file that appeared is NOT added: this stack's members\n"
+                                "were chosen (a derived subset, a hand-picked open), and\n"
+                                "that choice is never re-applied. Open the folder again\n"
+                                "for a stack of everything in it."
+                              : "\n\nA file that appeared JOINS this stack, numbered where\n"
+                                "its name puts it - the order the open used.";
                       ImGui::SetTooltip("%s", tip.c_str());
                   }
                   ImGui::Unindent(ImGui::GetFontSize());

@@ -485,12 +485,27 @@
             // A reload first, so the baseline this case is about is the ONLY
             // difference on the table: W20-W22 left three of these files
             // rewritten on disk, and a subset that starts out already changed
-            // would answer W23b with W17's finding. (w_004.npy is gone, so that
-            // one member refuses - which is exactly why it is not in the subset.)
-            int reFailed = 0;
-            reloadStackFromDisk(seq, &reFailed);
-            check(reFailed == 1,
-                  "W23 (setup) re-read: 4 members re-read, the deleted one refused");
+            // would answer W23b with W17's finding.
+            //
+            // That reload now REBUILDS this stack's membership (§6), and this
+            // folder is exactly the interesting case: w_004.npy was deleted in
+            // W20 (so it leaves, and refuses nothing - a gone frame is not a
+            // failed read) while w_005.npy appeared (so the rule names it) but
+            // is 4x4 where W22 left this stack's reference frame at 6x6 - so it
+            // is refused BY SHAPE, precisely as the loader refuses a sibling of
+            // another shape at the open. The stack is therefore 4 of 5: four
+            // members, five names, and the Files row says so.
+            int reFailed = -1;
+            const std::string reMsg = reloadStackFromDisk(seq, &reFailed);
+            fprintf(stderr, "watchselftest: W23 rebuild: %s\n", reMsg.c_str());
+            check(reFailed == 0 && (int)framesOfSeq(seq).size() == 4 &&
+                  seqInfo(seq) && seqInfo(seq)->expectedFrames == 5 &&
+                  reMsg.find("1 file(s) no longer exist (w_004.npy)") != std::string::npos &&
+                  reMsg.find("1 file(s) the rule names did not read (w_005.npy") !=
+                      std::string::npos,
+                  "W23 (setup) the rebuild drops the deleted file and says 4 of 5");
+            check(!*seqReloadMark(seq),
+                  "W23a ...and neither event is a (reload failed): no seam was made");
             std::vector<App::WatchTarget> tg = watchTargetsNow();
             App::WatchTarget sub;
             for (const auto& x : tg) if (x.seqId == seq) sub = x;
@@ -548,6 +563,386 @@
                   "W24c ...by INTEGRATING it: the files changed either way");
             app.watchEnabled = true;
         }
+
+        // ======================================================================
+        //  W25-W33: §6 - the Reload that rebuilds MEMBERSHIP.
+        //
+        //  W1-W24 are about SAYING that the folder moved. These are about acting
+        //  on it, and the sentence under test is §6's own: Reload is
+        //  reloadSource PLUS a membership rebuild, and seqId and SeqInfo survive
+        //  it. "Rebuilt as a stack" (ruling A6b) is a statement about the member
+        //  LIST - the name, the per-frame X axis, the series membership and the
+        //  compare pins belong to the same stack before and after.
+        //
+        //  Its own fixture folder, for R25's reason: W16-W23 spent 150 lines
+        //  rewriting w_* into 6x6 and deleting one of them, and a membership
+        //  test that has to be read against that history is a test nobody can
+        //  check by eye.
+        // ======================================================================
+        closeAll();
+        const std::string reb = root + "/reb";
+        std::filesystem::create_directories(pathFromUtf8(reb), ec);
+        auto rebName = [](int i) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "r_%03d.npy", i);
+            return std::string(nm);
+        };
+        auto rebWrite = [&](int i, float v) { writeNpy2(reb + "/" + rebName(i), 4, 4, v); };
+        auto rebKill = [&](int i) {
+            std::error_code e2;
+            std::filesystem::remove(pathFromUtf8(reb + "/" + rebName(i)), e2);
+        };
+        for (int i = 0; i < 5; i++) rebWrite(i, 100.0f + (float)i);
+        openFolder(reb);
+        loadAll();
+        int rs = 0;
+        for (const auto& s : app.seqs) if (!s.name.empty()) { rs = s.id; break; }
+        // THE membership, as ONE string: "0:r_000.npy 1:r_001.npy ...". A count
+        // is not a membership - a stack that swapped one member for another has
+        // the same count and is not the same stack - so every assert below
+        // states the whole list and the number each member carries.
+        auto members = [&](int sid) {
+            std::string s;
+            for (int idx : framesOfSeq(sid))          // framesOfSeq sorts by seqIndex
+                s += (s.empty() ? "" : " ") + std::to_string(app.images[idx]->seqIndex) +
+                     ":" + baseName(app.images[idx]->src->path);
+            return s;
+        };
+        auto memberDoc = [&](int sid, int index) -> ImageDoc* {
+            for (int idx : framesOfSeq(sid))
+                if (app.images[idx]->seqIndex == index) return app.images[idx].get();
+            return nullptr;
+        };
+        double sig5 = 0;
+        {   // ---- W25 (setup): five frames, and the sigma_t they answer ---------
+            check(rs != 0 && members(rs) == "0:r_000.npy 1:r_001.npy 2:r_002.npy "
+                                            "3:r_003.npy 4:r_004.npy" &&
+                  seqInfo(rs) && seqInfo(rs)->expectedFrames == 5,
+                  "W25 (setup) a 5-frame folder stack, members named and numbered");
+            App::TemporalState T{};
+            if (ImageDoc* d0 = memberDoc(rs, 0)) recomputeTemporalIfNeeded(d0, T);
+            sig5 = T.tempNoise[0];
+            // Five flat frames, 100..104. Deviations from the mean 102 are
+            // -2,-1,0,1,2, so the sum of squares is 4+1+0+1+4 = 10 and ddof=1
+            // divides by 4: sqrt(10/4) = 1.5811388.
+            check(fabs(sig5 - 1.5811388) < 1e-5,
+                  "W25b (setup) sigma_t over the five frames is sqrt(10/4)");
+        }
+        {   // ---- W26: a member whose FILE IS GONE leaves the membership --------
+            rebKill(3);
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(rs, &failed);
+            fprintf(stderr, "watchselftest: W26 summary: %s\n", msg.c_str());
+            check(members(rs) == "0:r_000.npy 1:r_001.npy 2:r_002.npy 3:r_004.npy",
+                  "W26 the vanished member is out and the survivors renumber 0..3");
+            check(seqInfo(rs) && seqInfo(rs)->expectedFrames == 4,
+                  "W26b n of N states the new N (the Files row reads 4f, not 4/5f)");
+            check(msg.find("1 file(s) no longer exist (r_003.npy)") != std::string::npos &&
+                  msg.find("4 of 4 frame(s), was 5") != std::string::npos,
+                  "W26c the summary states the NAME and BOTH counts");
+            // A frame that is GONE is not a frame that FAILED TO READ (#56): what
+            // remains is a stack of one moment, so it carries no seam mark.
+            check(failed == 0 && seqReloadNote(rs).empty() && !*seqReloadMark(rs),
+                  "W26d a gone file is not a refusal: no (reload failed) mark");
+            // ANTI-VACUITY: the doc is really gone from app.images, not merely
+            // missing from one listing.
+            int stillThere = 0;
+            for (const auto& d : app.images)
+                if (baseName(d->src->path) == "r_003.npy") stillThere++;
+            check(stillThere == 0, "W26e ...and no doc anywhere still holds r_003.npy");
+        }
+        {   // ---- W27: what is keyed on the stack follows the membership --------
+            App::TemporalState T{};
+            if (ImageDoc* d0 = memberDoc(rs, 0)) recomputeTemporalIfNeeded(d0, T);
+            // The four survivors are 100,101,102,104: mean 101.75, deviations
+            // -1.75,-0.75,0.25,2.25, sum of squares 3.0625+0.5625+0.0625+5.0625
+            // = 8.75, ddof=1 divides by 3: sqrt(8.75/3) = 1.7078251.
+            check(fabs(T.tempNoise[0] - 1.7078251) < 1e-5 &&
+                  fabs(T.tempNoise[0] - sig5) > 1e-3,
+                  "W27 sigma_t is the FOUR-frame answer, not the cached five");
+        }
+        {   // ---- W28: a member that APPEARS joins in the stack's own order -----
+            // ANTI-VACUITY first: this case is only about an ARRIVAL if the
+            // stack does not already hold r_003 - on a Reload that never changed
+            // membership, W28 below would be asserting that a member which never
+            // left is still there.
+            check((int)framesOfSeq(rs).size() == 4 && !memberDoc(rs, 4),
+                  "W28 (setup) the stack is down to four members, none of them r_003");
+            rebWrite(3, 903.0f);                  // r_003 is back, with new pixels
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(rs, &failed);
+            fprintf(stderr, "watchselftest: W28 summary: %s\n", msg.c_str());
+            // If it were appended, this would read "...3:r_004.npy 4:r_003.npy".
+            // sortFramesNumerically is the open's own order and the frame number
+            // is a measurement property, so r_003 is frame 3 and r_004 moves back
+            // to 4.
+            check(members(rs) == "0:r_000.npy 1:r_001.npy 2:r_002.npy "
+                                 "3:r_003.npy 4:r_004.npy",
+                  "W28 the new file is frame 3, not frame 4 (the open's order)");
+            ImageDoc* n3 = memberDoc(rs, 3);
+            check(n3 && n3->px()[0] == 903.0f && n3->w == 4 && n3->h == 4,
+                  "W28b ...and it was really decoded: the file's new pixels");
+            check(failed == 0 && seqInfo(rs) && seqInfo(rs)->expectedFrames == 5 &&
+                  msg.find("1 file(s) appeared in the folder (r_003.npy)") !=
+                      std::string::npos &&
+                  msg.find("5 of 5 frame(s), was 4") != std::string::npos,
+                  "W28c the summary names it and states both counts again");
+        }
+        {   // ---- W29: one gone and one arrived - the COUNT does not move -------
+            // The case a count-only test cannot see, and the one that proves the
+            // stack's key is not the frame count: five members before, five
+            // after, and NOT the same five.
+            const int rev0 = seqInfo(rs) ? seqInfo(rs)->stackRev : -1;
+            App::TemporalState T0{};
+            if (ImageDoc* d0 = memberDoc(rs, 0)) recomputeTemporalIfNeeded(d0, T0);
+            // 100,101,102,903,104: mean 262, squares 26244+25921+25600+410881+
+            // 24964 = 513610, /4 = 128402.5, sqrt = 358.33295.
+            check(fabs(T0.tempNoise[0] - 358.33295) < 1e-3,
+                  "W29 (setup) sigma_t of the five members now on the board");
+            rebKill(0);
+            rebWrite(5, 5000.0f);
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(rs, &failed);
+            fprintf(stderr, "watchselftest: W29 summary: %s\n", msg.c_str());
+            check(members(rs) == "0:r_001.npy 1:r_002.npy 2:r_003.npy "
+                                 "3:r_004.npy 4:r_005.npy",
+                  "W29b five before and five after, and not the same five");
+            check(msg.find("1 file(s) appeared in the folder (r_005.npy)") !=
+                      std::string::npos &&
+                  msg.find("1 file(s) no longer exist (r_000.npy)") != std::string::npos &&
+                  msg.find("5 of 5 frame(s), was 5") != std::string::npos,
+                  "W29c the summary names BOTH directions - the count says nothing");
+            check(seqInfo(rs) && seqInfo(rs)->stackRev > rev0,
+                  "W29d the stack's data revision moved on a same-size rebuild");
+            App::TemporalState T1{};
+            if (ImageDoc* d0 = memberDoc(rs, 0)) recomputeTemporalIfNeeded(d0, T1);
+            // 101,102,903,104,5000: mean 1242, squares 1301881+1299600+114921+
+            // 1295044+14122564 = 18134010, /4 = 4533502.5, sqrt = 2129.2023.
+            check(fabs(T1.tempNoise[0] - 2129.2023) < 1e-3 && T1.frames == 5,
+                  "W29e ...and sigma_t is the new set's, at the same frame count");
+        }
+        int ds = 0;
+        {   // ---- W30: a DERIVED stack does not re-admit what its rule left out -
+            // §6 and §11.4: a derive's membership is a decision made at derive
+            // time and is never re-applied. It lives in the same folder as its
+            // source, so a rebuild that asked the FOLDER instead of the STACK
+            // would hand back the two frames the user deliberately excluded.
+            DerivePlan P = buildDerivePlan(rs, DR_RANGE, 0, 0, 2, nullptr);
+            ds = applyDerivePlan(P, false);
+            check(ds != 0 && members(ds) == "0:r_001.npy 1:r_002.npy 2:r_003.npy",
+                  "W30 (setup) a 3-of-5 derived stack over the same folder");
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(ds, &failed);
+            fprintf(stderr, "watchselftest: W30 summary: %s\n", msg.c_str());
+            check(failed == 0 && members(ds) == "0:r_001.npy 1:r_002.npy 2:r_003.npy" &&
+                  msg.find("appeared in the folder") == std::string::npos,
+                  "W30b Reload does not re-apply the folder rule to a subset stack");
+            // ANTI-VACUITY: "never change a derived stack" would pass W30b. Its
+            // OWN members are re-read like anybody's.
+            rebWrite(2, 777.0f);
+            int f2 = -1;
+            reloadStackFromDisk(ds, &f2);
+            ImageDoc* dm = memberDoc(ds, 1);
+            check(f2 == 0 && dm && dm->px()[0] == 777.0f,
+                  "W30c ...while its own members are re-read normally");
+        }
+        {   // ---- W31: a derived stack sees the new pixels with NO Reload of its
+            // own. §10 calls this the reason the feature exists: one reload of
+            // the source stack, and every stack sharing those frames is current
+            // in the same step - there is no ledger of which copy is stale,
+            // because there is no copy.
+            requestStackAverage(ds);
+            loadAll();
+            ImageDoc* avg = app.images.empty() ? nullptr : app.images.back().get();
+            check(avg && !avg->avgOfPath.empty() && !avgIsStale(avg),
+                  "W31 (setup) a frame average of the derived stack, fresh");
+            const int dsRev = seqInfo(ds) ? seqInfo(ds)->stackRev : -1;
+            rebWrite(2, 888.0f);
+            int f = -1;
+            reloadStackFromDisk(rs, &f);          // the SOURCE stack, not this one
+            ImageDoc* dm = memberDoc(ds, 1);
+            check(f == 0 && dm && dm->px()[0] == 888.0f,
+                  "W31b the derived stack has the new pixels, unreloaded");
+            check(seqInfo(ds) && seqInfo(ds)->stackRev > dsRev,
+                  "W31c ...and ITS stack key moved, so its numbers unlatch too");
+            check(avg && avgIsStale(avg),
+                  "W31d ...and the reduced frame of it reads (stale)");
+        }
+        {   // ---- W32: the compare pins and the selection across a rebuild ------
+            // The decision: a pin is a pin on THIS FRAME (a membership uid),
+            // never on "whatever is at index 2 now". So a surviving pin is
+            // untouched even when its frame NUMBER moves, and a pin on the
+            // member that vanished is dropped exactly as closing that frame
+            // drops it. Promoting the frame that inherited the number would
+            // silently compare against a different picture.
+            ImageDoc* keep = memberDoc(rs, 2);            // r_003.npy, survives
+            const uint64_t keepUid = keep ? keep->uid : 0;
+            setCompareB(keep);
+            for (size_t k = 0; k < app.images.size(); k++)
+                if (app.images[k].get() == keep) selectImage((int)k);
+            rebKill(1);                                   // r_002.npy: NOT the pin
+            int f = -1;
+            reloadStackFromDisk(rs, &f);
+            ImageDoc* after = nullptr;
+            for (const auto& d : app.images) if (d->uid == keepUid) after = d.get();
+            check(app.compareBUid == keepUid && after && after->seqIndex == 1 &&
+                  baseName(after->src->path) == "r_003.npy",
+                  "W32 a pin survives a rebuild that renumbered the frame it holds");
+            check(app.current >= 0 && app.current < (int)app.images.size() &&
+                  app.images[app.current]->uid == keepUid,
+                  "W32b ...and so does the selection: the same frame, new number");
+            // ...and now the pinned frame is the one that goes.
+            rebKill(3);                                   // r_003.npy IS the pin
+            int f2 = -1;
+            reloadStackFromDisk(rs, &f2);
+            check(app.compareBUid == 0 && app.compareB.empty(),
+                  "W32c a pin on the frame that vanished is dropped, not moved");
+            check(app.current >= 0 && app.current < (int)app.images.size() &&
+                  app.images[app.current]->seqId == rs,
+                  "W32d ...and the selection lands on a live frame of the stack");
+        }
+        {   // ---- W33: the two things a rebuild must NOT do ---------------------
+            // (a) a file that EXISTS but cannot be read is still a REFUSAL - the
+            //     #56 mark keeps its subject, which is frames of two moments
+            //     under one name; and
+            // (b) a rebuild never empties a stack. "Every file is gone" is not a
+            //     thing a click on Reload should silently do to a measurement;
+            //     the stack keeps its frames and says the reload refused.
+            const std::string b2 = root + "/reb2";
+            std::filesystem::create_directories(pathFromUtf8(b2), ec);
+            for (int i = 0; i < 3; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "s_%03d.npy", i);
+                writeNpy2(b2 + "/" + nm, 4, 4, 10.0f + (float)i);
+            }
+            std::vector<int> had;
+            for (const auto& s : app.seqs) had.push_back(s.id);
+            openFolder(b2);
+            loadAll();
+            int s2 = 0;
+            for (const auto& s : app.seqs)
+                if (std::find(had.begin(), had.end(), s.id) == had.end()) s2 = s.id;
+            check(s2 != 0 && members(s2) == "0:s_000.npy 1:s_001.npy 2:s_002.npy",
+                  "W33 (setup) a second 3-frame stack of its own");
+            {   // (a) present, unreadable
+                std::ofstream g(pathFromUtf8(b2 + "/s_001.npy"), std::ios::binary);
+                g << "not a npy file at all";
+                g.close();
+                int f = -1;
+                const std::string msg = reloadStackFromDisk(s2, &f);
+                fprintf(stderr, "watchselftest: W33 unreadable: %s\n", msg.c_str());
+                check(f == 1 && members(s2) == "0:s_000.npy 1:s_001.npy 2:s_002.npy" &&
+                      seqInfo(s2) && seqInfo(s2)->reloadFailed == 1 &&
+                      seqInfo(s2)->reloadOk == 2,
+                      "W33b a member that exists but will not read stays, and REFUSES");
+                check(!seqReloadNote(s2).empty() && *seqReloadMark(s2),
+                      "W33c ...and the #56 mark is still exactly about that");
+            }
+            {   // (b) every file gone
+                for (int i = 0; i < 3; i++) {
+                    char nm[32];
+                    snprintf(nm, sizeof nm, "s_%03d.npy", i);
+                    std::error_code e3;
+                    std::filesystem::remove(pathFromUtf8(b2 + "/" + nm), e3);
+                }
+                int f = -1;
+                const std::string msg = reloadStackFromDisk(s2, &f);
+                fprintf(stderr, "watchselftest: W33 all gone: %s\n", msg.c_str());
+                check(f == 3 && members(s2) == "0:s_000.npy 1:s_001.npy 2:s_002.npy",
+                      "W33d a rebuild never empties a stack: the frames stay, it refuses");
+            }
+        }
+        {   // ---- W34-W38: the same rule at the SEAM, with no filesystem -------
+            // watch::planRebuild is to §6 what watch::observe is to §1/§4: the
+            // decision, as a function of the name lists it is handed. W26-W33
+            // above drove every one of these through real files (that is where
+            // the red was captured); these state them where a case that cannot
+            // conveniently be built out of a folder can be stated too - W35 is
+            // the one that matters and there is no comfortable way to write it
+            // with a directory.
+            auto V = [](std::initializer_list<const char*> xs) {
+                std::vector<std::string> v;
+                for (const char* x : xs) v.push_back(x);
+                return v;
+            };
+            auto join = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& x : v) s += (s.empty() ? "" : ",") + x;
+                return s;
+            };
+            const std::vector<std::string> HAVE = V({ "a_000.npy", "a_001.npy", "a_002.npy" });
+            {   // ---- W34: gone leaves, named joins, and the ORDER is the open's
+                const std::vector<std::string> listed =
+                    V({ "a_000.npy", "a_001.npy", "a_003.npy" });      // 002 gone, 003 new
+                watch::Rebuild r = watch::planRebuild(HAVE, listed, listed, rp::naturalLess);
+                check(join(r.dropped) == "a_002.npy" && join(r.added) == "a_003.npy" &&
+                      join(r.order) == "a_000.npy,a_001.npy,a_003.npy" && r.any(),
+                      "W34 gone leaves, named joins, and the order is by name");
+                // ...and an arrival that belongs in the MIDDLE is put there. The
+                // stack was opened with a_002 missing, so its members number
+                // 0,1,2 over 000/001/003; when a_002 arrives it is frame 2 and
+                // a_003 goes back to being frame 3. Appended, a_002 would be
+                // frame 3 and a_003 would keep a number that is now a lie.
+                const std::vector<std::string> gap = V({ "a_000.npy", "a_001.npy",
+                                                         "a_003.npy" });
+                const std::vector<std::string> full = V({ "a_000.npy", "a_001.npy",
+                                                          "a_002.npy", "a_003.npy" });
+                watch::Rebuild m = watch::planRebuild(gap, full, full, rp::naturalLess);
+                check(join(m.added) == "a_002.npy" &&
+                      join(m.order) == "a_000.npy,a_001.npy,a_002.npy,a_003.npy",
+                      "W34b an arrival belonging in the middle is numbered in the middle");
+            }
+            {   // ---- W35: the rule may un-name a member; only the DISK removes it
+                // siblingNamesAmong picks the frame axis as the last digit field
+                // that VARIES, so one new file can move that choice and stop
+                // naming members whose files are sitting right there. Dropping
+                // those would delete live frames from a measurement on the
+                // strength of a naming heuristic.
+                const std::vector<std::string> listed =
+                    V({ "a_000.npy", "a_001.npy", "a_002.npy" });      // all present
+                const std::vector<std::string> want = V({ "a_000.npy" });   // rule moved
+                watch::Rebuild r = watch::planRebuild(HAVE, listed, want, rp::naturalLess);
+                check(r.dropped.empty() && r.added.empty() && !r.any() &&
+                      join(r.order) == "a_000.npy,a_001.npy,a_002.npy",
+                      "W35 a member the rule stopped naming STAYS while its file does");
+            }
+            {   // ---- W36: no rule (a derived subset) can lose, never gain ------
+                const std::vector<std::string> listed =
+                    V({ "a_000.npy", "a_002.npy", "a_003.npy", "a_004.npy" });
+                watch::Rebuild r = watch::planRebuild(HAVE, listed, {}, rp::naturalLess);
+                check(join(r.dropped) == "a_001.npy" && r.added.empty() &&
+                      join(r.order) == "a_000.npy,a_002.npy",
+                      "W36 an empty rule loses the gone member and admits nothing");
+                // ANTI-VACUITY: the SAME lists with the folder's rule supplied do
+                // admit them, or W36 is only "planRebuild adds nothing".
+                watch::Rebuild g = watch::planRebuild(HAVE, listed, listed, rp::naturalLess);
+                check(join(g.added) == "a_003.npy,a_004.npy",
+                      "W36b ...and with a rule, those same two files DO join");
+            }
+            {   // ---- W37: the sentence, both directions and both counts --------
+                watch::Rebuild r;
+                r.added = V({ "a_005.npy" });
+                r.dropped = V({ "a_000.npy" });
+                check(watch::rebuildText(r, 5, 5, 5) ==
+                        "membership rebuilt: 1 file(s) appeared in the folder (a_005.npy), "
+                        "1 file(s) no longer exist (a_000.npy) - 5 of 5 frame(s), was 5",
+                      "W37 the sentence names both and states n of N and the before");
+                r.added = V({ "a_005.npy", "a_006.npy" });
+                r.dropped.clear();
+                check(watch::rebuildText(r, 3, 4, 5) ==
+                        "membership rebuilt: 2 file(s) appeared in the folder - "
+                        "4 of 5 frame(s), was 3",
+                      "W37b >1 names none of them, and 4 of 5 is a partial arrival");
+            }
+            {   // ---- W38: nothing moved, nothing said --------------------------
+                const std::vector<std::string> same = HAVE;
+                watch::Rebuild r = watch::planRebuild(HAVE, same, same, rp::naturalLess);
+                check(!r.any() && watch::rebuildText(r, 3, 3, 3).empty() &&
+                      join(r.order) == "a_000.npy,a_001.npy,a_002.npy",
+                      "W38 an untouched folder rebuilds to itself and says nothing");
+            }
+        }
+
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "watchselftest: %s\n", ok ? "ok" : "FAILED");

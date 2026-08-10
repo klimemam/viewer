@@ -815,6 +815,21 @@ struct App {
         // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a
         // reload that changes no shape (docs/reference-design.md §3.2).
         int stackRev = 0;
+        // ---- the rule this stack's MEMBERSHIP came from (watch-design §6) ----
+        // Set at the moment the stack is minted, and only when the file list it
+        // was minted from IS its folder's whole sibling group - i.e. when
+        // findSequenceSiblings(ruleDir/ruleHead) reproduces exactly these
+        // members. Empty = the membership is an EXPLICIT decision (a derived
+        // subset, a hand-picked open, a stack that spans two folders, a
+        // frame-axis file), and §6's rebuild will not re-apply any rule to it.
+        //
+        // Recorded rather than re-derived at Reload time, because at Reload time
+        // the two cases are genuinely indistinguishable: a folder group that
+        // GAINED a file and a subset that never had it look identical from the
+        // listing alone (§11.4 - the detection half decides this once, at the
+        // baseline, for the same reason). A stack with no rule fails towards
+        // doing nothing, never towards re-admitting frames a user excluded.
+        std::string ruleDir, ruleHead;
         // ---- what the LAST reload of this stack left behind (issue #56) ------
         // A reload that refuses one member and re-reads the others does not
         // leave a stack: it leaves frames of TWO moments under one name, and

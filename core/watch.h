@@ -220,20 +220,119 @@ inline bool observe(SetState& st, Obs obs) {
 // remote origin is not watched in this stage, and an unused branch claiming to
 // know how it reads would be the kind of second opinion this function exists to
 // avoid.
+// "3 file(s) changed on disk", "1 file(s) no longer exist (w_004.npy)". ONE
+// spelling of this phrase, because §5's line and §6's Reload summary say the
+// same things about the same files and two spellings of it would drift.
+inline std::string countPhrase(int n, const std::string& first, const char* what) {
+    std::string s = std::to_string(n) + " file(s) " + what;
+    if (n == 1 && !first.empty()) s += " (" + first + ")";
+    return s;
+}
+
 inline std::string findingText(const Finding& f) {
     if (!f.any()) return {};
-    auto part = [](int n, const std::string& first, const char* what) {
-        std::string s = std::to_string(n) + " file(s) " + what;
-        if (n == 1 && !first.empty()) s += " (" + first + ")";
-        return s;
-    };
     std::string s;
-    if (f.changed)  s += part(f.changed,  f.firstChanged,  "changed on disk");
+    if (f.changed)  s += countPhrase(f.changed,  f.firstChanged,  "changed on disk");
     if (f.appeared) s += (s.empty() ? "" : ", ") +
-                         part(f.appeared, f.firstAppeared, "appeared in the folder");
+                         countPhrase(f.appeared, f.firstAppeared, "appeared in the folder");
     if (f.vanished) s += (s.empty() ? "" : ", ") +
-                         part(f.vanished, f.firstVanished, "no longer exist");
+                         countPhrase(f.vanished, f.firstVanished, "no longer exist");
     return s;
+}
+
+// ---- §6: the MEMBERSHIP a Reload rebuilds -----------------------------------
+// Everything above answers "did the files move?". This answers "which files is
+// this stack made of NOW?", and it is the same kind of thing: a decision about
+// names, taken with no filesystem, no decode and no stack, so that the test
+// which pins it needs neither a folder nor a poll interval.
+//
+// Three name lists, which are three different questions, and keeping them apart
+// is the whole content of the function:
+//
+//   have    the stack's members, in the stack's own order
+//   listed  what the directory holds RIGHT NOW (watchScanDir's names)
+//   want    the stack's OWN rule, re-applied to that listing - for a folder
+//           stack, siblingNamesAmong(head, listed), the very function the open
+//           used (§11.3 split it out so both callers can have it)
+//
+// A member LEAVES only when its FILE IS GONE (absent from `listed`), never
+// merely because `want` stopped naming it. Those are not the same statement:
+// siblingNamesAmong picks the frame axis as the last digit field that VARIES,
+// so one new file in a folder can move that choice and un-name members whose
+// files are sitting right there. Dropping those would delete live frames from a
+// measurement on the strength of a naming heuristic. A frame that is gone is not
+// a frame the rule went off.
+//
+// A member JOINS when `want` names it and the stack has not got it. `want` is
+// where §11.4 lives: a stack is not always its folder's whole group (a derived
+// subset is not, and its membership was a decision made at derive time that §6
+// says is never re-applied), and handing such a stack the folder's group here
+// would re-admit exactly the frames its rule excluded. The CALLER decides what
+// this stack's rule is; an empty `want` means "no rule to re-apply", and then
+// the only thing that can happen is a departure.
+struct Rebuild {
+    std::vector<std::string> order;      // the membership AFTER, in stack order
+    std::vector<std::string> added;      // ...the names that joined
+    std::vector<std::string> dropped;    // ...and those whose file is gone
+    bool any() const { return !added.empty() || !dropped.empty(); }
+};
+
+// `less` is the ONE comparator a stack is ever built with - rp::naturalLess, by
+// way of sortFramesNumerically ("frame order is a fact, not a sort"). It is
+// passed in rather than reimplemented here for the reason that function's own
+// comment gives: a second opinion about frame order is a second measurement.
+inline Rebuild planRebuild(const std::vector<std::string>& have,
+                           const std::vector<std::string>& listed,
+                           const std::vector<std::string>& want,
+                           bool (*less)(const std::string&, const std::string&)) {
+    Rebuild r;
+    auto has = [](const std::vector<std::string>& v, const std::string& n) {
+        return std::find(v.begin(), v.end(), n) != v.end();
+    };
+    for (const std::string& n : have) {
+        if (has(listed, n)) r.order.push_back(n);
+        else if (!has(r.dropped, n)) r.dropped.push_back(n);
+    }
+    for (const std::string& n : want) {
+        // `listed` is checked even though `want` is derived from it: a caller
+        // that builds `want` from anything else must not be able to graft a
+        // name that is not on the disk.
+        if (has(have, n) || has(r.added, n) || !has(listed, n)) continue;
+        r.added.push_back(n);
+        r.order.push_back(n);
+    }
+    if (less) {
+        // The order is the OPEN's order, re-derived - not "the old members, then
+        // the new ones". A file that appears into 000/001/003/004 is frame 2 and
+        // has to be numbered 2; appending it would make it frame 4 and silently
+        // re-label the two frames after it.
+        std::sort(r.order.begin(), r.order.end(), less);
+        std::sort(r.added.begin(), r.added.end(), less);
+        std::sort(r.dropped.begin(), r.dropped.end(), less);
+    }
+    return r;
+}
+
+// The sentence the Reload summary carries, and THE guard for it (findingText's
+// discipline: the panel and the selftest read one string).
+//
+// BOTH counts, always. A rebuild that changed the member list and did not say
+// the new numbers leaves a stack quietly measuring a different set - and the
+// count alone is not the fact either: one file gone and one arrived leaves the
+// count where it was, so the names come first and the numbers after.
+// `resident` of `expected` is the same n-of-N the stack's own header states.
+inline std::string rebuildText(const Rebuild& r, int before, int resident, int expected) {
+    if (!r.any()) return {};
+    std::string s = "membership rebuilt: ";
+    std::string parts;
+    if (!r.added.empty())
+        parts += countPhrase((int)r.added.size(), r.added.front(),
+                             "appeared in the folder");
+    if (!r.dropped.empty())
+        parts += (parts.empty() ? "" : ", ") +
+                 countPhrase((int)r.dropped.size(), r.dropped.front(), "no longer exist");
+    return s + parts + " - " + std::to_string(resident) + " of " +
+           std::to_string(expected) + " frame(s), was " + std::to_string(before);
 }
 
 }   // namespace watch

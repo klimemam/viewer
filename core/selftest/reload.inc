@@ -296,9 +296,18 @@
             int failed = 0;
             std::string msg = reloadStackFromDisk(seqA, &failed);
             fprintf(stderr, "reloadselftest: R14 summary: %s\n", msg.c_str());
-            check(failed == 1 && msg.rfind("reloaded 4 frame(s), 1 failed", 0) == 0 &&
-                  msg.find("a_003.npy") != std::string::npos,
-                  "R14b stack reload counts both directions, names the error");
+            // The STACK-level reload does not meet that refusal at all any more
+            // (watch-design §6): a member whose file is gone leaves the
+            // membership before a byte is read, so four frames re-read, none
+            // refuses, and the summary states the new member list. R14a above
+            // is the same file through reloadSource, which is the function that
+            // still has to refuse it - one source, one file, and no membership
+            // to speak about.
+            check(failed == 0 && msg.rfind("reloaded 4 frame(s), 0 failed", 0) == 0 &&
+                  msg.find("1 file(s) no longer exist (a_003.npy)") != std::string::npos &&
+                  msg.find("4 of 4 frame(s), was 5") != std::string::npos &&
+                  (int)framesOfSeq(seqA).size() == 4,
+                  "R14b a member whose file is gone LEAVES; the summary says so");
             // the walk also refreshed the loose frame sharing a_002's source -
             // pixels OUTSIDE this stack changed, and the summary must say so
             check(msg.find("also refreshed 1 shared frame(s) in \"loose.npy\"")
@@ -588,7 +597,17 @@
                       windowTitleText().find("(reload failed)") == std::string::npos,
                       "R25a a clean reload marks nothing, anywhere");
             }
-            std::filesystem::remove(pathFromUtf8(mstk + "/e_002.npy"), ec);
+            // The member is made UNREADABLE, not deleted, and the difference is
+            // this test's whole subject since watch-design §6 landed: a file
+            // that is GONE leaves the membership (the stack that remains is of
+            // one moment, and --watch-selftest W26 pins that), while a file that
+            // is THERE and will not decode leaves a member holding pixels of an
+            // older moment beside four that were just re-read. THAT is the seam
+            // #56 is about, and it is what the mark has to say.
+            {
+                std::ofstream bad(pathFromUtf8(mstk + "/e_002.npy"), std::ios::binary);
+                bad << "this is not a .npy file";
+            }
             int f25 = 0;
             std::string msg25 = reloadStackFromDisk(seqE, &f25);
             fprintf(stderr, "reloadselftest: R25 summary: %s\n", msg25.c_str());

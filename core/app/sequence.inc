@@ -347,6 +347,30 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
     // printed "n=5/5" while the loader was still decoding frames 6..24.
     info.expectedFrames = (int)files.size();
     info.lastImageIdx = imageIdx;
+    {   // watch-design §6: IS this file list the folder's whole sibling group?
+        // Only a stack of which that is true may have the rule re-applied by a
+        // Reload and admit files that appeared (§11.4: a picker can hand this
+        // function three of a folder's five, and re-admitting the other two
+        // would undo the user's own choice).
+        //
+        // Asked HERE, once per stack, and answered by RUNNING the rule rather
+        // than by a flag threaded through the six call sites - being wrong at
+        // one of those is a stack that silently re-admits excluded frames, and
+        // the cost is one directory listing per stack opened (the same listing
+        // this open already took once, on a folder it has in cache).
+        const std::filesystem::path p0 = pathFromUtf8(files[0]);
+        std::string pat2;
+        std::vector<std::string> sib = findSequenceSiblings(files[0], pat2);
+        std::vector<std::string> a, b;
+        for (const std::string& f : files) a.push_back(baseName(f));
+        for (const std::string& f : sib)   b.push_back(baseName(f));
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        if (!b.empty() && a == b && !p0.parent_path().empty()) {
+            info.ruleDir = p0.parent_path().u8string();
+            info.ruleHead = p0.filename().u8string();
+        }
+    }
     app.seqs.push_back(info);
     ref->seqId = info.id;
     // position of the already-open frame inside the file list

@@ -449,6 +449,43 @@ static std::string reloadUnavailable(const FrameSource& S) {
     return {};
 }
 
+// Everything computed FROM a stack that a change to that stack kills, in one
+// place. Called once per affected stack by the reload walk below (a member's
+// pixels were swapped) and once by the membership rebuild (the member LIST
+// moved) - the two are the same event as far as anything derived from the stack
+// is concerned, and a second copy of this list is how one of them would come to
+// be missing a row. Returns true when a linearity row was dropped, so a whole
+// walk can call linFitStale ONCE.
+static bool invalidateStackDerived(int sid) {
+    bool linHit = false;
+    if (App::SeqInfo* si = seqInfo(sid)) si->stackRev++;   // the temporal key
+    // §10.1: reduced frames (frame average / sum) recorded this key at compute
+    // time. The bump is the event that makes them describe pixels that no longer
+    // exist, so the mark is LATCHED here, at the event - a stack reloaded and
+    // then closed cannot take the fact with it. The picture itself never
+    // recomputes behind the user: silent recompute is silent overwrite, and
+    // Recompute is the user's move.
+    for (auto& rd : app.images)
+        if (!rd->avgOfPath.empty() && rd->avgSeqId == sid) rd->avgStale = true;
+    // ...and the same event for a preprocessor product, which is the same kind
+    // of thing one layer up: a whole stack computed from this one, now
+    // describing pixels the disk no longer holds. Latched, not recomputed -
+    // remaking it is the user's move, from the source stack's own menu.
+    for (auto& ps : app.seqs)
+        if (ps.dt.made() && ps.dt.srcSeqId == sid) ps.dt.stale = true;
+    // a server aggregate naming this stack now describes dead pixels: re-fire
+    // it (same shape as seqMosaicChanged above)
+    if (app.srvTemporal.seqId == sid) requestServerTemporal(sid, app.srvTemporal);
+    if (app.srvTemporalB.seqId == sid) requestServerTemporal(sid, app.srvTemporalB);
+    // the linearity rows measured over this stack describe the old pixels: drop
+    // them - rows of untouched stacks keep their live numbers - and the fit that
+    // included them goes too (closeStack's discipline)
+    for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
+        if (it->seqId == sid) { it = app.lin.rows.erase(it); linHit = true; }
+        else ++it;
+    return linHit;
+}
+
 // THE one place pixels are replaced in place. Re-decodes a source from its own
 // provenance (path + member + fileFrame + raw recipe), swaps the result into
 // the SAME FrameSource, then walks every membership that shares it: dataRev,
@@ -713,35 +750,165 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
             seqIds.push_back(d->seqId);
     }
     bool linHit = false;
-    for (int sid : seqIds) {
-        if (App::SeqInfo* si = seqInfo(sid)) si->stackRev++;   // the temporal key
-        // §10.1: reduced frames (frame average / sum) recorded this key at
-        // compute time. The bump is the event that makes them describe pixels
-        // that no longer exist, so the mark is LATCHED here, at the event -
-        // a stack reloaded and then closed cannot take the fact with it. The
-        // picture itself never recomputes behind the user: silent recompute
-        // is silent overwrite, and Recompute is the user's move.
-        for (auto& rd : app.images)
-            if (!rd->avgOfPath.empty() && rd->avgSeqId == sid) rd->avgStale = true;
-        // ...and the same event for a preprocessor product, which is the same
-        // kind of thing one layer up: a whole stack computed from this one, now
-        // describing pixels the disk no longer holds. Latched, not recomputed -
-        // remaking it is the user's move, from the source stack's own menu.
-        for (auto& ps : app.seqs)
-            if (ps.dt.made() && ps.dt.srcSeqId == sid) ps.dt.stale = true;
-        // a server aggregate naming this stack now describes dead pixels:
-        // re-fire it (same shape as seqMosaicChanged above)
-        if (app.srvTemporal.seqId == sid) requestServerTemporal(sid, app.srvTemporal);
-        if (app.srvTemporalB.seqId == sid) requestServerTemporal(sid, app.srvTemporalB);
-        // the linearity rows measured over this stack describe the old pixels:
-        // drop them - rows of untouched stacks keep their live numbers - and
-        // the fit that included them goes too (closeStack's discipline)
-        for (auto it = app.lin.rows.begin(); it != app.lin.rows.end();)
-            if (it->seqId == sid) { it = app.lin.rows.erase(it); linHit = true; }
-            else ++it;
-    }
+    for (int sid : seqIds) linHit |= invalidateStackDerived(sid);
     if (linHit) linFitStale();
     return true;
+}
+
+// ---- §6: the membership a Reload rebuilds -----------------------------------
+// One directory's file NAMES. The same listing watchScanDir takes, without the
+// stat: what a rebuild wants from a folder is which names are IN it - whether
+// their bytes moved is reloadSource's question, and it answers that by re-reading
+// them.
+static std::vector<std::string> stackDirNames(const std::string& dir) {
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec)) {
+        std::error_code ec2;
+        if (!e.is_regular_file(ec2)) continue;
+        names.push_back(e.path().filename().u8string());
+    }
+    return names;
+}
+
+// What a Reload has to do to THIS stack's member list, decided before a byte is
+// read. The three lists watch::planRebuild wants, assembled from the stack:
+//
+//   have    the members' basenames, in seqIndex order
+//   listed  the ones whose file is still there, plus every name in the stack's
+//           own directory when it HAS a rule (that is where an arrival can come
+//           from at all)
+//   want    the stack's own rule re-applied - and ONLY for a stack that
+//           recorded one (SeqInfo::ruleHead, set at mint time when the stack was
+//           its folder's whole sibling group). A derived subset records none,
+//           gets an empty `want`, and therefore can lose a member whose file is
+//           gone but can never be handed back the frames its rule excluded.
+//
+// Two stacks answer "no rebuild at all", and both are refusals of the same
+// kind - the name rule has nothing to say about them:
+//   - a stack whose members do not have one file each (a frame-axis .npy is F
+//     memberships of ONE path): "which names are members" is not a question
+//     about that stack's names;
+//   - a stack with a member that has no local file (remote-backed, montage,
+//     plugin output): it never had a file to lose.
+static watch::Rebuild planStackMembership(int seqId) {
+    watch::Rebuild none;
+    std::vector<std::string> have;
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return none;
+    const std::vector<int> fr = framesOfSeq(seqId);
+    if (fr.empty()) return none;
+    std::vector<std::string> paths;
+    for (int idx : fr) {
+        const FrameSource& s = *app.images[idx]->src;
+        const bool localUrl = !s.remoteUrl.empty() && s.remoteUrl.rfind("local://", 0) == 0;
+        if (!s.remoteUrl.empty() && !localUrl) return none;      // a peer's pixels
+        const std::string p = localUrl ? s.remoteUrl.substr(8) : s.path;
+        if (p.empty()) return none;                              // composed here
+        paths.push_back(p);
+        have.push_back(baseName(p));
+    }
+    {   // one file per frame, or the names are not the membership
+        std::vector<std::string> u = have;
+        std::sort(u.begin(), u.end());
+        if (std::unique(u.begin(), u.end()) != u.end()) return none;
+    }
+    std::vector<std::string> listed;
+    for (size_t k = 0; k < paths.size(); k++) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(pathFromUtf8(paths[k]), ec))
+            listed.push_back(have[k]);
+    }
+    std::vector<std::string> want;
+    if (!si->ruleHead.empty() && !si->ruleDir.empty()) {
+        const std::vector<std::string> names = stackDirNames(si->ruleDir);
+        std::string pat;
+        want = siblingNamesAmong(si->ruleHead, names, pat);
+        for (const std::string& n : names)
+            if (std::find(listed.begin(), listed.end(), n) == listed.end() &&
+                std::find(want.begin(), want.end(), n) != want.end())
+                listed.push_back(n);
+    }
+    return watch::planRebuild(have, listed, want, rp::naturalLess);
+}
+
+// A file JOINING an open stack, decoded the way that stack's own frames were
+// (§6 step 2). WHICH DOOR is decided by the reference frame's provenance and
+// never by the new file's name - one stack is one kind of thing (§6.2) - and the
+// order of the tests is startSequenceLoad's worker's own, because it is the same
+// decision made in the same order. Returns null and a reason; the caller counts
+// it exactly as the loader counts a sibling that would not read.
+static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
+                                                     const std::string& path,
+                                                     std::string& errOut) {
+    const FrameSource& R = *ref.src;
+    const bool isRaw = R.rawDtype >= 0;
+    std::unique_ptr<ImageDoc> doc;
+    bool adopted = false;
+    {   // §6.2: the registry BEFORE the decode. This very file may already be
+        // resident (the same folder opened twice, a derived stack beside its
+        // source), and decoding it again would put two copies of identical
+        // pixels in RAM under two srcIds.
+        FrameSource probe;
+        probe.path = path;
+        if (isRaw) {
+            probe.rawDtype = R.rawDtype; probe.rawInterp = R.rawInterp;
+            probe.rawOffset = R.rawOffset; probe.rawLE = R.rawLE;
+            probe.srcW = R.srcW > 0 ? R.srcW : R.w;
+            probe.srcH = R.srcH > 0 ? R.srcH : R.h;
+        }
+        statSourceFile(probe);
+        if (probe.mtime || probe.fsize) {
+            const std::string key = srcIdentityKey(probe);     // IO: before the lock
+            std::lock_guard<std::mutex> lk(g_srcRegMtx);
+            if (std::shared_ptr<FrameSource> hit = srcRegistryFindLocked(key)) {
+                doc = std::make_unique<ImageDoc>();
+                doc->src = std::move(hit);
+                doc->name = baseName(path);
+                doc->note = ref.note;
+                doc->syncMirrors();
+                adopted = true;
+            }
+        }
+    }
+    std::string err;
+    if (!doc) {
+        if (isRaw) {
+            RawDialog d;
+            d.path = path;
+            d.dtype = R.rawDtype; d.interp = R.rawInterp;
+            d.offset = R.rawOffset; d.littleEndian = R.rawLE;
+            d.w = R.srcW > 0 ? R.srcW : R.w;
+            d.h = R.srcH > 0 ? R.srcH : R.h;
+            d.cfaPattern = ref.cfaPattern & 3;
+            d.replaceIdx = -1;
+            doc = decodeRawFrame(d, err);
+        } else if (imagefile::forPath(R.path)) {
+            doc = decodeImageFileFrame(path, err);
+        } else {
+            doc = decodeNpy(path, err);
+        }
+    }
+    // ...and the shape this stack IS. Same refusal, in the same words, as the
+    // loader's: a stack whose frames are not the same picture measured again is
+    // not a stack, and a member that joined on a Reload must clear the same bar
+    // as one that joined at the open.
+    if (doc) {
+        std::string bad = stackShapeRefusal(doc->w, doc->h, doc->ch, ref.w, ref.h, ref.ch,
+                                            baseName(R.path));
+        if (!bad.empty()) { err = bad; doc.reset(); }
+    }
+    if (!doc) { errOut = err.empty() ? "decode failed" : err; return nullptr; }
+    if (!adopted) {
+        computeMinMax(*doc);
+        const std::string addKey = srcIdentityKey(*doc->src);   // IO: before the lock
+        std::lock_guard<std::mutex> lk(g_srcRegMtx);
+        if (std::shared_ptr<FrameSource> live = srcRegistryAddLocked(doc->src, addKey)) {
+            doc->src = std::move(live);
+            doc->syncMirrors();
+        }
+    }
+    return doc;
 }
 
 // Files right-click on a stack header: every member's source, re-read from
@@ -757,6 +924,34 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
     int ok = 0, failed = 0, dims = 0, sharedN = 0;
     std::string firstErr, firstDims;
     std::vector<std::string> sharedNames;  // distinct holders, first one is named
+    // ---- §6 step 1-2a: the member list, BEFORE a byte is read ---------------
+    // The departures happen first, and that is not an implementation detail: a
+    // member whose file is GONE would otherwise reach reloadSource, be refused
+    // ("cannot read file"), and be counted as a REFUSAL - which would mark the
+    // stack as holding frames of two moments (#56) when what actually happened
+    // is that it now holds four frames of one moment. A frame that is gone is
+    // not a frame that failed to read, and the difference is the whole of what
+    // the mark means.
+    const int hadBefore = (int)framesOfSeq(seqId).size();
+    watch::Rebuild plan = planStackMembership(seqId);
+    if ((int)plan.dropped.size() >= hadBefore) plan = watch::Rebuild{};
+                                          // ...and a rebuild NEVER empties a
+                                          // stack. "Every file is gone" is not
+                                          // something a click on Reload may
+                                          // silently do to a measurement: the
+                                          // frames stay, every member refuses
+                                          // below, and the #56 mark says so.
+    if (!plan.dropped.empty()) {
+        std::vector<int> gone;
+        for (int idx : framesOfSeq(seqId))
+            if (std::find(plan.dropped.begin(), plan.dropped.end(),
+                          baseName(app.images[idx]->src->path)) != plan.dropped.end())
+                gone.push_back(idx);
+        // closeImages, exactly as §6 says: the membership goes, the SOURCE only
+        // dies if nothing else references it, and the pins/selection/series
+        // pruning this stack's frames need is the pruning any close does.
+        closeImages(gone);
+    }
     for (int idx : framesOfSeq(seqId)) {
         const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
         if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
@@ -789,6 +984,73 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
                                             : baseName(s->path)) + ": " + err;
         }
     }
+    // ---- §6 step 2b-3: the arrivals, then the numbers -----------------------
+    // AFTER the re-read, so a joining frame is measured against the reference
+    // frame's CURRENT shape rather than the shape it had a moment ago.
+    int joinFailed = 0;
+    std::string firstJoinErr;
+    if (!plan.added.empty()) {
+        const std::vector<int> fr = framesOfSeq(seqId);
+        const ImageDoc* ref = fr.empty() ? nullptr : app.images[fr.front()].get();
+        std::string dir;
+        if (const App::SeqInfo* si = seqInfo(seqId)) dir = si->ruleDir;
+        for (const std::string& n : plan.added) {
+            if (!ref || dir.empty()) break;
+            std::string err;
+            std::unique_ptr<ImageDoc> nd =
+                decodeJoiningMember(*ref, dir + "/" + n, err);
+            if (!nd) {
+                // NOT counted with the re-read refusals, and this is the same
+                // distinction #56 rests on: a file the rule NAMES but cannot
+                // decode (a sibling of another shape, a half-written frame) was
+                // never a member, so it leaves no seam between two moments in
+                // this stack and must not raise the (reload failed) mark. What
+                // it does raise is the ratio the loader raises for exactly this
+                // case: expectedFrames counts the names, the membership counts
+                // what decoded, and the Files row says "4/5f" until it reads.
+                // That statement outlives the toast, which is the point.
+                joinFailed++;
+                if (firstJoinErr.empty()) firstJoinErr = n + ": " + err;
+                continue;
+            }
+            // the per-membership half (§2.1), inherited from the reference frame
+            // exactly as pumpSequence inherits it for a frame that lands from
+            // the loader: the same range, the same mosaic, the same batch, or
+            // the new frame is not comparable with the ones beside it
+            nd->name = baseName(n);
+            nd->seqId = seqId;
+            nd->batchId = ref->batchId;
+            nd->black = ref->black; nd->white = ref->white;
+            nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
+            nd->cfaColorize = ref->cfaColorize;
+            nd->displayLut = ref->displayLut;
+            nd->texDirty = true;
+            nd->uid = app.nextUid++;
+            app.images.push_back(std::move(nd));
+            app.imagesRev++;
+        }
+    }
+    if (plan.any()) {
+        // §6 step 3: seqIndex re-issued over the rebuilt list, and it is the
+        // OPEN's own numbering - position in the natural-order member list, so a
+        // frame that arrived in the middle is numbered in the middle and a gap
+        // is left exactly where the open would leave one (a named member that
+        // would not decode).
+        for (int idx : framesOfSeq(seqId)) {
+            const std::string n = baseName(app.images[idx]->src->path);
+            auto it = std::find(plan.order.begin(), plan.order.end(), n);
+            if (it != plan.order.end())
+                app.images[idx]->seqIndex = (int)(it - plan.order.begin());
+        }
+        if (App::SeqInfo* si = seqInfo(seqId)) si->expectedFrames = (int)plan.order.size();
+        // The member LIST moved, so everything keyed on the stack AS A SET has
+        // to move with it - the sigma_t of four frames is not the sigma_t of
+        // five even when not one member's pixels changed. Same call the pixel
+        // walk makes, for the same reason (§3.2 / §10.1).
+        if (invalidateStackDerived(seqId)) linFitStale();
+        // ...and the watcher's target list is now a different set of files.
+        app.watchTargetsDirty = true;
+    }
     if (failedOut) *failedOut = failed;
     // ---- #56: what this attempt LEAVES ON the stack ------------------------
     // The summary below is a toast, and a toast scrolls away. A reload that
@@ -819,6 +1081,22 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
     char buf[256];
     snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed", ok, failed);
     std::string msg = buf;
+    // §6: the member list moved, so the summary says so, with the names and
+    // with both counts. A stack that quietly measures a different set of frames
+    // than it did a second ago is the failure this sentence exists to prevent -
+    // and the count alone would not prevent it, because one file gone and one
+    // arrived leaves the count exactly where it was.
+    if (plan.any()) {
+        const App::SeqInfo* si = seqInfo(seqId);
+        msg += " - " + watch::rebuildText(plan, hadBefore,
+                                          (int)framesOfSeq(seqId).size(),
+                                          si ? si->expectedFrames : 0);
+        if (joinFailed) {
+            snprintf(buf, sizeof buf, " - %d file(s) the rule names did not read (%s)",
+                     joinFailed, firstJoinErr.c_str());
+            msg += buf;
+        }
+    }
     // ...and the toast points at the mark it just left, because the mark is
     // the part that outlives the toast: a user who reads only this line must
     // still learn that the stack now carries the fact, and where.
