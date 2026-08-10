@@ -271,9 +271,10 @@ F10 は特に読む値打ちがある —— **設定にしないと決めた記
 
 2つ、名指しに値するもの:
 
-- **Blink (`CmpFlip`) には CLI も prefs も無い。** `--compare` は
-  `off|wipe|split|diff` の4つしか受けず、5つ目の Blink はメニューを
-  クリックする以外に到達できない。
+- **Blink (`CmpFlip` = 4) には CLI も prefs も無い。** `--compare` は
+  `off|wipe|split|diff` の4つしか受けず (`core/app/cli.inc:723`)、5つ目の
+  Blink はメニューをクリックする (か、そうして保存したセッションを開き直す)
+  以外に到達できない。**起動時から Blink** という指定が存在しない。
 - **Browse のソート列/向きだけが完全に揮発する。** `rbFlat`/`rbTree`/
   `rbNatural` は prefs.txt に載るのに、同じテーブルのソートは載らない。
 
