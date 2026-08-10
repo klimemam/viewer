@@ -1667,7 +1667,14 @@ struct App {
     bool readerListOpen = false;            // §4.12's visible, removable list
     char readerPickFile[512] = "";
     char readerPickFunc[128] = "load";
-    char readerLocalDir[512] = "";          // a folder of the user's own readers
+    // §4.13.2 (issue #51): the places readers are looked for, in the order the
+    // user registered them. A place is a FILE (that one reader) or a FOLDER
+    // (every .py in it) - which of the two is asked of the DISK at the moment of
+    // the look and never stored, because a stored kind is a second copy of a
+    // fact the filesystem already owns and the two disagree the day a folder is
+    // replaced by a file. Before this there was one folder here and one
+    // hard-coded shipped one, so a second location could not be found at all.
+    std::vector<std::string> readerPlaces;
     std::string readerPickWhy;              // why we are asking (native's own refusal)
     // The last run, kept WHOLE. A traceback is the only debugging surface an
     // adapter author has; folding it into "could not open" makes the feature
@@ -1683,9 +1690,11 @@ struct App {
     // comment states, skipped the one-at-a-time guard every other dialog has,
     // and left anyFileDialog() saying "no dialog" while one was on screen.
     std::unique_ptr<pfd::open_file>     rdOpenDlg;
-    int rdOpenMode = 0;               // 0 = pick a reader .py, 1 = open a file with one
+    int rdOpenMode = 0;               // 0 = pick a reader .py, 1 = open a file with one,
+                                      // 2 = register one .py as a place (§4.13.2)
     std::unique_ptr<pfd::select_folder> rdFolderDlg;
-    int rdFolderMode = 0;             // 0 = the folder of readers, 1 = open a folder with one
+    int rdFolderMode = 0;             // 0 = register a folder of readers (§4.13.2),
+                                      // 1 = open a folder with one
     std::unique_ptr<pfd::save_file>     rdNewDlg;   // where to write the template
     // A reader runs for as long as the user's data takes. Waiting for it on the
     // UI thread made the whole window stop answering - up to the five-minute

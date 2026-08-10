@@ -976,7 +976,12 @@ static void writePrefsTo(std::ostream& f) {
     for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
     for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
     if (!app.pythonExe.empty()) f << "pythonexe " << app.pythonExe << "\n";
-    if (app.readerLocalDir[0]) f << "readerdir " << app.readerLocalDir << "\n";
+    // §4.13.2: the registered reader places, IN ORDER - the order is the setting
+    // as much as the paths are, because first-match-wins is only answerable when
+    // the order holds still. ("readerdir", the single folder these replaced, is
+    // read once more below and then written out here as a place; it is never
+    // written again, so an old prefs.txt is migrated by being loaded and saved.)
+    for (const auto& p : app.readerPlaces) f << "readerplace " << p << "\n";
     // §4.12: path -> reader, most recent first. A TAB separates them because
     // both halves can contain spaces and only one of them can contain a tab
     // (no filesystem this tool runs on puts one in a path).
@@ -1071,7 +1076,8 @@ static void loadPrefs() {
         else if (key == "rbnatural")   { ls >> v; app.rbNatural = v != 0; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent" ||
-                 key == "pythonexe" || key == "readerfor" || key == "readerdir") {
+                 key == "pythonexe" || key == "readerfor" || key == "readerdir" ||
+                 key == "readerplace") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
@@ -1081,8 +1087,17 @@ static void loadPrefs() {
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
             else if (key == "pythonexe") app.pythonExe = s;
-            else if (key == "readerdir")
-                snprintf(app.readerLocalDir, sizeof app.readerLocalDir, "%s", s.c_str());
+            // The one folder that "readerplace" replaced (§4.13.2). Still read,
+            // and read as the FIRST place, so an existing prefs.txt keeps
+            // finding the readers it was finding yesterday. It is not written
+            // back under this key, so the migration completes on the next save
+            // - and it is deduplicated, because loadPrefs is called twice in one
+            // process by the selftests and appending would double the list.
+            else if (key == "readerdir" || key == "readerplace") {
+                bool dup = false;
+                for (const auto& q : app.readerPlaces) if (q == s) dup = true;
+                if (!dup && app.readerPlaces.size() < 32) app.readerPlaces.push_back(s);
+            }
             else if (key == "readerfor") {
                 // The cap is enforced on the way IN as well as on the way out:
                 // a prefs file edited by hand (or written by a future version
@@ -1162,6 +1177,241 @@ static std::string runAdapterScript() {
     return {};
 }
 
+// ---- where readers are looked for (docs/input-adapters.md §4.13.2) ----------
+// The ruling on issue #51 (2026-08-10): 「reader のファイルもしくはフォルダを
+// 登録できるようにすればよいですかね.」 Before it the search path was ONE user
+// folder plus one hard-coded folder beside the harness, so a person with
+// readers in two places - a project's, a team share, the one odd file in a
+// scratch directory - simply could not be found. Now the places are a LIST, a
+// place is a file or a folder, and the list is the user's, in their order.
+static const size_t READER_PLACES_MAX = 32;
+
+struct ReaderPlace {
+    std::string path;
+    bool shipped = false;      // the adapters beside the harness; always last
+    bool exists  = false;      // a registered place that has gone away is REPORTED
+    bool isDir   = false;
+    int  readers = 0;          // .py files in it, when it is a folder that is there
+};
+
+// What a place offers. A folder offers every .py in it (sorted, so the list a
+// user reads is the list twice running); a file offers itself, whatever it is
+// called - they registered that file, and second-guessing the name here would
+// be this function inventing a rule the user did not ask for.
+static std::vector<std::string> readersInPlace(const ReaderPlace& p) {
+    std::vector<std::string> out;
+    if (!p.exists) return out;                  // nothing, and the caller says so
+    if (!p.isDir) { out.push_back(p.path); return out; }
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(p.path), ec)) {
+        if (!e.is_regular_file(ec) || e.path().extension() != ".py") continue;
+        out.push_back(e.path().u8string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static ReaderPlace statReaderPlace(const std::string& path, bool shipped) {
+    ReaderPlace p;
+    p.path = path;
+    p.shipped = shipped;
+    std::error_code ec;
+    auto st = std::filesystem::status(pathFromUtf8(path), ec);
+    p.exists = std::filesystem::exists(st);
+    p.isDir  = std::filesystem::is_directory(st);
+    if (p.exists) p.readers = (int)readersInPlace(p).size();
+    return p;
+}
+
+// Every place, IN SEARCH ORDER: the registered ones first, in the order the user
+// registered them, and the folder that ships with the viewer last.
+//
+// Why registered-first. The shipped adapters are examples, and the tree they sit
+// in is what an update replaces. If shipped won, an update that added a
+// `npz_keys.py` would take that name away from the user's own `npz_keys.py` -
+// their readings would change with nobody having touched a setting. The other
+// way round an update can never shadow anything: yours beats ours, always. It
+// is also the only order that leaves an override possible at all, since a
+// packaged install may be read-only.
+//
+// Why the user's own order rather than alphabetical or newest-first: it is the
+// only order they can both see AND control, and first-match-wins is only
+// answerable when the order holds still.
+static std::vector<ReaderPlace> readerSearchPath() {
+    std::vector<ReaderPlace> out;
+    for (const auto& p : app.readerPlaces) out.push_back(statReaderPlace(p, false));
+    std::string script = runAdapterScript();
+    if (!script.empty())
+        out.push_back(statReaderPlace(
+            (pathFromUtf8(script).parent_path() / "adapters").u8string(), true));
+    return out;
+}
+
+// "Here is where I looked" - a LIST, not a single guess. §3.2's rule for
+// anything that cannot be found is that the program says what it looked for, and
+// for a search path that means every place, in order, with what is in each and
+// WHICH ONES ARE NOT THERE ANY MORE. A registered folder that has gone away is
+// the failure this report exists for: dropping it silently would leave a user
+// staring at a viewer that stopped finding readers it found last week.
+static std::string readerPlacesReport(const std::vector<ReaderPlace>& places) {
+    size_t reg = 0;
+    for (const auto& p : places) if (!p.shipped) reg++;
+    std::string s = "  looked in " + std::to_string(places.size()) + " place(s): " +
+                    std::to_string(reg) + " registered, in the order they were registered" +
+                    (places.size() > reg ? ", then the one that ships with the viewer" : "") +
+                    ":\n";
+    if (places.empty()) s += "    (none - no place has been registered and this build "
+                             "has no tools/import/adapters beside it)\n";
+    int n = 0;
+    for (const auto& p : places) {
+        std::string what = !p.exists
+            ? std::string("MISSING - registered, but not there now")
+            : p.isDir ? ("folder, " + std::to_string(p.readers) + " reader(s)")
+                      : std::string("file");
+        if (p.shipped) what += ", ships with the viewer";
+        s += "    " + std::to_string(++n) + ". " + dispPath(p.path) + "  (" + what + ")\n";
+    }
+    return s;
+}
+
+// A panel redraws at the frame rate, and a place can be a share that has gone
+// away - a stat() on one of those blocks for seconds. Walking up to 32 of them
+// sixty times a second would wedge the window on exactly the machine this
+// feature exists for. So the DRAWING side reads a snapshot refreshed at most
+// twice a second, or the moment the list itself changes: a reader saved in an
+// editor still shows up within half a second, so §4.13.0's loop is untouched,
+// and a button press is never waiting on a timer. Only the drawing uses this -
+// resolving a reader for a run takes the live answer, every time.
+static unsigned g_readerPlacesRev = 0;      // bumped by every edit to the list
+struct ReaderPlaceView { ReaderPlace place; std::vector<std::string> readers; };
+static const std::vector<ReaderPlaceView>& readerPlacesForUi() {
+    static std::vector<ReaderPlaceView> cache;
+    static double at = -1e9;
+    static unsigned rev = (unsigned)-1;
+    double t = nowSec();
+    if (rev != g_readerPlacesRev || t - at > 0.5) {
+        cache.clear();
+        for (const auto& p : readerSearchPath()) cache.push_back({ p, readersInPlace(p) });
+        at = t;
+        rev = g_readerPlacesRev;
+    }
+    return cache;
+}
+
+// The result of looking a reader up by name. `shadowed` is not decoration: under
+// first-match-wins the answer to "which acme.py ran?" is a fact about the ORDER,
+// and an order that decides in silence is the guess this repo refuses everywhere
+// else.
+struct ReaderLookup {
+    std::string file;                     // resolved; empty means it was not found
+    std::string place;                    // the place it came from
+    std::vector<std::string> shadowed;    // the same name, later in the order
+    std::string why;                      // the whole refusal, when file is empty
+};
+
+static bool readerSpecNamesAPath(const std::string& f) {
+    return f.find('/') != std::string::npos || f.find('\\') != std::string::npos;
+}
+
+// Turn the FILE half of a spec into a path that exists, or into the sentence
+// saying why not.
+//
+// A spec that names a PATH is used as it stands. That is what the memory holds
+// (§4.12), so registering a place can never change how an already-remembered
+// file opens: registration is additive BY CONSTRUCTION, not by promise.
+//
+// A spec that is a BARE NAME is looked up along the search path, and the FIRST
+// MATCH WINS. The alternative - refusing on a name collision - was rejected
+// because it makes registering a place a DESTRUCTIVE act: add a folder that
+// happens to hold a `util.py` and every already-working `util.py` stops. What
+// the collision gets instead is a name: the loser is listed, here and in the
+// panel, so "why did that one run?" always has an answer.
+static ReaderLookup resolveReaderFile(const std::string& spec) {
+    ReaderLookup r;
+    std::string want = readerFileOf(spec);
+    std::vector<ReaderPlace> places = readerSearchPath();
+    std::error_code ec;
+    if (readerSpecNamesAPath(want)) {
+        if (std::filesystem::is_regular_file(pathFromUtf8(want), ec)) { r.file = want; return r; }
+        // The remembered reader is gone - the other half of what issue #51 asked
+        // ("リーダのファイルが消えたとき憶えている対応をどうするか"). We do NOT
+        // quietly run a different file of the same name: §4.13 says only an
+        // explicitly chosen reader runs, and a substitution made behind the
+        // user's back is precisely that. Name the candidate and let them pick it
+        // - one click, and the pick re-remembers this file against what ran.
+        std::string base = baseName(want);
+        std::vector<std::string> also;
+        for (const auto& p : places)
+            for (const auto& f : readersInPlace(p))
+                if (baseName(f) == base) also.push_back(f);
+        r.why = base + ": the reader this file was opened with is not there any more\n"
+                "  " + dispPath(want) + "  (remembered, gone)\n" + readerPlacesReport(places);
+        if (!also.empty()) {
+            r.why += "  a file named " + base + " IS registered:\n";
+            for (const auto& f : also) r.why += "    " + dispPath(f) + "\n";
+            r.why += "  choose it in the Reader panel - nothing runs until you do";
+        } else {
+            r.why += "  register the file, or the folder it moved to: Reader panel > "
+                     "where readers are looked for > Add file... / Add folder...";
+        }
+        return r;
+    }
+    for (const auto& p : places)
+        for (const auto& f : readersInPlace(p))
+            if (baseName(f) == want) {
+                if (r.file.empty()) { r.file = f; r.place = p.path; }
+                else r.shadowed.push_back(f);
+            }
+    if (!r.file.empty()) return r;
+    r.why = want + ": no registered place holds a reader by that name\n" +
+            readerPlacesReport(places) +
+            "  register the file, or the folder it is in: Reader panel > "
+            "where readers are looked for > Add file... / Add folder...";
+    return r;
+}
+
+// Registering is additive and idempotent, and it refuses a path that is not
+// there RIGHT NOW - the one moment we can tell the user something useful about
+// it. (A place that vanishes later is reported by readerPlacesReport, not
+// dropped: the user put it there, and a share that is offline this morning is
+// back this afternoon.)
+static bool registerReaderPlace(const std::string& path, std::string* why) {
+    std::string p = dispPath(path);
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    std::error_code ec;
+    if (p.empty() || !std::filesystem::exists(pathFromUtf8(p), ec)) {
+        if (why) *why = "not there: " + dispPath(path);
+        return false;
+    }
+    for (const auto& q : app.readerPlaces)
+        if (q == p) { if (why) *why = "already registered: " + p; return false; }
+    if (app.readerPlaces.size() >= READER_PLACES_MAX) {
+        if (why) *why = "the search path holds " + std::to_string(READER_PLACES_MAX) +
+                        " places already - remove one first";
+        return false;
+    }
+    app.readerPlaces.push_back(p);
+    g_readerPlacesRev++;
+    savePrefs();
+    return true;
+}
+
+static void unregisterReaderPlace(size_t i) {
+    if (i >= app.readerPlaces.size()) return;
+    app.readerPlaces.erase(app.readerPlaces.begin() + (long)i);
+    g_readerPlacesRev++;
+    savePrefs();
+}
+
+// The order is a setting, so it has to be editable where it is visible.
+static void moveReaderPlace(size_t i, int delta) {
+    long j = (long)i + delta;
+    if (i >= app.readerPlaces.size() || j < 0 || j >= (long)app.readerPlaces.size()) return;
+    std::swap(app.readerPlaces[i], app.readerPlaces[(size_t)j]);
+    g_readerPlacesRev++;
+    savePrefs();
+}
+
 static uint64_t adapterHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
@@ -1213,14 +1463,29 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::vector<std::string>& argv,
                                 const adapter::Run& r,
                                 const FrameSource& originStat);   // fwd: the tail, shared
-static std::string openWithReader(const std::string& src, const std::string& spec,
+static std::string openWithReader(const std::string& src, const std::string& specIn,
                                   bool allowCache = true,
                                   App::ReaderJob* job = nullptr) {
     // Whatever happens, the panel gets the whole of it (§4.13.0).
     app.readerRan = true;
     app.readerLastOk = false;
-    app.readerLastSpec = spec;
+    app.readerLastSpec = specIn;
     app.readerLastOut.clear();
+    // §4.13.2: the reader is located BEFORE Python is started, so "there is no
+    // such reader" arrives as a sentence naming every place we looked, rather
+    // than as a traceback out of the harness about a module it could not import.
+    ReaderLookup look = resolveReaderFile(specIn);
+    if (look.file.empty()) { app.readerLastOut = look.why; return look.why; }
+    const std::string spec = look.file + ":" + readerFuncOf(specIn);
+    app.readerLastSpec = spec;
+    if (!look.shadowed.empty()) {
+        // First match won. Say which one, and which ones it beat - the durable
+        // record of a decision the ORDER made rather than the user.
+        std::string m = "reader " + baseName(look.file) + ": " + dispPath(look.file) +
+                        " won (registered first); also in";
+        for (const auto& s : look.shadowed) m += " " + dispPath(s);
+        logMsg(m);
+    }
     // identity BEFORE the bytes (§6.2): the reader is about to read the origin
     // file for however long it takes - the docs it produces bind to THIS stat
     FrameSource originStat;
@@ -1456,7 +1721,13 @@ static std::string readerCommandLine(const std::string& src, const std::string& 
     std::string script = runAdapterScript();
     if (py.empty()) return "(no Python found: " + why + ")";
     if (script.empty()) return "(run_adapter.py not found next to this build)";
-    return adapter::showCommand({ py, script, spec, src, "-o", "<cache>.npz" });
+    // The command shown must be the command run, so it carries the RESOLVED
+    // reader (§4.13.2). A bare name here would show a line that is not what
+    // starts, which is the one thing this display exists to prevent.
+    ReaderLookup look = resolveReaderFile(spec);
+    if (look.file.empty()) return "(no such reader - see the Reader panel)";
+    return adapter::showCommand({ py, script, look.file + ":" + readerFuncOf(spec),
+                                  src, "-o", "<cache>.npz" });
 }
 
 // ---- Open in new window (todo-open item 28) ---------------------------------
