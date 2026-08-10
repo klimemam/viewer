@@ -536,13 +536,14 @@ set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
 target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} ${stb_SOURCE_DIR})
-# Only the GUI binary reads .exr. viewer-serve deliberately does NOT link it:
-# the remote peer serves .npy only (docs/media-support.md §1, plan (a):
-# local-only until the loaders move to a shared TU), and the peer is the binary
-# that has to build on a bare compute server. TIFF held that line by living
-# behind core/imagefile.h, which viewer-serve does not compile; OpenEXR holds it
-# the same way, and the selftest evidence for both is the same one fact -
-# viewer-serve.exe is byte-identical across the change.
+# Both binaries read .exr now. This used to say that viewer-serve deliberately
+# did not link it - "the remote peer serves .npy only" - which was plan (a) of
+# docs/media-support.md §1: local-only until the loaders moved to a shared TU.
+# They have, and issue #148's judgment B is that the peer reads what the viewer
+# reads, so the line that used to be held here is now held by the format table
+# itself (core/imagefile.h) and by ONE column of it for the one format whose
+# limit is a licence. What the peer needs on a bare compute server is what this
+# project already builds for it: OpenEXR is fetched and built by this file.
 target_link_libraries(viewer PRIVATE OpenEXR::OpenEXR)
 if(UNIX)
   target_link_libraries(viewer PRIVATE ${CMAKE_DL_LIBS})   # dlopen
@@ -599,11 +600,34 @@ endif()
 # ...and version.cpp, since MOP_SET_FOLD's provenance trailer is the PEER's own
 # build: a set analyzer is a built-in, so "which build computed this" is the
 # viewer version and there is no dll to name instead (#46, docs/abi-v3.md §11).
+#
+# ...and, since issue #148's judgment B, the SAME readers the viewer has: the
+# peer decodes what this viewer decodes, so that one folder does not read one
+# way over ssh and another way off the disk. core/serve.cpp gained no format
+# knowledge for it - it calls core/imagefile.h, which is the seam both binaries
+# now compile, and that is what keeps "which library reads a .tif" a build-time
+# detail on the peer too.
+#
+# core/rawread.cpp is here for its SNIFF and nothing else (VIEWER_NO_LIBRAW
+# below). Every other reader is here whole.
 add_executable(viewer-serve core/serve_main.cpp core/serve.cpp core/plugin_host.cpp
                             core/version.cpp
+                            core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
+                            core/y4mread.cpp core/rawread.cpp
                             ${miniz_SOURCE_DIR}/miniz.c)
+# LibRaw is NOT linked into the peer, and the reason is a licence rather than a
+# limit: it is CDDL-1.0, and viewer-serve is the binary that installs ITSELF
+# onto someone else's machine over ssh (core/rawread.h's licence note), so
+# carrying it there is a distribution question that this change does not answer.
+# The define does not remove the format - the row stays in core/imagefile.cpp's
+# table with its extensions and its sniff, and loses only its decoder, which is
+# the `absent` state that table has always had. A .NEF on the peer is therefore
+# refused BY NAME with the reason, not mistaken for the TIFF it also is.
+target_compile_definitions(viewer-serve PRIVATE VIEWER_NO_LIBRAW)
+target_link_libraries(viewer-serve PRIVATE stb_lib OpenEXR::OpenEXR)
 add_dependencies(viewer-serve viewer_version)
 target_include_directories(viewer-serve PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core
+                                                ${stb_SOURCE_DIR}
                                                 ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(viewer-serve PRIVATE ps_api)
 if(UNIX)
@@ -1126,8 +1150,27 @@ viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 # formats are absent, and it is also where --browse-keys addresses rows BY INDEX
 # (tools/gen_testdata.py says so at length), so a .png added there would re-aim a
 # dozen assertions that have nothing to do with this.
-viewer_selftest(fmtgate     NOGL --fmtgate-selftest tools/testdata/media)
+# --remote-exe is not decoration here. Without it a local:// peer is THIS
+# binary, which links core/imagefile.h whatever viewer-serve links - so the P
+# block would prove that the client can talk to itself and nothing about the
+# peer that a lab actually installs. With it, the assertions run against the
+# standalone binary and the linking above is what makes them pass.
+viewer_selftest(fmtgate     NOGL --fmtgate-selftest tools/testdata/media
+                            --remote-exe $<TARGET_FILE:viewer-serve>)
 viewer_selftest(rtemporal   NOGL --rtemporal-selftest tools/testdata/rb/scanroot/10lx)
+
+# ...and the SAME test over a folder of PNGs (issue #148 judgment B). MEASURE is
+# the half the peer exists for - "measure where the data is" - so a peer that
+# gained TILE for the picture formats and not MEASURE would be the same "two
+# answers for one file" defect one level down, and this registration is what
+# makes that impossible to ship. Every assertion is the .npy run's: the peer's
+# sigma_t against an independent f64 reference, and then the SAME stack opened
+# and measured locally, bit for bit.
+#
+# --remote-exe, unlike the .npy registration above, because the whole subject is
+# whether the STANDALONE peer decodes a PNG: this binary always could.
+viewer_selftest(rtemporal-png NOGL --rtemporal-selftest tools/testdata/media/pngstack
+                              --remote-exe $<TARGET_FILE:viewer-serve>)
 # Windowless despite touching ImGui: its one call is GetClipboardText, and with
 # no backend installed ImGui's own default clipboard handler answers it (the
 # Win32 clipboard on Windows, an in-process buffer elsewhere). Verified: the TSV

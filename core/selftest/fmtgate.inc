@@ -46,9 +46,20 @@
             return 1;
         }
         std::vector<RbRow> view = rbBuildView(rbMain(), &B.dir, B.entries, false, false);
+        // A file is "listed" when the listing SHOWS it - as its own row, or as a
+        // member of a stack-group row. The second case arrived with #148 B and
+        // is not a special case for pictures: the peer folds a numbered family
+        // into one row, and media/ happens to hold three of them (gray4 /
+        // gray8 / gray16, as .png and again as .tif). That fold is the SAME
+        // rule that has always folded frame_001..003.npy, applied to a format
+        // the peer can now read - so the row is there and the file is in it,
+        // which is what this predicate has to be about.
         auto listed = [&](const char* n) {
             for (const RbRow& r : view)
                 if (!r.up && !r.ph && r.name() == n) return true;
+            for (const remote::Entry& e : B.entries)
+                for (const std::string& m : e.members)
+                    if (m == n) return true;
             return false;
         };
         auto has = [](const std::string& hay, const char* needle) {
@@ -57,17 +68,28 @@
         // `peer` is whether viewer-serve can serve it - the one column that is
         // NOT a property of the format table, and the one the old predicate
         // applied to all of them.
+        //
+        // Every picture row said `false` until issue #148's judgment B. What
+        // changed is not this table's meaning but the peer's BUILD: viewer-serve
+        // links core/imagefile.h now, so the column that used to separate .npy
+        // from the picture formats separates the picture formats from the one
+        // row whose limit is a licence (vendor RAW / LibRaw's CDDL - the .dng
+        // row below, and P6 further down for the sentence it produces).
         struct Want { const char* name; bool peer; };
         std::vector<Want> want = {
-            { "capture.npy",  true  },
-            { "gray8.png",    false },
-            { "gradient.jpg", false },
-            { "gray8.tif",    false },
-            { "one.y4m",      false },
+            { "capture.npy",  true },
+            { "gray8.png",    true },
+            { "gradient.jpg", true },
+            { "gray8.tif",    true },
+            { "one.y4m",      true },
             // Unconditional since #53's ruling: there is no build of this
             // viewer without OpenEXR, so there is none without an .exr fixture
             // in media/ either, and this row is as ordinary as the four above.
-            { "rgb_half.exr", false },
+            { "rgb_half.exr", true },
+            // ...and the row that is NOT about a reader. This file opens here
+            // and is refused over the link, and the refusal has to NAME the
+            // reason, because "we cannot read it" would be false.
+            { "sensor_rggb.dng", false },
         };
 
         // ---- F1: listed AND openable, on this machine ------------------------
@@ -132,7 +154,12 @@
                     if (!why.empty()) said = false;      // it CAN be served: no reason
                 } else {
                     // named, reasoned, way out attached - §3.2's three parts
-                    if (why.empty() || !has(why, ".npy")) said = false;
+                    // The reason is NAMED now rather than "the peer serves
+                    // .npy only": what the peer will not carry is a LIBRARY,
+                    // and a sentence about .npy would be a true-sounding lie
+                    // about a peer that serves five picture formats.
+                    if (why.empty() || !has(why, "LibRaw") ||
+                        !has(why, "read on this machine")) said = false;
                     if (firstWhy.empty()) firstWhy = why;
                 }
             }
@@ -167,11 +194,262 @@
             }
             const bool npy = viewerReadsName("a.npy") && peerServesName("a.npy");
             const bool upper = viewerReadsName("A.NPY") && peerServesName("FRAME_001.NPY");
-            fprintf(stderr, "fmtgateselftest:   table = [%s], npy both=%d case=%d\n",
-                    imagefile::decodableFormats().c_str(), npy ? 1 : 0, upper ? 1 : 0);
-            check(superset && npy && upper,
+            // ...and the LINK half of the same invariant, which is what #148 B
+            // added: the client's gate and the peer's limit are now ONE
+            // predicate over ONE table, so a row added tomorrow is checked by
+            // this loop without anybody editing it. It is stated as an equality
+            // with the table's own column, not as a list of extensions - a list
+            // here would be the second place that knows, which is the defect.
+            bool linkGate = true;
+            for (const imagefile::Backend& b : imagefile::backends()) {
+                std::string one = b.exts;
+                size_t sp = one.find(' ');
+                if (sp != std::string::npos) one = one.substr(0, sp);
+                if (peerServesName("x" + one) != b.overLink) linkGate = false;
+                if (b.overLink && !viewerReadsName("x" + one)) linkGate = false;
+                std::string up = one;                 // the peer lower-cases too
+                for (char& c : up) c = (char)toupper((unsigned char)c);
+                if (peerServesName("X" + up) != b.overLink) linkGate = false;
+            }
+            fprintf(stderr, "fmtgateselftest:   table = [%s], npy both=%d case=%d "
+                            "linkGate=%d\n",
+                    imagefile::decodableFormats().c_str(), npy ? 1 : 0, upper ? 1 : 0,
+                    linkGate ? 1 : 0);
+            check(superset && npy && upper && linkGate,
                   "F4 every table row reads locally; .npy answers both; case-insensitive");
         }
+
+        // ---- P: the PEER, and the same file opened both ways ------------------
+        //
+        // Everything above this line is the CLIENT's gate. It could be made to
+        // say anything without a peer existing, which is exactly what happened
+        // for five formats until #111 - so the assertions below talk to a real
+        // viewer-serve process (--remote-exe, or this binary when none was
+        // given) and compare what came back against what the LOCAL door decodes
+        // out of the same bytes.
+        //
+        // The strongest form available: BIT-IDENTICAL pixels. There is no
+        // rounding budget to spend and no reason to grant one. The peer decodes
+        // through core/imagefile.h, converts to the file's own dtype and sends
+        // that; the client converts it back to float. Every dtype these formats
+        // store is exactly representable in float32 (u16 max 65535 is 256 times
+        // under 2^24, and a half widens to a float without loss), so the round
+        // trip changes no bit - and an `==` here is what proves that claim
+        // rather than restating it. A tolerance would silently absorb the day
+        // somebody makes the peer send f32 for everything.
+        //
+        // ANTI-VACUITY IS HALF THE TEST. Two sides that both returned nothing
+        // agree perfectly, so every comparison below first insists that the
+        // local decode produced the expected number of samples AND that those
+        // samples are not all one value - a fixture that went uniform would
+        // otherwise make a broken crop compare equal.
+        {
+            const std::string exe = app.remoteExe.empty() ? app.exePath : app.remoteExe;
+            remote::Session S;
+            std::string serr;
+            S.setIdleTimeout(60.0);
+            const bool up = S.startOn("", 0, exe, serr);
+            fprintf(stderr, "fmtgateselftest: P peer = %s : %s (protocol %d)\n",
+                    exe.c_str(), up ? "connected" : serr.c_str(), S.peerVersion());
+            check(up, "P0 the standalone peer answers HELLO");
+            check(up && S.peerVersion() >= 10,
+                  "P0 ...and announces protocol 10 or later (the picture formats)");
+
+            // One file, opened both ways. `frames` is the file's own count, so
+            // a multi-page TIFF is compared page by page.
+            auto bothWays = [&](const char* fname, const char* wantDtype, int wantFrames,
+                                int step) {
+                if (!up) { ok = false; return; }
+                const std::string path = B.dir + "/" + fname;
+                remote::Meta m{};
+                std::string e2;
+                if (!S.meta(path, m, e2)) {
+                    fprintf(stderr, "fmtgateselftest:   %s: peer META FAILED: %s\n",
+                            fname, e2.c_str());
+                    check(false, "P1 the peer answers META for this file");
+                    return;
+                }
+                // the local door, on the same bytes
+                closeAll();
+                openPath(path);
+                if (app.images.empty()) {
+                    fprintf(stderr, "fmtgateselftest:   %s: did not open locally\n", fname);
+                    check(false, "P1 fixture: the file opens locally");
+                    return;
+                }
+                const ImageDoc* head = app.images.front().get();
+                const int localFrames = (int)app.images.size();
+                char what[192];
+                snprintf(what, sizeof what, "P1 %s: peer META == the local decode", fname);
+                fprintf(stderr, "fmtgateselftest:   %s: peer %dx%d ch%d %s frames=%d | "
+                                "local %dx%d ch%d %s frames=%d\n",
+                        fname, m.w, m.h, m.ch, m.dtype.c_str(), m.frames,
+                        head->w, head->h, head->ch, head->dtype.c_str(), localFrames);
+                check(m.w == head->w && m.h == head->h && m.ch == head->ch &&
+                      m.dtype == head->dtype && m.dtype == wantDtype &&
+                      m.frames == wantFrames && localFrames == wantFrames, what);
+                if (m.w != head->w || m.h != head->h || m.ch != head->ch) return;
+
+                std::vector<float> frame0;
+                bool framesDiffer = false;
+                for (int f = 0; f < m.frames; f++) {
+                    std::vector<float> pix;
+                    int ow = 0, oh = 0, och = 0;
+                    std::string dt;
+                    if (!S.tile(path, f, 0, 0, m.w, m.h, step, pix, ow, oh, och, dt, e2)) {
+                        fprintf(stderr, "fmtgateselftest:   %s frame %d: peer TILE "
+                                        "FAILED: %s\n", fname, f, e2.c_str());
+                        check(false, "P2 the peer answers TILE for this file");
+                        return;
+                    }
+                    // the same rect at the same stride, taken from the LOCAL
+                    // document: hand-derived, not read back off the peer
+                    const ImageDoc* d = app.images[(size_t)f].get();
+                    std::vector<float> want;
+                    for (int y = 0; y < m.h; y += step)
+                        for (int x = 0; x < m.w; x += step)
+                            for (int c = 0; c < m.ch; c++)
+                                want.push_back(d->px()[((size_t)y * m.w + x) * m.ch + c]);
+                    float lo = want.empty() ? 0.0f : want[0], hi = lo;
+                    for (float v : want) { lo = std::min(lo, v); hi = std::max(hi, v); }
+                    if (f == 0) frame0 = want;
+                    else if (want != frame0) framesDiffer = true;
+                    // ANTI-VACUITY. A frame of one value would let a crop that
+                    // read the wrong rows compare equal, so a single-picture
+                    // file must VARY inside the frame. stack3.tif's pages are
+                    // each uniform on purpose (1000 / 2000 / 3000), so for a
+                    // multi-picture file the variation that has to exist is
+                    // ACROSS frames instead - asserted after the loop, because
+                    // "the peer returned frame 0 three times" is exactly the
+                    // bug a per-frame check cannot see.
+                    const bool varies = m.frames > 1 ? true : hi > lo;
+                    const size_t expectN =
+                        (size_t)((m.w + step - 1) / step) * ((m.h + step - 1) / step) * m.ch;
+                    size_t diff = 0;
+                    float firstA = 0, firstB = 0;
+                    long firstAt = -1;
+                    for (size_t i = 0; i < std::min(pix.size(), want.size()); i++)
+                        if (!(pix[i] == want[i])) {
+                            if (!diff) { firstA = pix[i]; firstB = want[i]; firstAt = (long)i; }
+                            diff++;
+                        }
+                    fprintf(stderr, "fmtgateselftest:   %s frame %d step %d: peer %dx%d "
+                                    "ch%d %s n=%zu | local n=%zu range %.9g..%.9g | "
+                                    "differing samples %zu%s\n",
+                            fname, f, step, ow, oh, och, dt.c_str(), pix.size(),
+                            want.size(), (double)lo, (double)hi, diff,
+                            diff ? "" : " (bit for bit)");
+                    if (diff)
+                        fprintf(stderr, "fmtgateselftest:     first at %ld: peer %.9g "
+                                        "vs local %.9g\n", firstAt, (double)firstA,
+                                (double)firstB);
+                    snprintf(what, sizeof what,
+                             "P2 %s frame %d: peer pixels == local pixels, bit for bit",
+                             fname, f);
+                    // the three anti-vacuity clauses, then the equality
+                    check(want.size() == expectN && pix.size() == expectN &&
+                          varies && dt == wantDtype && diff == 0, what);
+                }
+                if (m.frames > 1) {
+                    char what2[192];
+                    snprintf(what2, sizeof what2,
+                             "P2 %s: the %d frames are not the same frame %d times",
+                             fname, m.frames, m.frames);
+                    check(framesDiffer, what2);
+                }
+                closeAll();
+            };
+
+            // The matrix. One row per backend that the peer serves, chosen so
+            // that the dtype, the channel count and the frame count are all
+            // exercised somewhere - and the decimated case (step 2) is on the
+            // 16-bit file, because a stride bug that dropped a byte would be
+            // invisible on u8.
+            bothWays("gray16.png",  "u16", 1, 2);   // u16, 1 ch, decimated
+            bothWays("rgb8.png",    "u8",  1, 1);   // u8, 3 ch, full res
+            bothWays("gradient.jpg","u8",  1, 1);   // the other stb door
+            bothWays("gray16.tif",  "u16", 1, 1);   // our own TIFF reader
+            bothWays("float32.tif", "f32", 1, 1);   // f32 straight through
+            bothWays("stack3.tif",  "u16", 3, 1);   // THREE frames from ONE file
+            bothWays("rgb_half.exr","f16", 1, 1);   // half, carried AS half (DT_F16)
+            bothWays("mono16.y4m",  "u16", 5, 1);   // a video container's frames
+
+            // ---- P3: a number derived by hand, not read off either side ------
+            // P2 compares the peer against the local decoder, so if BOTH were
+            // wrong in the same way it would still pass. This one is arithmetic
+            // from the fixture's own definition (tools/gen_testdata.py):
+            //
+            //   g16[y][x] = ((y * 64 + x) * 21) % 65536, written as 16-bit
+            //               big-endian greyscale PNG, 64 wide by 48 high
+            //
+            // A step-2 tile of the whole frame takes x = 0,2,4,... and
+            // y = 0,2,4,..., so output sample (ox, oy) is source (2*ox, 2*oy):
+            //
+            //   (ox,oy) = (1,1) -> (x,y) = (2,2) -> ((2*64 + 2) * 21) % 65536
+            //                                     = (130 * 21) = 2730
+            //   (ox,oy) = (0,0) -> (0,0)         -> 0
+            //   (ox,oy) = (31,23) -> (62,46)     -> ((46*64 + 62) * 21) % 65536
+            //                                     = (3006 * 21) = 63126
+            //
+            // 63126 is also the maximum P2 printed for this file, which is the
+            // cheapest possible check that the range line above is not a
+            // coincidence. All three are exact in u16 and exact in float32.
+            if (up) {
+                std::vector<float> pix;
+                int ow = 0, oh = 0, och = 0;
+                std::string dt, e2;
+                const bool got = S.tile(B.dir + "/gray16.png", 0, 0, 0, 64, 48, 2,
+                                        pix, ow, oh, och, dt, e2);
+                const float a = got && pix.size() > (size_t)(1 * ow + 1) ? pix[1 * ow + 1] : -1;
+                const float b = got && !pix.empty() ? pix[0] : -1;
+                const float c = got && pix.size() == 32 * 24 ? pix[23 * 32 + 31] : -1;
+                fprintf(stderr, "fmtgateselftest:   gray16.png step 2: (1,1)=%.9g "
+                                "want 2730, (0,0)=%.9g want 0, (31,23)=%.9g want 63126\n",
+                        (double)a, (double)b, (double)c);
+                check(got && ow == 32 && oh == 24 && och == 1 && pix.size() == 32 * 24 &&
+                      a == 2730.0f && b == 0.0f && c == 63126.0f,
+                      "P3 a decimated tile's samples are the ones arithmetic says");
+            }
+
+            // ---- P6: what the peer will NOT serve, and why ------------------
+            // The one row whose limit is a licence. Two things are asserted and
+            // the second is the one that matters: the peer must not answer this
+            // with "not a .npy file" - a sentence about the FILE, for a limit
+            // that belongs to the peer's build.
+            if (up) {
+                remote::Meta m{};
+                std::string e2;
+                const bool served = S.meta(B.dir + "/sensor_rggb.dng", m, e2);
+                fprintf(stderr, "fmtgateselftest:   sensor_rggb.dng over the peer: "
+                                "served=%d msg=\"%s\"\n", served ? 1 : 0, e2.c_str());
+                check(!served && has(e2, "vendor RAW") && has(e2, "CDDL") &&
+                      !has(e2, "not a .npy file"),
+                      "P6 the peer refuses vendor RAW by name, with the licence reason");
+            }
+
+            // ---- P7: SCAN folds a numbered PICTURE sequence ------------------
+            // Issue #148's headline: Open Folder over the peer returned "no .npy
+            // stacks under ..." for a folder of PNGs the Browse list was showing
+            // at the time. One group, four members, and the pattern says what
+            // the stack IS - the extent, not "????".
+            if (up) {
+                std::vector<remote::ScanGroup> gs;
+                bool trunc = false;
+                int skipped = 0;
+                std::string e2;
+                const bool got = S.scan(B.dir + "/pngstack", 4, 64, gs, trunc, skipped, e2);
+                fprintf(stderr, "fmtgateselftest:   SCAN pngstack: ok=%d groups=%zu%s%s\n",
+                        got ? 1 : 0, gs.size(), e2.empty() ? "" : " err=", e2.c_str());
+                for (const auto& g : gs)
+                    fprintf(stderr, "fmtgateselftest:     group \"%s\" x%zu\n",
+                            g.entry.name.c_str(), g.entry.members.size());
+                check(got && gs.size() == 1 && gs[0].entry.members.size() == 4 &&
+                      has(gs[0].entry.name, ".png"),
+                      "P7 the peer folds frame_001..004.png into ONE stack group");
+            }
+            S.stop();
+        }
+        closeAll();
 
         fprintf(stderr, "fmtgateselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();

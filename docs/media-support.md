@@ -44,7 +44,9 @@ remote は npy のみ配信([core/serve.cpp](../core/serve.cpp))。
 >
 > **peer は形式を増やさない** (下の「remote への波及」の案 (a))。`viewer-serve`
 > が `core/imagefile.cpp` をコンパイルしないという1つの事実がそれを保証していて、
-> 上の byte 同一がその証拠。
+> 上の byte 同一がその証拠。 —— **この段落は 2026-08-10 に失効した**
+> (#148 判断 B、下の「remote への波及」の追記)。peer は `core/imagefile.cpp` を
+> コンパイルする。
 
 必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
 読むことだけ。deep / tiled / multipart は当面対象外。
@@ -98,6 +100,20 @@ TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../core/remote_pr
 ただし loader が main.cpp 内にある現状では serve.cpp から呼べない。
 **推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` 的な
 共有 TU へ切り出す整理(toFloatSamples と同じ共有パターン)ができた時点で (b) を足す。
+
+> **(b) に移行した (issue #148 判断 B, 2026-08-10)。** 共有 TU は
+> `core/imagefile.cpp` という形で既にあり、`viewer-serve` がそれをリンクする。
+> 上の「peer は形式を増やさない」と「`viewer-serve` が `core/imagefile.cpp` を
+> コンパイルしないという1つの事実」は**この日で終わった** —— 終わらせた理由は
+> #148 の本体で、同じフォルダが ssh 越しとディスクから別の答えを返していた
+> ことである。
+>
+> 予測どおりプロトコルの**形**は変わっていない。1点だけ違う: **EXR を f32 に
+> 落として `DT_F32` を返してはいない**。落とすと画素は同じでも Inspector が
+> 同じ `.exr` をローカルで `f16`、リンク越しで `f32` と表示し、#148 の「2つの
+> 答え」を1段下で作る。代わりに `DT_F16` を wire dtype に**追記**した(half は
+> 全値が f32 で厳密なので、運ぶ形の問題であって精度の問題ではない —— 上の
+> 「half→float32 は情報無損失」がそのまま効く)。`rp::VERSION` は 10。
 
 ---
 

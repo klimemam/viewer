@@ -111,7 +111,32 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // at. And it is, as ever, what makes an installed viewer-serve update itself on
 // connect, which is the only reason a lab that copied the peer once ever sees
 // the feature at all.
-static const uint32_t VERSION = 9;
+// 10: the peer serves the PICTURE FORMATS - PNG, JPEG, TIFF, OpenEXR, y4m -
+// and not only .npy (issue #148, judgment B). No wire format moves by one byte:
+// MSG_TILE was always "-> (path, frame, rect, step) <- pixels", in the source
+// dtype, and there has never been a send-a-file op. What changes is the set of
+// files an answer exists for, and that is exactly the kind of change 4, 5 and 6
+// were - the MEANING, not the framing.
+//
+// It has to be a number for the two reasons those three had. First, a v9 peer
+// answers META on a .png with "not a .npy file", which is indistinguishable
+// from a corrupt file and blames the file for a limit that belongs to the
+// peer's build; from the number the client refuses BEFORE it sends and names
+// which mismatch it is (rp::pictureTooOldText). Second - and this is what makes
+// a lab that copied viewer-serve once ever see the feature - a version
+// difference is what makes an installed peer update itself on connect.
+//
+// WHY A NUMBER AND NOT A LIST OF EXTENSIONS IN THE HELLO REPLY. It was the
+// obvious alternative and it is the weaker one: a served-suffix list on the
+// wire is a SECOND place that knows which formats cross the link, beside
+// core/imagefile.cpp's table, and two places that know one thing is the defect
+// #148 is about. The number says the same thing in the form the rest of this
+// header already uses, and it says it about a build rather than about a guess.
+// The day two peers of the SAME protocol legitimately differ - one built
+// without OpenEXR, say - a number stops being enough and a list becomes
+// necessary; there is no such build today (#53 made OpenEXR unconditional), so
+// there is nothing for a list to say that the number does not.
+static const uint32_t VERSION = 10;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -317,17 +342,75 @@ struct TileRep {
     uint32_t flags;             // bit0: blob is deflate-compressed
 };
 
+// DT_F16 is APPENDED, not inserted: every number before it is on the wire in
+// sessions that already exist, and a renumbering would make one peer's u16 the
+// next one's i16. It arrived with protocol 10 (the picture formats) for a
+// reason that is the whole point of carrying the source dtype at all - an .exr
+// stores halves, the local door calls that "f16", and a peer that widened them
+// to f32 would print a different word for the same file depending on which end
+// opened it. The samples would have been identical and the label would not,
+// which is the same "two answers" defect issue #148 is about.
 enum DType : uint32_t {
-    DT_U8 = 0, DT_I8, DT_U16, DT_I16, DT_U32, DT_I32, DT_F32, DT_F64, DT_COUNT
+    DT_U8 = 0, DT_I8, DT_U16, DT_I16, DT_U32, DT_I32, DT_F32, DT_F64, DT_F16, DT_COUNT
 };
 static inline size_t dtypeSize(uint32_t t) {
     switch (t) {
         case DT_U8: case DT_I8:   return 1;
-        case DT_U16: case DT_I16: return 2;
+        case DT_U16: case DT_I16: case DT_F16: return 2;
         case DT_U32: case DT_I32: case DT_F32: return 4;
         case DT_F64: return 8;
         default: return 0;
     }
+}
+
+// IEEE-754 binary16 <-> binary32, in the header BOTH ends include, because the
+// peer packs and the client unpacks and two copies that disagreed would produce
+// pixels that still draw a picture.
+//
+// Every half is exactly a float, so widening is total. The narrowing direction
+// TRUNCATES the significand rather than rounding to nearest, and that is exact
+// for the only thing that reaches it: a float that came out of a half has 13
+// zero bits at the bottom. Nothing else is ever narrowed here - a float32 EXR
+// channel is DT_F32 and takes the other path (core/exrread.cpp dtypeOf) - and
+// the bit-identical local-vs-peer assertion in --fmtgate-selftest is what holds
+// that claim to account.
+inline float halfToFloat(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h >> 15) << 31;
+    const uint32_t e = (h >> 10) & 0x1fu;
+    uint32_t m = h & 0x3ffu;
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) {
+            bits = sign;                                   // +-0
+        } else {                                           // subnormal: normalise
+            uint32_t shift = 0;
+            while (!(m & 0x400u)) { m <<= 1; shift++; }
+            m &= 0x3ffu;
+            bits = sign | ((113u - shift) << 23) | (m << 13);
+        }
+    } else if (e == 31) {
+        bits = sign | 0x7f800000u | (m << 13);             // inf / NaN, payload kept
+    } else {
+        bits = sign | ((e + 112u) << 23) | (m << 13);
+    }
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+inline uint16_t floatToHalf(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint16_t sign = (uint16_t)((x >> 16) & 0x8000u);
+    const uint32_t be = (x >> 23) & 0xffu;                 // biased exponent
+    uint32_t m = x & 0x7fffffu;
+    if (be == 0xff)                                        // inf / NaN
+        return (uint16_t)(sign | 0x7c00u | (m ? ((m >> 13) | 0x200u) : 0u));
+    const int32_t e = (int32_t)be - 127;
+    if (e > 15) return (uint16_t)(sign | 0x7c00u);         // overflow -> inf
+    if (e >= -14) return (uint16_t)(sign | ((uint32_t)(e + 15) << 10) | (m >> 13));
+    if (e < -25) return sign;                              // underflow -> +-0
+    m |= 0x800000u;                                        // subnormal half
+    return (uint16_t)(sign | (m >> (uint32_t)(-e - 1)));
 }
 const char* dtypeName(uint32_t t);
 uint32_t dtypeFromName(const char* s);
@@ -575,10 +658,23 @@ inline std::string npyChannelCeilingText(const std::vector<int64_t>& shape, int6
 // otherwise conclude from an escape hatch that appears to do nothing.
 inline std::string npyReReadTooOldText(int peerVersion) {
     return "the remote peer is too old to read a .npy another way: it speaks "
-           "protocol " + std::to_string(peerVersion) + ", a declared reading needs " +
-           std::to_string(VERSION) + " (update viewer-serve). Nothing was re-read - "
+           "protocol " + std::to_string(peerVersion) + ", a declared reading needs 9"
+           " (update viewer-serve). Nothing was re-read - "
            "the peer would have returned the reading it chose itself, under the "
            "name of the one you asked for.";
+}
+
+// The peer predates the picture formats (issue #148). The same discipline as
+// the sentence above and for the sharper version of its reason: a v9 peer does
+// not merely refuse a .png, it refuses it with "not a .npy file" - a sentence
+// about the FILE, for a limit that belongs to the peer's build. So the client
+// refuses first, from the number the peer announced in HELLO, and says which of
+// the two it is and what fixes it.
+inline std::string pictureTooOldText(int peerVersion, const std::string& name) {
+    return name + ": the remote peer serves .npy only - it speaks protocol " +
+           std::to_string(peerVersion) + ", and the picture formats need 10 "
+           "(update viewer-serve). Nothing was opened: this file IS readable "
+           "here, so browsing it locally or copying it here both work today.";
 }
 
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.

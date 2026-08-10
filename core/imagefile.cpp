@@ -25,10 +25,62 @@
 #include "stb_image.h"
 #include "rawread.h"
 #include "tiffread.h"
+#ifndef VIEWER_NO_OPENEXR
 #include "exrread.h"
+#endif
 #include "y4mread.h"
 
 namespace imagefile {
+
+// VIEWER_NO_LIBRAW: the build viewer-serve gets. The RAW row stays in the
+// table, keeps its extensions and keeps its SNIFF (core/rawread.cpp's sniff is
+// header inspection and needs no library), and loses only its decoder - which
+// is the `absent` state this table was designed to have. A .NEF therefore still
+// arrives AS a .NEF on the peer and is refused by name, instead of falling
+// through to the TIFF row underneath it and being decoded as whatever IFD sits
+// at the front of it.
+#ifdef VIEWER_NO_LIBRAW
+static const char* const RAW_ABSENT =
+    "LibRaw is CDDL-1.0 and viewer-serve installs itself onto another machine "
+    "over ssh, so the peer does not carry it";
+#define VIEWER_RAW_LIBRARY ""
+#define VIEWER_RAW_DECODE  nullptr
+#define VIEWER_RAW_ABSENT  RAW_ABSENT
+#else
+#define VIEWER_RAW_LIBRARY RAW_LIBRARY
+#define VIEWER_RAW_DECODE  rawDecode
+#define VIEWER_RAW_ABSENT  nullptr
+#endif
+
+// VIEWER_NO_OPENEXR: the ONE build that has it is the glibc-compatibility
+// rebuild of viewer-serve (.github/workflows/build.yml). That binary exists so
+// a peer copied onto an old compute box runs at all, and it is compiled by one
+// g++ line with no external library on it - which every reader here satisfies
+// except this one, since OpenEXR is a library and not a file of ours.
+//
+// Same mechanism as the RAW row above and for a different reason, which is
+// worth keeping apart: RAW is refused on EVERY peer, by decision, and its
+// `overLink` column says so on both ends. This is one BUILD lacking a decoder
+// the format table still lists - so the client goes on offering .exr (correctly:
+// an ordinary peer serves it) and this peer answers with the table's own
+// `absent` sentence, naming the build rather than blaming the file.
+//
+// It is also the only case where two peers of the SAME protocol number differ
+// in what they serve, which is the case that would eventually make a capability
+// LIST in the HELLO reply worth its second source of truth. One build, one
+// format, refused legibly: not yet.
+#ifdef VIEWER_NO_OPENEXR
+static const char* const EXR_ABSENT =
+    "this peer is the compatibility build for older systems, which is compiled "
+    "without OpenEXR";
+#define VIEWER_EXR_LIBRARY ""
+#define VIEWER_EXR_DECODE  nullptr
+#define VIEWER_EXR_ABSENT  EXR_ABSENT
+#else
+#define VIEWER_EXR_LIBRARY EXR_LIBRARY
+#define VIEWER_EXR_DECODE  exrDecode
+#define VIEWER_EXR_ABSENT  nullptr
+#endif
 
 // ---------------------------------------------------------------- sniffing
 // Magic bytes only. The extension is what a user typed or a camera chose; the
@@ -173,8 +225,8 @@ static bool stbDecode(const uint8_t* p, size_t n, std::vector<Image>& images,
 // ---------------------------------------------------------------- the table
 const std::vector<Backend>& backends() {
     static const std::vector<Backend> B = {
-        { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr, nullptr },
-        { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr, nullptr },
+        { "PNG", ".png", "stb_image 2.30", sniffPng, stbDecode, nullptr, nullptr, true },
+        { "JPEG", ".jpg .jpeg .jpe", "stb_image 2.30", sniffJpeg, stbDecode, nullptr, nullptr, true },
         // Vendor RAW sits BEFORE TIFF, and the order is the decision rather
         // than an accident of when it was written.
         //
@@ -197,7 +249,13 @@ const std::vector<Backend>& backends() {
           ".dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .orf .rw2 .rwl .raf "
           ".pef .ptx .srw .3fr .fff .iiq .kdc .dcr .mrw .x3f .erf .mef .mos "
           ".mdc .cap",
-          RAW_LIBRARY, rawSniff, rawDecode, nullptr, nullptr },
+          // The one row whose `overLink` is false, and the only one whose
+          // reason is a licence rather than a reader (see imagefile.h). The
+          // peer's own build additionally has no decoder for it at all - the
+          // VIEWER_NO_LIBRAW block above - so the refusal there is the table's
+          // own `absent` sentence and not a special case anywhere.
+          VIEWER_RAW_LIBRARY, rawSniff, VIEWER_RAW_DECODE, VIEWER_RAW_ABSENT,
+          nullptr, false },
         // TIFF shipped for a while as a row with NO decoder, refusing by name.
         // What that row said is still the standard the reader behind it is held
         // to: TIFF is the only one of the three that carries measurements
@@ -207,7 +265,7 @@ const std::vector<Backend>& backends() {
         // pictures and wrong per-plane statistics with nothing on screen to say
         // so - so core/tiffread.cpp REFUSES a CFA TIFF, by name, rather than
         // open one. Everything else it will not read is refused the same way.
-        { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr, nullptr },
+        { "TIFF", ".tif .tiff", TIFF_LIBRARY, sniffTiff, tiffDecode, nullptr, nullptr, true },
         // OpenEXR used to be the row that could be in either of this table's
         // two states, because a build option could take its library away. That
         // option is gone (#53, 2026-08-09: 「既定ONで。OFFにするパスは不要
@@ -220,7 +278,8 @@ const std::vector<Backend>& backends() {
         // It is also the only row whose parts are NAMED (partWord): an .exr
         // holds layers, which are documents, where a multi-page TIFF holds
         // pages, which are frames.
-        { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, exrDecode, nullptr, "exr layer" },
+        { "OpenEXR", ".exr", VIEWER_EXR_LIBRARY, sniffExr, VIEWER_EXR_DECODE,
+          VIEWER_EXR_ABSENT, "exr layer", true },
         // y4m is a VIDEO container in a picture-format table, and it belongs
         // here because after docs/video-support.md's question it is one: a text
         // header plus raw planes, no compression, no inter-frame prediction -
@@ -232,7 +291,7 @@ const std::vector<Backend>& backends() {
         // the containers a codec library would open are the containers whose
         // numbers did not survive (core/y4mread.h). Those are refused by NAME,
         // in videoRefusal, and deliberately NOT as rows here.
-        { "y4m", ".y4m", Y4M_LIBRARY, sniffY4m, y4mDecode, nullptr, nullptr },
+        { "y4m", ".y4m", Y4M_LIBRARY, sniffY4m, y4mDecode, nullptr, nullptr, true },
     };
     return B;
 }
@@ -325,6 +384,57 @@ static const char* CHOOSE_A_READER = "\n  choose a reader to read it another way
 
 static std::string whatIsRead() {
     return "\n  " + listFormats(" and ", true) + " are read natively";
+}
+
+// ---------------------------------------------------------------- the link
+// See imagefile.h: the ONE place that answers "will the peer serve this".
+bool peerServes(const std::string& path) {
+    const std::string e = lowerExt(path);
+    // .npy is not a row of the table and never was - core/main.cpp opens it and
+    // core/serve.cpp parses its header inline - so it is named here rather than
+    // given a row with a decoder that does not exist.
+    if (e == ".npy") return true;
+    const Backend* b = forPath(path);
+    return b && b->overLink;
+}
+
+// What the peer WILL serve, as a sentence fragment, computed from the table so
+// a row added there cannot leave a refusal quoting yesterday's list.
+static std::string servedList() {
+    std::vector<const char*> names;
+    for (const Backend& b : backends()) if (b.overLink) names.push_back(b.format);
+    std::string s = ".npy";
+    for (size_t i = 0; i < names.size(); i++) {
+        s += (i + 1 == names.size()) ? " and " : ", ";
+        s += names[i];
+    }
+    return s;
+}
+
+std::string peerRefusal(const std::string& path) {
+    if (peerServes(path)) return {};
+    // Named, reasoned, way out attached - docs/input-adapters.md §3.2's three
+    // parts. The way out is real for the first two cases: the file IS readable
+    // here, just not over this link.
+    static const char* const WAY_OUT =
+        "\n  browse it locally (File > Browse Folder), or copy it here first";
+    if (const Backend* b = forPath(path)) {
+        // A row this build reads and the peer does not: say WHY the peer does
+        // not, which is never "we have no reader" (we do, one call away).
+        std::string why = std::string(b->format) + " is read on this machine, but the "
+                          "peer does not serve it";
+        // The peer's own build has the reason in the table's `absent` field -
+        // but only the peer's build does, so the sentence cannot be read out of
+        // it here. The one row this applies to states it in imagefile.h.
+        if (!b->overLink)
+            why += ": LibRaw is CDDL-1.0 and viewer-serve installs itself onto "
+                   "another machine over ssh";
+        return why + WAY_OUT;
+    }
+    if (lowerExt(path) == ".npz")
+        return ".npz is read on this machine, but the peer serves one array per "
+               "file, not a container" + std::string(WAY_OUT);
+    return "the peer serves " + servedList();
 }
 
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,

@@ -952,6 +952,38 @@ _sub = 2 * (Y4W // 2) * (Y4H // 2)
 (media / "capture.mp4").write_bytes(b"\x00" * 4096)
 
 
+# ------------------------------------------- media/pngstack/ (issue #148) ----
+# A folder of numbered 16-bit PNGs: one stack, four frames, in the shape a
+# capture script actually produces. It exists because the peer serves the
+# picture formats now (judgment B) and the two things that has to be TRUE of
+# rather than merely possible are both measurements over a stack:
+#
+#   * --rtemporal-selftest run against this folder compares sigma_t computed on
+#     the PEER with sigma_t computed here, bit for bit. That is the assertion
+#     MEASURE exists for ("measure where the data is"), and it is the half a
+#     TILE-only change would have left behind;
+#   * the numbered-sequence grouping the remote SCAN does has to fold
+#     frame_001..004.png the same way it folds frame_001..004.npy.
+#
+# THE FIXED PATTERN AND THE NOISE ARE BOTH DELIBERATE, and #57 judgment 2 is
+# why: a stack whose frames are identical has sigma_t == 0, and "local 0 equals
+# peer 0" is an agreement about nothing. So each frame carries the same spatial
+# ramp (a fixed pattern to measure) PLUS a per-frame perturbation (a temporal
+# noise to measure), both integer-exact in u16 so that no part of the number
+# depends on rounding.
+pngstack = media / "pngstack"
+pngstack.mkdir(exist_ok=True)
+_ps_h, _ps_w = 24, 32
+_ps_y, _ps_x = np.mgrid[0:_ps_h, 0:_ps_w]
+_ps_fixed = (1000 + _ps_x * 7 + _ps_y * 13).astype(np.int64)      # the pattern
+for _f in range(4):
+    # a deterministic, integer, per-frame wobble: no PRNG, so the file content
+    # is reproducible byte for byte on every machine that runs this script
+    _wob = ((_ps_x * 3 + _ps_y * 5 + _f * 11) % 17) * (_f + 1)
+    write_png(pngstack / ("frame_%03d.png" % (_f + 1)),
+              (_ps_fixed + _wob).astype(np.uint16), bit=16, ctype=0)
+
+
 # ------------------------------------------------- vendor RAW (as DNG) ----
 # The fixtures for the LibRaw backend (core/rawread.h), and the first question
 # about them is where a vendor RAW comes from at all: a camera file cannot be

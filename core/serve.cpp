@@ -24,6 +24,7 @@
 #include <tuple>
 #include <vector>
 
+#include "imagefile.h"           // #148 B: the peer decodes what the viewer decodes
 #include "miniz.h"
 
 #if defined(_WIN32)
@@ -33,7 +34,8 @@
 
 namespace rp {
 
-static const char* DT_NAMES[DT_COUNT] = { "u8", "i8", "u16", "i16", "u32", "i32", "f32", "f64" };
+static const char* DT_NAMES[DT_COUNT] = { "u8", "i8", "u16", "i16", "u32", "i32",
+                                         "f32", "f64", "f16" };
 const char* dtypeName(uint32_t t) { return t < DT_COUNT ? DT_NAMES[t] : "?"; }
 uint32_t dtypeFromName(const char* s) {
     for (uint32_t i = 0; i < DT_COUNT; i++) if (!strcmp(s, DT_NAMES[i])) return i;
@@ -95,10 +97,34 @@ static bool sendErr(const std::string& msg) {
     return sendMsg(MSG_ERR, p);
 }
 
-// ---------------------------------------------------------------- npy reading
-// A reader, not a loader: it parses the header and then seeks. Nothing here ever
-// holds a whole frame, which is the entire point of serving remotely.
-struct NpyFile {
+// ---------------------------------------------------------------- one file
+// TWO BRANCHES, AND THEY COST DIFFERENT THINGS (issue #148, judgment B).
+//
+// .npy is a READER, not a loader: openNpy parses the header and readRegion
+// seeks, so nothing here ever holds a whole frame. That is the entire point of
+// serving remotely and it does not change.
+//
+// The picture formats cannot be read that way. A PNG is one deflate stream, a
+// JPEG is entropy-coded, a strip TIFF is compressed per strip and an .exr is
+// compressed per scanline block: there is no offset to compute for "row y,
+// column x" without decoding what came before it. So they are DECODED WHOLE and
+// the requested rect is cropped and strided out of the decoded frames. The peer
+// holds one file's pictures for the lifetime of one request, which is the trade
+// - and the thing that does NOT change is what LEAVES the peer: the rect that
+// was asked for, at the step that was asked for, in the file's own dtype.
+//
+// One consequence is worth stating where it will be read: a request that walks
+// N frames of ONE file (MEASURE over a multi-page TIFF) decodes that file ONCE,
+// because the decode lives on this struct and the struct outlives the loop. A
+// request that walks N SEPARATE files decodes each once, which is the floor.
+struct ServedFile {
+    // ---- the picture branch: empty for .npy ---------------------------------
+    // The frames of ONE stack. imagefile hands back several Images when a file
+    // holds several pictures; core/app/loader_npz.inc's loadImageFile turns the
+    // UNNAMED ones into a stack's frames and the NAMED ones (an .exr's layers)
+    // into separate documents. The wire addresses a FILE, so only the first of
+    // those two is servable and the second is refused by name - see openPicture.
+    std::vector<imagefile::Image> pics;
     std::ifstream f;
     uint32_t dtype = DT_COUNT;
     bool bigEndian = false, fortran = false;
@@ -121,7 +147,7 @@ struct NpyFile {
 
 // The layout decision, under a DECLARED reading (issue #124, docs/
 // input-adapters.md §3.3). This is core/app/loader_npz.inc's npyLayout, which
-// the peer had no equivalent of: parseNpyHeader hard-coded the native
+// the peer had no equivalent of: openNpy hard-coded the native
 // interpretation, so the escape hatch the Inspector offers for a file opened
 // through File > Open did not exist for the same file opened through a peer.
 //
@@ -133,7 +159,7 @@ struct NpyFile {
 // only the STRIDES - which is the one thing the local npyLayout cannot lend,
 // since a peer computes them from the file's own fortran flag and reads bytes
 // through them, while the client's are into a decoded buffer.
-static bool serveLayout(NpyFile& n, const std::vector<int64_t>& dims, int read,
+static bool serveLayout(ServedFile& n, const std::vector<int64_t>& dims, int read,
                         bool& fellBack, std::string& err) {
     fellBack = false;
     const size_t rank = dims.size();
@@ -199,8 +225,7 @@ static bool serveLayout(NpyFile& n, const std::vector<int64_t>& dims, int read,
     return true;
 }
 
-static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err,
-                           int read = NR_NATIVE) {
+static bool openNpy(ServedFile& n, const std::string& path, std::string& err, int read) {
     n.f.open(std::filesystem::u8path(path), std::ios::binary);
     if (!n.f) { err = "cannot open " + path; return false; }
     char magic[6];
@@ -270,10 +295,11 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     return true;
 }
 
-// Read one decimated region. Seeks per source row and takes every `step`th
-// sample, so the bytes read scale with what is asked for, not with the frame.
-static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
-                       uint32_t& outW, uint32_t& outH, std::string& err) {
+// Read one decimated region of a .npy. Seeks per source row and takes every
+// `step`th sample, so the bytes read scale with what is asked for, not with the
+// frame.
+static bool readNpyRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& out,
+                          uint32_t& outW, uint32_t& outH, std::string& err) {
     uint32_t step = std::max(1u, r.step);
     uint32_t x0 = std::min(r.x, (uint32_t)n.w), y0 = std::min(r.y, (uint32_t)n.h);
     // 64-bit sums: x + w wrapping at 2^32 must clamp to the edge, not go empty
@@ -348,6 +374,197 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
     return true;
 }
 
+// FRAME_001.NPY is still a .npy. The client lower-cases the same way
+// (core/imagefile.cpp peerServes, through core/ui/menus.inc peerServesName) and
+// the two must agree, or the client offers an open the peer then refuses.
+static bool isNpySuffix(const std::string& name) {
+    if (name.size() < 4) return false;
+    std::string ext = name.substr(name.size() - 4);
+    for (char& c : ext) c = (char)tolower((unsigned char)c);
+    return ext == ".npy";
+}
+
+// What this peer will walk, group and decode. ONE predicate, and it is not this
+// file's: core/imagefile.cpp owns it so that the client's Browse gate and the
+// peer's own limit cannot become two lists (core/imagefile.h, issue #148).
+static bool isServedSuffix(const std::string& name) { return imagefile::peerServes(name); }
+
+// ------------------------------------------------------------ picture reading
+//
+// WHY float32 MAY BE INVERTED HERE AND NOWHERE ELSE.
+//
+// core/imagefile.h hands every decode back as float32 "values as stored", and
+// remote_proto.h's opening paragraph forbids float32 on the wire for a measured
+// reason: a 24-bit significand cannot hold u4/i4 above 2^24 or f8 at all, so a
+// 16777217 would arrive as 16777216 and a 1e300 as inf.
+//
+// The inverse is exact for these formats, and that is arithmetic rather than
+// convention. Every dtype they store is exactly representable in float32:
+//
+//   u8   0..255                 - 8 bits of significand needed
+//   u16  0..65535               - 16 bits; 2^24 is 65536 times larger
+//   f16  every half is a float  - core/exrread.cpp says so where it widens
+//   f32  it IS the wire type
+//
+// So decode -> float32 -> the file's own dtype is a round trip that changes no
+// bit, and the peer sends u16 for a 16-bit TIFF exactly as it sends u16 for a
+// u2 .npy. The alternative - send f32 for everything - would also have made the
+// Inspector print "f32" for a file the local door calls "u16", which is the
+// same folder giving two answers that issue #148 is about.
+static bool dtypeOfPicture(const std::string& name, uint32_t& dt) {
+    // The names core/imagefile.h's backends produce are exactly the names on
+    // the wire, DT_F16 included since protocol 10 - so no mapping table sits
+    // between the two vocabularies and neither can drift.
+    dt = dtypeFromName(name.c_str());
+    return dt < DT_COUNT;
+}
+
+// One sample, float32 -> the file's dtype. The clamp can only fire on a value
+// that was never in an integer file (nothing decodes a u8 to 300), and it is
+// here so that a future backend cannot turn a bad decode into an out-of-range
+// store; the bit-identical local-vs-peer assertion in --fmtgate-selftest is
+// what proves it never fires on the formats that are actually served.
+static inline void putSample(uint8_t* dst, uint32_t dtype, float v) {
+    switch (dtype) {
+        case DT_U8: {
+            uint8_t q = (uint8_t)(v < 0.0f ? 0.0f : v > 255.0f ? 255.0f : v);
+            memcpy(dst, &q, 1);
+            break;
+        }
+        case DT_U16: {
+            uint16_t q = (uint16_t)(v < 0.0f ? 0.0f : v > 65535.0f ? 65535.0f : v);
+            memcpy(dst, &q, 2);
+            break;
+        }
+        case DT_F16: {
+            uint16_t q = floatToHalf(v);
+            memcpy(dst, &q, 2);
+            break;
+        }
+        default: memcpy(dst, &v, 4); break;            // f32, bit for bit
+    }
+}
+
+static bool openPicture(ServedFile& n, const std::string& path, std::string& err, int read) {
+    // A DECLARED READING (§3.3 / issue #124) is a .npy concept: it reinterprets
+    // an ARRAY's axes, and a picture format declares its own geometry - a TIFF
+    // page is a page and an .exr channel is a channel. Refused rather than
+    // ignored, for the reason protocol 9 exists at all: a request whose trailer
+    // is silently dropped comes back as a successful answer to a question that
+    // was not asked.
+    if (read != NR_NATIVE) {
+        err = "a declared .npy reading does not apply to a picture format";
+        return false;
+    }
+    if (!imagefile::peerServes(path)) { err = imagefile::peerRefusal(path); return false; }
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    if (!in) { err = "cannot open " + path; return false; }
+    in.seekg(0, std::ios::end);
+    const std::streamoff sz = in.tellg();
+    if (sz < 0) { err = "cannot read " + path; return false; }
+    // The same ceiling MSG framing carries, applied before the allocation: a
+    // peer that OOMs on a listing takes the session down for everyone using it
+    // (the .npy header-length bound above is the same lesson).
+    if ((uint64_t)sz > (2ull << 30)) { err = "file is too large to decode (> 2 GiB)"; return false; }
+    std::vector<uint8_t> bytes((size_t)sz);
+    in.seekg(0);
+    in.read((char*)bytes.data(), sz);
+    if (in.gcount() != sz) { err = "short read on " + path; return false; }
+    in.close();
+    if (!imagefile::decode(path, bytes, n.pics, err)) return false;
+    bytes.clear();
+    bytes.shrink_to_fit();
+
+    // NAMED parts are documents, not frames (core/imagefile.h). The wire
+    // addresses a file and has no word for "the Z layer of it", so an .exr that
+    // holds more than one is refused BY NAME rather than silently served as its
+    // first layer - which would draw a plausible picture of the wrong channel.
+    // One picture with a name is still one document, so it passes.
+    if (n.pics.size() > 1) {
+        std::string named;
+        for (const auto& im : n.pics)
+            if (!im.member.empty()) named += (named.empty() ? "" : ", ") + im.member;
+        if (!named.empty()) {
+            err = "this file holds named parts (" + named + "), which are separate "
+                  "documents rather than frames - the link addresses a file, not a "
+                  "part of one\n  open it on the machine that holds it, or copy it here";
+            return false;
+        }
+    }
+    const imagefile::Image& head = n.pics.front();
+    for (const auto& im : n.pics)
+        if (im.w != head.w || im.h != head.h || im.ch != head.ch || im.dtype != head.dtype) {
+            err = "the pictures in this file differ in shape or dtype, so they are "
+                  "not the frames of one stack";
+            return false;
+        }
+    if (!dtypeOfPicture(head.dtype, n.dtype)) {
+        err = "unsupported sample type " + head.dtype;
+        return false;
+    }
+    n.w = head.w; n.h = head.h; n.ch = head.ch;
+    n.frames = (int)n.pics.size();
+    n.elemSize = dtypeSize(n.dtype);
+    // ndim stays 0: MR_SHAPE is the DECLARED .npy shape, and a picture declares
+    // none. Sending one would put a "read as (F,H,W)" menu on screen for a file
+    // that has no other reading.
+    n.ndim = 0;
+    n.ok = true;
+    return true;
+}
+
+// Crop and stride out of an ALREADY DECODED frame - the picture half of
+// readNpyRegion, and the arithmetic clamping the rect is deliberately the same
+// so a request that lands on the edge lands the same way on both branches.
+static bool readPictureRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& out,
+                              uint32_t& outW, uint32_t& outH, std::string& err) {
+    const uint32_t step = std::max(1u, r.step);
+    const uint32_t x0 = std::min(r.x, (uint32_t)n.w), y0 = std::min(r.y, (uint32_t)n.h);
+    const uint32_t x1 = (uint32_t)std::min<uint64_t>((uint64_t)r.x + r.w, (uint64_t)n.w);
+    const uint32_t y1 = (uint32_t)std::min<uint64_t>((uint64_t)r.y + r.h, (uint64_t)n.h);
+    if (x1 <= x0 || y1 <= y0) { err = "empty region"; return false; }
+    outW = (x1 - x0 + step - 1) / step;
+    outH = (y1 - y0 + step - 1) / step;
+    const uint32_t frame = std::min<uint32_t>(r.frame, (uint32_t)n.frames - 1);
+    const imagefile::Image& im = n.pics[frame];
+    const size_t es = n.elemSize;
+    const size_t px = es * (size_t)n.ch;
+    out.resize((size_t)outW * outH * px);
+    uint8_t* dst = out.data();
+    for (uint32_t y = y0, oy = 0; oy < outH; y += step, oy++) {
+        const float* row = im.data.data() + (size_t)y * im.w * im.ch;
+        for (uint32_t x = x0, ox = 0; ox < outW; x += step, ox++)
+            for (int c = 0; c < n.ch; c++, dst += es)
+                putSample(dst, n.dtype, row[(size_t)x * im.ch + c]);
+    }
+    return true;
+}
+
+// ------------------------------------------------------------- the two doors
+//
+// EVERY call site goes through these, which is the point: the peer had exactly
+// two functions that touched pixels, so teaching those two a second format
+// teaches LIST, SCAN, META, TILE, MEASURE and the plugin mouth at once. TILE
+// without MEASURE would be a peer that can show a TIFF and cannot measure it -
+// two answers for one file, one level down from the issue that asked for this.
+//
+// Dispatch is by NAME, and it is the same order the local door uses
+// (core/app/loader_npz.inc: .npy first, then imagefile::forPath). A name
+// neither of them claims falls to the .npy branch, which opens it and says
+// "not a .npy file" - unchanged, and still the right sentence for a file whose
+// bytes nothing here recognises.
+static bool openServed(ServedFile& n, const std::string& path, std::string& err,
+                       int read = NR_NATIVE) {
+    if (!isNpySuffix(path) && imagefile::forPath(path)) return openPicture(n, path, err, read);
+    return openNpy(n, path, err, read);
+}
+
+static bool readRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& out,
+                       uint32_t& outW, uint32_t& outH, std::string& err) {
+    return n.pics.empty() ? readNpyRegion(n, r, out, outW, outH, err)
+                          : readPictureRegion(n, r, out, outW, outH, err);
+}
+
 // ---------------------------------------------------------------- handlers
 //
 // The handlers below answer a request and produce a reply; they do not know how
@@ -376,13 +593,6 @@ static uint32_t servedVersion() {
     return v;
 }
 
-static bool isNpySuffix(const std::string& name) {
-    if (name.size() < 4) return false;
-    std::string ext = name.substr(name.size() - 4);
-    for (char& c : ext) c = (char)tolower((unsigned char)c);
-    return ext == ".npy";
-}
-
 // C++17 has no portable file_clock -> system_clock conversion (that is C++20);
 // anchoring the difference against "now" on both clocks is exact to well under
 // a second, which a directory listing does not care about.
@@ -400,15 +610,24 @@ static int64_t unixMtime(const std::filesystem::path& p) {
 // One v3 listing entry. `peekBudget` bounds how many .npy headers one LIST may
 // open: a directory of thousands of files must not turn a listing into
 // thousands of file opens (the header itself is a few hundred bytes to read).
+//
+// The peek stays .npy-ONLY even though the peer now serves pictures, and the
+// budget is the reason it has to. Peeking a .npy costs a few hundred bytes;
+// peeking a PNG costs a full decode, because a picture format states its shape
+// in a header the seam does not expose separately - so a folder of 256 photos
+// would decode 256 photos to draw a listing. A picture row therefore carries no
+// LE_META, and the Browse listing shows no dtype for it. That is the same
+// answer here as over ssh and the same answer as a local browse (which goes
+// through this very code), so no folder gains a second reading from it.
 static void putListEntryV3(Buf& out, const std::filesystem::path& full,
                            const std::string& name, bool dir, uint64_t size,
                            int64_t mtime, int& peekBudget) {
-    NpyFile n;
+    ServedFile n;
     bool meta = false;
     if (!dir && isNpySuffix(name) && peekBudget > 0) {
         peekBudget--;
         std::string e2;
-        meta = parseNpyHeader(n, full.u8string(), e2);   // reads only the header
+        meta = openServed(n, full.u8string(), e2);   // reads only the header
     }
     out.putStr(name);
     out.putU32((dir ? LE_DIR : 0u) | (meta ? LE_META : 0u));
@@ -426,7 +645,7 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 
 // ---- numbered-sequence grouping ------------------------------------------
 
-struct NpyGroup {
+struct SeqGroup {
     std::string pattern;                // frame_###.npy - display name
     std::vector<std::string> names;     // member file names, numeric order
     uint64_t bytes = 0;                 // sum over members
@@ -441,9 +660,17 @@ struct NpyGroup {
 // and the *.npy fold then swallowed the lot into one stack (verbatim
 // complaint). Matches the client's segment-based sibling scan in spirit;
 // '?' in the pattern because the client renders it in ImGui labels.
-static bool npySegKey(const std::string& name, std::string& key, std::string& pattern) {
-    if (!isNpySuffix(name)) return false;
-    std::string stem = name.substr(0, name.size() - 4);
+static bool seqSegKey(const std::string& name, std::string& key, std::string& pattern) {
+    if (!isServedSuffix(name)) return false;
+    // The EXTENSION rides in the key, so two formats in one folder never land
+    // in one group: dark_001.png and dark_001.npy are different files of the
+    // same scene, and a stack that mixed them would average two readings of it.
+    // The client's own scanner splits the same way (scanFolderGroups folds its
+    // leftovers per extension), and the two have to agree or one folder reads
+    // differently depending on which end listed it.
+    const size_t dot = name.find_last_of('.');
+    const std::string ext = dot == std::string::npos ? std::string() : name.substr(dot);
+    std::string stem = name.substr(0, name.size() - ext.size());
     bool anyDigit = false;
     key.clear(); pattern.clear();
     for (size_t i = 0; i < stem.size();) {
@@ -456,7 +683,7 @@ static bool npySegKey(const std::string& name, std::string& key, std::string& pa
             i = j;
         } else { key += stem[i]; pattern += stem[i]; i++; }
     }
-    key += ".npy"; pattern += ".npy";
+    key += ext; pattern += ext;
     return anyDigit;
 }
 
@@ -478,7 +705,7 @@ static std::vector<SegRun> segRuns(const std::string& stem) {
 // Partition one directory's files into numbered groups (>= 2 members) and the
 // indices of everything else. `files` are (name, path) of regular files only.
 //
-// Two stages. Stage 1 buckets by npySegKey (every digit run collapsed) - cheap
+// Two stages. Stage 1 buckets by seqSegKey (every digit run collapsed) - cheap
 // and unchanged. Stage 2 decides, PER BUCKET, which digit run is the frame
 // axis: the LAST varying run (the client's findSequenceSiblings rule). The
 // pattern then keeps every other
@@ -488,14 +715,14 @@ static std::vector<SegRun> segRuns(const std::string& stem) {
 // runs' values instead of growing a second '?' - a condition-mixed stack has a
 // meaningless sigma_t, and the client splits those sets too. One-member
 // sub-buckets fall back to singles.
-static void groupNumberedNpy(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
-                             std::vector<NpyGroup>& groups, std::vector<size_t>& singles) {
+static void groupNumbered(const std::vector<std::pair<std::string, std::filesystem::path>>& files,
+                             std::vector<SeqGroup>& groups, std::vector<size_t>& singles) {
     struct Bucket { std::string key, pattern; std::vector<size_t> m; };
     std::vector<Bucket> buckets;
     std::vector<char> used(files.size(), 0);
     for (size_t i = 0; i < files.size(); i++) {
         std::string key, pat;
-        if (!npySegKey(files[i].first, key, pat)) continue;
+        if (!seqSegKey(files[i].first, key, pat)) continue;
         Bucket* b = nullptr;
         for (auto& q : buckets) if (q.key == key) { b = &q; break; }
         if (!b) { buckets.push_back({ key, pat, {} }); b = &buckets.back(); }
@@ -507,16 +734,18 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
     // display-only - members always travel by real name (putGroupEntryV3).
     auto emit = [&](const std::vector<size_t>& mem, int frameAxis,
                     const std::string& fallbackPattern) {
-        NpyGroup g;
+        SeqGroup g;
         if (frameAxis >= 0) {
             const std::string& nm = files[mem.front()].first;
-            std::vector<SegRun> sr = segRuns(nm.substr(0, nm.size() - 4));
+            const size_t dot = nm.find_last_of('.');
+            const std::string ext = dot == std::string::npos ? std::string() : nm.substr(dot);
+            std::vector<SegRun> sr = segRuns(nm.substr(0, nm.size() - ext.size()));
             int run = 0;
             for (const auto& r : sr) {
                 if (r.digit && run++ == frameAxis) g.pattern += std::string(r.s.size(), '?');
                 else g.pattern += r.s;
             }
-            g.pattern += ".npy";
+            g.pattern += ext;
         } else {
             g.pattern = fallbackPattern;      // degenerate bucket: stage-1 view
         }
@@ -552,7 +781,8 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
         bool segOk = true;
         for (size_t i = 0; i < b.m.size() && segOk; i++) {
             const std::string& nm = files[b.m[i]].first;
-            for (const auto& r : segRuns(nm.substr(0, nm.size() - 4)))
+            const size_t dot = nm.find_last_of('.');
+            for (const auto& r : segRuns(nm.substr(0, dot == std::string::npos ? nm.size() : dot)))
                 if (r.digit) vals[i].push_back(r.s);
             if (i == 0) nRuns = vals[i].size();
             else if (vals[i].size() != nRuns) segOk = false;
@@ -609,13 +839,15 @@ static void groupNumberedNpy(const std::vector<std::pair<std::string, std::files
 // dumps have gaps and uneven zero-padding, and reconstructing names that do
 // not exist is exactly the failure this tool must not have. Names only: even
 // a 1000-frame group is ~20 KB, noise next to one tile.
-static void putGroupEntryV3(Buf& out, const NpyGroup& g, int& peekBudget) {
-    NpyFile n;
+static void putGroupEntryV3(Buf& out, const SeqGroup& g, int& peekBudget) {
+    ServedFile n;
     bool meta = false;
-    if (peekBudget > 0) {
+    // .npy only, for putListEntryV3's reason: a group's meta is its FIRST
+    // frame's, and peeking a picture group would decode a picture per group.
+    if (peekBudget > 0 && isNpySuffix(g.first.filename().u8string())) {
         peekBudget--;
         std::string e2;
-        meta = parseNpyHeader(n, g.first.u8string(), e2);
+        meta = openServed(n, g.first.u8string(), e2);
     }
     out.putStr(g.pattern);
     out.putU32(LE_GROUP | (meta ? LE_META : 0u));
@@ -676,9 +908,9 @@ static void handleList(Buf& in) {
         if (e.is_directory(e2)) dirs.push_back(&e);
         else files.push_back({ e.path().filename().u8string(), e.path() });
     }
-    std::vector<NpyGroup> groups;
+    std::vector<SeqGroup> groups;
     std::vector<size_t> singles;
-    groupNumberedNpy(files, groups, singles);
+    groupNumbered(files, groups, singles);
     // one merged, name-sorted row list, so the reply reads like a directory
     struct Row { std::string name; int kind; size_t idx; };   // 0 dir, 1 single, 2 group
     std::vector<Row> rows;
@@ -850,7 +1082,7 @@ static void handleScan(Buf& in) {
     }
     uint32_t skipped = 0;
     bool trunc = false;
-    struct Found { std::string rel; NpyGroup g; };
+    struct Found { std::string rel; SeqGroup g; };
     std::vector<Found> found;
     // Manual walk: recursive_directory_iterator aborts everything on one
     // unreadable entry, and symlinks are not followed at all - a cycle must
@@ -860,43 +1092,58 @@ static void handleScan(Buf& in) {
     [&](ScanState& files, const std::filesystem::directory_entry& it, bool isDir) {
         std::error_code fec;
         if (!isDir && it.is_regular_file(fec) &&
-            isNpySuffix(it.path().filename().u8string())) {
+            isServedSuffix(it.path().filename().u8string())) {
             files.push_back({ it.path().filename().u8string(), it.path() });
         }
     }, [&](const std::filesystem::path& curDir, ScanState& files) {
         if (files.empty()) return;
         std::sort(files.begin(), files.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
-        std::vector<NpyGroup> gs;
+        std::vector<SeqGroup> gs;
         std::vector<size_t> singles;
-        groupNumberedNpy(files, gs, singles);
+        groupNumbered(files, gs, singles);
         // Two or more leftovers fold into ONE natural-order stack ("*.npy"):
         // capture sets are not always numbered (capture_a / capture_b / ...),
         // and N single-frame stacks from one folder is never what Open Folder
         // meant. A lone file still opens as itself.
-        if (singles.size() >= 2) {
-            NpyGroup g;
-            g.pattern = "*.npy";
-            std::sort(singles.begin(), singles.end(), [&](size_t x, size_t y) {
-                return rp::naturalLess(files[x].first, files[y].first);
-            });
-            for (size_t i : singles) {
+        //
+        // PER EXTENSION, because the peer no longer walks one format: a folder
+        // holding capture_a.png beside notes.npy is two stacks and not one, and
+        // "*.npy" over a set of PNGs would be a label that names the wrong
+        // format. The client's scanFolderGroups folds its own leftovers per
+        // extension for the same reason (core/app/sequence.inc), and these two
+        // have to answer the same or one folder reads two ways.
+        std::vector<std::pair<std::string, std::vector<size_t>>> byExt;
+        for (size_t i : singles) {
+            const std::string& nm = files[i].first;
+            const size_t dot = nm.find_last_of('.');
+            std::string ext = dot == std::string::npos ? std::string() : nm.substr(dot);
+            for (char& c : ext) c = (char)tolower((unsigned char)c);
+            std::vector<size_t>* v = nullptr;
+            for (auto& q : byExt) if (q.first == ext) { v = &q.second; break; }
+            if (!v) { byExt.push_back({ ext, {} }); v = &byExt.back().second; }
+            v->push_back(i);
+        }
+        std::sort(byExt.begin(), byExt.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (auto& q : byExt) {
+            std::vector<size_t>& mem = q.second;
+            SeqGroup g;
+            if (mem.size() >= 2) {
+                g.pattern = "*" + q.first;
+                std::sort(mem.begin(), mem.end(), [&](size_t x, size_t y) {
+                    return rp::naturalLess(files[x].first, files[y].first);
+                });
+            } else {
+                g.pattern = files[mem[0]].first;
+            }
+            for (size_t i : mem) {
                 g.names.push_back(files[i].first);
                 std::error_code e2;
                 g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, e2);
                 g.mtime = std::max(g.mtime, unixMtime(files[i].second));
             }
-            g.first = files[singles.front()].second;
-            gs.push_back(std::move(g));
-        } else if (singles.size() == 1) {
-            size_t i = singles[0];
-            NpyGroup g;
-            g.pattern = files[i].first;
-            g.names = { files[i].first };
-            std::error_code e2;
-            g.bytes = (uint64_t)std::filesystem::file_size(files[i].second, e2);
-            g.mtime = unixMtime(files[i].second);
-            g.first = files[i].second;
+            g.first = files[mem.front()].second;
             gs.push_back(std::move(g));
         }
         std::string rel = curDir.lexically_relative(rootP).generic_u8string();
@@ -942,8 +1189,8 @@ static void handleMeta(Buf& in) {
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
-    NpyFile n;
-    if (!parseNpyHeader(n, path, err, read)) { sendErr(err); return; }
+    ServedFile n;
+    if (!openServed(n, path, err, read)) { sendErr(err); return; }
     MetaRep m{};
     m.w = (uint32_t)n.w; m.h = (uint32_t)n.h; m.ch = (uint32_t)n.ch;
     m.dtype = n.dtype; m.frames = (uint32_t)n.frames; m.flags = 0;
@@ -974,8 +1221,8 @@ static void handleTile(Buf& in) {
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
-    NpyFile n;
-    if (!parseNpyHeader(n, path, err, read)) { sendErr(err); return; }
+    ServedFile n;
+    if (!openServed(n, path, err, read)) { sendErr(err); return; }
     std::vector<uint8_t> pix;
     uint32_t ow = 0, oh = 0;
     if (!readRegion(n, r, pix, ow, oh, err)) { sendErr(err); return; }
@@ -1033,6 +1280,9 @@ void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out) {
         case DT_I32: for (size_t i = 0; i < n; i++) out[i] = (float)((const int32_t*)src)[i]; break;
         case DT_F32: memcpy(out, src, n * 4); break;
         case DT_F64: for (size_t i = 0; i < n; i++) out[i] = (float)((const double*)src)[i]; break;
+        // every half is exactly a float, so this one loses nothing at all
+        case DT_F16: for (size_t i = 0; i < n; i++)
+                         out[i] = halfToFloat(((const uint16_t*)src)[i]); break;
         default:     for (size_t i = 0; i < n; i++) out[i] = 0.0f; break;
     }
 }
@@ -1132,7 +1382,7 @@ std::string planeKey(const char* base, uint32_t cfaType, int plane) {
 struct FrameSource {
     const MeasureReqHead* head = nullptr;
     const std::vector<std::string>* paths = nullptr;
-    NpyFile n;                        // in-file mode stays open across frames
+    ServedFile n;                        // in-file mode stays open across frames
     bool perFile = false;
     uint32_t count = 0;
     std::string err;
@@ -1141,7 +1391,7 @@ struct FrameSource {
         head = &h;
         paths = &p;
         perFile = p.size() > 1;
-        if (!parseNpyHeader(n, p[0], err)) return false;
+        if (!openServed(n, p[0], err)) return false;
         if (perFile) {
             count = (uint32_t)p.size();
         } else {
@@ -1167,8 +1417,8 @@ struct FrameSource {
         TileReq r{};
         r.x = rx; r.y = ry; r.w = rw; r.h = rh; r.step = 1;
         if (perFile) {
-            NpyFile f;
-            if (!parseNpyHeader(f, (*paths)[i], err)) return false;
+            ServedFile f;
+            if (!openServed(f, (*paths)[i], err)) return false;
             if (f.w != n.w || f.h != n.h || f.ch != n.ch || f.dtype != n.dtype) {
                 err = "frame " + std::to_string(i) + " differs in shape/dtype";
                 return false;
@@ -1181,7 +1431,7 @@ struct FrameSource {
     }
 };
 
-bool clampRoi(const NpyFile& n, const std::vector<RoiRect>& rois, uint32_t c,
+bool clampRoi(const ServedFile& n, const std::vector<RoiRect>& rois, uint32_t c,
               uint32_t& rx, uint32_t& ry, uint32_t& rw, uint32_t& rh) {
     rx = 0; ry = 0; rw = (uint32_t)n.w; rh = (uint32_t)n.h;
     if (!rois.empty()) {
@@ -1744,8 +1994,8 @@ static bool runFrameAnalyzerOn(const AnalyzerPluginInfo& ana,
                                std::vector<std::vector<MItem>>& cols,
                                std::vector<MSeries>& series,
                                std::string& err) {
-    NpyFile n;
-    if (!parseNpyHeader(n, paths[0], err)) return false;
+    ServedFile n;
+    if (!openServed(n, paths[0], err)) return false;
     TileReq full{};
     full.frame = head.frame0;
     full.x = 0; full.y = 0; full.w = (uint32_t)n.w; full.h = (uint32_t)n.h;

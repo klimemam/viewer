@@ -26,7 +26,8 @@
         }
         sortFramesNumerically(files);
         if (files.size() < 2) {
-            fprintf(stderr, "rtemporalselftest: need >= 2 npy under %s\n", dir.c_str());
+            fprintf(stderr, "rtemporalselftest: need >= 2 peer-servable files under %s\n",
+                    dir.c_str());
             return 1;
         }
         // independent reference: per-pixel f64 accumulation over the local files.
@@ -43,7 +44,16 @@
             int N = 0;
             for (const auto& f : files) {
                 std::string err;
-                std::unique_ptr<ImageDoc> d = decodeNpy(f, err);
+                // WHICHEVER local door reads it, which since issue #148 is two:
+                // this test is registered twice, once over a folder of .npy and
+                // once over a folder of .png, and the second one is the whole
+                // point - a peer that serves pictures for TILE and cannot be
+                // measured over them would be the same "two answers" defect one
+                // level down. The dispatch is the local door's own order
+                // (core/app/loader_npz.inc: .npy first, then the format table).
+                std::unique_ptr<ImageDoc> d = imagefile::forPath(f)
+                                            ? decodeImageFileFrame(f, err)
+                                            : decodeNpy(f, err);
                 if (!d) {
                     fprintf(stderr, "rtemporalselftest: %s: %s\n", f.c_str(), err.c_str());
                     return 1;
@@ -91,7 +101,14 @@
             pumpMeasure();
             if (rbMain().b.connected && !fired) {
                 std::string leaf = dir.substr(dir.find_last_of('/') + 1);
-                requestBrowseTemporal(rbMain().b.host, files, leaf + "/frame_???.npy", rbMain().b.port);
+                // the label carries the fixture's OWN extension: this runs over
+                // a .png folder as well now, and a label reading ".npy" over a
+                // stack of PNGs is a printed statement that is simply false
+                const size_t dot = files.front().find_last_of('.');
+                const std::string ext = dot == std::string::npos
+                                      ? std::string() : files.front().substr(dot);
+                requestBrowseTemporal(rbMain().b.host, files, leaf + "/frame_???" + ext,
+                                      rbMain().b.port);
                 fired = true;
             }
             if (fired && !app.srvTemporal.pending) break;

@@ -456,6 +456,41 @@ peer のもの。ローカルの絵にはその安価な部分デコードが無
 **`viewer-serve` は 1バイトも変わっていない** (media 3本と同じ前例)。この問題は
 最初から**クライアント側の述語**の問題だった。
 
+#### 3.6.4b peer も同じ形式を配る (#148 判断 B, 2026-08-10)
+
+上の `peerServesName(n) -> .npy` は**この日で終わった**。#148 の判断 B により
+`viewer-serve` は `core/imagefile.h` をリンクし、**このビューアが読む絵の形式を配る**。
+
+```
+peerServesName(n) -> imagefile::peerServes(n)   // .npy + 表の overLink 列
+```
+
+**述語は 1つ、表も 1つ。** 「どの形式がリンクを渡るか」は `Backend::overLink` という
+表の 1列で、client の門も peer の限界も**同じ関数**を読む —— 一覧が 2つあれば
+ずれる、というのが #148 が 1段上で言っていることだからである。
+
+**RAW だけが false**。理由は reader ではなく**配布**で、LibRaw は CDDL-1.0、
+`viewer-serve` は ssh で相手のマシンに自分をインストールする別バイナリである
+(`core/rawread.h` の licence note)。peer のビルドでは表の RAW 行は**拡張子と
+sniff を保ったまま decoder だけ失う** (`absent`) ので、`.NEF` は名指しで断られ、
+下の TIFF 行に落ちて先頭 IFD を「測定値」として解かれることはない。
+
+拒否文は §3.2 の三部構成のまま、**理由が名指しになった**:
+
+> `vendor RAW is read on this machine, but the peer does not serve it: LibRaw is`
+> `CDDL-1.0 and viewer-serve installs itself onto another machine over ssh`
+> `  browse it locally (File > Browse Folder), or copy it here first`
+
+**ワイヤの形は変わっていない** —— `MSG_TILE` は元から画素を運ぶ。送るのは
+**ファイル自身の dtype** で、viewer の内部表現 (float32) ではない: この 5形式の
+dtype (u8/u16/f16/f32) は**すべて float32 に厳密に載る**ので往復で 1ビットも
+変わらない。`f16` は wire に型を 1つ足した (`rp::DT_F16`) —— f32 に広げると
+同じ `.exr` が local で `f16`、リンク越しで `f32` と表示され、それこそ #148 の
+「1つのフォルダが 2つの答え」を 1段下で作ることになる。
+
+`rp::VERSION` は **10**。形は動かないので 4/5/6 と同じ**意味**の版上げで、
+入っている peer を接続時に更新させるのもこの番号である。
+
 ### 3.6.5 ベンダ RAW — ファイルが数値の意味を名乗る唯一の形式 (2026-08-10)
 
 **裁定 (2026-08-09、ユーザー、#52)**:

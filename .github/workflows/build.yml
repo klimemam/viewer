@@ -171,6 +171,12 @@ jobs:
             # miniz.c is C: compiling it as C++ turns its tentative definitions
             # into redefinition errors, so it gets its own gcc pass
             gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
+            # stb_image is C too, and VENDORED in the tree (third_party/stb), so
+            # the peer's PNG and JPEG readers cost this step one more gcc pass
+            # and no dependency at all. Same warnings-off treatment as miniz: it
+            # is third-party code, and core/imagefile.cpp is the file this
+            # project holds to -Wall.
+            gcc -O2 -Ithird_party/stb -c core/stb_image_impl.c -o /tmp/stb.o
             # core/version.cpp, and -Ibuild/generated for the header the cmake
             # build above wrote there. MOP_SET_FOLD returns the peer version as
             # PROVENANCE - "which build folded this", which is what #46 asks of
@@ -179,10 +185,34 @@ jobs:
             # parity refusal (PR #135) and it costs this list exactly one file.
             # This list is the whole definition of the compat binary, so keep it
             # minimal - but a symbol the peer genuinely needs belongs in it.
-            g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -Icore -Iinclude -Ibuild/_deps/miniz-src \
+            # ...and the READERS, since issue #148 judgment B: the peer serves
+            # the picture formats this viewer reads, so core/imagefile.h and the
+            # readers behind it are part of what a peer IS now. Every one of
+            # them is this repository's own code or a vendored header, so the
+            # FILE list grew and the DEPENDENCY list did not:
+            #
+            #   VIEWER_NO_LIBRAW   LibRaw is CDDL-1.0 and this binary installs
+            #                      itself onto someone else's machine. Refused
+            #                      by name on every peer; core/rawread.cpp is
+            #                      still compiled, for its SNIFF, so a .NEF is
+            #                      recognised as a camera's file instead of
+            #                      falling through to the TIFF reader beneath it.
+            #   VIEWER_NO_OPENEXR  the one reader here that is a LIBRARY. This
+            #                      compat binary exists so that a peer runs on an
+            #                      old distro AT ALL, and building OpenEXR inside
+            #                      this container would trade that for minutes of
+            #                      CI and a new way to fail. The .exr row keeps
+            #                      its extension and its sniff and loses its
+            #                      decoder, so this peer refuses .exr BY NAME and
+            #                      names the build - which is also the one place
+            #                      where two peers of the same protocol number
+            #                      differ in what they serve.
+            g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -DVIEWER_NO_LIBRAW -DVIEWER_NO_OPENEXR \
+                -Icore -Iinclude -Ibuild/_deps/miniz-src -Ithird_party/stb \
                 -Ibuild/generated \
                 core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
-                /tmp/miniz.o \
+                core/imagefile.cpp core/tiffread.cpp core/y4mread.cpp core/rawread.cpp \
+                /tmp/miniz.o /tmp/stb.o \
                 -o build/viewer-serve \
                 -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
             for f in plugins/*.c; do
