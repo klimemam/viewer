@@ -701,8 +701,9 @@ static std::string buildTemporalExport(char delim) {
     for (const TExpSide& s : sides) {
         const ImageDoc* d = s.doc;
         char b[512];
-        snprintf(b, sizeof b, "%s: %s%s  |  path: %s", s.letter.c_str(),
+        snprintf(b, sizeof b, "%s: %s%s%s  |  path: %s", s.letter.c_str(),
                  abDocLabel(d).c_str(), avgIsStale(d) ? " (stale)" : "",
+                 seqReloadMark(d->seqId),
                  d->src->path.empty() ? "-" : d->src->path.c_str());
         doc.comment(b);
         // A computed frame's provenance is its note - there is no path to
@@ -715,6 +716,13 @@ static std::string buildTemporalExport(char delim) {
             doc.comment("NOTE: side " + s.letter + ": (stale) - the source stack was "
                         "reloaded after this frame was computed; these numbers "
                         "describe the OLD pixels (Recompute to refresh)");
+        // #56: sigma_t is THE number a mixed-generation stack corrupts, and
+        // this document is where it is carried into a report. So the mark
+        // travels with it - not as a colour, which a TSV cannot hold, but as
+        // the same sentence the Inspector prints. An export that dropped it
+        // would be the one surface that let the number out unqualified.
+        if (std::string rn = seqReloadNote(d->seqId); !rn.empty())
+            doc.comment("NOTE: side " + s.letter + ": " + rn);
         std::string cfa = d->cfa
             ? std::string(CFA_PATTERNS[d->cfaPattern & 3]) + (d->cfa == 2 ? " quad" : "") + " (4 planes)"
             : std::string("none");

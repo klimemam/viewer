@@ -444,6 +444,32 @@ dedup しない。2つが同じ入力 tuple を記録していれば「同じ絵
 Files 行での表示。Watch (stage 6) はこのマークの**自動更新者**になるだけで、
 新しい機構を持ち込まない。
 
+実装済 (2026-08-10, branch reload-failed-marker / #56): **機構は §10.1 と1つ、
+状態は2つ**。共有するのは「事象の瞬間にラッチし、黙って消えず、報告書が
+引用する5面 (title / Files 行 / tooltip / Inspector / TSV export) で読める」
+という形。状態を分けたのは主語と直し方が違うから — `(stale)` は**派生した
+絵**が stack に追いつけていないことで Recompute 一手で真に戻せる、
+`(reload failed)` は**stack 自身**の frame が同一瞬間でなくなったことで、
+再計算では直らず「全 frame が成功する再読込」以外に消し方がない。
+
+- 状態: 「この stack の**直近の reload が member を1つ以上拒否した**」。
+  mtime 比較ではない (1秒1枚で書かれた folder stack は mtime が frame 数だけ
+  あって完全に整合している — mtime は「メモリ上の複製が同一瞬間か」を見られ
+  ない)。`stackRev` でもない (再読込を数えるが、置いていかれた member が
+  あるかは数えない)。だから**事象の場所**、`reloadStackFromDisk` の最後で
+  `SeqInfo` に記録する。
+- `reloadOk > 0` なら混合世代 (危険な方、σ_t が2世代を平均する)、
+  `reloadOk == 0` なら何も差し替わっていない (瞬間は1つのまま、ただし
+  ユーザーが求めた瞬間ではない)。マークは1つ、文言が両者を言い分ける。
+- 消えるのは**全 member が成功した stack 単位の reload** だけ。再描画でも
+  選択でも単一 frame の reload でも消えない (単一 frame の再読込は他の
+  member について何も言っていない)。ファイルが恒久的に失われた stack は
+  閉じるまで付いたまま — それは真だから。
+- セッションには保存しない (`stackRev` と同じ理由: 復元は今日のディスクを
+  読み直すので、復元された stack は構成上1つの瞬間である)。
+- 赤枠は Files 行に、文は tooltip / Inspector / export に。色だけでは報告書に
+  貼れないので必ず語と対にする。検証は `--reload-selftest` の R25a-h。
+
 ### 10.4 統合順への含意
 
 stackavg は main 側の機能なので、この追補の実装は **ref-integrate が main に

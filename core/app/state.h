@@ -802,6 +802,41 @@ struct App {
         // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a
         // reload that changes no shape (docs/reference-design.md §3.2).
         int stackRev = 0;
+        // ---- what the LAST reload of this stack left behind (issue #56) ------
+        // A reload that refuses one member and re-reads the others does not
+        // leave a stack: it leaves frames of TWO moments under one name, and
+        // every stack-level number - sigma_t first - then averages across a
+        // seam nothing on screen admits to. The toast that said so scrolls
+        // away, so the fact is latched HERE, on the stack itself, at the
+        // moment the walk finishes.
+        //
+        // The state is "the last reload of this stack refused at least one
+        // member", and it is recorded at the EVENT rather than inferred:
+        //   - NOT from mtimes. A folder stack written one file per second has
+        //     as many mtimes as frames and is perfectly coherent; mtime cannot
+        //     see the only thing that matters, which is whether the copies in
+        //     memory were taken at one moment.
+        //   - NOT from stackRev. That counts re-reads, and counts them the
+        //     same whether every member came along or one was left behind.
+        // reloadOk > 0 with reloadFailed > 0 is the mixed-generation case (the
+        // dangerous half); reloadOk == 0 means nothing was re-read at all, so
+        // the pixels are still of one moment - just not the moment the user
+        // asked for. One mark, and seqReloadNote() says which it is.
+        //
+        // Cleared by ONE move: a reload of this whole stack in which EVERY
+        // member succeeds - the operation that actually makes the statement
+        // false again. Never by a redraw, a selection, a panel, or a
+        // single-frame reload (that one says nothing about the other members).
+        // A stack whose file is gone for good therefore stays marked until it
+        // is closed, which is true: it can no longer be re-read as one moment.
+        //
+        // NOT saved in a session, for stackRev's reason: a restore re-reads
+        // every member from today's disk, so the restored stack is of one
+        // moment by construction and a carried-over mark would be a lie.
+        int reloadFailed = 0;             // members the last reload REFUSED
+        int reloadOk = 0;                 // ...and members it re-read, same attempt
+        std::string reloadFirstErr;       // "a_003.npy: cannot read file"
+        std::string reloadWhen;           // wall clock of that attempt
         // Per-frame X axis for the Temporal chart: what frame i physically IS
         // (elapsed time, exposure, temperature). NAME + UNIT + one value per
         // frame - a bare list of numbers cannot label an axis, so all three
@@ -911,6 +946,8 @@ struct App {
                 s.name = "<stale SeqInfo>";     // short enough to stay inline
                 s.lastImageIdx = -1;
                 s.expectedFrames = s.stackRev = 0;
+                s.reloadFailed = s.reloadOk = 0;
+                s.reloadFirstErr.clear(); s.reloadWhen.clear();
                 s.refW = s.refH = s.refCh = 0;
                 s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
                 s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();

@@ -1513,6 +1513,14 @@ static const ImU32  AB_AMBER32 = IM_COL32(242, 184, 89, 255);
 // stepping is indistinguishable from part of the file name - the one moment it
 // exists to be read. It is a separate token now, in the warning amber.
 static const char* AB_STALE_TOKEN = "[stale]";
+// The one RED, and it is a step past the amber on purpose (issue #56). Amber
+// says "shown, and out of date" - a thing the user can refresh. This says "the
+// re-read you asked for did not happen, and what is on screen is not one
+// generation any more": nothing the program can put right by itself, and the
+// numbers taken off it are wrong rather than old. It outlines the Files row
+// (the user's own proposal on #56) and inks the Inspector sentence.
+static const ImVec4 RELOAD_FAIL_RED(0.92f, 0.36f, 0.33f, 1.0f);
+static const ImU32  RELOAD_FAIL_RED32 = IM_COL32(235, 92, 84, 255);
 
 // What A or B is CALLED, everywhere the two are set against each other.
 // A capture series names every stack's frames identically - 00/frame_000.npy

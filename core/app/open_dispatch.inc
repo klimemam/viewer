@@ -784,10 +784,41 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
         }
     }
     if (failedOut) *failedOut = failed;
+    // ---- #56: what this attempt LEAVES ON the stack ------------------------
+    // The summary below is a toast, and a toast scrolls away. A reload that
+    // refused a member left frames of two moments under one name, and every
+    // stack number computed afterwards averages across that seam - so the fact
+    // is latched on the SeqInfo, here, at the event that caused it, exactly as
+    // §10.1 latches avgStale on the reduced frames a few lines up.
+    //
+    // And the clean run is the one thing that CLEARS it: every member re-read
+    // in one attempt is a stack of one moment again. Not a redraw, not a
+    // single-frame reload - the operation that failed is the operation that
+    // un-says it. The pointer is taken after the last reloadSource: nothing in
+    // the walk adds or removes a stack, but seqInfo()'s rule is that the
+    // pointer is not held ACROSS anything, so it is not.
+    if (App::SeqInfo* si = seqInfo(seqId)) {
+        si->reloadFailed = failed;
+        si->reloadOk = failed ? ok : 0;
+        si->reloadFirstErr = failed ? firstErr : std::string();
+        if (failed) {
+            char ts[32] = "";
+            time_t now = time(nullptr);
+            if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
+            si->reloadWhen = ts;
+        } else {
+            si->reloadWhen.clear();
+        }
+    }
     char buf[256];
     snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed", ok, failed);
     std::string msg = buf;
-    if (failed) msg += " - " + firstErr;
+    // ...and the toast points at the mark it just left, because the mark is
+    // the part that outlives the toast: a user who reads only this line must
+    // still learn that the stack now carries the fact, and where.
+    if (failed)
+        msg += " - " + firstErr + " - this stack is marked " +
+               SEQ_RELOAD_FAIL_TOKEN + " in Files until every frame re-reads";
     if (dims) {
         snprintf(buf, sizeof buf, " - %d changed dimensions (%s)", dims, firstDims.c_str());
         msg += buf;
