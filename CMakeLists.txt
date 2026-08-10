@@ -1266,9 +1266,9 @@ viewer_selftest(abstats-cfa-bayer --abstats-selftest tools/testdata/multi --cfa 
 # runs reading the user's layout.ini - until the default was fixed, the default
 # bench layout docked Projection, Histogram and Temporal into ONE dock node as
 # tabs. ImGui::Begin returns false for the two that are not selected, so the
-# frame times covered one panel of the three and read 5x too fast (2.25 ms
-# against 12.61 ms on the same machine and the same fixture). Nothing failed;
-# the number was simply smaller than the thing it named.
+# frame times covered one panel of the three and read 5.3x too fast (2.38 ms
+# against 12.58 ms, median of three, same machine and same fixture). Nothing
+# failed; the number was simply smaller than the thing it named.
 #
 # No NOGL: the whole subject is what a real docking layout does to a real
 # frame, which is exactly what cannot be computed without a window. Small and

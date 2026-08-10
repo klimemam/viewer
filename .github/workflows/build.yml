@@ -133,10 +133,11 @@ jobs:
           # ...and that the frames rendered contain what the number claims. The
           # run prints the panels its measured frames drew and exits non-zero
           # when a panel it OPENED never did (an unselected dock tab draws
-          # nothing, which is how this gate spent from ba40ba8 to PR #142
-          # watching a fifth of the work). The pipe into tee above swallows that
-          # exit status, so the verdict is read from the log instead of relied
-          # on: a gate that quotes a frame time has to check that time's scope.
+          # nothing, which is how this gate spent every run from ba40ba8 until
+          # the default layout was fixed watching a fifth of the work). The pipe
+          # into tee above swallows that exit status, so the verdict is read
+          # from the log instead of relied on: a gate that quotes a frame time
+          # has to check that time's scope.
           grep -q "^benchcov: .* PASS$" bench.log \
             || { echo "the bench measured fewer panels than it opened:"; \
                  grep -E "^bench: (panels|OPEN)|^benchcov:" bench.log; exit 1; }
