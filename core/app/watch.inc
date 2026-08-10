@@ -731,7 +731,14 @@ static const char* watchAutoBusy(int seqId) {
 // until its files happened to move a second time.
 static std::vector<int> watchAutoArmed() {
     std::vector<int> out;
-    if (!app.watchEnabled || !app.watchAutoReload) return out;
+    // watchPaused with the other two, and rbPollDue's line is the precedent:
+    // §2's "not while the window is minimised" is about not doing background
+    // work behind a window nobody can see, and ACTING behind one is more of
+    // that, not less. (The frame loop already returns before pumpWatch while
+    // iconified, so this is a statement rather than a guard - but it is also
+    // what a test that pauses Watch to stop other writers is entitled to
+    // assume, which is now a real caller: a9b7973.)
+    if (!app.watchEnabled || !app.watchAutoReload || app.watchPaused) return out;
     for (const App::SeqInfo& si : app.seqs)
         if (si.watchFound.any() && !watchAutoRefusal(si.id)) out.push_back(si.id);
     return out;
@@ -813,7 +820,10 @@ static void watchAutoDrain() {
 // seqWatchNote states what the DISK did, and this states what the program is
 // about to do about it, which are two facts and not one.
 static std::string watchAutoNote(int seqId) {
-    if (!app.watchEnabled || !app.watchAutoReload) return {};
+    // The same three terms watchAutoArmed opens with, and they have to be the
+    // same three: this sentence promises "reloading automatically", and a
+    // promise made under conditions the drain does not share is a false one.
+    if (!app.watchEnabled || !app.watchAutoReload || app.watchPaused) return {};
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si || !si->watchFound.any()) return {};
     // The PEER refusal is already the whole of what this line says

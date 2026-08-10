@@ -972,6 +972,16 @@
         //  kept out of §11.5's blind spot.
         // ======================================================================
         closeAll();
+        // app.watchAutoReload IS THE PREFS KEY `watchauto`, and VIEWER_TEST_HOME
+        // is ONE directory shared by every selftest - a run that ends with a
+        // preference changed rewrites that file for everything after it, and the
+        // value survives across runs until somebody notices (a9b7973: one
+        // `watchfiles 0` took the browse group from 3.1 s PASS to 183 s FAIL and
+        // kept it there). This test cannot use a non-persisted flag instead,
+        // because the persisted one is its SUBJECT - so it is restored here,
+        // once, for the whole section rather than at the end of the case that
+        // happens to set it last.
+        const bool autoWas = app.watchAutoReload;
         const std::string aut = root + "/auto";
         std::filesystem::create_directories(pathFromUtf8(aut), ec);
         auto autName = [](int i) {
@@ -1181,7 +1191,6 @@
             watchAutoDrain();
             check(pxOf(1) == 88.0f && !seqInfo(as)->autoReloadNote.empty(),
                   "W44f ...and the next change is automatic again");
-            app.watchAutoReload = false;
         }
         {   // ---- W45: the sentence, with no filesystem and no stack -------------
             check(watch::autoReloadText("14:32:07", "reloaded 5 frame(s), 0 failed",
@@ -1199,6 +1208,7 @@
                   "W45b ...and it says when the compare pin went with a gone frame");
         }
 
+        app.watchAutoReload = autoWas;   // see the note above the §9 section
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "watchselftest: %s\n", ok ? "ok" : "FAILED");
