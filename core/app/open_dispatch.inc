@@ -415,6 +415,40 @@ static void seqMosaicChanged(const ImageDoc* im) {
 }
 
 // ---- reload from disk (docs/reference-design.md §3.2) --------------------------
+// Why "Reload from disk" cannot serve THIS source - the sentence the Files
+// right-click shows where the click would have been - or "" when it can.
+//
+// ONE predicate, and it exists because there were two. The menu item greys
+// itself out, and it did so from its own transcription of reloadSource's
+// refusals, sitting in another file: the two lists agreed only as long as
+// nobody taught the walk something new. That is not a hypothetical - the
+// picture formats were greyed out here for exactly as long as they were
+// refused there, and the day the walk learned to reload a .tif this copy would
+// still have been saying "not wired yet" over a working reload. The refusals
+// are a fact about reloadSource, so they are stated once, next to it.
+//
+// Order matches reloadSource's own, so the reason a user is shown is the reason
+// the function would have given.
+static std::string reloadUnavailable(const FrameSource& S) {
+    // local:// is LOCAL: a Browse-panel local open carries the on-disk path
+    // inside its url, so those pixels ARE reloadable. Only real remote schemes
+    // (a peer holds the bytes) refuse.
+    const bool localUrl = !S.remoteUrl.empty() && S.remoteUrl.rfind("local://", 0) == 0;
+    if (!S.remoteUrl.empty() && !localUrl)
+        return "remote-backed: these pixels come from the peer,\n"
+               "not from a local file.";
+    if ((localUrl ? S.remoteUrl.substr(8) : S.path).empty())
+        return "no file behind these pixels - they were composed\n"
+               "here (montage / plugin result).";
+    if (S.member.rfind("__pixels_", 0) == 0)
+        return "a container/reader member: the file rebuilds\n"
+               "as a unit - re-open it to reload.";
+    if (const imagefile::Backend* b =
+            imagefile::forPath(localUrl ? S.remoteUrl.substr(8) : S.path))
+        return std::string(b->format) + " reload is not wired yet: re-open the file.";
+    return {};
+}
+
 // THE one place pixels are replaced in place. Re-decodes a source from its own
 // provenance (path + member + fileFrame + raw recipe), swaps the result into
 // the SAME FrameSource, then walks every membership that shares it: dataRev,

@@ -951,6 +951,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/reload.inc"
 
+    #include "selftest/fmtreg.inc"
+
     #include "selftest/stackavg.inc"
 
     #include "selftest/abstats.inc"

@@ -27,6 +27,8 @@ static std::string g_newwinSelftest;    // --newwin-selftest <dir>: instance slo
 static std::string g_reloadSelftest;    // --reload-selftest <dir>: reload walk + temporal key, exit
 static std::string g_srcmapSelftest;    // --srcmap-selftest <dir>: who holds which pixels, exit
 static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
+static std::string g_fmtRegSelftest;    // --fmtreg-selftest <dir>: every format's place in the
+                                        // source registry and the reload walk (§6.2 / §3.2), exit
 static std::string g_asetSelftest;      // --aset-selftest <dir>: AnalysisSet transport/binding/session, exit
 static std::string g_setAnalysisSelftest; // --setanalysis-selftest <dir>: direct DSNU / PRNU
                                           // over a bound set (#57 判断4) + the famous-name
@@ -687,6 +689,8 @@ static void parseCli(int argc, char** argv) {
             g_srcmapSelftest = next();             // handled in main()
         } else if (a == "--media-selftest") {
             g_mediaSelftest = next();              // handled in main()
+        } else if (a == "--fmtreg-selftest") {
+            g_fmtRegSelftest = next();             // handled in main()
         } else if (a == "--remote-selftest") {
             next();
         } else if (a == "--rplugin-selftest") {

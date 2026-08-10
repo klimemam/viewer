@@ -975,6 +975,14 @@ viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 # It writes its own fixtures under a scratch subdirectory of the given dir.
 viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 
+# ...and WHICH formats that walk, and the registry it keys off, actually reach:
+# one row per backend of core/imagefile.h plus the members of a viewer
+# container - registers / reload reaches / a second open shares. It writes the
+# PNG, TIFF and y4m fixtures from their own samples and copies the JPEG, .exr
+# and .dng pairs out of tools/testdata/media (which is why it is pointed at
+# tools/testdata and reads media/ from under it, rather than at media/ itself).
+viewer_selftest(fmtreg NOGL --fmtreg-selftest tools/testdata)
+
 # --remote-selftest returns before startup reaches GLFW at all, so it was the
 # one test carrying NOGL before there was a windowless startup path - and it
 # must be told where the standalone peer is, or it silently tests this binary

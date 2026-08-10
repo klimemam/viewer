@@ -791,36 +791,16 @@ static void drawFileList() {
                 if (ImGui::MenuItem("Open in new window"))
                     openInNewWindow(app.images[i].get());
                 {   // manual reload (reference-design §3.2 / §8 row 5): re-read
-                    // this frame's file and swap the pixels in place
-                    const FrameSource& S = *app.images[i]->src;
-                    // local:// is a file on THIS disk: reloadable. Only real
-                    // remote schemes (the peer holds the bytes) refuse.
-                    const bool remote = !S.remoteUrl.empty() &&
-                                        S.remoteUrl.rfind("local://", 0) != 0;
-                    // PNG/JPEG: reloadSource refuses these by name (they are
-                    // outside the registry too) - grey the item rather than
-                    // offer a click that only ever toasts a refusal
-                    const imagefile::Backend* pic = S.path.empty() ? nullptr
-                                                  : imagefile::forPath(S.path);
-                    // container/reader members reload as a unit - see reloadSource
-                    const bool unit = S.member.rfind("__pixels_", 0) == 0;
-                    const bool canReload = !remote && !S.path.empty() && !pic && !unit;
-                    if (ImGui::MenuItem("Reload from disk", nullptr, false, canReload))
+                    // this frame's file and swap the pixels in place. WHY the
+                    // item may be greyed is reloadSource's own answer, asked
+                    // once (reloadUnavailable) rather than transcribed here -
+                    // a second list of refusals is a list that goes stale
+                    // behind the walk.
+                    const std::string why = reloadUnavailable(*app.images[i]->src);
+                    if (ImGui::MenuItem("Reload from disk", nullptr, false, why.empty()))
                         pendingReloadImg = i;
-                    if (!canReload && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                        if (remote)
-                            ImGui::SetTooltip("remote-backed: these pixels come from the peer,\n"
-                                              "not from a local file.");
-                        else if (pic)
-                            ImGui::SetTooltip("%s reload is not wired yet: re-open the file.",
-                                              pic->format);
-                        else if (unit)
-                            ImGui::SetTooltip("a container/reader member: the file rebuilds\n"
-                                              "as a unit - re-open it to reload.");
-                        else
-                            ImGui::SetTooltip("no file behind these pixels - they were composed\n"
-                                              "here (montage / plugin result).");
-                    }
+                    if (!why.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", why.c_str());
                 }
                 // Recompute (§10.1): the reduced frame's own "reload" - it has
                 // no file, it has a stack, and the picture NEVER refreshes
@@ -983,33 +963,22 @@ static void drawFileList() {
             if (ImGui::MenuItem("Open in new window"))
                 openInNewWindow(app.images[stack.front()].get());
             {   // manual reload (reference-design §3.2 / §8 row 5): every
-                // member's file re-read, pixels swapped in place
-                bool anyLocal = false, anyRemote = false, anyPic = false, anyUnit = false;
+                // member's file re-read, pixels swapped in place. ONE member
+                // the walk can serve is enough to offer the item - the summary
+                // counts the rest; when none can, the FIRST member's own reason
+                // is the one shown, from the same predicate the frame menu asks
+                // (reloadUnavailable, beside reloadSource).
+                bool anyLocal = false;
+                std::string why;
                 for (int idx : stack) {
-                    const FrameSource& S = *app.images[idx]->src;
-                    // local:// embeds a path on this disk - that member reloads
-                    if (!S.remoteUrl.empty() &&
-                        S.remoteUrl.rfind("local://", 0) != 0) anyRemote = true;
-                    // PNG/JPEG members: reloadSource refuses them by name -
-                    // they do not make the stack reloadable on their own
-                    else if (!S.path.empty() && imagefile::forPath(S.path)) anyPic = true;
-                    // ...and container/reader members reload as a unit
-                    else if (S.member.rfind("__pixels_", 0) == 0) anyUnit = true;
-                    else if (!S.path.empty() || !S.remoteUrl.empty()) anyLocal = true;
+                    std::string w = reloadUnavailable(*app.images[idx]->src);
+                    if (w.empty()) { anyLocal = true; break; }
+                    if (why.empty()) why = std::move(w);
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
                     pendingReloadSeq = si->id;
                 if (!anyLocal && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(anyRemote
-                        ? "remote-backed: these pixels come from the peer,\n"
-                          "not from local files."
-                        : anyUnit
-                        ? "a container/reader file rebuilds as a unit -\n"
-                          "re-open it to reload."
-                        : anyPic
-                        ? "PNG/JPEG reload is not wired yet: re-open the file."
-                        : "no files behind these pixels - they were composed\n"
-                          "here (montage / plugin result).");
+                    ImGui::SetTooltip("%s", why.c_str());
             }
             // The series (系列) this stack is in, or could be. Multi-select is
             // a later phase; until then this menu is how a stack joins a sweep
