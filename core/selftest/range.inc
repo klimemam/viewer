@@ -73,7 +73,8 @@
                 }
                 for (int sh = 0; sh < 3; sh++) {
                     app.compareRangeMode = sh;
-                    std::string lab = abHistXLabel(cur(), cmpB());
+                    recomputeHistogramIfNeeded(cur(), app.hist[0]);
+                    std::string lab = abHistXLabel(cur(), cmpB(), app.hist[0]);
                     bool named = app.linkRange
                                      ? lab.find("linked range") != std::string::npos
                                      : (sh == 2

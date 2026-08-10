@@ -1333,6 +1333,55 @@ static void drawCanvas(ImVec2 avail) {
     }
 }
 
+// Where the 256 bins go. Pure, so a selftest can pin every case of it without a
+// window (--abstats-selftest, group W).
+//
+// Spreading 256 bins evenly over [black, white] makes the bin width fractional
+// whenever the range is not a multiple of 256: 64..1023 gives 3.746 DN/bin, so
+// one bin swallows FOUR integer DN values and its neighbour swallows three, and
+// the panel draws a periodic comb that is not in the data. Reading the shape of
+// a noise distribution is what the histogram is for, so that is fatal
+// (docs/todo-open.md 9, user report 2026-07-29).
+//
+// So the grid is snapped to a round width and a round origin:
+//   integer dtype  w = ceil(span/256) as a whole number, at least 1 - one bin
+//                  is then a whole number of DN and every bin holds the same
+//                  count of them. 0..4095 gives exactly 16, 0..255 exactly 1.
+//   float          w = the smallest power of two >= span/256, so the bin EDGES
+//                  are exact in binary and re-binning accumulates no error.
+//   both           origin = floor(black/w)*w.
+// It always widens OUTWARD: origin <= black and origin + 256w >= white, so the
+// snapped grid contains the requested range and no pixel is hidden by it. What
+// that costs is that "outside the bins" is no longer "outside the display
+// range" - see the clip counting in recomputeHistogramIfNeeded.
+static void histBinGrid(const std::string& dtype, float black, float white,
+                        float& origin, float& w) {
+    float span = white - black;
+    if (!(span > 0) || !std::isfinite(span)) span = 1.0f;   // degenerate: 1 DN across
+    const float q = span / 256.0f;                          // the unrounded width
+    const bool intType = !dtype.empty() &&
+                         (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
+    if (intType) {
+        w = std::ceil(q);
+        if (!(w >= 1.0f)) w = 1.0f;             // an integer bin is never sub-DN
+    } else {
+        // frexpf, not ceil(log2 q): log2 of an exact power of two can come back
+        // a hair under it, and ceil would then DOUBLE a width that was already
+        // right. frexp is exact - q = m * 2^e with m in [0.5, 1), so q is a
+        // power of two exactly when m is 0.5.
+        int e = 0;
+        if (frexpf(q, &e) == 0.5f) e--;
+        // ...and never let the exponent leave float's normal range: a width
+        // that underflowed to zero would divide by zero below, and rounding UP
+        // to the smallest normal still widens the grid, so it still contains.
+        w = ldexpf(1.0f, std::clamp(e, -126, 127));
+    }
+    // In double: black/w can be far outside float's exactly-representable
+    // integers, and a floor() computed there would not be a floor.
+    origin = (float)(std::floor((double)black / (double)w) * (double)w);
+    if (origin > black) origin -= w;            // rounding must never narrow it
+}
+
 // The cache slot is a parameter (slot 0 = A, slot 1 = compare B). Everything
 // below is the previous body with `app.hist` replaced by `H`.
 //
@@ -1346,6 +1395,12 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                                        float binWhite = std::numeric_limits<float>::quiet_NaN()) {
     const float wantBlack = std::isfinite(binBlack) ? binBlack : effBlack(*im);
     const float wantWhite = std::isfinite(binWhite) ? binWhite : effWhite(*im);
+    // The grid is decided HERE, above the cache comparison, so that the cache
+    // key, the binning, the axis label and the shared A/B grid all see one
+    // decision made in one place. Snapping below the comparison would miss the
+    // cache every frame and re-scan a million pixels.
+    float gOrigin = 0, gW = 0;
+    histBinGrid(im->dtype, wantBlack, wantWhite, gOrigin, gW);
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
@@ -1364,6 +1419,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
     H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
     H.black = wantBlack; H.white = wantWhite;
+    H.binOrigin = gOrigin; H.binW = gW;
     H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
     H.rx = rx; H.ry = ry; H.rw = rw; H.rh = rh; H.roiUsed = roiUsed;
     memset(H.bins, 0, sizeof H.bins);
@@ -1373,7 +1429,12 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     static const char* CFA_SERIES[4] = { "R", "Gr", "Gb", "B" };
     static const char* CH_SERIES[4] = { "ch0", "ch1", "ch2", "ch3" };
     for (int s = 0; s < 4; s++) H.seriesNames[s] = cfa ? CFA_SERIES[s] : CH_SERIES[s];
-    float inv = 256.0f / std::max(H.white - H.black, 1e-20f);
+    // DIVIDE, never multiply by a reciprocal. 1/w is inexact for every integer
+    // w that is not a power of two, and (k*w) * (1/w) then lands a hair under k
+    // and floors to k-1: an off-by-one bin at the very edges the snapping exists
+    // to make exact. In double the quotient is correctly rounded and floor(t) is
+    // the right bin for every w below 2^53.
+    const double binW = H.binW, binOrigin = H.binOrigin;
     size_t total = (size_t)rw * rh;
     // A CFA sample stride has to move by WHOLE mosaic cells and take every
     // pixel of the cell it lands on - the shape 47eec0c settled on for the
@@ -1387,6 +1448,15 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     // ...and the budget has to know that each landing covers `cell` rows
     size_t step = std::max<size_t>(1, total * cell / 1000000);   // sample <= ~1M px
     if (cell > 1) step = ((step + cell - 1) / cell) * cell;      // whole cells only
+    // below/above are counted against black/white - the range the USER SET -
+    // and never against the bins. Since the grid snaps OUTWARD they are no
+    // longer the same question: at a display range of 101..1000 the bins run
+    // 100..1124, so DN 1050 is a pixel the user sees blown out that lands in an
+    // ordinary bin. clipLo/clipHi are printed as "<black / >white", which is a
+    // statement about the DISPLAY range; counted off the bins instead, the
+    // saturated-pixel count silently drops the moment the grid widens - it went
+    // from 3.00% to 0.00% on the --abstats-selftest W5 fixture while this was
+    // being written.
     size_t below = 0, above = 0, cnt = 0, values = 0;
     double sum[4] = {}, sum2[4] = {};
     size_t n[4] = {};
@@ -1398,10 +1468,10 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                     float v = src[0];
                     if (std::isfinite(v)) {
                         int s = cfaChannelAt(*im, rx + x, ry + y);
-                        float t = (v - H.black) * inv;
-                        if (t < 0) { below++; H.bins[s][0]++; }
-                        else if (t >= 256) { above++; H.bins[s][255]++; }
-                        else H.bins[s][(int)t]++;
+                        double t = ((double)v - binOrigin) / binW;
+                        H.bins[s][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
+                        if (v < H.black) below++;
+                        else if (v >= H.white) above++;
                         sum[s] += v; sum2[s] += (double)v * v; n[s]++;
                         values++;
                     }
@@ -1409,10 +1479,10 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                     for (int c = 0; c < H.nSeries; c++) {
                         float v = src[c];
                         if (!std::isfinite(v)) continue;
-                        float t = (v - H.black) * inv;
-                        if (t < 0) { below++; H.bins[c][0]++; }
-                        else if (t >= 256) { above++; H.bins[c][255]++; }
-                        else H.bins[c][(int)t]++;
+                        double t = ((double)v - binOrigin) / binW;
+                        H.bins[c][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
+                        if (v < H.black) below++;
+                        else if (v >= H.white) above++;
                         sum[c] += v; sum2[c] += (double)v * v; n[c]++;
                         values++;
                     }
