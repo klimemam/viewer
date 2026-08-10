@@ -10,6 +10,11 @@
 # the argument lists here, and adding a test there adds it to CI.
 #
 # The script, in order:
+#   0. ends anything still RUNNING from the build directory it was given - and
+#      only from that one, never another worktree's. A selftest with a window is
+#      a process, a run that ends badly leaves it alive, and a live viewer holds
+#      the binary the next link has to write. That failure arrives as
+#      "Permission denied" from ld and reads as a broken build;
 #   1. builds - a stale binary passing tests for code that no longer compiles is
 #      the single most expensive failure mode there is, so a failed build stops
 #      the run instead of quietly testing yesterday's exe;
@@ -101,6 +106,257 @@ if [ -z "$python_bin" ]; then
     echo "run_selftests: tried python3, python, py - install numpy (pip install numpy)." >&2
     exit 2
 fi
+
+# ---- leftovers: a viewer still RUNNING from this build directory -------------
+# A selftest that draws real frames is a process with a window, and a run that
+# does not end cleanly - interrupted, or a test that never reaches its own
+# return - leaves that process alive. It then holds the binary, and the next
+# build cannot write it:
+#
+#     ld.exe: cannot open output file viewer.exe: Permission denied
+#
+# after which this script correctly refuses to run (the block below: a stale
+# binary must never 'pass'). So the whole event reads as "the build stopped",
+# and the one fact that explains it - something is still running - is nowhere
+# in the output. Three times on 2026-08-10, each recovered by hand with
+# taskkill and rm. It is the shape PR #118 fixed for scratch directories: the
+# previous run breaks the next one. A per-test TMP cannot fix this one, because
+# what leaks is not a file.
+#
+# WHOSE PROCESSES. Never "every viewer on the machine". Several agents run
+# suites here at once, each in its own worktree with its own build tree - while
+# this was being written, a second worktree had a live --browse-keys-selftest
+# and four --serve peers of its own, and `taskkill /IM viewer.exe /F` would have
+# killed all five of them mid-run. The predicate is the only one that cannot do
+# that: the process's own IMAGE PATH lies inside THIS build directory. It is a
+# question for the OS's process table, and it is asked there rather than of a
+# name - the same reason the binaries updater refuses to match on `tasklist`.
+#
+# What each platform can actually answer:
+#
+#   Windows  Win32_Process.ExecutablePath is the real image path. wmic answers
+#            in 0.4 s; PowerShell's CIM is asked instead where wmic has been
+#            removed, as it has been from newer images. Exact either way.
+#   Linux    /proc/<pid>/exe is a kernel symlink to the image. Exact.
+#   macOS    ps -o comm= is the path the process was exec'd with - absolute for
+#            anything ctest launched, which is all we are looking for. It is
+#            argv-derived rather than kernel-authoritative, so it can fail to
+#            answer; what it cannot answer cannot match, and no match means
+#            nothing is killed, which is the safe direction of the two.
+#   anything else
+#            nothing is asked and nothing is killed, and it says so rather than
+#            being quietly a no-op.
+#
+# Two calls: BEFORE the build, so a run is not defeated by the last one, and
+# AFTER the suite, so this run does not leave the machine for the next one to
+# clean. Both are silent when there is nothing there, which is what CI is.
+build_abs="$(cd "$build_dir" && pwd)"
+# WHICH question this platform can be asked is decided ONCE, and here rather
+# than inside processes_here(): every call of that runs in a command
+# substitution, so an answer of "this machine cannot say" would be reached in a
+# subshell and lost on the way back - the cleanup would then be silently a
+# no-op, which is the one outcome worse than not having it.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        win_paths=1
+        if   command -v wmic       >/dev/null 2>&1; then reap_how=wmic
+        elif command -v powershell >/dev/null 2>&1; then reap_how=cim
+        else                                             reap_how=none
+        fi
+        # The process table spells paths the way Windows does, so the prefix has
+        # to be in those terms too: pwd -W, and cygpath where pwd cannot.
+        build_native="$( (cd "$build_dir" && pwd -W) 2>/dev/null )"
+        [ -n "$build_native" ] || build_native="$(cygpath -m "$build_abs" 2>/dev/null)"
+        [ -n "$build_native" ] || build_native="$build_abs"
+        ;;
+    Linux)  win_paths=0; reap_how=proc; build_native="$build_abs" ;;
+    Darwin) win_paths=0; reap_how=ps;   build_native="$build_abs" ;;
+    *)      win_paths=0; reap_how=none; build_native="$build_abs" ;;
+esac
+# The trailing slash is not decoration: without it "build-mingw" also prefixes
+# "build-mingw2", which is another worktree's tree and not ours to touch. On
+# Windows the comparison is lower-cased with forward slashes, because C:\X and
+# c:/x are one directory there and the process table may say either.
+reap_prefix="$build_native/"
+[ "$win_paths" -eq 1 ] && reap_prefix="$(printf '%s' "$reap_prefix" | tr 'A-Z\\' 'a-z/')"
+
+# pid <TAB> path-relative-to-the-build-dir <TAB> image path as the OS spells it
+processes_here() {
+    local raw=""
+    case "$reap_how" in
+        wmic)
+            raw="$(wmic process get ExecutablePath,ProcessId /format:list 2>/dev/null \
+                   | tr -d '\r' \
+                   | awk '/^ExecutablePath=/ { e = substr($0, 16) }
+                          /^ProcessId=/ { if (e != "") printf "%s\t%s\n", substr($0, 11), e
+                                          e = "" }')" ;;
+        cim)
+            raw="$(powershell -NoProfile -NonInteractive -Command \
+                    'Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath } |
+                     ForEach-Object { $_.ProcessId.ToString() + [char]9 + $_.ExecutablePath }' \
+                   2>/dev/null | tr -d '\r')" ;;
+        proc)
+            raw="$(for d in /proc/[0-9]*; do
+                       e="$(readlink "$d/exe" 2>/dev/null)" || continue
+                       [ -n "$e" ] && printf '%s\t%s\n' "${d#/proc/}" "$e"
+                   done)" ;;
+        ps)
+            raw="$(ps -A -o pid=,comm= 2>/dev/null \
+                   | awk '{ pid = $1; $1 = ""; sub(/^ */, "")
+                            if (pid != "" && $0 != "") printf "%s\t%s\n", pid, $0 }')" ;;
+        *)  return 0 ;;
+    esac
+    # The relative half is what gets removed further down: it is a path this
+    # shell can name whatever the process table used to say it.
+    printf '%s\n' "$raw" | awk -F'\t' -v pre="$reap_prefix" -v win="$win_paths" '
+        NF < 2 { next }
+        { p = $2
+          if (win) { gsub("\\\\", "/", p); p = tolower(p) }
+          if (index(p, pre) == 1)
+              printf "%s\t%s\t%s\n", $1, substr(p, length(pre) + 1), $2 }'
+}
+
+end_process() {                  # BY PID. Never by image name - see above.
+    case "$reap_how" in
+        # /T takes the children too: a viewer spawns `viewer --serve` peers (four
+        # of them in seven seconds, measured), and a python reader besides. Those
+        # are this process's own descendants, so the tree is exactly our scope
+        # and no wider.
+        wmic|cim) taskkill //PID "$1" //T //F >/dev/null 2>&1 ;;
+        *)  kill -TERM "$1" 2>/dev/null
+            local i=0
+            while [ "$i" -lt 15 ]; do
+                kill -0 "$1" 2>/dev/null || return 0
+                sleep 0.2; i=$((i + 1))
+            done
+            kill -KILL "$1" 2>/dev/null ;;
+    esac
+}
+
+# Asked only about processes already matched, so its cost is paid once per
+# leftover and never on the ordinary run where there are none. It is the half
+# that names WHICH selftest leaked, which is the difference between a cleanup
+# and a diagnosis.
+cmdline_of() {
+    case "$reap_how" in
+        wmic) wmic process where "ProcessId=$1" get CommandLine /format:list 2>/dev/null \
+                  | tr -d '\r' | sed -n 's/^CommandLine=//p' | head -1 ;;
+        cim)  powershell -NoProfile -NonInteractive -Command \
+                  "(Get-CimInstance Win32_Process -Filter 'ProcessId=$1').CommandLine" \
+                  2>/dev/null | tr -d '\r' | head -1 ;;
+        proc) tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null ;;
+        ps)   ps -p "$1" -o args= 2>/dev/null ;;
+    esac
+}
+
+reap_leftovers() {               # $1: "before" (the build) or "after" (the suite)
+    local when="$1" procs pid rel path cmd images="" still="" ended="" i
+    if [ "$reap_how" = none ]; then
+        [ "$when" = before ] && {
+            echo "run_selftests: this platform ($(uname -s)) cannot be asked which" >&2
+            echo "run_selftests: processes came from $build_dir, so none is ended." >&2
+            echo "run_selftests: a link that fails with 'Permission denied' below is" >&2
+            echo "run_selftests: one of them still running." >&2
+        }
+        return 0
+    fi
+    procs="$(processes_here)"
+    [ -n "$procs" ] || return 0          # the ordinary case, and CI's: silence
+
+    echo
+    if [ "$when" = before ]; then
+        echo "run_selftests: a previous run left this running in $build_dir."
+        echo "run_selftests: it holds the binary, and the link below would have failed"
+        echo "run_selftests: with 'cannot open output file: Permission denied':"
+    else
+        echo "run_selftests: THIS run left a process alive in $build_dir."
+        echo "run_selftests: the tests' own verdict stands; this is about what it left"
+        echo "run_selftests: behind, which would have broken the NEXT build:"
+    fi
+    # SAY first, END second, in two passes. One pass cannot do both: a viewer
+    # spawns `viewer --serve` peers, ending the parent takes its children with
+    # it, and a child ended before its turn came round has no command line left
+    # to read - the run would name the parent and print the peers as bare pids.
+    while IFS=$'\t' read -r pid rel path; do
+        [ -n "$pid" ] || continue
+        echo "  pid $pid  $path"
+        # The arguments are the half that says WHICH selftest leaked it, so they
+        # are printed when there are any - and not when the command line is just
+        # the path again, which is the same fact twice.
+        cmd="$(cmdline_of "$pid")"
+        [ -n "$cmd" ] && [ "$cmd" != "$path" ] && echo "      $cmd"
+        images="$images$rel
+"
+    done <<EOF
+$procs
+EOF
+    while IFS=$'\t' read -r pid rel path; do
+        [ -n "$pid" ] || continue
+        ended="$ended $pid "
+        end_process "$pid"
+    done <<EOF
+$procs
+EOF
+
+    # Ending a process is not the same as releasing its image. Recorded by hand
+    # on 2026-08-10: once the kill was not enough on its own and the file still
+    # had to be removed, so wait for the table to agree they are gone and then
+    # remove what they were running anyway. Removing it is right for a second
+    # reason: an output file that is GONE is one every generator relinks, where
+    # one that is merely stale can be skipped - and this script must never test
+    # a binary the build did not just write.
+    i=0
+    while [ "$i" -lt 12 ]; do
+        still="$(processes_here)"
+        [ -n "$still" ] || break
+        sleep 0.5; i=$((i + 1))
+    done
+    if [ -n "$still" ]; then
+        echo >&2
+        echo "run_selftests: still running in $build_dir:" >&2
+        printf '%s\n' "$still" | awk -F'\t' '{ print "run_selftests:     pid " $1 "  " $3 }' >&2
+        echo "run_selftests: this is NOT a build failure and NOT a failed test." >&2
+        # A pid that was never on the list is not one that refused to die: it is
+        # one that STARTED while we were looking, which means something else is
+        # running this build tree right now. Measured, not imagined - a ctest
+        # left behind by an interrupted suite kept launching selftests in this
+        # very directory while this block was being written, and the two cases
+        # want opposite reactions: end the leftover, but never race a live run.
+        local fresh=""
+        while IFS=$'\t' read -r pid rel path; do
+            case "$ended" in *" $pid "*) ;; *) fresh=1 ;; esac
+        done <<EOF
+$still
+EOF
+        if [ -n "$fresh" ]; then
+            echo "run_selftests: and they are NEW - processes keep appearing here, so" >&2
+            echo "run_selftests: another run is using $build_dir at this moment." >&2
+            echo "run_selftests: two runs cannot share one build tree: they overwrite" >&2
+            echo "run_selftests: each other's binary. Wait for it, or use another." >&2
+        else
+            echo "run_selftests: the binary is held open by a process that would not" >&2
+            echo "run_selftests: end. End it by hand and run this again." >&2
+        fi
+        # Before the build it is fatal, because the build cannot write a file
+        # somebody else is holding and 'Permission denied' from ld is precisely
+        # the message this exists to replace. After the suite it is NOT: ctest
+        # has already returned a verdict on the asserts, and swallowing the one
+        # line this script exists to print - "ran N, skipped M ... PASS/FAIL" -
+        # to report a stray process would be reporting the smaller fact by
+        # destroying the larger one.
+        [ "$when" = before ] && exit 1
+        echo "run_selftests: the NEXT build in $build_dir will fail to link until it" >&2
+        echo "run_selftests: is gone. The test results below are unaffected." >&2
+        return 0
+    fi
+    printf '%s' "$images" | sort -u | while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        rm -f "$build_abs/$rel" 2>/dev/null \
+            && echo "  removed $build_dir/$rel (the next build relinks it)"
+    done
+}
+
+reap_leftovers before
 
 echo "== build ($build_dir, $config) =="
 if ! cmake --build "$build_dir" --config "$config" -j "$jobs"; then
@@ -449,6 +705,13 @@ if [ "$rc" -ne 0 ]; then
     archive_failures "failed during tools/run_selftests.sh $build_dir"
     kept_paths="$archived"
 fi
+
+# ctest has returned, so anything of ours still running is something a test did
+# not take with it. Ending it here is what keeps the damage inside the run that
+# caused it, instead of handing it to whoever builds next - and, unlike the
+# sweep before the build, there is no question of it being a concurrent run: at
+# this instant nothing of this build's is supposed to be alive.
+reap_leftovers after
 
 echo
 echo "== skipped: no GL context (NOT a gate - these did NOT run) =="
