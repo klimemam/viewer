@@ -552,8 +552,23 @@ bool Session::glob(const std::string& root, const std::string& pattern, int dept
     return true;
 }
 
-bool Session::meta(const std::string& path, Meta& out, std::string& err) {
+// A DECLARED reading needs a peer that can serve one. Refused HERE, from the
+// number the peer announced, and never by sending and hoping: the trailer a
+// v8 peer does not read produces no error at all, only the native reading under
+// the label of the one that was asked for (rp::npyReReadTooOldText, and the
+// VERSION note in remote_proto.h at length). Shared by meta() and tile() so the
+// two cannot drift into disagreeing about which peer is old enough.
+bool Session::readServable(int read, std::string& err) const {
+    if (read == rp::NR_NATIVE) return true;
+    if (peerVersion_ >= 9) return true;
+    err = rp::npyReReadTooOldText(peerVersion_);
+    return false;
+}
+
+bool Session::meta(const std::string& path, Meta& out, std::string& err, int read) {
+    if (!readServable(read, err)) return false;
     W w; w.str(serverPath(path));
+    if (peerVersion_ >= 9) w.u32((uint32_t)read);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -564,6 +579,21 @@ bool Session::meta(const std::string& path, Meta& out, std::string& err) {
     out.w = (int)m.w; out.h = (int)m.h; out.ch = (int)m.ch;
     out.frames = (int)m.frames;
     out.dtype = rp::dtypeName(m.dtype);
+    out.readFellBack = (m.flags & rp::MR_READ_FELL_BACK) != 0;
+    out.shape.clear();
+    // The declared shape, when the peer said it is there. A rank outside 2..4
+    // is dropped rather than kept: the client's own §3.3 machinery reads no
+    // other rank, and a shape it cannot compute a menu from would put a "read
+    // as" line on screen with nothing behind it - the exact half-feature #124
+    // says is worse than the blank.
+    if (m.flags & rp::MR_SHAPE) {
+        uint32_t nd = 0, d[4] = { 0, 0, 0, 0 };
+        bool got = r.u32(nd);
+        for (int i = 0; i < 4 && got; i++) got = r.u32(d[i]);
+        if (!got) { err = "bad META reply"; return false; }
+        if (nd >= 2 && nd <= 4)
+            for (uint32_t i = 0; i < nd; i++) out.shape.push_back((int64_t)d[i]);
+    }
     return true;
 }
 
@@ -603,7 +633,8 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-                   std::string& err) {
+                   std::string& err, int read) {
+    if (!readServable(read, err)) return false;
     W wr;
     wr.str(serverPath(path));
     rp::TileReq q{};
@@ -613,6 +644,7 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     q.step = (uint32_t)std::max(1, step);
     q.flags = 1;                        // ask for deflate: the link is the cost
     wr.blob(&q, sizeof q);
+    if (peerVersion_ >= 9) wr.u32((uint32_t)read);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_TILE, wr.b, err) || !recv(type, reply, err)) return false;

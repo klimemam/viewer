@@ -45,6 +45,19 @@ struct GlobHit { std::string rel; bool dir = false; };
 struct Meta {
     int w = 0, h = 0, ch = 1, frames = 1;
     std::string dtype;
+    // The shape the FILE declared, before any interpretation (protocol 9,
+    // issue #124). EMPTY from a peer that predates it - which is the only
+    // honest value, because "no shape" and "a shape I cannot tell you about"
+    // must not read the same to the Inspector: the first is a document with no
+    // §3.3 menu to offer, the second is a document whose menu exists and cannot
+    // be acted on, and they get different lines on screen.
+    std::vector<int64_t> shape;
+    // The peer read this NATIVELY because the reading that was asked for does
+    // not fit the shape - the same fallback core/app/loader_npz.inc's npyLayout
+    // makes, reported so the caller can write the same note and record that no
+    // declaration was applied. Reached by a session line pointing at a file
+    // whose rank changed, never by the menu.
+    bool readFellBack = false;
 };
 
 // MEASURE: what came back is exactly what the analyzer emitted, so the caller
@@ -150,12 +163,19 @@ public:
     bool glob(const std::string& root, const std::string& pattern, int depth,
               int maxResults, std::vector<GlobHit>& out, bool& truncated,
               int& skippedDirs, std::string& err);
-    bool meta(const std::string& path, Meta& out, std::string& err);
+    // `read` is rp::NpyRead: 0 = let the shape rule decide (what every caller
+    // wanted before #124), anything else is the user's DECLARATION and travels
+    // to the peer. Both calls take it, and both refuse from peerVersion() before
+    // sending when the peer predates protocol 9 - see rp::npyReReadTooOldText
+    // for why that refusal cannot be left to the peer.
+    bool meta(const std::string& path, Meta& out, std::string& err, int read = 0);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
-    // (converted from the source dtype) plus the decimated dimensions.
+    // (converted from the source dtype) plus the decimated dimensions. The rect
+    // and the frame index are coordinates INSIDE `read`, so it must be the same
+    // reading the meta() that sized this request was asked for.
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-              std::string& err);
+              std::string& err, int read = 0);
     // run analysis where the data is; only the emitted results travel
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
 
@@ -165,6 +185,9 @@ public:
     int peerVersion() const { return peerVersion_; }   // from HELLO; gates MEASURE
 
 private:
+    // "can this peer serve a DECLARED reading at all" - the protocol-9 gate,
+    // in one place because meta() and tile() must answer it identically.
+    bool readServable(int read, std::string& err) const;
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
     bool recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& err);
 

@@ -114,9 +114,93 @@ struct NpyFile {
     // through the same code as a C-order one (the local loader has always
     // handled Fortran; refusing it only over the link was an inconsistency)
     uint64_t sFrame = 0, sY = 0, sX = 0, sCh = 1;
+    // the DECLARED reading did not fit this rank, so native was used instead
+    // (issue #124; the local npyLayout's "read natively" note is the same fact)
+    bool readFellBack = false;
 };
 
-static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err) {
+// The layout decision, under a DECLARED reading (issue #124, docs/
+// input-adapters.md §3.3). This is core/app/loader_npz.inc's npyLayout, which
+// the peer had no equivalent of: parseNpyHeader hard-coded the native
+// interpretation, so the escape hatch the Inspector offers for a file opened
+// through File > Open did not exist for the same file opened through a peer.
+//
+// It is written as ONE assignment through rp::npyReadAxes rather than as the
+// four hand-rolled cases that were here, because there are now twelve
+// (rank 2/3/4 x four readings) and hand-rolling twelve is how the two doors
+// disagreed the first time. The axis rule, the native rule and both refusal
+// sentences all come from remote_proto.h, so what this function contributes is
+// only the STRIDES - which is the one thing the local npyLayout cannot lend,
+// since a peer computes them from the file's own fortran flag and reads bytes
+// through them, while the client's are into a decoded buffer.
+static bool serveLayout(NpyFile& n, const std::vector<int64_t>& dims, int read,
+                        bool& fellBack, std::string& err) {
+    fellBack = false;
+    const size_t rank = dims.size();
+    if (rank < 2 || rank > 4) { err = npyNotNativeText(dims); return false; }
+    int r = read;
+    // A declaration that does not fit this rank falls back to native and SAYS
+    // so - word for word what the local npyLayout does, including for rank 2,
+    // which has no choice to make. Matching matters more than the refusal I
+    // first wrote here: a session restored against a file that was rewritten
+    // from (H,W,3) to (F,H,W,C) must open the same way through a peer as
+    // through File > Open, and "this door refuses, that one opens with a note"
+    // is exactly the disagreement #71 was about. The client turns fellBack into
+    // the same note the local decoder writes.
+    //
+    // It is never reached from the menu on either side: npyReadOptions only
+    // offers readings the shape permits. What reaches it is a stale session
+    // line, which is precisely the case that must not silently lie.
+    if (r != NR_NATIVE) {
+        int a, b, c, d;
+        if (!npyReadAxes(rank, r, a, b, c, d)) { fellBack = true; r = NR_NATIVE; }
+    }
+    int iF = -1, iH = -1, iW = -1, iC = -1;
+    if (rank == 2) {                          // (H,W): one frame, one channel
+        iH = 0; iW = 1;
+    } else {
+        if (r == NR_NATIVE) r = npyNativeRead(dims);
+        npyReadAxes(rank, r, iF, iH, iW, iC);
+    }
+    n.frames = iF >= 0 ? (int)dims[iF] : 1;
+    n.h      = (int)dims[iH];
+    n.w      = (int)dims[iW];
+    n.ch     = iC >= 0 ? (int)dims[iC] : 1;
+    // The ceiling is tested on the DECLARED 64-bit extent, not on the truncated
+    // int, so that the sentence quotes the number the file actually says and is
+    // the local door's sentence character for character (the refusal selftest
+    // asserts that equality, and a (2^32+3) channel axis must not pass as 3).
+    const int64_t c64 = iC >= 0 ? dims[iC] : 1;
+    if (c64 > 4) { err = npyChannelCeilingText(dims, c64); return false; }
+    // A malformed header must produce an error message, not a std::length_error
+    // that terminates the peer: negative dims flow into size arithmetic as 2^64.
+    // Still one guard over every axis, and it NAMES the shape.
+    if (n.w <= 0 || n.h <= 0 || n.w > (1 << 20) || n.h > (1 << 20) ||
+        n.ch < 1 || n.frames < 1 || n.frames > (1 << 20)) {
+        err = npyShapeText(dims) + " has an axis this cannot read: "
+              "every axis must be at least 1, and H and W at most " +
+              std::to_string(1 << 20);
+        return false;
+    }
+    // Per-axis element strides, computed for the DECLARED axes and then picked
+    // off by role. C order: the last dimension is fastest. Fortran order: the
+    // first. Everything downstream indexes through these four numbers, so the
+    // two layouts - and now the four readings - differ nowhere else.
+    std::vector<uint64_t> ax(rank, 0);
+    uint64_t acc = 1;
+    if (n.fortran) { for (size_t i = 0; i < rank; i++)  { ax[i] = acc; acc *= (uint64_t)dims[i]; } }
+    else           { for (size_t i = rank; i-- > 0; )   { ax[i] = acc; acc *= (uint64_t)dims[i]; } }
+    n.sFrame = iF >= 0 ? ax[iF] : 0;
+    n.sY     = ax[iH];
+    n.sX     = ax[iW];
+    n.sCh    = iC >= 0 ? ax[iC] : 1;
+    if (!n.sCh) n.sCh = 1;                    // 2D / (F,H,W): single channel
+    if (!n.sFrame) n.sFrame = (uint64_t)n.w * n.h * n.ch;   // single-frame file
+    return true;
+}
+
+static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err,
+                           int read = NR_NATIVE) {
     n.f.open(std::filesystem::u8path(path), std::ios::binary);
     if (!n.f) { err = "cannot open " + path; return false; }
     char magic[6];
@@ -174,66 +258,14 @@ static bool parseNpyHeader(NpyFile& n, const std::string& path, std::string& err
     }
     n.ndim = (int)dims.size();
     for (size_t i = 0; i < dims.size() && i < 4; i++) n.odims[i] = (uint32_t)dims[i];
-    if (dims.size() == 2)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = 1; }
-    else if (dims.size() == 3) {
-        if (dims[2] <= 4)      { n.h = (int)dims[0]; n.w = (int)dims[1]; n.ch = (int)dims[2]; }
-        else                   { n.frames = (int)dims[0]; n.h = (int)dims[1]; n.w = (int)dims[2]; n.ch = 1; }
-    }
-    else if (dims.size() == 4) { n.frames = (int)dims[0]; n.h = (int)dims[1];
-                                 n.w = (int)dims[2]; n.ch = (int)dims[3]; }
-    // §3.2, and the same sentence the local door uses (rp::npyNotNativeText).
-    // "unsupported .npy shape" named neither the shape that arrived nor the
-    // shapes that would have worked, so the SAME bad file was a refusal with a
-    // destination through File > Open and a dead end through a peer - the
-    // asymmetry issue #71 recorded as D4. V22c asserts this on the local side;
-    // R3 below asserts the peer says it too.
-    else { err = npyNotNativeText(dims); return false; }
-    // (F,H,W,C) IS a native form; C > 4 is this viewer's own ceiling, so it is
-    // said as a ceiling and not as "not a native form" - a different refusal
-    // deserves a different sentence. Word for word what the local door says
-    // (core/app/loader_npz.inc), for the D4 reason above: one file, one answer,
-    // whichever way it was opened.
-    if (n.ch > 4) {
-        err = npyShapeText(dims) + " would be " + std::to_string(n.ch) +
-              " channels: this viewer shows up to 4";
-        return false;
-    }
-    // A malformed header must produce an error message, not a std::length_error
-    // that terminates the peer: negative dims flow into size arithmetic as 2^64.
-    // Still one guard over every axis, but it NAMES the shape now: "unreasonable
-    // .npy shape" told a user nothing they could act on or report.
-    if (n.w <= 0 || n.h <= 0 || n.w > (1 << 20) || n.h > (1 << 20) ||
-        n.ch < 1 || n.frames < 1 || n.frames > (1 << 20)) {
-        err = npyShapeText(dims) + " has an axis this cannot read: "
-              "every axis must be at least 1, and H and W at most " +
-              std::to_string(1 << 20);
-        return false;
-    }
-    // Per-axis element strides. C order: the last dimension is fastest.
-    // Fortran order: the first. Everything downstream indexes through these, so
-    // the two layouts differ in four numbers and nowhere else.
-    {
-        std::vector<uint64_t> d;                    // dims in declaration order
-        std::vector<uint64_t*> s;                   // stride slot for each
-        if (dims.size() == 2)      { d = { (uint64_t)n.h, (uint64_t)n.w };
-                                     s = { &n.sY, &n.sX }; }
-        else if (dims.size() == 3 && n.frames == 1) { d = { (uint64_t)n.h, (uint64_t)n.w, (uint64_t)n.ch };
-                                     s = { &n.sY, &n.sX, &n.sCh }; }
-        else if (dims.size() == 3) { d = { (uint64_t)n.frames, (uint64_t)n.h, (uint64_t)n.w };
-                                     s = { &n.sFrame, &n.sY, &n.sX }; }
-        else                       { d = { (uint64_t)n.frames, (uint64_t)n.h,
-                                           (uint64_t)n.w, (uint64_t)n.ch };
-                                     s = { &n.sFrame, &n.sY, &n.sX, &n.sCh }; }
-        for (auto* p : s) *p = 0;
-        uint64_t acc = 1;
-        if (n.fortran) {
-            for (size_t i = 0; i < d.size(); i++) { *s[i] = acc; acc *= d[i]; }
-        } else {
-            for (size_t i = d.size(); i-- > 0; ) { *s[i] = acc; acc *= d[i]; }
-        }
-        if (!n.sCh) n.sCh = 1;                      // 2D / (F,H,W): single channel
-        if (!n.sFrame) n.sFrame = (uint64_t)n.w * n.h * n.ch;   // single-frame file
-    }
+    // The interpretation, the ceiling and the axis guard now all live in
+    // serveLayout, which takes the DECLARED reading (issue #124). What used to
+    // be here was the native case written out by hand; §3.2's refusal
+    // (rp::npyNotNativeText, the same sentence the local door uses - #71 D4,
+    // asserted by R3 below and by V22c on the local side) and the C > 4 ceiling
+    // are the same sentences, now said in one place because the peer has to say
+    // them about a declared reading too.
+    if (!serveLayout(n, dims, read, n.readFellBack, err)) return false;
     n.ok = true;
     return true;
 }
@@ -887,17 +919,48 @@ static void handleScan(Buf& in) {
     sendMsg(MSG_OK, out);
 }
 
+// The DECLARED reading trailing a META or TILE request (protocol 9). Absent =
+// NR_NATIVE, which is what every v8 and older client sends and what this peer
+// answered before there was anything else to answer.
+//
+// Refused rather than clamped when it is not one of the four: a reading is a
+// user's declaration and the client computed it from a menu, so a value this
+// peer does not recognise means the two ends disagree about what the numbers
+// mean - and the one answer that must not come back from that is a picture.
+static bool getRead(Buf& in, int& read, std::string& err) {
+    read = NR_NATIVE;
+    uint32_t v = 0;
+    if (!in.getU32(v)) return true;               // an older client: native
+    if (v > NR_CHW) { err = "unknown .npy reading " + std::to_string(v); return false; }
+    read = (int)v;
+    return true;
+}
+
 static void handleMeta(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad META"); return; }
-    NpyFile n;
+    int read = NR_NATIVE;
     std::string err;
-    if (!parseNpyHeader(n, path, err)) { sendErr(err); return; }
+    if (!getRead(in, read, err)) { sendErr(err); return; }
+    NpyFile n;
+    if (!parseNpyHeader(n, path, err, read)) { sendErr(err); return; }
     MetaRep m{};
     m.w = (uint32_t)n.w; m.h = (uint32_t)n.h; m.ch = (uint32_t)n.ch;
     m.dtype = n.dtype; m.frames = (uint32_t)n.frames; m.flags = 0;
+    // The shape the FILE declared, so the client can print §3.3's "read as" line
+    // and compute which OTHER readings this array permits (issue #124). Only
+    // when the version this peer is SERVING has it: VIEWER_SERVE_PROTOCOL=8 has
+    // to be a v8 peer in the reply as well as in the handshake, or the seam
+    // tests a peer that does not exist.
+    const bool sendShape = servedVersion() >= 9 && n.ndim >= 2 && n.ndim <= 4;
+    if (sendShape) m.flags |= MR_SHAPE;
+    if (servedVersion() >= 9 && n.readFellBack) m.flags |= MR_READ_FELL_BACK;
     Buf out;
     out.putBlob(&m, sizeof m);
+    if (sendShape) {
+        out.putU32((uint32_t)n.ndim);
+        for (int i = 0; i < 4; i++) out.putU32(n.odims[i]);
+    }
     sendMsg(MSG_OK, out);
 }
 
@@ -907,9 +970,12 @@ static void handleTile(Buf& in) {
     TileReq r{};
     if (in.rd + sizeof r > in.b.size()) { sendErr("bad TILE"); return; }
     memcpy(&r, in.b.data() + in.rd, sizeof r);
-    NpyFile n;
+    in.rd += sizeof r;
+    int read = NR_NATIVE;
     std::string err;
-    if (!parseNpyHeader(n, path, err)) { sendErr(err); return; }
+    if (!getRead(in, read, err)) { sendErr(err); return; }
+    NpyFile n;
+    if (!parseNpyHeader(n, path, err, read)) { sendErr(err); return; }
     std::vector<uint8_t> pix;
     uint32_t ow = 0, oh = 0;
     if (!readRegion(n, r, pix, ow, oh, err)) { sendErr(err); return; }
