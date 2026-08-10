@@ -1022,7 +1022,18 @@ static void savePrefs() {
                " - the previous prefs.txt is unchanged", true);
 }
 
+// Keys the last loadPrefs() did not recognise, in file order. A key that
+// writePrefsTo emits and loadPrefs drops is a setting that silently reverts,
+// which is a defect and not a compatibility case - N11 asserts this list is
+// empty for the file the writer itself produces. Reading a key that is NOT
+// written is the opposite and is legitimate (a migration): that direction is
+// deliberately not policed here. Whether an unknown key should also be named
+// on screen is #50 §9-6 and is not decided yet, so nothing outside the test
+// looks at this.
+static std::vector<std::string> g_prefsUnknownKeys;
+
 static void loadPrefs() {
+    g_prefsUnknownKeys.clear();
     std::vector<uint8_t> buf;
     std::string p = prefsPath();
     if (p.empty() || !readFileBytes(p, buf)) return;
@@ -1049,6 +1060,25 @@ static void loadPrefs() {
                                          app.procPolicy = std::clamp(app.procPolicy, 0, 2);
                                          if (app.procPolicy == App::PolServerRetired)
                                              app.procPolicy = App::PolAuto; }
+        // The PREFILL a newly created series starts from - not the unit of any
+        // measurement (state.h says so where it is declared; what an axis
+        // prints comes from Series::unit, where empty stays empty). prefs.txt
+        // is its owner: writePrefsTo has always written it here, and nothing
+        // read it back, so changing the unit and restarting gave "lx" again.
+        // Value is the rest of the line - "cd/m2" has no space in it, but a
+        // unit the user typed may.
+        else if (key == "linunit")     {
+            std::string u;
+            std::getline(ls, u);
+            while (!u.empty() && (u.front() == ' ' || u.front() == '\t')) u.erase(0, 1);
+            while (!u.empty() && (u.back() == '\r' || u.back() == '\n' ||
+                                  u.back() == ' '  || u.back() == '\t')) u.pop_back();
+            // An empty value is not a unit. Leaving the default in place is the
+            // same rule the series modal follows: an empty box stays empty and
+            // never silently becomes "lx" on an axis.
+            if (!u.empty())
+                snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str());
+        }
         else if (key == "gamma")       { ls >> app.dispGamma; }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;
@@ -1108,6 +1138,7 @@ static void loadPrefs() {
             }
             else if (app.rbRecents.size() < 10) app.rbRecents.push_back(s);
         }
+        else if (!key.empty()) g_prefsUnknownKeys.push_back(key);
     }
     app.themeVariant = std::clamp(app.themeVariant, 0, 1);
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
@@ -2404,8 +2435,12 @@ static std::string loadSession(const std::string& path) {
             }
             app.aSetRestore[curSet].roles.push_back(std::move(rr));
         }
-        else if (key == "linunit") { std::string u = restOfLine(ls);
-                                     snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str()); }
+        // ("linunit" was read here and is not any more: it is a PREFERENCE -
+        //  the prefill a new series starts from - and prefs.txt is its owner,
+        //  which is where it has always been written. No writeSessionTo has
+        //  ever emitted this key, so no session in existence carries one; a
+        //  session that did would be a document changing an application
+        //  preference on the way in.)
         else if (key == "seqframe") {   // select the frame this stack was left on
             int want = 0; ls >> want;
             if (lastImageOk && cur() && cur()->seqId != 0) {

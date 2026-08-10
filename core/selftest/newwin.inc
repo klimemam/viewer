@@ -310,8 +310,73 @@
                       "N8 a run that saw no window writes no window line");
             }
 
+            // ---- N12: a key written is a key read ---------------------------
+            // The audit for #50 counted prefs.txt as "writes 25 keys, reads 25"
+            // and found the two SETS differ. The two directions are not
+            // symmetric and must not be tested as if they were:
+            //
+            //   read but never written  = a migration ("rbadv" is read and
+            //     dropped, "readerdir" is read as the first reader place). Both
+            //     are deliberate and both are commented as such.
+            //   written but never read  = a setting that SILENTLY REVERTS. The
+            //     user changes it, the value reaches the disk, and the next
+            //     launch throws it away. There is no benign version of this.
+            //
+            // So only the second direction is asserted, and it is asserted at
+            // the level of the whole file rather than one key: writePrefsTo
+            // emits the file, loadPrefs reads that same text back, and every
+            // key it did not recognise is counted. A future key that is added
+            // to the writer and forgotten in the loader fails here on the day
+            // it is added, which is the only day it is cheap to fix.
+            {
+                std::string wrote;
+                {
+                    std::ostringstream os;
+                    writePrefsTo(os);
+                    wrote = os.str();
+                }
+                // anti-vacuity: the document has to BE a prefs file with a
+                // realistic number of keys, or "0 unknown" means nothing. 15 is
+                // below the 17 keys a scripted run always writes (the optional
+                // ones - window, bookmarks, recents, remoteexe, the reader
+                // lines - are absent here by design) and above any accident.
+                int lines = 0;
+                for (char c : wrote) if (c == '\n') lines++;
+                check(wrote.compare(0, 13, "viewer-prefs ") == 0 && lines >= 15,
+                      "N12 the written prefs document is a real one (anti-vacuity)");
+
+                std::ofstream wf(pathFromUtf8(pp), std::ios::binary);
+                wf << wrote;
+                wf.close();
+                reload();
+                std::string names;
+                for (const auto& k : g_prefsUnknownKeys)
+                    names += (names.empty() ? "" : ", ") + k;
+                if (!g_prefsUnknownKeys.empty())
+                    fprintf(stderr, "newwinselftest: prefs keys written but not read: %s\n",
+                            names.c_str());
+                check(g_prefsUnknownKeys.empty(),
+                      "N12 every key writePrefsTo emits is a key loadPrefs reads");
+            }
+
+            // N12b: the round trip for the one key the audit caught. lin.unit
+            // is NOT the unit of any measurement (state.h says so where it is
+            // declared) - it is the PREFILL a newly created series starts from,
+            // and its owner is prefs.txt. It was written there and read back
+            // from a .vsession, which no writeSessionTo has ever produced, so
+            // changing the unit and restarting silently gave "lx" back.
+            {
+                snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "cd/m2");
+                savePrefs();
+                snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx");
+                reload();
+                check(std::string(app.lin.unit) == "cd/m2",
+                      "N12 the series unit prefill survives prefs.txt");
+            }
+
             app.winX = sx; app.winY = sy; app.winW = sw; app.winH = sh;
             app.winMax = sm;
+            snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx");
             app.rbBookmarks = bmSnap;
             app.rbRecents = rcSnap;
             app.readerMemo = memoSnap;
