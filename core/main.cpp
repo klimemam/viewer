@@ -1092,7 +1092,11 @@ int main(int argc, char** argv) {
     // has returned above, so reaching here with no window means either
     // --no-window on a test that needs one (say so, by name) or --no-window on
     // a normal start, which is a window the user asked for and cannot have.
-    // The keyboard test drives the Browse panel by hand and asserts what the
+    // Set for a scripted run that must be the only writer of the state it asserts;
+// read by the frame loop, which would otherwise clear watchPaused every frame.
+static bool g_watchSuppressed = false;
+
+// The keyboard test drives the Browse panel by hand and asserts what the
     // panel SAYS. A Watch poll (PR #162) re-lists the same directory every few
     // seconds over the same session, and the reply carries the peer's real
     // protocol version - which overwrites the one `setpv` injected a few
@@ -1109,7 +1113,7 @@ int main(int argc, char** argv) {
     // LATER test in that home starts with Watch off - which is exactly what
     // happened when this was first written, and it read as "the poll never
     // issues" in the browse B group rather than as anything to do with prefs.
-    if (!g_browseKeys.empty()) app.watchPaused = true;
+    if (!g_browseKeys.empty()) g_watchSuppressed = true;
     if (!g_haveWindow) {
         if (!g_browseKeys.empty()) needWindow("--browse-keys-selftest");
         else if (benchFrames)      needWindow("--bench");
@@ -2010,7 +2014,12 @@ int main(int argc, char** argv) {
             glfwWaitEvents();
             continue;
         }
-        app.watchPaused = false;
+        // ...and back on, unless a scripted run asked for no watcher at all.
+        // A plain `= false` here is what made the first attempt at this fail:
+        // the suppression was set once at startup and the frame loop cleared it
+        // on the very first frame, so the poll went out anyway and CI kept
+        // failing on `chkproto` with the fix apparently in place.
+        app.watchPaused = g_watchSuppressed;
         // The tick "is this panel on screen" is measured in (watch-design §14.1).
         // Incremented here, once, before anything asks: the pumps below run
         // BEFORE this frame's draw, so an instance drawn in the frame that just
@@ -2958,7 +2967,18 @@ int main(int argc, char** argv) {
                         g_popupCheck[0], g_popupCheck[1],
                         (!rawDlg.forQueue || rawDlg.open) ? 1 : 0,
                         !popAsked ? "not asked for" : popOk ? "ok" : "FAIL");
-                keysOk = routeOk && popOk && keysCheckBad == 0;
+                // Nothing polled under this run. The suppression is asserted,
+                // not assumed: it was silently cleared by the frame loop once
+                // already, and a suppression that stops working looks exactly
+                // like an intermittent chkproto failure on one CI runner.
+                // rbMain() is the instance the keyboard run drives; a scripted
+                // run opens no others.
+                int polls = rbMain().pollsIssued;
+                bool watchOff = app.watchPaused && polls == 0;
+                fprintf(stderr, "browsekeys: watch suppressed for this run: "
+                                "paused=%d polls=%d: %s\n",
+                        app.watchPaused ? 1 : 0, polls, watchOff ? "ok" : "FAIL");
+                keysOk = routeOk && popOk && watchOff && keysCheckBad == 0;
                 fprintf(stderr, "browsekeys: %d action(s) through real frames, "
                                 "no crash, %d panel check(s) failed: %s\n",
                         (int)keyActs.size(), keysCheckBad,
