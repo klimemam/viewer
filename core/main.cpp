@@ -1092,6 +1092,24 @@ int main(int argc, char** argv) {
     // has returned above, so reaching here with no window means either
     // --no-window on a test that needs one (say so, by name) or --no-window on
     // a normal start, which is a window the user asked for and cannot have.
+    // The keyboard test drives the Browse panel by hand and asserts what the
+    // panel SAYS. A Watch poll (PR #162) re-lists the same directory every few
+    // seconds over the same session, and the reply carries the peer's real
+    // protocol version - which overwrites the one `setpv` injected a few
+    // actions earlier, so `chkproto` finds an agreeing peer and no notice.
+    // Seen on main, Linux CI: `chkproto:1 -> peer v10 line="10 items"`. Nothing
+    // about that is wrong for a user (the version DOES come from the
+    // connection); it is a test that wants no other writer while it is
+    // asserting. So this run does not watch anything - the Watch behaviour has
+    // its own tests (--watch-selftest, --rwatch-selftest, browse B0-B6).
+    //
+    // watchPaused, NOT watchEnabled: the latter is the prefs key `watchfiles`,
+    // and this process saves its preferences on the way out. Written the other
+    // way, one keyboard run leaves `watchfiles 0` in the pinned prefs and every
+    // LATER test in that home starts with Watch off - which is exactly what
+    // happened when this was first written, and it read as "the poll never
+    // issues" in the browse B group rather than as anything to do with prefs.
+    if (!g_browseKeys.empty()) app.watchPaused = true;
     if (!g_haveWindow) {
         if (!g_browseKeys.empty()) needWindow("--browse-keys-selftest");
         else if (benchFrames)      needWindow("--bench");
