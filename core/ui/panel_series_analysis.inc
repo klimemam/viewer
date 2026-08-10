@@ -213,7 +213,17 @@ static void drawPanelSeriesAnalysis() {
             ImGui::TableNextColumn();
             int tp = row ? std::clamp(L.tablePlane, 0, std::max(0, row->nPl - 1)) : 0;
             if (row && row->valid) textNum("%.6g", row->mean[tp]);
-            else ImGui::TextDisabled(row ? row->err.c_str() : "-");
+            // "%s", and not the string itself: TextDisabled is printf-shaped, so
+            // passing err as the FORMAT makes whatever a producer wrote into a
+            // format specification. The strings this cell can show today happen
+            // to carry no '%' - they are literals in computeStackStats /
+            // computeFrameStats - so the cell reads correctly by luck, and the
+            // luck belongs to the OTHER end: the first error message that names
+            // a percentage ("100% of the ROI masked") or quotes a filename with
+            // a %-escape in it would be re-read as a directive and pull
+            // arguments that were never passed. Asserted in C1 of
+            // --seriespanel-selftest; -Wformat-security is what found it.
+            else ImGui::TextDisabled("%s", row ? row->err.c_str() : "-");
             ImGui::TableNextColumn();
             if (row && row->valid && row->hasSigma) textNum("%.6g", row->sigmaT[tp]);
             else ImGui::TextDisabled("-");

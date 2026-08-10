@@ -11,6 +11,28 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)   # use extraction time for FetchContent URL downloads
 endif()
 
+# The MSVC warning level belongs to the TARGET that wants it, not to a default
+# nobody chose. Without this, CMake puts /W3 into CMAKE_<LANG>_FLAGS for every
+# target in the tree, ours and third-party alike - and then a per-target or
+# per-source level lands on the SAME command line as the default, which cl
+# reports:
+#
+#   cl : command line warning D9025: overriding '/W1' with '/w' [libraw_lib]
+#   cl : command line warning D9025: overriding '/W3' with '/w' [viewer]
+#
+# Two warnings on every Windows build, saying that this file did on purpose
+# exactly what this file says it does on purpose. NEW drops the injected
+# default, so the level on a command line is the one a target ASKED for.
+#
+# It is half the answer and it was measured that way: with the default gone,
+# the Visual Studio generator still gives a project its own <WarningLevel>
+# (Level1), and the two third-party targets went on printing D9025 against
+# THAT instead. The other half is spelling their silence /W0 rather than /w -
+# see libraw_lib below. Both are needed; neither alone gets to zero.
+if(POLICY CMP0092)
+  cmake_policy(SET CMP0092 NEW)   # no /W3 in the default flags; targets say their own
+endif()
+
 find_package(OpenGL REQUIRED)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)        # background sequence loader
@@ -175,6 +197,45 @@ else()
   unset(_exr_excl)
 endif()
 
+# "third-party: do not police its warnings" (the stance miniz, stb and LibRaw
+# take below) has a hole in it that only shows on a HEADER-heavy dependency:
+# -w silences the third-party TU, and OpenEXR's problem is not in its TUs. Its
+# headers are the interface - ImfHeader.h pulls ImfAttribute.h, which defines a
+# TypedAttribute template whose readValueFrom(is, size, version) ignores two of
+# its parameters - and a header is compiled with the flags of whoever INCLUDED
+# it. So core/exrread.cpp and tools/mkexr.cpp, ours and under -Wall -Wextra,
+# each reported three -Wunused-parameter against a file this project did not
+# write and cannot fix: six warnings on macOS out of twelve, and none of them
+# actionable by anyone reading them.
+#
+# It is only the FETCHED copy that does this. An installed OpenEXR arrives as
+# an IMPORTED target, whose interface include dirs CMake already passes as
+# -isystem; a FetchContent one is an ordinary target in this build tree, and
+# ordinary targets are consumed with -I. Saying INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+# gives the fetched copy the same treatment the installed copy gets by default -
+# so the two paths now warn identically, which is worth as much as the silence.
+#
+# Deliberately not blanket: this suppresses diagnostics inside THEIR headers.
+# Our own code's warnings, including those raised by our USE of their API
+# (wrong type, unused result, narrowing at our call site), are unaffected -
+# -isystem stops at the header boundary.
+foreach(_exr_tgt OpenEXR OpenEXRCore Iex IlmThread Imath)
+  # ALIAS targets (OpenEXR::OpenEXR) cannot carry properties; the real ones can.
+  # An installed OpenEXR only defines the aliases, so this loop finds nothing
+  # and changes nothing - which is correct, it is already -isystem there.
+  if(TARGET ${_exr_tgt})
+    get_target_property(_exr_alias ${_exr_tgt} ALIASED_TARGET)
+    get_target_property(_exr_inc ${_exr_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT _exr_alias AND _exr_inc)
+      set_target_properties(${_exr_tgt} PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_exr_inc}")
+    endif()
+  endif()
+endforeach()
+unset(_exr_tgt)
+unset(_exr_alias)
+unset(_exr_inc)
+
 # ---- LibRaw (vendor RAW) -----------------------------------------------------
 # The third block to read beside the two above, because it comes out a third
 # way: the library is not optional, it has no CMake at all, and only a QUARTER
@@ -242,8 +303,15 @@ target_include_directories(libraw_lib PUBLIC ${libraw_SOURCE_DIR})
 target_compile_definitions(libraw_lib PUBLIC LIBRAW_NODLL)   # static, no dllimport
 # third-party: do not police its warnings, the same stance miniz and stb take.
 # core/rawread.cpp is OURS and stays under -Wall -Wextra.
+#
+# /W0 rather than /w, though cl documents them as the same thing, because they
+# are not the same thing to the GENERATOR. CMake's Visual Studio writer knows
+# /W0../W4 and turns them into the project's <WarningLevel> element; /w is not
+# in that table, so it goes to AdditionalOptions and lands on a command line
+# that already carries the project's level - which cl reports as D9025 on every
+# build. Same silence, one flag.
 target_compile_options(libraw_lib PRIVATE
-  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/w>)
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/W0>)
 if(WIN32)
   # LibRaw's metadata parsers byte-swap with ntohl/htons, which on Windows live
   # in winsock rather than in libc: 12 undefined references without this. It is
@@ -273,9 +341,93 @@ if(WIN32)
   target_link_libraries(imgui_lib PUBLIC imm32)
 endif()
 
+# stb_image's implementation, as its own target for the same reason imgui and
+# LibRaw have one: a library's warning level is a property of the LIBRARY, and
+# the only way to say that on MSVC is to give it a command line of its own.
+#
+# It used to be a source file of the `viewer` target carrying a per-file /w.
+# That works - cl takes the last level and stb compiles silently - but the
+# target's own /W3 is on the same command line, so every Windows build printed
+#
+#   cl : command line warning D9025: overriding '/W3' with '/w' [viewer]
+#
+# which is a warning about the arrangement, not about any code. Here there is
+# no /W3 to override: this target asks for silence and nothing contradicts it.
+# core/imagefile.cpp - the wrapper, OURS - is untouched and stays under
+# -Wall -Wextra, which was always the point of splitting the TU.
+#
+# /W0 and not /w, for the generator reason spelled out on libraw_lib above.
+add_library(stb_lib STATIC core/stb_image_impl.c)
+target_include_directories(stb_lib PUBLIC ${stb_SOURCE_DIR})
+target_compile_options(stb_lib PRIVATE
+  $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<C_COMPILER_ID:MSVC>:/W0>)
+
 # public plugin ABI header (include/ps/ps_plugin.h)
 add_library(ps_api INTERFACE)
 target_include_directories(ps_api INTERFACE ${CMAKE_SOURCE_DIR}/include)
+
+# ---- and what OUR OWN code is held to, beyond -Wall -Wextra ------------------
+# Everything from here down is this repository's; every third-party target is
+# above. ${VIEWER_STRICT} goes on all of them, next to the warning level.
+#
+# WHY NOT -Werror. It was the obvious answer and it is the wrong one HERE, for
+# one reason that is a property of this project rather than an opinion: the
+# workflow builds on ubuntu-latest / macos-latest / windows-latest, and those
+# labels MOVE. A runner image that ships the next GCC brings that GCC's new
+# -Wall diagnostics with it, and under -Werror the first branch to build after
+# the image rolls goes red for something it did not do - on a Tuesday, with no
+# commit to point at. The repo also holds that CI and a developer run the same
+# command (tools/run_selftests.sh says so), so the usual dodge - -Werror in CI
+# only - is not open: it would make green locally and red on CI mean different
+# things, which is the failure this whole change is about.
+#
+# So: -Werror on the CLASSES that name a defect rather than a taste, and warn
+# on the rest.
+#   -Werror=format          - the argument does not match the conversion. There
+#                             is no style reading of "%d" given a long; it is a
+#                             wrong value printed or a crash.
+#   -Werror=format-security - a non-literal format string. This is the one that
+#                             found the real bug in this change (the Series
+#                             Analysis error cell), the fix is always the same
+#                             one character pair, and it has no false positive
+#                             that is worth keeping.
+# Both are old, stable and spelled identically by GCC and clang, so neither can
+# be widened by a compiler upgrade the way -Wall can.
+#
+# NOT promoted, and deliberately: -Wformat-truncation=. It is the other warning
+# this change fixed, and it is OPTIMISER-DEPENDENT - measured on the very code
+# it fired on, it reports at -O1, -O2 and -O3 and is SILENT at -O0, because what
+# it knows about a value's range is what the optimiser worked out. clang does
+# not implement it at all. As an error it would make a Debug build and a Release
+# build disagree about whether the tree compiles; it stays a warning.
+#
+# What that trades away: a new -Wall diagnostic in some future compiler can
+# still land in the tree as a warning and sit there, which is exactly how the
+# two fixed here got in. Turning -Werror on for real needs the runner images
+# PINNED first (actions/runner-images tags, not -latest) - that is a decision
+# about the whole workflow's cadence, not about warnings, so it is named here
+# and left to the owner rather than taken quietly on the way past.
+if(MSVC)
+  # C4996 on getenv / sscanf / fopen / localtime / _wopen: 24 of them, and all
+  # one claim - that Microsoft ships a _s variant which should be preferred.
+  # Every one of these call sites is ISO C used correctly, and every _s variant
+  # named is Windows-only, so "fixing" them would mean this program no longer
+  # builds with GCC or clang. That is the definition of a warning whose remedy
+  # is worse than the diagnosis, so it is turned off - narrowly: the define
+  # covers the deprecate-in-favour-of-_s family and nothing else, and any OTHER
+  # C4996 (a genuinely retired API, a header that announces its own removal)
+  # still reports.
+  #
+  # The one call worth a second look is localtime, whose returned tm lives in a
+  # shared static. All four uses take a time(nullptr) and strftime it into a
+  # local buffer on the next line, on the thread that is drawing - nothing is
+  # held, nothing is shared - so the hazard the static creates is not present.
+  # A background thread that ever wants a timestamp needs localtime_r/_s and a
+  # helper, and would need it on Linux too, where nothing warns at all.
+  set(VIEWER_STRICT /D_CRT_SECURE_NO_WARNINGS)
+else()
+  set(VIEWER_STRICT -Werror=format -Werror=format-security)
+endif()
 
 # core/browse/*.cpp: Browse as real TUs since P7 (docs/split-plan.md §5 - the
 # two files the plan budgets; instances.inc is #included by nav.cpp). The .inc
@@ -287,7 +439,7 @@ add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/window_frame.cpp core/version.cpp core/adapter.cpp
                       core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
                       core/rawread.cpp
-                      core/y4mread.cpp core/stb_image_impl.c
+                      core/y4mread.cpp
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
@@ -309,10 +461,9 @@ target_include_directories(viewer PRIVATE ${CMAKE_BINARY_DIR}/generated)
 set_source_files_properties(${miniz_SOURCE_DIR}/miniz.c PROPERTIES
                             COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>"
                             COMPILE_DEFINITIONS "MINIZ_NO_STDIO")
-# ...and the same for stb_image's implementation, for the same reason. The
-# wrapper around it (core/imagefile.cpp) is OURS and stays under -Wall -Wextra.
-set_source_files_properties(core/stb_image_impl.c PROPERTIES
-                            COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w>;$<$<C_COMPILER_ID:MSVC>:/w>")
+# ...and stb_image's implementation gets the same, in stb_lib above - a target
+# rather than a per-source override, because on MSVC that is the difference
+# between one warning level on the command line and two (D9025).
 
 # ---- no backend may build its decoder on the STACK --------------------------
 # A format backend wraps a library, and a library's context can be enormous:
@@ -339,14 +490,47 @@ set_source_files_properties(core/stb_image_impl.c PROPERTIES
 # the two that never see the crash, and can now refuse to build the cause of it.
 # MSVC has no equivalent, so Windows keeps gating the way it always did: by
 # running the tests.
+#
+# ...and it was ONE platform, not two, from the hour it was written (7ec9a8b),
+# because the two compilers do not spell it the same way and clang said so in a
+# voice nobody was listening in. GCC takes the size on the -Werror= form:
+#
+#     -Werror=frame-larger-than=65536                     (gcc: gate, armed)
+#
+# clang parses -Werror=<name> and finds no warning called
+# "frame-larger-than=65536"; its own is "frame-larger-than", and the SIZE is
+# carried by a separate -W flag. So on macOS every build of these five files
+# printed
+#
+#     warning: unknown warning option '-Werror=frame-larger-than=65536';
+#              did you mean '-Werror=frame-larger-than='?
+#
+# five times - and an unknown -W is a WARNING to clang, never an error, so the
+# gate was absent and the build was green. That is the failure this repo keeps
+# writing down: a check that is present, passing, and answering nothing. macOS
+# would have compiled `LibRaw R;` as a local without complaint.
+#
+# Two flags, then, and the size on the plain -W where clang wants it:
+#
+#     -Wframe-larger-than=65536 -Werror=frame-larger-than (clang: gate, armed)
+#
+# Verified by MEASUREMENT rather than by reading, at the -O3 a Release build
+# uses, with a 100,000-byte local whose address escapes: gcc and clang each
+# refuse to compile it under their own spelling and each reject the other's.
+#
+# -Werror=unknown-warning-option is the half that matters more than either. It
+# is why this was invisible: clang shrugs at a flag it cannot parse, so ANY
+# misspelled guard here silently stops guarding. Now a guard that cannot be
+# spelled fails the build instead, and the next one to be added cannot repeat
+# this. (GCC has no equivalent - it errors on an unknown -Werror= by itself.)
 if(NOT MSVC)
   set_source_files_properties(
     core/imagefile.cpp core/rawread.cpp core/tiffread.cpp
     core/exrread.cpp core/y4mread.cpp
     PROPERTIES COMPILE_OPTIONS
-    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Werror=frame-larger-than=65536>")
+    "$<$<CXX_COMPILER_ID:GNU>:-Werror=frame-larger-than=65536>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wframe-larger-than=65536;-Werror=frame-larger-than;-Werror=unknown-warning-option>")
 endif()
-target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads libraw_lib)
+target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads libraw_lib stb_lib)
 # where the server pulls its own peer binary from (binaries branch)
 set(VIEWER_REPO_URL "https://github.com/klimemam/viewer.git" CACHE STRING
     "repository the remote peer bootstraps itself from")
@@ -377,6 +561,16 @@ if(CMAKE_CROSSCOMPILING)
 else()
   add_executable(mkicon tools/mkicon.cpp core/app_icon.cpp ${miniz_SOURCE_DIR}/miniz.c)
   target_include_directories(mkicon PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
+  # The one target of ours that named no warning level, so it took whatever the
+  # generator's default happened to be - which on MSVC was /W3 by accident and
+  # on GCC/clang was nothing at all: tools/mkicon.cpp has never been compiled
+  # under -Wall in this project's life. mkexr, the other host tool, says its
+  # own; this one now does too, and it is clean under both.
+  if(MSVC)
+    target_compile_options(mkicon PRIVATE /W3 /utf-8 ${VIEWER_STRICT})
+  else()
+    target_compile_options(mkicon PRIVATE -Wall -Wextra ${VIEWER_STRICT})
+  endif()
   add_custom_command(
     OUTPUT ${VIEWER_ICON_DIR}/viewer.ico ${VIEWER_ICON_DIR}/viewer.png
            ${VIEWER_ICON_DIR}/viewer-remote.ico ${VIEWER_ICON_DIR}/viewer-remote.png
@@ -416,9 +610,9 @@ if(UNIX)
   target_link_libraries(viewer-serve PRIVATE ${CMAKE_DL_LIBS})   # dlopen for plugins
 endif()
 if(MSVC)
-  target_compile_options(viewer-serve PRIVATE /W3 /utf-8)
+  target_compile_options(viewer-serve PRIVATE /W3 /utf-8 ${VIEWER_STRICT})
 else()
-  target_compile_options(viewer-serve PRIVATE -Wall -Wextra)
+  target_compile_options(viewer-serve PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
 if(WIN32)
   # dwmapi: the integrated window frame asks DWM for the drop shadow and the
@@ -440,9 +634,9 @@ if(UNIX AND NOT APPLE AND GLFW_BUILD_X11)
   endif()
 endif()
 if(MSVC)
-  target_compile_options(viewer PRIVATE /W3 /utf-8)
+  target_compile_options(viewer PRIVATE /W3 /utf-8 ${VIEWER_STRICT})
 else()
-  target_compile_options(viewer PRIVATE -Wall -Wextra)
+  target_compile_options(viewer PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
 if(MINGW)   # self-contained exes: no libstdc++/libgcc/libwinpthread DLLs alongside
   foreach(tgt viewer viewer-serve)
@@ -483,9 +677,9 @@ function(viewer_add_plugin name)
     LIBRARY_OUTPUT_DIRECTORY "$<1:${VIEWER_PLUGIN_DIR}>"  # genex kills per-config subdir
     C_VISIBILITY_PRESET hidden)
   if(MSVC)
-    target_compile_options(${name} PRIVATE /W3)
+    target_compile_options(${name} PRIVATE /W3 ${VIEWER_STRICT})
   else()
-    target_compile_options(${name} PRIVATE -Wall -Wextra)
+    target_compile_options(${name} PRIVATE -Wall -Wextra ${VIEWER_STRICT})
   endif()
   if(UNIX AND NOT APPLE)
     target_link_libraries(${name} PRIVATE m)         # isfinite/sqrt
@@ -536,9 +730,9 @@ endif()
 # Held to the same standard as every plugin (viewer_add_plugin does this; a bare
 # add_executable inherits none of it). It is clean today; this keeps it so.
 if(MSVC)
-  target_compile_options(test_prnu PRIVATE /W3)
+  target_compile_options(test_prnu PRIVATE /W3 ${VIEWER_STRICT})
 else()
-  target_compile_options(test_prnu PRIVATE -Wall -Wextra)
+  target_compile_options(test_prnu PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
 
 # The second, and it is built the same way for the same reason: fill_lut is
@@ -550,9 +744,9 @@ endif()
 add_executable(test_display_falsecolor plugins/test/test_display_falsecolor.c)
 target_link_libraries(test_display_falsecolor PRIVATE ps_api)
 if(MSVC)
-  target_compile_options(test_display_falsecolor PRIVATE /W3)
+  target_compile_options(test_display_falsecolor PRIVATE /W3 ${VIEWER_STRICT})
 else()
-  target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra)
+  target_compile_options(test_display_falsecolor PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
 
 # The third, and the only one whose subject is not arithmetic: the probe rule
@@ -565,9 +759,9 @@ add_executable(test_abi_probe plugins/test/test_abi_probe.c)
 target_link_libraries(test_abi_probe PRIVATE ps_api)
 target_include_directories(test_abi_probe PRIVATE ${CMAKE_SOURCE_DIR}/plugins/test)
 if(MSVC)
-  target_compile_options(test_abi_probe PRIVATE /W3)
+  target_compile_options(test_abi_probe PRIVATE /W3 ${VIEWER_STRICT})
 else()
-  target_compile_options(test_abi_probe PRIVATE -Wall -Wextra)
+  target_compile_options(test_abi_probe PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
 
 # ---- the .exr fixtures -------------------------------------------------------
@@ -592,9 +786,9 @@ if(NOT CMAKE_CROSSCOMPILING)
   add_executable(mkexr tools/mkexr.cpp)
   target_link_libraries(mkexr PRIVATE OpenEXR::OpenEXR)
   if(MSVC)
-    target_compile_options(mkexr PRIVATE /W3 /utf-8)
+    target_compile_options(mkexr PRIVATE /W3 /utf-8 ${VIEWER_STRICT})
   else()
-    target_compile_options(mkexr PRIVATE -Wall -Wextra)
+    target_compile_options(mkexr PRIVATE -Wall -Wextra ${VIEWER_STRICT})
   endif()
   set(VIEWER_EXR_FIXTURE_DIR ${CMAKE_SOURCE_DIR}/tools/testdata/media)
   add_custom_command(
