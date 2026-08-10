@@ -175,6 +175,45 @@ else()
   unset(_exr_excl)
 endif()
 
+# "third-party: do not police its warnings" (the stance miniz, stb and LibRaw
+# take below) has a hole in it that only shows on a HEADER-heavy dependency:
+# -w silences the third-party TU, and OpenEXR's problem is not in its TUs. Its
+# headers are the interface - ImfHeader.h pulls ImfAttribute.h, which defines a
+# TypedAttribute template whose readValueFrom(is, size, version) ignores two of
+# its parameters - and a header is compiled with the flags of whoever INCLUDED
+# it. So core/exrread.cpp and tools/mkexr.cpp, ours and under -Wall -Wextra,
+# each reported three -Wunused-parameter against a file this project did not
+# write and cannot fix: six warnings on macOS out of twelve, and none of them
+# actionable by anyone reading them.
+#
+# It is only the FETCHED copy that does this. An installed OpenEXR arrives as
+# an IMPORTED target, whose interface include dirs CMake already passes as
+# -isystem; a FetchContent one is an ordinary target in this build tree, and
+# ordinary targets are consumed with -I. Saying INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+# gives the fetched copy the same treatment the installed copy gets by default -
+# so the two paths now warn identically, which is worth as much as the silence.
+#
+# Deliberately not blanket: this suppresses diagnostics inside THEIR headers.
+# Our own code's warnings, including those raised by our USE of their API
+# (wrong type, unused result, narrowing at our call site), are unaffected -
+# -isystem stops at the header boundary.
+foreach(_exr_tgt OpenEXR OpenEXRCore Iex IlmThread Imath)
+  # ALIAS targets (OpenEXR::OpenEXR) cannot carry properties; the real ones can.
+  # An installed OpenEXR only defines the aliases, so this loop finds nothing
+  # and changes nothing - which is correct, it is already -isystem there.
+  if(TARGET ${_exr_tgt})
+    get_target_property(_exr_alias ${_exr_tgt} ALIASED_TARGET)
+    get_target_property(_exr_inc ${_exr_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT _exr_alias AND _exr_inc)
+      set_target_properties(${_exr_tgt} PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_exr_inc}")
+    endif()
+  endif()
+endforeach()
+unset(_exr_tgt)
+unset(_exr_alias)
+unset(_exr_inc)
+
 # ---- LibRaw (vendor RAW) -----------------------------------------------------
 # The third block to read beside the two above, because it comes out a third
 # way: the library is not optional, it has no CMake at all, and only a QUARTER
