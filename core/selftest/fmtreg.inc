@@ -331,6 +331,15 @@
             bool shared = n1 == (size_t)cases[ci].docs && n1 == n2;
             for (size_t k = 0; k < n1 && shared; k++)
                 if (app.images[f1 + k]->src != app.images[f2 + k]->src) shared = false;
+            // ...and the fixture pair really is a pair: version A's pixels are
+            // NOT version B's. Asserted here, where both are in hand, so that a
+            // "reload produced version B" further down cannot be satisfied by
+            // two files that were the same picture all along.
+            bool differ = n1 == want[ci].size();
+            for (size_t k = 0; k < n1 && differ; k++)
+                if (app.images[f1 + k]->px() == want[ci][k]) differ = false;
+            check(differ, std::string("F0 ") + cases[ci].fmt +
+                              ": the two versions of the file are different pictures");
             fprintf(stderr, "fmtregselftest: F1 %s: %zu + %zu doc(s), sources %s\n",
                     cases[ci].fmt, n1, n2, shared ? "SHARED" : "separate");
             check(shared, std::string("F1 ") + cases[ci].fmt +
@@ -501,6 +510,48 @@
                       e.find("no longer in the file") != std::string::npos &&
                       app.images[f + 1]->px() == kept,
                   "F5 OpenEXR: a layer the file no longer names is refused by name");
+        }
+
+        // ---- F5b: what the registry was FOR - #82's staleness ------------------
+        // A frame average is a computation over pixels that can move on without
+        // it, and it ends up in reports as if it had been captured, so it has to
+        // be able to say whether it still describes its stack. The key is
+        // (avgSeqId, avgStackRev), and the only thing that moves stackRev is the
+        // reload walk - so an average over PNG or TIFF frames could not go
+        // (stale) at all while those frames were outside the walk. It can now,
+        // and this is the one assertion that says so end to end.
+        {
+            const std::string sp = root + "/avg.tif";
+            writeTiff16(sp, 8, 6, 100, 4);
+            size_t f = 0;
+            const size_t n = openRange(sp, f);
+            const int seq = n ? app.images[f]->seqId : 0;
+            const size_t before = app.images.size();
+            if (seq) requestStackAverage(seq);
+            ImageDoc* avg = app.images.size() == before + 1 ? app.images.back().get() : nullptr;
+            const bool made = n == 4 && seq && avg && !avg->avgOfPath.empty() &&
+                              avg->avgSeqId == seq && !avg->avgStale;
+            check(made, "F5b fixture: a frame average over a four-page TIFF stack");
+            std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+            writeTiff16(sp, 8, 6, 50000, 4);
+            std::string e;
+            const bool r = made && reloadSource(app.images[f]->src, e);
+            fprintf(stderr, "fmtregselftest: F5b after reloading page 0: avgStale=%d\n",
+                    (made && avg->avgStale) ? 1 : 0);
+            check(r && avg->avgStale,
+                  "F5b reloading one page marks the average (stale) - the stackRev key moved");
+            // ...and it is LATCHED, not recomputed behind the user: the picture
+            // is still the one that was computed, which is what makes the mark
+            // worth having.
+            // page p, pixel i = 100 + 1000p + i, so the mean over four pages is
+            // 100 + 1500 + i - the PRE-rewrite numbers, still there
+            bool held = made && avg->px().size() == (size_t)8 * 6;
+            for (size_t i = 0; held && i < avg->px().size(); i++)
+                if (fabsf(avg->px()[i] - (1600.0f + (float)i)) > 0.01f) held = false;
+            check(held, "F5b ...and the average's own pixels are untouched until Recompute");
+            std::vector<int> idx;
+            for (size_t k = f; k < app.images.size(); k++) idx.push_back((int)k);
+            closeImages(idx);
         }
 
         // ---- F6: the members of a viewer container ----------------------------

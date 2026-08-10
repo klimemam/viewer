@@ -1899,6 +1899,26 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
             else if (!v.cfa.empty())
                 d->note += (d->note.empty() ? "" : ", ") + std::string("cfa \"") + v.cfa +
                            "\" is not a known pattern";
+            // §6.2: a CONTAINER's member has a tuple, exactly as an .npz
+            // member does - the file on disk is these bytes, and the member
+            // name plus the frame index say which of them. So a second open of
+            // one .vnz shares its pixels instead of decoding the tree twice.
+            // (Identity is complete only here: loadNpyBuffer knew neither the
+            // member name nor the container's stat. addImage already measured
+            // the source while it was private, so nothing enters the registry
+            // showing the default 0/1 range.)
+            //
+            // A READER'S output does not, and the reason is the tuple rather
+            // than the mechanism. It names the file (path + member + frame +
+            // mtime + fsize) and has no field for WHICH READER was run, so two
+            // readers over one instrument .dat would key the same tuple and the
+            // second would silently adopt the first's pixels - §3.3's "two
+            // readings of one file are two sets of pixels", one layer up. The
+            // npy door keeps its two readings apart because npyRead IS in the
+            // key; until a reader's spec is too, its output stays out. Being
+            // out costs a re-decode on the second open; being in would cost the
+            // wrong numbers, silently.
+            if (readerSpec.empty()) shareOrRegisterSource(*d);
         }
         // range: (2,) for the whole node, (F,2) one per frame (§4.3.3)
         if (v.rangeShape.size() == 1 && v.range.size() == 2) {
@@ -2165,6 +2185,52 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
     return {};
 }
 
+// One decoded picture, turned into the document the rest of the program knows.
+//
+// THREE callers, and that is the reason this is a function: the open door
+// (loadImageFile), the background sequence loader (decodeImageFileFrame) and
+// the reload walk. They must produce the same thing from the same picture -
+// the same identity fields above all, because the registry tuple is built out
+// of them, and a reload whose fresh decode recorded a different `member` or a
+// different `fileFrame` from the open would land in a different slot and hand
+// pixels to a tuple that never held them. Three transcriptions of this were
+// two too many.
+//
+// `stat` is the caller's PRE-read stat of the file (identity before bytes,
+// §6.2). It is required rather than defaulted: a zero baseline is what keeps a
+// source out of the registry (srcShareable), so defaulting it would let a
+// caller drop a format back out of the registry by forgetting an argument.
+static std::unique_ptr<ImageDoc> imageDocFromPicture(imagefile::Image& img,
+                                                     const std::string& path, int page,
+                                                     const std::string& label,
+                                                     const FrameSource& stat) {
+    auto im = std::make_unique<ImageDoc>();
+    im->name = img.member.empty() ? label : label + ":" + img.member;
+    FrameSource& S = *im->src;
+    S.path = path;
+    S.fileFrame = page;      // which picture of the FILE: identity (§6.2) and the
+                             // provenance a reload replays
+    S.member = img.member;   // ...and which NAMED part of it, when it has any
+    S.w = img.w; S.h = img.h; S.ch = img.ch;
+    S.dtype = img.dtype;
+    S.data = std::move(img.data);
+    // npyShape stays empty on purpose: these formats declare their own axes, so
+    // there is no second reading of them to offer (§3.3's menu is computed from
+    // that shape, and an empty one means "no other reading exists"). It also
+    // means npyKeyRead folds them all onto NR_NATIVE, so the tuple of a picture
+    // is exactly (path, member, picture index, mtime, fsize).
+    im->note = img.note;
+    // Only what the decoder READ. No format here can be relied on to declare a
+    // CFA pattern, so none of them claims one - and --cfa still applies in
+    // addImage, because that is the user declaring it rather than us guessing.
+    im->cfa = img.cfa;
+    im->cfaPattern = img.cfaPattern & 3;
+    im->syncMirrors();
+    S.mtime = stat.mtime;    // the Watch baseline, and half of the identity
+    S.fsize = stat.fsize;    // tuple: the file on disk IS these pixels
+    return im;
+}
+
 // A PICTURE FILE: PNG, JPEG, TIFF. The decoding is behind core/imagefile.h so
 // that the library can be replaced without this file learning its name; what
 // comes back is the same Image the .npy door produces, so everything downstream
@@ -2197,6 +2263,16 @@ static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*
 // teaching the seam a selective decode, and it is no more work than opening
 // the file normally was.
 static std::string loadImageFile(const std::string& path, const std::string& onlyMember) {
+    // identity BEFORE the bytes (§6.2): see decodeNpyFrame. An overwrite
+    // completing during a decode that can take seconds (a large .exr, a
+    // multi-page TIFF) binds the OLD tuple to the OLD pixels, which is the safe
+    // direction - the next open of the NEW tuple misses the registry and reads
+    // the disk. Taken here rather than inside the builder for the same reason
+    // npzOpenMember takes the caller's stat: one open is one generation of the
+    // file, however many documents come out of it.
+    FrameSource preStat;
+    preStat.path = path;
+    statSourceFile(preStat);
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read file";
     std::vector<imagefile::Image> imgs;
@@ -2205,27 +2281,19 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
 
     const std::string label = baseName(path);
     auto build = [&](imagefile::Image& img, int page) {
-        auto im = std::make_unique<ImageDoc>();
-        im->name = img.member.empty() ? label : label + ":" + img.member;
-        FrameSource& S = *im->src;
-        S.path = path;
-        S.fileFrame = page;         // which page of the FILE: identity and provenance
-        S.member = img.member;   // ...and which NAMED part of it, when it has any
-        S.w = img.w; S.h = img.h; S.ch = img.ch;
-        S.dtype = img.dtype;
-        S.data = std::move(img.data);
-        // npyShape stays empty on purpose: these formats declare their own axes, so
-        // there is no second reading of them to offer (§3.3's menu is computed from
-        // that shape, and an empty one means "no other reading exists").
-        im->note = img.note;
-        // Only what the decoder READ. No format here can be relied on to declare a
-        // CFA pattern, so none of them claims one - and --cfa still applies in
-        // addImage, because that is the user declaring it rather than us guessing.
-        im->cfa = img.cfa;
-        im->cfaPattern = img.cfaPattern & 3;
-        im->syncMirrors();
-        statSourceFile(S);          // the file on disk IS these pixels: Watch baseline
-        return im;
+        return imageDocFromPicture(img, path, page, label, preStat);
+    };
+
+    // §6.2, once for however many documents this file produced: each one either
+    // joins the source already resident under its tuple or registers its own.
+    // AFTER addImage, never before - addImage runs computeMinMax, and no source
+    // may become discoverable in the registry while it still shows the default
+    // 0/1 range (the seq worker would sync those mirrors). loadNpy says the
+    // same thing at the same point, for the same reason.
+    const size_t firstDoc = app.images.size();
+    auto registerFrom = [&]() {
+        for (size_t i = firstDoc; i < app.images.size(); i++)
+            shareOrRegisterSource(*app.images[i]);
     };
 
     // ---- named parts: one document each -------------------------------------
@@ -2242,6 +2310,7 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
             return onlyMember.empty()
                  ? "nothing readable in this file"
                  : "'" + onlyMember + "' is not a part of this file";
+        registerFrom();
         // Say what opened, BY NAME - never silent about having produced more
         // than one document from one file. The .npz member path sets this
         // convention and this is the same sentence.
@@ -2255,6 +2324,7 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
 
     if (imgs.size() == 1) {
         addImage(build(imgs[0], 0));
+        registerFrom();
         return {};
     }
 
@@ -2282,6 +2352,7 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
     }
     for (auto& s : app.seqs)
         if (s.id == info.id) s.lastImageIdx = firstIdx;
+    registerFrom();
     fprintf(stderr, "picture stack: %s - %zu frames (%dx%d %dch)\n", label.c_str(),
             imgs.size(), ref->w, ref->h, ref->ch);
     return {};
@@ -2298,6 +2369,15 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
 // without a word is the failure this whole seam is arranged to avoid.
 static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
                                                       std::string& errOut) {
+    // identity BEFORE the bytes (§6.2): see decodeNpyFrame, whose twin this is.
+    // It used to stat AFTER the decode, which on this side of the seam is the
+    // longer window of the two - a folder of .exr is decompressed frame by
+    // frame on this thread - and an overwrite landing inside it would have
+    // stamped the NEW disk state onto the OLD pixels, so the tuple would claim
+    // bytes it never held and the next open would adopt them.
+    FrameSource st;
+    st.path = path;
+    statSourceFile(st);
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) { errOut = "cannot read file"; return {}; }
     std::vector<imagefile::Image> imgs;
@@ -2308,20 +2388,14 @@ static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
                  "a folder's stack - open it on its own";
         return {};
     }
-    imagefile::Image& img = imgs[0];
-    auto im = std::make_unique<ImageDoc>();
+    auto im = imageDocFromPicture(imgs[0], path, 0, baseName(path), st);
+    // A folder's frame is named by its FILE, never "file:layer", even when the
+    // one picture in it is a named part. The frame axis here comes from the
+    // files, so the file name is what distinguishes one frame from the next -
+    // and the registry-adoption branch in the sequence worker names it that way
+    // too, so a stack whose frames were half decoded and half adopted would
+    // otherwise show two naming schemes in one list.
     im->name = baseName(path);
-    FrameSource& S = *im->src;
-    S.path = path;
-    S.member = img.member;
-    S.w = img.w; S.h = img.h; S.ch = img.ch;
-    S.dtype = img.dtype;
-    S.data = std::move(img.data);
-    im->note = img.note;
-    im->cfa = img.cfa;
-    im->cfaPattern = img.cfaPattern & 3;
-    im->syncMirrors();
-    statSourceFile(S);
     return im;
 }
 

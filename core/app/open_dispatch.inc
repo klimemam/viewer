@@ -443,9 +443,9 @@ static std::string reloadUnavailable(const FrameSource& S) {
     if (S.member.rfind("__pixels_", 0) == 0)
         return "a container/reader member: the file rebuilds\n"
                "as a unit - re-open it to reload.";
-    if (const imagefile::Backend* b =
-            imagefile::forPath(localUrl ? S.remoteUrl.substr(8) : S.path))
-        return std::string(b->format) + " reload is not wired yet: re-open the file.";
+    // (no row for the picture formats: they go through the walk now. The three
+    // above are the whole list, and it is short on purpose - anything a re-read
+    // of the file can answer belongs in reloadSource, not here.)
     return {};
 }
 
@@ -461,10 +461,18 @@ static std::string reloadUnavailable(const FrameSource& S) {
 // not an error - the mirrors resync and *noteOut says what changed, so the
 // caller's notice can. What DOES refuse: no local file behind the pixels
 // (remote-backed / montage / plugin output), an unreadable or undecodable file,
-// a vanished npz member, and a frame-axis index past the file's new frame count
-// (that frame no longer exists - there is no "same frame" to give new values
-// to). On any failure the source is untouched: old pixels stay, never a
+// a vanished named part (an .npz member, an .exr layer), and a picture index
+// past the file's new picture count - an .npy frame, a TIFF page or a y4m
+// frame that no longer exists, and there is no "same frame" to give new values
+// to. On any failure the source is untouched: old pixels stay, never a
 // half-swap.
+//
+// WHICH DECODER re-reads the file is decided by what the PIXELS are, in that
+// order, and never by the file name alone: a reader/container member first (it
+// rebuilds as a unit), then a declared raw recipe (the recipe is what those
+// pixels are), then the picture seam, then .npy/.npz. A source that came in
+// through one door must not go out through another - the name is the last
+// thing consulted, and only for sources no earlier test claimed.
 //
 // A cropped source re-applies its recorded crop rect to the fresh decode (the
 // crop is part of what these pixels ARE - §2.1 keeps it on the source); the
@@ -482,20 +490,17 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     if (!src->remoteUrl.empty() && !localUrl) { errOut = "remote-backed"; return false; }
     const std::string fpath = localUrl ? src->remoteUrl.substr(8) : src->path;
     if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
-    // PNG/JPEG stay out of the reload walk for now, BY NAME: these sources do
-    // not participate in the registry either (see the integration order in
-    // #63), and without this line their bytes would fall through to the npy
-    // decoder below and the toast would blame a "decode failure" that never
-    // happened. Re-opening the file is the working path today.
-    if (const imagefile::Backend* fmt = imagefile::forPath(fpath)) {
-        errOut = std::string(fmt->format) + " reload is not wired yet: re-open the file";
-        return false;
-    }
     // Container/reader members (__pixels_*) rebuild as a UNIT: one __viewer
     // line restores the whole tree, and a reader file re-runs its adapter.
     // A per-member reload is not wired - and without this refusal a reader's
     // .dat origin would fall into the npz branch below, whose npzList would
     // then blame "not a zip file" for a failure that never happened.
+    //
+    // This test comes FIRST, before the recipe and the format table, because
+    // its subject is where the pixels came from rather than what the file is
+    // called: a reader's origin may perfectly well be named .tif, and reading
+    // it as a TIFF would silently replace a reader's output with a decode of
+    // the file it was run on.
     if (src->member.rfind("__pixels_", 0) == 0) {
         errOut = "container/reader members reload by re-opening the file";
         return false;
@@ -515,6 +520,61 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
             d.cropW = src->w; d.cropH = src->h;
         }
         nd = decodeRawFrame(d, err);       // stats BEFORE reading, like every loader
+    } else if (const imagefile::Backend* fmt = imagefile::forPath(fpath)) {
+        // A PICTURE FILE, back through the same seam it was opened through
+        // (core/imagefile.h). The extension only chooses this door - what
+        // decodes is decided by the bytes, exactly as on the way in, so a file
+        // re-exported into a different encoding of the same format still
+        // reloads and a .png that has become a JPEG still says so.
+        //
+        // AFTER the raw recipe on purpose: a .png the user chose to read
+        // through the headerless dialog is those pixels because of the RECIPE,
+        // and srcIdentityKey keys it by the recipe for the same reason. The
+        // extension does not get to overrule a reading the user declared.
+        //
+        // The whole file is decoded to recover one picture, which is what the
+        // open door already does and says so (loadImageFile) - and what the
+        // .npy frame-axis branch below has always done. Reloading a 100-frame
+        // y4m frame by frame therefore reads it 100 times; that is the
+        // frame-axis cost this walk has carried since it was written, not a
+        // new one, and it is per-SOURCE, so reloadStackFromDisk pays it once
+        // per distinct source rather than once per membership.
+        FrameSource st;                    // identity BEFORE the bytes
+        st.path = fpath;
+        statSourceFile(st);
+        std::vector<uint8_t> bytes;
+        if (!readFileBytes(fpath, bytes)) { errOut = "cannot read file"; return false; }
+        std::vector<imagefile::Image> imgs;
+        if (!imagefile::decode(fpath, bytes, imgs, err)) { errOut = err; return false; }
+        // Which picture of the file these pixels ARE - the provenance the open
+        // recorded, replayed, never re-chosen. The two kinds are the two the
+        // seam already distinguishes (core/imagefile.h): a NAMED part is found
+        // by its name, an unnamed one by its position.
+        imagefile::Image* pick = nullptr;
+        if (!src->member.empty()) {
+            for (auto& g : imgs) if (g.member == src->member) { pick = &g; break; }
+            if (!pick) {          // ...and a part that is gone is refused BY NAME,
+                                  // the way a vanished .npz member is
+                errOut = std::string(fmt->partWord ? fmt->partWord : "part") + " \"" +
+                         src->member + "\" is no longer in the file";
+                return false;
+            }
+        } else {
+            if (src->fileFrame >= (int)imgs.size()) {
+                // the same sentence, and the same reasoning, as the .npy frame
+                // axis: there is no "same frame" left to give new values to
+                errOut = "file now has " + std::to_string(imgs.size()) + " frame(s); frame " +
+                         std::to_string(src->fileFrame) + " no longer exists";
+                return false;
+            }
+            pick = &imgs[(size_t)src->fileFrame];
+        }
+        nd = imageDocFromPicture(*pick, fpath, src->fileFrame, baseName(fpath), st);
+        // a crop made after load re-scoped this frame; the reload keeps that
+        // scope, exactly as the .npy branch does
+        if (nd && src->srcW > 0 &&
+            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW || src->h != src->srcH))
+            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
     } else {
         // identity BEFORE the bytes: an overwrite completing during this read
         // binds the OLD tuple to the OLD pixels - the safe direction.

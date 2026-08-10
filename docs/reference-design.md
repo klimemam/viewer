@@ -300,10 +300,14 @@ cmpslot は別のメンバに刺さり、stackavg は別のメンバを畳んで
 
 ### 6.2 開くときの共有 — source registry
 
-source の identity tuple = **(path または url, npzMember, fileFrame,
+source の identity tuple = **(path または url, member, fileFrame,
 remoteFrame, raw レシピ, npy の読み方 npyRead, mtime, fsize)**。ローダ
-(npy / npz / raw / remote) はデコード前に registry を引き、**同じ tuple の
-source が既に居ればデコードせず共有する**。npyRead は §3.3 の宣言
+(npy / npz / raw / remote / **形式 seam の全 backend** = PNG・JPEG・ベンダ
+RAW・TIFF・OpenEXR・y4m / **viewer コンテナのメンバー**) はデコード前に
+registry を引き、**同じ tuple の source が既に居ればデコードせず共有する**。
+`member` は「そのファイルの中のこの部分」であって npz 専用ではない — .exr の
+layer も同じ欄で、TIFF の page と y4m の frame は名前を持たないので
+`fileFrame` の側に載る。npyRead は §3.3 の宣言
 (input-adapters.md) を正規化して埋める — native と同じ読みを明示しただけの
 宣言は native に畳む (`npyKeyRead`)。**同一ファイルの2つの読みは2つの
 tuple** であり、決して共有しない (reload selftest R21b)。
@@ -314,6 +318,13 @@ tuple** であり、決して共有しない (reload selftest R21b)。
   RAM の画素と同一なので共有してよい (同じフォルダを2回開けば、2つの batch の
   2つの stack が同じ source 群を指し、メモリは1倍になる)。
 - registry は弱参照 (source が全 membership を失えば消える)。
+- **入らないものが1つあり、それは形式ではなく tuple の都合。** reader
+  (アダプタ) が作った画素は登録しない — tuple はファイルを名乗る欄しか持たず、
+  **どの reader を走らせたか**を書く欄が無いので、1つの .dat に2つの reader を
+  当てると同じ tuple になり、2つ目が1つ目の画素を黙って拾う。npy 側が2つの
+  読みを分けられるのは npyRead が鍵に入っているからで、reader の spec が同じ
+  ように入るまでは外に置く (§3.3 の「同一ファイルの2つの読みは2つの source」と
+  同じ判断を1段上でしたもの)。代償は2回目の open での再デコード1回。
 
 ### 6.3 「not resident」のミスはミスのまま (V1 の裁定)
 
