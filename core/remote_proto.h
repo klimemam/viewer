@@ -65,7 +65,22 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // guesses afterwards from an error string. That number is this one - and it is
 // also what makes an installed viewer-serve update itself on connect, which is
 // the reason a lab that copied the peer once ever sees the op at all.
-static const uint32_t VERSION = 7;
+//
+// 8: MOP_SET_FOLD - the fold half of a SET analysis run on the peer, under a
+// parity check on the fold's own declared form (docs/analysis-layers.md §3.5 /
+// §6, #57 judgments 4/5). FRAMING again, and for §10's reason rather than a new
+// one: this op adds a REQUEST GRAMMAR the older head cannot express. A set is
+// {role: stack} and MeasureReqHead carries one flat path list with nowhere to
+// say where one stack stops and the next begins, so the grouping arrives in a
+// role block appended after the rois - which a v7 peer never reads, because it
+// refuses on the op number first.
+//
+// That refusal is correct and unreadable: "unknown measure op" is the same
+// sentence a v7 peer gives for a typo, and it is indistinguishable from the
+// parity refusal this op exists to produce. With the number the client refuses
+// BEFORE it sends, names which mismatch it is, and never turns a too-old peer
+// into a quiet local fold over pixels it would have had to fetch.
+static const uint32_t VERSION = 8;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -110,6 +125,28 @@ enum MeasureOp : uint32_t {
     // as well as frame ones, and returns the peer's ledger row so the result
     // can name the dll that actually computed it.
     MOP_PLUGIN_ANALYZE  = 3,
+    // docs/analysis-layers.md §3.5's last line ("set の集計も同じ線"). A set
+    // analyzer's inputs are N stacks with NAMED ROLES, and its outputs are
+    // scalars - so what moves to the peer is the FOLD (per-pixel temporal mean
+    // and its residual, reduced to per-plane sums) and what stays here is every
+    // named estimator built on top of it. See core/setfold.h for the split and
+    // why the per-pixel difference two roles need is reduced on the peer rather
+    // than recomposed from moments here.
+    MOP_SET_FOLD        = 4,
+};
+
+// MOP_SET_FOLD only: what the peer must do ACROSS roles once each one is
+// folded. JOIN_NONE answers every role on its own, which is all the direct DSNU
+// row and every level of the separation fit need. JOIN_DIFF additionally forms
+// D = M[role 0] - M[role 1] per pixel and reduces it there - the one thing a
+// client cannot compose from per-role scalars without changing the digits.
+// A field rather than an inference from the role count: two roles are a
+// perfectly ordinary independent pair (a sweep of two levels is refused for a
+// different reason entirely), and the request has to SAY that a difference is
+// wanted rather than have the peer guess it.
+enum SetJoin : uint32_t {
+    SJ_NONE = 0,
+    SJ_DIFF = 1,
 };
 
 // Which mouth of the plugin the request is aimed at (MOP_PLUGIN_ANALYZE only).
@@ -134,6 +171,32 @@ enum MeasureTarget : uint32_t {
 // After, not before, so that not one byte moves for the three ops that came
 // first: an op a v6 peer knows is parsed by a v6 peer identically, and the op
 // it does not know it refuses on the op number before it reads this far.
+//
+// MOP_SET_FOLD appends, in the same place and for the same reason:
+//   [str foldForm]   what the CLIENT's fold declares (setfold::foldForm).
+//                    "" = declares nothing, which is refused rather than read
+//                    as a match - two absences are not an agreement.
+//   [u32 join]       SetJoin
+//   [u32 nRoles]     1..64
+//     per role: [str role][u32 nPaths][u32 frame0][u32 frameCount]
+//
+// The ROLE BLOCK is the grammar #134 said this op would need and could not
+// inherit. The flat `nPaths` list is KEPT and keeps its meaning - one file per
+// frame, in sequence order - and the block says how many of it each role owns,
+// in declaration order, so the paths of role 0 come first and so on. A
+// COMPANION COUNT ARRAY rather than a nested list because it is the change that
+// costs the existing parser nothing: `nPaths` is still the number of strings to
+// read, still read by the same loop, and a peer that mis-sums the counts finds
+// out immediately (sum != nPaths is a refusal, not a silent re-slice).
+//
+// frame0/frameCount are PER ROLE and not the head's, because two roles are two
+// different stacks: a dark of 480 frames and a flat of 8 have no common range,
+// and the head's pair describes one file. The head's own frame0/frameCount are
+// ignored for this op.
+//
+// rois must be empty. A set analyzer reads the frame (core/app/setanalysis.inc:
+// "EVERY pixel, no decimation"), so a request carrying one is refused rather
+// than quietly measuring a different population than the local path would.
 struct MeasureReqHead {
     uint32_t op;                 // MeasureOp
     uint32_t frame0, frameCount; // range in a frame-axis file; frameCount 0 = all
@@ -161,6 +224,28 @@ struct MeasureReqHead {
 // The path is the peer's absolute path and is quoted as such - the client
 // writes NOTHING about its own dll of the same name here, because it did not
 // compute this and a citation names the computer.
+//
+// MOP_SET_FOLD reuses that trailer EXACTLY - same five fields, same parser -
+// with a built-in's answers to the same questions: name = "set fold
+// (built-in)", version = the PEER's viewer version, file = "" because a
+// built-in has no dll and that absence is the statement, path = the peer's own
+// executable. #46's 計算者欄 asks for "viewer 版、またはプラグイン name +
+// version + ファイル"; this is the first half of that sentence.
+//
+// Its columns are ONE PER ROLE, in the request's declaration order, and then -
+// when join != SJ_NONE - one more for the join. The keys are neutral sums, not
+// named quantities: `p<k>.s1` / `p<k>.s2` / `p<k>.cs` / `p<k>.n` per plane
+// (`p<k>.s1a` / `s1b` / `dq` / `cs` / `n` on the join column), plus the shading
+// probe's `p<k>.shade_pp` / `shade_pct` / `shade_pct_ok`, plus the role's own
+// facts: `frames` / `expected` / `w` / `h` / `ch` / `planes` / `cfa` /
+// `cfa_pattern` / `nonfinite` / `dropped`, and `role` as text.
+//
+// A role the peer could not fold (fewer than 2 frames) still gets its column,
+// carrying `frames` / `expected` / the shape and no sums. That is deliberate:
+// the sentence a person reads for that case is settled in
+// core/app/setanalysis.inc, in words about roles and stacks, and a peer that
+// turned it into MSG_ERR would leave the client with nothing to write it from.
+// The peer answers with FACTS; the refusals stay where their words are settled.
 
 // shared sample-to-float conversion (defined in serve.cpp, linked everywhere)
 void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out);

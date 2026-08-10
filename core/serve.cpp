@@ -7,6 +7,8 @@
 // displayed in.
 #include "remote_proto.h"
 #include "plugin_host.h"
+#include "setfold.h"                 // the fold half of a set analysis, shared with the viewer
+#include "version.h"                 // the commit this peer was built from (provenance)
 
 #include <algorithm>
 #include <chrono>
@@ -325,6 +327,22 @@ static bool readRegion(NpyFile& n, const TileReq& r, std::vector<uint8_t>& out,
 // must get the LIST shape it knows how to parse; defaulting to 2 keeps a client
 // that never said hello (none of ours) on the safe format.
 static uint32_t g_clientVersion = 2;
+
+// VIEWER_SERVE_PROTOCOL: serve as an OLDER peer. The same kind of seam
+// VIEWER_SERVE_LAG_MS already is - "a real link's latency, on demand" - and it
+// is not a claim but a behaviour: this peer announces the lower number in HELLO
+// AND refuses every op that number predates, which is byte for byte what the
+// build before those ops does. Without it the client's "your peer is too old"
+// gate can only be exercised by keeping an old binary on the disk, and a
+// refusal nobody runs is a refusal that rots.
+static uint32_t servedVersion() {
+    static uint32_t v = [] {
+        const char* e = getenv("VIEWER_SERVE_PROTOCOL");
+        const uint32_t n = e ? (uint32_t)atoi(e) : VERSION;
+        return (n == 0 || n > VERSION) ? VERSION : n;
+    }();
+    return v;
+}
 
 static bool isNpySuffix(const std::string& name) {
     if (name.size() < 4) return false;
@@ -1359,6 +1377,266 @@ static void runFrameRoiStats(const MeasureReqHead& head,
     sendMeasureReply(src.count, cols, series);
 }
 
+// ---- set folding on the peer (docs/analysis-layers.md §3.5 / §6) -----------
+//
+// A 480-frame dark on a compute node should be folded HERE, not pulled across
+// ssh to be folded there. What this op does is exactly the fold - the per-pixel
+// temporal mean and the temporal residual still in it, reduced to per-plane
+// sums - and it computes nothing that has a name. DSNU, PRNU, the separation
+// fit's OLS: every one of those is composed by the client, on the client's own
+// code, out of the handful of scalars below. core/setfold.h says why the split
+// falls there and why the ONE thing that could not be composed from per-role
+// scalars (the pixel-wise difference of two mean images) is reduced on this
+// side instead.
+//
+// Everything large is a std::vector: PR #133's 768 KB local overflowed Windows'
+// 1 MB main-thread stack, and a fold's accumulators are megabytes.
+struct SetRoleReq {
+    std::string role;
+    uint32_t nPaths = 0, frame0 = 0, frameCount = 0;
+};
+
+struct RoleFold {
+    std::string role;
+    bool folded = false;               // false = fewer than 2 frames; the CLIENT
+                                       // words that refusal, see below
+    uint32_t frames = 0, expected = 0;
+    int w = 0, h = 0, ch = 1, nPl = 1;
+    uint64_t nonFinite = 0, dropped = 0;
+    std::vector<double> M, corr;       // kept only when a join needs them
+    std::vector<uint8_t> plane;
+    setfold::PlaneAcc pl[4];
+    DetrendReport shade;
+};
+
+// One role: read its frames, fold, reduce, probe. `keep` decides whether the
+// per-pixel pictures survive the call - a join needs two of them resident at
+// once, and the separation fit's M+1 roles deliberately do not, so a sweep of
+// twenty levels costs this peer one fold's memory rather than twenty.
+static bool foldOneRole(const MeasureReqHead& head, const std::vector<std::string>& paths,
+                        const SetRoleReq& rq, bool keep, RoleFold& F, std::string& err) {
+    MeasureReqHead h = head;           // FrameSource reads the range off the head,
+    h.frame0 = rq.frame0;              // and a set's roles each have their own
+    h.frameCount = rq.frameCount;
+    FrameSource src;
+    if (!src.init(h, paths)) { err = "\"" + rq.role + "\": " + src.err; return false; }
+    F.role = rq.role;
+    F.frames = src.count;
+    F.w = (int)src.n.w; F.h = (int)src.n.h; F.ch = (int)src.n.ch;
+    F.expected = src.perFile ? (uint32_t)paths.size() : (uint32_t)src.n.frames;
+    if (F.expected < F.frames) F.expected = F.frames;
+    // The plane rule, mirrored from the local fold rather than from
+    // runTemporalStats: a mosaic is four planes only when the frame really has
+    // one channel, and an RGB frame with a CFA declaration is one plane. Same
+    // condition, same table (CFA_MAP_S == state.h's CFA_MAP).
+    F.nPl = (head.cfaType != 0 && F.ch == 1) ? 4 : 1;
+    if (F.frames < (uint32_t)setfold::kMinFrames) return true;   // a FACT, not an error
+    const size_t samples = (size_t)F.w * F.h * F.ch;
+    if (samples > setfold::kMaxSamples) {
+        err = "\"" + rq.role + "\": the frame is larger than 32M samples";
+        return false;
+    }
+    F.M.assign(samples, std::numeric_limits<double>::quiet_NaN());
+    F.corr.assign(samples, std::numeric_limits<double>::quiet_NaN());
+    F.plane.assign(samples, 0);
+    {
+        std::vector<double> sum(samples, 0.0), sum2(samples, 0.0);
+        std::vector<uint32_t> cnt(samples, 0);
+        std::vector<uint8_t> raw;
+        std::vector<float> pix;
+        for (uint32_t f = 0; f < src.count; f++) {
+            uint32_t ow = 0, oh = 0;
+            if (!src.read(f, 0, 0, (uint32_t)F.w, (uint32_t)F.h, raw, ow, oh)) {
+                err = "\"" + rq.role + "\": " + src.err;
+                return false;
+            }
+            pix.resize(samples);
+            toFloatSamples(raw.data(), src.n.dtype, samples, pix.data());
+            for (size_t i = 0; i < samples; i++) {
+                const double v = pix[i];
+                if (!std::isfinite(v)) { F.nonFinite++; continue; }
+                sum[i] += v; sum2[i] += v * v; cnt[i]++;
+            }
+        }
+        for (int y = 0; y < F.h; y++)
+            for (int x = 0; x < F.w; x++) {
+                const uint8_t p = F.nPl == 4
+                    ? (uint8_t)planeOf(head.cfaType, head.cfaPattern, (uint32_t)x, (uint32_t)y)
+                    : (uint8_t)0;
+                for (int c = 0; c < F.ch; c++) {
+                    const size_t i = ((size_t)y * F.w + x) * F.ch + c;
+                    F.plane[i] = p;
+                    double m = 0, cr = 0;
+                    if (!setfold::pixelMeanCorr(sum[i], sum2[i], cnt[i], m, cr)) {
+                        F.dropped++;
+                        continue;
+                    }
+                    F.M[i] = m; F.corr[i] = cr;
+                }
+            }
+    }
+    setfold::reduceOne(F.M.data(), F.corr.data(), F.plane.data(), samples, F.pl);
+    F.shade = detrendProbeT(F.M.data(), F.w, F.h, F.ch, F.plane.data(), F.nPl);
+    F.folded = true;
+    if (!keep) {
+        F.M.clear(); F.M.shrink_to_fit();
+        F.corr.clear(); F.corr.shrink_to_fit();
+        F.plane.clear(); F.plane.shrink_to_fit();
+    }
+    return true;
+}
+
+static std::string setPlaneKey(int p, const char* leaf) {
+    char b[48];
+    snprintf(b, sizeof b, "p%d.%s", p, leaf);
+    return b;
+}
+
+static void putShade(std::vector<MItem>& col, int nPl, const DetrendReport& S) {
+    for (int p = 0; p < nPl; p++) {
+        col.push_back({ 0u, setPlaneKey(p, "shade_pp"), S.pl[p].ppDn, {} });
+        col.push_back({ 0u, setPlaneKey(p, "shade_pct"),
+                        S.pl[p].pctOk ? S.pl[p].pct : 0.0, {} });
+        col.push_back({ 0u, setPlaneKey(p, "shade_pct_ok"), S.pl[p].pctOk ? 1.0 : 0.0, {} });
+    }
+}
+
+// Parity, for a BUILT-IN. §10 matches a plugin's name and version; there is no
+// dll here and no descriptor to version, so what is matched is the FORM the
+// fold declares - see core/setfold.h for why that, and not the viewer version,
+// is the thing whose equality makes the answer mean one thing.
+static bool setFoldParityOk(const std::string& clientForm, uint32_t join, std::string& why) {
+    const std::string mine = setfold::foldForm(join);
+    if (!clientForm.empty() && clientForm == mine) return true;
+    const std::string head = "set fold parity refused: the fold ";
+    if (clientForm.empty()) {
+        why = head + "declares nothing on the client and is\n  <" + mine +
+              ">\n  on the peer (viewer " + viewerVersion() + ")\n"
+              "  A set analyzer is a built-in, so there is no descriptor version to "
+              "match: what is matched is the FORM the fold declares, and a form that "
+              "was never declared cannot be matched.";
+        return false;
+    }
+    why = head + "is\n  <" + clientForm + ">\n  on the client and\n  <" + mine +
+          ">\n  on the peer (viewer " + viewerVersion() + ")\n"
+          "  Neither form wins: this is not folded with the peer's build, and it is "
+          "not handed back to the client to fold here.\n"
+          "  A set analyzer's name is worn by more than one estimator, so a fold "
+          "that is not the one the row was named for is the failure this check "
+          "exists to make impossible.";
+    return false;
+}
+
+static void runSetFold(const MeasureReqHead& head,
+                       const std::vector<std::string>& paths,
+                       const std::vector<RoiRect>& rois,
+                       const std::string& clientForm, uint32_t join,
+                       const std::vector<SetRoleReq>& roles) {
+    if (!rois.empty()) {
+        // A set analyzer reads the frame. Measuring a rectangle here would
+        // answer a different population than the local path and call it the
+        // same number, which is the one thing this op must not do.
+        sendErr("set fold refused: a set analyzer reads the whole frame, so this "
+                "op takes no ROI (it was sent " + std::to_string(rois.size()) + ")");
+        return;
+    }
+    std::string why;
+    if (!setFoldParityOk(clientForm, join, why)) { sendErr(why); return; }
+    if (join == SJ_DIFF && roles.size() != 2) {
+        std::string have;
+        for (const auto& r : roles) have += (have.empty() ? "" : ", ") + ("\"" + r.role + "\"");
+        sendErr("set fold refused: the difference join is between two roles, and "
+                "this request names " + std::to_string(roles.size()) + " (" +
+                (have.empty() ? "none" : have) + ")");
+        return;
+    }
+    std::vector<RoleFold> folds(roles.size());
+    std::vector<std::vector<MItem>> cols;
+    std::string err;
+    size_t at = 0;
+    uint32_t usedTotal = 0, expectedTotal = 0;
+    for (size_t r = 0; r < roles.size(); r++) {
+        std::vector<std::string> mine(paths.begin() + at, paths.begin() + at + roles[r].nPaths);
+        at += roles[r].nPaths;
+        if (!foldOneRole(head, mine, roles[r], join != SJ_NONE, folds[r], err)) {
+            sendErr("set fold refused: " + err);
+            return;
+        }
+        usedTotal += folds[r].frames;
+        expectedTotal += folds[r].expected;
+    }
+    for (const RoleFold& F : folds) {
+        cols.emplace_back();
+        std::vector<MItem>& col = cols.back();
+        col.push_back({ 1u, "role", 0.0, F.role });
+        col.push_back({ 0u, "frames", (double)F.frames, {} });
+        col.push_back({ 0u, "expected", (double)F.expected, {} });
+        col.push_back({ 0u, "w", (double)F.w, {} });
+        col.push_back({ 0u, "h", (double)F.h, {} });
+        col.push_back({ 0u, "ch", (double)F.ch, {} });
+        col.push_back({ 0u, "planes", (double)F.nPl, {} });
+        col.push_back({ 0u, "cfa", (double)head.cfaType, {} });
+        col.push_back({ 0u, "cfa_pattern", (double)head.cfaPattern, {} });
+        col.push_back({ 0u, "folded", F.folded ? 1.0 : 0.0, {} });
+        if (!F.folded) continue;       // frames < 2: the facts, and no sums
+        col.push_back({ 0u, "nonfinite", (double)F.nonFinite, {} });
+        col.push_back({ 0u, "dropped", (double)F.dropped, {} });
+        for (int p = 0; p < F.nPl; p++) {
+            col.push_back({ 0u, setPlaneKey(p, "s1"), F.pl[p].s1, {} });
+            col.push_back({ 0u, setPlaneKey(p, "s2"), F.pl[p].s2, {} });
+            col.push_back({ 0u, setPlaneKey(p, "cs"), F.pl[p].cs, {} });
+            col.push_back({ 0u, setPlaneKey(p, "n"),  F.pl[p].n,  {} });
+        }
+        putShade(col, F.nPl, F.shade);
+    }
+    // ---- the join -----------------------------------------------------------
+    // Omitted rather than refused when the two roles do not line up: the
+    // sentence for "these two are not one shape" is settled in
+    // core/app/setanalysis.inc, in the words of the ROLES it is about, and the
+    // client can only write it if the role columns above arrive. So the peer
+    // sends the facts and says join_ok = 0; the refusal is written where its
+    // words live.
+    if (join == SJ_DIFF) {
+        cols.emplace_back();
+        std::vector<MItem>& col = cols.back();
+        col.push_back({ 1u, "join", 0.0, "difference" });
+        const RoleFold& A = folds[0];
+        const RoleFold& B = folds[1];
+        const bool lined = A.folded && B.folded && A.w == B.w && A.h == B.h &&
+                           A.ch == B.ch && A.nPl == B.nPl;
+        col.push_back({ 0u, "join_ok", lined ? 1.0 : 0.0, {} });
+        if (lined) {
+            const size_t samples = (size_t)A.w * A.h * A.ch;
+            setfold::PairAcc pl[4];
+            setfold::reducePair(A.M.data(), A.corr.data(), B.M.data(), B.corr.data(),
+                                A.plane.data(), samples, pl);
+            col.push_back({ 0u, "planes", (double)A.nPl, {} });
+            for (int p = 0; p < A.nPl; p++) {
+                col.push_back({ 0u, setPlaneKey(p, "s1a"), pl[p].s1a, {} });
+                col.push_back({ 0u, setPlaneKey(p, "s1b"), pl[p].s1b, {} });
+                col.push_back({ 0u, setPlaneKey(p, "dq"),  pl[p].dq,  {} });
+                col.push_back({ 0u, setPlaneKey(p, "cs"),  pl[p].cs,  {} });
+                col.push_back({ 0u, setPlaneKey(p, "n"),   pl[p].n,   {} });
+            }
+            // the shading of D, because D is the picture the client's ratio is
+            // taken over and a figure has to describe the picture beside it
+            std::vector<double> D(samples);
+            setfold::differenceImage(A.M.data(), B.M.data(), samples, D.data());
+            putShade(col, A.nPl,
+                     detrendProbeT(D.data(), A.w, A.h, A.ch, A.plane.data(), A.nPl));
+        }
+    }
+    // #46's 計算者欄 for a built-in: the viewer version, and no dll, because
+    // there is none and that absence is the statement.
+    MeasureProv prov;
+    prov.name = "set fold (built-in)";
+    prov.version = viewerVersion();
+    prov.file = "";
+    prov.path = plugin_host::exeDir();
+    prov.expected = expectedTotal;
+    sendMeasureReply(usedTotal, cols, {}, &prov);
+}
+
 // ---- plugin analysis on the peer (docs/abi-v3.md §10) ---------------------
 //
 // One frame, materialized as f32 exactly as the local host would, handed to
@@ -1750,7 +2028,50 @@ static void handleMeasure(Buf& in) {
             return;
         }
         if (target > MT_STACK) { sendErr("bad MEASURE target"); return; }
+        if (servedVersion() < 7) { sendErr("unknown measure op"); return; }
         runPluginAnalyze(head, paths, rois, analyzer, clientVersion, target);
+        return;
+    }
+    if (head.op == MOP_SET_FOLD) {
+        // On the op NUMBER, before a byte of the role block is read - which is
+        // what a peer that predates this op does, because it has nothing to
+        // read the block with. VIEWER_SERVE_PROTOCOL makes this peer be that
+        // peer rather than imitate it.
+        if (servedVersion() < 8) { sendErr("unknown measure op"); return; }
+        // The role block, read AFTER the rois for the reason the parity block
+        // is: an op an older peer knows is parsed by it identically, and the op
+        // it does not know it never reaches.
+        std::string foldForm;
+        uint32_t join = SJ_NONE, nRoles = 0;
+        if (!in.getStr(foldForm) || !in.getU32(join) || !in.getU32(nRoles)) {
+            sendErr("bad MEASURE role block");
+            return;
+        }
+        if (join > SJ_DIFF) { sendErr("bad MEASURE join"); return; }
+        if (nRoles == 0 || nRoles > 64) { sendErr("bad MEASURE role count"); return; }
+        std::vector<SetRoleReq> roles(nRoles);
+        uint64_t sum = 0;
+        for (auto& r : roles) {
+            if (!in.getStr(r.role) || !in.getU32(r.nPaths) || !in.getU32(r.frame0) ||
+                !in.getU32(r.frameCount)) {
+                sendErr("bad MEASURE role block");
+                return;
+            }
+            if (r.nPaths == 0) {
+                sendErr("bad MEASURE role block: \"" + r.role + "\" owns no path");
+                return;
+            }
+            sum += r.nPaths;
+        }
+        // The companion count array has ONE invariant and it is checked rather
+        // than trusted: a mis-summed block would silently re-slice one role's
+        // frames into another's, and the answer would look perfectly normal.
+        if (sum != (uint64_t)head.nPaths) {
+            sendErr("bad MEASURE role block: the roles claim " + std::to_string(sum) +
+                    " path(s) and the head declared " + std::to_string(head.nPaths));
+            return;
+        }
+        runSetFold(head, paths, rois, foldForm, join, roles);
         return;
     }
     if (head.op != MOP_ANALYZER) { sendErr("unknown measure op"); return; }
@@ -1794,7 +2115,7 @@ void handleRequest(uint32_t type, Buf& in) {
             uint32_t cv = 0;
             if (in.getU32(cv) && cv) g_clientVersion = cv;   // gates the LIST shape
             Buf out;
-            out.putU32(VERSION);
+            out.putU32(servedVersion());
             out.putStr("viewer --serve");
             sendMsg(MSG_OK, out);
             break;

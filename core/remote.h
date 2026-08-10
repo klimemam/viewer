@@ -63,9 +63,10 @@ struct MeasureSeries {
 struct MeasureResult {
     int serverLoc = 0;            // 0 = CPU, 1 = CUDA (provenance)
     int framesUsed = 0;           // n
-    // MOP_PLUGIN_ANALYZE only (docs/abi-v3.md §10/§11): WHO computed this, read
-    // off the PEER's ledger. Empty for every other op - a builtin aggregate
-    // wears no plugin tag, here for the same reason it wears none locally.
+    // MOP_PLUGIN_ANALYZE and MOP_SET_FOLD (docs/abi-v3.md §10/§11): WHO
+    // computed this, read off the PEER's ledger - its plugin row for the first,
+    // its own viewer version for the second, since a built-in has no dll.
+    // Empty for every other op: those never claimed a provenance trailer.
     // These are the peer's strings and are never filled in from a local dll of
     // the same name: a citation names the computer, and this machine did not
     // compute it.
@@ -90,6 +91,21 @@ struct MeasureReq {
     int target = 0;                   // rp::MeasureTarget: frame or stack
     struct Roi { int x = 0, y = 0, w = 0, h = 0; };
     std::vector<Roi> rois;            // empty = whole frame
+    // MOP_SET_FOLD only. A set is {role: stack}, and the flat `paths` list
+    // above cannot say where one stack stops - so the roles carry their own
+    // paths and their own frame range, and `paths` is IGNORED for this op
+    // rather than kept in step with them by hand. One source of truth: measure()
+    // writes the flat list out of these, in declaration order.
+    struct Role {
+        std::string role;             // the schema's name, verbatim
+        std::vector<std::string> paths;   // >1 = one file per frame, in order
+        int frame0 = 0, frameCount = 0;   // range within a frame-axis file
+    };
+    std::vector<Role> roles;
+    // What OUR fold declares (setfold::foldForm), and "" never - an undeclared
+    // form is refused by the peer, exactly as an undeclared plugin version is.
+    std::string foldForm;
+    int join = 0;                     // rp::SetJoin
 };
 
 // One connection to one machine. Not thread-safe: requests are serialised by the

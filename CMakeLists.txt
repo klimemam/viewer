@@ -402,9 +402,15 @@ endif()
 # no X11, so a GUI binary would fail to load there before it could reach --serve.
 # It links miniz, the C++ runtime - and plugin_host, so MEASURE runs the SAME
 # analyzer plugins the local host runs (plugin_host is verified GL-free).
+# ...and version.cpp, since MOP_SET_FOLD's provenance trailer is the PEER's own
+# build: a set analyzer is a built-in, so "which build computed this" is the
+# viewer version and there is no dll to name instead (#46, docs/abi-v3.md §11).
 add_executable(viewer-serve core/serve_main.cpp core/serve.cpp core/plugin_host.cpp
+                            core/version.cpp
                             ${miniz_SOURCE_DIR}/miniz.c)
-target_include_directories(viewer-serve PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
+add_dependencies(viewer-serve viewer_version)
+target_include_directories(viewer-serve PRIVATE ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core
+                                                ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(viewer-serve PRIVATE ps_api)
 if(UNIX)
   target_link_libraries(viewer-serve PRIVATE ${CMAKE_DL_LIBS})   # dlopen for plugins
@@ -992,6 +998,7 @@ viewer_selftest(rplugin NOGL
                 ENV VIEWER_SERVE_PIN_BUDGET_MB=1
                 --rplugin-selftest tools/testdata/bench_stack.npy
                 --remote-exe $<TARGET_FILE:viewer-serve>)
+
 
 # The same A/B statistics run over a MOSAICED stack: --cfa bayer makes every
 # 1-channel frame a Bayer frame, which is the case where the panels' rule "CFA

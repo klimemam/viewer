@@ -663,6 +663,17 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
               "computed here and labelled as the peer's.";
         return false;
     }
+    // ...and the same shape for the set fold. "unknown measure op" from a v7
+    // peer is a refusal about a TYPO as much as about an age, and the one thing
+    // it must never become is a quiet local fold over pixels this machine would
+    // have had to fetch first.
+    if (q.op == rp::MOP_SET_FOLD && peerVersion_ < 8) {
+        err = "the remote peer is too old for set analysis: it speaks protocol " +
+              std::to_string(peerVersion_) + ", MOP_SET_FOLD needs 8 "
+              "(update viewer-serve). Nothing was folded - a set result is not "
+              "computed here and labelled as the peer's.";
+        return false;
+    }
     W w;
     rp::MeasureReqHead head{};
     head.op = (uint32_t)q.op;
@@ -673,8 +684,20 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     head.black = q.black; head.white = q.white;
     head.nPaths = (uint32_t)q.paths.size();
     head.nRois = (uint32_t)q.rois.size();
+    // The set fold's paths come out of the ROLES, so that the flat list and the
+    // per-role counts cannot drift apart: one loop writes both.
+    if (q.op == rp::MOP_SET_FOLD) {
+        size_t total = 0;
+        for (const auto& r : q.roles) total += r.paths.size();
+        head.nPaths = (uint32_t)total;
+    }
     w.blob(&head, sizeof head);
-    for (const auto& p : q.paths) w.str(serverPath(p));
+    if (q.op == rp::MOP_SET_FOLD) {
+        for (const auto& r : q.roles)
+            for (const auto& p : r.paths) w.str(serverPath(p));
+    } else {
+        for (const auto& p : q.paths) w.str(serverPath(p));
+    }
     w.str(q.analyzer);
     w.str(q.params);
     for (const auto& r : q.rois) {
@@ -686,6 +709,18 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     if (q.op == rp::MOP_PLUGIN_ANALYZE) {
         w.str(q.analyzerVersion);
         w.u32((uint32_t)q.target);
+    }
+    // the role block, in the same place and for the same reason
+    if (q.op == rp::MOP_SET_FOLD) {
+        w.str(q.foldForm);
+        w.u32((uint32_t)q.join);
+        w.u32((uint32_t)q.roles.size());
+        for (const auto& r : q.roles) {
+            w.str(r.role);
+            w.u32((uint32_t)r.paths.size());
+            w.u32((uint32_t)std::max(0, r.frame0));
+            w.u32((uint32_t)std::max(0, r.frameCount));
+        }
     }
     std::vector<uint8_t> reply;
     uint32_t type = 0;
@@ -724,14 +759,16 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
         if (hasX && !r.f32v(s.xs, n)) { err = "bad MEASURE reply"; return false; }
         if (!r.f32v(s.ys, n)) { err = "bad MEASURE reply"; return false; }
     }
-    if (q.op == rp::MOP_PLUGIN_ANALYZE) {
+    if (q.op == rp::MOP_PLUGIN_ANALYZE || q.op == rp::MOP_SET_FOLD) {
         uint32_t expected = 0;
         if (!r.str(out.provName) || !r.str(out.provVersion) || !r.str(out.provFile) ||
             !r.str(out.provPath) || !r.u32(expected)) {
             // A result with no provenance is refused rather than shown: the op
             // exists to make "which build measured this" answerable, so a reply
             // that cannot answer it has failed at the thing it was for.
-            err = "the peer answered a plugin analysis without provenance";
+            err = q.op == rp::MOP_SET_FOLD
+                      ? "the peer answered a set fold without provenance"
+                      : "the peer answered a plugin analysis without provenance";
             return false;
         }
         out.expected = (int)expected;
