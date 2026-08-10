@@ -299,7 +299,7 @@
         check(seq != 0 && (int)framesOfSeq(seq).size() == 5,
               "W13 (setup) a 5-frame local stack is open");
 
-        std::map<int, watch::SetState> states;
+        std::map<int, WatchSet> states;
         std::vector<App::WatchDone> out;
         // One poll, exactly as watchWorker performs it - and with the target
         // list built exactly as pumpWatch builds it.
@@ -425,7 +425,7 @@
             for (auto x : tg) if (x.seqId == seq) { x.seed.clear(); noSeed.push_back(x); }
             check(noSeed.size() == 1, "W22 (setup) one target, with its seed removed");
             writeNpy2(stk + "/w_003.npy", 6, 6, 9.0f);   // changed BEFORE poll 1
-            std::map<int, watch::SetState> st2;
+            std::map<int, WatchSet> st2;
             std::vector<App::WatchDone> o2;
             bool spokeEver = false;
             for (int k = 0; k < 3; k++) {
@@ -445,6 +445,57 @@
             check(spokeAfter && o2.size() == 1 && o2[0].found.changed == 1 &&
                   o2[0].found.firstChanged == "w_000.npy",
                   "W22c ...and a change AFTER that baseline is seen, normally");
+        }
+        {   // ---- W23: a SUBSET stack is not told about the frames it excluded ---
+            // A derived stack (Files > "Derive stack (a subset, by reference)")
+            // shares its source's directory, and its membership was a decision
+            // made at derive time that §6 says is never re-applied. Watching it
+            // over the whole folder group would tell it, for as long as it is
+            // open, that the frames its own rule left out have "appeared".
+            //
+            // The situation is built directly rather than through the modal: a
+            // target whose seed names 3 of the folder's files is exactly what a
+            // 3-of-5 derive produces, and it is the seed that the rule reads.
+            //
+            // A reload first, so the baseline this case is about is the ONLY
+            // difference on the table: W20-W22 left three of these files
+            // rewritten on disk, and a subset that starts out already changed
+            // would answer W23b with W17's finding. (w_004.npy is gone, so that
+            // one member refuses - which is exactly why it is not in the subset.)
+            int reFailed = 0;
+            reloadStackFromDisk(seq, &reFailed);
+            check(reFailed == 1,
+                  "W23 (setup) re-read: 4 members re-read, the deleted one refused");
+            std::vector<App::WatchTarget> tg = watchTargetsNow();
+            App::WatchTarget sub;
+            for (const auto& x : tg) if (x.seqId == seq) sub = x;
+            watch::Obs keep;
+            for (const watch::Ent& e : sub.seed)
+                if (e.name == "w_000.npy" || e.name == "w_001.npy" || e.name == "w_002.npy")
+                    keep.push_back(e);
+            sub.seed = keep;
+            check(sub.seed.size() == 3 && !sub.dir.empty(),
+                  "W23 (setup) a 3-of-5 subset of the same folder");
+            std::map<int, WatchSet> st3;
+            std::vector<App::WatchDone> o3;
+            bool spokeEver = false;
+            for (int k = 0; k < 4; k++) {
+                o3.clear();
+                spokeEver |= watchPollRound({ sub }, st3, o3);
+            }
+            check(!spokeEver && o3.empty() && !st3[seq].wholeGroup,
+                  "W23b the other 2 files in the folder are NOT \"appeared\" for it");
+            // ANTI-VACUITY: one of ITS OWN three members changing must still be
+            // reported, or the rule above is just "say nothing about subsets".
+            writeNpy2(stk + "/w_001.npy", 6, 6, 3.0f);
+            bool spokeAfter = false;
+            for (int k = 0; k < 2; k++) {
+                o3.clear();
+                spokeAfter |= watchPollRound({ sub }, st3, o3);
+            }
+            check(spokeAfter && o3.size() == 1 && o3[0].found.changed == 1 &&
+                  o3[0].found.appeared == 0 && o3[0].found.firstChanged == "w_001.npy",
+                  "W23c ...while a change to one of its OWN 3 is reported normally");
         }
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);

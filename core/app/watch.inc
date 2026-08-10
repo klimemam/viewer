@@ -108,6 +108,31 @@ static watch::Obs watchScanDir(const std::string& dir) {
     return o;
 }
 
+// The worker's memory of one watched set: §4's state machine, plus the one
+// thing that is decided ONCE and never revisited.
+struct WatchSet {
+    watch::SetState st;
+    // Is this stack its folder's WHOLE group?
+    //
+    // A derived stack (Files > "Derive stack (a subset, by reference)") is a
+    // chosen subset of one, and it shares its source stack's directory. Telling
+    // it that the frames its own rule deliberately left out have "appeared"
+    // would be a false statement about that stack for as long as it is open -
+    // and §6 is explicit that a derive's membership is a decision made at derive
+    // time and is never re-applied. So a stack that is not the whole group is
+    // watched over its OWN members: what changed and what is gone are still true
+    // of it, and what its rule excluded is not its business.
+    //
+    // Decided at the moment the baseline is taken, and never again: a folder
+    // that GAINS a file must not thereby stop being the group it was, which is
+    // what re-deciding every poll would conclude. A file that appears in the gap
+    // between the stack opening and the first poll therefore makes this stack
+    // look like a subset and costs it appearance reports - a bounded miss that
+    // fails towards saying nothing, never towards saying something untrue.
+    bool wholeGroup = true;
+    bool decided = false;
+};
+
 // ONE POLL ROUND, as a function of what it is handed.
 //
 // This is the extraction §10 needs and the reason --watch-selftest is fast: the
@@ -123,13 +148,14 @@ static watch::Obs watchScanDir(const std::string& dir) {
 // Returns true when at least one finding CHANGED, which is exactly the
 // condition under which the UI is woken.
 static bool watchPollRound(const std::vector<App::WatchTarget>& targets,
-                           std::map<int, watch::SetState>& states,
+                           std::map<int, WatchSet>& states,
                            std::vector<App::WatchDone>& out) {
     // §2's dedupe: one listing per DISTINCT directory, not one per stack.
     std::map<std::string, watch::Obs> listed;
     bool changed = false;
     for (const App::WatchTarget& t : targets) {
-        watch::SetState& st = states[t.seqId];
+        WatchSet& ws = states[t.seqId];
+        watch::SetState& st = ws.st;
         // §1: the baseline is FrameSource's own stat, and it MOVES when a
         // Reload re-reads the files (reloadSource re-stats and rewrites
         // mtime/fsize). That is the whole mechanism by which the amber line
@@ -159,8 +185,21 @@ static bool watchPollRound(const std::vector<App::WatchTarget>& targets,
             // would silently become empty, which reads as "nothing to say"
             // rather than "they are gone".
             if (mem.empty()) mem.push_back(t.headName);
-            for (const std::string& n : mem)
+            if (!ws.decided && st.haveBase) {   // see WatchSet::wholeGroup
+                ws.wholeGroup = true;
+                for (const std::string& n : mem)
+                    if (!watch::find(st.base, n)) { ws.wholeGroup = false; break; }
+                ws.decided = true;
+            }
+            for (const std::string& n : mem) {
+                // a subset stack sees its own members and nothing else
+                if (!ws.wholeGroup && st.haveBase && !watch::find(st.base, n)) continue;
                 if (const watch::Ent* e = watch::find(it->second, n)) obs.push_back(*e);
+            }
+            // A member of a SUBSET stack whose file is gone is not in `mem` at
+            // all (the rule works off the listing), and its absence from obs is
+            // exactly what §4 confirms as vanished - so nothing extra is needed
+            // for it. The same is true of the whole-group case.
         } else {
             std::error_code ec;
             auto p = pathFromUtf8(t.file);
@@ -190,7 +229,7 @@ static bool watchPollRound(const std::vector<App::WatchTarget>& targets,
 }
 
 static void watchWorker() {
-    std::map<int, watch::SetState> states;
+    std::map<int, WatchSet> states;
     while (!app.watchStop) {
         std::vector<App::WatchTarget> targets;
         if (!app.watchPaused) {        // §2: not while the window is minimised
