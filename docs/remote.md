@@ -1,7 +1,7 @@
 # リモートのデータを手元から見る (`ssh://`)
 
 計算機に置いた大量の RAW/npy を、手元のマシンの viewer から開いて測るための仕組み。
-稼働中の機能です(プロトコル `VERSION = 8`、[core/remote_proto.h](../core/remote_proto.h) /
+稼働中の機能です(プロトコル `VERSION = 9`、[core/remote_proto.h](../core/remote_proto.h) /
 [core/serve.cpp](../core/serve.cpp) / [core/remote.cpp](../core/remote.cpp))。
 残っている制限は §8。
 
@@ -308,13 +308,14 @@ viewer ssh://user@host/data/run42
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 8`、[core/remote_proto.h](../core/remote_proto.h))の状態。
+現時点(プロトコル `VERSION = 9`、[core/remote_proto.h](../core/remote_proto.h))の状態。
 **残っている制限だけ**を書く節です。済んだものを「これから」の顔で残さないこと —
 この節は一度それで嘘をつきました。
 
 | 項目 | 状態 |
 |---|---|
 | **対応フォーマット** | **`.npy` のみ**。`parseNpyHeader` が u8/i8/u16/i16/u32/i32/f32/f64 と 2〜4 次元の shape を扱う。`.npz` はサーバ側に無い(ローカルなら開ける) |
+| **`read as` / `re-read as…`** | **実装済み**([docs/input-adapters.md](input-adapters.md) §3.3、`VERSION = 9`、issue #124)。META が**ファイルが宣言した shape** を運び(`MR_SHAPE` で本体の後ろに `[u32 ndim][u32 dims[4]]`)、META と TILE が**宣言された読み方**(`rp::NpyRead`)を受ける。peer 側は `serveLayout` が軸割り当てとストライドをやり直すので、`(48,40,1)` を `(F,H,W)` として読み直した TILE が**ローカルの読み直しと1画素も違わない**。古い peer はこの要求を**拒否しない** —— 末尾の4バイトを読まないまま自分の読み方で成功を返すので、client が **HELLO の数から送る前に断る**(`rp::npyReReadTooOldText`)。Inspector は行を出したうえで menu の代わりに理由を出す(押せない menu を出さない)|
 | **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
 | **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む。ローカルの loader は元から Fortran を読めたので、リンク越しだけ拒否するのは不整合だった([docs/startup.md](startup.md) の「まだ出来ないこと」もそう言っている) |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
