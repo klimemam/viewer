@@ -2952,7 +2952,22 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "bench: panels measured over %zu benched frame(s): %s\n",
                 benchMs.size(), drew.empty() ? "(none)" : drew.c_str());
-        if (benchCovBad) {
+        // A run that measured NOTHING must not report PASS. Without this, a
+        // bench that never got past its warm-up - a fixture that would not
+        // load, a picker that never accepted - prints a coverage line with an
+        // empty list, finds no panel that failed to draw, and says PASS. "It
+        // measured everything it opened" is true of a run that opened nothing,
+        // and that is the exact shape of green-and-measuring-nothing this
+        // assert exists to refuse.
+        if (benchMs.empty() || nPanels == 0) {
+            fprintf(stderr, "bench: NOTHING WAS MEASURED - %zu benched frame(s), "
+                            "%d panel(s). The run never reached its measured "
+                            "frames (fixture, picker or warm-up), so there is no "
+                            "frame time here and no coverage to report.\n",
+                    benchMs.size(), nPanels);
+            benchCovBad++;
+        }
+        if (benchCovBad && nPanels) {
             fprintf(stderr, "bench: OPEN BUT NEVER DRAWN: %s\n", missing.c_str());
             fprintf(stderr,
                     "bench: the frame times above cover %d of the %d panel(s) this run "

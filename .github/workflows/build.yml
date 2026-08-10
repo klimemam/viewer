@@ -129,7 +129,11 @@ jobs:
           # --compare exercises the A/B path too: two images, two textures
           xvfb-run -a ./build/viewer --bench 120 --stack never --compare wipe \
                    tools/testdata/bench_big.npy tools/testdata/bench_stack.npy 2>&1 | tee bench.log
-          grep -q "bench:" bench.log || { echo "no frames rendered"; exit 1; }
+          # "^bench: frames=", not "bench:" - the run prints several bench:
+          # lines now, and the one that means FRAMES WERE RENDERED is the stats
+          # line. A prefix that any of them satisfies is a check that a run
+          # rendering nothing can pass.
+          grep -q "^bench: frames=" bench.log || { echo "no frames rendered"; exit 1; }
           # ...and that the frames rendered contain what the number claims. The
           # run prints the panels its measured frames drew and exits non-zero
           # when a panel it OPENED never did (an unselected dock tab draws
