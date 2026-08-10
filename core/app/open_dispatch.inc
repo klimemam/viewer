@@ -695,6 +695,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                                       // future opens, and both hold identical
                                       // bytes.
     }
+    // Watch's baseline just moved: these pixels ARE what the disk holds again,
+    // and the amber line that said otherwise has to stop being true. The watcher
+    // learns it from the republished seed (App::watchTargetsDirty), not from a
+    // message - which is why the flag is set HERE, in the one place a source's
+    // mtime/fsize is ever rewritten, and not at each of the callers.
+    app.watchTargetsDirty = true;
     // ---- the walk (§3.2): every membership sharing this source, in one step ----
     std::vector<int> seqIds;
     for (auto& d : app.images) {

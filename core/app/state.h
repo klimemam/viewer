@@ -36,6 +36,8 @@
 #include "../remote.h"               // remote::Session / Entry / ScanGroup / GlobHit / MeasureResult
 #include "../remote_proto.h"         // rp::F32Loss - what float32 cost THESE pixels
 #include "../adapter.h"              // adapter::Run (App::ReaderJob)
+#include "../watch.h"                // watch::Finding - what Watch has CONFIRMED
+                                     // about a stack's files (watch-design §4)
 #include "../browse/browse_state.h"  // browse::Instance and the rb types (P7 §3);
                                      // App aliases them below, so every existing
                                      // App::BrowseInstance reference is unchanged
@@ -839,6 +841,27 @@ struct App {
         int reloadOk = 0;                 // ...and members it re-read, same attempt
         std::string reloadFirstErr;       // "a_003.npy: cannot read file"
         std::string reloadWhen;           // wall clock of that attempt
+        // ---- Watch (docs/watch-design.md §5) ---------------------------------
+        // What the watcher has CONFIRMED about this stack's files on disk, and
+        // it is a fact about the DISK, not about these pixels: the frames in
+        // memory are exactly what they always were, and the line this drives
+        // says the files behind them have moved.
+        //
+        // Only the confirmed SUMMARY lives here. The baseline and §4's
+        // candidate stay in the worker (watch::SetState): the worker cannot
+        // hold a SeqInfo* at all, because SeqTable reseats its storage on every
+        // add and remove precisely so that held pointers die (cc1ee8b). The UI
+        // thread copies the summary across in pumpWatch.
+        //
+        // NOT saved in a session, for reloadFailed's reason: a restore re-reads
+        // every member from today's disk, so a restored stack's baseline is
+        // today's disk and a carried-over finding would describe a comparison
+        // nobody made.
+        watch::Finding watchFound;
+        bool watchToasted = false;        // §5: the ONE toast, on first detection.
+                                          // The line does not expire; the toast
+                                          // does, so it is fired once and the
+                                          // line carries the fact from then on.
         // Per-frame X axis for the Temporal chart: what frame i physically IS
         // (elapsed time, exposure, temperature). NAME + UNIT + one value per
         // frame - a bare list of numbers cannot label an axis, so all three
@@ -950,6 +973,8 @@ struct App {
                 s.expectedFrames = s.stackRev = 0;
                 s.reloadFailed = s.reloadOk = 0;
                 s.reloadFirstErr.clear(); s.reloadWhen.clear();
+                s.watchFound = watch::Finding{};
+                s.watchToasted = false;
                 s.refW = s.refH = s.refCh = 0;
                 s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
                 s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();
@@ -1191,6 +1216,53 @@ struct App {
     std::condition_variable mCv;
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
+    // ---- Watch (docs/watch-design.md §2/§3) ---------------------------------
+    // ONE watched set. The UI thread rebuilds this list from the open stacks;
+    // the worker only reads it, so nothing here is a pointer into app state.
+    //
+    //   dir + headName is a FOLDER stack: the directory is listed once per poll
+    //   however many stacks share it (§2's dedupe), and headName re-applies the
+    //   sibling rule to that listing - which is what makes "a new file appeared"
+    //   and "a file is gone" answerable in the same round trip as "one changed".
+    //   file is an IN-FILE frame-axis stack (one .npy holding F frames): one
+    //   stat, and the set has exactly one member.
+    struct WatchTarget {
+        int seqId = 0;
+        std::string dir, headName;    // folder stack
+        std::string file;             // frame-axis stack (dir empty)
+        // §1: the baseline from the loader's own stat (FrameSource::mtime/fsize),
+        // where EVERY member has one. Empty = this stack has no recorded
+        // baseline and the first poll makes it - which is the honest answer for
+        // a stack opened before Watch existed, and the reason that first poll
+        // says nothing.
+        watch::Obs seed;
+    };
+    struct WatchDone { int seqId = 0; watch::Finding found; };
+    std::thread watchThread;
+    std::atomic<bool> watchStop{ false };
+    std::mutex watchMtx;
+    std::condition_variable watchCv;
+    std::vector<WatchTarget> watchTargets;   // UI -> worker (under watchMtx)
+    std::vector<WatchDone> watchDone;        // worker -> UI (under watchMtx)
+    // The target list carries the BASELINE (WatchTarget::seed), so anything that
+    // moves FrameSource::mtime/fsize has to republish it - and a reload moves
+    // exactly those, while changing neither the stack table's revision nor the
+    // image count that pumpWatch otherwise watches. Set in reloadSource's walk,
+    // which is the one place pixels are ever replaced (reference-design §3.2).
+    bool watchTargetsDirty = true;
+    // File > Watch > Watch source files (default ON: the whole feature is
+    // "notify", and a notification nobody asked to suppress costs one directory
+    // listing every five seconds on a thread that is asleep the rest of the
+    // time). Persisted in prefs.txt.
+    bool watchEnabled = true;
+    // §2's interval, in seconds, as a value rather than a literal so
+    // --watch-selftest never has to live through one. prefs is §9's "later".
+    double watchIntervalSec = 5.0;
+    // §2: stacks are polled "while the app is not minimised" - the same line the
+    // frame loop already draws for drawing at all. A minimised window has no row
+    // to put a finding under, and the answer is not stale when it comes back:
+    // the first poll after restoring reads today's disk.
+    std::atomic<bool> watchPaused{ false };
     // last server temporal result, keyed to the stack it describes
     // Linearity: one row per MEMBER of one series (value in, response out), fits
     // per CFA plane. Recomputed only on demand - this walks hundreds of frames.

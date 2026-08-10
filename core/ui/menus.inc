@@ -278,6 +278,22 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::EndMenu();
         }
         ImGui::Separator();
+        // ---- Watch (docs/watch-design.md 項目20) ---------------------------
+        // One switch, and what it governs is NOTICING - never acting. The
+        // settled semantics are "notify, then a manual Reload" (A6/A6b), so
+        // there is nothing here that can change a pixel behind the user; the
+        // only cost of leaving it on is one directory listing every few seconds
+        // on a thread that is asleep in between, which is why ON is the default.
+        if (ImGui::MenuItem("Watch source files on disk", nullptr, &app.watchEnabled))
+            app.prefsDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-read the folders behind the open stacks every few\n"
+                              "seconds and SAY when a file has changed, appeared or\n"
+                              "gone - under the stack's row in Files, in amber, with a\n"
+                              "Reload beside it.\n\n"
+                              "Nothing is re-read without that click: what is on screen\n"
+                              "is what was measured until you say otherwise.");
+        ImGui::Separator();
 #if defined(__APPLE__)
         if (ImGui::MenuItem("Quit", "Cmd+Q")) glfwSetWindowShouldClose(win, 1);
 #else

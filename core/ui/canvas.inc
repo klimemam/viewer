@@ -1522,6 +1522,13 @@ static const char* AB_STALE_TOKEN = "[stale]";
 static const ImVec4 RELOAD_FAIL_RED(0.92f, 0.36f, 0.33f, 1.0f);
 static const ImU32  RELOAD_FAIL_RED32 = IM_COL32(235, 92, 84, 255);
 
+// ...and AMBER, one step down from it (docs/watch-design.md §5: 「琥珀の1行」).
+// The two say different things and must not wear one colour: red is "what is on
+// screen is wrong", amber is "what is on screen is fine, and the FILES behind it
+// have moved". Nothing about the pixels in memory is in doubt when this shows -
+// which is exactly why it has a button and the red one has none.
+static const ImU32  WATCH_AMBER32 = IM_COL32(235, 175, 70, 255);
+
 // What A or B is CALLED, everywhere the two are set against each other.
 // A capture series names every stack's frames identically - 00/frame_000.npy
 // and 01/frame_000.npy are both "frame_000.npy" - so the FILE name identifies

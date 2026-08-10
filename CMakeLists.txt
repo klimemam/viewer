@@ -1184,6 +1184,19 @@ viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 # It writes its own fixtures under a scratch subdirectory of the given dir.
 viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 
+# ...and NOTICING that a file was rewritten in the first place (項目20,
+# docs/watch-design.md §10). W1-W12 drive watch::observe by hand - no filesystem
+# at all - so the not-equal rule (an OLDER file with the same size is a change),
+# §4's two readings that must agree, appeared, vanished and the baseline are
+# each asserted on numbers written out beside them. W13-W22 run the same rule
+# through real files and a real stack, via watchPollRound: the function the
+# worker calls, called with no worker. NOTHING IN IT SLEEPS - the poll interval
+# is 5 s and this test decides when a poll happens, which is the whole reason
+# the round was extracted from the thread. NOGL for the roistats reasoning: what
+# it asserts is counts and the sentence the panel draws. It writes its own
+# fixtures under a scratch subdirectory of the given dir.
+viewer_selftest(watch NOGL --watch-selftest tools/testdata)
+
 # ...and WHICH formats that walk, and the registry it keys off, actually reach:
 # one row per backend of core/imagefile.h plus the members of a viewer
 # container - registers / reload reaches / a second open shares. It writes the
