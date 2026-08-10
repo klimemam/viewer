@@ -22,8 +22,13 @@ endif()
 #
 # Two warnings on every Windows build, saying that this file did on purpose
 # exactly what this file says it does on purpose. NEW drops the injected
-# default, so a command line carries one warning level: the /W3 our own targets
-# ask for below, or the /w a third-party target asks for, never both.
+# default, so the level on a command line is the one a target ASKED for.
+#
+# It is half the answer and it was measured that way: with the default gone,
+# the Visual Studio generator still gives a project its own <WarningLevel>
+# (Level1), and the two third-party targets went on printing D9025 against
+# THAT instead. The other half is spelling their silence /W0 rather than /w -
+# see libraw_lib below. Both are needed; neither alone gets to zero.
 if(POLICY CMP0092)
   cmake_policy(SET CMP0092 NEW)   # no /W3 in the default flags; targets say their own
 endif()
@@ -298,8 +303,15 @@ target_include_directories(libraw_lib PUBLIC ${libraw_SOURCE_DIR})
 target_compile_definitions(libraw_lib PUBLIC LIBRAW_NODLL)   # static, no dllimport
 # third-party: do not police its warnings, the same stance miniz and stb take.
 # core/rawread.cpp is OURS and stays under -Wall -Wextra.
+#
+# /W0 rather than /w, though cl documents them as the same thing, because they
+# are not the same thing to the GENERATOR. CMake's Visual Studio writer knows
+# /W0../W4 and turns them into the project's <WarningLevel> element; /w is not
+# in that table, so it goes to AdditionalOptions and lands on a command line
+# that already carries the project's level - which cl reports as D9025 on every
+# build. Same silence, one flag.
 target_compile_options(libraw_lib PRIVATE
-  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/w>)
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/W0>)
 if(WIN32)
   # LibRaw's metadata parsers byte-swap with ntohl/htons, which on Windows live
   # in winsock rather than in libc: 12 undefined references without this. It is
@@ -343,10 +355,12 @@ endif()
 # no /W3 to override: this target asks for silence and nothing contradicts it.
 # core/imagefile.cpp - the wrapper, OURS - is untouched and stays under
 # -Wall -Wextra, which was always the point of splitting the TU.
+#
+# /W0 and not /w, for the generator reason spelled out on libraw_lib above.
 add_library(stb_lib STATIC core/stb_image_impl.c)
 target_include_directories(stb_lib PUBLIC ${stb_SOURCE_DIR})
 target_compile_options(stb_lib PRIVATE
-  $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<C_COMPILER_ID:MSVC>:/w>)
+  $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<C_COMPILER_ID:MSVC>:/W0>)
 
 # public plugin ABI header (include/ps/ps_plugin.h)
 add_library(ps_api INTERFACE)
