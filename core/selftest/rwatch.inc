@@ -761,6 +761,36 @@
         };
         const int pseq = makePeerStack(stkFiles, 5);
 
+        {   // ---- R22: an EMPTY host is THIS DISK, and the rule is run here -----
+            // §16.5's cost, asserted rather than claimed. Every Browse open of a
+            // folder goes through recordRemoteRule, and the overwhelming
+            // majority of them are LOCAL (`local://`, an empty host, the peer
+            // serving this filesystem). Those frames stay on the local half by
+            // §13.7, so the rebuild will re-apply siblingNamesAmong over a
+            // directory_iterator - and recording the rule with the PEER's
+            // grouper instead would ask a link for a grouping this machine is
+            // about to compute, on every single open.
+            //
+            // The assertion IS the absence of that round trip: the resolver
+            // handed in is peerDown, which answers null to everything. A rule
+            // recorded through it cannot have asked the peer anything.
+            App::SeqInfo local;
+            local.remoteHost.clear();
+            local.remotePort = 0;
+            const bool got = recordRemoteRule(local, stkFiles, 0, peerDown);
+            check(got && local.ruleHead == "w_000.npy" && local.ruleDir == stk,
+                  "R22 an empty host records the rule from THIS disk, no request");
+            // ANTI-VACUITY: the same files with a NAMED host DO go to the link,
+            // so the same dead resolver records nothing. Without this pair, R22
+            // passes on a function that ignores its resolver entirely.
+            App::SeqInfo named = local;
+            named.ruleDir.clear();
+            named.ruleHead.clear();
+            named.remoteHost = "kepler";
+            const bool got2 = recordRemoteRule(named, stkFiles, 0, peerDown);
+            check(!got2 && named.ruleHead.empty(),
+                  "R22b ...while a named host asks the peer: a dead link records none");
+        }
         {   // ---- R13: what the screen may OFFER for a remote finding -----------
             // §13.6 said the remote line could promise no [Reload], because
             // reloadSource refused a peer's pixels BY NAME and an offered button

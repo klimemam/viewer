@@ -841,14 +841,31 @@ server 集計はその path を名指し、session 行はそれを書く。membe
 `ruleHead` を記録する。3-of-5 の手選択は記録を持たず、**増える方向へは
 二度と倒れない** (R20d-R20f)。
 
-代価は **stack 1本につき LIST 1回**、§12.2 がローカルで受け入れたのと同じ。
-
 副作用として **`local://` の stack も規則を持つようになった**。Browse から
 開いたローカル stack は `attachRemoteStack` を通るのに `ruleDir` を記録して
 おらず、消えたメンバーは外せるが**現れたファイルを迎え入れられなかった** ——
 §12.2 の「記録の無い stack」の列挙 (派生・手選択・2ディレクトリ・frame軸・
-旧セッション) に**入っていない穴**だった。`local://` の再構築は §13.7 のまま
-ローカル listing とローカル `siblingNamesAmong` を使う (peer 行より厳密)。
+旧セッション) に**入っていない穴**だった。
+
+**どちらの規則を走らせるかは、後で再適用される規則と同じでなければならない**
+—— でなければ記録は「誰も再適用しない規則」の記録になる。
+`planStackMembership` が frame の在り処で分岐するのと**同じ分岐**を
+`recordRemoteRule` も持つ:
+
+- **host が空 = この disk**。peer はここで走ってこのファイルシステムを配るので
+  `makeRemoteUrl` は `local://` を綴り、§13.7 が frame をローカル半分に置く。
+  再構築は `siblingNamesAmong` を `directory_iterator` の上で再適用するので、
+  **記録もそれで取る**。
+- **host が付いていれば peer のもの**。再構築は peer の LIST を引くので、
+  記録も LIST で取る。
+
+**代価は open 1回ごとに掛かるので、監視対象だけの話ではない**と明記しておく:
+`local://` の open は **`directory_iterator` 1回** (§12.2 がローカルで既に
+受け入れた同じ listing)、peer の open は **LIST 1回**で、その open が既に
+出している META と TILE の隣に並ぶ。**ローカルの open にリンクの往復を
+持ち込まない**ことが眼目で、Browse の selftest だけで数十回開く。
+R22/R22b が assert する —— 往復の**不在**を、null しか返さない resolver を
+渡して記録が取れることで示す (名前付き host なら同じ resolver で記録は取れない)。
 
 ### 16.6 自動 Reload は**リンクを越えない** —— 理由が入れ替わった
 
@@ -884,7 +901,33 @@ over the link - Reload it by hand`。
 この項は落とせる。それは §16 の範囲ではない —— 非同期にすると
 `reloadStackFromDisk` が2本になり、§15.1 が禁じたものになるからである。
 
-### 16.7 その他
+### 16.6b レビューで落ちた `selftest.browse-keys` は、この節の話ではなかった
+
+本 PR のレビューで `selftest.browse-keys` が **28 FAIL / 300.8 秒**で落ちる、
+という報告があった。原因は本節の LIST ではなく、**`tools/testdata/rb` に
+1行増えていた**ことだった。再現も較正も取ってある (同じ 28 FAIL / 300.8 秒)。
+
+`--browse-selftest` の B0-B6 は fixture を `tools/testdata/rb/bwatch-scratch`
+に作って最後に消していたが、**rb のサブディレクトリは rb の1行**である。
+掃除に到達しなかった走り (kill / 中断 / 別テストが木を掴んだまま終了) が
+1つでもあると、その行は残る。`--browse-keys-selftest` は
+**位置で操作する** (`home` のあと `down` を8回) ので、1行ずれた瞬間に
+以後の check が全部落ち、待ちがテストの 300 秒予算まで回る。**別のテストで、
+ここを指す手掛かり無しに。**
+
+2つ直した:
+
+- fixture は**テスト専用の TMP へ移した** (CMake が selftest ごとに
+  `TMP/TEMP/TMPDIR` を分けているのはこのため。同じファイルの
+  `viewer_hlenbomb` が既にその形)。掃除に到達しようがしまいが、他のテストから
+  見えない。
+- `--browse-selftest` は **渡された共有 fixture の entry 数を先頭と末尾で
+  数えて突き合わせる**。次のテストが歩くフォルダに行を残したら、**残した側の
+  テストが**そう言う。較正済み: 意図的に1ファイル漏らして
+  `33 entr(ies) before, 34 after: FAIL`。
+
+規律として書いておく: **共有 fixture の中に自分の fixture を作らない。**
+これは Watch の設計ではなくテストの規律だが、この PR がそれで一度止まった。
 
 - **`watchActionText` は origin ではなく「ボタンが在るか」で分岐する**
   (`watchReloadOffered`)。文とコントロールが食い違わないことが分岐の目的

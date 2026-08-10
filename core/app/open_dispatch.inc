@@ -966,9 +966,25 @@ static bool remoteFolderNames(const std::string& host, int port, const std::stri
 // the answer is recorded at the moment the stack is minted, from the peer's own
 // grouper, or it is not recorded at all and the stack can only ever LOSE members.
 //
-// Cost: one LIST per remote stack opened - the same listing §12.2 already
-// accepted locally, and the same one Browse took to offer the row that was
-// clicked. Returns whether a rule was recorded, so the caller can say so.
+// WHICH rule is run is the same question planStackMembership asks later, and it
+// has to get the same answer or the record describes a rule nobody re-applies:
+//
+//   AN EMPTY HOST IS THIS DISK. The peer runs here and serves this filesystem,
+//   so makeRemoteUrl spelled those frames local:// and §13.7 keeps them on the
+//   LOCAL half - the rebuild will re-apply siblingNamesAmong over a
+//   directory_iterator. Recording it with the PEER's grouper instead would ask a
+//   link for a grouping this machine is about to compute anyway, and would put
+//   a round trip on EVERY Browse open of a local folder - the Browse selftests
+//   alone open dozens. So the local rule is run locally.
+//
+//   A NAMED HOST is the peer's, and the rebuild will ask the peer's LIST, so
+//   that is what is run here.
+//
+// Cost, stated for both because it lands on every open and not only on watched
+// stacks: a local:// open pays ONE directory_iterator - the same listing §12.2
+// already accepted for a File > Open folder stack - and a peer open pays ONE
+// LIST, beside the META and TILE that open is already making. Returns whether a
+// rule was recorded, so the caller can say so.
 static bool recordRemoteRule(App::SeqInfo& si, const std::vector<std::string>& files,
                              int headIdx, const ReloadPeer& peer = ReloadPeer()) {
     si.ruleDir.clear();
@@ -976,15 +992,21 @@ static bool recordRemoteRule(App::SeqInfo& si, const std::vector<std::string>& f
     if (files.empty() || headIdx < 0 || headIdx >= (int)files.size()) return false;
     // ONE directory, or there is no folder whose listing could be the rule -
     // watchTargetsNow's own refusal, for the same reason (a stack spanning two
-    // of the peer's folders has no single LIST that speaks about it).
+    // folders has no single listing that speaks about it).
     const std::string dir = remoteDirOf(files[0]);
     if (dir.empty()) return false;
     for (const std::string& f : files)
         if (remoteDirOf(f) != dir) return false;
     const std::string head = baseName(files[headIdx]);
-    std::vector<std::string> listed, group;
-    if (!remoteFolderNames(si.remoteHost, si.remotePort, dir, head, listed, group, peer))
-        return false;                        // no answer records no rule either
+    std::vector<std::string> group;
+    if (si.remoteHost.empty()) {
+        std::string pat;
+        group = siblingNamesAmong(head, stackDirNames(dir), pat);
+    } else {
+        std::vector<std::string> listed;
+        if (!remoteFolderNames(si.remoteHost, si.remotePort, dir, head, listed, group, peer))
+            return false;                    // no answer records no rule either
+    }
     std::vector<std::string> a, b = group;
     for (const std::string& f : files) a.push_back(baseName(f));
     std::sort(a.begin(), a.end());
