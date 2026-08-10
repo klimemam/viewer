@@ -967,10 +967,9 @@
         //
         //  Its own fixture folder, for W25's reason: the folders above have
         //  been rewritten, emptied and refilled by 400 lines of other cases.
-        //  Every change here moves mtime BACKWARDS by two days with the size
-        //  untouched (§11.5: a same-size rewrite inside the clock's 15.6 ms
-        //  granularity is invisible, and this test must not race that), so the
-        //  stack stays 4x4 throughout and the only thing moving is content.
+        //  The stack stays 4x4 throughout, so the size never carries a change
+        //  and mtime is the only thing that can - see autWrite for how it is
+        //  kept out of §11.5's blind spot.
         // ======================================================================
         closeAll();
         const std::string aut = root + "/auto";
