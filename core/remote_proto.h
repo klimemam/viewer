@@ -15,6 +15,10 @@
 #include <stddef.h>
 #include <stdio.h>                   // snprintf, for exactNum
 #include <stdlib.h>                  // strtod, for exactNum's round-trip check
+#include <string.h>                  // memcpy, for the half <-> float bit moves.
+                                     // MSVC and libc++ pull it in transitively;
+                                     // libstdc++ does not, so leaving it out
+                                     // built everywhere except the Linux runner.
 #include <string>
 #include <vector>
 

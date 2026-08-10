@@ -661,8 +661,8 @@ static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<fl
         // f16 is the one narrow type that is NOT a loss: every half is exactly
         // a float, which is why it may cross the wire as itself (protocol 10)
         // instead of being widened on the peer and losing its NAME on the way.
-        case rp::DT_F16: for (size_t i = 0; i < n; i++)
-                             out[i] = rp::halfToFloat(((const uint16_t*)src)[i]); break;
+        case rp::DT_F16: { for (size_t i = 0; i < n; i++)
+                               out[i] = rp::halfToFloat(((const uint16_t*)src)[i]); } break;
         case rp::DT_F64: for (size_t i = 0; i < n; i++) {
                              double e = ((const double*)src)[i];
                              if (loss) loss->observe(e);

@@ -1281,8 +1281,11 @@ void toFloatSamples(const uint8_t* src, uint32_t dtype, size_t n, float* out) {
         case DT_F32: memcpy(out, src, n * 4); break;
         case DT_F64: for (size_t i = 0; i < n; i++) out[i] = (float)((const double*)src)[i]; break;
         // every half is exactly a float, so this one loses nothing at all
-        case DT_F16: for (size_t i = 0; i < n; i++)
-                         out[i] = halfToFloat(((const uint16_t*)src)[i]); break;
+        // (braced: the `break` belongs to the switch, not to the loop, and
+        //  gcc's -Wmisleading-indentation is right to say the layout implied
+        //  otherwise)
+        case DT_F16: { for (size_t i = 0; i < n; i++)
+                           out[i] = halfToFloat(((const uint16_t*)src)[i]); } break;
         default:     for (size_t i = 0; i < n; i++) out[i] = 0.0f; break;
     }
 }
