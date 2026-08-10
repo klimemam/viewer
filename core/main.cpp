@@ -521,6 +521,8 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 #include "selftest/stackana.inc"
 
+#include "selftest/bundled.inc"
+
 #include "selftest/rplugin.inc"
 
 int main(int argc, char** argv) {
@@ -917,6 +919,11 @@ int main(int argc, char** argv) {
     // dll pulling a real stack. Windowless for the same reason - the subject is
     // a number derived by hand and the order two decisions are made in.
     if (g_stackAnaSelftest) return stackAnaSelftest();
+
+    // The five SHIPPED analyzers on the v3 mouth (docs/abi-v3.md §1): what each
+    // declares, where the declaration surfaces, and - the larger half - that
+    // moving them there moved no result. Windowless for the anaprov reasons.
+    if (g_bundledSelftest) return bundledSelftest();
 
     #include "selftest/verify.inc"
 

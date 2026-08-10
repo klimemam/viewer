@@ -59,6 +59,16 @@ static bool g_anaProvSelftest = false;
 // built in memory, and every assertion is a number or a string.
 static bool g_stackAnaSelftest = false;
 
+// --bundled-selftest: the five SHIPPED analyzers on the v3 mouth (docs/abi-v3.md
+// §1's migration) - each declares a version, that version reaches the status
+// line and the Copy-table document, and nothing else about the results moved.
+// The second half is the reason it prints its whole result set to stdout: the
+// evidence for "no number changed" is a diff of that output across the
+// fail-first commit and the migration commit, not an assertion about a value
+// this test would have had to learn from the code it is checking. Takes no
+// directory and no window for the --anaprov-selftest reasons.
+static bool g_bundledSelftest = false;
+
 // --browse-keys-selftest <dir>: the Browse panel's KEYBOARD, driven through real
 // frames. The other browse selftests call the panel's helpers directly, which
 // is enough for what the rows contain but blind to everything that only exists
@@ -468,6 +478,8 @@ static void printUsage() {
         "                              coinciding, through the real panel\n"
         "  --anaprov-selftest          analyzer results name the plugin dll that\n"
         "                              computed them (the host's ledger, #46)\n"
+        "  --bundled-selftest          the five shipped analyzers on ABI v3: each\n"
+        "                              declares a version, and no result moved\n"
         "  --derive-selftest <dir>     derive a stack from a stack: counts, copy, follow\n"
         "  --stackavg-selftest <dir>   a stack's per-pixel mean opened as one frame:\n"
         "                              value, NaN exclusion, CFA planes, provenance\n"
@@ -612,6 +624,8 @@ static void parseCli(int argc, char** argv) {
             g_anaProvSelftest = true;              // handled in main()
         } else if (a == "--stackana-selftest") {
             g_stackAnaSelftest = true;             // handled in main()
+        } else if (a == "--bundled-selftest") {
+            g_bundledSelftest = true;              // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
         } else if (a == "--picker-selftest") {

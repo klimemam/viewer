@@ -17,7 +17,7 @@
 #define NFREQ 101                  /* SFR samples: 0 .. 1.0 cy/px step 0.01 */
 
 static int32_t analyze(const psFrame* in, const psRect* roi,
-                       const psAnalyzeSink2* sink, char* err, size_t err_cap) {
+                       const psAnalyzeSink3* sink, char* err, size_t err_cap) {
     psRect r;
     int pw, ph, x, y;
     float* plane;
@@ -221,12 +221,23 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-static const psAnalyzerV2 DESC = {
-    2u, PS_CAP_CPU, "iso12233/e-sfr",
-    "ROI over one slanted edge (5-40 deg)", NULL, analyze, {0}
+/* V3 registration (docs/abi-v3.md §3-§4). The version names THE COMPUTATION -
+ * it changes when an input could produce a different result document and never
+ * for a commit or a compiler (the rule, and why it is not the build id, is in
+ * docs/analyzers.md; the long form is in analyzer_stats.c). Note that a change
+ * to any of the simplifications this file documents - the missing sinc
+ * correction, the Hamming window, the 4x binning - moves the curve and is
+ * therefore a version change, which is the case the field was added for.
+ * The headline is the key verbatim, prefix and all: "mtf50 (cy/px)" has no
+ * channel prefix to strip, and it is the row the host's V1/V2 table already
+ * accented under exactly that string. */
+static const psAnalyzerV3 DESC = {
+    3u, PS_CAP_CPU, "iso12233/e-sfr", "1.0.0",
+    "ROI over one slanted edge (5-40 deg)",
+    NULL, "mtf50 (cy/px)", analyze, {0}
 };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < 2u || !host->register_analyzer2) return 1;
-    return host->register_analyzer2(host->ctx, &DESC);
+    if (!host || host->abi_version < PS_ABI_VERSION || !host->register_analyzer3) return 1;
+    return host->register_analyzer3(host->ctx, &DESC);
 }

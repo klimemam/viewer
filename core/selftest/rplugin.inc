@@ -68,7 +68,16 @@ static int rpluginSelfTest(const char* exe, const char* path) {
     // --stackana-selftest load them - out of their own directory, through the
     // real loader. The peer loads the same directory from its own side; that
     // the two lists agree is not assumed anywhere below, it is asked.
-    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins-abitest",
+    // ...and, since the bundled analyzers migrated to v3 (docs/abi-v3.md §1),
+    // the SHIPPED directory as well. This selftest returns before main() reaches
+    // the startup load, so without this line the client knows only the fixtures
+    // - and section 5 below is exactly the case the fixtures cannot stand in
+    // for: the analyzer a user already has, on both machines, from the same
+    // build. The peer finds the same directory by itself (ensurePlugins()
+    // searches <exedir>/plugins), which is the deployment §10 was written for.
+    plugin_host::loadAll({ plugin_host::exeDir() + "/plugins",
+                           plugin_host::exeDir() + "/../plugins",
+                           plugin_host::exeDir() + "/plugins-abitest",
                            plugin_host::exeDir() + "/../plugins-abitest" },
                          [](const std::string& m, bool e) {
                              fprintf(stderr, "rpluginselftest: load: %s%s\n",
@@ -351,6 +360,82 @@ static int rpluginSelfTest(const char* exe, const char* path) {
         check(eq, "RP21 MOP_ANALYZER is untouched: name-only, same numbers as before");
         check(oka && ra.provName.empty() && ra.expected == 0,
               "RP22 ...and it carries no provenance trailer - it never claimed one");
+    }
+
+    // ---- 5. a SHIPPED analyzer, which is the whole point of the rule --------
+    //
+    // Everything above runs on fixture dlls this repo builds for the purpose.
+    // That was the only thing available when §10 landed: the five bundled
+    // analyzers were V2 registrations with an empty version, so the parity rule
+    // - correct, and correctly refusing an undeclared version (#134 judgment 2)
+    // - could not be used with anything a user actually has. The migration
+    // (docs/abi-v3.md §1) is what closes that, and this is where it is asked.
+    //
+    // The peer needs no new plumbing to find them: ensurePlugins() already
+    // searches <exedir>/plugins, viewer-serve sits beside build/plugins, and
+    // VIEWER_SERVE_PLUGINS only ADDS the fixture directory. So both ends load
+    // the same shipped dll from the same place, which is the deployment this op
+    // was designed for stated in the smallest possible way.
+    {
+        const AnalyzerPluginInfo* sh = nullptr;
+        for (const auto& a : plugin_host::analyzers())
+            if (a.name == "stats/moments") sh = &a;
+        check(sh && sh->abi == 3 && !sh->version.empty(),
+              "RP23 a SHIPPED analyzer declares a version at all (docs/abi-v3.md §1)");
+        if (sh && !sh->version.empty()) {
+            std::vector<std::pair<std::string, std::string>> shLocal;
+            {
+                g_rpRows = &shLocal;
+                psFrame f = makeFrame(ref);
+                psRect roi{ (uint32_t)RX, (uint32_t)RY, (uint32_t)RW, (uint32_t)RH };
+                psAnalyzeSink3 sk{ nullptr, rpNum, rpTxt, rpSer, {} };
+                char perr[256] = { 0 };
+                if (sh->v3.analyze(&f, &roi, &sk, perr, sizeof perr) != 0)
+                    fprintf(stderr, "rpluginselftest: RP24 local run failed: %s\n", perr);
+                g_rpRows = nullptr;
+            }
+            remote::MeasureReq qb = q;
+            qb.analyzer = sh->name;
+            qb.analyzerVersion = sh->version;      // verbatim from OUR ledger
+            remote::MeasureResult rb;
+            std::string eb;
+            const bool okb = s.measure(qb, rb, eb);
+            if (!okb) fprintf(stderr, "rpluginselftest: RP24: %s\n", eb.c_str());
+            bool eqb = okb && rb.cols.size() == 1 && rb.cols[0].size() == shLocal.size() &&
+                       !shLocal.empty();
+            if (eqb)
+                for (size_t i = 0; i < shLocal.size(); i++)
+                    if (rb.cols[0][i].key != shLocal[i].first ||
+                        rpFmt(rb.cols[0][i]) != shLocal[i].second) {
+                        fprintf(stderr, "rpluginselftest: RP24 %s: peer '%s' vs local '%s'\n",
+                                rb.cols[0][i].key.c_str(), rpFmt(rb.cols[0][i]).c_str(),
+                                shLocal[i].second.c_str());
+                        eqb = false;
+                    }
+            check(eqb, "RP24 ...and runs on the peer under parity, same numbers, %.9g exact");
+            fprintf(stderr, "rpluginselftest: prov(shipped): %s\n",
+                    analyzerTag(rb.provName, rb.provVersion, rb.provFile).c_str());
+            // The parity statement itself, and it is deliberately NOT compared
+            // against a literal: what §10 asks is whether the two DECLARATIONS
+            // agree, so the assertion is that the peer's ledger row came back
+            // saying what ours says. A literal here would pass on a machine
+            // where both sides were equally wrong.
+            check(okb && rb.provName == sh->name && rb.provVersion == sh->version &&
+                      rb.provFile == sh->file,
+                  "RP25 ...and the peer's ledger row is OUR declaration, name and version");
+            // ...and the refusal that could not fire before the migration,
+            // because there was nothing on either side to disagree about.
+            remote::MeasureReq qc = qb;
+            qc.analyzerVersion = sh->version + "+dirty";
+            remote::MeasureResult rc2;
+            std::string ec;
+            const bool okc = s.measure(qc, rc2, ec);
+            fprintf(stderr, "rpluginselftest: refusal(shipped mismatch):\n%s\n", ec.c_str());
+            check(!okc && ec.find("<" + qc.analyzerVersion + ">") != std::string::npos &&
+                      ec.find("<" + sh->version + ">") != std::string::npos &&
+                      rc2.cols.empty(),
+                  "RP26 ...and one release of skew between the two is now refusable");
+        }
     }
 
     s.stop();
