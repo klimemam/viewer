@@ -750,6 +750,15 @@ struct App {
         uint64_t uid = 0;
         int dataRev = -1;
         float black = 0, white = 0;
+        // The bin GRID, which is not the same thing as the range above.
+        // black/white are the range the user ASKED for - the display range - and
+        // they stay that, because they are the cache key (canvas.inc) and the
+        // "is this side still binned like A?" test (panel_histogram.inc) and
+        // both compare against effBlack/effWhite. The 256 bins are laid on a
+        // ROUND grid snapped outward from it (histBinGrid), so that a bin is a
+        // whole number of DN and no bin swallows one more integer value than
+        // its neighbour. bin b spans [binOrigin + b*binW, binOrigin + (b+1)*binW).
+        float binOrigin = 0, binW = 0;
         int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
         int cfa = -1, cfaPattern = -1;
         int nSeries = 0;

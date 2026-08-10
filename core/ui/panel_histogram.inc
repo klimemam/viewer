@@ -43,16 +43,29 @@ static const char* abRangeSaid(bool haveB) {
 
 // The histogram's x axis label, built in one place so --range-selftest can
 // print the exact string the panel draws.
-static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b) {
-    char xl[192];
+static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b,
+                                const App::HistState& H) {
+    char xl[288];
     const std::string xu = abValueUnit(a->dtype);
     const char* xr = abRangeSaid(b != nullptr);
+    // The bins are snapped OUTWARD onto a round grid (histBinGrid), so the range
+    // the plot actually spans is not the black-white range named above, and the
+    // bin width is a quantity the reader needs in order to judge what the shape
+    // of a distribution means. Both go on the axis, with the unit, by the same
+    // standing rule that puts a unit on every axis in this app:
+    //   "... | bins 100..1124 DN, 4 DN/bin"
+    char gr[112] = "";
+    if (H.binW > 0)
+        snprintf(gr, sizeof gr, "  |  bins %.6g..%.6g %s, %.6g %s/bin",
+                 (double)H.binOrigin,
+                 (double)H.binOrigin + 256.0 * (double)H.binW,
+                 xu.c_str(), (double)H.binW, xu.c_str());
     if (b && b->dtype != a->dtype)
         snprintf(xl, sizeof xl, "pixel value (%s, %s - bins every side)"
-                                "  -  A %s / B %s, DTYPE MISMATCH",
-                 xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str());
+                                "  -  A %s / B %s, DTYPE MISMATCH%s",
+                 xu.c_str(), xr, a->dtype.c_str(), b->dtype.c_str(), gr);
     else
-        snprintf(xl, sizeof xl, "pixel value (%s, %s)", xu.c_str(), xr);
+        snprintf(xl, sizeof xl, "pixel value (%s, %s)%s", xu.c_str(), xr, gr);
     return xl;
 }
 
@@ -329,8 +342,19 @@ static void drawPanelHistogram() {
         else
             snprintf(yl, sizeof yl, app.histLog ? "pixel count (log, max %u)"
                                                 : "pixel count (max %u)", H.maxBin);
-        const std::string xlBuf = abHistXLabel(im, Bim);
+        const std::string xlBuf = abHistXLabel(im, Bim, H);
         const char* xl = xlBuf.c_str();
+        // The x axis is the BIN GRID, not the black-white range. plotSeries
+        // places bin b positionally, at b/256 of the rect, so the rect has to
+        // span exactly what the bins span - and since the grid snaps outward
+        // (histBinGrid) those two are no longer the same numbers. Drawn against
+        // black..white the whole staircase would be stretched onto a narrower
+        // axis and every bar would sit at the wrong pixel value. Every side is
+        // binned on A's grid, so one pair of limits serves all of them.
+        const float xLo = H.binW > 0 ? H.binOrigin : effBlack(*im);
+        const float xHi = H.binW > 0
+                            ? (float)((double)H.binOrigin + 256.0 * (double)H.binW)
+                            : effWhite(*im);
 
         // one curve, one way to draw it: filled bars, solid outline, dashed
         // outline. The staircase is built once and reused by all three.
@@ -462,7 +486,7 @@ static void drawPanelHistogram() {
         }
 
         if (!side) {
-            PlotRect hp = beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+            PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                     false, false, plotH);
             drawAll(hp, true, true);
             if (!leg.empty())  slotLegendRow(leg, true);
@@ -478,7 +502,7 @@ static void drawPanelHistogram() {
             ImGui::BeginChild("##histA", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             drawABBand("A", abDocLabel(im));
-            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+            drawAll(beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                               false, false, plotH), true, false);
             ImGui::EndChild();
             ImGui::SameLine();
@@ -486,7 +510,7 @@ static void drawPanelHistogram() {
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             drawABBand("B", bLabel, bStale);
             // identical axis ranges by construction: same xl/yl, same limits
-            drawAll(beginPlot(xl, yl, effBlack(*im), effWhite(*im), 0.0f, 1.0f,
+            drawAll(beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                               false, false, plotH), false, true);
             ImGui::EndChild();
         }

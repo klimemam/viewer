@@ -42,8 +42,10 @@
         }
 
         // ---- the reference implementations, written from the rule, not shared
-        // with the panel: 256 bins across black..white, one sample every
-        // `step`-th pixel of the resolved rect, CFA planes never mixed.
+        // with the panel: 256 bins on the SNAPPED grid (docs/todo-open.md 9 -
+        // an integer number of DN per bin, or a power of two for float), one
+        // sample every `step`-th pixel of the resolved rect, CFA planes never
+        // mixed.
         struct RefHist {
             uint32_t bins[4][256] = {};
             double mean[4] = {}, sd[4] = {};
@@ -56,7 +58,28 @@
             bool cfa = im.ch == 1 && im.cfa != 0;
             R.nSeries = cfa ? 4 : std::min(im.ch, 3);
             const float black = effBlack(im), white = effWhite(im);
-            const float inv = 256.0f / std::max(white - black, 1e-20f);
+            // The grid, from the RULE and by a different construction than the
+            // panel's: the power of two is found by doubling/halving (exact in
+            // binary, and not frexp), the integer width by ceil. Sharing
+            // histBinGrid here would make this reference agree with the panel by
+            // definition, which is the one thing it must not do.
+            float span = white - black;
+            if (!(span > 0)) span = 1.0f;
+            const float q = span / 256.0f;
+            const bool isInt = !im.dtype.empty() &&
+                               (im.dtype[0] == 'u' || im.dtype[0] == 'i' ||
+                                im.dtype == "bool");
+            float bw;
+            if (isInt) {
+                bw = std::ceil(q);
+                if (!(bw >= 1.0f)) bw = 1.0f;
+            } else {
+                bw = 1.0f;
+                while (bw < q) bw *= 2.0f;          // up to the first >= q ...
+                while (bw * 0.5f >= q) bw *= 0.5f;  // ... and down to the least
+            }
+            const float origin = (float)(std::floor((double)black / (double)bw) *
+                                         (double)bw);
             const size_t total = (size_t)rw * rh;
             const size_t step = std::max<size_t>(1, total / 1000000);
             double s1[4] = {}, s2[4] = {};
@@ -72,7 +95,7 @@
                         float v = src[0];
                         if (std::isfinite(v)) {
                             int s = cfaChannelAt(im, x, y);
-                            float t = (v - black) * inv;
+                            double t = ((double)v - origin) / bw;
                             int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
                             R.bins[s][b]++;
                             s1[s] += v; s2[s] += (double)v * v; n[s]++;
@@ -81,7 +104,7 @@
                         for (int c = 0; c < R.nSeries; c++) {
                             float v = src[c];
                             if (!std::isfinite(v)) continue;
-                            float t = (v - black) * inv;
+                            double t = ((double)v - origin) / bw;
                             int b = t < 0 ? 0 : (t >= 256 ? 255 : (int)t);
                             R.bins[c][b]++;
                             s1[c] += v; s2[c] += (double)v * v; n[c]++;
@@ -171,6 +194,8 @@
                    a.rw == b.rw && a.rh == b.rh && a.roiUsed == b.roiUsed &&
                    memcmp(&a.black, &b.black, sizeof a.black) == 0 &&
                    memcmp(&a.white, &b.white, sizeof a.white) == 0 &&
+                   memcmp(&a.binOrigin, &b.binOrigin, sizeof a.binOrigin) == 0 &&
+                   memcmp(&a.binW, &b.binW, sizeof a.binW) == 0 &&
                    memcmp(a.bins, b.bins, sizeof a.bins) == 0 &&
                    memcmp(a.mean, b.mean, sizeof a.mean) == 0 &&
                    memcmp(a.sd, b.sd, sizeof a.sd) == 0 &&
@@ -1538,6 +1563,218 @@
             app.compareFollowFrame = true;
             app.abStatsLayout = App::AbAuto;
             app.histPlane = -1;
+        }
+
+        // ---- W: the bin GRID - integer / power-of-two bin widths ------------
+        // (docs/todo-open.md 9, user report 2026-07-29.) 256 bins spread evenly
+        // over [black, white] gives a FRACTIONAL bin width whenever the range is
+        // not a multiple of 256: at 64..1023 that is 3.746 DN, so one bin
+        // swallows 4 integer DN values and the next swallows 3, and the panel
+        // prints a periodic comb that is not in the data. Reading the shape of a
+        // noise distribution is what this panel is FOR, so that is fatal.
+        //
+        // Every fixture below is a RAMP holding each DN of its range exactly
+        // once, so "how many DN values landed in this bin" is read straight off
+        // the bin counts - the comb is measured, not inferred. Deterministic and
+        // windowless: synthetic documents, recomputeHistogramIfNeeded called
+        // directly, no timing anywhere.
+        {
+            auto saveCmp = app.compareMode;
+            bool saveLink = app.linkRange;
+            auto saveAnn = app.selectedAnn;
+            app.compareMode = App::CmpOff;   // these docs are nobody's compare part
+            app.linkRange = false;           // ...and effBlack must be the doc's own
+            app.selectedAnn = 0;             // whole image, no ROI
+
+            auto mkRamp = [](const char* dt, int W2, int H2, double v0, double dv,
+                             float black, float white) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = "wgrid"; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+                d->src->dtype = dt;
+                d->src->data.resize((size_t)W2 * H2);
+                for (size_t i = 0; i < d->src->data.size(); i++)
+                    d->src->data[i] = (float)(v0 + dv * (double)i);
+                d->src->vmin = (float)v0;
+                d->src->vmax = (float)(v0 + dv * (double)(d->src->data.size() - 1));
+                d->syncMirrors();
+                d->uid = app.nextUid++;
+                d->black = black; d->white = white;
+                return d;
+            };
+            // How many DN values landed in each bin, and is it the SAME number
+            // everywhere? Only the bins the data REACHES are asked: the grid
+            // widens outward on purpose, so bins past the data are legitimately
+            // empty and an empty bin is not a comb tooth.
+            auto binDnSpread = [](const App::HistState& HS, uint32_t& lo, uint32_t& hi,
+                                  int& nonEmpty) {
+                lo = 0xFFFFFFFFu; hi = 0; nonEmpty = 0;
+                for (int b = 0; b < 256; b++) {
+                    uint32_t c = HS.bins[0][b];
+                    if (!c) continue;
+                    lo = std::min(lo, c); hi = std::max(hi, c); nonEmpty++;
+                }
+                if (!nonEmpty) lo = 0;       // ...and "uniform" must not pass on nothing
+            };
+            auto isPow2 = [](float w) {
+                if (!(w > 0) || !std::isfinite(w)) return false;
+                int e; return frexpf(w, &e) == 0.5f;   // exact: no log2 rounding
+            };
+            // the snapped grid always CONTAINS the requested range - it widens
+            // outward, never inward, or the panel would hide real pixels
+            auto contains = [](const App::HistState& HS) {
+                return HS.binOrigin <= HS.black &&
+                       (double)HS.binOrigin + 256.0 * (double)HS.binW >= (double)HS.white;
+            };
+            auto grid = [&](const App::HistState& HS, const char* tag) {
+                uint32_t lo, hi; int ne;
+                binDnSpread(HS, lo, hi, ne);
+                fprintf(stderr, "abstatsselftest: %s binW=%.9g origin=%.9g bins %.9g..%.9g"
+                                " | range %.9g..%.9g | DN/bin %u..%u over %d bins\n",
+                        tag, HS.binW, HS.binOrigin, HS.binOrigin,
+                        (double)HS.binOrigin + 256.0 * (double)HS.binW,
+                        HS.black, HS.white, lo, hi, ne);
+            };
+
+            {   // W1  u16 0..4095, a 12-bit sensor at full scale.
+                // span = 4095 - 0 = 4095;  4095/256 = 15.99609375;  ceil -> 16.
+                // origin = floor(0/16)*16 = 0, so the bins cover 0..4096, which
+                // contains 0..4095. 4096 DN values / 256 bins = 16 in EVERY bin.
+                auto d = mkRamp("u16", 64, 64, 0, 1, 0.0f, 4095.0f);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                uint32_t lo, hi; int ne;
+                binDnSpread(T, lo, hi, ne);
+                grid(T, "W1 u16 0..4095:");
+                check(ne == 256 && hi > 0, "W1 fixture: all 256 bins carry data");
+                check(T.binW == 16.0f, "W1 u16 0..4095 is exactly 16 DN/bin");
+                check(T.binOrigin == 0.0f, "W1 u16 0..4095 bin origin is 0 DN");
+                check(contains(T), "W1 the grid contains the requested range");
+                check(lo == 16 && hi == 16, "W1 no comb: every bin holds 16 DN values");
+            }
+            {   // W2  u8 0..255.  span = 255;  255/256 = 0.99609375;  ceil -> 1
+                // (and the floor of 1 would give the same). origin = 0, bins
+                // cover 0..256: exactly one DN per bin, which is the case the
+                // user named first.
+                auto d = mkRamp("u8", 16, 16, 0, 1, 0.0f, 255.0f);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                uint32_t lo, hi; int ne;
+                binDnSpread(T, lo, hi, ne);
+                grid(T, "W2 u8 0..255:  ");
+                check(ne == 256 && hi > 0, "W2 fixture: all 256 bins carry data");
+                check(T.binW == 1.0f, "W2 u8 0..255 is exactly 1 DN/bin");
+                check(T.binOrigin == 0.0f, "W2 u8 0..255 bin origin is 0 DN");
+                check(contains(T), "W2 the grid contains the requested range");
+                check(lo == 1 && hi == 1, "W2 every bin holds exactly one DN value");
+            }
+            {   // W3  THE COMB, at the report's own example: u16 64..1023.
+                // Unsnapped the width is 959/256 = 3.74609375 DN, so bin 0 takes
+                // DN 64..67 (four values) and bin 1 takes 68..70 (three) - a
+                // periodic structure that is not in the data.
+                // Snapped: ceil(3.74609375) = 4 DN/bin, origin =
+                // floor(64/4)*4 = 64, bins cover 64..1088 (contains 64..1023).
+                // The 960 DN of the range fill bins 0..239 with 4 each; bins
+                // 240..255 lie past the data and stay empty.
+                auto d = mkRamp("u16", 32, 30, 64, 1, 64.0f, 1023.0f);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                uint32_t lo, hi; int ne;
+                binDnSpread(T, lo, hi, ne);
+                grid(T, "W3 u16 64..1023:");
+                check(ne >= 200 && hi > 0, "W3 fixture: the data reaches 200+ bins");
+                check(T.binW == 4.0f, "W3 u16 64..1023 is exactly 4 DN/bin");
+                check(T.binOrigin == 64.0f, "W3 u16 64..1023 bin origin is 64 DN");
+                check(contains(T), "W3 the grid contains the requested range");
+                check(lo == hi, "W3 no comb: every filled bin holds one DN count");
+                check(lo == 4, "W3 ...and that count is 4 DN values per bin");
+            }
+            {   // W4  float, an arbitrary range: -3.7 .. 11.3.
+                // span = 15 exactly in float; 15/256 = 0.05859375; the next
+                // power of two at or above it is 2^-4 = 0.0625.
+                // origin = floor(-3.7/0.0625)*0.0625 = floor(-59.2)*0.0625
+                //        = -60*0.0625 = -3.75, so the bins cover -3.75..12.25.
+                // Powers of two are the point: the edges are exact in binary and
+                // re-binning accumulates no error.
+                auto d = mkRamp("f32", 40, 40, -3.7, 0.009, -3.7f, 11.3f);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                grid(T, "W4 f32 -3.7..11.3:");
+                check(T.sampled > 0, "W4 fixture: the histogram has samples");
+                check(isPow2(T.binW), "W4 f32 bin width is a power of two");
+                check(T.binW == 0.0625f, "W4 f32 -3.7..11.3 is 2^-4 DN/bin");
+                check(T.binOrigin == -3.75f, "W4 f32 bin origin is -3.75 DN");
+                check(contains(T), "W4 the grid contains the requested range");
+            }
+            {   // W4b  f32 0..1: 1/256 = 0.00390625 is ALREADY 2^-8, so the rule
+                // must leave it exactly there - the next power of two at or
+                // above an exact power of two is itself, and widening it would
+                // halve the resolution of every normalised float image there is.
+                auto d = mkRamp("f32", 32, 32, 0.0, 1.0 / 2000.0, 0.0f, 1.0f);
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                grid(T, "W4b f32 0..1: ");
+                check(isPow2(T.binW), "W4b f32 bin width is a power of two");
+                check(T.binW == 0.00390625f, "W4b f32 0..1 stays at 2^-8 DN/bin");
+                check(T.binOrigin == 0.0f, "W4b f32 0..1 bin origin is 0 DN");
+                check(contains(T), "W4b the grid contains the requested range");
+            }
+            {   // W5  THE TRAP the design names. u16, display range 101..1000.
+                // span = 899;  899/256 = 3.51171875;  ceil -> 4 DN/bin;
+                // origin = floor(101/4)*4 = 25*4 = 100. The bins run 100..1124,
+                // so the grid is wider than the display range at BOTH ends and
+                // DN 100 / DN 1050 are outside what the user SEES but inside the
+                // bins. clipLo/clipHi are "blown out or crushed at the DISPLAY
+                // range" - the footer prints them as <black / >white - so they
+                // have to be counted against 101..1000. Count them off the bins,
+                // as the code did before this change, and the saturated-pixel
+                // count silently drops the moment the grid widens.
+                //
+                // 1000 px:  10 @ 50   and 10 @ 100   are < 101   -> clipLo 2.00%
+                //           20 @ 1050 and 10 @ 1100  are >= 1000 -> clipHi 3.00%
+                //           950 in 101..999 are in range.
+                auto d = mkRamp("u16", 25, 40, 0, 0, 101.0f, 1000.0f);
+                for (size_t i = 0; i < d->src->data.size(); i++)
+                    d->src->data[i] = i < 10   ? 50.0f
+                                    : i < 20   ? 100.0f
+                                    : i < 40   ? 1050.0f
+                                    : i < 50   ? 1100.0f
+                                               : 101.0f + (float)((i - 50) % 899);
+                d->src->vmin = 50.0f; d->src->vmax = 1100.0f;
+                d->syncMirrors();
+                App::HistState T{};
+                recomputeHistogramIfNeeded(d.get(), T);
+                const double topDN = (double)T.binOrigin + 256.0 * (double)T.binW;
+                grid(T, "W5 u16 101..1000:");
+                fprintf(stderr, "abstatsselftest: W5 clipLo=%.6f%% clipHi=%.6f%% "
+                                "(want 2.000000%% / 3.000000%%) of %zu px\n",
+                        T.clipLo * 100.0, T.clipHi * 100.0, T.sampled);
+                check(T.binW == 4.0f && T.binOrigin == 100.0f,
+                      "W5 fixture: 101..1000 snaps to 4 DN/bin from 100");
+                check(T.binOrigin < T.black && topDN > (double)T.white,
+                      "W5 fixture: the grid is wider than the range, both ends");
+                check(T.clipLo > 0 && T.clipHi > 0,
+                      "W5 fixture: it really does hold clipped pixels");
+                check(fabs(T.clipLo - 0.02) < 1e-12,
+                      "W5 clipLo 2.00%: counted at the DISPLAY range");
+                check(fabs(T.clipHi - 0.03) < 1e-12,
+                      "W5 clipHi 3.00%: the wider bins did not eat it");
+                check(T.black == 101.0f && T.white == 1000.0f,
+                      "W5 black/white stay the REQUESTED range");
+                // ...and that is what keeping them requested BUYS: the cache
+                // still hits. canvas.inc keys on H.black == wantBlack and
+                // panel_histogram.inc asks H.black != effBlack(A) every frame;
+                // store the snapped value in either and the histogram re-scans a
+                // million pixels forever. Overwrite an OUTPUT and call again - a
+                // re-scan would clear it.
+                T.maxBin = 0xABCDEF;
+                recomputeHistogramIfNeeded(d.get(), T);
+                check(T.maxBin == 0xABCDEF, "W6 an identical second call is a cache HIT");
+                check(T.black == effBlack(*d) && T.white == effWhite(*d),
+                      "W6 ...because black/white still equal effBlack/White");
+            }
+            app.compareMode = saveCmp;
+            app.linkRange = saveLink;
+            app.selectedAnn = saveAnn;
         }
 
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");

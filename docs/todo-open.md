@@ -389,7 +389,18 @@ Image View から目を離した先。拡大率は**今見ている画素の性�
 
 ---
 
-## 9. Histogram の bin は整数 / 2のべき乗で切る
+## 9. Histogram の bin は整数 / 2のべき乗で切る — 済 (hist-bin-snap)
+
+### 状態更新: 設計どおり実装、`--abstats-selftest` の W 群が全ケースを固定
+
+`histBinGrid` (core/ui/canvas.inc) が純関数として格子を決める。`black`/`white`
+は要求レンジのまま据え置き、格子は `HistState::binOrigin` / `::binW` という
+別フィールド (下の「罠」のとおり、キャッシュキーと `abHistSideStale` が両方
+`effBlack`/`effWhite` と比較しているため)。丸めはキャッシュ比較より前。
+実測: u16 0..4095 → 16 DN/bin、u8 0..255 → 1 DN/bin、u16 64..1023 → 4 DN/bin
+(修正前は `DN/bin 3..4` の櫛、修正後は `4..4`)、f32 -3.7..11.3 → 2^-4。
+クリップ数は `wantBlack`/`wantWhite` と比較して数えるように分離した (罠の項)。
+以下は経緯の記録。
 
 ユーザー指摘 (2026-07-29): 「HistgramのBinだけど基本的には整数もしくは2のべき乗
 Floatでbin切りたいなぁ．」
