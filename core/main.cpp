@@ -124,6 +124,8 @@ App app;
 
 #include "app/setanalysis.inc"
 
+#include "app/setanalysis_remote.inc"
+
 #include "app/open_dispatch.inc"
 
 // ---------------------------------------------------------------- view helpers
@@ -525,6 +527,8 @@ static void migrateLayoutIni(const std::string& iniPath) {
 #include "selftest/bundled.inc"
 
 #include "selftest/rplugin.inc"
+
+#include "selftest/rset.inc"
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
@@ -932,6 +936,14 @@ int main(int argc, char** argv) {
 
     #include "selftest/setanalysis.inc"
 
+    // The same rows folded on a peer. Late rather than beside --rplugin-selftest
+    // because its LOCAL half opens the fixture through the real loader, which
+    // needs the startup this block sits after; --remote-exe still has to reach
+    // it, or "test the standalone peer" silently tests this binary against
+    // itself (the #134 reason, unchanged).
+    if (!g_rsetSelftest.empty())
+        return rsetSelfTest((app.remoteExe.empty() ? app.exePath : app.remoteExe).c_str(),
+                            g_rsetSelftest.c_str());
 
     #include "selftest/detrend.inc"
 

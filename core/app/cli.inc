@@ -31,6 +31,9 @@ static std::string g_asetSelftest;      // --aset-selftest <dir>: AnalysisSet tr
 static std::string g_setAnalysisSelftest; // --setanalysis-selftest <dir>: direct DSNU / PRNU
                                           // over a bound set (#57 判断4) + the famous-name
                                           // scan of the shipping sources, exit
+static std::string g_rsetSelftest;        // --rset-selftest <dir>: the same set analysis
+                                          // folded on a peer and folded here, compared
+                                          // field by field (MOP_SET_FOLD), exit
 static std::string g_detrendSelftest;     // --detrend-selftest <dir>: the detrend
                                           // AnalysisPreProcessor (#57 判断6/7) - the raw
                                           // default, the shading figure, the product, exit
@@ -506,7 +509,11 @@ static void printUsage() {
         "                              pass --remote-exe to test viewer-serve itself\n"
         "  --rplugin-selftest <file>   plugin analysis on the peer (ABI v3 §10):\n"
         "                              name+version parity, its refusals, and the\n"
-        "                              stack mouth pulled over the link\n",
+        "                              stack mouth pulled over the link\n"
+        "  --rset-selftest <dir>       set analysis folded on the peer (MOP_SET_FOLD):\n"
+        "                              the same rows folded there and here, compared\n"
+        "                              field by field, plus the fold-parity and\n"
+        "                              too-old-peer refusals\n",
         NPY_NATIVE_FORMS);
 }
 
@@ -652,6 +659,8 @@ static void parseCli(int argc, char** argv) {
             g_asetSelftest = next();               // handled in main()
         } else if (a == "--setanalysis-selftest") {
             g_setAnalysisSelftest = next();        // handled in main()
+        } else if (a == "--rset-selftest") {
+            g_rsetSelftest = next();               // handled in main()
         } else if (a == "--detrend-selftest") {
             g_detrendSelftest = next();            // handled in main()
         } else if (a == "--derive-selftest") {

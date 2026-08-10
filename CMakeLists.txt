@@ -630,7 +630,7 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Six of the tests below do; the other 29 take the --no-window startup path and
+# Six of the tests below do; the other 36 take the --no-window startup path and
 # need neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -999,6 +999,26 @@ viewer_selftest(rplugin NOGL
                 --rplugin-selftest tools/testdata/bench_stack.npy
                 --remote-exe $<TARGET_FILE:viewer-serve>)
 
+# Set analysis folded on the peer (MOP_SET_FOLD, docs/analysis-layers.md §3.5).
+# The same standalone-peer reasoning again - a client talking to itself cannot
+# tell "the peer folded that" from "I did".
+#
+# It writes its own fixture under a scratch subdirectory of the given dir - the
+# --stackavg / --derive precedent - because the shared trees have no injected
+# fixed pattern and every row would clamp: "local 0 == peer 0" is an agreement
+# about nothing, which is the exact trap #57 judgment 2 named.
+#
+# --cfa bayer is not decoration either. The plane map is one of the two things
+# the local fold and the peer's must agree on sample for sample (the other is
+# the frame order), and the two are written in different files against different
+# copies of the table.
+#
+# It starts a SECOND peer under VIEWER_SERVE_PROTOCOL=7, which is how the
+# too-old refusal is exercised in the gate rather than by keeping an old binary
+# on a disk somewhere.
+viewer_selftest(rset NOGL --rset-selftest tools/testdata
+                --cfa bayer --bayer-pattern RGGB
+                --remote-exe $<TARGET_FILE:viewer-serve>)
 
 # The same A/B statistics run over a MOSAICED stack: --cfa bayer makes every
 # 1-channel frame a Bayer frame, which is the case where the panels' rule "CFA
