@@ -156,72 +156,108 @@ jobs:
       # run old distros: a binary linked against the runner's glibc 2.39 dies
       # there with "GLIBC_2.38 not found" (reproduced on the user's server).
       # Rebuild it - and the plugins MEASURE loads - inside Ubuntu 20.04
-      # (glibc 2.31), which covers everything from RHEL 8 up.
+      # (glibc 2.31), which covers RHEL 9, Debian 11 and Ubuntu 20.04 up.
+      # NOT RHEL 8, which this line used to claim: the assertion below measures
+      # 2.29, and RHEL 8 ships 2.28. The container's own libm is what forces it
+      # (exp, log and pow gained a version at 2.29), so the claim was wrong on
+      # the day it was written rather than broken since - but a number that is
+      # now asserted must not sit under a sentence that contradicts it.
+      #
+      # THE SCRIPT ARRIVES ON STDIN, and that is a bug fix rather than a style
+      # choice. It used to be one single-quoted argument to `bash -ec '...'`,
+      # and an apostrophe in an English comment - "the peer's PNG readers",
+      # added when #148 gave this step the picture readers - CLOSED that quote.
+      # Everything after it was then parsed by the RUNNER's shell instead: the
+      # container compiled miniz.o and exited, and the runner ran the rest, so
+      # the "compat" binary was being linked against the runner's own glibc.
+      # It failed loudly only because the runner's /tmp had no miniz.o in it.
+      # NOTHING SWALLOWED AN ERROR - `bash -ec` had -e all along; the script had
+      # been cut in half by a quote, and each half stopped on its first failure
+      # exactly as told. A heredoc quoted with <<'COMPAT' has no such character:
+      # neither shell parses anything inside it, so prose in these comments
+      # cannot reach out and change what runs. `set -euo pipefail` is written
+      # out at the top for the same reason - the shell options now belong to the
+      # script rather than to the way it happened to be quoted.
       - name: Rebuild viewer-serve for old glibc (Ubuntu 20.04 container)
         if: runner.os == 'Linux'
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
-            # archive.ubuntu.com is flaky from Actions runners (two runs in a
-            # row died on "Connection failed" here); the Azure mirror is what
-            # the runner images themselves use, and retries cover the rest
-            sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
-            echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
-            apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
-            # miniz.c is C: compiling it as C++ turns its tentative definitions
-            # into redefinition errors, so it gets its own gcc pass
-            gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
-            # stb_image is C too, and VENDORED in the tree (third_party/stb), so
-            # the peer's PNG and JPEG readers cost this step one more gcc pass
-            # and no dependency at all. Same warnings-off treatment as miniz: it
-            # is third-party code, and core/imagefile.cpp is the file this
-            # project holds to -Wall.
-            gcc -O2 -Ithird_party/stb -c core/stb_image_impl.c -o /tmp/stb.o
-            # core/version.cpp, and -Ibuild/generated for the header the cmake
-            # build above wrote there. MOP_SET_FOLD returns the peer version as
-            # PROVENANCE - "which build folded this", which is what #46 asks of
-            # a built-in, since a built-in has no dll to name instead. It is
-            # written into the reply and NEVER compared, so it cannot become a
-            # parity refusal (PR #135) and it costs this list exactly one file.
-            # This list is the whole definition of the compat binary, so keep it
-            # minimal - but a symbol the peer genuinely needs belongs in it.
-            # ...and the READERS, since issue #148 judgment B: the peer serves
-            # the picture formats this viewer reads, so core/imagefile.h and the
-            # readers behind it are part of what a peer IS now. Every one of
-            # them is this repository's own code or a vendored header, so the
-            # FILE list grew and the DEPENDENCY list did not:
-            #
-            #   VIEWER_NO_LIBRAW   LibRaw is CDDL-1.0 and this binary installs
-            #                      itself onto someone else's machine. Refused
-            #                      by name on every peer; core/rawread.cpp is
-            #                      still compiled, for its SNIFF, so a .NEF is
-            #                      recognised as a camera's file instead of
-            #                      falling through to the TIFF reader beneath it.
-            #   VIEWER_NO_OPENEXR  the one reader here that is a LIBRARY. This
-            #                      compat binary exists so that a peer runs on an
-            #                      old distro AT ALL, and building OpenEXR inside
-            #                      this container would trade that for minutes of
-            #                      CI and a new way to fail. The .exr row keeps
-            #                      its extension and its sniff and loses its
-            #                      decoder, so this peer refuses .exr BY NAME and
-            #                      names the build - which is also the one place
-            #                      where two peers of the same protocol number
-            #                      differ in what they serve.
-            g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -DVIEWER_NO_LIBRAW -DVIEWER_NO_OPENEXR \
-                -Icore -Iinclude -Ibuild/_deps/miniz-src -Ithird_party/stb \
-                -Ibuild/generated \
-                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
-                core/imagefile.cpp core/tiffread.cpp core/y4mread.cpp core/rawread.cpp \
-                /tmp/miniz.o /tmp/stb.o \
-                -o build/viewer-serve \
-                -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
-            for f in plugins/*.c; do
-              gcc -O2 -shared -fPIC -Iinclude "$f" \
-                  -o "build/plugins/$(basename "${f%.c}").so" -lm
-            done'
+          docker run --rm -i -v "$PWD:/src" -w /src ubuntu:20.04 bash -s <<'COMPAT'
+          set -euo pipefail
+          # archive.ubuntu.com is flaky from Actions runners (two runs in a
+          # row died on "Connection failed" here); the Azure mirror is what
+          # the runner images themselves use, and retries cover the rest
+          sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
+          echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
+          apt-get update -qq >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
+          # miniz.c is C: compiling it as C++ turns its tentative definitions
+          # into redefinition errors, so it gets its own gcc pass
+          gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
+          # stb_image is C too, and VENDORED in the tree (third_party/stb), so
+          # the peer's PNG and JPEG readers cost this step one more gcc pass
+          # and no dependency at all. Same warnings-off treatment as miniz: it
+          # is third-party code, and core/imagefile.cpp is the file this
+          # project holds to -Wall.
+          gcc -O2 -Ithird_party/stb -c core/stb_image_impl.c -o /tmp/stb.o
+          # core/version.cpp, and -Ibuild/generated for the header the cmake
+          # build above wrote there. MOP_SET_FOLD returns the peer version as
+          # PROVENANCE - "which build folded this", which is what #46 asks of
+          # a built-in, since a built-in has no dll to name instead. It is
+          # written into the reply and NEVER compared, so it cannot become a
+          # parity refusal (PR #135) and it costs this list exactly one file.
+          # This list is the whole definition of the compat binary, so keep it
+          # minimal - but a symbol the peer genuinely needs belongs in it.
+          # ...and the READERS, since issue #148 judgment B: the peer serves
+          # the picture formats this viewer reads, so core/imagefile.h and the
+          # readers behind it are part of what a peer IS now. Every one of
+          # them is this repository's own code or a vendored header, so the
+          # FILE list grew and the DEPENDENCY list did not:
+          #
+          #   VIEWER_NO_LIBRAW   LibRaw is CDDL-1.0 and this binary installs
+          #                      itself onto someone else's machine. Refused
+          #                      by name on every peer; core/rawread.cpp is
+          #                      still compiled, for its SNIFF, so a .NEF is
+          #                      recognised as a camera's file instead of
+          #                      falling through to the TIFF reader beneath it.
+          #   VIEWER_NO_OPENEXR  the one reader here that is a LIBRARY. This
+          #                      compat binary exists so that a peer runs on an
+          #                      old distro AT ALL, and building OpenEXR inside
+          #                      this container would trade that for minutes of
+          #                      CI and a new way to fail. The .exr row keeps
+          #                      its extension and its sniff and loses its
+          #                      decoder, so this peer refuses .exr BY NAME and
+          #                      names the build - which is also the one place
+          #                      where two peers of the same protocol number
+          #                      differ in what they serve.
+          g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -DVIEWER_NO_LIBRAW -DVIEWER_NO_OPENEXR \
+              -Icore -Iinclude -Ibuild/_deps/miniz-src -Ithird_party/stb \
+              -Ibuild/generated \
+              core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
+              core/imagefile.cpp core/tiffread.cpp core/y4mread.cpp core/rawread.cpp \
+              /tmp/miniz.o /tmp/stb.o \
+              -o build/viewer-serve \
+              -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
+          for f in plugins/*.c; do
+            gcc -O2 -shared -fPIC -Iinclude "$f" \
+                -o "build/plugins/$(basename "${f%.c}").so" -lm
+          done
+          COMPAT
           ./build/viewer-serve --help
-          echo "glibc ceiling of the compat binary:"
-          objdump -T build/viewer-serve | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          # THE CEILING IS ASSERTED, not printed for someone to notice. This
+          # number is the entire promise of the step - it is what "runs on an
+          # old distro" MEANS - and a printed number gates nothing: the quote
+          # bug above walked a runner-built binary past this very line for as
+          # long as that binary linked at all, and this line said so in the log
+          # and let the job go green. 2.29 is what the container's own libm
+          # forces (exp, log and pow gained a version there) and is what this
+          # binary measures today; a rise means the compat binary has stopped
+          # being compatible and the step has lost its point.
+          ceil=$(objdump -T build/viewer-serve | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "glibc ceiling of the compat binary: ${ceil:-<none>}"
+          max=GLIBC_2.29
+          test -n "$ceil" || { echo "no versioned glibc symbols at all: objdump found nothing to check"; exit 1; }
+          test "$(printf '%s\n%s\n' "$ceil" "$max" | sort -V | tail -1)" = "$max" \
+            || { echo "the compat binary now needs $ceil, above the $max this step promises"; exit 1; }
 
       - name: Package (Windows exe + plugins)
         if: runner.os == 'Windows'
