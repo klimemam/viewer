@@ -236,8 +236,13 @@ Analysis) で、**Files パネルの選択が応答の層を切り替える** (�
 - **NaN は画素ごとに除外して数える** — 分母に畳まない (`computeStackStats` /
   serve.cpp で確立済み)。除外数は結果が運ぶ。
 - **remote の stack 集計は画素の居る側 (peer) で走る** (`MOP_TEMPORAL_STATS`
-  の先例。未オープン stack は `not opened` タグ)。プラグインの stack 解析と
-  set の集計も同じ線 — 細部は実装時 (§10)。
+  の先例。未オープン stack は `not opened` タグ)。プラグインの stack 解析
+  (`MOP_PLUGIN_ANALYZE`, abi-v3.md §10) と set の集計 (`MOP_SET_FOLD`) も
+  同じ線で着地済み。set の要求文法だけは既存の頭では書けなかった —
+  `MeasureReqHead` の平坦なパス列には「どこで1つの stack が終わるか」を
+  書く場所が無いので、rois の後ろに**役割ブロック** (役割名 + そのパス数 +
+  frame 範囲) が付き、`rp::VERSION` が 8 に上がった。古い peer は op 番号で
+  拒否するので、client は**送る前に**数から拒否して、どの不一致かを名指す。
 
 ## 4. Specific Analyzer — シグネチャが要求を宣言する
 
@@ -341,8 +346,17 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 <!-- 【実装 2026-08-10 — PR #130】上の2行は着地した (map はまだ: 器は #49)。
      「実装は 1–3 の再利用」は文字どおりで、DSNU は **dark stack に掛けた
      補正済み sigma_fpn そのもの** — selftest がパネルの値と bit 単位で
-     一致することを確かめている。remote (§3.5 の「画素の居る側で走る」) は
-     未対応で、2つの stack をまたぐ MEASURE op を要するため別 PR が持つ。 -->
+     一致することを確かめている。 -->
+<!-- 【実装 2026-08-10 — 本 PR】remote (§3.5 の「画素の居る側で走る」) も
+     着地した: `MOP_SET_FOLD` (`rp::VERSION = 8`)。**畳み込みだけ** が peer に
+     移り、名前を持つ量は全部こちらで合成する — この節の「画素に触る段は
+     peer、fit・KPI はスカラの上で手元」がそのまま実装の分割線である。
+     役割ごとの平面別 (ΣM, ΣM², ΣC, n) が渡り、直接 PRNU が要る
+     **画素ごとの差** だけは peer 側で差画像を作って落とす (モーメントから
+     組み直すと局所と別の binary64 になる)。分離フィットは差を要さないので
+     M+1 stack が1要求・1畳み込みずつ。
+     組み込みのパリティは「畳み込みが宣言する form の等値」 —
+     プラグインの name+version (abi-v3.md §10) に対応する組み込みの答え。 -->
 
 | **DSNU / PRNU 分離** | `{"sweep": Series(), "dark": Stack()}` | level 毎 σ_fpn → σ_fpn²–μ² 線形回帰 | sc |
 | read noise (dark 実測) | `{"dark": Stack()}` | σ_t (§3.2 Temporal) | sc |

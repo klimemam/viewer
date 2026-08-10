@@ -12,7 +12,7 @@
 | バイナリ | 中身 | 役割 |
 |---|---|---|
 | `viewer` | `core/main.cpp` + `plugin_host` + `ui_theme` + `serve` + `remote` + `app_icon` + `window_frame` + miniz | GUI 本体。`--serve` を渡すと peer にもなる |
-| `viewer-serve` | `core/serve_main.cpp` + `serve.cpp` + `plugin_host.cpp` + miniz | ssh 越しに動く peer。**GL/GLFW/X11 に一切リンクしない** |
+| `viewer-serve` | `core/serve_main.cpp` + `serve.cpp` + `plugin_host.cpp` + `version.cpp` + miniz | ssh 越しに動く peer。**GL/GLFW/X11 に一切リンクしない**。`version.cpp` は `MOP_SET_FOLD` の provenance のため — 組み込みの解析には dll が無いので、「どのビルドが畳んだか」は viewer 版そのものになる |
 | `mkicon` | `tools/mkicon.cpp` | ビルド時にアイコンを生成するホストツール |
 
 加えて `plugins/*.c` が7つの `MODULE` ライブラリになり、`build/plugins/` へ出ます
@@ -452,6 +452,9 @@ core/
                     (rp::naturalLess / rp::patternWithExtent)
   serve.cpp         peer 側のハンドラ (list/meta/tile/measure/glob/scan)
   serve_main.cpp    viewer-serve の main
+  setfold.h         set 解析のうち「画素の居る側で走る」半分。両端が呼ぶ1つの
+                    実装 (畳み込みと平面別の集約、パリティ用の form 宣言)
+  shading_probe.h   シェーディング量の測定 (2次面) — 同じ理由で両端が呼ぶ
   plugin_host.h/.cpp  プラグインの探索・読み込み・検証・登録簿 (GL 非依存)
   ui_theme.h/.cpp   ダーク/ライトとアクセント色
   window_frame.h/.cpp  メニューバーに描くタイトルバー (Win32 / X11)

@@ -1,7 +1,7 @@
 # リモートのデータを手元から見る (`ssh://`)
 
 計算機に置いた大量の RAW/npy を、手元のマシンの viewer から開いて測るための仕組み。
-稼働中の機能です(プロトコル `VERSION = 5`、[core/remote_proto.h](../core/remote_proto.h) /
+稼働中の機能です(プロトコル `VERSION = 8`、[core/remote_proto.h](../core/remote_proto.h) /
 [core/serve.cpp](../core/serve.cpp) / [core/remote.cpp](../core/remote.cpp))。
 残っている制限は §8。
 
@@ -215,6 +215,13 @@ PRNU も e-SFR もノイズフロアも、入力は数 Mpx あっても出力は
 画素をこちら側に引いてから測るのは、答えを得るために原料を輸送しているようなものです。
 解析プラグインはリモート側で走らせ、結果だけ持ってくるのが正しい。
 
+set 解析(DSNU / PRNU / 分離フィット)も同じ線に乗りました。ただし set の入力は
+**役割の付いた N 本の stack** なので、`MeasureReqHead` の平坦なパス列では
+「どこで1本が終わるか」を書けません。`MOP_SET_FOLD` は rois の後ろに
+**役割ブロック**を足してそれを言い、返すのは平面ごとの和だけ — 名前のある量は
+どれも手元で合成されます。480 枚の dark は計算機で畳まれ、リンクを渡るのは
+スカラです。
+
 ---
 
 ## 5. 当初の「WebSocket ブリッジ」との関係
@@ -301,7 +308,7 @@ viewer ssh://user@host/data/run42
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 7`、[core/remote_proto.h](../core/remote_proto.h))の状態。
+現時点(プロトコル `VERSION = 8`、[core/remote_proto.h](../core/remote_proto.h))の状態。
 **残っている制限だけ**を書く節です。済んだものを「これから」の顔で残さないこと —
 この節は一度それで嘘をつきました。
 
@@ -312,6 +319,7 @@ viewer ssh://user@host/data/run42
 | **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む。ローカルの loader は元から Fortran を読めたので、リンク越しだけ拒否するのは不整合だった([docs/startup.md](startup.md) の「まだ出来ないこと」もそう言っている) |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
 | **`MOP_PLUGIN_ANALYZE`** | **実装済み**([docs/abi-v3.md](abi-v3.md) §10、`VERSION = 7`)。プラグインの **name + version が等値** のときだけ peer で走る。不一致は**両方の版を並べて拒否**し、黙って手元実行に振り替えない。frame / stack の両方に届き、stack は peer が1枚ずつ読んで `release_frame` で区画を返す(§9.2 の窓)。返答は peer 自身の帳簿(name / version / dll / フルパス)を provenance として運ぶ。version を宣言しない V1/V2 記述子は**照合できないので拒否**され、名前だけで一致する従来の `MOP_ANALYZER` に残る。`VIEWER_SERVE_PLUGINS` で peer のプラグイン探索先を足せる |
+| **`MOP_SET_FOLD`** | **実装済み**([docs/analysis-layers.md](analysis-layers.md) §3.5 / §6、`VERSION = 8`)。set 解析の**畳み込みだけ**が peer で走り、DSNU / PRNU / 分離フィットという**名前のある量は全部こちらで合成する**。要求は rois の後ろに**役割ブロック**(役割名 + そのパス数 + frame 範囲)を足したもの — set は「役割 → stack」で、平坦なパス列だけでは区切りを書けないため。返るのは役割ごと平面ごとの (ΣM, ΣM², ΣC, n) と遮蔽量、つまり数値だけ。**画素ごとの差**を要する直接 PRNU は peer 側で差画像を作って落とす(モーメントから組み直すと局所と別の binary64 になる)。パリティは組み込みなので name+version ではなく**畳み込みが宣言する form の等値**で、不一致は両方の form を並べて拒否する。古い peer は op 番号で拒否するので、client は送る前に数から拒否して「古い」と「不一致」を言い分ける。`VIEWER_SERVE_PROTOCOL` で peer を古い版として喋らせられる(試験用) |
 | **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
 | **`ssh://` の CLI 配線** | **配線済み**。`openPath` が `ssh://` と `local://` を受け、`viewer ssh://host/path.npy`(ファイル)と `viewer ssh://host/~/dir`(接続してそこを Browse)の両方が起動パス。`--help` にも出る |
 | **LIST のファイルサイズ** | 64 bit。u32 の lo/hi 2 本で送る(`serve.cpp`、`remote_proto.h` の mtime と同じ形) |
