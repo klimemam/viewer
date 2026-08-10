@@ -90,7 +90,7 @@ App app;
 // (core/browse/nav.cpp, core/browse/panel.cpp). What the spine, the fragments
 // below and the selftests inside main() may call of it is declared in
 // browse.h; the seam the browse side calls back through is g_browseHost
-// (host.h), filled at the end of the include block where all fourteen targets
+// (host.h), filled at the end of the include block where all fifteen targets
 // are visible. host.h also declares the viewer-side helpers the browse TUs
 // call by name (and owns struct PathSeg), so it precedes util.inc.
 #include "browse/host.h"
@@ -223,7 +223,7 @@ static std::string fmtVal(float v, const std::string& dtype) {
 // internal linkage stays - de-statics were only paid where browse calls a
 // helper by name (host.h lists those). Plain function pointers, so the table
 // is constant-initialized and no browse call can ever beat it. This sits after
-// cli.inc because the spine has only now seen all fourteen definitions.
+// cli.inc because the spine has only now seen all fifteen definitions.
 static void browseWakeUi() { glfwPostEmptyEvent(); }   // rbWorker's UI wake
 const BrowseHost g_browseHost = {
     &toast,
@@ -234,6 +234,7 @@ const BrowseHost g_browseHost = {
     &openStackForAverage,
     &requestBrowseTemporal,
     &openPickerWith,
+    &openFolder,
     &openReaderPicker,
     &browseFolderDialog,
     &selectImage,

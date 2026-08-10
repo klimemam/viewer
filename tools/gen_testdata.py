@@ -1167,6 +1167,36 @@ np.save(prec / "f8_range.npy", np.array(
 np.save(prec / "u4_fits.npy", np.array([[0, 4095, 65535, 16777215]], np.uint32))
 np.save(prec / "f8_fits.npy", np.array([[0.0, 1.0, 0.5, 1024.25]], np.float64))
 
+# ------------------------------------------------------------ openfolder/ ----
+# Issue #148: the folder that answered differently depending on which door
+# opened it. NOT ONE .npy IN IT, on purpose - that is the whole fixture.
+#
+#   the local scan (scanFolderGroups, which asks core/imagefile.h)
+#                                     -> 2 stacks, 3 frames each
+#   the peer scan (core/serve.cpp, which collects isNpySuffix only)
+#                                     -> 0 groups
+#
+# Two groups and not one, because the second is named in Japanese: the grouping
+# is a question about DIGIT RUNS and must not become a question about which
+# bytes a name is made of. --scan-selftest hand-derives both stack names from
+# these six file names (core/selftest/scan.inc), so the counts and the padding
+# here are load-bearing: three files, zero-padded to three digits, one digit run
+# each, which is what makes the patterns "dark_001‥003.png" and
+# "暗電流_001‥003.png".
+#
+# fresh(): counted, exactly as linset and levelfiles are. A leftover seventh
+# file from an older layout would make "2 stacks" read as a pass for the wrong
+# reason.
+openf = fresh(out / "openfolder")
+ofyy, ofxx = np.mgrid[0:6, 0:8]
+for _i in (1, 2, 3):
+    # values differ per frame so the three are not one file written thrice -
+    # a stack whose frames are identical cannot show a loader that dropped one
+    write_png(openf / ("dark_%03d.png" % _i),
+              ((ofxx * 3 + ofyy + _i * 17) % 256).astype(np.uint8), bit=8, ctype=0)
+    write_png(openf / ("暗電流_%03d.png" % _i),   # 暗電流 = dark current
+              ((ofyy * 5 + ofxx + _i * 29) % 256).astype(np.uint8), bit=8, ctype=0)
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     if p.is_dir():

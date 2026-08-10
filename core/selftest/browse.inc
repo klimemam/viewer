@@ -294,6 +294,13 @@
             // include the CURRENT directory itself (a stack whose name has no
             // folder prefix), which is exactly what the old row-only entry
             // could not reach without first going up a level.
+            //
+            // #148: this browse is of THIS machine (host empty), so the door
+            // now goes to the extension-aware local scan - the same one a
+            // dropped folder takes - and the picker is a LOCAL picker. The
+            // claim being made here is unchanged and is about the scan's ROOT,
+            // not about which scan ran: "all stacks below" has to mean this
+            // folder AND everything under it, whichever side walks the tree.
             remoteScanFolder(rbMain(), B.dir);
             double t1 = nowSec();
             while (nowSec() - t1 < 120.0) {
@@ -309,10 +316,10 @@
                 if (names.size() < 160)
                     names += (names.empty() ? "" : ",") + fp.g.name;
             }
-            bool scanOk = app.folderPickOpen && app.folderPickRemote && here >= 1 && below >= 1;
+            bool scanOk = app.folderPickOpen && !app.folderPickRemote && here >= 1 && below >= 1;
             fprintf(stderr, "browseselftest: open-folder on the current dir %s -> picker "
-                            "open=%d remote=%d, %d stack(s) in this folder, %d below "
-                            "[%s]: %s\n",
+                            "open=%d remote=%d (0 = the local scan, #148), %d stack(s) in "
+                            "this folder, %d below [%s]: %s\n",
                     B.dir.c_str(), app.folderPickOpen ? 1 : 0, app.folderPickRemote ? 1 : 0,
                     here, below, names.c_str(), scanOk ? "ok" : "FAIL");
             if (!scanOk) ok = false;
@@ -900,10 +907,23 @@
             // including a local Open Folder selection being filtered - and
             // re-raised the modal over it. RbGlob has carried a generation
             // token since it was written; RbScan carried none at all.
+            //
+            // The job is enqueued HERE rather than through remoteScanFolder,
+            // because since #148 that function produces no RbScan at all when
+            // the host is empty (a folder on this disk goes to the local,
+            // extension-aware scan). The subject of this assertion is the
+            // REMOTE scan's cancel token, so the remote job is what has to be
+            // in flight - built exactly as remoteScanFolder builds it.
             app.folderPick.clear();
             app.folderPickOpen = false;
-            remoteScanFolder(rbMain(), B.dir);
-            uint32_t genAt = rbMain().b.scanGen;
+            uint32_t genAt = ++rbMain().b.scanGen;
+            {
+                App::RbJob j;
+                j.kind = App::RbScan;
+                j.host = rbMain().b.host; j.port = rbMain().b.port; j.dir = B.dir;
+                j.gen = genAt;
+                rbEnqueue(rbMain(), std::move(j));
+            }
             rbMain().b.scanGen++;            // exactly what the cancel button does
             double t3 = nowSec();
             bool sawScan = false;

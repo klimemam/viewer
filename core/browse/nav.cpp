@@ -226,6 +226,14 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             // re-raises the modal over it. RbGlob has had this guard since it
             // was written; RbScan carried no token at all.
             if (r.gen != B.scanGen) continue;
+            // The scan you started has ANSWERED - recorded here, before the
+            // answer is acted on, and for the EMPTY answer too. Zero groups
+            // opens no picker, queues nothing and loads nothing, so a caller
+            // watching for a stack to appear has nothing to watch for; this is
+            // the only place the fact exists (the reply is consumed below and
+            // dropped). See RemoteBrowse::scanDoneGen for what that cost.
+            B.scanDoneGen = r.gen;
+            B.scanGroups = r.ok ? (int)r.scanGroups.size() : -1;
             if (!r.ok) { g_browseHost.toast("remote scan: " + r.err, true); continue; }
             auto joinR = [](const std::string& a, const std::string& b) {
                 if (b.empty()) return a;
@@ -510,7 +518,49 @@ void remoteStartSearch(App::BrowseInstance& I,
 // The remote openFolder(): the worker asks the server to walk the subtree and
 // report every stack below it; the result feeds the picker / open queue on
 // the UI thread (pumpRemoteBrowse).
+//
+// #148 - EXCEPT when the folder is on this machine. An empty host means the
+// files are on this disk, and this process reads png/tif/exr/RAW; the peer
+// reads .npy and nothing else (core/serve.cpp's walk collects isNpySuffix, and
+// npySegKey refuses the rest on its first line). Sending a local folder round
+// through it made the SAME folder answer differently depending on which door
+// opened it: `viewer <dir>`, a dropped folder and the file dialog grouped the
+// pictures, and File ▸ Open Folder (all stacks below)… / every Browse "Open
+// folder (all stacks below)" said "no .npy stacks under …" and opened nothing,
+// with the listing right beside it showing those very files (LIST has no
+// extension filter - only the meta peek is npy-gated). serve.cpp:533-538 is our
+// own rule against precisely that: the same folder must not read one way over
+// ssh and another way opened from disk.
+//
+// So the local case goes to openFolder(), which is the ONE path a drop already
+// takes - scanFolderGroups (it asks core/imagefile.h, so a format the table
+// gains is gained here with it) into the SAME picker. The picker is not forked;
+// only the scan differs, and only in which extensions it can see.
+//
+// The REMOTE case is unchanged and stays npy-only on purpose: over ssh that is
+// a declared refusal the panel already explains (peerRefusalFor), not an
+// oversight. Whether the peer should serve more than .npy is #148's open
+// question and is not answered here.
+//
+// ONE difference this hands over with the extensions, stated rather than left
+// to be found: the two walks do not reach as far. The peer is asked for depth 6
+// (the `scan(job.dir, 6, 256, ...)` above); scanFolderGroups walks depth 3.
+// Both cap at 256 groups and both report the cap. So a local tree deeper than
+// three levels now yields what a DROP of that folder yields, which is the point
+// of the change - the local doors agree - but it is less than the peer used to
+// return through this one door. Which depth "all stacks below" should mean is a
+// question about the local scan and is asked of every door at once; it is not
+// answered by making this door disagree with the drop again.
 void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
+    if (I.b.host.empty()) {
+        // Bump the token first: an earlier peer scan still in flight would
+        // otherwise land on top of the picker this is about to raise, and
+        // openPickerWith does not merely re-raise the modal - it CLEARS the
+        // selection (the reason scanGen exists at all).
+        ++I.b.scanGen;
+        g_browseHost.openFolder(root);
+        return;
+    }
     App::RbJob j;
     j.kind = App::RbScan;
     j.host = I.b.host;

@@ -96,6 +96,18 @@ struct RemoteBrowse {
     // merge and sweep fields, destroying a local Open Folder selection the
     // user was in the middle of filtering.
     uint32_t scanGen = 0;
+    // ...and what the scan ANSWERED (#148). scanDoneGen is the token of the
+    // last reply that was accepted, so `scanDoneGen == scanGen` means "the scan
+    // you started has come back"; scanGroups is how many stacks it carried, or
+    // -1 when the peer refused. ZERO IS AN ANSWER: nav.cpp toasts it and opens
+    // no picker, queues no stack and loads no frame, so anything waiting for a
+    // stack to appear would wait forever. The UI never did - it draws the next
+    // frame - but --scan-selftest sat in that wait for its whole budget, which
+    // made a fixture that lost its .npy files HANG the suite instead of failing
+    // it. There is nowhere else this can be read off: the reply is consumed and
+    // dropped on the UI thread.
+    uint32_t scanDoneGen = 0;
+    int scanGroups = -1;
 };
 // The connect / install / list sequence runs on the INSTANCE's worker, never
 // on the UI thread: a git clone on the far side takes seconds, and "Connect
