@@ -125,14 +125,19 @@ static std::string setCutoffOfSeq(int seqId) {
 // Two roles, two inputs, and they need not agree - so say both rather than
 // picking one. A pixel-wise subtraction between a detrended image and a raw
 // dark is a real thing to do by mistake, and the cutoff line is where it shows.
-static std::string setCutoffOfRoles(const std::vector<std::pair<std::string, int>>& roles) {
+//
+// Takes the cutoff TEXT and not a seqId, because a role folded on a peer has no
+// local SeqInfo to read one off: what the peer folded is a file, and a file on
+// disk is raw. The detrend stage makes a first-class stack HERE, so a detrended
+// role is by construction a local one.
+static std::string setCutoffOfRoles(const std::vector<std::pair<std::string, std::string>>& roles) {
     std::string s;
     bool same = true;
     for (size_t i = 1; i < roles.size(); i++)
-        if (setCutoffOfSeq(roles[i].second) != setCutoffOfSeq(roles[0].second)) same = false;
-    if (same && !roles.empty()) return setCutoffOfSeq(roles[0].second);
+        if (roles[i].second != roles[0].second) same = false;
+    if (same && !roles.empty()) return roles[0].second;
     for (size_t i = 0; i < roles.size(); i++)
-        s += (i ? "; " : "") + roles[i].first + ": " + setCutoffOfSeq(roles[i].second);
+        s += (i ? "; " : "") + roles[i].first + ": " + roles[i].second;
     return s;
 }
 
@@ -235,6 +240,45 @@ static bool setFoldStack(int seqId, SetFold& F) {
     return true;
 }
 
+// ---- the fold, REDUCED: the only thing that has to cross a machine ----------
+//
+// docs/analysis-layers.md §3.5 draws the line at "the aggregate runs where the
+// pixels are", and §6 at "fit・KPI はスカラの上". Everything below this point is
+// composition - sqrt(max(0, var - C)), the clamp, mu, the ratio, the OLS - and
+// every one of those runs HERE, on this machine, out of the handful of scalars
+// in these two structs. What produced the scalars is a transport question: the
+// local fold above, or a peer's MOP_SET_FOLD (core/app/setanalysis_remote.inc).
+//
+// So the equality between a local run and a peer run is STRUCTURAL rather than
+// maintained: there is one composer per row and it does not know which side
+// folded. The reductions themselves are one function too (core/setfold.h),
+// called by this file and by core/serve.cpp.
+struct SetRoleFold {
+    std::string role;                 // the schema's name
+    // The BINDING is the client's: a peer knows a path, not which stack a set
+    // declared to be the dark. n/N are the peer's facts (#134 RP13); the name
+    // and the head path are ours.
+    std::string member, headPath;
+    bool folded = false;              // false = fewer than 2 frames, which is a
+                                      // REFUSAL of the analysis and worded below
+    int W = 0, H = 0, C = 0, nPl = 1;
+    int cfa = 0, cfaPattern = 0;
+    int frames = 0, expected = 0;     // n of N (the canon's mandatory pair)
+    uint64_t nonFinite = 0;
+    size_t dropped = 0;
+    setfold::PlaneAcc pl[4];
+    DetrendReport shade;              // of THIS role's mean image, when asked for
+    std::string cutoff;               // "" = raw (a peer folds files, and files are raw)
+};
+// The join: what two roles' mean images make together, reduced where they both
+// are. Never composable from the two roles' own sums - see core/setfold.h.
+struct SetJoinFold {
+    bool ok = false;
+    int nPl = 1;
+    setfold::PairAcc pl[4];
+    DetrendReport shade;              // of D, which is the picture the ratio is over
+};
+
 // ---- role resolution: a binding is DECLARED, never inferred ------------------
 // docs/terminology.md: "役割の束縛は宣言である。推論しない — フォルダ名や
 // level 0 から dark を推測して束ねない". Nothing below looks at a folder name, a
@@ -336,6 +380,11 @@ struct SetResult {
     // provenance the display may not drop (docs/analysis-layers.md §8)
     std::string cutoff = kSetCutoffRaw;
     std::string form;
+    // WHO folded it (docs/analysis-layers.md §8's 計算者欄, #46). Empty = this
+    // machine, which is what the panel has always printed as "[local]"; a peer
+    // fold carries the peer's own viewer version, read off its reply and never
+    // filled in from ours - a citation names the computer.
+    std::string computedBy;
     std::vector<SetRoleUse> used;
     // ...and, for a row whose input is a SWEEP, the settled second half of the
     // tag: "- sweep: <series>, M levels" (docs/flat-field-stats.md (c),
@@ -344,18 +393,6 @@ struct SetResult {
     std::string sweep;
     int levels = 0;
 };
-
-// The figure, off a mean image the fold already built. The plane map is the
-// FOLD's own, not a fresh one, so the shading reported is the shading of
-// exactly the population the statistic beside it pooled.
-static void setShadingOf(SetResult& R, const std::vector<double>& img, const SetFold& F) {
-    DetrendReport S = detrendProbeT(img.data(), F.W, F.H, F.C, F.plane.data(), F.nPl);
-    for (int p = 0; p < R.nPl && p < 4; p++) {
-        R.shadePp[p] = S.pl[p].ppDn;
-        R.shadePct[p] = S.pl[p].pct;
-        R.shadePctOk[p] = S.pl[p].pctOk;
-    }
-}
 
 // The result's own name (canon invariant (a): "解析結果は自分の層と (set 解析
 // なら) set を名乗る"). docs/flat-field-stats.md (b) fixes the tag as
@@ -384,10 +421,58 @@ static std::string setResultTitle(const SetResult& R) {
     return s;
 }
 
-static void setUseFromFold(SetRoleUse& u, const char* role, const SetFold& F) {
-    u.role = role; u.member = F.name; u.headPath = F.headPath;
+static void setUseFromFold(SetRoleUse& u, const SetRoleFold& F) {
+    u.role = F.role; u.member = F.member; u.headPath = F.headPath;
     u.n = F.frames; u.N = F.expected;
     u.nonFinite = F.nonFinite; u.dropped = F.dropped;
+}
+
+// The local fold, reduced. `wantShade` because the figure beside a row has to
+// describe the picture THAT ROW measured: DSNU measures the dark's mean image
+// and asks for it here, while PRNU measures D and asks for it on the join - so
+// nothing fits a surface it will not print.
+static void setReduceLocal(SetRoleFold& R, const char* role, const SetFold& F,
+                           bool wantShade) {
+    R.role = role;
+    R.member = F.name;
+    R.headPath = F.headPath;
+    R.folded = F.valid;
+    R.W = F.W; R.H = F.H; R.C = F.C; R.nPl = F.nPl;
+    R.cfa = F.cfa; R.cfaPattern = F.cfaPattern;
+    R.frames = F.frames; R.expected = F.expected;
+    R.nonFinite = F.nonFinite; R.dropped = F.dropped;
+    if (!F.valid) return;
+    R.cutoff = setCutoffOfSeq(F.seqId);
+    setfold::reduceOne(F.M.data(), F.corr.data(), F.plane.data(), F.M.size(), R.pl);
+    if (wantShade)
+        R.shade = detrendProbeT(F.M.data(), F.W, F.H, F.C, F.plane.data(), F.nPl);
+}
+static void setReduceLocalPair(SetJoinFold& J, const SetFold& Fa, const SetFold& Fb) {
+    J.nPl = Fa.nPl;
+    setfold::reducePair(Fa.M.data(), Fa.corr.data(), Fb.M.data(), Fb.corr.data(),
+                        Fa.plane.data(), Fa.M.size(), J.pl);
+    std::vector<double> D(Fa.M.size());
+    setfold::differenceImage(Fa.M.data(), Fb.M.data(), Fa.M.size(), D.data());
+    J.shade = detrendProbeT(D.data(), Fa.W, Fa.H, Fa.C, Fa.plane.data(), Fa.nPl);
+    J.ok = true;
+}
+
+// The shading figure, off whichever probe the row's own picture produced.
+static void setShadingFrom(SetResult& R, const DetrendReport& S) {
+    for (int p = 0; p < R.nPl && p < 4; p++) {
+        R.shadePp[p] = S.pl[p].ppDn;
+        R.shadePct[p] = S.pl[p].pct;
+        R.shadePctOk[p] = S.pl[p].pctOk;
+    }
+}
+
+// The one-line refusal for a role that could not be folded, in the settled
+// words. Composed from the role's own facts, so it reads identically whether
+// the frames were counted here or on a peer.
+static std::string setShortRoleRefusal(const SetRoleFold& F) {
+    return "\"" + F.role + "\": needs >= " + std::to_string(setfold::kMinFrames) +
+           " frames - \"" + F.member + "\" has " + std::to_string(F.frames) +
+           " of " + std::to_string(F.expected) + " loaded";
 }
 
 // One plane's corrected fixed-pattern variance from a spatial accumulator.
@@ -409,6 +494,44 @@ static SetPlaneFpn setPlaneFpn(double s1, double s2, double corrSum, double n) {
 }
 
 // ---- DSNU: {"dark": Stack()} -------------------------------------------------
+//
+// The COMPOSITION, out of the four numbers per plane a fold reduces to. It does
+// not know, and must not know, which machine produced them - that is the whole
+// content of "one estimator, two transports" (docs/analysis-layers.md §3.5).
+static SetResult composeDirectDsnu(const std::string& setName, const SetRoleFold& D) {
+    SetResult R;
+    R.kind = SA_DSNU;
+    R.setName = setName;
+    R.form = kSetAnalyzers[SA_DSNU].form;
+    if (!D.folded) { R.refusal = setShortRoleRefusal(D); return R; }
+    // No detrend on a dark, ever - and for a reason worth keeping written down:
+    // there is no illumination, so there is no shading to remove, and the
+    // low-frequency structure a dark does carry (a temperature gradient) IS part
+    // of the DSNU rather than something to subtract off it
+    // (docs/flat-field-stats.md (b)).
+    R.nPl = D.nPl; R.cfa = D.cfa; R.cfaPattern = D.cfaPattern;
+    for (int p = 0; p < R.nPl; p++) {
+        const SetPlaneFpn f = setPlaneFpn(D.pl[p].s1, D.pl[p].s2, D.pl[p].cs, D.pl[p].n);
+        R.value[p] = sqrt(f.fvar);
+        R.corrDn[p] = sqrt(f.corr);
+        R.uncorr[p] = sqrt(f.var);        // the bound this row used to be
+        R.clamped[p] = f.clamped;
+        R.samples[p] = (size_t)D.pl[p].n;
+    }
+    // The shading of the picture this row measured. On a dark the ratio to the
+    // centre usually has no level to be a ratio of, and the p-p carries it
+    // instead - which is the honest reading anyway: a dark's low-frequency
+    // structure (a temperature gradient) IS part of this quantity and is not
+    // something to remove (docs/flat-field-stats.md (b)). The figure is here so
+    // it can be SEEN, not so it can be subtracted.
+    setShadingFrom(R, D.shade);
+    R.cutoff = D.cutoff.empty() ? kSetCutoffRaw : D.cutoff;
+    R.used.emplace_back();
+    setUseFromFold(R.used.back(), D);
+    R.ok = true;
+    return R;
+}
+
 static SetResult runDirectDsnu(const App::ASet& S) {
     SetResult R;
     R.kind = SA_DSNU;
@@ -418,112 +541,72 @@ static SetResult runDirectDsnu(const App::ASet& S) {
     R.refusal = setRoleRefusal(S, "dark", &darkSeq);
     if (!R.refusal.empty()) return R;
     SetFold Fd;
-    if (!setFoldStack(darkSeq, Fd)) {
-        R.refusal = Fd.err == "min_frames"
-            ? "\"dark\": needs >= 2 frames - \"" + Fd.name + "\" has " +
-              std::to_string(Fd.frames) + " of " + std::to_string(Fd.expected) + " loaded"
-            : "\"dark\": " + Fd.err;
+    if (!setFoldStack(darkSeq, Fd) && Fd.err != "min_frames") {
+        R.refusal = "\"dark\": " + Fd.err;
         return R;
     }
-    // No detrend on a dark, ever - and for a reason worth keeping written down:
-    // there is no illumination, so there is no shading to remove, and the
-    // low-frequency structure a dark does carry (a temperature gradient) IS part
-    // of the DSNU rather than something to subtract off it
-    // (docs/flat-field-stats.md (b)).
-    double s1[4] = {}, s2[4] = {}, cs[4] = {}, n[4] = {};
-    for (size_t i = 0; i < Fd.M.size(); i++) {
-        if (!std::isfinite(Fd.M[i])) continue;
-        const int p = Fd.plane[i];
-        s1[p] += Fd.M[i]; s2[p] += Fd.M[i] * Fd.M[i]; cs[p] += Fd.corr[i]; n[p] += 1.0;
-    }
-    R.nPl = Fd.nPl; R.cfa = Fd.cfa; R.cfaPattern = Fd.cfaPattern;
-    for (int p = 0; p < R.nPl; p++) {
-        const SetPlaneFpn f = setPlaneFpn(s1[p], s2[p], cs[p], n[p]);
-        R.value[p] = sqrt(f.fvar);
-        R.corrDn[p] = sqrt(f.corr);
-        R.uncorr[p] = sqrt(f.var);        // the bound this row used to be
-        R.clamped[p] = f.clamped;
-        R.samples[p] = (size_t)n[p];
-    }
-    // The shading of the picture this row measured. On a dark the ratio to the
-    // centre usually has no level to be a ratio of, and the p-p carries it
-    // instead - which is the honest reading anyway: a dark's low-frequency
-    // structure (a temperature gradient) IS part of this quantity and is not
-    // something to remove (docs/flat-field-stats.md (b)). The figure is here so
-    // it can be SEEN, not so it can be subtracted.
-    setShadingOf(R, Fd.M, Fd);
-    R.cutoff = setCutoffOfSeq(Fd.seqId);
-    R.used.emplace_back();
-    setUseFromFold(R.used.back(), "dark", Fd);
-    R.ok = true;
-    return R;
+    SetRoleFold D;
+    setReduceLocal(D, "dark", Fd, true);
+    return composeDirectDsnu(S.name, D);
 }
 
 // ---- PRNU: {"image": Stack(), "dark": Stack()} -------------------------------
-static SetResult runDirectPrnu(const App::ASet& S) {
+//
+// The composition again - but note what it takes: the JOIN, not the two roles'
+// own sums. sum(D^2) is not a function of sum(M_i^2) and sum(M_d^2), and the
+// route that would make it one (a sixth scalar, the joint moment sum(M_i*M_d))
+// is algebraically equal and a different sequence of operations, so it does not
+// return this row's binary64. The difference image is therefore formed where
+// both pictures are, and the five numbers per plane below are what travels -
+// core/setfold.h has the measurement that settled it.
+static SetResult composeDirectPrnu(const std::string& setName, const SetRoleFold& I,
+                                   const SetRoleFold& D, const SetJoinFold& J) {
     SetResult R;
     R.kind = SA_PRNU;
-    R.setName = S.name;
+    R.setName = setName;
     R.form = kSetAnalyzers[SA_PRNU].form;
-    int imgSeq = 0, darkSeq = 0;
-    R.refusal = setRoleRefusal(S, "image", &imgSeq);
-    if (!R.refusal.empty()) return R;
-    R.refusal = setRoleRefusal(S, "dark", &darkSeq);
-    if (!R.refusal.empty()) return R;
-    SetFold Fi, Fd;
-    for (int which = 0; which < 2; which++) {
-        SetFold& F = which ? Fd : Fi;
-        const char* role = which ? "dark" : "image";
-        if (setFoldStack(which ? darkSeq : imgSeq, F)) continue;
-        R.refusal = F.err == "min_frames"
-            ? std::string("\"") + role + "\": needs >= 2 frames - \"" + F.name +
-              "\" has " + std::to_string(F.frames) + " of " +
-              std::to_string(F.expected) + " loaded"
-            : std::string("\"") + role + "\": " + F.err;
-        return R;
-    }
+    if (!I.folded) { R.refusal = setShortRoleRefusal(I); return R; }
+    if (!D.folded) { R.refusal = setShortRoleRefusal(D); return R; }
     // Shape disagreement. The pixel-wise subtraction is what makes this
     // estimator exact under y = d + g*mu, and it is only defined between two
     // pictures of the same sensor: the refusal NAMES both shapes, the peer's
     // house style since #71.
-    if (Fi.W != Fd.W || Fi.H != Fd.H || Fi.C != Fd.C) {
+    if (I.W != D.W || I.H != D.H || I.C != D.C) {
         char b[224];
         snprintf(b, sizeof b,
                  "\"image\" is %dx%dx%dch and \"dark\" is %dx%dx%dch - "
                  "the per-pixel subtraction needs one shape",
-                 Fi.W, Fi.H, Fi.C, Fd.W, Fd.H, Fd.C);
+                 I.W, I.H, I.C, D.W, D.H, D.C);
         R.refusal = b;
         return R;
     }
-    if (Fi.cfa != Fd.cfa || (Fi.cfa != 0 && Fi.cfaPattern != Fd.cfaPattern)) {
+    if (I.cfa != D.cfa || (I.cfa != 0 && I.cfaPattern != D.cfaPattern)) {
         R.refusal = "\"image\" and \"dark\" do not read as the same mosaic - "
                     "CFA planes are never mixed, so the planes have to line up";
         return R;
     }
-    double sI[4] = {}, sD[4] = {}, dq[4] = {}, cs[4] = {}, n[4] = {};
-    for (size_t i = 0; i < Fi.M.size(); i++) {
-        // a sample either side could not measure has no difference either: it
-        // leaves BOTH the variance and the mean, and is counted as dropped
-        if (!std::isfinite(Fi.M[i]) || !std::isfinite(Fd.M[i])) continue;
-        const int p = Fi.plane[i];
-        const double d = Fi.M[i] - Fd.M[i];
-        sI[p] += Fi.M[i]; sD[p] += Fd.M[i];
-        dq[p] += d * d; cs[p] += Fi.corr[i] + Fd.corr[i]; n[p] += 1.0;
+    if (!J.ok) {
+        // The two roles line up and the join still did not arrive: that is a
+        // transport fact, not a statement about the data, and it says so.
+        R.refusal = "the per-pixel difference of \"image\" and \"dark\" was not "
+                    "computed - this row is not composed from anything else";
+        return R;
     }
-    R.nPl = Fi.nPl; R.cfa = Fi.cfa; R.cfaPattern = Fi.cfaPattern;
+    R.nPl = I.nPl; R.cfa = I.cfa; R.cfaPattern = I.cfaPattern;
     bool anyMu = false;
     for (int p = 0; p < R.nPl; p++) {
-        if (n[p] < 2.0) continue;
+        const setfold::PairAcc& a = J.pl[p];
+        if (a.n < 2.0) continue;
         // mu is written as the settled formula writes it - the difference of the
         // two spatial means, each over the samples that actually entered.
-        const double mu = sI[p] / n[p] - sD[p] / n[p];
-        const double s1 = sI[p] - sD[p];                 // sum of D over the plane
-        const SetPlaneFpn f = setPlaneFpn(s1, dq[p], cs[p], n[p]);
+        const double mu = a.s1a / a.n - a.s1b / a.n;
+        const double s1 = a.s1a - a.s1b;                 // sum of D over the plane
+        const SetPlaneFpn f = setPlaneFpn(s1, a.dq, a.cs, a.n);
         R.mu[p] = mu;
         R.sigmaD[p] = sqrt(f.fvar);
         R.corrDn[p] = sqrt(f.corr);
         R.clamped[p] = f.clamped;
-        R.samples[p] = (size_t)n[p];
+        R.samples[p] = (size_t)a.n;
         if (mu > 0) {
             R.value[p] = 100.0 * sqrt(f.fvar) / mu;
             R.uncorr[p] = 100.0 * sqrt(f.var) / mu;
@@ -547,19 +630,44 @@ static SetResult runDirectPrnu(const App::ASet& S) {
     // figure beside it has to describe - and its centre level IS mu, so here
     // the ratio to the centre is defined and reads as "this fraction of the
     // signal is low-frequency illumination structure".
-    {
-        std::vector<double> D(Fi.M.size(), std::numeric_limits<double>::quiet_NaN());
-        for (size_t i = 0; i < D.size(); i++)
-            if (std::isfinite(Fi.M[i]) && std::isfinite(Fd.M[i])) D[i] = Fi.M[i] - Fd.M[i];
-        setShadingOf(R, D, Fi);
-    }
-    R.cutoff = setCutoffOfRoles({ { "image", Fi.seqId }, { "dark", Fd.seqId } });
+    setShadingFrom(R, J.shade);
+    R.cutoff = setCutoffOfRoles({ { "image", I.cutoff.empty() ? kSetCutoffRaw : I.cutoff },
+                                  { "dark",  D.cutoff.empty() ? kSetCutoffRaw : D.cutoff } });
     R.used.emplace_back();
-    setUseFromFold(R.used.back(), "image", Fi);
+    setUseFromFold(R.used.back(), I);
     R.used.emplace_back();
-    setUseFromFold(R.used.back(), "dark", Fd);
+    setUseFromFold(R.used.back(), D);
     R.ok = true;
     return R;
+}
+
+static SetResult runDirectPrnu(const App::ASet& S) {
+    SetResult R;
+    R.kind = SA_PRNU;
+    R.setName = S.name;
+    R.form = kSetAnalyzers[SA_PRNU].form;
+    int imgSeq = 0, darkSeq = 0;
+    R.refusal = setRoleRefusal(S, "image", &imgSeq);
+    if (!R.refusal.empty()) return R;
+    R.refusal = setRoleRefusal(S, "dark", &darkSeq);
+    if (!R.refusal.empty()) return R;
+    SetFold Fi, Fd;
+    for (int which = 0; which < 2; which++) {
+        SetFold& F = which ? Fd : Fi;
+        const char* role = which ? "dark" : "image";
+        if (setFoldStack(which ? darkSeq : imgSeq, F)) continue;
+        if (F.err == "min_frames") continue;   // composed below, in the settled words
+        R.refusal = std::string("\"") + role + "\": " + F.err;
+        return R;
+    }
+    SetRoleFold I, D;
+    setReduceLocal(I, "image", Fi, false);
+    setReduceLocal(D, "dark", Fd, false);
+    SetJoinFold J;
+    if (I.folded && D.folded && I.W == D.W && I.H == D.H && I.C == D.C &&
+        I.nPl == D.nPl)
+        setReduceLocalPair(J, Fi, Fd);
+    return composeDirectPrnu(S.name, I, D, J);
 }
 
 // The DIRECT pair only (kind < kSetDirectCount). The separation fit is one
@@ -679,146 +787,54 @@ static std::string sepLevelCensus(const SepFit& F) {
     return s;
 }
 
-static SepFit runSeparationFit(const App::ASet& S) {
-    SepFit F;
-    F.setName = S.name;
-    for (int i = 0; i < 2; i++) {
-        SetResult& R = i ? F.prnu : F.dsnu;
-        R.kind = i ? SA_SEP_PRNU : SA_SEP_DSNU;
-        R.setName = S.name;
-        R.form = kSetAnalyzers[R.kind].form;
-    }
-    auto refuse = [&F](const std::string& why) -> SepFit& {
-        F.refusal = why;
-        F.dsnu.refusal = why;
-        F.prnu.refusal = why;
-        return F;
-    };
-    int seriesId = 0, darkSeq = 0;
-    std::string why = setSeriesRoleRefusal(S, "sweep", &seriesId);
-    if (!why.empty()) return refuse(why);
-    why = setRoleRefusal(S, "dark", &darkSeq);
-    if (!why.empty()) return refuse(why);
-    const App::Series* Ser = seriesById(seriesId);
-    if (!Ser) return refuse("\"sweep\" names a series that is not open anymore");
-    F.seriesName = Ser->name;
-    F.paramName = Ser->paramName;
-    F.unit = Ser->unit;
-
-    // ---- the dark, which contributes ONE SCALAR PER PLANE ------------------
-    SetFold Fd;
-    if (!setFoldStack(darkSeq, Fd))
-        return refuse(Fd.err == "min_frames"
-            ? "\"dark\": needs >= 2 frames - \"" + Fd.name + "\" has " +
-              std::to_string(Fd.frames) + " of " + std::to_string(Fd.expected) + " loaded"
-            : "\"dark\": " + Fd.err);
-    double dSum[4] = {}, dN[4] = {};
-    for (size_t i = 0; i < Fd.M.size(); i++) {
-        if (!std::isfinite(Fd.M[i])) continue;
-        dSum[Fd.plane[i]] += Fd.M[i];
-        dN[Fd.plane[i]] += 1.0;
-    }
-    double darkMean[4];
+// What the separation fit takes off the dark: a per-plane SCALAR, and nothing
+// else. Unlike the direct PRNU nothing subtracts pixel from pixel here, which
+// is why this row needs no join on the wire at all - one MOP_SET_FOLD with
+// SJ_NONE over M+1 roles is the whole request.
+static void sepDarkMeans(const setfold::PlaneAcc* acc, double* out) {
     for (int p = 0; p < 4; p++)
-        darkMean[p] = dN[p] > 0 ? dSum[p] / dN[p]
-                                : std::numeric_limits<double>::quiet_NaN();
-    F.nPl = Fd.nPl; F.cfa = Fd.cfa; F.cfaPattern = Fd.cfaPattern;
+        out[p] = acc[p].n > 0 ? acc[p].s1 / acc[p].n
+                              : std::numeric_limits<double>::quiet_NaN();
+}
 
-    // ---- the levels --------------------------------------------------------
-    // Order of the tests is deliberate: what the member IS comes before what
-    // the user DECLARED about it, so "this can never be a level" and "you took
-    // this one out" never get reported as each other.
-    F.members = (int)Ser->members.size();
-    for (const auto& m : Ser->members) {
-        if (m.seqId == 0) {
-            const ImageDoc* fd = frameMemberDoc(m.frameUid);
-            if (!fd) { F.exGone++; continue; }
-            F.exFrame++;
-            F.skipped.push_back({ fd->name,
-                "a frame member has no time axis, so its s_t - and the "
-                "-sigma_t^2/N correction made of it - do not exist" });
-            continue;
-        }
-        const App::SeqInfo* si = seqInfo(m.seqId);
-        if (!si) { F.exGone++; continue; }
-        if (m.fold == FOLD_SUM) {
-            F.exSum++;
-            F.skipped.push_back({ si->name,
-                "stands as sum - a sum is n x the mean's scale, so its "
-                "sigma_fpn^2 and its mu are not the other levels' quantities" });
-            continue;
-        }
-        if (!m.include) {
-            F.exNotInc++;
-            F.skipped.push_back({ si->name, "not included (the series' own switch)" });
-            continue;
-        }
-        if (!std::isfinite(m.value)) {
-            F.exNoValue++;
-            F.skipped.push_back({ si->name,
-                "no value set - UNSET is not 0, and the series' rule is that it "
-                "does not enter a fit" });
-            continue;
-        }
-        SetFold Fl;
-        if (!setFoldStack(m.seqId, Fl)) {
-            if (Fl.err == "min_frames") {
-                F.exShort++;
-                F.skipped.push_back({ si->name,
-                    "needs >= 2 frames - " + std::to_string(Fl.frames) + " of " +
-                    std::to_string(Fl.expected) + " loaded" });
-                continue;
-            }
-            return refuse("\"sweep\" member \"" + si->name + "\": " + Fl.err);
-        }
-        // Planes, not pixels. mu takes a per-plane MEAN off the dark, so W x H
-        // may differ; what may not differ is what plane p means, or the two
-        // sides are not the same detector read the same way.
-        if (Fl.C != Fd.C || Fl.nPl != Fd.nPl || Fl.cfa != Fd.cfa ||
-            (Fl.cfa != 0 && Fl.cfaPattern != Fd.cfaPattern)) {
-            char b[288];
-            snprintf(b, sizeof b,
-                     "sweep member \"%s\" is %dch / %d plane(s) and \"dark\" is "
-                     "%dch / %d plane(s) - mu is a per-plane difference, so the "
-                     "planes have to mean the same thing on both sides",
-                     si->name.c_str(), Fl.C, Fl.nPl, Fd.C, Fd.nPl);
-            return refuse(b);
-        }
-        double s1[4] = {}, s2[4] = {}, cs[4] = {}, np[4] = {};
-        for (size_t i = 0; i < Fl.M.size(); i++) {
-            if (!std::isfinite(Fl.M[i])) continue;
-            const int p = Fl.plane[i];
-            s1[p] += Fl.M[i]; s2[p] += Fl.M[i] * Fl.M[i];
-            cs[p] += Fl.corr[i]; np[p] += 1.0;
-        }
-        SepLevel Lv;
-        Lv.seqId = m.seqId;
-        Lv.member = Fl.name;
-        Lv.headPath = Fl.headPath;
-        Lv.value = m.value;
-        Lv.n = Fl.frames; Lv.N = Fl.expected;
-        Lv.nonFinite = Fl.nonFinite; Lv.dropped = Fl.dropped;
-        for (int p = 0; p < F.nPl; p++) {
-            // the SAME per-plane arithmetic the direct rows use - not "the same
-            // formula", the same function
-            const SetPlaneFpn f = setPlaneFpn(s1[p], s2[p], cs[p], np[p]);
-            Lv.mu[p] = np[p] > 0 ? s1[p] / np[p] - darkMean[p]
-                                 : std::numeric_limits<double>::quiet_NaN();
-            Lv.fpnVar[p] = f.fvar;
-            Lv.fpnVarRaw[p] = f.var;
-            Lv.corr[p] = f.corr;
-            Lv.clamped[p] = f.clamped;
-            Lv.samples[p] = (size_t)np[p];
-        }
-        F.levels.push_back(std::move(Lv));
-    }
+// One level's contribution to the fit, from that level's four numbers and the
+// dark's one. The SAME per-plane arithmetic the direct rows use - not "the same
+// formula", the same function - and the same one whichever side reduced.
+static void sepLevelFromAcc(SepLevel& Lv, int p, const setfold::PlaneAcc& a,
+                            double darkMean) {
+    const SetPlaneFpn f = setPlaneFpn(a.s1, a.s2, a.cs, a.n);
+    Lv.mu[p] = a.n > 0 ? a.s1 / a.n - darkMean
+                       : std::numeric_limits<double>::quiet_NaN();
+    Lv.fpnVar[p] = f.fvar;
+    Lv.fpnVarRaw[p] = f.var;
+    Lv.corr[p] = f.corr;
+    Lv.clamped[p] = f.clamped;
+    Lv.samples[p] = (size_t)a.n;
+}
+
+// The refusal, on all three faces of the same fit: the fit itself and the two
+// named rows it would have produced.
+static SepFit& sepRefuse(SepFit& F, const std::string& why) {
+    F.refusal = why;
+    F.dsnu.refusal = why;
+    F.prnu.refusal = why;
+    return F;
+}
+
+// The FIT, composed out of levels that are already per-plane scalars. Split
+// from the gathering above it for the same reason the direct rows were: what a
+// level contributes is (sum M, sum M^2, sum C, n) and a mu, so the levels can
+// have been folded anywhere. This is the row PR #131 said needed the peer most
+// - it folds M+1 stacks - and it is also the row that needed the least, because
+// nothing here ever wanted a picture.
+static SepFit& sepComposeFit(SepFit& F, const SetRoleFold& dark) {
     F.M = (int)F.levels.size();
     if (F.M < 3)
-        return refuse("the sweep \"" + F.seriesName + "\" has " +
-                      std::to_string(F.M) + " usable level(s) - the separation "
-                      "needs 3 (two points fit a line exactly, so there is no "
-                      "residual left to check the model with). " +
-                      sepLevelCensus(F));
+        return sepRefuse(F, "the sweep \"" + F.seriesName + "\" has " +
+                            std::to_string(F.M) + " usable level(s) - the separation "
+                            "needs 3 (two points fit a line exactly, so there is no "
+                            "residual left to check the model with). " +
+                            sepLevelCensus(F));
 
     // ---- the OLS, per plane, unweighted (判断5) -----------------------------
     // x = mu^2, y = the corrected sigma_fpn^2. Written in the centred form
@@ -881,8 +897,8 @@ static SepFit runSeparationFit(const App::ASet& S) {
         // no plane produced a line, so there is no number anywhere: the whole
         // analysis refuses, in the first plane's own words
         for (int p = 0; p < F.nPl; p++)
-            if (!F.planeWhy[p].empty()) return refuse(F.planeWhy[p]);
-        return refuse("the levels do not make a line on any plane");
+            if (!F.planeWhy[p].empty()) return sepRefuse(F, F.planeWhy[p]);
+        return sepRefuse(F, "the levels do not make a line on any plane");
     }
 
     // ---- the two named outputs ---------------------------------------------
@@ -909,9 +925,122 @@ static SepFit runSeparationFit(const App::ASet& S) {
             R.samples[p] = (size_t)F.M;
         }
         R.used.emplace_back();
-        setUseFromFold(R.used.back(), "dark", Fd);
+        setUseFromFold(R.used.back(), dark);
         R.ok = true;
     }
     F.ok = true;
     return F;
+}
+
+static SepFit runSeparationFit(const App::ASet& S) {
+    SepFit F;
+    F.setName = S.name;
+    for (int i = 0; i < 2; i++) {
+        SetResult& R = i ? F.prnu : F.dsnu;
+        R.kind = i ? SA_SEP_PRNU : SA_SEP_DSNU;
+        R.setName = S.name;
+        R.form = kSetAnalyzers[R.kind].form;
+    }
+    auto refuse = [&F](const std::string& why) -> SepFit& { return sepRefuse(F, why); };
+    int seriesId = 0, darkSeq = 0;
+    std::string why = setSeriesRoleRefusal(S, "sweep", &seriesId);
+    if (!why.empty()) return refuse(why);
+    why = setRoleRefusal(S, "dark", &darkSeq);
+    if (!why.empty()) return refuse(why);
+    const App::Series* Ser = seriesById(seriesId);
+    if (!Ser) return refuse("\"sweep\" names a series that is not open anymore");
+    F.seriesName = Ser->name;
+    F.paramName = Ser->paramName;
+    F.unit = Ser->unit;
+
+    // ---- the dark, which contributes ONE SCALAR PER PLANE ------------------
+    SetFold Fd;
+    if (!setFoldStack(darkSeq, Fd))
+        return refuse(Fd.err == "min_frames"
+            ? "\"dark\": needs >= 2 frames - \"" + Fd.name + "\" has " +
+              std::to_string(Fd.frames) + " of " + std::to_string(Fd.expected) + " loaded"
+            : "\"dark\": " + Fd.err);
+    setfold::PlaneAcc dacc[4];
+    setfold::reduceOne(Fd.M.data(), Fd.corr.data(), Fd.plane.data(), Fd.M.size(), dacc);
+    double darkMean[4];
+    sepDarkMeans(dacc, darkMean);
+    F.nPl = Fd.nPl; F.cfa = Fd.cfa; F.cfaPattern = Fd.cfaPattern;
+
+    // ---- the levels --------------------------------------------------------
+    // Order of the tests is deliberate: what the member IS comes before what
+    // the user DECLARED about it, so "this can never be a level" and "you took
+    // this one out" never get reported as each other.
+    F.members = (int)Ser->members.size();
+    for (const auto& m : Ser->members) {
+        if (m.seqId == 0) {
+            const ImageDoc* fd = frameMemberDoc(m.frameUid);
+            if (!fd) { F.exGone++; continue; }
+            F.exFrame++;
+            F.skipped.push_back({ fd->name,
+                "a frame member has no time axis, so its s_t - and the "
+                "-sigma_t^2/N correction made of it - do not exist" });
+            continue;
+        }
+        const App::SeqInfo* si = seqInfo(m.seqId);
+        if (!si) { F.exGone++; continue; }
+        if (m.fold == FOLD_SUM) {
+            F.exSum++;
+            F.skipped.push_back({ si->name,
+                "stands as sum - a sum is n x the mean's scale, so its "
+                "sigma_fpn^2 and its mu are not the other levels' quantities" });
+            continue;
+        }
+        if (!m.include) {
+            F.exNotInc++;
+            F.skipped.push_back({ si->name, "not included (the series' own switch)" });
+            continue;
+        }
+        if (!std::isfinite(m.value)) {
+            F.exNoValue++;
+            F.skipped.push_back({ si->name,
+                "no value set - UNSET is not 0, and the series' rule is that it "
+                "does not enter a fit" });
+            continue;
+        }
+        SetFold Fl;
+        if (!setFoldStack(m.seqId, Fl)) {
+            if (Fl.err == "min_frames") {
+                F.exShort++;
+                F.skipped.push_back({ si->name,
+                    "needs >= 2 frames - " + std::to_string(Fl.frames) + " of " +
+                    std::to_string(Fl.expected) + " loaded" });
+                continue;
+            }
+            return refuse("\"sweep\" member \"" + si->name + "\": " + Fl.err);
+        }
+        // Planes, not pixels. mu takes a per-plane MEAN off the dark, so W x H
+        // may differ; what may not differ is what plane p means, or the two
+        // sides are not the same detector read the same way.
+        if (Fl.C != Fd.C || Fl.nPl != Fd.nPl || Fl.cfa != Fd.cfa ||
+            (Fl.cfa != 0 && Fl.cfaPattern != Fd.cfaPattern)) {
+            char b[288];
+            snprintf(b, sizeof b,
+                     "sweep member \"%s\" is %dch / %d plane(s) and \"dark\" is "
+                     "%dch / %d plane(s) - mu is a per-plane difference, so the "
+                     "planes have to mean the same thing on both sides",
+                     si->name.c_str(), Fl.C, Fl.nPl, Fd.C, Fd.nPl);
+            return refuse(b);
+        }
+        // the same reduction the peer runs, by being the same function
+        setfold::PlaneAcc acc[4];
+        setfold::reduceOne(Fl.M.data(), Fl.corr.data(), Fl.plane.data(), Fl.M.size(), acc);
+        SepLevel Lv;
+        Lv.seqId = m.seqId;
+        Lv.member = Fl.name;
+        Lv.headPath = Fl.headPath;
+        Lv.value = m.value;
+        Lv.n = Fl.frames; Lv.N = Fl.expected;
+        Lv.nonFinite = Fl.nonFinite; Lv.dropped = Fl.dropped;
+        for (int p = 0; p < F.nPl; p++)
+            sepLevelFromAcc(Lv, p, acc[p], darkMean[p]);
+        F.levels.push_back(std::move(Lv));
+    }
+    SetRoleFold DK;
+    setReduceLocal(DK, "dark", Fd, false);
+    return sepComposeFit(F, DK);
 }

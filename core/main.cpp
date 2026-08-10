@@ -28,6 +28,7 @@
 #include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
 #include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
+#include "setfold.h"                 // the fold half of a set analysis, shared with the peer
 #include "app_icon.h"
 #include "window_frame.h"
 
@@ -930,6 +931,7 @@ int main(int argc, char** argv) {
     #include "selftest/aset.inc"
 
     #include "selftest/setanalysis.inc"
+
 
     #include "selftest/detrend.inc"
 

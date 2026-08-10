@@ -421,7 +421,17 @@ static void drawPanelSetAnalysis() {
     // ---- provenance: what a number pasted into a report has to carry ---------
     ImGui::Separator();
     if (ImGui::TreeNodeEx("provenance", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextDisabled("[local]   set \"%s\" in batch \"%s\"", Sp->name.c_str(),
+        // WHO computed it. Every row this panel can produce today is folded
+        // here, so this reads "[local]" - but the field is the result's own
+        // (SetResult::computedBy) rather than a literal, because a row folded
+        // on a peer carries the peer's answer to the same question and a panel
+        // that printed "[local]" over it would be citing the wrong machine.
+        // Routing a run to a peer from this panel is 残課題【Fable】.
+        std::string who;
+        for (int k = 0; k < SA_COUNT && who.empty(); k++)
+            if (g_setPanel.r[k].ok) who = g_setPanel.r[k].computedBy;
+        ImGui::TextDisabled("%s   set \"%s\" in batch \"%s\"",
+                            who.empty() ? "[local]" : who.c_str(), Sp->name.c_str(),
                             batchNameOf(Sp->batchId).c_str());
         for (const auto& r : Sp->roles) {
             if (!r.bound()) {
