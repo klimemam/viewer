@@ -156,42 +156,162 @@ jobs:
       # run old distros: a binary linked against the runner's glibc 2.39 dies
       # there with "GLIBC_2.38 not found" (reproduced on the user's server).
       # Rebuild it - and the plugins MEASURE loads - inside Ubuntu 20.04
-      # (glibc 2.31), which covers everything from RHEL 8 up.
+      # (glibc 2.31), which covers RHEL 9, Debian 11 and Ubuntu 20.04 up.
+      # NOT RHEL 8, which this line used to claim: the assertion below measures
+      # 2.29, and RHEL 8 ships 2.28. The container's own libm is what forces it
+      # (exp, log and pow gained a version at 2.29), so the claim was wrong on
+      # the day it was written rather than broken since - but a number that is
+      # now asserted must not sit under a sentence that contradicts it.
+      #
+      # THE SCRIPT ARRIVES ON STDIN, and that is a bug fix rather than a style
+      # choice. It used to be one single-quoted argument to `bash -ec '...'`,
+      # and an apostrophe in an English comment - "the peer's PNG readers",
+      # added when #148 gave this step the picture readers - CLOSED that quote.
+      # Everything after it was then parsed by the RUNNER's shell instead: the
+      # container compiled miniz.o and exited, and the runner ran the rest, so
+      # the "compat" binary was being linked against the runner's own glibc.
+      # It failed loudly only because the runner's /tmp had no miniz.o in it.
+      # NOTHING SWALLOWED AN ERROR - `bash -ec` had -e all along; the script had
+      # been cut in half by a quote, and each half stopped on its first failure
+      # exactly as told. A heredoc quoted with <<'COMPAT' has no such character:
+      # neither shell parses anything inside it, so prose in these comments
+      # cannot reach out and change what runs. `set -euo pipefail` is written
+      # out at the top for the same reason - the shell options now belong to the
+      # script rather than to the way it happened to be quoted.
       - name: Rebuild viewer-serve for old glibc (Ubuntu 20.04 container)
         if: runner.os == 'Linux'
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -ec '
-            # archive.ubuntu.com is flaky from Actions runners (two runs in a
-            # row died on "Connection failed" here); the Azure mirror is what
-            # the runner images themselves use, and retries cover the rest
-            sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
-            echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
-            apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ >/dev/null
-            # miniz.c is C: compiling it as C++ turns its tentative definitions
-            # into redefinition errors, so it gets its own gcc pass
-            gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
-            # core/version.cpp, and -Ibuild/generated for the header the cmake
-            # build above wrote there. MOP_SET_FOLD returns the peer version as
-            # PROVENANCE - "which build folded this", which is what #46 asks of
-            # a built-in, since a built-in has no dll to name instead. It is
-            # written into the reply and NEVER compared, so it cannot become a
-            # parity refusal (PR #135) and it costs this list exactly one file.
-            # This list is the whole definition of the compat binary, so keep it
-            # minimal - but a symbol the peer genuinely needs belongs in it.
-            g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -Icore -Iinclude -Ibuild/_deps/miniz-src \
-                -Ibuild/generated \
-                core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
-                /tmp/miniz.o \
-                -o build/viewer-serve \
-                -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
-            for f in plugins/*.c; do
-              gcc -O2 -shared -fPIC -Iinclude "$f" \
-                  -o "build/plugins/$(basename "${f%.c}").so" -lm
-            done'
+          # OpenEXR is built from THE SAME SOURCES the cmake build above
+          # fetched: CMakeLists.txt pins the versions, FetchContent unpacked
+          # them here, and this step compiles that tree for the old container.
+          # One pin, every platform - a peer that decoded .exr with a different
+          # OpenEXR than the client is #148's two-answers defect one level down.
+          # If a runner image ever ships OpenEXR, find_package() wins upstairs
+          # and these directories never appear; fail HERE rather than let this
+          # step quietly reach for some other copy of the library.
+          for d in build/_deps/imath-src build/_deps/openexr-src; do
+            test -d "$d" || { echo "$d is missing: the cmake build did not fetch OpenEXR (a system copy satisfied find_package?), so this step cannot build the version the client uses"; exit 1; }
+          done
+          docker run --rm -i -v "$PWD:/src" -w /src ubuntu:20.04 bash -s <<'COMPAT'
+          set -euo pipefail
+          # archive.ubuntu.com is flaky from Actions runners (two runs in a
+          # row died on "Connection failed" here); the Azure mirror is what
+          # the runner images themselves use, and retries cover the rest
+          sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
+          echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
+          apt-get update -qq >/dev/null
+          # cmake and make join g++ because OpenEXR is a configured project and
+          # not a file to compile. 20.04's own cmake 3.16.3 is enough: both
+          # OpenEXR 3.4 and Imath 3.2 ask for 3.14.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ cmake make >/dev/null
+          # ---- OpenEXR + Imath, static, in the container ---------------------
+          # This is the one reader that is a LIBRARY, and #148 judgment B says
+          # the peer serves what the viewer reads - so the peer in the release
+          # tarball must decode .exr, or the same file reads two ways depending
+          # on which end opened it. That is the defect #148 exists to remove,
+          # and shipping a peer without it would recreate it one platform down.
+          #
+          # STATIC, and that is the requirement rather than a preference: this
+          # binary is copied onto someone else's compute box, and a peer that
+          # needed libOpenEXR.so over there would defeat the whole step.
+          #
+          # NOT CACHED, deliberately. It costs about a minute on a runner, and
+          # a correct cache key would have to name the container's compiler as
+          # well as the library version - `ubuntu:20.04` is a MOVING tag, so no
+          # key available here can promise the cached .a files were built by the
+          # g++ that is about to link them. A minute of CI is cheaper than a
+          # cache that can hand this step a stale library.
+          cmake -S build/_deps/imath-src -B /tmp/imath-build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+                -DIMATH_INSTALL_PKG_CONFIG=OFF -DCMAKE_INSTALL_PREFIX=/tmp/exr >/dev/null
+          cmake --build /tmp/imath-build -j"$(nproc)" --target install >/dev/null
+          cmake -S build/_deps/openexr-src -B /tmp/openexr-build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+                -DOPENEXR_INSTALL_PKG_CONFIG=OFF -DOPENEXR_INSTALL_DOCS=OFF \
+                -DOPENEXR_INSTALL_TOOLS=OFF -DOPENEXR_BUILD_TOOLS=OFF \
+                -DOPENEXR_BUILD_EXAMPLES=OFF -DOPENEXR_BUILD_PYTHON=OFF \
+                -DOPENEXR_TEST_LIBRARIES=OFF -DOPENEXR_TEST_TOOLS=OFF \
+                -DOPENEXR_FORCE_INTERNAL_DEFLATE=ON \
+                -DCMAKE_PREFIX_PATH=/tmp/exr -DCMAKE_INSTALL_PREFIX=/tmp/exr >/dev/null
+          cmake --build /tmp/openexr-build -j"$(nproc)" --target install >/dev/null
+          # miniz.c is C: compiling it as C++ turns its tentative definitions
+          # into redefinition errors, so it gets its own gcc pass
+          gcc -O2 -DMINIZ_NO_STDIO -c build/_deps/miniz-src/miniz.c -o /tmp/miniz.o
+          # stb_image is C too, and VENDORED in the tree (third_party/stb), so
+          # the peer's PNG and JPEG readers cost this step one more gcc pass
+          # and no dependency at all. Same warnings-off treatment as miniz: it
+          # is third-party code, and core/imagefile.cpp is the file this
+          # project holds to -Wall.
+          gcc -O2 -Ithird_party/stb -c core/stb_image_impl.c -o /tmp/stb.o
+          # core/version.cpp, and -Ibuild/generated for the header the cmake
+          # build above wrote there. MOP_SET_FOLD returns the peer version as
+          # PROVENANCE - "which build folded this", which is what #46 asks of
+          # a built-in, since a built-in has no dll to name instead. It is
+          # written into the reply and NEVER compared, so it cannot become a
+          # parity refusal (PR #135) and it costs this list exactly one file.
+          # This list is the whole definition of the compat binary, so keep it
+          # minimal - but a symbol the peer genuinely needs belongs in it.
+          # ...and the READERS, since issue #148 judgment B: the peer serves
+          # the picture formats this viewer reads, so core/imagefile.h and the
+          # readers behind it are part of what a peer IS now.
+          #
+          # VIEWER_NO_LIBRAW is the ONE reader still left out, and its reason is
+          # a licence and not a build: LibRaw is CDDL-1.0 and this binary
+          # installs itself onto someone else's machine. Refused by name on
+          # every peer; core/rawread.cpp is still compiled, for its SNIFF, so a
+          # .NEF is recognised as a camera's file instead of falling through to
+          # the TIFF reader beneath it. There is no VIEWER_NO_OPENEXR any more:
+          # no build of this project has one, which is what #53's "no off
+          # switch" ruling means once the peer is a reader too.
+          #
+          # --start-group over the whole install dir rather than five -l flags:
+          # the archive names carry the library version (libOpenEXR-3_4.a), and
+          # a version bump in CMakeLists.txt must not have to be repeated here.
+          # An archive nothing needs contributes nothing to the binary.
+          g++ -O2 -std=c++17 -DMINIZ_NO_STDIO -DVIEWER_NO_LIBRAW \
+              -Icore -Iinclude -Ibuild/_deps/miniz-src -Ithird_party/stb \
+              -Ibuild/generated \
+              -isystem /tmp/exr/include/OpenEXR -isystem /tmp/exr/include/Imath \
+              core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
+              core/imagefile.cpp core/tiffread.cpp core/y4mread.cpp core/rawread.cpp \
+              core/exrread.cpp \
+              /tmp/miniz.o /tmp/stb.o \
+              -o build/viewer-serve \
+              -Wl,--start-group /tmp/exr/lib/*.a -Wl,--end-group \
+              -static-libgcc -static-libstdc++ -ldl -lpthread -lstdc++fs
+          for f in plugins/*.c; do
+            gcc -O2 -shared -fPIC -Iinclude "$f" \
+                -o "build/plugins/$(basename "${f%.c}").so" -lm
+          done
+          COMPAT
           ./build/viewer-serve --help
-          echo "glibc ceiling of the compat binary:"
-          objdump -T build/viewer-serve | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          # THE CEILING IS ASSERTED, not printed for someone to notice. This
+          # number is the whole promise of the step - it is what "runs on an old
+          # distro" MEANS - and a printed number is not a gate: the quote bug
+          # above shipped a runner-built binary past this very line for as long
+          # as it linked. 2.29 is what the container's own libm forces (exp,
+          # log, pow gained a version there) and is what both the OpenEXR build
+          # and the one before it measure; a rise means the compat binary has
+          # stopped being compatible and the step has lost its point.
+          ceil=$(objdump -T build/viewer-serve | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "glibc ceiling of the compat binary: ${ceil:-<none>}"
+          max=GLIBC_2.29
+          test -n "$ceil" || { echo "no versioned glibc symbols at all: objdump found nothing to check"; exit 1; }
+          test "$(printf '%s\n%s\n' "$ceil" "$max" | sort -V | tail -1)" = "$max" \
+            || { echo "the compat binary now needs $ceil, above the $max this step promises"; exit 1; }
+
+      # ...and what it serves is MEASURED, not assumed. The same fmtgate the
+      # selftest step ran against the ordinary peer, pointed at the binary that
+      # actually ships: one file opened locally and served over this peer, with
+      # the pixels compared bit for bit (P1/P2). The .exr row is the reason this
+      # step exists - the client builds OpenEXR normally, and until now the peer
+      # in the tarball refused the file the client opened - so "it linked" is
+      # not the check. A serve is.
+      - name: The compat peer serves what the client reads
+        if: runner.os == 'Linux'
+        run: |
+          ./build/viewer --no-window --fmtgate-selftest tools/testdata/media \
+                         --remote-exe "$PWD/build/viewer-serve"
 
       - name: Package (Windows exe + plugins)
         if: runner.os == 'Windows'

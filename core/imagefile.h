@@ -124,10 +124,50 @@ struct Backend {
     // is a second place that knows what an .exr is, which is precisely what
     // this seam exists to prevent.
     const char* partWord;
+    // Does the REMOTE PEER (viewer-serve) serve this format? Issue #148's
+    // judgment B: the peer decodes what this viewer decodes, so that one folder
+    // does not read one way over ssh and another way off the disk.
+    //
+    // A column here rather than a list of extensions somewhere else, and the
+    // reason is the one the whole header is about: the client has to PREDICT
+    // what the peer will do with a file before it sends anything (it dims the
+    // row and says why - #111), and the peer has to DO it. Two lists would be
+    // two answers, which is the defect #148 was filed about one level up. This
+    // is the one place, and both binaries compile this file.
+    //
+    // It is not the same question as `decode != nullptr`. That one is answered
+    // per BUILD - and the two builds differ, deliberately: vendor RAW is read
+    // here and refused on the peer, because LibRaw is CDDL-1.0 and viewer-serve
+    // installs ITSELF onto someone else's machine over ssh (core/rawread.h's
+    // licence note). That is a distribution decision, not a technical one, and
+    // it has to read the same in both binaries or the client would offer an
+    // open the peer refuses.
+    bool overLink;
 };
 
 // The table, in dispatch order. THE ONLY PLACE A LIBRARY IS NAMED.
 const std::vector<Backend>& backends();
+
+// Can the remote peer serve a file with this name? The `overLink` column above
+// answers for the picture formats; .npy is added because it is core/main.cpp's
+// own door and core/serve.cpp parses its header inline, so it was never a row
+// of the table.
+//
+// THE ONE PLACE THAT KNOWS. core/serve.cpp asks it to decide what to walk,
+// group and decode; the Browse panel asks it (through peerServesName) to decide
+// which rows it may offer over a link. Those two used to be a hard-coded
+// {".npy"} on one side and an `isNpySuffix` on the other, which is exactly the
+// pair of lists this now replaces.
+//
+// Names, not bytes: it is asked about a directory listing, where there are no
+// bytes yet. What actually decodes is still decided by the content (`decode`).
+bool peerServes(const std::string& path);
+
+// Why the peer will not serve it, as a sentence; "" when it will. The reason a
+// format is refused over the link is not always the reason it is refused here -
+// vendor RAW is READ on this machine - so the sentence is built where the
+// column that knows lives, in the register of docs/input-adapters.md §3.2.
+std::string peerRefusal(const std::string& path);
 
 // Which format the NAME claims (extension, lower-cased). Null = not one of ours,
 // and the caller falls through to whatever it did before. This is dispatch, not

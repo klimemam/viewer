@@ -194,6 +194,11 @@ private:
     // "can this peer serve a DECLARED reading at all" - the protocol-9 gate,
     // in one place because meta() and tile() must answer it identically.
     bool readServable(int read, std::string& err) const;
+    // "can THIS peer serve this file's FORMAT" - the protocol-10 gate (#148 B),
+    // in one place for the same reason: meta(), tile() and measure() must all
+    // refuse a .png on a v9 peer with the same sentence, and none of them may
+    // let it through to come back as "not a .npy file".
+    bool formatServable(const std::string& path, std::string& err) const;
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
     bool recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& err);
 

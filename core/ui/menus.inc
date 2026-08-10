@@ -646,29 +646,34 @@ bool viewerReadsName(const std::string& n) {
     return imagefile::forPath(n) != nullptr;
 }
 
-// FRAME_001.NPY is still a .npy - the peer's own isNpySuffix (core/serve.cpp)
-// lower-cases the same way, and the two must agree or the client offers an open
-// the peer then refuses.
-bool peerServesName(const std::string& n) { return extIsOneOf(n, { ".npy" }); }
+// Will the PEER serve it? One call, and deliberately not a list of extensions
+// here: this used to be `{".npy"}` while core/serve.cpp carried its own
+// isNpySuffix, and issue #148's judgment B moves the answer into the format
+// table that both binaries compile (core/imagefile.h peerServes). Two lists
+// cannot drift apart when there is one list.
+//
+// FRAME_001.NPY is still a .npy: that predicate lower-cases the same way the
+// peer's own does, and the two must agree or the client offers an open the peer
+// then refuses.
+//
+// It is asked with NO SESSION in hand - the Browse panel asks it about rows it
+// is drawing, before and while a connection exists - so it answers for the peer
+// this build EXPECTS. A peer OLDER than that is caught where the session is in
+// hand, at the one door that sends: remote::Session::meta/tile/measure refuse
+// from the protocol number the peer announced in HELLO (rp::pictureTooOldText),
+// which is the same place and the same discipline as the declared-reading gate
+// that came before it.
+bool peerServesName(const std::string& n) { return imagefile::peerServes(n); }
 
 // Why the peer will NOT serve this file; "" when it will. A sentence and not a
 // bool, because #111's ruling is that a remote listing SHOWS what the peer
 // cannot serve and says why - this repository refuses by name and never
 // silently omits (docs/input-adapters.md §3.2), and a row dimmed with no reason
 // is the silent omission wearing different clothes.
-std::string peerRefusalFor(const std::string& n) {
-    if (peerServesName(n)) return {};
-    std::string what;
-    if (const imagefile::Backend* b = imagefile::forPath(n)) what = b->format;
-    else if (extIsOneOf(n, { ".npz" })) what = ".npz";
-    if (what.empty())                     // nothing here reads it either
-        return "the peer serves .npy only";
-    // Named, reasoned, way out attached - the same three parts every refusal in
-    // §3.2 has. The way out is real: the file IS readable, just not over this
-    // link, so the sentence points at the door that does work.
-    return what + " is read on this machine, but the peer serves .npy only"
-           "\n  browse it locally (File > Browse Folder), or copy it here first";
-}
+// The wording lives beside the column that decides it (core/imagefile.cpp), for
+// the reason the predicate above does: a refusal that quoted ".npy only" from
+// here would go stale the day the table gained a row, and it did.
+std::string peerRefusalFor(const std::string& n) { return imagefile::peerRefusal(n); }
 
 // Why THIS VIEWER will not open it; "" when it will. The local half of the pair
 // above, and the reason a local Browse still dims some rows: a folder holds

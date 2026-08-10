@@ -1,4 +1,5 @@
 #include "remote.h"
+#include "imagefile.h"    // peerServes: the one table the format gate reads
 #include "remote_proto.h"
 
 #include <algorithm>
@@ -565,8 +566,37 @@ bool Session::readServable(int read, std::string& err) const {
     return false;
 }
 
+// Can THIS peer serve this file's FORMAT? Asked from the number the peer
+// announced in HELLO, before anything is sent, and it is the answer to "should
+// the gate be asked of the peer at connect time rather than hard-coded".
+//
+// It is, and this is where: peerServesName (core/ui/menus.inc) says what this
+// build EXPECTS of a peer, because the Browse panel asks it while drawing rows
+// with no session in hand; the peer's own protocol number says what the peer it
+// actually reached can do. Only the second one can be wrong about a real
+// machine, and it is only knowable here.
+//
+// The refusal a v9 peer would give on its own is "not a .npy file" - a sentence
+// about the FILE, for a limit that belongs to the peer's build, and identical
+// to what it says about a truncated .npy. That is the illegibility the VERSION
+// note in remote_proto.h keeps paying for, so the client says it instead.
+bool Session::formatServable(const std::string& path, std::string& err) const {
+    // A file this build would not send anywhere is not this gate's business:
+    // peerServesName refused it already and said why (#111).
+    if (peerVersion_ >= 10 || !imagefile::peerServes(path)) return true;
+    const size_t slash = path.find_last_of("/\\");
+    const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (name.size() >= 4) {
+        std::string ext = name.substr(name.size() - 4);
+        for (char& c : ext) c = (char)tolower((unsigned char)c);
+        if (ext == ".npy") return true;               // every peer ever served these
+    }
+    err = rp::pictureTooOldText(peerVersion_, name);
+    return false;
+}
+
 bool Session::meta(const std::string& path, Meta& out, std::string& err, int read) {
-    if (!readServable(read, err)) return false;
+    if (!readServable(read, err) || !formatServable(path, err)) return false;
     W w; w.str(serverPath(path));
     if (peerVersion_ >= 9) w.u32((uint32_t)read);
     std::vector<uint8_t> reply;
@@ -628,6 +658,11 @@ static void toFloat(const uint8_t* src, uint32_t dtype, size_t n, std::vector<fl
                              out[i] = (float)e;
                          } break;
         case rp::DT_F32: memcpy(out.data(), src, n * 4); break;
+        // f16 is the one narrow type that is NOT a loss: every half is exactly
+        // a float, which is why it may cross the wire as itself (protocol 10)
+        // instead of being widened on the peer and losing its NAME on the way.
+        case rp::DT_F16: { for (size_t i = 0; i < n; i++)
+                               out[i] = rp::halfToFloat(((const uint16_t*)src)[i]); } break;
         case rp::DT_F64: for (size_t i = 0; i < n; i++) {
                              double e = ((const double*)src)[i];
                              if (loss) loss->observe(e);
@@ -657,7 +692,7 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
                    std::string& err, int read, rp::F32Loss* loss) {
-    if (!readServable(read, err)) return false;
+    if (!readServable(read, err) || !formatServable(path, err)) return false;
     W wr;
     wr.str(serverPath(path));
     rp::TileReq q{};
@@ -706,6 +741,15 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
 
 bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err) {
     if (peerVersion_ < 2) { err = "the remote peer is too old for MEASURE (update viewer-serve)"; return false; }
+    // MEASURE is the half #148 B exists for ("measure where the data is"), so
+    // it gets the format gate too - and it gets it on EVERY path, because one
+    // path per stack is what a set fold sends. A peer that could show a TIFF
+    // and not measure it would be the same two-answers defect one level down.
+    for (const auto& p : q.paths)
+        if (!formatServable(p, err)) return false;
+    for (const auto& r : q.roles)                 // MOP_SET_FOLD ignores q.paths
+        for (const auto& p : r.paths)
+            if (!formatServable(p, err)) return false;
     // Refused HERE, from the number, and never by sending and reading back
     // "unknown measure op". §10's whole content is that a refusal must say
     // which mismatch it is: an old peer and a parity mismatch are different

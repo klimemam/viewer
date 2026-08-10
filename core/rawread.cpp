@@ -26,7 +26,17 @@
 #include <exception>
 #include <memory>
 
+// VIEWER_NO_LIBRAW is viewer-serve's build (CMakeLists.txt). The peer does not
+// carry LibRaw - it is CDDL-1.0 and viewer-serve installs ITSELF onto another
+// machine over ssh, which makes it a distribution question and not a technical
+// one (issue #148). What survives that build is rawSniff and nothing else, and
+// it survives on purpose: it is header inspection with no library behind it, so
+// a .NEF reaching the peer is still RECOGNISED as a camera's file and refused
+// by name through the table's `absent` state, instead of falling through to the
+// TIFF row beneath it and being decoded as whichever IFD sits at its front.
+#ifndef VIEWER_NO_LIBRAW
 #include <libraw/libraw.h>
+#endif
 
 namespace imagefile {
 
@@ -34,9 +44,16 @@ namespace imagefile {
 // of the version anyone pins, and it would ride into every refusal sentence.
 #define RAW_STR2(x) #x
 #define RAW_STR(x) RAW_STR2(x)
+#ifdef VIEWER_NO_LIBRAW
+// "" is what core/imagefile.h says a row with no decoder carries here, and this
+// build is that row: naming a library the binary does not link would be a claim
+// about a decoder that is not there.
+const char* const RAW_LIBRARY = "";
+#else
 const char* const RAW_LIBRARY = "LibRaw " RAW_STR(LIBRAW_MAJOR_VERSION) "."
                                RAW_STR(LIBRAW_MINOR_VERSION) "."
                                RAW_STR(LIBRAW_PATCH_VERSION);
+#endif
 
 namespace {
 
@@ -147,6 +164,8 @@ bool rawSniff(const uint8_t* p, size_t n) {
     if (le && p[8] == 'C' && p[9] == 'R') return true;
     return tiffHeadedRaw(p, n);
 }
+
+#ifndef VIEWER_NO_LIBRAW
 
 namespace {
 
@@ -404,5 +423,7 @@ bool rawDecode(const uint8_t* p, size_t n, std::vector<Image>& out, std::string&
         return false;
     }
 }
+
+#endif  // VIEWER_NO_LIBRAW
 
 }  // namespace imagefile

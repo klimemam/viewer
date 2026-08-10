@@ -27,15 +27,37 @@ ls build/_deps/*/LICENSE*                          # the texts quoted below
 | GLFW | 3.4 | zlib/libpng | yes | no | no |
 | miniz | 3.0.2 | MIT | yes | yes | no |
 | portable-file-dialogs | commit `c12ea8c` | WTFPL-2.0 | yes (header-only) | no | no |
-| stb_image | commit `013ac3b` (v2.30) | MIT **or** public domain (Unlicense) | yes | no | no |
-| LibRaw | 0.22.2 | LGPL-2.1 **or** CDDL-1.0 - **this project uses it under the CDDL-1.0 option** | yes | no | no |
-| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes | no | no |
-| Imath | v3.2.2 | BSD-3-Clause | yes | no | no |
+| stb_image | commit `013ac3b` (v2.30) | MIT **or** public domain (Unlicense) | yes | **yes** | no |
+| LibRaw | 0.22.2 | LGPL-2.1 **or** CDDL-1.0 - **this project uses it under the CDDL-1.0 option** | yes | **no - deliberately** | no |
+| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes | **yes** | no |
+| Imath | v3.2.2 | BSD-3-Clause | yes | **yes** (with OpenEXR) | no |
 
-`viewer-serve` is the remote peer. It reads `.npy` only, so it links neither a
-window toolkit nor an image decoder - which is also why the Ubuntu 20.04
-compatibility rebuild in `build.yml` can still compile it with one `g++` line.
-Formats added to `viewer` are deliberately not added to it.
+`viewer-serve` is the remote peer. It links no window toolkit, and since issue
+#148 (judgment B, 2026-08-10) it links the same picture readers `viewer` does -
+PNG, JPEG, TIFF, OpenEXR and y4m - because the peer must serve what this viewer
+reads or the same folder gets two answers depending on which end opened it.
+
+**LibRaw is the one decoder deliberately kept OUT of the peer, and the reason is
+this licence table rather than a technical one.** `viewer-serve` installs
+*itself* onto another machine over ssh, so shipping it is a distribution act;
+the CDDL-1.0 obligations below are ones this project chose to meet for `viewer`,
+and extending them to a self-installing peer is a separate decision that has not
+been taken. The peer therefore compiles with `VIEWER_NO_LIBRAW`: the vendor-RAW
+row of `core/imagefile.h`'s table keeps its extensions and its sniff and loses
+its decoder, so a `.NEF` sent to a peer is refused **by name, with this reason**,
+and is not mistaken for the TIFF it also is.
+
+The Ubuntu 20.04 compatibility rebuild in `build.yml` - the `viewer-serve` that
+the Linux release tarball actually carries - **serves every one of those five
+formats, `.exr` included.** Every other reader is this repository's own code or
+a vendored header, so it costs that step a compiler pass; OpenEXR is a library,
+so the step builds it there too, from the same pinned sources the CMake build
+fetches, and links it **statically**. Two consequences belong in a distribution
+document: a released peer carries OpenEXR's and Imath's BSD-3-Clause code inside
+itself and reproduces their notices below on the same terms `viewer` does, and
+it needs no `libOpenEXR.so` on the machine it is copied to. There is no build of
+this project, on any platform, in which the peer refuses a file the client can
+open.
 
 The bundled plugins (`plugins/*.c`), the TIFF reader (`core/tiffread.cpp`), the
 OpenEXR *wrapper* (`core/exrread.cpp` - the library itself is the row above), the

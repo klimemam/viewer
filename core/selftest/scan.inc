@@ -154,11 +154,24 @@
         // being true, S2's "0 groups" would be a statement about an unreadable
         // folder rather than about the grouping rule.
         {
+            // As their own rows, or as the MEMBERS of a stack-group row. The
+            // second case arrived with #148 judgment B: the peer folds a
+            // numbered family into one row now that it can read the format, so
+            // dark_001..003.png is one row holding three names rather than
+            // three rows - which is exactly what it has always done to
+            // frame_001..003.npy. What S1 is FOR is unchanged: all six files
+            // are SHOWN, so S2's answer below is about the grouping rule and
+            // not about a folder the peer could not read.
             auto countPng = [] {
                 int n = 0;
-                for (const auto& e : rbMain().b.entries)
-                    if (!e.dir && e.name.size() > 4 &&
-                        e.name.compare(e.name.size() - 4, 4, ".png") == 0) n++;
+                auto isPng = [](const std::string& nm) {
+                    return nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".png") == 0;
+                };
+                for (const auto& e : rbMain().b.entries) {
+                    if (e.dir) continue;
+                    if (e.members.empty()) { if (isPng(e.name)) n++; continue; }
+                    for (const auto& m : e.members) if (isPng(m)) n++;
+                }
                 return n;
             };
             remoteBrowseTo(rbMain(), nonpy);
@@ -177,22 +190,36 @@
             check(png == 6, "S1 the Browse listing shows all six .png (LIST has no filter)");
         }
 
-        // ---- S2: the peer scan answers 0 and RETURNS -------------------------
-        // The peer stays npy-only; that is not what is being fixed. What is
-        // being fixed is that this TEST ENTRY POINT sat in its wait for the full
-        // budget when the answer was zero, so a fixture that lost its .npy files
-        // would make the suite HANG rather than FAIL. (The UI itself was always
-        // fine: core/browse/nav.cpp toasts and carries on.)
+        // ---- S2: the peer scan opens them, the same way the local door does --
+        // This assertion is the REVERSE of what it was, and the reversal is
+        // issue #148's judgment B. It used to read "the peer scan of a folder
+        // with no .npy opens nothing" - true, correct under judgment A, and the
+        // whole of the complaint: the Browse list showed six .png (S1) and Open
+        // Folder answered "no .npy stacks under ...". viewer-serve links
+        // core/imagefile.h now, so the answer is two stacks - the SAME two the
+        // local door produces in S3 below, which is the property the issue
+        // asked for and the reason both halves live in one test.
+        //
+        // S2b survives untouched and is about something else: zero groups must
+        // be an ANSWER and not a wait. It was written when a folder that grouped
+        // into nothing made this entry point sit out its whole budget, and it
+        // still guards exactly that - what changed is which folder produces zero.
         closeAll();
         {
             const double budget = 30.0;
             double el = runScan(nonpy, budget);
-            fprintf(stderr, "scanselftest: peer scan of %s: %d stack(s), %.1fs of a "
-                            "%.0fs budget, timedOut=%d, toast=\"%s\"\n",
-                    nonpy.c_str(), (int)app.seqs.size(), el, budget,
+            int frames = 0;
+            std::string names;
+            for (const auto& sq : app.seqs) names += (names.empty() ? "" : " | ") + sq.name;
+            for (const auto& im : app.images) if (im->seqId >= 0) frames++;
+            fprintf(stderr, "scanselftest: peer scan of %s: %d stack(s) [%s], %d frame(s), "
+                            "%.1fs of a %.0fs budget, timedOut=%d, toast=\"%s\"\n",
+                    nonpy.c_str(), (int)app.seqs.size(), names.c_str(), frames, el, budget,
                     timedOut ? 1 : 0, app.toast.c_str());
-            check(app.seqs.empty(),
-                  "S2a the peer scan of a folder with no .npy opens nothing");
+            check(app.seqs.size() == 2 && frames == 6,
+                  "S2a the peer scan of a folder of .png opens two stacks, six frames");
+            check(names.find(G0) != std::string::npos && names.find(G1) != std::string::npos,
+                  "S2a ...under the same two patterns the local door produces (S3d)");
             check(!timedOut,
                   "S2b ...and REPORTS it: zero groups is an answer, not a wait");
         }
