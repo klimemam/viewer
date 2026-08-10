@@ -260,10 +260,14 @@ F10 は特に読む値打ちがある —— **設定にしないと決めた記
 | Projection (H/V) | 9 | 2 (`projMode` 畳み方、`projAllRow` 面混合行) + 部分 3 |
 | Series Analysis | 5 | 3 (`fitMethod` / `winMode` / `winLo,winHi`) + 部分 1 |
 | Set Analysis | 1 | 0 (`g_setPanel.tablePlane` は file-static でセッションにも入らない) |
-| Compare (A/B) | 8 | 4 (`diffAbs` / `diffGain` / `compareFollowFrame` / `compareRangeMode`) |
+| Compare (A/B) | 7 | 4 (`diffAbs` / `diffGain` / `compareFollowFrame` / `compareRangeMode`) |
 | Inspector | 1 | 1 (`rangeScope` + `linkRange`) |
 | Browse | 1 | 0 (**ソート列と向きはどこにも保存されない** —— 起動のたびに Name 昇順に戻る) |
-| **計** | **43** | **12** (+ 部分 4) |
+| **計** | **43** | **11 + Blink = 12** (+ 部分 4) |
+
+(`compareMode` 自体は `--compare` で与えられるので上の 43 に数えていない。
+ただし5つ目の値 **Blink だけは CLI からも prefs からも到達できない**ので、
+数値を動かすものの側では 12 番目として数えている。)
 
 2つ、名指しに値するもの:
 
