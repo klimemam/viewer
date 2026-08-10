@@ -1003,6 +1003,12 @@ int main(int argc, char** argv) {
 
     #include "selftest/watch.inc"
 
+    // ...and the same rule with a PEER on the other side of it (watch-design
+    // §1's remote bullet). Its own file for selftest.rtemporal's reason: it
+    // needs the standalone viewer-serve binary, or "the peer grouped that
+    // folder" cannot be told from "I did".
+    #include "selftest/rwatch.inc"
+
     #include "selftest/media.inc"
 
     // The ROI table's numbers. Windowless, so it runs on every runner in the

@@ -26,6 +26,12 @@
 //   put on screen either ("writing..." would be a claim about a fact that has
 //   not settled). The rule is applied PER MEMBER: one file still being written
 //   must not hold back the finding about a file beside it that has settled.
+//   ...and PER MEMBER is decided by the READING, not by preference. A local
+//   scan stats every file, so a member is a file. A peer's LIST group row is
+//   one reading of the whole set (groupObs below), so there the member IS the
+//   stack and one file still growing does hold the rest back - which is a fact
+//   about what an aggregated row can support, and is said out loud rather than
+//   papered over.
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -87,12 +93,34 @@ inline Ent* findMut(Obs& o, const std::string& n) {
 struct Finding {
     int changed = 0, appeared = 0, vanished = 0;
     std::string firstChanged, firstAppeared, firstVanished;
-    bool any() const { return changed || appeared || vanished; }
+    // ---- §1's REMOTE half, and the honesty constraint it carries -------------
+    // A peer's LIST group row gives the SET's total bytes and its NEWEST
+    // member's mtime - never a member's own state. So a remote finding can say
+    // that this stack's source moved and CANNOT say which of its members did,
+    // and `srcMoved` is the field that says exactly that much.
+    //
+    // It is a flag and not a number on purpose. `changed` is a COUNT, and a
+    // count is precisely what an aggregate reading cannot produce: filling it
+    // with N would print "5 file(s) changed on disk" about a row that never
+    // claimed anything of the sort, and filling it with 1 would invent a file.
+    // The two never both appear - remoteFinding() drops the count when it
+    // raises the flag.
+    bool srcMoved = false;
+    // Whose disk this is ABOUT, as a person reads it (peerLabel's answer, so a
+    // peer running here says "this machine" rather than nothing). "" = local,
+    // and a local line names no machine because there is only one.
+    std::string host;
+    // How many files the row covers. The row DOES carry this - it is the member
+    // list's length - and it is what makes "which of them is not knowable" a
+    // bounded statement instead of a shrug.
+    int members = 0;
+    bool any() const { return changed || appeared || vanished || srcMoved; }
 };
 inline bool operator==(const Finding& a, const Finding& b) {
     return a.changed == b.changed && a.appeared == b.appeared &&
            a.vanished == b.vanished && a.firstChanged == b.firstChanged &&
-           a.firstAppeared == b.firstAppeared && a.firstVanished == b.firstVanished;
+           a.firstAppeared == b.firstAppeared && a.firstVanished == b.firstVanished &&
+           a.srcMoved == b.srcMoved && a.host == b.host && a.members == b.members;
 }
 inline bool operator!=(const Finding& a, const Finding& b) { return !(a == b); }
 
@@ -208,18 +236,61 @@ inline bool observe(SetState& st, Obs obs) {
     return true;
 }
 
+// ---- §1's remote half: ONE LIST group row is ONE reading of a whole stack ---
+//
+// The peer already answers this question. For a numbered sequence LIST returns a
+// SYNTHETIC group row carrying the set's summed bytes, its newest member's mtime
+// and the full member name list (core/serve.cpp putGroupEntryV3), so one request
+// on the watched directory decides a whole stack and no new protocol is needed.
+//
+// Turning that row into an Obs is what makes the rule ONE rule: observe() folds
+// it exactly as it folds a directory scan. What differs is what the numbers
+// MEAN, and it is worth being blunt about:
+//
+//   THE NAMES ARE PER-MEMBER TRUTH. The row lists every member, so a file that
+//   appeared and a file that is gone are named as precisely as a local scan
+//   names them. That half needs no hedge and gets none.
+//
+//   THE (mtime, size) IS NOT. It is the SET's, so every member is handed the
+//   SAME pair here - which is not a shortcut but the shape of the evidence.
+//
+//   §4 THEREFORE SETTLES THE STACK AS ONE UNIT. "Two readings that agree" is
+//   answered for the aggregate rather than per file: one member still being
+//   written on the peer holds back the whole stack's finding, where a local
+//   stat releases the settled members beside it (--watch-selftest W9 against
+//   --rwatch-selftest R7). A limit of one reading of N files, not a policy.
+inline Obs groupObs(uint64_t bytes, int64_t mtime, std::vector<std::string> names) {
+    Obs o;
+    o.reserve(names.size());
+    for (std::string& n : names) o.push_back({ std::move(n), mtime, bytes });
+    normalize(o);
+    return o;
+}
+
+// What a finding folded from an AGGREGATED reading may honestly say. `raw` is
+// what observe() computed over a groupObs; the conversion drops the `changed`
+// COUNT (see Finding::srcMoved) and keeps appeared/vanished exactly as they are,
+// because those came off the member name list and are per-member facts.
+//
+// `members` is how many members the reading covered, and `host` is what to call
+// the machine. Nothing to say converts to nothing to say: a Finding{} compares
+// equal to the previous one and costs the UI no wake at all (§3).
+inline Finding remoteFinding(const Finding& raw, const std::string& host, int members) {
+    Finding f;
+    if (!raw.any()) return f;
+    f.srcMoved = raw.changed > 0;
+    f.appeared = raw.appeared;  f.firstAppeared = raw.firstAppeared;
+    f.vanished = raw.vanished;  f.firstVanished = raw.firstVanished;
+    f.host = host;
+    f.members = members;
+    return f;
+}
+
 // The sentence §5 puts under the stack's header row, amber, and the ONE string
-// both the panel and --watch-selftest read (seqReloadNote's discipline: the
-// guard asserts the wording that is drawn, not a second opinion beside it).
+// both the panel and the selftests read (seqReloadNote's discipline: the guard
+// asserts the wording that is drawn, not a second opinion beside it).
 // "" = nothing to say.
 //
-// Members are named because a LOCAL stack is stat'ed per file, so the count is
-// a real count. The remote half of §1 cannot do this - a peer's LIST group row
-// carries the set's total bytes and its newest mtime, never per-member state -
-// and the sentence it will need is deliberately not written here yet: the
-// remote origin is not watched in this stage, and an unused branch claiming to
-// know how it reads would be the kind of second opinion this function exists to
-// avoid.
 // "3 file(s) changed on disk", "1 file(s) no longer exist (w_004.npy)". ONE
 // spelling of this phrase, because §5's line and §6's Reload summary say the
 // same things about the same files and two spellings of it would drift.
@@ -231,12 +302,29 @@ inline std::string countPhrase(int n, const std::string& first, const char* what
 
 inline std::string findingText(const Finding& f) {
     if (!f.any()) return {};
+    std::vector<std::string> parts;
+    // §1's honesty constraint, spelled where the screen reads it. A local stack
+    // is stat'ed per file, so its count is a real count and it names the file
+    // when there is one. An aggregated remote reading has neither, and this
+    // clause says so OUTRIGHT rather than leaving the reader to carry the local
+    // precision across: the count it does have is how many files the row covers,
+    // and "which of them" is the thing a peer listing does not answer.
+    if (f.srcMoved)  parts.push_back("source changed");
+    if (f.changed)   parts.push_back(countPhrase(f.changed, f.firstChanged,
+                                                 "changed on disk"));
+    if (f.appeared)  parts.push_back(countPhrase(f.appeared, f.firstAppeared,
+                                                 "appeared in the folder"));
+    if (f.vanished)  parts.push_back(countPhrase(f.vanished, f.firstVanished,
+                                                 "no longer exist"));
+    // WHERE, said ONCE and on the first clause: every clause of one finding is
+    // about one stack, and a peer named after each of them reads as three
+    // machines. A local finding names nothing - there is only one disk here.
+    if (!f.host.empty()) parts[0] += " on " + f.host;
+    if (f.srcMoved)
+        parts[0] += " (" + std::to_string(f.members) +
+                    " file(s); a peer listing cannot say which)";
     std::string s;
-    if (f.changed)  s += countPhrase(f.changed,  f.firstChanged,  "changed on disk");
-    if (f.appeared) s += (s.empty() ? "" : ", ") +
-                         countPhrase(f.appeared, f.firstAppeared, "appeared in the folder");
-    if (f.vanished) s += (s.empty() ? "" : ", ") +
-                         countPhrase(f.vanished, f.firstVanished, "no longer exist");
+    for (const std::string& p : parts) s += (s.empty() ? "" : ", ") + p;
     return s;
 }
 

@@ -1250,15 +1250,32 @@ struct App {
     //   and "a file is gone" answerable in the same round trip as "one changed".
     //   file is an IN-FILE frame-axis stack (one .npy holding F frames): one
     //   stat, and the set has exactly one member.
+    //   peer is a stack that lives on a PEER (§1's remote bullet): dir is the
+    //   peer's directory, members are the stack's own file names in it, and one
+    //   LIST of dir answers the whole stack at once. No local path exists for
+    //   any of it, so `file`/`headName`/`seed` are all empty and the first poll
+    //   makes the baseline.
     struct WatchTarget {
         int seqId = 0;
         std::string dir, headName;    // folder stack
         std::string file;             // frame-axis stack (dir empty)
+        // ---- §1's remote half ------------------------------------------------
+        // `peer` is a FLAG and not an inference from `host`: an empty host is a
+        // real peer (the same protocol over a pipe instead of ssh - remote.h's
+        // "passing an empty host starts a local peer"), so "host is empty" means
+        // local to no part of this program.
+        bool peer = false;
+        std::string host;             // "" = the peer runs here
+        int port = 0;                 // non-default ssh port, or 0
+        std::string hostLabel;        // what the SENTENCE calls it (peerLabel)
+        std::string exe;              // how to invoke it, frozen at publish time
+        std::vector<std::string> members;   // the stack's own names, sorted/unique
         // §1: the baseline from the loader's own stat (FrameSource::mtime/fsize),
         // where EVERY member has one. Empty = this stack has no recorded
         // baseline and the first poll makes it - which is the honest answer for
-        // a stack opened before Watch existed, and the reason that first poll
-        // says nothing.
+        // a stack opened before Watch existed, for a remote stack (an ssh:// url
+        // stays 0/0 on purpose: a peer's disk cannot be statted from here - see
+        // statLocalUrl), and the reason that first poll says nothing.
         watch::Obs seed;
     };
     struct WatchDone { int seqId = 0; watch::Finding found; };
@@ -1282,6 +1299,12 @@ struct App {
     // §2's interval, in seconds, as a value rather than a literal so
     // --watch-selftest never has to live through one. prefs is §9's "later".
     double watchIntervalSec = 5.0;
+    // ...and §2's OTHER interval: a peer is asked every 15 s, not every 5. The
+    // worker's timer is the local one, so a remote target is polled every Nth
+    // round with N computed from these two (watchRemoteEvery) rather than typed
+    // - changing either number here cannot then silently leave the peer polled
+    // at the local rate.
+    double watchRemoteIntervalSec = 15.0;
     // §2: stacks are polled "while the app is not minimised" - the same line the
     // frame loop already draws for drawing at all. A minimised window has no row
     // to put a finding under, and the answer is not stale when it comes back:

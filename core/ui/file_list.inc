@@ -1184,6 +1184,25 @@ static void drawFileList() {
                   ImGui::TextUnformatted(wn.c_str());
                   ImGui::PopStyleColor();
                   ImGui::SameLine();
+                  // A stack whose pixels are the PEER's has no button here, and
+                  // this is not a styling choice: reloadSource refuses a
+                  // remote-backed source by name, so an offered [Reload] would
+                  // refuse every member and latch the (reload failed) mark of
+                  // issue #56 onto a stack where nothing failed. §6's rebuild has
+                  // not reached the remote origin; until it does, the line says
+                  // the gesture that DOES work rather than a control that does
+                  // not. One predicate (watchReloadOffered), asked here and by
+                  // --rwatch-selftest.
+                  if (!watchReloadOffered(wsi->id)) {
+                      ImGui::TextDisabled("%s", watchActionText(true));
+                      if (ImGui::IsItemHovered())
+                          ImGui::SetTooltip("%s",
+                              "These pixels come from the peer, not from a local\n"
+                              "file, so there is nothing here to re-read: the\n"
+                              "membership rebuild (watch-design 6) is local-only\n"
+                              "today. Open the folder again from Browse for a\n"
+                              "stack of what the peer holds now.");
+                  } else {
                   if (ImGui::SmallButton("Reload##watch")) pendingReloadSeq = wsi->id;
                   // What Reload will and will not do, stated where the click is.
                   // Re-reading the frames this stack HAS is reference-design
@@ -1210,6 +1229,7 @@ static void drawFileList() {
                               : "\n\nA file that appeared JOINS this stack, numbered where\n"
                                 "its name puts it - the order the open used.";
                       ImGui::SetTooltip("%s", tip.c_str());
+                  }
                   }
                   ImGui::Unindent(ImGui::GetFontSize());
               }
