@@ -116,8 +116,15 @@ struct RemoteBrowse {
 // instead of replacing the listing: expanding a node must not navigate.
 // RbDisconnect stops the session on the thread that OWNS it: the status bar
 // must never call stop() on the worker's Session from the UI thread.
+// RbPoll is an ordinary LIST of the directory the panel is ALREADY standing
+// in, issued by nobody's click (watch-design §2's second row). It is a
+// separate kind and not an RbList because what the UI does with the answer
+// differs in every particular: it is dropped when it is the listing already
+// on screen, it never touches the recents, it never raises an error band,
+// and it never makes the worker look busy. A nav's answer is something the
+// user asked for; this one is something they did not.
 enum RbKind { RbConnect = 0, RbList = 1, RbUpdatePeer = 2, RbScan = 3, RbGlob = 4,
-              RbTreeList = 5, RbDisconnect = 6 };
+              RbTreeList = 5, RbDisconnect = 6, RbPoll = 7 };
 struct RbJob {
     int kind = RbConnect;
     std::string host, dir;
@@ -192,13 +199,35 @@ struct Instance {
     // the thread first, so the Session's destruction is single-threaded too.
     std::unique_ptr<remote::Session> session;   // the worker's, exclusively
     std::thread thread;
-    std::mutex mtx;               // guards queue / done / phase
+    // guards queue / done / phase. `mutable` so a const view of an instance can
+    // still ask whether its queue is empty - rbPollDue decides nothing and
+    // changes nothing, and taking a non-const reference to say so would let it.
+    mutable std::mutex mtx;
     std::condition_variable cv;
     std::vector<RbJob> queue;
     std::vector<RbResult> done;
     std::string phase;            // what the worker is doing, for the UI
     std::atomic<bool> busy{ false };
     std::atomic<bool> stop{ false };
+    // ---- watch-design §2, second row: this instance re-lists its own dir ----
+    // WHILE IT IS BEING DRAWN, and that is the whole condition. drawPanelRemote
+    // writes `drawnFrame` at its head; a window that is closed, collapsed or on
+    // an unselected dock tab never reaches that line (ImGui::Begin answers
+    // false and the spine does not call the panel at all), so the mark simply
+    // stops advancing and the poll stops with it. Nothing has to be told.
+    uint64_t drawnFrame = 0;      // App::uiFrame at the head of the last draw
+    // nowSec() of the last round ISSUED, and 0 = the timer is not running. The
+    // first round after a navigation or a first draw ARMS it and lists nothing:
+    // the listing on screen arrived a moment ago, and re-reading it because a
+    // panel opened would be a round trip for a fact already on the glass.
+    double polledAt = 0;
+    // A poll is out. §2 says a round is SKIPPED when the worker is busy rather
+    // than queued behind it, and a poll deliberately does NOT set `busy` (it is
+    // not something anybody is waiting for, and rbAnyBusy drives the window's
+    // "keep animating" logic), so this is what the skip is asked about.
+    std::atomic<bool> pollPending{ false };
+    int pollsIssued = 0;          // selftest probe: rounds that went out
+    int pollsApplied = 0;         // ...and answers that replaced the listing
     // ---- tree mode: this instance's expanded nodes and their children ---
     std::map<std::string, std::vector<remote::Entry>> treeCache;
     std::vector<std::string> expanded;     // absolute dirs currently open

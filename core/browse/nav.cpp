@@ -9,7 +9,9 @@
 #include "browse.h"                  // ...and the declarations this TU defines
 
 #include <algorithm>
-#include <cstring>                   // strstr (rbIsBrowseWindowName)
+#include <cmath>                     // ceil (browseWatchEvery's ratio)
+#include <cstring>                   // strstr (rbIsBrowseWindowName), memcmp
+#include <mutex>                     // the poll round asks the instance's queue
 #include <string>
 #include <vector>
 
@@ -43,7 +45,13 @@ static void rbWorker(App::BrowseInstance* ip) {
             job = std::move(I.queue.front());
             I.queue.erase(I.queue.begin());
         }
-        I.busy = true;
+        // A POLL is not something anybody is waiting for (watch-design §2's
+        // second row), so it does not raise `busy`: rbAnyBusy is the main
+        // loop's "keep this window animating" question and the panel's
+        // spinner, and a background re-listing must answer neither. The skip
+        // rule asks pollPending instead - see rbPollDue.
+        const bool rbQuiet = job.kind == App::RbPoll;
+        if (!rbQuiet) I.busy = true;
         App::RbResult r;
         r.kind = job.kind;
         r.host = job.host;
@@ -117,7 +125,11 @@ static void rbWorker(App::BrowseInstance* ip) {
                     r.err = err;
                 }
             } else {
-                rbSetPhase(I, "listing " + job.dir + "...");
+                // ...and it says nothing either: the phase line is what the
+                // panel prints while the user waits, and "listing ..." flashing
+                // up every three seconds on its own is the visible half of a
+                // poll that is supposed to be silent.
+                if (!rbQuiet) rbSetPhase(I, "listing " + job.dir + "...");
                 std::vector<remote::Entry> got;
                 if (I.session->list(job.dir, got, err)) {
                     r.ok = true;
@@ -134,12 +146,17 @@ static void rbWorker(App::BrowseInstance* ip) {
             r.alive = I.session->alive();
             r.rx = I.session->bytesReceived();
         }
-        rbSetPhase(I, "");
+        if (!rbQuiet) rbSetPhase(I, "");
         {
             std::lock_guard<std::mutex> lk(I.mtx);
             I.done.push_back(std::move(r));
         }
-        I.busy = false;
+        if (!rbQuiet) I.busy = false;
+        // A poll DOES wake the UI: the reply has to be looked at (it may be a
+        // new listing), and the pumps live inside the frame. What it must never
+        // do is wake it to DECIDE to poll - that is the idle-skip term
+        // rbAnyPollDue, asked once per idle timeout and false unless a panel is
+        // both drawn and overdue.
         g_browseHost.wakeUi();
     }
 }
@@ -150,6 +167,14 @@ void rbEnqueue(App::BrowseInstance& I, App::RbJob job) {
         job.exe = app.remoteExe.empty()
             ? (job.host.empty() ? app.exePath : std::string(REMOTE_HOME) + "/viewer-serve")
             : app.remoteExe;
+    // A NAVIGATION RE-ARMS the poll timer (watch-design §2's second row). The
+    // listing about to arrive is fresh, so the next round belongs one interval
+    // after IT, not one interval after the last poll - otherwise walking into a
+    // folder can be followed by a re-listing of it a tenth of a second later.
+    // Here rather than in the six callers: every way of navigating funnels
+    // through this queue, which is the same argument remoteBrowseTo makes for
+    // owning the history.
+    if (job.kind == App::RbConnect || job.kind == App::RbList) I.polledAt = 0;
     {
         std::lock_guard<std::mutex> lk(I.mtx);
         I.queue.push_back(std::move(job));
@@ -281,6 +306,34 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             }
             continue;
         }
+        if (r.kind == App::RbPoll) {
+            // watch-design §2/§5. What this branch does NOT do is most of it,
+            // and each omission is a rule:
+            //
+            //   a failed LIST is dropped, not shown. §13.4: an unreachable
+            //   peer, a dropped ssh link and a refused path all arrive as "no
+            //   reply", and a listing nobody asked for must not put an error
+            //   band over a panel that is showing perfectly good rows. The
+            //   next round comes.
+            //   an answer about somewhere ELSE is dropped. The user navigated
+            //   while it was in flight, and B.dir is not this reply's dir.
+            //   an answer IDENTICAL to what is on screen is dropped, whole.
+            //   Bumping `rev` for it would re-run the cursor and selection
+            //   carry, re-key every row cache and cost a frame, three seconds
+            //   at a time, to say that nothing happened (§3's idle promise is
+            //   what that would spend).
+            //   the recents are NOT touched. A poll is not a visit: reordering
+            //   the places list and setting prefsDirty every three seconds
+            //   would rewrite prefs.txt because a panel was left open.
+            I.pollPending = false;
+            if (!r.ok) continue;
+            if (r.host != B.host || r.port != B.port || r.dir != B.dir) continue;
+            if (rbSameListing(B.entries, r.entries)) continue;
+            B.entries = std::move(r.entries);
+            B.rev++;                  // ...and the cursor and ticks follow it
+            I.pollsApplied++;
+            continue;
+        }
         if (r.kind == App::RbTreeList) {
             // A node's children. It must NOT touch B.dir / B.entries / recents:
             // expanding a folder in the tree is not a navigation.
@@ -363,6 +416,157 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
 void pumpRemoteBrowse() {
     for (size_t i = 0; i < app.browsePanels.size(); i++)
         pumpRemoteBrowseOne(*app.browsePanels[i]);
+}
+
+// ---- watch-design §2, second row: a DRAWN instance re-lists where it stands ---
+//
+// The stack half of Watch (core/app/watch.inc) polls to SAY something: a stack's
+// pixels and its files disagree, and a line of amber says so and waits for a
+// human. This half says nothing at all. §5 is explicit about the difference -
+// "a listing is something you look at, not a measurement, so it may update
+// silently" - and that is not a shortcut but the whole reason no notification
+// belongs here: the panel is a view of a directory, and a view whose subject
+// moved is simply out of date.
+//
+// What that buys, and what it therefore has to be worth: the listing is REPLACED
+// under the reader's eyes. It is safe to do only because the cursor and the
+// multi-selection follow the ROW BY NAME across a rev bump (rbCursorFollow /
+// rbSelFollow, PR #155). Before #155 a second listing of the same folder wiped
+// both, which was an intermittent defect when it took a duplicate reply to
+// trigger it and would be a permanent one at one re-listing every three seconds.
+// --browse-selftest B4 is that assertion and it is the reason this stage could
+// be built at all.
+
+// Two listings, as the panel would draw them. Compared POSITION BY POSITION,
+// which is sound because both came off the same peer's LIST and core/serve.cpp
+// sorts its reply - two readings of an unchanged directory are byte-identical,
+// so a difference here is a difference on the disk and not a difference of
+// order. Every field the panel puts on screen is in it: a row whose SIZE moved
+// is a changed listing even though its name did not.
+bool rbSameListing(const std::vector<remote::Entry>& a,
+                   const std::vector<remote::Entry>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        const remote::Entry& x = a[i];
+        const remote::Entry& y = b[i];
+        if (x.name != y.name || x.dir != y.dir || x.size != y.size ||
+            x.mtime != y.mtime || x.group != y.group || x.frames != y.frames ||
+            x.members != y.members || x.hasMeta != y.hasMeta || x.dtype != y.dtype ||
+            x.ndim != y.ndim || x.fortran != y.fortran ||
+            memcmp(x.dims, y.dims, sizeof x.dims) != 0)
+            return false;
+    }
+    return true;
+}
+
+// §2: "while that instance is BEING DRAWN". drawPanelRemote writes the mark at
+// its head, and the spine calls it only when ImGui::Begin answered true - so a
+// window that is closed, collapsed or sitting on an unselected dock tab stops
+// advancing the mark and stops being polled, with nothing having to be told.
+//
+// A FRAME NUMBER and not a timestamp, and this is the correction §14.1 records:
+// this program idles at 0 fps, so a `lastDrawnAt` on a panel that is plainly on
+// screen goes stale the moment the user stops touching anything - which is
+// precisely the case this feature is for (watching a capture folder fill while
+// doing nothing). The last frame that HAPPENED is what is on the glass, and a
+// frame counter says that where a clock says the opposite.
+//
+// "This frame or the one before": the pump runs at the head of a frame, before
+// this frame's draw, so an instance drawn in the frame that just finished
+// carries uiFrame - 1. drawnFrame 0 is "never drawn" and is never a match, which
+// is why uiFrame starts at 1.
+static bool rbInstanceDrawn(const App::BrowseInstance& I, uint64_t uiFrame) {
+    return I.drawnFrame != 0 && I.drawnFrame + 1 >= uiFrame;
+}
+
+// §2's two Browse intervals as ONE decision, in watchRemoteEvery's shape (§13.7):
+// the LOCAL interval is the tick, and a peer is asked every Nth one with N
+// computed from the two constants rather than typed. The point of computing it
+// is what happens when one of them moves: nothing can then leave the peer polled
+// at the local rate, because N is never less than 1. 3 s and 10 s give
+// ceil(10/3) = 4, so a peer's folder is re-listed every 4 x 3 = 12 s - twelve
+// and not ten, which is the price of the ratio being a whole number of rounds
+// and is recorded as such in §14.3.
+int browseWatchEvery() {
+    const double a = app.browseWatchIntervalSec, b = app.browseWatchRemoteIntervalSec;
+    if (a <= 0.0 || b <= a) return 1;
+    return (int)std::ceil(b / a - 1e-9);
+}
+double browseWatchInterval(bool peer) {
+    const double a = app.browseWatchIntervalSec;
+    return peer ? a * browseWatchEvery() : a;
+}
+
+// Does this instance owe a round right now? Nothing in here reads a clock or
+// touches the network: `now` is handed in, for the reason watchPollRound is
+// handed its lister - a test that had to live through a three-second interval
+// would be a slow test that fails on a loaded machine.
+bool rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    // ONE switch for the feature (§9: "start with one global switch"). Watch
+    // turned off stops the Browse half with the stack half; a listing that
+    // refreshes itself is Watch whichever panel it lands in.
+    if (!app.watchEnabled || app.watchPaused) return false;
+    if (!I.b.connected) return false;
+    // §2 says the instance's CURRENT DIR. The search results view stands in for
+    // the listing (remoteBrowseTo turns it off for that very reason), so while
+    // it is up the listing is not on screen and re-reading it would be a round
+    // trip for rows nobody can see.
+    if (I.search.active) return false;
+    if (!rbInstanceDrawn(I, uiFrame)) return false;
+    // §2: SKIP, NEVER QUEUE. A queue of stale listings is worse than a missed
+    // round - each one replaces the listing when it lands, so a slow link would
+    // redraw the panel N times with N answers to the same question, the last
+    // N-1 already out of date on arrival. Three ways to be occupied and all
+    // three count: a job running, a poll already out (a poll deliberately does
+    // not set `busy`), and a navigation waiting to go out.
+    if (I.busy || I.pollPending) return false;
+    {
+        std::lock_guard<std::mutex> lk(I.mtx);
+        if (!I.queue.empty()) return false;
+    }
+    if (I.polledAt <= 0) return false;          // the timer is not running yet
+    return now - I.polledAt >= browseWatchInterval(!I.b.host.empty());
+}
+
+// ONE ROUND for one instance. Returns true exactly when a LIST went out.
+bool rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    // ARMING is not polling. A panel that has just been drawn, or that has just
+    // navigated, is looking at a listing that arrived a moment ago; re-reading
+    // it because a timer had never been started would be a round trip for a
+    // fact already on the glass. So the first round after either event starts
+    // the clock and lists nothing - the same shape as §1's first observation,
+    // which takes the baseline and announces nothing.
+    if (I.polledAt <= 0) {
+        if (app.watchEnabled && !app.watchPaused && I.b.connected &&
+            rbInstanceDrawn(I, uiFrame))
+            I.polledAt = now;
+        return false;
+    }
+    if (!rbPollDue(I, now, uiFrame)) return false;
+    I.polledAt = now;
+    I.pollsIssued++;
+    I.pollPending = true;
+    App::RbJob j;
+    j.kind = App::RbPoll;
+    j.host = I.b.host;
+    j.port = I.b.port;
+    j.dir  = I.b.dir;
+    rbEnqueue(I, std::move(j));
+    return true;
+}
+
+// ...and every instance, once per UI frame, beside pumpRemoteBrowse.
+void pumpBrowseWatch(double now) {
+    for (size_t i = 0; i < app.browsePanels.size(); i++)
+        rbPollRound(*app.browsePanels[i], now, app.uiFrame);
+}
+// The idle-skip chain's term (§3). It asks "is a round DUE", never "is a Browse
+// panel open": with no panel drawn, none connected or Watch switched off it is
+// false and the 0 fps idle is exactly what it was.
+bool rbAnyPollDue(double now) {
+    for (auto& p : app.browsePanels)
+        if (rbPollDue(*p, now, app.uiFrame)) return true;
+    return false;
 }
 
 // ---- tree mode: expand / collapse one node ------------------------------------

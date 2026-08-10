@@ -1233,6 +1233,369 @@
             rbMain().cursor = -1;
             rbMain().cursorKey.clear();
         }
+        {   // ---- BROWSE-SIDE POLLING (watch-design §2's second row, §5) -------
+            // While an instance is BEING DRAWN, its current directory is
+            // re-listed on a timer and the listing simply becomes the new one.
+            // §5 is explicit that this is NOT a notification: a listing is
+            // something you look at, not a measurement, so it may update
+            // silently - which is only honest if the cursor and the ticks
+            // survive it, and that is what this block exists for.
+            //
+            // NOTHING HERE SLEEPS. The interval is 3 s and the peer's 12 s; a
+            // test that lived through either would be a slow test that fails on
+            // a loaded machine (watch.h's own reason for existing). Every
+            // decision below takes `now` as an argument, so the clock is SET.
+            // `clk` is that clock: rbPollDue only ever compares `now` against
+            // the instant of the last round, so a synthetic pair exercises a
+            // three-second interval in a microsecond. It is deliberately not
+            // nowSec() - which is seconds since THIS process started, so
+            // "nowSec() - 99" is a negative instant a few seconds in.
+            App::BrowseInstance& I = rbMain();
+            double clk = 100000.0;
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : " ") + n;
+                return s;
+            };
+            auto check = [&](bool cond, const char* what) {
+                fprintf(stderr, "browseselftest: %-72s %s\n", what,
+                        cond ? "PASS" : "FAIL");
+                if (!cond) ok = false;
+            };
+            // A frame number to stand in for the real one: App::uiFrame is
+            // bumped once per frame by the spine, and a NOGL run draws none.
+            const uint64_t FR = 1000;
+            app.uiFrame = FR;
+            I.drawnFrame = FR;
+            // Let this instance's worker come to rest, and swallow whatever it
+            // produced. Called between cases that enqueue: a reply still in
+            // flight from the case before would land in the middle of the next
+            // one, which is the shape of the intermittent failures this panel
+            // has already produced twice.
+            auto settle = [&]() {
+                double t0 = nowSec();
+                while (nowSec() - t0 < 60.0) {
+                    pumpRemoteBrowse();
+                    bool quiet;
+                    {
+                        std::lock_guard<std::mutex> lk(I.mtx);
+                        quiet = I.queue.empty() && I.done.empty();
+                    }
+                    if (quiet && !I.busy) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                I.pollPending = false;
+            };
+            // ---- the fixture ---------------------------------------------------
+            // Its own folder, written by hand: the case is "a file appeared
+            // while the panel was looking at it", and doing that inside
+            // tools/testdata/rb would change what every other selftest sees
+            // there. The bytes are arithmetic - a 4x4 f32 .npy is a 128-byte
+            // header region + 4*4*4 = 192 bytes, the same sum --rwatch-selftest
+            // states - and the names are deliberately NOT a numbered sequence:
+            // the peer folds w_000..w_003 into ONE group row, and this case
+            // wants several rows to put a cursor on and two to tick. (The group
+            // row is the stack watcher's subject and is asserted over the link
+            // in --rwatch-selftest R1.)
+            std::string scratch = dir + "/bwatch-scratch";
+            std::error_code bec;
+            std::filesystem::remove_all(pathFromUtf8(scratch), bec);
+            std::filesystem::create_directories(pathFromUtf8(scratch), bec);
+            auto writeNpy4 = [](const std::string& path, float v) {
+                std::vector<float> px(16, v);
+                std::vector<uint8_t> b = selftestNpyBytes("<f4", { 4, 4 }, px.data(),
+                                                          px.size() * sizeof(float));
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            };
+            const char* names4[4] = { "alpha.npy", "bravo.npy", "delta.npy", "echo.npy" };
+            for (int i = 0; i < 4; i++) writeNpy4(scratch + "/" + names4[i], (float)i);
+            remoteBrowseTo(I, scratch);
+            double ts = nowSec();
+            while (nowSec() - ts < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == scratch && B.entries.size() == 4) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            settle();
+            auto viewHere = [&]() {
+                return rbBuildView(I, &B.dir, B.entries, I.flat, I.tree);
+            };
+            check(B.dir == scratch && B.entries.size() == 4,
+                  "B0 (setup) the panel stands in a folder of 4 plain rows");
+
+            {   // ---- B1: §2's two intervals, as a RATIO and not a second
+                // constant. #161 computes the peer's interval from the two
+                // numbers rather than typing it, so moving one of them can
+                // never silently leave the peer polled at the local rate; the
+                // Browse half is the same question and gets the same shape.
+                //
+                // The arithmetic, hand-derived: 3 s local and 10 s remote, so a
+                // peer is asked every ceil(10 / 3) = 4th local round = every
+                // 4 x 3 = 12 s. TWELVE, not ten: the ratio is a whole number of
+                // local rounds, and that is what makes "never faster than the
+                // local rate" true by construction (watch-design §14.3).
+                const bool ratio = browseWatchEvery() == 4 &&
+                                   app.browseWatchIntervalSec == 3.0 &&
+                                   app.browseWatchRemoteIntervalSec == 10.0 &&
+                                   browseWatchInterval(false) == 3.0 &&
+                                   browseWatchInterval(true) == 12.0;
+                check(ratio, "B1 3 s local / 10 s remote -> a peer every ceil(10/3)=4th "
+                             "round = 12 s");
+                // ANTI-VACUITY, and it is the whole point of computing it: move
+                // the LOCAL interval past the remote one and the peer must slow
+                // down with it, never speed up to the local rate.
+                const double keep = app.browseWatchIntervalSec;
+                app.browseWatchIntervalSec = 10.0;
+                const bool never = browseWatchEvery() == 1 &&
+                                   browseWatchInterval(true) == 10.0;
+                app.browseWatchIntervalSec = keep;
+                check(never, "B1b ...and a local interval raised to 10 s does not leave "
+                             "the peer at 3 s");
+            }
+            {   // ---- B2: ONLY WHILE DRAWN -------------------------------------
+                // §2: the poll runs for an instance that is actually being
+                // drawn. drawPanelRemote writes the mark at its head and the
+                // spine calls it only when ImGui::Begin answered true, so a
+                // window that is closed, collapsed or on an unselected dock tab
+                // simply stops advancing it. Asserted rather than assumed: the
+                // mark IS the gate, and a gate nobody asks about is a comment.
+                clk += 100.0;
+                I.polledAt = clk - 99.0;             // long overdue either way
+                I.drawnFrame = FR;
+                const bool drawnNow = rbPollDue(I, clk, FR);
+                I.drawnFrame = FR - 1;               // drawn in the frame that
+                const bool drawnLast = rbPollDue(I, clk, FR);   // just finished
+                I.drawnFrame = FR - 2;               // ...and then the window
+                const bool gone = rbPollDue(I, clk, FR);        // went away
+                I.drawnFrame = 0;                    // never drawn at all
+                const bool never = rbPollDue(I, clk, FR);
+                check(drawnNow && drawnLast && !gone && !never,
+                      "B2 polled while drawn (this frame or last), never once the "
+                      "panel stops");
+                I.drawnFrame = FR;
+                I.polledAt = 0;
+            }
+            {   // ---- B3: SKIP, NEVER QUEUE ------------------------------------
+                // §2: if that instance's worker is busy, the round is skipped -
+                // the next one comes. A queue of stale listings is worse than a
+                // missed round: each of them replaces the listing when it lands,
+                // so a slow link would redraw the panel N times with N answers
+                // to the same question, the last N-1 already out of date when
+                // they arrived.
+                clk += 100.0;
+                const int was = I.pollsIssued;
+                I.polledAt = clk - 99.0;
+                I.pollPending = false;
+                I.busy = true;                       // a real job is running
+                const bool whileBusy = rbPollRound(I, clk, FR);
+                I.busy = false;
+                I.pollPending = true;                // ...or a poll is already out
+                const bool whilePolling = rbPollRound(I, clk, FR);
+                I.pollPending = false;
+                {   // ...or a navigation is waiting to go out
+                    std::lock_guard<std::mutex> lk(I.mtx);
+                    App::RbJob j;
+                    j.kind = App::RbList;
+                    j.host = I.b.host;
+                    j.port = I.b.port;
+                    j.dir = I.b.dir;
+                    I.queue.push_back(std::move(j));
+                }
+                const bool whileQueued = rbPollRound(I, clk, FR);
+                {
+                    std::lock_guard<std::mutex> lk(I.mtx);
+                    I.queue.clear();
+                }
+                check(!whileBusy && !whilePolling && !whileQueued &&
+                      I.pollsIssued == was,
+                      "B3 a busy worker, a poll in flight or a queued nav: the round "
+                      "is SKIPPED");
+                // ANTI-VACUITY: with the worker free the very same call DOES
+                // issue one, and exactly one - "it never polls at all" passes
+                // B3 on its own.
+                I.polledAt = clk - 99.0;
+                const bool free1 = rbPollRound(I, clk, FR);
+                const bool free2 = rbPollRound(I, clk, FR);   // same instant: not due
+                int kinds = 0, mine = 0;
+                std::string aimedAt;
+                {
+                    std::lock_guard<std::mutex> lk(I.mtx);
+                    kinds = (int)I.queue.size();
+                    for (const auto& j : I.queue)
+                        if (j.kind == App::RbPoll) { mine++; aimedAt = j.dir; }
+                }
+                check(free1 && !free2 && I.pollsIssued == was + 1 && kinds == 1 &&
+                      mine == 1 && aimedAt == I.b.dir,
+                      "B3b ...and a free worker issues ONE round, of THIS dir, per "
+                      "interval");
+                settle();
+            }
+            {   // ---- B4: THE LOAD-BEARING ONE ---------------------------------
+                // A poll-driven re-listing must leave the keyboard cursor and
+                // the multi-selection exactly where a manual refresh leaves
+                // them. `RemoteBrowse::rev` bumps on every listing that arrives,
+                // and until PR #155 that bump wiped both; #155 made them follow
+                // the row BY NAME (rbCursorFollow / rbSelFollow). Browse-side
+                // polling re-lists every few seconds, so anything that regressed
+                // there would turn an intermittent defect into a permanent one -
+                // which is why this assertion is the reason the stage is safe to
+                // build at all.
+                std::vector<RbRow> v0 = viewHere();
+                rbCursorFollow(I, v0);
+                rbSelFollow(I, v0);
+                int row0 = -1;
+                std::vector<std::string> ticked;
+                for (size_t i = 0; i < v0.size(); i++) {
+                    if (v0[i].up) continue;          // ".." is in every listing
+                    if (row0 < 0) row0 = (int)i;
+                    if (ticked.size() < 2) { I.sel[i] = 1; ticked.push_back(v0[i].name()); }
+                }
+                I.cursor = row0;
+                rbCursorFollow(I, v0);               // records the name under it
+                rbSelFollow(I, v0);                  // ...and the ticked names
+                const std::string want = row0 >= 0 ? v0[row0].name() : std::string();
+                const uint64_t rev0 = B.rev;
+                const size_t rows0 = v0.size();
+                // ...and now a file appears in the folder the panel is looking
+                // at. "charlie" sorts between bravo and delta, so it does not
+                // merely lengthen the listing - it MOVES every row after it,
+                // which is the case an index-keyed cursor cannot survive and a
+                // name-keyed one must.
+                writeNpy4(scratch + "/charlie.npy", 9.0f);
+                clk += 100.0;
+                I.polledAt = clk - 99.0;             // due: the clock is SET,
+                const bool issued = rbPollRound(I, clk, FR);      // never waited on
+                double tp = nowSec();
+                while (nowSec() - tp < 120.0) {
+                    pumpRemoteBrowse();
+                    if (B.rev != rev0) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                std::vector<RbRow> v1 = viewHere();
+                rbCursorFollow(I, v1);
+                rbSelFollow(I, v1);
+                std::vector<std::string> kept;
+                for (size_t i = 0; i < v1.size() && i < I.sel.size(); i++)
+                    if (I.sel[i]) kept.push_back(v1[i].name());
+                const int cur = I.cursor;
+                const std::string curName = cur >= 0 && cur < (int)v1.size()
+                                          ? v1[cur].name() : std::string();
+                bool sawNew = false;
+                for (const auto& e : B.entries) if (e.name == "charlie.npy") sawNew = true;
+                // ANTI-VACUITY, and it is the whole guard: the listing really
+                // WAS replaced. Without these four terms, "the cursor is still
+                // on alpha.npy" is satisfied by a poll that never happened.
+                check(issued && sawNew && B.rev == rev0 + 1 && v1.size() == rows0 + 1,
+                      "B4 a poll-driven re-listing IS a new listing: +1 row, rev +1, "
+                      "charlie.npy in it");
+                check(!want.empty() && cur >= 0 && curName == want,
+                      "B4b ...and the keyboard cursor is still on the SAME row, by name");
+                check(ticked.size() == 2 && kept == ticked,
+                      "B4c ...and both ticks are still on the SAME two rows");
+                fprintf(stderr, "browseselftest: B4 detail: rows %zu->%zu rev %llu->%llu "
+                                "cursor %d '%s' (want '%s') ticks [%s] -> [%s]\n",
+                        rows0, v1.size(), (unsigned long long)rev0,
+                        (unsigned long long)B.rev, cur, curName.c_str(), want.c_str(),
+                        say(ticked).c_str(), say(kept).c_str());
+                settle();
+            }
+            {   // ---- B5: a poll that found NOTHING costs the panel nothing ----
+                // §5 lets the listing update silently; it does not ask for the
+                // rows to be rebuilt every three seconds when the folder has not
+                // moved. An answer identical to what is on screen is DROPPED -
+                // no rev bump, so no cursor/selection carry, no recents churn
+                // and no prefs write - which is what keeps a panel left open on
+                // a quiet folder from spending §3's idle promise on nothing.
+                const uint64_t rev0 = B.rev;
+                const int applied0 = I.pollsApplied;
+                const bool dirty0 = app.prefsDirty;
+                clk += 100.0;
+                I.polledAt = clk - 99.0;
+                const bool issued = rbPollRound(I, clk, FR);
+                double tq = nowSec();
+                while (nowSec() - tq < 120.0) {
+                    pumpRemoteBrowse();
+                    if (!I.pollPending) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                check(issued && !I.pollPending && B.rev == rev0 &&
+                      I.pollsApplied == applied0 && app.prefsDirty == dirty0,
+                      "B5 a poll of an unchanged folder replaces nothing: rev, rows and "
+                      "prefs all still");
+                // ANTI-VACUITY: the comparator that decided that is not simply
+                // saying yes to everything. One byte of one row's size, one
+                // second of its mtime and one missing row are three different
+                // listings.
+                std::vector<remote::Entry> a = B.entries, b = B.entries;
+                const bool same = rbSameListing(a, b);
+                if (!b.empty()) b[0].size++;
+                const bool notSize = !rbSameListing(a, b);
+                b = a;
+                if (!b.empty()) b[0].mtime++;
+                const bool notTime = !rbSameListing(a, b);
+                b = a;
+                if (!b.empty()) b.pop_back();
+                check(!a.empty() && same && notSize && notTime && !rbSameListing(a, b),
+                      "B5b ...and 'nothing moved' notices one byte, one second and one "
+                      "row");
+                settle();
+            }
+            {   // ---- B6: THE COST, stated as a number -------------------------
+                // §2 dedupes by (host, port, dir): three stacks open from one
+                // folder cost ONE LIST (--rwatch-selftest R3). The Browse poll
+                // cannot join that request - the stack watcher owns its own
+                // Session on its own thread by §3's "one Session, one owning
+                // thread", and for a LOCAL folder it makes no request at all (it
+                // walks the directory with directory_iterator, where the panel
+                // asks a peer over a pipe). So the honest statement is this one,
+                // and it is what is asserted: the panel adds ONE listing per
+                // interval per DRAWN INSTANCE - not one per stack, and not one
+                // per row. See watch-design §14.4.
+                std::vector<int> made;
+                for (int k = 0; k < 3; k++) {
+                    App::SeqInfo si;
+                    si.id = app.nextSeqId++;
+                    si.name = "peer stack " + std::to_string(si.id);
+                    si.remoteHost = "kepler";
+                    si.remotePort = 2222;
+                    for (int f = 0; f < 4; f++)
+                        si.remoteFiles.push_back(scratch + "/" + names4[f]);
+                    si.expectedFrames = 4;
+                    app.seqs.push_back(si);
+                    made.push_back(si.id);
+                }
+                std::vector<App::WatchTarget> tg = watchTargetsNow();
+                int mine = 0;
+                bool oneKey = true;
+                for (const auto& t : tg) {
+                    bool ours = false;
+                    for (int id : made) if (t.seqId == id) ours = true;
+                    if (!ours) continue;
+                    mine++;
+                    if (t.host != "kepler" || t.port != 2222 || t.dir != scratch)
+                        oneKey = false;
+                }
+                const int was = I.pollsIssued;
+                clk += 100.0;
+                I.polledAt = clk - 99.0;
+                rbPollRound(I, clk, FR);
+                check(mine == 3 && oneKey && I.pollsIssued == was + 1,
+                      "B6 three stacks in the browsed folder are ONE watch key; the "
+                      "panel adds ONE listing");
+                for (int id : made)
+                    for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+                        if (it->id == id) { app.seqs.erase(it); break; }
+                settle();
+            }
+            I.cursor = -1;
+            I.cursorKey.clear();
+            I.sel.clear();
+            I.selKeys.clear();
+            I.polledAt = 0;
+            app.uiFrame = 0;
+            std::filesystem::remove_all(pathFromUtf8(scratch), bec);
+        }
         {   // PORT. A non-default ssh port used to survive only inside the
             // browse worker: makeRemoteUrl dropped it, and that string is what
             // becomes ImageDoc::path, RFetchJob::url, MJob::url and the session

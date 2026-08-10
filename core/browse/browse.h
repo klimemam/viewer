@@ -33,6 +33,21 @@ void rbEnqueue(App::BrowseInstance& I, App::RbJob job);
 void stopRbWorker();                 // shutdown: every instance's worker
 void pumpRemoteBrowse();             // UI thread, once per frame
 void pumpRemoteOpenQueue();          // folder-scan stacks, opened one at a time
+// ---- watch-design §2's second row: a drawn instance re-lists its own dir ------
+// Free functions, and the reason is rbCursorFollow's: a NOGL selftest drives the
+// decision the frame loop drives, rather than a second copy of it. `now` is
+// passed in for watchPollRound's reason - nothing in here may read a clock, or
+// the test that pins a 3-second interval would have to live through one.
+int    browseWatchEvery();                     // peer rounds per local round
+double browseWatchInterval(bool peer);         // ...as seconds
+bool   rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame);
+bool   rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame);
+void   pumpBrowseWatch(double now);            // every instance, once per frame
+bool   rbAnyPollDue(double now);               // the idle-skip chain's term
+// Two listings, as the panel would draw them: "nothing moved" means every row is
+// the same row with the same numbers.
+bool   rbSameListing(const std::vector<remote::Entry>& a,
+                     const std::vector<remote::Entry>& b);
 bool rbHas(const std::vector<std::string>& v, const std::string& s);
 void rbTreeExpand(App::BrowseInstance& I, const std::string& dir);
 void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir);

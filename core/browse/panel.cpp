@@ -693,6 +693,14 @@ static std::string rbElideMiddle(const std::string& s, float maxW) {
 
 void drawPanelRemote(App::BrowseInstance& I) {
     App::RemoteBrowse& B = I.b;
+    // watch-design §2, second row: THIS INSTANCE IS BEING DRAWN, and that is the
+    // entire condition under which its directory is re-listed on a timer. The
+    // mark is here, at the head, and nowhere else: a window that is closed,
+    // collapsed or on an unselected dock tab never reaches this line, because
+    // the spine calls this function only when ImGui::Begin answered true. So
+    // "stop polling" needs no event and no bookkeeping - the mark stops
+    // advancing, and rbPollDue stops saying yes.
+    I.drawnFrame = app.uiFrame;
     // FIRST, so it is destroyed LAST - after `view` and after every row that
     // points into the browse state. Anything that replaces that state is queued
     // through rbDefer and runs here. (This replaces a one-flag "forget the tree

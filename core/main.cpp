@@ -1966,6 +1966,16 @@ int main(int argc, char** argv) {
                 // thing this line lets through is a fact that is already true
                 // and is waiting for pumpWatch to put it on screen.
                 working |= watchFindingsPending();
+                // ...and §2's second row, which is the ONE place this feature
+                // costs the idle loop anything. A Browse panel that is on screen
+                // re-lists its folder every few seconds, and the enqueue is a UI
+                // thread act (the queue, and RbJob::exe, are the UI thread's), so
+                // the frame that issues it has to happen. It is asked as "is a
+                // round DUE", never as "is a Browse panel open": no panel drawn,
+                // or none connected, and this is false and the idle stays at 0
+                // fps exactly as it was. See watch-design §14.2 for the measured
+                // cost of the case where it is true.
+                working |= rbAnyPollDue(nowSec());
             }
             // (--crash-test counts frames, so it must not be skipped)
             if (g_inputSeq == before && !typing && !working && !crashAfter) continue;
@@ -1983,10 +1993,16 @@ int main(int argc, char** argv) {
             continue;
         }
         app.watchPaused = false;
+        // The tick "is this panel on screen" is measured in (watch-design §14.1).
+        // Incremented here, once, before anything asks: the pumps below run
+        // BEFORE this frame's draw, so an instance drawn in the frame that just
+        // finished carries uiFrame - 1 when rbPollDue is asked about it.
+        app.uiFrame++;
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpMeasure();                // integrate server-side measurement results
         pumpRemoteBrowse();           // connect/list results from the browse worker
+        pumpBrowseWatch(nowSec());    // ...and re-list a DRAWN panel's own dir (§2)
         pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
         pumpWatch();                  // source files that moved on disk (項目20)
         // --compare, deferred until the files (and their background-loaded frames)

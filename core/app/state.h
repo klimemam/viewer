@@ -1179,6 +1179,7 @@ struct App {
     static constexpr browse::RbKind RbGlob       = browse::RbGlob;
     static constexpr browse::RbKind RbTreeList   = browse::RbTreeList;
     static constexpr browse::RbKind RbDisconnect = browse::RbDisconnect;
+    static constexpr browse::RbKind RbPoll       = browse::RbPoll;
     using RbJob = browse::RbJob;
     using RbResult = browse::RbResult;
     // Stacks a remote folder scan decided to open, one at a time: the next
@@ -1305,6 +1306,13 @@ struct App {
     // - changing either number here cannot then silently leave the peer polled
     // at the local rate.
     double watchRemoteIntervalSec = 15.0;
+    // ---- §2's SECOND row: a Browse instance re-lists where it stands ---------
+    // The same pair, for the other watched thing. A drawn Browse panel is a
+    // person looking at a folder, so it is polled faster than a stack whose
+    // finding is a line of text; the peer's is the same ratio question and is
+    // computed from these two rather than typed (browseWatchEvery, nav.cpp).
+    double browseWatchIntervalSec = 3.0;
+    double browseWatchRemoteIntervalSec = 10.0;
     // §2: stacks are polled "while the app is not minimised" - the same line the
     // frame loop already draws for drawing at all. A minimised window has no row
     // to put a finding under, and the answer is not stale when it comes back:
@@ -1947,6 +1955,16 @@ struct App {
     std::string pendingLayout;        // dock settings from a session, applied next frame
     bool compactUi = true;            // dense spacing: this tool is table-heavy
     int wakeFrames = 3;               // frames still to draw after the last input
+    // Frames the main loop has BEGUN, counted so "is this panel on screen right
+    // now" can be asked outside the draw. It is a COUNTER and not a timestamp on
+    // purpose (watch-design §14.1): this program idles at 0 fps, so a panel that
+    // is plainly on screen has a `lastDrawnAt` that goes stale the moment the
+    // user stops touching anything - which is exactly when a Browse panel is
+    // being watched. The last frame that HAPPENED is what is on the glass, and
+    // that is what a frame number says and a clock does not. 0 = no frame yet;
+    // the first frame is 1, so a panel that has never been drawn (drawnFrame 0)
+    // is never mistaken for one that was drawn in frame 0.
+    uint64_t uiFrame = 0;
     bool lowBandwidth = false;        // remote/ssh: draw the minimum, not a tail
     bool showFps = false;
     bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
