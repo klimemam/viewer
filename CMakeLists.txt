@@ -658,7 +658,14 @@ if(UNIX AND NOT APPLE AND GLFW_BUILD_X11)
   endif()
 endif()
 if(MSVC)
-  target_compile_options(viewer PRIVATE /W3 /utf-8 ${VIEWER_STRICT})
+  # /bigobj: core/main.cpp is ONE translation unit that #includes the whole
+  # spine plus every selftest, and MSVC's default COFF object has a 65,536
+  # section ceiling that it crossed (error C1128, on the Windows runner only -
+  # gcc and clang have no such limit, so a build that is green on two of the
+  # three matrix faces can still stop here). The flag raises the ceiling to
+  # 2^31 and costs nothing else: the object format is the same one, and no
+  # other toolchain has an equivalent to keep in step.
+  target_compile_options(viewer PRIVATE /W3 /utf-8 /bigobj ${VIEWER_STRICT})
 else()
   target_compile_options(viewer PRIVATE -Wall -Wextra ${VIEWER_STRICT})
 endif()
