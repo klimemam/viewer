@@ -309,7 +309,17 @@ static void setPanelSeparation(const App::ASet& S, uint64_t key) {
         ImGui::TableHeadersRow();
         for (const auto& L : F.levels) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(L.member.c_str());
+            ImGui::TableNextColumn();
+            // The row a reader stops at: its mu is 0 and nothing else on the
+            // line explains why. It is the dark, standing as a level of its own
+            // sweep - allowed, and therefore said HERE rather than only in the
+            // paragraph under the table (確定 2026-08-10, #57).
+            if (L.isDark) {
+                ImGui::TextColored(ImVec4(0.72f, 0.84f, 0.98f, 1), "%s  (also the dark)",
+                                   L.member.c_str());
+            } else {
+                ImGui::TextUnformatted(L.member.c_str());
+            }
             ImGui::TableNextColumn(); ImGui::Text("%.6g", L.value);
             ImGui::TableNextColumn();
             if (L.N > L.n) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%d/%d", L.n, L.N);
@@ -338,6 +348,12 @@ static void setPanelSeparation(const App::ASet& S, uint64_t key) {
     ImGui::TextDisabled("%s", sepLevelCensus(F).c_str());
     for (const auto& sk : F.skipped)
         ImGui::TextDisabled("  excluded \"%s\": %s", sk.member.c_str(), sk.why.c_str());
+    // ...and the other membership fact, which is not an exclusion: a stack that
+    // entered TWICE, once as the dark and once as a level. It sits with the
+    // census because that is where "what this fit was made of" is stated, and
+    // it is wrapped rather than tooltipped because a fact a reader has to hover
+    // to find is a fact a screenshot loses.
+    if (!F.dualNote.empty()) ImGui::TextWrapped("%s", F.dualNote.c_str());
 
     // ---- the residual plot: the model check, on the fit's own axis ---------
     if (F.planeFit[tp] && F.levels.size() >= 3) {

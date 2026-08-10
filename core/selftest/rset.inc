@@ -143,26 +143,31 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
         return (double)((x * 29 + y * 13 + seed * 7) % 97) / 97.0;
     };
     int seed = 0;
-    auto writeStack = [&](const char* name, double level, double B, double a) {
+    // W/H are parameters only so that ONE stack can be written at half the
+    // linear size: the WxH refusal (確定 2026-08-10, #57) has to be exercised
+    // over the WIRE and not only in memory, because the peer is where W and H
+    // stop being the client's own facts and become numbers it was told.
+    auto writeStack = [&](const char* name, double level, double B, double a,
+                          int W, int H) {
         const std::string d = root + "/" + name;
         const int sd = ++seed;
         std::error_code ec;
         std::filesystem::create_directories(pathFromUtf8(d), ec);
         for (int f = 0; f < NFR; f++) {
-            std::vector<float> px((size_t)FW * FH);
-            for (int y = 0; y < FH; y++)
-                for (int x = 0; x < FW; x++) {
+            std::vector<float> px((size_t)W * H);
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
                     const int p = (y & 1) * 2 + (x & 1);
                     const int u = x >> 1, v = y >> 1;
                     const double val =
                         L0 + ((v & 1) ? -B : B) +
                         level * SENS[p] * (1.0 + ((u & 1) ? -qg : qg)) +
                         (((u ^ v) & 1) ? -a : a) + TD[f] * kt + grit(x, y, sd);
-                    px[(size_t)y * FW + x] = (float)val;
+                    px[(size_t)y * W + x] = (float)val;
                 }
             char dict[128];
             snprintf(dict, sizeof dict,
-                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", FH, FW);
+                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", H, W);
             std::string hdr = dict;
             hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
             hdr += '\n';
@@ -177,15 +182,19 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
         }
     };
     const double Bd = 8.0, Bl = 20.0, resid = 3.0 * kt;
-    writeStack("dark", 0.0, Bd, resid);          // the dark: additive pattern only
-    writeStack("lv0", 512.0, Bl, resid);         // four lit levels, one line in mu^2
-    writeStack("lv1", 1024.0, Bl, resid);
-    writeStack("lv2", 2048.0, Bl, resid);
-    writeStack("lv3", 3072.0, Bl, resid);
+    writeStack("dark", 0.0, Bd, resid, FW, FH);          // the dark: additive pattern only
+    writeStack("lv0", 512.0, Bl, resid, FW, FH);         // four lit levels, one line in mu^2
+    writeStack("lv1", 1024.0, Bl, resid, FW, FH);
+    writeStack("lv2", 2048.0, Bl, resid, FW, FH);
+    writeStack("lv3", 3072.0, Bl, resid, FW, FH);
     // ...and one stack whose fixed pattern is UNDER its own temporal floor, so
     // the clamp fires and the two sides have to agree about a 0 that is a
     // statement rather than a value.
-    writeStack("quiet", 0.0, 0.0, 1.0);
+    writeStack("quiet", 0.0, 0.0, 1.0, FW, FH);
+    // ...and one at HALF the linear size, same channel count and same plane map,
+    // for RS23. It is a perfectly good stack; what it is not is the sweep's own
+    // shape (確定 2026-08-10, #57).
+    writeStack("half", 2560.0, Bl, resid, FW / 2, FH / 2);
 
     // ---- opened HERE: one stack per folder ----------------------------------
     app.seqLoadMode = 1;                   // numbered files ARE a stack
@@ -202,7 +211,7 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
             }
             pumpSequenceAndQueue();
             if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
-                !app.folderPickOpen && app.seqs.size() >= 6) break;
+                !app.folderPickOpen && app.seqs.size() >= 7) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
@@ -241,13 +250,14 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
     Level* darkP = byName("dark");
     Level* litP = byName("lv3");
     Level* quietP = byName("quiet");
+    Level* halfP = byName("half");
     std::vector<Level*> levels;
     for (int i = 0; i < 4; i++) {
         Level* L = byName(kLevelDirs[i]);
         if (L) { L->value = kLevelVal[i]; levels.push_back(L); }
     }
-    if (!darkP || !litP || !quietP || levels.size() != 4) {
-        fprintf(stderr, "rsetselftest: the scratch fixture did not open as 6 stacks\n");
+    if (!darkP || !litP || !quietP || !halfP || levels.size() != 4) {
+        fprintf(stderr, "rsetselftest: the scratch fixture did not open as 7 stacks\n");
         return 1;
     }
     const Level& dark = *darkP;
@@ -463,6 +473,141 @@ static int rsetSelfTest(const char* exe, const char* dirArg) {
               "RS11 ...so both named rows of the fit read the same on either side");
         if (!w1.empty()) fprintf(stderr, "rsetselftest: RS11 %s\n", w1.c_str());
         if (!w2.empty()) fprintf(stderr, "rsetselftest: RS11 %s\n", w2.c_str());
+    }
+
+    // ---- RS23 / RS24: the two rulings of 2026-08-10, over the wire ----------
+    //
+    // Both are CLIENT-side composition, so neither changes a byte of the
+    // request or the fold's declared form - the parity token is unmoved and
+    // rp::VERSION stays 8. What they do change is a sentence and a tag, and a
+    // sentence that reads differently on the two transports is a statement
+    // about a machine rather than about data. So the local run and the peer run
+    // are compared, not merely exercised.
+    //
+    // `member` is the CLIENT's own word for a binding on both transports (it
+    // never crosses the wire - the peer knows a path). Both sentences under
+    // test quote it, so these two blocks hand the peer path the same name the
+    // local path reads off its own SeqInfo; anything else would be comparing
+    // two descriptions of one binding written by two different authors.
+    auto peerRoleBound = [&](const char* role, const Level& L) {
+        SetPeerRole r = peerRole(role, L);
+        if (const App::SeqInfo* si = seqInfo(L.seqId)) r.member = si->name;
+        return r;
+    };
+    struct SepMember { const Level* L; double value; };
+    auto makeSweepSet = [&](const char* setName, const char* serName,
+                            const std::vector<SepMember>& mem, const Level& dk) {
+        App::Series Sr;
+        Sr.id = app.nextSeriesId++;
+        Sr.batchId = 1;
+        Sr.name = serName;
+        Sr.paramName = "illuminance";
+        snprintf(Sr.unit, sizeof Sr.unit, "lx");
+        for (const auto& m : mem) {
+            App::Series::Member mm;
+            mm.seqId = m.L->seqId;
+            mm.value = m.value;
+            mm.include = true;
+            mm.fold = FOLD_MEAN;
+            Sr.members.push_back(mm);
+        }
+        app.series.push_back(std::move(Sr));
+        App::ASet Ss;
+        Ss.id = app.nextASetId++;
+        Ss.batchId = 1;
+        Ss.name = setName;
+        App::ASetRole rs; rs.role = "sweep"; rs.seriesId = app.series.back().id;
+        Ss.roles.push_back(rs);
+        App::ASetRole rd; rd.role = "dark"; rd.seqId = dk.seqId;
+        Ss.roles.push_back(rd);
+        app.analysisSets.push_back(Ss);
+        return Ss.id;
+    };
+    auto peerLevels = [&](const std::vector<SepMember>& mem) {
+        std::vector<SetPeerLevel> pl;
+        for (size_t i = 0; i < mem.size(); i++) {
+            SetPeerLevel L;
+            L.role = peerRoleBound("level", *mem[i].L);
+            L.role.role = "level" + std::to_string(i);     // distinct, per role
+            L.value = mem[i].value;
+            pl.push_back(std::move(L));
+        }
+        return pl;
+    };
+
+    {   // ---- RS23: a sweep member that is not the dark's shape --------------
+        // 確定 2026-08-10 (#57): 「dark, sweep の WxH 不一致は拒否」. The member
+        // is a perfectly good 16x16 stack with the same channel count and the
+        // same plane map, and the fit's arithmetic would have run over it - the
+        // dark contributes a per-plane scalar and nothing subtracts pixel from
+        // pixel. On this transport W and H are not even the client's own facts:
+        // they are numbers the PEER counted and sent back, which is the half of
+        // this refusal that could quietly not exist.
+        std::vector<SepMember> mem;
+        for (size_t i = 0; i < levels.size(); i++)
+            mem.push_back({ levels[i], levels[i]->value });
+        mem.push_back({ halfP, 2560.0 });
+        const int sid = makeSweepSet("sep-size", "lx sweep", mem, dark);
+        SepFit LF = runSeparationFit(*aSetById(sid));
+        SepFit PF;
+        const std::string e = setPeerSeparation(s, "sep-size", "lx sweep", peerLevels(mem),
+                                                peerRoleBound("dark", dark),
+                                                cfaType, cfaPattern, PF);
+        fprintf(stderr, "rsetselftest: RS23 local \"%s\"\n", LF.refusal.c_str());
+        fprintf(stderr, "rsetselftest: RS23 peer  \"%s\"\n", PF.refusal.c_str());
+        check(!LF.ok && LF.refusal.find("16x16x1ch") != std::string::npos &&
+                  LF.refusal.find("32x32x1ch") != std::string::npos &&
+                  LF.refusal.find("one shape") != std::string::npos,
+              "RS23 a WxH mismatch is refused locally, with BOTH shapes named");
+        check(!PF.ok && !PF.refusal.empty() && PF.refusal == LF.refusal &&
+                  e == LF.refusal,
+              "RS23 ...and the peer transport refuses in the very same sentence");
+        check(!LF.dsnu.ok && !PF.dsnu.ok && !LF.prnu.ok && !PF.prnu.ok &&
+                  LF.dsnu.refusal == PF.dsnu.refusal,
+              "RS23 ...with no row composed on either side");
+    }
+
+    {   // ---- RS24: the dark ALSO standing as a level ------------------------
+        // 確定 2026-08-10 (#57): 「dark が sweep のメンバを兼ねるは、そう
+        // Analysis Set を作ったら許容」. The peer folds the same files twice,
+        // once under each role, exactly as the local path folds the same stack
+        // twice - so the anchor's mu is a number minus itself on both sides and
+        // the equality below is ==, not a tolerance.
+        std::vector<SepMember> mem;
+        mem.push_back({ darkP, 0.0 });          // the dark, standing as this sweep's zero
+        for (size_t i = 0; i < levels.size(); i++)
+            mem.push_back({ levels[i], levels[i]->value });
+        const int sid = makeSweepSet("sep-anchored", "lx sweep", mem, dark);
+        SepFit LF = runSeparationFit(*aSetById(sid));
+        SepFit PF;
+        const std::string e = setPeerSeparation(s, "sep-anchored", "lx sweep",
+                                                peerLevels(mem), peerRoleBound("dark", dark),
+                                                cfaType, cfaPattern, PF);
+        if (!e.empty()) fprintf(stderr, "rsetselftest: RS24: %s\n", e.c_str());
+        fprintf(stderr, "rsetselftest: RS24 %s\n", setResultTitle(LF.dsnu).c_str());
+        fprintf(stderr, "rsetselftest: RS24 %s\n", setResultTitle(PF.dsnu).c_str());
+        fprintf(stderr, "rsetselftest: RS24 anchor mu %.17g / %.17g  y %.17g / %.17g  "
+                        "intercept %.17g / %.17g\n",
+                LF.ok ? LF.levels[0].mu[0] : -1.0, PF.ok ? PF.levels[0].mu[0] : -1.0,
+                LF.ok ? LF.levels[0].fpnVar[0] : -1.0, PF.ok ? PF.levels[0].fpnVar[0] : -1.0,
+                LF.ok ? LF.inter[0] : 0.0, PF.ok ? PF.inter[0] : 0.0);
+        check(LF.ok && PF.ok && LF.M == 5 && PF.M == 5,
+              "RS24 a dark that is also a level folds on the peer and fits, M+1 roles");
+        bool zero = LF.ok && PF.ok;
+        for (int p = 0; p < LF.nPl && zero; p++)
+            zero = LF.levels[0].mu[p] == 0.0 && PF.levels[0].mu[p] == 0.0;
+        check(zero, "RS24 ...its mu is EXACTLY 0 on both sides, on every plane");
+        check(LF.alsoDark.size() == 1 && LF.alsoDark == PF.alsoDark &&
+                  !LF.dualNote.empty() && LF.dualNote == PF.dualNote,
+              "RS24 ...and both transports name the double duty in one sentence");
+        std::string w3, w4;
+        const bool same = rsetSameResult(LF.dsnu, PF.dsnu, w3) &&
+                          rsetSameResult(LF.prnu, PF.prnu, w4);
+        if (!w3.empty()) fprintf(stderr, "rsetselftest: RS24 %s\n", w3.c_str());
+        if (!w4.empty()) fprintf(stderr, "rsetselftest: RS24 %s\n", w4.c_str());
+        check(same, "RS24 ...so both rows, overlap clause and all, read the same");
+        check(setResultTitle(LF.dsnu).find("is also the dark role") != std::string::npos,
+              "RS24 ...and a number quoted out of either one carries the fact");
     }
 
     // ---- RS12: the peer computes nothing that has a name --------------------
