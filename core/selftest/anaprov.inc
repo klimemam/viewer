@@ -150,7 +150,17 @@ static int anaProvSelftest() {
     check(!anas[sel].file.empty() &&
           tsv.find(anas[sel].file) != std::string::npos,
           "AP9 TSV: the pasted grid names the dll");
-    check(tsv.find("# plugin: " + anas[sel].path + "\n") != std::string::npos,
+    // The full path, spelled by the ONE citation every mouth uses. It was the
+    // bare path when this was written, because stats/moments was a V2
+    // registration and had no version to put in front of it; the §1 migration
+    // gave it one, so the line is now "<1.0.0> C:\...\analyzer_stats.dll".
+    // Asserting through analyzerCitation rather than re-spelling it keeps this
+    // check about what it was always about - that the pasted document cites the
+    // FILE - and leaves "which shape does a citation have" to AP23/AP24, where
+    // both shapes are asked of the twins on purpose.
+    check(tsv.find("# plugin: " + analyzerCitation(anas[sel].version, anas[sel].path) +
+                   "\n") != std::string::npos &&
+          tsv.find(anas[sel].path) != std::string::npos,
           "AP10 TSV: '# plugin:' carries the full path");
 
     // ---- and builtin results wear NO plugin tag -----------------------------

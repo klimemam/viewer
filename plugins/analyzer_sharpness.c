@@ -11,7 +11,7 @@
 #include <string.h>
 
 static int32_t analyze(const psFrame* in, const psRect* roi,
-                       const psAnalyzeSink2* sink, char* err, size_t err_cap) {
+                       const psAnalyzeSink3* sink, char* err, size_t err_cap) {
     psRect r;
     int pw, ph, x, y;
     float* luma;
@@ -82,14 +82,20 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V2 registration for the description alone: the menu shows the precondition
- * where the user picks the tool, instead of a host-side lookup table. */
-static const psAnalyzerV2 DESC = {
-    2u, PS_CAP_CPU, "sharpness/gradient",
-    "relative focus compare, same scene; demosaic CFA first", NULL, analyze, {0}
+/* V3 registration (docs/abi-v3.md §3-§4). The version names THE COMPUTATION -
+ * it changes when an input could produce a different result document and never
+ * for a commit or a compiler (the rule, and why it is not the build id, is in
+ * docs/analyzers.md; the long form is in analyzer_stats.c). The headline needs
+ * no stripping here - these three keys carry no channel prefix, because all
+ * three are computed on one luma plane - and it is the same row the host's
+ * V1/V2 table picked by the whole-string suffix "tenengrad". */
+static const psAnalyzerV3 DESC = {
+    3u, PS_CAP_CPU, "sharpness/gradient", "1.0.0",
+    "relative focus compare, same scene; demosaic CFA first",
+    NULL, "tenengrad", analyze, {0}
 };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < 2u || !host->register_analyzer2) return 1;
-    return host->register_analyzer2(host->ctx, &DESC);
+    if (!host || host->abi_version < PS_ABI_VERSION || !host->register_analyzer3) return 1;
+    return host->register_analyzer3(host->ctx, &DESC);
 }

@@ -61,7 +61,7 @@ static void selectNth(float* a, size_t lo, size_t hi, size_t k) {
 }
 
 static int32_t analyze(const psFrame* in, const psRect* roi,
-                       const psAnalyzeSink2* sink, char* err, size_t err_cap) {
+                       const psAnalyzeSink3* sink, char* err, size_t err_cap) {
     psRect r;
     size_t npx, finiteTotal = 0;
     float* scratch;
@@ -189,14 +189,35 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V2 registration for the description alone: the menu shows the precondition
- * where the user picks the tool, instead of a host-side lookup table. */
-static const psAnalyzerV2 DESC = {
-    2u, PS_CAP_CPU, "stats/moments",
-    "any image / ROI; CFA planes split; finite ratio < 1 flags NaN or Inf", NULL, analyze, {0}
+/* V3 registration (docs/abi-v3.md §3-§4). Two fields are new and neither is a
+ * formality:
+ *
+ *   version  - the one thing the host cannot source for itself, and the one
+ *              string ABI v3 §10 compares for EQUALITY between a client and a
+ *              peer. So it names THE COMPUTATION and nothing else: it changes
+ *              when some input could produce a different result document (a key
+ *              gained or lost, a unit, a value, an error sentence), and it does
+ *              NOT change for a comment, a refactor, a compiler or a commit.
+ *              Deliberately not derived from the build (cmake/gitversion.cmake
+ *              gives the viewer "<hash>+local"): that would be right for a
+ *              binary and would make two peers that agree about every line of
+ *              this file refuse each other - the failure parity exists to
+ *              prevent, arriving from the other side. 1.0.0 is not a claim that
+ *              this analyzer is new; it is the first version it has ever
+ *              DECLARED. The full rule is in docs/analyzers.md.
+ *   headline  - NULL here, and NULL is an answer: every row this emits is a
+ *              peer of every other, and §3.2 honours a declared "none" instead
+ *              of falling back to the host's V1/V2 table.
+ *
+ * description is unchanged and still self-declared: the menu shows the
+ * precondition where the user picks the tool, instead of a host-side table. */
+static const psAnalyzerV3 DESC = {
+    3u, PS_CAP_CPU, "stats/moments", "1.0.0",
+    "any image / ROI; CFA planes split; finite ratio < 1 flags NaN or Inf",
+    NULL, NULL, analyze, {0}
 };
 
 PS_PLUGIN_EXPORT int32_t psRegisterPlugins(const psHostApi* host) {
-    if (!host || host->abi_version < 2u || !host->register_analyzer2) return 1;
-    return host->register_analyzer2(host->ctx, &DESC);
+    if (!host || host->abi_version < PS_ABI_VERSION || !host->register_analyzer3) return 1;
+    return host->register_analyzer3(host->ctx, &DESC);
 }
