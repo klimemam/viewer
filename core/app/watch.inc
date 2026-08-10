@@ -346,6 +346,14 @@ static void pumpWatch() {
         // polling for a line nobody will draw. notify_all wakes it out of its
         // interval at once, so the join is not a stall.
         if (app.watchThread.joinable()) stopWatchWorker();
+        // ...and whatever it found before it was told to stop is INTEGRATED,
+        // not dropped. Two reasons, and the second is the one that bites:
+        // those files really did change (switching the watcher off does not
+        // un-change them), and an undrained queue leaves
+        // watchFindingsPending() true forever - which puts `working` in the
+        // idle-skip chain permanently and turns the 0 fps idle into a
+        // continuous 12 fps for the rest of the session.
+        watchIntegrate();
         return;
     }
     {   // What to watch, refreshed from the open stacks. It walks the stacks and

@@ -522,6 +522,32 @@
                   o3[0].found.appeared == 0 && o3[0].found.firstChanged == "w_001.npy",
                   "W23c ...while a change to one of its OWN 3 is reported normally");
         }
+        {   // ---- W24: switching Watch OFF drains the queue -----------------------
+            // The one way this feature could cost the idle loop everything it
+            // promised (§3): a finding queued just before the switch is thrown
+            // would sit there for the rest of the session, and
+            // watchFindingsPending() is IN the idle-skip chain - so `working`
+            // would be permanently true and the 0 fps idle would become a
+            // continuous 12 fps. Turning the watcher off does not un-change the
+            // files, so the finding is integrated rather than dropped.
+            {
+                std::lock_guard<std::mutex> lk(app.watchMtx);
+                app.watchDone.clear();
+                App::WatchDone d;
+                d.seqId = seq;
+                d.found.changed = 1;
+                d.found.firstChanged = "w_002.npy";
+                app.watchDone.push_back(d);
+            }
+            check(watchFindingsPending(), "W24 (setup) a finding is sitting in the queue");
+            app.watchEnabled = false;
+            pumpWatch();
+            check(!watchFindingsPending() && !app.watchThread.joinable(),
+                  "W24b Watch switched OFF drains the queue (else the idle loop spins)");
+            check(seqWatchNote(seq) == "1 file(s) changed on disk (w_002.npy)",
+                  "W24c ...by INTEGRATING it: the files changed either way");
+            app.watchEnabled = true;
+        }
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "watchselftest: %s\n", ok ? "ok" : "FAILED");
