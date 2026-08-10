@@ -80,6 +80,17 @@ static std::vector<App::WatchTarget> watchTargetsNow() {
             t.dir = p0.parent_path().u8string();
             t.headName = p0.filename().u8string();
             if (t.dir.empty()) continue;
+            // ONE directory, or this stack is not watched. The whole mechanism
+            // is "re-run the sibling rule over this folder's listing" (§1), and
+            // that rule can only speak about one folder: members living
+            // elsewhere would simply be absent from every observation, which §4
+            // would confirm - correctly, by its own lights - as VANISHED. A
+            // false sentence about a stack whose files are all present is worse
+            // than no sentence, so the stack is skipped and says nothing.
+            bool oneDir = true;
+            for (size_t k = 1; k < paths.size() && oneDir; k++)
+                oneDir = pathFromUtf8(paths[k]).parent_path().u8string() == t.dir;
+            if (!oneDir) continue;
         }
         out.push_back(std::move(t));
     }

@@ -334,6 +334,31 @@
             check(t && t->seed[0].name == "w_000.npy" && t->seed[0].size == 192 &&
                   fsizeOf(stk + "/w_000.npy") == 192,
                   "W14b ...and that seed is the file's real size (128 + 4*4*4 = 192)");
+            // A stack spanning TWO directories is not watched at all. The whole
+            // mechanism is the sibling rule over ONE folder's listing (§1), and
+            // members living elsewhere would be absent from every observation -
+            // which §4 would confirm, correctly by its own lights, as VANISHED.
+            // A false sentence about a stack whose files are all present is
+            // worse than no sentence.
+            //
+            // Built by pointing one member's source at a copy of itself in
+            // another folder, which is what the guard actually reads, and put
+            // back immediately.
+            std::error_code ec2;
+            std::filesystem::create_directories(pathFromUtf8(root + "/elsewhere"), ec2);
+            writeNpy2(root + "/elsewhere/w_004.npy", 4, 4, 4.0f);
+            const std::vector<int> fr = framesOfSeq(seq);
+            const std::string was = app.images[fr.back()]->src->path;
+            app.images[fr.back()]->src->path = root + "/elsewhere/w_004.npy";
+            bool stillWatched = false;
+            for (const auto& x : watchTargetsNow()) if (x.seqId == seq) stillWatched = true;
+            app.images[fr.back()]->src->path = was;
+            bool backAgain = false;
+            for (const auto& x : watchTargetsNow()) if (x.seqId == seq) backAgain = true;
+            // ...and the pair: the SAME stack with every member in one folder IS
+            // watched, or the line above is only "watch nothing".
+            check(!stillWatched && backAgain,
+                  "W14c a stack spanning two directories is not watched at all");
         }
         {   // ---- W15: nothing has moved, so nothing is said, ever ---------------
             // ...which is also the IDLE COST assertion (§3). The worker's return
