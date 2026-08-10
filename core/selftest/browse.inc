@@ -5,6 +5,16 @@
         std::string dir = g_browseSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
         while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+        // How many entries the SHARED fixture folder had before this test ran a
+        // line. Compared again at the very bottom - see the note there: the next
+        // test walks this folder by position, so a row this one leaves behind is
+        // that test's failure and this test's fault.
+        int fixtureEntriesAtStart = 0;
+        {
+            std::error_code fec;
+            for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), fec))
+                { (void)e; fixtureEntriesAtStart++; }
+        }
         startRemote(rbMain(), "local://" + dir);
         double t0 = nowSec();
         while (nowSec() - t0 < 120.0) {
@@ -1290,15 +1300,33 @@
             // Its own folder, written by hand: the case is "a file appeared
             // while the panel was looking at it", and doing that inside
             // tools/testdata/rb would change what every other selftest sees
-            // there. The bytes are arithmetic - a 4x4 f32 .npy is a 128-byte
-            // header region + 4*4*4 = 192 bytes, the same sum --rwatch-selftest
-            // states - and the names are deliberately NOT a numbered sequence:
-            // the peer folds w_000..w_003 into ONE group row, and this case
-            // wants several rows to put a cursor on and two to tick. (The group
-            // row is the stack watcher's subject and is asserted over the link
-            // in --rwatch-selftest R1.)
-            std::string scratch = dir + "/bwatch-scratch";
+            // there.
+            //
+            // ...which is what it did, because a SUBDIRECTORY of rb is a row of
+            // rb. It was `dir + "/bwatch-scratch"` and it is removed on the way
+            // out, so a run that finishes leaves nothing - but a run that does
+            // NOT (killed, interrupted, or the process ended from another test
+            // still holding the tree) leaves an eleventh row in rb, and
+            // --browse-keys-selftest is positional: `home` then eight `down`
+            // lands one row short, every check after it fails, and the waits
+            // spin out to the 300 s test budget. Measured: 28 FAIL / 300.8 s,
+            // from four .npy files in a directory this test believed was its
+            // own. So it goes where the per-test TMP is (the same place the
+            // header-length bomb above uses, and the reason CMake gives every
+            // selftest its own TMP/TEMP/TMPDIR): a folder no other test can see
+            // whether this one cleans up or not.
+            //
+            // The bytes are arithmetic - a 4x4 f32 .npy is a 128-byte header
+            // region + 4*4*4 = 192 bytes, the same sum --rwatch-selftest states
+            // - and the names are deliberately NOT a numbered sequence: the peer
+            // folds w_000..w_003 into ONE group row, and this case wants several
+            // rows to put a cursor on and two to tick. (The group row is the
+            // stack watcher's subject and is asserted over the link in
+            // --rwatch-selftest R1.)
             std::error_code bec;
+            std::string scratch =
+                (std::filesystem::temp_directory_path(bec) / "viewer_bwatch").u8string();
+            std::replace(scratch.begin(), scratch.end(), '\\', '/');
             std::filesystem::remove_all(pathFromUtf8(scratch), bec);
             std::filesystem::create_directories(pathFromUtf8(scratch), bec);
             auto writeNpy4 = [](const std::string& path, float v) {
@@ -1638,6 +1666,30 @@
                     u.c_str(), h1.c_str(), p1.c_str(), gp1, uh.c_str(), gp2,
                     same ? 1 : 0, portOk ? "ok" : "FAIL");
             if (!portOk) ok = false;
+        }
+        {   // ---- THE FIXTURE THIS TEST WAS HANDED IS NOT THIS TEST'S TO EDIT --
+            // tools/testdata/rb is shared: --browse-keys-selftest navigates it by
+            // POSITION (home, then N x down), so one extra row shifts every
+            // gesture it makes and every check after the first fails - for 300 s,
+            // in a different test, with nothing pointing here. That is not
+            // hypothetical: the bwatch fixture above used to be a subdirectory of
+            // this folder and a run that did not reach its own cleanup left one
+            // behind, which cost 28 FAIL / 300.8 s in selftest.browse-keys and an
+            // afternoon of looking at the wrong branch.
+            //
+            // So the count is taken at the end and compared with the one taken at
+            // the top. It is deliberately about the DIRECTORY and not about any
+            // particular fixture: whatever this test grows next, it cannot leak a
+            // row into the folder the next test walks without saying so HERE,
+            // where the cause is.
+            int after = 0;
+            std::error_code fec;
+            for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), fec))
+                { (void)e; after++; }
+            fprintf(stderr, "browseselftest: shared fixture %s: %d entr(ies) before, "
+                            "%d after: %s\n", dir.c_str(), fixtureEntriesAtStart, after,
+                    after == fixtureEntriesAtStart ? "ok" : "FAIL");
+            if (after != fixtureEntriesAtStart) ok = false;
         }
         fprintf(stderr, "browseselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
