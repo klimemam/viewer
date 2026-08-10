@@ -315,16 +315,32 @@
                   "R14c cross-stack refresh is named, never silent");
         }
         {   // ---- R15: what reload is NOT offered for ----------------------------
+            // A peer's pixels are no longer on this list (watch-design §16):
+            // reloadSource has the peer's own "stat it and read it again", so a
+            // remote-backed source goes to the PEER and fails only when the peer
+            // does not answer - which is what this asserts, through the resolver
+            // the reload is handed rather than over a real link (an ssh to a
+            // host called "host" is ten seconds of ConnectTimeout inside a test
+            // whose subject is not the network). What is still refused BY NAME,
+            // with no round trip at all, is a source with no origin.
             auto rdoc = std::make_unique<ImageDoc>();
             rdoc->src->remoteUrl = "ssh://host/x.npy";
-            rdoc->src->path = "x.npy";
+            rdoc->src->path = rdoc->src->remoteUrl;
+            auto noPeer = [](const std::string&, int, std::string& e) -> remote::Session* {
+                e = "the peer did not answer";
+                return nullptr;
+            };
             std::string e7, e8;
-            bool r7 = reloadSource(rdoc->src, e7);
+            bool r7 = reloadSource(rdoc->src, e7, nullptr, noPeer);
             auto odoc = std::make_unique<ImageDoc>();       // montage/plugin: no path
             bool r8 = reloadSource(odoc->src, e8);
-            check(!r7 && !r8 && e7 == "remote-backed" &&
+            check(!r7 && !r8 && e7 == "the peer did not answer" &&
                   e8 == "no file behind these pixels",
-                  "R15 remote-backed and origin-less sources are refused");
+                  "R15 a peer that cannot be reached refuses; no origin refuses by name");
+            // ANTI-VACUITY: the refusal really is the LINK's and not a name
+            // check that happens to have moved - the menu offers this source.
+            check(reloadUnavailable(*rdoc->src).empty(),
+                  "R15b ...and the menu offers that same source, unlike a montage");
         }
         {   // ---- R16: reload RE-KEYS the registry ------------------------------
             // the reloaded source carries a NEW tuple (fresh mtime/fsize); a

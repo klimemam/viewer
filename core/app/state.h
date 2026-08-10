@@ -829,6 +829,16 @@ struct App {
         // listing alone (§11.4 - the detection half decides this once, at the
         // baseline, for the same reason). A stack with no rule fails towards
         // doing nothing, never towards re-admitting frames a user excluded.
+        //
+        // For a stack opened from a PEER this is the PEER's directory and the
+        // rule that was run is the peer's own grouper (§16, recordRemoteRule) -
+        // the one that produced the Browse row the stack was opened from, and
+        // the one whose group row the watcher already reads every fifteen
+        // seconds. Which listing re-applies it is decided by where the FRAMES
+        // are, not by what this string looks like: planStackMembership asks the
+        // disk for a stack of local files and the peer for a stack of the
+        // peer's, so a peer path is never handed to this machine's
+        // directory_iterator.
         std::string ruleDir, ruleHead;
         // ---- what the LAST reload of this stack left behind (issue #56) ------
         // A reload that refuses one member and re-reads the others does not

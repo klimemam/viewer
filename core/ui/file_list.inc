@@ -1186,24 +1186,22 @@ static void drawFileList() {
                   ImGui::TextUnformatted(wn.c_str());
                   ImGui::PopStyleColor();
                   ImGui::SameLine();
-                  // A stack whose pixels are the PEER's has no button here, and
-                  // this is not a styling choice: reloadSource refuses a
-                  // remote-backed source by name, so an offered [Reload] would
-                  // refuse every member and latch the (reload failed) mark of
-                  // issue #56 onto a stack where nothing failed. §6's rebuild has
-                  // not reached the remote origin; until it does, the line says
-                  // the gesture that DOES work rather than a control that does
-                  // not. One predicate (watchReloadOffered), asked here and by
-                  // --rwatch-selftest.
+                  // A stack no member of which the reload walk can serve gets no
+                  // button here, and this is not a styling choice: an offered
+                  // [Reload] would refuse every member and latch the (reload
+                  // failed) mark of issue #56 onto a stack where nothing failed.
+                  // ONE predicate (watchReloadOffered), asked here, by the
+                  // sentence beside it and by --rwatch-selftest. A PEER's stack
+                  // is no longer one of them - watch-design §16 gave the walk the
+                  // peer's own "stat it and read it again", so the button below
+                  // re-fetches those frames over the link.
                   if (!watchReloadOffered(wsi->id)) {
-                      ImGui::TextDisabled("%s", watchActionText(true));
+                      ImGui::TextDisabled("%s", watchActionText(wsi->id));
                       if (ImGui::IsItemHovered())
                           ImGui::SetTooltip("%s",
-                              "These pixels come from the peer, not from a local\n"
-                              "file, so there is nothing here to re-read: the\n"
-                              "membership rebuild (watch-design 6) is local-only\n"
-                              "today. Open the folder again from Browse for a\n"
-                              "stack of what the peer holds now.");
+                              "These pixels rebuild as a unit - a container or\n"
+                              "reader member has no per-member re-read. Open the\n"
+                              "file again for what it holds now.");
                   } else {
                   if (ImGui::SmallButton("Reload##watch")) pendingReloadSeq = wsi->id;
                   // What Reload will and will not do, stated where the click is.
@@ -1215,9 +1213,18 @@ static void drawFileList() {
                   // told so here rather than left to infer it from a frame count
                   // that did not move.
                   if (ImGui::IsItemHovered()) {
-                      std::string tip = "Re-read every frame of this stack from disk,\n"
-                                        "and rebuild which files are its members.\n"
-                                        "Numbers computed from the old pixels are dropped.";
+                      std::string tip =
+                          watchIsPeerStack(*wsi)
+                              ? std::string(
+                                    "Re-fetch every frame of this stack from the peer,\n"
+                                    "and rebuild which files are its members from the\n"
+                                    "peer's own listing. The window does not repaint\n"
+                                    "while it reads. Numbers computed from the old\n"
+                                    "pixels are dropped.")
+                              : std::string(
+                                    "Re-read every frame of this stack from disk,\n"
+                                    "and rebuild which files are its members.\n"
+                                    "Numbers computed from the old pixels are dropped.");
                       if (wsi->watchFound.vanished)
                           tip += "\n\nA file that is gone LEAVES this stack - it is not a\n"
                                  "frame that failed to read - and n of N says the new "

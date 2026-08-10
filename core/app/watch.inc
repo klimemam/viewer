@@ -51,15 +51,9 @@ static bool watchIsPeerStack(const App::SeqInfo& si) {
     return true;
 }
 
-// The peer's directory holding `p`, with no trailing separator - and "" when it
-// has none. A peer path is the SERVER's, so it is split as text: this machine's
-// std::filesystem would apply this machine's rules to a name that never touches
-// this disk (a Windows client reading a Linux peer's "/data/cap/f_000.npy").
-// Both separators, because the peer may be either.
-static std::string remoteDirOf(const std::string& p) {
-    const size_t cut = p.find_last_of("/\\");
-    return cut == std::string::npos ? std::string() : p.substr(0, cut);
-}
+// (remoteDirOf - "which folder is this PEER path in" - moved to
+// open_dispatch.inc: §16's membership rebuild needs it and that fragment is
+// included first. Same function, one spelling.)
 
 // The open stacks, as watched sets. UI thread only: it reads app.seqs and
 // app.images.
@@ -578,31 +572,35 @@ static bool watchFindingsPending() {
     return !app.watchDone.empty();
 }
 
-// WHAT TO DO ABOUT IT, which is not one sentence for both origins.
-//
-// The local line ends "- Reload in Files to re-read them" and puts a [Reload]
-// beside it. A stack whose pixels are the PEER's has no such button: reloadSource
-// refuses remote-backed sources by name ("these pixels come from the peer, not
-// from a local file" - reloadUnavailable), and §6's membership rebuild has not
-// reached the remote origin. Printing the local instruction there would be
-// telling the user to press a control this program greys out, so the remote line
-// names the gesture that does work.
-static const char* watchActionText(bool peer) {
-    return peer ? " - re-open the folder from Browse to re-read it"
-                : " - Reload in Files to re-read them";
-}
-
 // May the watch line OFFER [Reload] for this stack? One predicate, asked by the
 // panel and by --rwatch-selftest, and it is the same question the stack's
 // context menu already asks about the same members (reloadUnavailable) - a
 // second transcription of that list is how the menu and this button would come
 // to disagree about one stack.
+//
+// §16 REMOVED a term from it. The peer's origin used to be refused here on top
+// of reloadUnavailable's own answer, because §6's rebuild was local-only and an
+// offered button would have refused every member and latched #56's mark onto a
+// stack where nothing failed. The rebuild reaches the peer now, so the extra
+// term is gone and this is once again a question with exactly one source of
+// truth: can the walk serve at least one of these members?
 static bool watchReloadOffered(int seqId) {
-    const App::SeqInfo* si = seqInfo(seqId);
-    if (si && watchIsPeerStack(*si)) return false;
     for (int idx : framesOfSeq(seqId))
         if (reloadUnavailable(*app.images[idx]->src).empty()) return true;
     return false;
+}
+
+// WHAT TO DO ABOUT IT, and it is now one sentence for both origins.
+//
+// The line used to fork on the ORIGIN, because a peer's stack had no [Reload] to
+// point at. It forks on the BUTTON instead - the same predicate that draws it -
+// so the sentence and the control cannot disagree, which was the point of the
+// fork in the first place. A stack the walk cannot serve at all is a
+// container/reader member (`__pixels_*`), and reloadUnavailable's own words for
+// that one are "the file rebuilds as a unit - re-open it to reload".
+static const char* watchActionText(int seqId) {
+    return watchReloadOffered(seqId) ? " - Reload in Files to re-read them"
+                                     : " - re-open the file to re-read it";
 }
 
 // ============================================================================
@@ -639,14 +637,31 @@ static bool watchReloadOffered(int seqId) {
 // Is this stack eligible for an AUTOMATIC reload at all? nullptr = yes; a
 // reason, in the words the screen uses, when not.
 //
-// Two refusals, and neither is about the switch:
+// Three refusals, and none of them is about the switch:
 //
-//   THE PEER. §6's rebuild is local-only (§13.6), so reloadSource would refuse
-//   every member of a remote-backed stack by name and #56's (reload failed)
-//   would land on a stack where nothing failed - once every fifteen seconds,
-//   automatically. The predicate is watchReloadOffered, the same one the panel
-//   asks before drawing the button, so the thing that acts and the thing that
-//   offers cannot come to disagree about one stack.
+//   THE PEER - and §16 changed the REASON while keeping the answer. The old one
+//   was that §6's rebuild could not reach a peer's stack at all, so an automatic
+//   reload would have refused every member and latched #56 onto a stack where
+//   nothing failed. That is spent: the rebuild reaches it, watchReloadOffered
+//   says yes, and the button below the amber line works.
+//
+//   What has NOT changed is what the act COSTS, and that is the whole of the
+//   argument now. A local reload is N file reads on a disk that answers or
+//   errors in milliseconds. A remote one is META + TILE per member on a link
+//   that can drop, read to completion on the UI thread with nothing repainting
+//   (openRemote's UiThreadStall says so in as many words) - so a stack of forty
+//   resident frames is forty round trips and a folder's worth of pixels, with
+//   nobody's click behind it, repeatable every time the peer's folder settles.
+//   Waiting it out is not available either: watchAutoBusy waits for work the
+//   frame loop is already keeping frames coming for, and a blocked ssh read is
+//   the opposite of that.
+//
+//   So: the gesture reaches the peer, the AUTOMATON does not. That is one term
+//   in this predicate rather than a second copy of §12/§13's rules - what runs
+//   when it does run is still the one reloadStackFromDisk - and it is asked
+//   through watchIsPeerStack, the same predicate the watcher already splits the
+//   origins with. The Files line says it (watchAutoNote), and it says the
+//   gesture that does work: Reload it by hand.
 //
 //   A RELOAD THAT ALREADY REFUSED. Without this the retry loop is real and it
 //   never stops: the reload refuses a member, watchReloadNow clears the finding,
@@ -660,9 +675,10 @@ static bool watchReloadOffered(int seqId) {
 //   person.
 static const char* watchAutoRefusal(int seqId) {
     if (!watchReloadOffered(seqId))
-        return "these pixels are the peer's - re-open the folder from Browse";
-    const App::SeqInfo* si = seqInfo(seqId);
-    if (si && si->reloadFailed > 0)
+        return "nothing here re-reads these pixels - re-open the file";
+    if (const App::SeqInfo* si = seqInfo(seqId); si && watchIsPeerStack(*si))
+        return "these frames come back over the link - Reload it by hand";
+    if (const App::SeqInfo* si = seqInfo(seqId); si && si->reloadFailed > 0)
         return "the last reload of this stack refused a member - Reload it by hand";
     return nullptr;
 }
@@ -826,11 +842,13 @@ static std::string watchAutoNote(int seqId) {
     if (!app.watchEnabled || !app.watchAutoReload || app.watchPaused) return {};
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si || !si->watchFound.any()) return {};
-    // The PEER refusal is already the whole of what this line says
-    // (watchActionText: "re-open the folder from Browse to re-read it"), so
-    // repeating it under a second heading would print one folder's instruction
-    // twice in one sentence. What is left is the refusal the line does NOT
-    // otherwise carry: this stack's automatic reload has stopped.
+    // A stack the walk cannot serve at all has already been told what to do by
+    // watchActionText ("re-open the file to re-read it"), so repeating it under
+    // a second heading would print one instruction twice in one sentence.
+    //
+    // The PEER is no longer that case (§16): its line now offers [Reload], so
+    // the fact that the AUTOMATIC one is holding off has to be spoken here or a
+    // peer's stack reads as one the feature simply forgot about.
     if (!watchReloadOffered(seqId)) return {};
     if (const char* why = watchAutoRefusal(seqId))
         return std::string(" - auto-reload cannot: ") + why;
@@ -873,14 +891,16 @@ static void watchIntegrate() {
         si->watchToasted = true;
         // §5: one toast, and the line stays. A toast expires; "3 file(s)
         // changed on disk" must not (seqNote's precedent). What it tells the
-        // reader to DO is watchActionText's, because a peer's stack has no
-        // [Reload] to press - unless §9 is on, in which case what to do is not
-        // the reader's business and the toast says what is about to happen
-        // instead. Telling somebody to press a button the program is already
-        // pressing for them is how a setting gets forgotten.
+        // reader to DO is watchActionText's, asked of the STACK rather than of
+        // the finding's origin (§16: the sentence forks on whether there is a
+        // button, which is the thing it is about) - unless §9 has something to
+        // say, in which case what to do is not the reader's business and the
+        // toast says what is about to happen, or why it is not. Telling somebody
+        // to press a button the program is already pressing for them is how a
+        // setting gets forgotten.
         const std::string an = watchAutoNote(d.seqId);
         toast(si->name + ": " + watch::findingText(d.found) +
-              (an.empty() ? watchActionText(!d.found.host.empty()) : an));
+              (an.empty() ? watchActionText(d.seqId) : an));
     }
 }
 

@@ -661,68 +661,342 @@
                   "R14c ...and the peer is named once, not once per clause");
             rm(stk + "/w_005.npy");
         }
+        // =====================================================================
+        //  R13, R16-R21: §16 - the Reload that REACHES the peer.
+        //
+        //  Everything above only ever SAYS something about a peer's folder.
+        //  These act on it, through the one reloadStackFromDisk the [Reload]
+        //  button calls, with every guard §12 put in it (the departures before
+        //  reloadSource, the rule recorded at the mint, a rebuild that never
+        //  empties a stack). What §16 adds is WHOSE listing answers "which files
+        //  are in that folder now" and WHERE the pixels are re-read from.
+        //
+        //  THE FIXTURE, and why it is built by hand a second time: R2-R15 need
+        //  no frames at all (what they read is SeqInfo::remoteFiles), but a
+        //  reload is about the frames, and a stack with none of them passes
+        //  every assertion below vacuously - watchReloadOffered walks members and
+        //  answers false for a stack that has none. So these frames are FETCHED,
+        //  through the same peer, and their pixels are the peer's own bytes.
+        //
+        //  The urls are the scp spelling "kepler:<path>" (remote::parseUrl's
+        //  third form). That is deliberate and it is the only fiction here: the
+        //  local peer is reached with an EMPTY host, and an empty host spells
+        //  local://, which is LOCAL by §13.7 and would reload off this disk
+        //  through the branch this file is not testing. A named host makes these
+        //  sources peer-backed everywhere in the program - watchIsPeerStack,
+        //  reloadUnavailable, planStackMembership - and the ReloadPeer handed in
+        //  points the round trip at the real viewer-serve on the other end of
+        //  `ses`. It is exactly the fiction the lister above already runs on
+        //  (R2 watches "kepler" over a local pipe).
+        // =====================================================================
+        for (int i = 0; i < 5; i++) writeNpy2(stk + "/" + nm(i), 4, 4, 100.0f + (float)i);
+        // WHICH session the reload talks to, and the one that never answers.
+        auto peerOf = [&](const std::string&, int, std::string&) { return &ses; };
+        auto peerDown = [&](const std::string&, int, std::string& e) -> remote::Session* {
+            e = "the peer did not answer";
+            return nullptr;
+        };
+        // One frame of a peer stack, fetched the way pumpRemoteFetch mints one.
+        auto fetchFrame = [&](const std::string& file, int sid, int idx) -> ImageDoc* {
+            remote::Meta m;
+            std::string err;
+            if (!ses.meta(file, m, err)) return nullptr;
+            std::vector<float> px;
+            int w = 0, h = 0, c = 0;
+            std::string dt;
+            if (!ses.tile(file, 0, 0, 0, m.w, m.h, 1, px, w, h, c, dt, err)) return nullptr;
+            auto d = std::make_unique<ImageDoc>();
+            d->name = baseName(file);
+            FrameSource& S = *d->src;
+            S.path = "kepler:" + file;
+            S.remoteUrl = S.path;
+            S.remoteFrame = 0;
+            S.remoteStep = 1;
+            S.npyShape = m.shape;
+            S.dtype = dt;
+            S.w = w; S.h = h; S.ch = c;
+            S.data = std::move(px);
+            d->syncMirrors();
+            computeMinMax(*d);
+            defaultRange(*d);
+            shareOrRegisterSource(*d);
+            d->seqId = sid;
+            d->seqIndex = idx;
+            d->uid = app.nextUid++;
+            app.images.push_back(std::move(d));
+            app.imagesRev++;
+            return app.images.back().get();
+        };
+        // A peer stack of `files`, with `resident` of them actually fetched.
+        auto makePeerStack = [&](const std::vector<std::string>& files, int resident) {
+            const int sid = makeRemoteSeq("kepler", 0, files);
+            ImageDoc* head = nullptr;
+            for (int i = 0; i < resident && i < (int)files.size(); i++) {
+                ImageDoc* d = fetchFrame(files[i], sid, i);
+                if (!head) head = d;
+            }
+            if (App::SeqInfo* si = seqInfo(sid)) {
+                si->expectedFrames = (int)files.size();
+                if (head) {
+                    si->refW = head->w; si->refH = head->h; si->refCh = head->ch;
+                    si->refName = head->name;
+                }
+            }
+            return sid;
+        };
+        // THE membership, as ONE string (--watch-selftest W25's discipline): a
+        // count is not a membership, so every assertion states the whole list and
+        // the number each member carries.
+        auto members = [&](int sid) {
+            std::string s;
+            for (int idx : framesOfSeq(sid))
+                s += (s.empty() ? "" : " ") + std::to_string(app.images[idx]->seqIndex) +
+                     ":" + baseName(app.images[idx]->src->path);
+            return s;
+        };
+        auto memberDoc = [&](int sid, int index) -> ImageDoc* {
+            for (int idx : framesOfSeq(sid))
+                if (app.images[idx]->seqIndex == index) return app.images[idx].get();
+            return nullptr;
+        };
+        const int pseq = makePeerStack(stkFiles, 5);
+
         {   // ---- R13: what the screen may OFFER for a remote finding -----------
-            // The local line ends "- Reload in Files to re-read them" and puts a
-            // [Reload] beside it. For a stack whose pixels are the peer's, that
-            // button is greyed out everywhere else in this program
-            // (reloadUnavailable: "remote-backed"), and §6's membership rebuild
-            // has not reached the remote origin. Telling its owner to press it
-            // would be an instruction to press a disabled button - so the line
-            // says what actually works instead.
+            // §13.6 said the remote line could promise no [Reload], because
+            // reloadSource refused a peer's pixels BY NAME and an offered button
+            // would refuse every member and latch #56's mark onto a stack where
+            // nothing failed. §16 gave reloadSource the peer's equivalent of
+            // "stat it and read it again", so the refusal is gone and the line
+            // says the thing that now works.
             FrameSource peerSrc;
             peerSrc.remoteUrl = "ssh://kepler/data/cap/w_000.npy";
-            check(!reloadUnavailable(peerSrc).empty(),
-                  "R13 (setup) [Reload] refuses a peer's pixels, as it always has");
-            check(!watchReloadOffered(seq),
-                  "R13b so the watch line offers no [Reload] for a peer's stack");
-            check(std::string(watchActionText(true)).find("Browse") != std::string::npos &&
-                  std::string(watchActionText(true)).find("Reload in Files") ==
-                      std::string::npos,
-                  "R13c ...and says what does work instead of naming that button");
-            // ANTI-VACUITY: a LOCAL stack still gets the button and the sentence
-            // it always had.
-            check(std::string(watchActionText(false)) ==
+            peerSrc.path = peerSrc.remoteUrl;
+            check(reloadUnavailable(peerSrc).empty(),
+                  "R13 [Reload] no longer refuses a peer's pixels by name");
+            check(watchReloadOffered(pseq),
+                  "R13b so the watch line DOES offer [Reload] for a peer's stack");
+            check(std::string(watchActionText(pseq)) ==
                       " - Reload in Files to re-read them",
-                  "R13d ...while a local stack keeps the line it always had");
+                  "R13c ...and names that button rather than sending them to Browse");
+            // ANTI-VACUITY, both ways. The two refusals reloadSource still makes
+            // are still made - dropping the remote row must not have dropped the
+            // list - and a stack with no member the walk can serve still gets the
+            // other sentence.
+            FrameSource unit;                     // a container/reader member
+            unit.path = stk + "/tree.npz";
+            unit.member = "__pixels_1";
+            FrameSource none;                     // a montage / plugin result
+            check(!reloadUnavailable(unit).empty() && !reloadUnavailable(none).empty(),
+                  "R13d ...while the other two refusals are untouched");
+            check(!watchReloadOffered(seq) &&
+                  std::string(watchActionText(seq)).find("Reload in Files") ==
+                      std::string::npos,
+                  "R13e ...and a stack with no reloadable member keeps the other line");
         }
-        {   // ---- R16: §9's Auto-reload does not reach a peer either -------------
-            // The same fact as R13, one layer up and with more at stake: R13 is
-            // about a button that would refuse if pressed, and this is about a
-            // program that would press it. §6's rebuild is local-only today, so
-            // an automatic reload of a peer's stack would refuse every member
-            // and latch #56's (reload failed) onto a stack where nothing failed
-            // - once every fifteen seconds, and with nobody having clicked.
+        {   // ---- R16: §9's Auto-reload does NOT follow it there -----------------
+            // §15.7 refused a peer's stack because the REBUILD could not reach
+            // it. That reason is spent. The refusal stays, and §16.6 states the
+            // new one: the act is a blocking round trip per member over a link
+            // that can drop, repeatable every fifteen seconds, with nobody's
+            // click behind it. A manual Reload pays that price knowingly.
             //
-            // ONE predicate for both halves (watchAutoRefusal reads
-            // watchReloadOffered), so the panel's greyed-out line and the thing
-            // that decides not to act cannot come to disagree about one stack.
+            // What makes this an assertion rather than a comment is that
+            // watchReloadOffered now answers TRUE here: the peer clause is
+            // demonstrably the thing doing the refusing, where before it could
+            // have been the missing button.
             const bool wasAuto = app.watchAutoReload;
             app.watchAutoReload = true;
-            // A STANDING FINDING first, exactly the one watchIntegrate would have
-            // put here. Arming is a state ("this stack's files have moved and it
-            // has not been reloaded since"), so without one there is nothing to
-            // refuse and R16c would pass on a program that had never heard of
-            // peers.
-            if (App::SeqInfo* si = seqInfo(seq)) {
+            if (App::SeqInfo* si = seqInfo(pseq)) {
                 si->watchFound = watch::Finding{};
                 si->watchFound.srcMoved = true;
-                si->watchFound.host = "this machine";
+                si->watchFound.host = "kepler";
                 si->watchFound.members = 5;
             }
-            check(seqInfo(seq) && seqInfo(seq)->watchFound.any() && app.watchAutoReload,
-                  "R16 (setup) the peer's stack has a standing finding, auto is ON");
-            const char* why = watchAutoRefusal(seq);
-            check(why && std::string(why).find("Browse") != std::string::npos,
-                  "R16b auto-reload refuses a peer's stack and names what does work");
-            // ANTI-VACUITY, locally: the ONLY thing holding it back is that
-            // refusal. Nothing is in flight over it and the switch is on, so an
-            // empty armed list here is the origin's doing and not an idle test.
-            check(watchAutoArmed().empty() && !watchAutoDue() && !watchAutoBusy(seq),
-                  "R16c ...so a standing finding never arms it, and nothing else stops it");
-            if (App::SeqInfo* si = seqInfo(seq)) si->watchFound = watch::Finding{};
+            check(seqInfo(pseq) && seqInfo(pseq)->watchFound.any() && app.watchAutoReload &&
+                      watchReloadOffered(pseq) && !watchAutoBusy(pseq) &&
+                      seqInfo(pseq)->reloadFailed == 0,
+                  "R16 (setup) armed, auto ON, reloadable, and nothing else holds it");
+            const char* why = watchAutoRefusal(pseq);
+            check(why && std::string(why).find("link") != std::string::npos,
+                  "R16b auto still refuses a peer, and the reason is now the ACT");
+            check(watchAutoArmed().empty() && !watchAutoDue(),
+                  "R16c ...so a standing finding never arms it");
+            // ...and the Files line SAYS so. §15.7 suppressed this clause because
+            // watchActionText already carried the peer refusal; now that line
+            // offers the button, so the refusal has to be spoken here or the
+            // stack looks like one the feature simply forgot.
+            check(watchAutoNote(pseq).find("auto-reload cannot") != std::string::npos,
+                  "R16d ...and the Files line says so, where it used to say nothing");
+            if (App::SeqInfo* si = seqInfo(pseq)) si->watchFound = watch::Finding{};
             app.watchAutoReload = wasAuto;
         }
+        {   // ---- R17: the LISTING is the peer's, and a gone file LEAVES --------
+            // §13's own finding, spent: the group row aggregates (mtime, size)
+            // and cannot say which member moved, but it carries the full member
+            // NAME list - and names are exactly what a membership rebuild is made
+            // of. planRebuild wants three name lists and the peer can answer two
+            // of them, so it needs no new protocol either.
+            rm(stk + "/" + nm(4));
+            watch::Rebuild plan = planStackMembership(pseq, peerOf);
+            check(plan.dropped.size() == 1 && plan.dropped[0] == "w_004.npy" &&
+                      plan.added.empty() && plan.order.size() == 4,
+                  "R17 the peer's rows answer the rebuild: one departure, named");
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(pseq, &failed, peerOf);
+            fprintf(stderr, "rwatchselftest: R17 summary: %s\n", msg.c_str());
+            check(members(pseq) == "0:w_000.npy 1:w_001.npy 2:w_002.npy 3:w_003.npy",
+                  "R17b the vanished member is out and the survivors renumber 0..3");
+            check(seqInfo(pseq) && seqInfo(pseq)->expectedFrames == 4 &&
+                      seqInfo(pseq)->remoteFiles.size() == 4,
+                  "R17c ...and the stack's OWN list of the peer's files moved with it");
+            check(msg.find("1 file(s) no longer exist (w_004.npy)") != std::string::npos &&
+                      msg.find("4 of 4 frame(s), was 5") != std::string::npos,
+                  "R17d the summary states the NAME and BOTH counts (§12)");
+            check(failed == 0 && seqInfo(pseq) && seqInfo(pseq)->reloadFailed == 0,
+                  "R17e a gone file is not a refusal: no (reload failed) mark");
+        }
+        {   // ---- R18: the pixels really come back FROM THE PEER ----------------
+            // The other half of a Reload, and the half §13.6 said was missing:
+            // reloadSource re-reads the file. For a peer's source that is META +
+            // TILE on the same connection the open used, not a local re-read of a
+            // path that does not exist here.
+            ImageDoc* d2 = memberDoc(pseq, 2);
+            check(d2 && d2->px()[0] == 102.0f,
+                  "R18 (setup) frame 2 holds the 102 the fixture wrote");
+            const int rev0 = d2 ? d2->src->rev : -1;
+            const int drev0 = d2 ? d2->dataRev : -1;
+            writeNpy2(stk + "/" + nm(2), 4, 4, 902.0f);
+            int failed = -1;
+            reloadStackFromDisk(pseq, &failed, peerOf);
+            ImageDoc* n2 = memberDoc(pseq, 2);
+            check(failed == 0 && n2 && n2->px()[0] == 902.0f,
+                  "R18b the peer's new bytes are in the frame after a Reload");
+            check(n2 && n2->src->rev > rev0 && n2->dataRev > drev0,
+                  "R18c ...through reloadSource: the source and doc revisions moved");
+        }
+        {   // ---- R19: NO ANSWER REBUILDS NOTHING -------------------------------
+            // §13.4 made DETECTION fail towards silence. A rebuild has to fail
+            // the same way and harder: an unreachable peer folded into an empty
+            // listing would take every member out of the stack, and the sentence
+            // it printed on the way ("4 file(s) no longer exist") would be a lie
+            // about a capture that is sitting there.
+            //
+            // Asserted on planStackMembership DIRECTLY, and that is the whole
+            // point: §12.5's "a rebuild never empties a stack" would zero the
+            // plan afterwards, so a summary-only assertion passes on exactly the
+            // implementation this case exists to forbid.
+            rm(stk + "/" + nm(3));                       // a REAL deletion...
+            watch::Rebuild silent = planStackMembership(pseq, peerDown);
+            check(!silent.any() && silent.dropped.empty() && silent.added.empty(),
+                  "R19 a peer that did not answer produces no plan at all");
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(pseq, &failed, peerDown);
+            fprintf(stderr, "rwatchselftest: R19 summary: %s\n", msg.c_str());
+            check(msg.find("no longer exist") == std::string::npos,
+                  "R19b ...and the summary never says the files stopped existing");
+            check(members(pseq) == "0:w_000.npy 1:w_001.npy 2:w_002.npy 3:w_003.npy",
+                  "R19c ...and the membership is exactly what it was");
+            check(failed == 4 && seqInfo(pseq) && seqInfo(pseq)->reloadOk == 0,
+                  "R19d what failed is the RE-READ, and #56 says nothing was re-read");
+            // ANTI-VACUITY: the same folder, the same deletion, over a live link.
+            // Without this pair R19 is "the remote rebuild never does anything".
+            watch::Rebuild live = planStackMembership(pseq, peerOf);
+            check(live.dropped.size() == 1 && live.dropped[0] == "w_003.npy",
+                  "R19e ...while a live link sees exactly that deletion");
+            writeNpy2(stk + "/" + nm(3), 4, 4, 103.0f);  // put it back
+            int f2 = -1;
+            reloadStackFromDisk(pseq, &f2, peerOf);      // ...and clear #56's latch
+            check(f2 == 0 && seqInfo(pseq) && seqInfo(pseq)->reloadFailed == 0,
+                  "R19f a clean run over a live link clears the mark again");
+        }
+        {   // ---- R20: §12.2 over the link - the RULE is recorded at the mint ---
+            // A stack may only re-admit a file that APPEARED when its membership
+            // is its folder's whole group, and at Reload time that is not
+            // decidable: "the folder gained one" and "this stack always excluded
+            // two" look identical. Over a link it is worse, because a group row
+            // cannot be narrowed at all (§13.5). So the peer's own grouper is run
+            // ONCE, at the mint, and compared against the files handed in.
+            App::SeqInfo* psi = seqInfo(pseq);
+            const bool got = psi && recordRemoteRule(*psi, psi->remoteFiles, 0, peerOf);
+            check(got && seqInfo(pseq) && seqInfo(pseq)->ruleHead == "w_000.npy" &&
+                      seqInfo(pseq)->ruleDir == stk,
+                  "R20 the peer's own grouper is recorded as this stack's rule");
+            writeNpy2(stk + "/" + nm(5), 4, 4, 905.0f);
+            int failed = -1;
+            const std::string msg = reloadStackFromDisk(pseq, &failed, peerOf);
+            fprintf(stderr, "rwatchselftest: R20 summary: %s\n", msg.c_str());
+            check(members(pseq) == "0:w_000.npy 1:w_001.npy 2:w_002.npy "
+                                   "3:w_003.npy 4:w_005.npy" &&
+                      msg.find("1 file(s) appeared in the folder (w_005.npy)") !=
+                          std::string::npos,
+                  "R20b a file that appeared JOINS, in the open's own order");
+            ImageDoc* n4 = memberDoc(pseq, 4);
+            check(failed == 0 && n4 && n4->px()[0] == 905.0f,
+                  "R20c ...and it was FETCHED from the peer, not invented");
+            // The other half, and the one that costs a user their own choice if
+            // it is wrong: a stack that is 3 of the folder's 5 records no rule
+            // and can never be handed back the frames it excluded.
+            std::vector<std::string> three(stkFiles.begin(), stkFiles.begin() + 3);
+            const int sub = makePeerStack(three, 3);
+            App::SeqInfo* ssi = seqInfo(sub);
+            const bool got2 = ssi && recordRemoteRule(*ssi, three, 0, peerOf);
+            check(!got2 && seqInfo(sub) && seqInfo(sub)->ruleHead.empty(),
+                  "R20d a 3-of-5 subset of the peer's group records no rule");
+            watch::Rebuild subPlan = planStackMembership(sub, peerOf);
+            check(subPlan.added.empty() && subPlan.dropped.empty(),
+                  "R20e ...so its rebuild admits nothing the peer's group holds");
+            // ANTI-VACUITY: hand that same stack a rule and those same files DO
+            // join. Without it R20e is "a subset stack is never rebuilt".
+            if (App::SeqInfo* s2 = seqInfo(sub)) {
+                s2->ruleDir = stk;
+                s2->ruleHead = "w_000.npy";
+            }
+            watch::Rebuild subWith = planStackMembership(sub, peerOf);
+            check(subWith.added.size() == 2 &&
+                      subWith.added.front() == "w_003.npy" &&
+                      subWith.added.back() == "w_005.npy",
+                  "R20f ...while WITH a rule the other two members join it");
+            if (App::SeqInfo* s2 = seqInfo(sub)) {
+                s2->ruleDir.clear();
+                s2->ruleHead.clear();
+            }
+            dropSeq(sub);
+        }
+        {   // ---- R21: RESIDENCY IS NOT MEMBERSHIP ------------------------------
+            // A remote stack is allowed to be short of its own file list - the
+            // memory budget fetches four of three hundred and the Files row says
+            // "n of N". `have` is built from the frames that are HERE, so a
+            // rebuild taken from it would re-issue expectedFrames and remoteFiles
+            // as the four and delete two hundred and ninety-six files from the
+            // stack without a word. A stack whose list it is not is not rebuilt.
+            const std::string part = root + "/part";
+            std::filesystem::create_directories(pathFromUtf8(part), ec);
+            std::vector<std::string> pf;
+            for (int i = 0; i < 4; i++) {
+                char b[32];
+                snprintf(b, sizeof b, "p_%03d.npy", i);
+                pf.push_back(part + "/" + b);
+                writeNpy2(pf.back(), 4, 4, 200.0f + (float)i);
+            }
+            const int ps = makePeerStack(pf, 3);         // 3 of 4 resident
+            rm(pf[2]);                                   // ...and one of THOSE is gone
+            check((int)framesOfSeq(ps).size() == 3 && seqInfo(ps) &&
+                      seqInfo(ps)->remoteFiles.size() == 4,
+                  "R21 (setup) a 3-of-4 resident peer stack, one resident file gone");
+            watch::Rebuild partial = planStackMembership(ps, peerOf);
+            check(!partial.any(),
+                  "R21b a stack short of its own file list is not rebuilt at all");
+            // ANTI-VACUITY: the very same stack, once its list IS its residency,
+            // sees that deletion immediately.
+            if (App::SeqInfo* si = seqInfo(ps))
+                si->remoteFiles = { pf[0], pf[1], pf[2] };
+            watch::Rebuild whole = planStackMembership(ps, peerOf);
+            check(whole.dropped.size() == 1 && whole.dropped[0] == "p_002.npy",
+                  "R21c ...while the same stack whose list it IS drops the gone one");
+            dropSeq(ps);
+        }
 
+        dropSeq(pseq);
         dropSeq(seq);
         closeAll();
         ses.stop();

@@ -729,3 +729,195 @@ Files のこの琥珀行 / Messages の同じ文 / Files 行の `n of N` /
 項目20 の残りは **§5 の「Watch: open new stacks」** (#47 の Browse 設計待ち)
 と、**§6 の Reload をリモート origin に届かせること** (§13.6 / §15.7 の行が
 [Reload] を出せるようになり、自動もそこへ届く) の2つ。
+
+---
+
+## 16. 実装から返ってきたもの (2026-08-11、§6 の Reload をリモートへ)
+
+§13.6 / §15.7 が残していた「**§6 の再構築をリモート origin に届かせる**」が
+着地した。**実装が §6・§13.6・§15.7 を6箇所で訂正している**ので、§11-§15 と
+同様に以後はこの節が優先する。
+
+前提として変わっていないもの: **走る Reload は1本**である。リモート用の
+2本目は書いていない —— §15.1 が数えた5つのガード (削除は reloadSource の
+手前 / 規則は開いた瞬間の記録 / 規則が名指さなくてもファイルが在れば残る /
+読めなかった新ファイルは n/N / 再構築は stack を空にしない) は
+`reloadStackFromDisk` の中に1組しか無く、リモートが足したのは**その関数が
+「どのフォルダに何が在るか」と「画素をどこから読み直すか」を誰に聞くか**
+だけである。
+
+### 16.1 `reloadUnavailable` がリモートを拒んでいた理由は「経路が無い」だった
+
+§13.6 は「remote-backed な source は `reloadSource` が名指しで拒否する」と
+書いた。**なぜ拒否していたか**を先に確かめた: `reloadSource` の本体は
+`statSourceFile` → `readFileBytes` → デコード、つまり**この disk の path を
+stat して読み直す**手続きしか持っていなかった。peer の path はここに無いので
+拒否は正しく、そして**足りないのは判断ではなく peer 側の同じ2手**だった。
+
+だから拒否を消すのではなく、**peer の door を1つ増やした** (`reloadSource` の
+4番目ではなく**先頭**の door。door を選ぶのは「この画素が何であるか」であって
+ファイル名ではない、という既存の規律のまま):
+
+- **META が stat** —— ファイルが今宣言している shape と frame 数。
+- **TILE が read** —— `remoteFrame` / `npyRead` (§3.3 の宣言) / `remoteStep` を
+  **再選択せずに再生する**。3つのどれかを今日決め直せば「同じ frame の新しい値」
+  ではなく「黙って別の frame」になる。
+- 順序は META → TILE。ローカルの door が `statSourceFile` を bytes の前に置く
+  のと同じ理由 (書き換えが途中で完了したとき、**古い tuple が古い画素に
+  結び付く**方が安全)。
+
+`reloadUnavailable` からは行が1本消えた。**そこは reloadSource の事実を述べる
+場所**なので、向こうで branch が消えればここも消える —— リストが1本しか無い
+ことの実体。**peer が答えるかどうかはここで判定しない**: これは毎フレーム
+メニューを灰色にする述語であり、ネットワークに聞けば再描画ごとに往復1回、
+しかもクリックが届く頃には古い。到達できない peer は「**失敗する Reload**」
+であって「出せないボタン」ではない (#56 の `reloadOk == 0` が
+「1枚も読み直していない」と既に言い分ける)。
+
+### 16.2 グループ行の名前列は `planRebuild` に**足りている** —— ただし2つ条件がある
+
+§13 は「グループ行は (合計 bytes, 最新 mtime) を集約し、**どれが**は言えない。
+だが**メンバー名の全列は運ぶ**」と書いた。`watch::planRebuild` が要るのは
+`have` / `listed` / `want` の**名前列3本だけ**である。したがって答えは
+**足りている、そのまま**であり、新しいプロトコルはここでも要らない ——
+検知が15秒ごとに送っている LIST が、再構築の質問にもそのまま答える。
+
+ただし実装が2つ足した:
+
+- **`listed` はグループ行のメンバーだけでは作れない。** フォルダが1枚に減れば
+  peer はそれを**平の行**で返す (§13.3)。グループ行だけから `listed` を作ると、
+  **最後に残った1枚を vanished と報告する** —— 唯一消えていないファイルを。
+  よって `listed` は「dir でない全行」: グループ行のメンバー**と**平の行の名前。
+- **`want` は「head を名指すグループ行のメンバー列」**である。これが peer の
+  grouper の出力そのもの (`remoteSequenceSiblings` が stack を開くときに
+  見ているのと同じ行で、`rp::patternWithExtent` を通じてローカルの
+  `siblingNamesAmong` と同じ規則)。
+
+### 16.3 「返事が無い」は plan を**空にする** —— §12.5 のガードは証拠にならない
+
+§13.4 は検知を沈黙側に倒した。再構築は**もっと厳しく**倒す必要がある:
+検知が空 listing を信じれば偽の文が1行出るだけだが、**再構築が信じれば
+stack から全メンバーが外れる**。
+
+実装は `planStackMembershipRemote` が **LIST が答えなかった周は
+`Rebuild{}` を返す**。ここで重要なのは**テストの形**である: §12.5 の
+「再構築は stack を空にしない」ガードは `dropped >= hadBefore` を後から
+0 に潰すので、**サマリ文字列だけを見る assert は、まさにこの案件が禁じたい
+実装の上でも通る**。よって R19 は `planStackMembership` を**直接**呼んで
+`!any()` を assert し、その対 (anti-vacuity) として**同じフォルダ・同じ削除を
+生きたリンクで**見せて `dropped == {w_003.npy}` を assert する。
+
+なお**リンクが落ちている Reload そのものは止めない**。全メンバーが
+`the peer did not answer` で refuse し、#56 が `reloadOk == 0` =
+「1枚も読み直していない」を latch する —— これは既に書かれている経路であり、
+「リンクが死んでいる」を「ファイルが消えた」と言わないという条件さえ
+守れば、正直な出力である。
+
+### 16.4 residency は membership ではない (リモート固有の罠)
+
+`have` は**ここに在るフレーム**から作る。リモート stack は
+**自分のファイル列より短いことが許されている** (メモリ予算が300枚のうち4枚を
+取ってくる。Files 行の `n of N` がそう言っている)。その `have` から再構築すると
+`expectedFrames` と `remoteFiles` が**4に振り直され、296 枚が黙って stack から
+消える**。
+
+よって `planStackMembershipRemote` は「**`si->remoteFiles` の basename 集合 ==
+`have`**」でないとき何もしない (R21)。ローカル半分には無い条件で、
+ローカルには無い失敗である。
+
+`remoteFiles` は再構築のあと**振り直す**: `watchTargetsNow` は監視メンバー列を
+そこから作り (次の周の「全体グループか」判定が別のフォルダに対して行われる)、
+server 集計はその path を名指し、session 行はそれを書く。membership の一部で
+あって横のメモではない。
+
+### 16.5 §12.2 はリモートでは peer の grouper を1回走らせて記録する
+
+「規則を再適用してよい stack か」は Reload 時には判定できない (§12.2)、
+リモートではさらに厳しい (§13.5: グループ行は絞り込めない)。ローカルが
+`findSequenceSiblings` を mint で1回走らせるのと同じことを、
+`recordRemoteRule` が **peer の grouper で**やる:
+`attachRemoteStack` が LIST を1発撃ち、head を名指すグループ行のメンバーが
+**渡された files と一致するとき**だけ `ruleDir` (peer のフォルダ) と
+`ruleHead` を記録する。3-of-5 の手選択は記録を持たず、**増える方向へは
+二度と倒れない** (R20d-R20f)。
+
+代価は **stack 1本につき LIST 1回**、§12.2 がローカルで受け入れたのと同じ。
+
+副作用として **`local://` の stack も規則を持つようになった**。Browse から
+開いたローカル stack は `attachRemoteStack` を通るのに `ruleDir` を記録して
+おらず、消えたメンバーは外せるが**現れたファイルを迎え入れられなかった** ——
+§12.2 の「記録の無い stack」の列挙 (派生・手選択・2ディレクトリ・frame軸・
+旧セッション) に**入っていない穴**だった。`local://` の再構築は §13.7 のまま
+ローカル listing とローカル `siblingNamesAmong` を使う (peer 行より厳密)。
+
+### 16.6 自動 Reload は**リンクを越えない** —— 理由が入れ替わった
+
+§15.7 の拒否理由は「§6 の再構築がリモートに届いていないから」だった。
+**その理由は尽きた**。`watchReloadOffered` は peer stack に yes と答え、
+琥珀の行の下にボタンが出て、押せば効く。
+
+拒否は**残す**。理由は再構築ではなく**行為の代価**である:
+
+- **ローカルの Reload は N 回のファイル読み**で、ミリ秒で答えるか errno を返す。
+- **リモートの Reload は メンバーごとに META + TILE**、しかも**落ちうるリンク**の
+  上で、**UI スレッドが読み切るまで再描画しない** (`UiThreadStall` が
+  openRemote について同じことを書いている)。常駐40枚の stack なら往復40回と
+  フォルダ1つ分の画素で、**誰もクリックしていない**。peer のフォルダが
+  落ち着くたびに繰り返しうる。
+- **待って回避することもできない**。`watchAutoBusy` が待てるのは
+  「メインループが既にフレームを回し続けている仕事」だけで (§15.4)、
+  ブロックした ssh の read はその正反対である。
+
+したがって: **手はリンクを越える、自動は越えない**。判定は
+`watchAutoRefusal` の**1項**であって §12/§13 の規則の2つ目のコピーではない
+(走るときに走るのは同じ `reloadStackFromDisk` のまま)。項は
+`watchIsPeerStack` —— 検知側が origin を分けるのに使っている**同じ述語**で問う。
+
+そして**画面がそう言う**。§15.7 は `watchAutoNote` をこの場合に空にしていた
+(行そのものが「Browse から開き直せ」と言っていたので二度言わないため) が、
+行がボタンを出すようになった以上、**自動が待っている事実はここで言わないと
+「忘れられた stack」に見える**: `- auto-reload cannot: these frames come back
+over the link - Reload it by hand`。
+
+**再検討の条件を書いておく**: リモート Reload がメインループを止めない形
+(rfWorker 経由の非同期 + 完了時に1回だけ membership を確定する) になったとき、
+この項は落とせる。それは §16 の範囲ではない —— 非同期にすると
+`reloadStackFromDisk` が2本になり、§15.1 が禁じたものになるからである。
+
+### 16.7 その他
+
+- **`watchActionText` は origin ではなく「ボタンが在るか」で分岐する**
+  (`watchReloadOffered`)。文とコントロールが食い違わないことが分岐の目的
+  だったので、分岐の軸を目的そのものに寄せた。残る「ボタンの無い watch 対象」は
+  container/reader メンバー (`__pixels_*`) だけなので、文言は
+  `reloadUnavailable` 自身の言葉に合わせて「re-open the file to re-read it」。
+- **`watchReloadOffered` から項が1つ減った**。peer の除外は
+  `reloadUnavailable` の答えに**上乗せ**されていたので、上乗せの理由が消えた
+  今は真理の出所が再び1つになった。
+- **新しいメンバーも peer から取る**。`decodeJoiningMember` の door は参照
+  フレームの provenance で決まる、という既存の規律のままで peer の door を
+  足した。url は **参照フレームの url のファイル名だけを差し替えて**作る ——
+  `makeRemoteUrl` で綴り直すと、同じファイルが別の綴りで registry の別の枠を
+  引く。step は参照フレームの `remoteStep` を継ぐので、shape 判定
+  (`stackShapeRefusal`) は同じ幾何どうしの比較になる。
+- **`f32loss` は swap に入った**。float32 が何サンプルを持ちきれなかったかは
+  **今入れる配列の統計**なので、vmin/vmax と一緒に動く (identity 側ではない)。
+  pumpRemoteFetch が full frame で preview のそれを置き換えるのと同じ判断。
+- **テストの seam は `ReloadPeer`**。`watchPollRound` が `WatchLister` を
+  引数に取るのと同じ理由で、Reload も **peer を渡される**: ローカル peer は
+  **空の host** で届き、空の host を綴った url は `local://` になって §13.7 の
+  ローカル半分に落ちるので、**リモート branch は本物の peer を相手に
+  ドライブできない**。`--rwatch-selftest` は scp 綴り `kepler:<path>` で
+  source を peer-backed にし、`ReloadPeer` で往復を実物の `viewer-serve` に
+  向ける (R2 の lister が既に走っている同じ約束事)。null を返す resolver が
+  「リンクが落ちた」である。
+- **R13 と R16 は主語が変わった**。どちらも `makeRemoteSeq` のフレーム0本の
+  stack に対して assert していたが、`watchReloadOffered` はメンバーを歩く
+  述語なので**フレームの無い stack では常に false** —— 変更後も**空虚に通る**。
+  実フレームを peer から取ってくる fixture に載せ替えた。
+
+### 16.8 未着手
+
+項目20 の残りは **§5 の「Watch: open new stacks」** (#47 の Browse 設計待ち)
+のみ。§16.6 が書いた「リモート Reload の非同期化 → 自動をリンクへ」は
+項目20 ではなく、その判断が要るときに別項目として起こす。

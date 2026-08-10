@@ -332,6 +332,53 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port)
     return false;
 }
 
+// ---- §16: HOW the remote half of a Reload reaches the peer -------------------
+// A function the reload is HANDED rather than a Session it reaches for. This is
+// watchPollRound's WatchLister one layer down, and it exists for that function's
+// two reasons exactly:
+//
+//   THE ROUND TRIP HAS TO BE DRIVABLE. --rwatch-selftest runs against the
+//   standalone `viewer-serve` over a pipe, and the local peer is reached with an
+//   EMPTY host - which no remote url can spell (remote::parseUrl refuses
+//   "ssh://" with no host, and makeRemoteUrl turns an empty host into local://,
+//   which is LOCAL by §13.7 and reloads off this disk). Handing the session in
+//   is what lets the branch below be exercised against the real peer instead of
+//   a stub, which is the whole ethos of that file (R1).
+//
+//   ...and a resolver that ANSWERS NULL is how "the link is down" is tested
+//   without unplugging anything. That is §13.4 one layer down: no answer is not
+//   an empty directory, and the rebuild has to fail towards doing NOTHING.
+//
+// Empty = the program's own answer: app.uiSession, the connection the open used,
+// read on the thread that owns it (§3's "one Session, one owning thread"). The
+// window does not repaint while it reads, exactly as an open does not - see
+// UiThreadStall, and §16.6 for why that is the manual gesture's price and not
+// the automatic one's.
+using ReloadPeer = std::function<remote::Session*(const std::string& host, int port,
+                                                  std::string& errOut)>;
+static remote::Session* reloadPeerFor(const ReloadPeer& how, const std::string& host,
+                                      int port, std::string& errOut) {
+    if (how) return how(host, port, errOut);
+    if (!ensureUiSession(host, errOut, port)) return nullptr;
+    return &app.uiSession;
+}
+
+// The peer's directory holding `p`, with no trailing separator - and "" when it
+// has none. A peer path is the SERVER's, so it is split as text: this machine's
+// std::filesystem would apply this machine's rules to a name that never touches
+// this disk (a Windows client reading a Linux peer's "/data/cap/f_000.npy").
+// Both separators, because the peer may be either.
+//
+// It lives here rather than in watch.inc (where it was born) because the
+// membership rebuild below needs it and this fragment is included first. ONE
+// spelling of "which folder is this peer path in", for the reason every other
+// pair in this feature is one function: two would differ on a trailing slash
+// exactly once, in the one place nobody reads.
+static std::string remoteDirOf(const std::string& p) {
+    const size_t cut = p.find_last_of("/\\");
+    return cut == std::string::npos ? std::string() : p.substr(0, cut);
+}
+
 std::string makeRemoteUrl(const std::string& host, const std::string& path, int port) {
     if (host.empty()) return "local://" + path;
     // A home-relative path ("~/data/x.npy") pasted straight after the host would
@@ -431,12 +478,22 @@ static void seqMosaicChanged(const ImageDoc* im) {
 // the function would have given.
 static std::string reloadUnavailable(const FrameSource& S) {
     // local:// is LOCAL: a Browse-panel local open carries the on-disk path
-    // inside its url, so those pixels ARE reloadable. Only real remote schemes
-    // (a peer holds the bytes) refuse.
+    // inside its url, so those pixels ARE reloadable off this disk.
     const bool localUrl = !S.remoteUrl.empty() && S.remoteUrl.rfind("local://", 0) == 0;
-    if (!S.remoteUrl.empty() && !localUrl)
-        return "remote-backed: these pixels come from the peer,\n"
-               "not from a local file.";
+    // ...and the row that USED to be here - "remote-backed: these pixels come
+    // from the peer, not from a local file" - is gone, because it stopped being
+    // true (§16). reloadSource now has the peer's equivalent of "stat it and
+    // read it again": META then TILE, the same two round trips the open made,
+    // on the same connection. A refusal is a fact about reloadSource and this
+    // function states reloadSource's facts, so removing the branch there
+    // removes the row here - which is the whole reason there is one list.
+    //
+    // What is NOT decided here is whether the peer will ANSWER. That is a fact
+    // about a link at a moment, and this predicate greys a menu item by
+    // inspection, on the UI thread, every frame: asking the network would be a
+    // round trip per repaint, and the answer would still be stale by the time
+    // the click arrived. An unreachable peer is a reload that FAILS, with the
+    // reason on the row and #56's mark saying nothing was re-read.
     if ((localUrl ? S.remoteUrl.substr(8) : S.path).empty())
         return "no file behind these pixels - they were composed\n"
                "here (montage / plugin result).";
@@ -517,14 +574,16 @@ static bool invalidateStackDerived(int sid) {
 // recorded rect was snapped when the crop was made, and the mosaic is a
 // per-membership interpretation the source cannot see.
 static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& errOut,
-                         std::string* noteOut = nullptr) {
+                         std::string* noteOut = nullptr,
+                         const ReloadPeer& peer = ReloadPeer()) {
     if (!src) { errOut = "no source"; return false; }
     // local:// is LOCAL: a Browse-panel local open carries the on-disk path
-    // inside its url - the pixels are on this disk and reload reads that file.
-    // Only real remote schemes (a peer holds the bytes) refuse.
+    // inside its url - the pixels are on this disk and reload reads that file,
+    // which is strictly more than a peer can tell us about it (§13.7). A real
+    // remote scheme goes through the peer's door, the FIRST of the four below.
     const bool localUrl = !src->remoteUrl.empty() &&
                           src->remoteUrl.rfind("local://", 0) == 0;
-    if (!src->remoteUrl.empty() && !localUrl) { errOut = "remote-backed"; return false; }
+    const bool peerUrl = !src->remoteUrl.empty() && !localUrl;
     const std::string fpath = localUrl ? src->remoteUrl.substr(8) : src->path;
     if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
     // Container/reader members (__pixels_*) rebuild as a UNIT: one __viewer
@@ -544,7 +603,81 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     }
     std::unique_ptr<ImageDoc> nd;
     std::string err;
-    if (src->rawDtype >= 0) {
+    if (peerUrl) {
+        // ---- §16: THE PEER's door - "stat it and read it again", over a link --
+        //
+        // The local doors below all say the same thing twice: statSourceFile
+        // before the bytes, then a decode. The peer's two calls ARE that pair.
+        // META is the stat (the shape the file declares NOW, and how many frames
+        // it holds), TILE is the read, and they go out in that order for the
+        // local doors' own reason - a file being rewritten under us binds the
+        // OLD answer to the OLD pixels, which is the safe direction.
+        //
+        // Nothing about WHICH pixels these are is re-chosen: the frame index,
+        // the §3.3 reading declaration and the decimation step are replayed off
+        // the source. A reload is "the same frame, new values" over the link
+        // exactly as it is off the disk, and re-deriving any of the three would
+        // make it "a different frame, silently".
+        //
+        // It BLOCKS this thread, as an open of the same frame does (openRemote's
+        // UiThreadStall). That is the price of a manual gesture and it is stated
+        // where the gesture is; §16.6 is why it is not also the price of an
+        // automatic one.
+        std::string host, rpath;
+        int port = 0;
+        if (!remote::parseUrl(src->remoteUrl, host, rpath, &port)) {
+            errOut = "not a remote url: " + src->remoteUrl;
+            return false;
+        }
+        remote::Session* ses = reloadPeerFor(peer, host, port, errOut);
+        if (!ses) {
+            if (errOut.empty()) errOut = "the peer did not answer";
+            return false;
+        }
+        remote::Meta m;
+        if (!ses->meta(rpath, m, errOut, src->npyRead)) return false;
+        if (src->remoteFrame >= (int)m.frames) {
+            // The same sentence and the same reasoning as the .npy frame axis
+            // below: there is no "same frame" left to give new values to.
+            errOut = "file now has " + std::to_string(m.frames) + " frame(s); frame " +
+                     std::to_string(src->remoteFrame) + " no longer exists";
+            return false;
+        }
+        const int step = std::max(1, src->remoteStep);
+        std::vector<float> px;
+        int tw = 0, th = 0, tch = 0;
+        std::string dt;
+        rp::F32Loss tloss;
+        if (!ses->tile(rpath, src->remoteFrame, 0, 0, m.w, m.h, step,
+                       px, tw, th, tch, dt, errOut, src->npyRead, &tloss))
+            return false;
+        if (tw < 1 || th < 1 || tch < 1 || tch > 4) {
+            errOut = "the peer returned a degenerate frame";
+            return false;
+        }
+        nd = std::make_unique<ImageDoc>();
+        FrameSource& P = *nd->src;
+        P.path = src->path;                    // the url IS the provenance here
+        P.remoteUrl = src->remoteUrl;
+        P.remoteFrame = src->remoteFrame;
+        P.remoteStep = step;
+        P.npyShape = m.shape;                  // the PEER's disk, as it declares
+                                               // it now (§3.3, the same field the
+                                               // local branch takes off the file)
+        P.npyRead = src->npyRead;              // ...replayed, never re-chosen
+        P.remoteProto = ses->peerVersion();
+        P.dtype = dt;
+        P.w = tw; P.h = th; P.ch = tch;
+        P.data = std::move(px);
+        P.f32loss = tloss;                     // measured on THESE samples
+        nd->syncMirrors();
+        // a crop made after the open re-scoped this frame; the reload keeps that
+        // scope, exactly as the two branches below do
+        if (src->srcW > 0 &&
+            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW ||
+             src->h != src->srcH))
+            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
+    } else if (src->rawDtype >= 0) {
         RawDialog d;                       // the recipe, replayed against the file
         d.path = fpath;
         d.dtype = src->rawDtype; d.interp = src->rawInterp;
@@ -726,6 +859,12 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         src->rev++;
         src->mtime = N.mtime;
         src->fsize = N.fsize;
+        src->f32loss = N.f32loss;     // what float32 cost THESE samples. It is a
+                                      // census of the array being installed, so
+                                      // it travels with vmin/vmax and not with
+                                      // the identity fields above - the same
+                                      // call pumpRemoteFetch makes when a full
+                                      // frame replaces a preview's.
         srcRegistryAddLocked(src, newKey);   // the new tuple's slot. A live
                                       // occupant (the same tuple decoded fresh
                                       // meanwhile) wins: it already serves
@@ -771,6 +910,86 @@ static std::vector<std::string> stackDirNames(const std::string& dir) {
     return names;
 }
 
+// §16: the PEER's answer to the same question, and to one more.
+//
+// `listed` is every name the peer's LIST reports in that folder - the members of
+// every GROUP row and the name of every PLAIN row, because a folder that has
+// dropped to a single file is no longer a group and its last survivor arrives as
+// a plain row. Building `listed` out of group rows alone would report that
+// survivor as VANISHED, which is the one file it demonstrably is not.
+//
+// `group` is the members of the group row that names `head` - the peer's own
+// grouper, which IS the rule a remote folder stack was minted from
+// (remoteSequenceSiblings opens one from exactly this row, and the peer shares
+// rp::patternWithExtent with the local scan, so it is the same rule
+// siblingNamesAmong applies here).
+//
+// FALSE means NO ANSWER (§13.4 one layer down): an unreachable peer, a dropped
+// ssh link and a refused path all arrive this way, and folding them into an
+// empty listing would have the rebuild conclude that every file of the stack is
+// gone. The caller's only correct response is to do nothing at all.
+static bool remoteFolderNames(const std::string& host, int port, const std::string& dir,
+                              const std::string& head,
+                              std::vector<std::string>& listed,
+                              std::vector<std::string>& group,
+                              const ReloadPeer& peer) {
+    std::string err;
+    remote::Session* ses = reloadPeerFor(peer, host, port, err);
+    if (!ses) return false;
+    std::vector<remote::Entry> rows;
+    if (!ses->list(dir, rows, err)) return false;
+    for (const remote::Entry& e : rows) {
+        if (e.dir) continue;
+        if (!e.group) { listed.push_back(e.name); continue; }
+        bool mine = false;
+        for (const std::string& m : e.members) {
+            listed.push_back(m);
+            if (m == head) mine = true;
+        }
+        if (mine) group = e.members;
+    }
+    return true;
+}
+
+// §12.2 over the link: IS this file list the peer's WHOLE sibling group?
+//
+// The local half asks this at the mint by RUNNING findSequenceSiblings and
+// comparing (sequence.inc), and it does so for a reason that does not weaken
+// over a link - it gets stronger. At Reload time "the folder gained a file" and
+// "this stack always excluded two" are indistinguishable from a listing alone,
+// and a group row cannot even be narrowed to the stack's own members (§13.5). So
+// the answer is recorded at the moment the stack is minted, from the peer's own
+// grouper, or it is not recorded at all and the stack can only ever LOSE members.
+//
+// Cost: one LIST per remote stack opened - the same listing §12.2 already
+// accepted locally, and the same one Browse took to offer the row that was
+// clicked. Returns whether a rule was recorded, so the caller can say so.
+static bool recordRemoteRule(App::SeqInfo& si, const std::vector<std::string>& files,
+                             int headIdx, const ReloadPeer& peer = ReloadPeer()) {
+    si.ruleDir.clear();
+    si.ruleHead.clear();
+    if (files.empty() || headIdx < 0 || headIdx >= (int)files.size()) return false;
+    // ONE directory, or there is no folder whose listing could be the rule -
+    // watchTargetsNow's own refusal, for the same reason (a stack spanning two
+    // of the peer's folders has no single LIST that speaks about it).
+    const std::string dir = remoteDirOf(files[0]);
+    if (dir.empty()) return false;
+    for (const std::string& f : files)
+        if (remoteDirOf(f) != dir) return false;
+    const std::string head = baseName(files[headIdx]);
+    std::vector<std::string> listed, group;
+    if (!remoteFolderNames(si.remoteHost, si.remotePort, dir, head, listed, group, peer))
+        return false;                        // no answer records no rule either
+    std::vector<std::string> a, b = group;
+    for (const std::string& f : files) a.push_back(baseName(f));
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    if (b.empty() || a != b) return false;   // a subset, a hand-picked open
+    si.ruleDir = dir;
+    si.ruleHead = head;
+    return true;
+}
+
 // What a Reload has to do to THIS stack's member list, decided before a byte is
 // read. The three lists watch::planRebuild wants, assembled from the stack:
 //
@@ -789,20 +1008,41 @@ static std::vector<std::string> stackDirNames(const std::string& dir) {
 //   - a stack whose members do not have one file each (a frame-axis .npy is F
 //     memberships of ONE path): "which names are members" is not a question
 //     about that stack's names;
-//   - a stack with a member that has no local file (remote-backed, montage,
-//     plugin output): it never had a file to lose.
-static watch::Rebuild planStackMembership(int seqId) {
+//   - a stack with a member that has no file at all (a montage, a plugin
+//     output): it never had one to lose.
+//
+// §16 added a THIRD list to build them from. Which folder answers "what is in
+// it now" is decided by where the frames are, not by which panel opened them:
+// a frame with a file on this disk (local://, §13.7) is answered by the disk,
+// and a frame that is the PEER's is answered by the peer's LIST - whose group
+// row carries the full member name list, which is exactly and only what these
+// three lists are made of. A stack of BOTH origins has no one folder and is not
+// rebuilt, which is the same refusal a two-directory stack already takes.
+static watch::Rebuild planStackMembershipRemote(int seqId, const ReloadPeer& peer);
+static watch::Rebuild planStackMembership(int seqId,
+                                          const ReloadPeer& peer = ReloadPeer()) {
     watch::Rebuild none;
     std::vector<std::string> have;
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) return none;
     const std::vector<int> fr = framesOfSeq(seqId);
     if (fr.empty()) return none;
+    {   // WHOSE listing, asked of every frame before any of them is read
+        bool anyPeer = false, allPeer = true;
+        for (int idx : fr) {
+            const FrameSource& s = *app.images[idx]->src;
+            const bool p = !s.remoteUrl.empty() &&
+                           s.remoteUrl.rfind("local://", 0) != 0;
+            anyPeer |= p;
+            allPeer &= p;
+        }
+        if (anyPeer && !allPeer) return none;   // two origins, no one folder
+        if (anyPeer) return planStackMembershipRemote(seqId, peer);
+    }
     std::vector<std::string> paths;
     for (int idx : fr) {
         const FrameSource& s = *app.images[idx]->src;
         const bool localUrl = !s.remoteUrl.empty() && s.remoteUrl.rfind("local://", 0) == 0;
-        if (!s.remoteUrl.empty() && !localUrl) return none;      // a peer's pixels
         const std::string p = localUrl ? s.remoteUrl.substr(8) : s.path;
         if (p.empty()) return none;                              // composed here
         paths.push_back(p);
@@ -832,6 +1072,70 @@ static watch::Rebuild planStackMembership(int seqId) {
     return watch::planRebuild(have, listed, want, rp::naturalLess);
 }
 
+// ...and the same three lists for a stack whose frames are the PEER's (§16).
+//
+// What the peer can answer is exactly what planRebuild needs, and §13 is what
+// makes that a finding rather than a hope: a group row's (mtime, size) is the
+// SET's and can never say which member moved, but its member NAME LIST is
+// per-member truth, named as precisely as a local scan names it. `listed` and
+// `want` are name lists. So no new protocol is needed here either - the same
+// LIST the watcher already sends every fifteen seconds answers the rebuild.
+//
+// Three refusals, and each of them fails towards changing NOTHING:
+//
+//   NO ANSWER. §13.4 one layer down, and harder: detection that folds an
+//   unreachable peer into an empty listing says a false sentence, a REBUILD
+//   that does it takes every member out of the stack. §12.5's "never empties a
+//   stack" would catch the extreme case afterwards, but a guard is not a
+//   reading - the plan has to be empty because nothing was read.
+//
+//   RESIDENCY IS NOT MEMBERSHIP. A remote stack is allowed to be short of its
+//   own file list (the memory budget fetches four of three hundred, and the
+//   Files row says "n of N"). `have` is what is HERE; rebuilding from it would
+//   re-issue expectedFrames and remoteFiles as the four and delete two hundred
+//   and ninety-six of the peer's files from the stack without a word.
+//
+//   NO RULE, NO ARRIVALS. §12.2, recorded by recordRemoteRule at the mint.
+static watch::Rebuild planStackMembershipRemote(int seqId, const ReloadPeer& peer) {
+    watch::Rebuild none;
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return none;
+    std::vector<std::string> have;
+    std::string dir, host = si->remoteHost;
+    const int port = si->remotePort;
+    for (int idx : framesOfSeq(seqId)) {
+        const FrameSource& s = *app.images[idx]->src;
+        std::string h, rpath;
+        int p = 0;
+        if (!remote::parseUrl(s.remoteUrl, h, rpath, &p)) return none;
+        const std::string d = remoteDirOf(rpath);
+        if (d.empty()) return none;
+        if (dir.empty()) dir = d;
+        else if (d != dir) return none;      // one LIST speaks about one folder
+        have.push_back(baseName(rpath));
+    }
+    {   // one file per frame, or the names are not the membership (a remote
+        // frame-axis stack is F memberships of ONE url)
+        std::vector<std::string> u = have;
+        std::sort(u.begin(), u.end());
+        if (std::unique(u.begin(), u.end()) != u.end()) return none;
+    }
+    {   // ...and every member of this stack's own list has to BE here
+        std::vector<std::string> mine;
+        for (const std::string& f : si->remoteFiles) mine.push_back(baseName(f));
+        std::sort(mine.begin(), mine.end());
+        std::vector<std::string> h2 = have;
+        std::sort(h2.begin(), h2.end());
+        if (mine != h2) return none;
+    }
+    std::vector<std::string> listed, group;
+    if (!remoteFolderNames(host, port, dir, si->ruleHead, listed, group, peer))
+        return none;                         // no answer is not an empty folder
+    std::vector<std::string> want;
+    if (!si->ruleHead.empty() && si->ruleDir == dir) want = group;
+    return watch::planRebuild(have, listed, want, rp::naturalLess);
+}
+
 // A file JOINING an open stack, decoded the way that stack's own frames were
 // (§6 step 2). WHICH DOOR is decided by the reference frame's provenance and
 // never by the new file's name - one stack is one kind of thing (§6.2) - and the
@@ -840,11 +1144,73 @@ static watch::Rebuild planStackMembership(int seqId) {
 // it exactly as the loader counts a sibling that would not read.
 static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
                                                      const std::string& path,
-                                                     std::string& errOut) {
+                                                     std::string& errOut,
+                                                     const ReloadPeer& peer = ReloadPeer()) {
     const FrameSource& R = *ref.src;
     const bool isRaw = R.rawDtype >= 0;
+    // ...and the PEER's door is one of them (§16). It is chosen by the same
+    // question every other door here is chosen by - what the REFERENCE frame is
+    // - so a stack whose frames came over a link takes its new member over that
+    // link too, and `path` is read as the peer's path rather than this disk's.
+    const bool refPeer = !R.remoteUrl.empty() && R.remoteUrl.rfind("local://", 0) != 0;
     std::unique_ptr<ImageDoc> doc;
     bool adopted = false;
+    if (refPeer) {
+        // The joining member's LOCATOR, built by replacing the file name in the
+        // reference frame's own url. Not makeRemoteUrl(host, path, port): that
+        // re-spells the locator from parsed pieces, and a url that came in as
+        // one form and went out as another would key a different registry slot
+        // for the same file. One name changes; everything that says WHERE stays
+        // byte for byte what the stack is already using.
+        const size_t cut = R.remoteUrl.find_last_of("/\\");
+        if (cut == std::string::npos) { errOut = "no folder in " + R.remoteUrl; return nullptr; }
+        const std::string url = R.remoteUrl.substr(0, cut + 1) + baseName(path);
+        std::string host, rpath;
+        int port = 0;
+        if (!remote::parseUrl(url, host, rpath, &port)) {
+            errOut = "not a remote url: " + url;
+            return nullptr;
+        }
+        std::string perr;
+        remote::Session* ses = reloadPeerFor(peer, host, port, perr);
+        if (!ses) { errOut = perr.empty() ? "the peer did not answer" : perr; return nullptr; }
+        remote::Meta m;
+        if (!ses->meta(rpath, m, errOut, R.npyRead)) return nullptr;
+        // The SAME decimation the stack's own frames carry, so the new member is
+        // the same kind of thing as the ones beside it - and so the shape check
+        // below compares two readings of one geometry rather than a full frame
+        // against a preview.
+        const int step = std::max(1, R.remoteStep);
+        std::vector<float> px;
+        int tw = 0, th = 0, tch = 0;
+        std::string dt;
+        rp::F32Loss tloss;
+        if (!ses->tile(rpath, 0, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, errOut,
+                       R.npyRead, &tloss))
+            return nullptr;
+        if (tw < 1 || th < 1 || tch < 1 || tch > 4) {
+            errOut = "the peer returned a degenerate frame";
+            return nullptr;
+        }
+        doc = std::make_unique<ImageDoc>();
+        doc->name = baseName(rpath);
+        doc->note = ref.note;              // one note per stack, as every other
+                                           // frame of it carries (openRemote)
+        FrameSource& P = *doc->src;
+        P.path = url;
+        P.remoteUrl = url;
+        P.remoteFrame = 0;                 // a folder stack: one file, one frame
+        P.remoteStep = step;
+        P.npyShape = m.shape;
+        P.npyRead = R.npyRead;             // §3.3's three facts, inherited from
+        P.remoteProto = ses->peerVersion();// the head exactly as rfInheritRead
+        P.dtype = dt;                      // gives them to a sibling at the open
+        P.w = tw; P.h = th; P.ch = tch;
+        P.data = std::move(px);
+        P.f32loss = tloss;
+        doc->syncMirrors();
+    }
+    if (!doc)
     {   // §6.2: the registry BEFORE the decode. This very file may already be
         // resident (the same folder opened twice, a derived stack beside its
         // source), and decoding it again would put two copies of identical
@@ -919,7 +1285,8 @@ static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
 // memberships OUTSIDE this stack that the walk refreshed through shared
 // sources - numbers moving in a stack the user never touched need a stated
 // cause.
-static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
+static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
+                                       const ReloadPeer& peer = ReloadPeer()) {
     std::vector<const FrameSource*> done;
     int ok = 0, failed = 0, dims = 0, sharedN = 0;
     std::string firstErr, firstDims;
@@ -933,7 +1300,7 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
     // not a frame that failed to read, and the difference is the whole of what
     // the mark means.
     const int hadBefore = (int)framesOfSeq(seqId).size();
-    watch::Rebuild plan = planStackMembership(seqId);
+    watch::Rebuild plan = planStackMembership(seqId, peer);
     if ((int)plan.dropped.size() >= hadBefore) plan = watch::Rebuild{};
                                           // ...and a rebuild NEVER empties a
                                           // stack. "Every file is gone" is not
@@ -957,7 +1324,7 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
         if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
         done.push_back(s.get());
         std::string err, note;
-        if (reloadSource(s, err, &note)) {
+        if (reloadSource(s, err, &note, peer)) {
             ok++;
             if (!note.empty()) {
                 dims++;
@@ -998,7 +1365,7 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
             if (!ref || dir.empty()) break;
             std::string err;
             std::unique_ptr<ImageDoc> nd =
-                decodeJoiningMember(*ref, dir + "/" + n, err);
+                decodeJoiningMember(*ref, dir + "/" + n, err, peer);
             if (!nd) {
                 // NOT counted with the re-read refusals, and this is the same
                 // distinction #56 rests on: a file the rule NAMES but cannot
@@ -1042,7 +1409,24 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr) {
             if (it != plan.order.end())
                 app.images[idx]->seqIndex = (int)(it - plan.order.begin());
         }
-        if (App::SeqInfo* si = seqInfo(seqId)) si->expectedFrames = (int)plan.order.size();
+        if (App::SeqInfo* si = seqInfo(seqId)) {
+            si->expectedFrames = (int)plan.order.size();
+            // ...and a REMOTE stack's own list of the peer's files is part of
+            // its membership, not a note beside it: watchTargetsNow builds the
+            // watched member list out of it (so the next poll would decide
+            // "whole group" against a folder this stack no longer matches), the
+            // server aggregates name those paths, and a session line writes
+            // them. Re-issued from the rebuilt order, in the peer's spelling.
+            // planStackMembershipRemote has already refused any stack whose
+            // residency is not this list, so `order` names all of it.
+            if (!si->remoteFiles.empty()) {
+                const std::string rd = remoteDirOf(si->remoteFiles[0]);
+                std::vector<std::string> rf;
+                for (const std::string& n : plan.order)
+                    rf.push_back(rd.empty() ? n : rd + "/" + n);
+                si->remoteFiles = std::move(rf);
+            }
+        }
         // The member LIST moved, so everything keyed on the stack AS A SET has
         // to move with it - the sigma_t of four frames is not the sigma_t of
         // five even when not one member's pixels changed. Same call the pixel
@@ -1602,6 +1986,18 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
     si.refName = baseName(files[headIdx]);
     si.cfaType = first->cfa; si.cfaPattern = first->cfaPattern;   // planes travel too
     for (const auto& f : files) si.remoteFiles.push_back(f);
+    // watch-design §12.2 over the link (§16): IS this file list the peer's whole
+    // sibling group? Answered by RUNNING the peer's own grouper - the one that
+    // produced the row Browse was clicked on - and comparing, exactly as
+    // startSequenceLoad answers it for a local folder stack by running
+    // findSequenceSiblings. A stack that records no rule can still LOSE a member
+    // whose file is gone; it can never be handed back frames it did not open
+    // with, which is the direction a wrong answer has to fail in.
+    //
+    // One LIST, once, at the mint. It cannot be re-derived at Reload time: a
+    // folder that gained a file and a subset that excluded two are the same
+    // listing from there, and a group row cannot even be narrowed (§13.5).
+    recordRemoteRule(si, files, headIdx);
     // where the user is standing, so the next session line is written from the
     // frame the stack was left on (startSequenceLoad records the same fact for
     // a local folder stack; this path never did, so a restored remote stack

@@ -654,12 +654,20 @@
             FrameSource unit;                 // a container member
             unit.path = root + "/tree.npz";
             unit.member = "__pixels_1";
-            FrameSource peer;                 // a peer's pixels
-            peer.remoteUrl = "ssh://host/x.npy";
             FrameSource none;                 // a montage / plugin result
-            check(!reloadUnavailable(unit).empty() && !reloadUnavailable(peer).empty() &&
-                      !reloadUnavailable(none).empty(),
-                  "F8 the three sources reload cannot serve are still greyed, with a reason");
+            check(!reloadUnavailable(unit).empty() && !reloadUnavailable(none).empty(),
+                  "F8 the two sources reload cannot serve are still greyed, with a reason");
+            // ...and a PEER's pixels are no longer one of them (watch-design
+            // §16): reloadSource has the peer's own "stat it and read it again",
+            // so the row that greyed a remote-backed source went with the branch
+            // that refused it. This is the same predicate, asserted in the same
+            // place, saying the opposite thing - which is the whole point of
+            // there being one list rather than two.
+            FrameSource peer;
+            peer.remoteUrl = "ssh://host/x.npy";
+            peer.path = peer.remoteUrl;
+            check(reloadUnavailable(peer).empty(),
+                  "F8b ...and a peer's pixels are offered now, not greyed");
         }
 
         closeAll();
