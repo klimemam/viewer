@@ -1240,6 +1240,27 @@ viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 # fixtures under a scratch subdirectory of the given dir.
 viewer_selftest(watch NOGL --watch-selftest tools/testdata)
 
+# ...and the SAME rule with a peer on the other side of it (§1's remote bullet).
+# R1 is the claim the whole design rests on, asserted against the real peer
+# before anything is built on it: LIST already folds a numbered sequence into
+# one synthetic GROUP row carrying the set's summed bytes, its newest member's
+# mtime and the full member name list - so ONE request decides a whole stack and
+# no new protocol is needed. R7 is the constraint that follows: the row carries
+# no per-member mtime, so §4 settles the stack as one unit and the sentence says
+# so rather than borrowing the local half's file count.
+#
+# --remote-exe is not decoration, for selftest.fmtgate's reason exactly: without
+# it the local:// peer is THIS binary, and "the peer grouped that folder" cannot
+# be told from "I did" - the grouping under test is core/serve.cpp's, and the
+# standalone binary is the one a lab installs.
+#
+# Pointed at tools/testdata (not at media/) because it writes its own fixtures
+# under a scratch subdirectory and reads media/pngstack from under it: issue
+# #148's peer serves the picture formats, so a watched remote folder is no
+# longer necessarily .npy and R12 is what holds that to account.
+viewer_selftest(rwatch NOGL --rwatch-selftest tools/testdata
+                       --remote-exe $<TARGET_FILE:viewer-serve>)
+
 # ...and WHICH formats that walk, and the registry it keys off, actually reach:
 # one row per backend of core/imagefile.h plus the members of a viewer
 # container - registers / reload reaches / a second open shares. It writes the

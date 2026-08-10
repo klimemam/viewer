@@ -30,18 +30,99 @@ static std::string watchLocalPathOf(const FrameSource& s) {
     return s.path;
 }
 
+// Is this stack the PEER's?
+//
+// It declares a remote origin (remoteFiles for a folder stack, remoteUrl for a
+// frame-axis one) AND not one of its frames has a file on this disk behind it.
+//
+// The second half is what keeps a local:// stack out of the remote path, and it
+// is reloadUnavailable's own line restated: a Browse-panel local open carries
+// the on-disk path inside its url, so those frames really are stat-able from
+// here. The LOCAL half then watches them PER FILE, which is strictly more than a
+// group row can say - a stack must not lose that precision merely because it was
+// opened through the browser. A real peer's frames answer "" to
+// watchLocalPathOf, and a stack whose frames are not resident at all (the memory
+// budget fetched four of three hundred) answers it for every one of them, which
+// is the same answer for the same reason.
+static bool watchIsPeerStack(const App::SeqInfo& si) {
+    if (si.remoteFiles.empty() && si.remoteUrl.empty()) return false;
+    for (int idx : framesOfSeq(si.id))
+        if (!watchLocalPathOf(*app.images[idx]->src).empty()) return false;
+    return true;
+}
+
+// The peer's directory holding `p`, with no trailing separator - and "" when it
+// has none. A peer path is the SERVER's, so it is split as text: this machine's
+// std::filesystem would apply this machine's rules to a name that never touches
+// this disk (a Windows client reading a Linux peer's "/data/cap/f_000.npy").
+// Both separators, because the peer may be either.
+static std::string remoteDirOf(const std::string& p) {
+    const size_t cut = p.find_last_of("/\\");
+    return cut == std::string::npos ? std::string() : p.substr(0, cut);
+}
+
 // The open stacks, as watched sets. UI thread only: it reads app.seqs and
 // app.images.
 //
 // What is NOT here, and why: loose frames (§9 - "single files are covered by
-// manual Reload"), remote stacks (§1's remote half needs a LIST on the worker's
-// own Session and is the next stage), and any stack whose members have no local
-// file at all. A stack that cannot be watched gets no line rather than an empty
+// manual Reload"), and any stack whose members have neither a local file nor a
+// peer to ask. A stack that cannot be watched gets no line rather than an empty
 // one - saying nothing is the honest output for "not looked at".
 static std::vector<App::WatchTarget> watchTargetsNow() {
     std::vector<App::WatchTarget> out;
     for (const App::SeqInfo& si : app.seqs) {
-        if (!si.remoteHost.empty() || !si.remoteUrl.empty()) continue;   // stage 6
+        if (watchIsPeerStack(si)) {
+            // ---- §1's remote bullet: ONE LIST decides this whole stack -------
+            App::WatchTarget t;
+            t.seqId = si.id;
+            t.peer = true;
+            t.host = si.remoteHost;
+            t.port = si.remotePort;
+            // What the SENTENCE calls it, frozen here: watch.h builds that
+            // sentence and the worker carries it, and neither may reach into the
+            // app to ask what an empty host is called on screen.
+            t.hostLabel = peerLabel(si.remoteHost);
+            // ...and HOW the peer is invoked, frozen here too, for rfEnqueue's
+            // reason: the UI thread edits app.remoteExe freely and the worker
+            // must not read it mid-round.
+            t.exe = app.remoteExe.empty()
+                        ? (si.remoteHost.empty() ? app.exePath
+                                                 : std::string(REMOTE_HOME) + "/viewer-serve")
+                        : app.remoteExe;
+            std::vector<std::string> files = si.remoteFiles;
+            if (files.empty() && !si.remoteUrl.empty()) {
+                // A frame-axis stack: ONE file on the peer holding F frames.
+                // §1 says to look at that one file's row, and that is what the
+                // member list of one does.
+                std::string h, rpath;
+                int prt = 0;
+                if (remote::parseUrl(si.remoteUrl, h, rpath, &prt)) files.push_back(rpath);
+            }
+            if (files.empty()) continue;
+            t.dir = remoteDirOf(files[0]);
+            if (t.dir.empty()) continue;
+            // ONE directory, or this stack is not watched - W14c's rule, and it
+            // bites harder here: one LIST speaks about one directory, so members
+            // living elsewhere would be absent from every observation and §4
+            // would confirm them, correctly by its own lights, as VANISHED.
+            bool oneDir = true;
+            for (const std::string& f : files) {
+                if (remoteDirOf(f) != t.dir) { oneDir = false; break; }
+                t.members.push_back(baseName(f));
+            }
+            if (!oneDir) continue;
+            std::sort(t.members.begin(), t.members.end());
+            t.members.erase(std::unique(t.members.begin(), t.members.end()),
+                            t.members.end());
+            // §1's "no baseline": NO SEED, ever. A remote open records no
+            // (mtime, size) at all - an ssh:// url stays 0/0 on purpose, because
+            // a peer's disk cannot be statted from here (statLocalUrl says so) -
+            // so the FIRST poll makes the baseline and announces nothing. That
+            // is not a gap to fill later: forging "the state at the moment it
+            // was opened" is exactly what §1 forbids.
+            out.push_back(std::move(t));
+            continue;
+        }
         App::WatchTarget t;
         t.seqId = si.id;
         // The members' files. A frame-axis stack has one path repeated F times;
@@ -142,7 +223,48 @@ struct WatchSet {
     // fails towards saying nothing, never towards saying something untrue.
     bool wholeGroup = true;
     bool decided = false;
+    // What a PEER's stack last SAID (watch::remoteFinding's output). The raw
+    // finding is not the statement here: the conversion drops `changed`'s count,
+    // so two raw findings differing only in a number the sentence never prints
+    // would otherwise cost the UI a wake for a line that did not move (§3).
+    watch::Finding saidRemote;
 };
+
+// One reading of a peer's directory, and whether there WAS one. `ok == false`
+// is not an empty directory: see WatchLister.
+struct WatchListing {
+    bool ok = false;
+    std::vector<remote::Entry> rows;
+};
+
+// HOW a peer's directory is listed, as a function the round is HANDED (§1's
+// remote bullet: no new protocol, one LIST answers a whole stack).
+//
+// A callback and not a Session inside watchPollRound, for the reason
+// watchPollRound itself exists: the round must stay drivable by hand. The worker
+// passes a lambda over ITS OWN Session (§3's "one Session, one owning thread");
+// --rwatch-selftest passes one over a Session of its own and counts the calls,
+// which is how §2's "one LIST per (host, port, dir)" becomes an assertion rather
+// than a claim; and a lister that ANSWERS FALSE is how "the link was down" is
+// tested without unplugging anything.
+//
+// Returning false means NO READING WAS TAKEN - not "the directory is empty".
+// The distinction is the whole reason this returns a bool at all: an
+// unreachable peer whose silence was folded into an empty listing would have
+// §4 confirm, correctly by its own lights, that every file of the stack is
+// gone.
+using WatchLister = std::function<bool(const App::WatchTarget& t,
+                                       std::vector<remote::Entry>& rows)>;
+
+// §2's two intervals as ONE decision. The worker's timer is the LOCAL interval
+// (5 s), so a peer is asked every Nth round - and N is computed from the two
+// constants rather than typed, so moving either one cannot silently leave the
+// peer polled at the local rate. 5 s and 15 s give 3.
+static int watchRemoteEvery() {
+    const double a = app.watchIntervalSec, b = app.watchRemoteIntervalSec;
+    if (a <= 0.0 || b <= a) return 1;
+    return (int)std::ceil(b / a - 1e-9);
+}
 
 // ONE POLL ROUND, as a function of what it is handed.
 //
@@ -160,13 +282,135 @@ struct WatchSet {
 // condition under which the UI is woken.
 static bool watchPollRound(const std::vector<App::WatchTarget>& targets,
                            std::map<int, WatchSet>& states,
-                           std::vector<App::WatchDone>& out) {
+                           std::vector<App::WatchDone>& out,
+                           const WatchLister& lister = WatchLister(),
+                           bool doRemote = true) {
     // §2's dedupe: one listing per DISTINCT directory, not one per stack.
     std::map<std::string, watch::Obs> listed;
+    // ...and the same rule over the link, keyed on (host, port, dir): three
+    // stacks open from one folder of one peer is ONE request. This is what makes
+    // §2's cost ceiling - "watched dirs x one LIST per interval" - a ceiling.
+    std::map<std::string, WatchListing> peerListed;
     bool changed = false;
     for (const App::WatchTarget& t : targets) {
+        // §2: a peer is asked on ITS interval (15 s), not the worker's timer
+        // (5 s). The worker decides whose round this is; the round itself reads
+        // no clock. BEFORE `states[...]`, so a round that is not the peer's
+        // costs nothing at all - not even a default-constructed set - and its
+        // baseline, which lives in `states` from an earlier round, is untouched.
+        if (t.peer && !doRemote) continue;
         WatchSet& ws = states[t.seqId];
         watch::SetState& st = ws.st;
+        if (t.peer) {
+            const std::string key = t.host + "\n" + std::to_string(t.port) + "\n" + t.dir;
+            auto pit = peerListed.find(key);
+            if (pit == peerListed.end()) {
+                WatchListing L;
+                L.ok = lister && lister(t, L.rows);
+                pit = peerListed.emplace(key, std::move(L)).first;
+            }
+            // A LIST THAT DID NOT ANSWER IS NOT A READING. An unreachable peer,
+            // a dropped ssh link and a refused path all arrive as "no reply";
+            // folded into an empty listing they would have §4 confirm - quite
+            // correctly by its own lights - that every file of the stack is
+            // GONE, and the screen would announce that a capture was deleted
+            // because a network cable was. The round is skipped for this stack,
+            // its baseline and its candidate untouched, so the poll after the
+            // link returns reads today's disk against the same baseline.
+            if (!pit->second.ok) continue;
+            // The rows that SPEAK FOR this stack's members. A group row speaks
+            // for every member it lists and speaks for them TOGETHER (one pair
+            // of numbers for the set); a plain row speaks for itself, and that
+            // one is per-member truth - so a frame-axis file, or a folder with a
+            // single capture in it, is watched exactly as precisely as a local
+            // stat watches it. Hedging a reading that IS exact would be its own
+            // dishonesty, in the other direction.
+            uint64_t bytes = 0;
+            int64_t mtime = 0;
+            bool aggregated = false;
+            std::vector<std::string> names;
+            for (const remote::Entry& e : pit->second.rows) {
+                if (e.dir) continue;
+                bool mine = false;
+                if (e.group) {
+                    for (const std::string& m : e.members)
+                        if (std::binary_search(t.members.begin(), t.members.end(), m)) {
+                            mine = true;
+                            break;
+                        }
+                } else {
+                    mine = std::binary_search(t.members.begin(), t.members.end(), e.name);
+                }
+                if (!mine) continue;
+                bytes += e.size;
+                mtime = std::max(mtime, e.mtime);
+                if (e.group) {
+                    aggregated = true;
+                    for (const std::string& m : e.members) names.push_back(m);
+                } else {
+                    names.push_back(e.name);
+                }
+            }
+            std::sort(names.begin(), names.end());
+            names.erase(std::unique(names.begin(), names.end()), names.end());
+            // An EMPTY reading is not a decision (R15). A folder that holds none
+            // of this stack's members at the instant of the baseline - not yet
+            // filled, or cleared between the open and the first poll - carries
+            // no names to compare, and answering "not the whole group" from
+            // that would put the stack permanently on mute: the question below
+            // is settled ONCE, so the files arriving a second later would never
+            // be spoken about again. Deferring costs the stack nothing: the
+            // baseline is taken from the empty reading either way, and the
+            // files that then arrive are an ARRIVAL, which is what they are.
+            if (!ws.decided && !names.empty()) {
+                // §11.4 from the other side of the link, and it is STRICTER
+                // here. The local half narrows its observation to the stack's
+                // own members, because a local scan stats every file
+                // separately; a group row cannot be narrowed at all - its bytes
+                // and its mtime cover files this stack does not contain, and
+                // there is no per-member state to subtract them with. So a
+                // stack that is not its group's whole membership (a derived
+                // subset, a hand-picked open, one frame-axis file among
+                // numbered siblings) says NOTHING. Same failure direction as
+                // the local half takes, and the only honest one an aggregate
+                // leaves available.
+                //
+                // Decided ONCE, at the baseline, for the local half's reason: a
+                // folder that GAINS a file must not thereby stop being the
+                // group it was, which is what re-deciding every poll concludes.
+                ws.wholeGroup = (names == t.members);
+                ws.decided = true;
+            }
+            if (!ws.wholeGroup) continue;
+            watch::Obs obs = aggregated
+                                 ? watch::groupObs(bytes, mtime, std::move(names))
+                                 : watch::Obs();
+            if (!aggregated)
+                for (const remote::Entry& e : pit->second.rows) {
+                    if (e.dir || e.group) continue;
+                    if (std::binary_search(t.members.begin(), t.members.end(), e.name))
+                        obs.push_back({ e.name, e.mtime, e.size });
+                }
+            watch::observe(st, std::move(obs));
+            // The STATEMENT, not the raw finding: what the panel prints is the
+            // converted one, and the wake belongs to the sentence changing (§3).
+            watch::Finding said;
+            if (aggregated) {
+                said = watch::remoteFinding(st.found, t.hostLabel, (int)st.conf.size());
+            } else {
+                // Every row that spoke was a PLAIN row, so every number here is
+                // the file's own: the finding is the local one, counts and names
+                // included, and the only thing to add is WHERE.
+                said = st.found;
+                if (said.any()) said.host = t.hostLabel;
+            }
+            if (said != ws.saidRemote) {
+                ws.saidRemote = said;
+                out.push_back({ t.seqId, said });
+                changed = true;
+            }
+            continue;
+        }
         // §1: the baseline is FrameSource's own stat, and it MOVES when a
         // Reload re-reads the files (reloadSource re-stats and rewrites
         // mtime/fsize). That is the whole mechanism by which the amber line
@@ -241,6 +485,18 @@ static bool watchPollRound(const std::vector<App::WatchTarget>& targets,
 
 static void watchWorker() {
     std::map<int, WatchSet> states;
+    // §3's rule, kept the shape rfWorker (remote_client.inc) and mWorker keep:
+    // ONE Session, owned by the thread that uses it. It is emphatically NOT the
+    // Browse instance's - two threads writing one pipe interleave two requests'
+    // frames, and the reply either one then reads is a decode of the other's
+    // bytes. Connections are held across rounds and reused, which is what makes
+    // "one LIST every 15 s" cost one LIST every 15 s rather than an ssh
+    // handshake every 15 s.
+    remote::Session ses;
+    ses.setAbort(&app.watchStop);      // a blocked read gives up when Quit asks
+    std::string sesHost = "\n";        // impossible: force the first connect
+    int sesPort = -1;
+    long long round = 0;
     while (!app.watchStop) {
         std::vector<App::WatchTarget> targets;
         if (!app.watchPaused) {        // §2: not while the window is minimised
@@ -248,11 +504,34 @@ static void watchWorker() {
             targets = app.watchTargets;
         }
         std::vector<App::WatchDone> found;
+        // §2's second interval. The timer below is the LOCAL one, so a peer
+        // gets every Nth round and N comes out of the two constants.
+        const bool doRemote = (round % watchRemoteEvery()) == 0;
+        bool anyPeer = false;
+        for (const App::WatchTarget& t : targets) anyPeer |= t.peer;
+        WatchLister lister = [&](const App::WatchTarget& t,
+                                 std::vector<remote::Entry>& rows) {
+            std::string err;
+            ensureSession(ses, sesHost, sesPort, t.host, t.port, t.exe, err);
+            if (!err.empty()) return false;
+            return ses.list(t.dir, rows, err);
+        };
         // An empty target list is a no-op round and NOT a re-baselining one:
         // watchPollRound would forget every state it holds. Minimised must cost
         // the baselines nothing - a window restored after an hour has to say
         // what changed during it, not start over.
-        const bool any = !targets.empty() && watchPollRound(targets, states, found);
+        const bool any = !targets.empty() &&
+                         watchPollRound(targets, states, found, lister, doRemote);
+        round++;
+        // Nothing on the peer is being watched any more (the last remote stack
+        // was closed, or Watch was paused): let the link go. An idle ssh process
+        // per stack somebody closed an hour ago is a real cost on the machine at
+        // the other end, and the next remote target reconnects in one round.
+        if (!anyPeer && ses.alive()) {
+            ses.stop();
+            sesHost = "\n";
+            sesPort = -1;
+        }
         if (any) {
             {
                 std::lock_guard<std::mutex> lk(app.watchMtx);
@@ -299,6 +578,33 @@ static bool watchFindingsPending() {
     return !app.watchDone.empty();
 }
 
+// WHAT TO DO ABOUT IT, which is not one sentence for both origins.
+//
+// The local line ends "- Reload in Files to re-read them" and puts a [Reload]
+// beside it. A stack whose pixels are the PEER's has no such button: reloadSource
+// refuses remote-backed sources by name ("these pixels come from the peer, not
+// from a local file" - reloadUnavailable), and §6's membership rebuild has not
+// reached the remote origin. Printing the local instruction there would be
+// telling the user to press a control this program greys out, so the remote line
+// names the gesture that does work.
+static const char* watchActionText(bool peer) {
+    return peer ? " - re-open the folder from Browse to re-read it"
+                : " - Reload in Files to re-read them";
+}
+
+// May the watch line OFFER [Reload] for this stack? One predicate, asked by the
+// panel and by --rwatch-selftest, and it is the same question the stack's
+// context menu already asks about the same members (reloadUnavailable) - a
+// second transcription of that list is how the menu and this button would come
+// to disagree about one stack.
+static bool watchReloadOffered(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (si && watchIsPeerStack(*si)) return false;
+    for (int idx : framesOfSeq(seqId))
+        if (reloadUnavailable(*app.images[idx]->src).empty()) return true;
+    return false;
+}
+
 // The SENTENCE, and it is THE guard: the Files panel draws this string and
 // --watch-selftest asserts this string, so there is no second opinion to drift
 // (seqReloadNote's discipline). "" = this stack has nothing to say.
@@ -332,9 +638,11 @@ static void watchIntegrate() {
         if (si->watchToasted) continue;
         si->watchToasted = true;
         // §5: one toast, and the line stays. A toast expires; "3 file(s)
-        // changed on disk" must not (seqNote's precedent).
+        // changed on disk" must not (seqNote's precedent). What it tells the
+        // reader to DO is watchActionText's, because a peer's stack has no
+        // [Reload] to press.
         toast(si->name + ": " + watch::findingText(d.found) +
-              " - Reload in Files to re-read them");
+              watchActionText(!d.found.host.empty()));
     }
 }
 
