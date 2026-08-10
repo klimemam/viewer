@@ -698,6 +698,70 @@
             check(seriesAudit(why), "B4 audit after the close");
         }
 
+        // ---- C1: a row's error message is PRINTED, never INTERPRETED --------
+        // The mean cell of an invalid row shows that row's err, and err is a
+        // RUNTIME string - it comes from computeStackStats / computeFrameStats,
+        // i.e. from whoever next writes a refusal. ImGui's text calls are
+        // printf-shaped, so handing err over as the format silently makes every
+        // error message a format specification; -Wformat-security is the only
+        // reason anyone knew.
+        //
+        // The poison is "100%%" rather than "%s" ON PURPOSE. "%s" would make the
+        // bug read a pointer that was never passed - undefined behaviour, so a
+        // test built on it measures the day's luck. "%%" takes NO argument at
+        // all: printf collapses it to one '%' and reads nothing, so the failure
+        // is a difference between two strings and nothing else. Before the fix
+        // this cell showed "100%" where the row said "100%%"; the assert is that
+        // what the row says is what the panel shows, character for character.
+        {
+            App::Series* SC = app.series.empty() ? nullptr : &app.series.front();
+            int sid = SC ? SC->id : 0;
+            linRecompute(sid);
+            static const char* const POISON =
+                "no finite samples (100%% of the ROI masked)";
+            bool poisoned = false;
+            for (auto& r : app.lin.rows)
+                if (!poisoned) { r.valid = false; r.err = POISON; poisoned = true; }
+            check(poisoned, "C1 fixture: one member's row carries an error message");
+            // One frame of the REAL panel, with or without the backends - the
+            // roiStatsSelftest() recipe, see the NewFrame comment there.
+            ImGuiIO& io = ImGui::GetIO();
+            if (g_haveWindow) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+            } else {
+                io.DisplaySize = ImVec2(1600, 1000);
+                io.DisplayFramebufferScale = ImVec2(1, 1);
+                io.DeltaTime = 1.0f / 60.0f;
+                if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+            }
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_Always);
+            ImGui::Begin("SeriesPanelProbe", nullptr,
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+            // ImGui's own text capture, which is the only reader that sees what
+            // a widget PRINTED rather than what it was handed: LogRenderedText
+            // runs downstream of the format pass. It also sets ItemUnclipByLog,
+            // so a row scrolled out of the table still reports its text.
+            ImGui::LogToBuffer();
+            drawPanelSeriesAnalysis();
+            // Read it BEFORE LogFinish: LogFinish clears LogBuffer (it is the
+            // clipboard path's staging area), so afterwards there is nothing
+            // left to look at - which is a silent empty pass, not an error.
+            std::string shown = ImGui::GetCurrentContext()->LogBuffer.c_str();
+            ImGui::LogFinish();
+            ImGui::End();
+            ImGui::EndFrame();
+            check(!shown.empty(), "C1 fixture: the panel drew and was captured");
+            const bool verbatim = shown.find(POISON) != std::string::npos;
+            if (!verbatim)
+                fprintf(stderr, "seriespanelselftest: C1 the panel showed: %s\n",
+                        shown.c_str());
+            check(verbatim, "C1 the panel prints a row's error text verbatim");
+        }
+
         fprintf(stderr, "seriespanelselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader(); stopRemoteFetcher(); stopMeasureWorker(); stopRbWorker();
         return ok ? 0 : 1;
