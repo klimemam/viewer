@@ -726,9 +726,13 @@ static SetResult runSetAnalyzer(const App::ASet& S, int kind) {
 //     is the whole reason this fit exists.
 //   - mu IS dark-corrected: mu_l = mean(M_l) - mean(M_dark). Run on raw means,
 //     the (mu+c)^2 cross term breaks the model. Note what this needs of the
-//     dark: a per-plane SCALAR. Nothing subtracts pixel from pixel here, so
-//     unlike the direct PRNU this analysis has no reason to demand one shape -
-//     what it does demand is that plane p means the same thing on both sides.
+//     dark: a per-plane SCALAR. Nothing subtracts pixel from pixel here, so the
+//     arithmetic would run over a dark of any size - and it is REFUSED anyway
+//     (確定 2026-08-10, #57: 「dark, sweep の WxH 不一致は拒否」). The sweep and
+//     the dark have to be one shape, exactly as the direct PRNU row demands,
+//     because a dark that is not the sweep's size is a mis-binding and the
+//     number it produces is indistinguishable from a good one. sepShapeRefusal
+//     below is the whole of it, and it names both shapes.
 //   - M >= 3. Two points fit a line exactly, so M = 2 always looks perfect and
 //     the residuals cannot check anything.
 //   - STACK members only. A frame member has no s_t, so the -C correction
@@ -785,21 +789,49 @@ static std::string sepDualNote(const std::vector<std::string>& names,
 // and until now the sentence existed twice, once in each file, with nothing
 // holding the two copies together.
 //
-//   PLANES. mu is a per-plane difference, so plane p has to mean the same thing
-//   on both sides, or the two are not one detector read one way. PR #131's
-//   sentence, moved and not rewritten.
+// TWO refusals, in this order, and the order is what keeps PR #131's sentence
+// exactly where it was:
+//
+//   1. PLANES. mu is a per-plane difference, so plane p has to mean the same
+//      thing on both sides, or the two are not one detector read one way.
+//      PR #131's sentence, moved and not rewritten. It stays FIRST because a
+//      member that disagrees about channels disagrees about both at once, and
+//      "what a plane means" is the deeper of the two statements - so the row
+//      that used to print it still prints it, unchanged.
+//   2. W x H. Nothing here subtracts pixel from pixel - the dark contributes a
+//      per-plane SCALAR - so the arithmetic runs happily over a dark of any
+//      size, which is precisely why PR #131 could not settle this and asked.
+//      確定 2026-08-10 (#57): 「dark, sweep の WxH 不一致は拒否」. This row is
+//      now as strict as the direct PRNU row, and it refuses by NAMING BOTH
+//      SHAPES - PR #121's lesson, which is that a refusal declining to say what
+//      it refused leaves the reader with nowhere to go.
+//
+// The sentence says outright that this would have computed, because that is the
+// honest reason for the rule: the danger of a mis-bound dark is not that the
+// number cannot be formed, it is that the number CAN be formed and looks
+// exactly like the right one.
 static std::string sepShapeRefusal(const std::string& member,
                                    int W, int H, int C, int nPl, int cfa, int cfaPattern,
                                    int dW, int dH, int dC, int dPl, int dCfa, int dCfaPattern) {
-    (void)W; (void)H; (void)dW; (void)dH;
     const std::string q = "sweep member \"" + member + "\" is ";
     auto planes = [](int c, int pl) {
         return std::to_string(c) + "ch / " + std::to_string(pl) + " plane(s)";
+    };
+    auto shape = [](int w, int h, int c) {
+        return std::to_string(w) + "x" + std::to_string(h) + "x" +
+               std::to_string(c) + "ch";
     };
     if (C != dC || nPl != dPl || cfa != dCfa || (cfa != 0 && cfaPattern != dCfaPattern))
         return q + planes(C, nPl) + " and \"dark\" is " + planes(dC, dPl) +
                " - mu is a per-plane difference, so the planes have to mean the "
                "same thing on both sides";
+    if (W != dW || H != dH)
+        return q + shape(W, H, C) + " and \"dark\" is " + shape(dW, dH, dC) +
+               " - the sweep and the dark have to be one shape. Nothing here "
+               "subtracts pixel from pixel, so this would have computed; a dark "
+               "that is not the sweep's own size is a MIS-BINDING, and a number "
+               "computed off one reads exactly like a number computed off the "
+               "right dark.";
     return "";
 }
 
