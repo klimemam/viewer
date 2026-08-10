@@ -537,9 +537,17 @@ static void drawPanelProjection() {
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-            // ONE mean, not three: over a rectangle the region mean, the mean
-            // of the row means and the mean of the column means are the same
-            // number. The old per-axis table printed it twice.
+            // ONE mean, not three - and the one printed is the REGION's.
+            // Over a rectangle the region mean and the mean of the column means
+            // are the same number twice: the H pass visits every column of
+            // every step-th row and the region moments are gathered from
+            // exactly those visits, so the sample sets are identical and the
+            // column counts equal. --precision-selftest P7c holds them to it.
+            // The mean of the ROW means is NOT that number: the V pass visits
+            // every row of every step-th COLUMN, a different set of pixels, and
+            // differs by ~0.04 DN on a 4000x3000 frame for that reason alone.
+            // Which is why this table prints fStat and not an axis: it says
+            // "the region", and every row of it means the same thing.
             // the literal is split after each escape: "\xcf\x83f" would be read
             // as \xcf followed by the 3-digit escape \x83f, which is not a byte
             // Spelled out rather than initialled. "sigma-f" needs the footnote

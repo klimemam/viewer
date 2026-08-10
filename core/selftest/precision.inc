@@ -265,6 +265,115 @@ if (!g_precisionSelftest.empty()) {
     check(rok.valid && rok.mean == okSum / 4.0 && !du4ok->src->f32loss.any(),
           "P6c and where nothing was lost, the ROI mean IS exact and says nothing");
 
+    // ---------------------------------------------------------------- P7
+    // THE ACCUMULATOR, not the sample. P1-P6 are about values float32 cannot
+    // HOLD. This one is about a value it holds perfectly - 3000.4 DN - and
+    // then loses on the way to the screen, because the fold that carries it
+    // was single precision while the fold beside it was not.
+    //
+    // The projection panel prints two means OF THE SAME PIXELS:
+    //   wide table   "mean" = P.fStat[].mean, the region moments, which
+    //                panel_histogram.inc accumulates in `double fSum[5]`;
+    //   per-axis     "mean" = P.hStat[].mean, the mean of the COLUMN means,
+    //   table        and every column sum was accumulated in a float.
+    // The H pass visits every column of every step-th row, and the region
+    // moments are gathered from EXACTLY those visits, so over a rectangle
+    // every column carries the same sample count and the two are the same
+    // number in arithmetic. Whatever separates them is the accumulator - and
+    // which of the two you are shown is decided by how wide the panel is.
+    //
+    // The fixture is arithmetic rather than a measurement, on the P1 rule:
+    // every pixel is 3000.4f (= 3000.39990234375, exactly), so every column
+    // mean is 3000.4f, the mean of the column means is 3000.4f, and the region
+    // mean is 3000.4f. 512 rows per column is what a 4000x3000 frame leaves
+    // after PROJ_MAX_SAMPLES strides it (step 6 -> 500 rows), so this small
+    // fixture drifts by what a real frame drifts by: measured -0.0149 DN here
+    // against -0.0146 DN on the 4000x3000 original.
+    //
+    // Why a UNIFORM region and not a noisy one: the rounding error of a column
+    // sum depends on the values, so on a noisy frame the 4000 columns make
+    // 4000 different errors that average away to ~1e-6 DN. On a flat field -
+    // the frame this panel exists to measure - every column makes the SAME
+    // error, nothing averages, and the whole error survives into the mean.
+    // "Present but invisible" and "visible" are the same defect at two
+    // correlation lengths, and the flat field is the one users bring.
+    const float PV = 3000.4f;                   // 3000.39990234375, exactly
+    auto mkFlat = [&](const char* nm, int W2, int H2, float base, float noise) {
+        auto d = std::make_unique<ImageDoc>();
+        d->name = nm; d->src->w = W2; d->src->h = H2; d->src->ch = 1;
+        d->src->dtype = "f32";
+        d->src->data.resize((size_t)W2 * H2);
+        uint32_t st = 0x13579bdfu;              // fixed, so the numbers repeat
+        for (int y = 0; y < H2; y++)
+            for (int x = 0; x < W2; x++) {
+                st = st * 1664525u + 1013904223u;
+                float n = noise * ((float)(st >> 8) * 0x1p-24f - 0.5f);
+                d->px()[(size_t)y * W2 + x] = base + n;
+            }
+        d->syncMirrors();
+        d->uid = app.nextUid++;
+        return d;
+    };
+    const int savedMode = app.projMode, savedSel = app.selectedAnn;
+    const bool savedAll = app.projAllRow, savedBusy = app.annBusy;
+    app.projMode = 0;                           // mean; max/min do not accumulate
+    app.projAllRow = false;
+    app.annBusy = false;
+    app.anns.clear(); app.selectedAnn = 0;      // whole image, no ROI
+    auto probe = [&](ImageDoc* d, App::ProjState& P) {
+        P = App::ProjState{};
+        recomputeProjectionIfNeeded(d, P);
+    };
+    // one float ulp at the scale of the mean. That is the ONLY error a correct
+    // implementation can have here: P.h is a vector<float> because the plot
+    // draws it, so each column mean is rounded once on the way in, and
+    // averaging those cannot exceed the largest of them.
+    auto ulpBound = [](double m) { return fabs(m) * 0x1p-23 + 1e-12; };
+
+    auto flat = mkFlat("p7flat", 128, 512, PV, 0.0f);
+    App::ProjState PF;
+    probe(flat.get(), PF);
+    fprintf(stderr, "precisionselftest: P7 uniform %d x %d at %s DN | region %s | "
+                    "H profile %s | off by %s DN (%.3g ppm) | screen \"%.6g\" vs \"%.6g\"\n",
+            flat->w, flat->h, rp::exactNum((double)PV).c_str(),
+            rp::exactNum(PF.fStat[0].mean).c_str(), rp::exactNum(PF.hStat[0].mean).c_str(),
+            rp::exactNum(PF.hStat[0].mean - PF.fStat[0].mean).c_str(),
+            fabs((PF.hStat[0].mean - PF.fStat[0].mean) / PF.fStat[0].mean) * 1e6,
+            PF.fStat[0].mean, PF.hStat[0].mean);
+    check(PF.fStat[0].valid && PF.fStat[0].mean == (double)PV,
+          "P7a the region moments of a uniform region ARE its value");
+    check(PF.hStat[0].valid && PF.hStat[0].mean == (double)PV,
+          "P7b ...and so is the mean of its column means");
+    // The permanent guard. Not "float is bad" - a bound the two sides must
+    // meet, over the sample set the code itself says they share. It is what
+    // would have caught this: the mean of the column means and the region mean
+    // are one number computed twice, and PR #127 is the precedent for putting
+    // two sides that must agree where they can be compared.
+    check(fabs(PF.hStat[0].mean - PF.fStat[0].mean) <= ulpBound(PF.fStat[0].mean),
+          "P7c the profile mean IS the region mean, to one float ulp");
+    // ...and the bound must not be so tight that honest data trips it: the
+    // same assertion over a noisy frame, where the column means genuinely
+    // differ and each is rounded into P.h on its own.
+    auto noisy = mkFlat("p7noisy", 128, 512, PV, 220.0f);
+    App::ProjState PN;
+    probe(noisy.get(), PN);
+    fprintf(stderr, "precisionselftest: P7 noisy | region %s | H profile %s | "
+                    "off by %s DN (%.3g ppm), bound %.3g ppm\n",
+            rp::exactNum(PN.fStat[0].mean).c_str(), rp::exactNum(PN.hStat[0].mean).c_str(),
+            rp::exactNum(PN.hStat[0].mean - PN.fStat[0].mean).c_str(),
+            fabs((PN.hStat[0].mean - PN.fStat[0].mean) / PN.fStat[0].mean) * 1e6,
+            ulpBound(PN.fStat[0].mean) / fabs(PN.fStat[0].mean) * 1e6);
+    check(PN.fStat[0].valid && PN.hStat[0].valid &&
+          fabs(PN.hStat[0].mean - PN.fStat[0].mean) <= ulpBound(PN.fStat[0].mean),
+          "P7d and the same bound holds over a noisy frame");
+    // The V profile is NOT part of this: it visits all rows of every step-th
+    // COLUMN, which is a different set of pixels from the one the region
+    // moments were gathered over, so its mean legitimately differs (0.037 DN
+    // on a 4000x3000 frame, in double). Asserting it here would be asserting
+    // something untrue - the comment in panel_histogram.inc used to.
+    app.projMode = savedMode; app.projAllRow = savedAll;
+    app.annBusy = savedBusy; app.selectedAnn = savedSel;
+
     fprintf(stderr, "precisionselftest: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

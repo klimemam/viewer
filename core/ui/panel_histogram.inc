@@ -574,18 +574,42 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
 
     // ...and everything below is indexed BY SLOT, never by position, so the
     // five-slot arrays and the loops cannot drift apart again.
+    //
+    // hAcc/vAcc are where the profile is SUMMED; P.h/P.v are where it is
+    // STORED. They are different types on purpose. P.h is float because the
+    // plot draws it and a curve is drawn from floats, but a sum of a few
+    // hundred to a few thousand samples has no business being one: at a few
+    // thousand DN a float sum is already spending its last bits on the
+    // running total, and what it drops is the tail of every addend after it.
+    // The region moments below are double for exactly this reason and over
+    // exactly these samples - one accumulator of each type over one set of
+    // pixels is the arrangement that cannot be right.
+    std::vector<double> hAcc[5], vAcc[5];
     std::vector<std::vector<int>> hN(5), vN(5);
     for (int i = 0; i < nAcc; i++) {
         const int s = fillSlot[i];
         P.h[s].assign(rw, 0.0f);
         P.v[s].assign(rh, 0.0f);
+        hAcc[s].assign(rw, 0.0);
+        vAcc[s].assign(rh, 0.0);
         hN[s].assign(rw, 0);
         vN[s].assign(rh, 0);
     }
     if (!P.allRow) { P.h[4].clear(); P.v[4].clear(); P.fStat[4] = {}; P.hStat[4] = {}; P.vStat[4] = {}; }
-    // region moments, gathered from the SAME samples the H pass visits (every
-    // column, every step-th row) - so the region sigma and the profile sigmas
-    // describe one and the same set of pixels
+    // Region moments, gathered from the SAME samples the H pass visits (every
+    // column, every step-th row). So the region statistics and the H profile
+    // describe one and the same set of pixels, and - every column of a
+    // rectangle carrying the same sample count - the region mean and the mean
+    // of the column means are ONE NUMBER, computed twice. The panel prints
+    // both: fStat[].mean in the wide table, hStat[].mean in the per-axis one.
+    // They are asserted equal to within one float ulp (--precision-selftest
+    // P7c); they were 0.015 DN apart while the sum above was a float.
+    //
+    // NOT the V profile. That pass visits every row of every step-th COLUMN,
+    // which is a different set of pixels, and its mean differs from the region
+    // mean by ~0.04 DN on a 4000x3000 frame for that reason alone. The comment
+    // that used to stand here said "the profile sigmas", plural, and was
+    // therefore false for half of what it named.
     double fSum[5] = {}, fSum2[5] = {};
     size_t fN[5] = {};
     double fMn[5] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
@@ -594,8 +618,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (useMax || useMin)
         for (int i = 0; i < nAcc; i++) {
             const int s = fillSlot[i];
-            std::fill(P.h[s].begin(), P.h[s].end(), useMax ? -FLT_MAX : FLT_MAX);
-            std::fill(P.v[s].begin(), P.v[s].end(), useMax ? -FLT_MAX : FLT_MAX);
+            std::fill(hAcc[s].begin(), hAcc[s].end(), useMax ? -DBL_MAX : DBL_MAX);
+            std::fill(vAcc[s].begin(), vAcc[s].end(), useMax ? -DBL_MAX : DBL_MAX);
         }
     // Sample cap (this was the only uncapped full-image pass). Each profile keeps
     // full resolution along its OWN axis and strides the orthogonal one, so no
@@ -620,9 +644,9 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         // into the pooled "all" row as well. Pooling here rather than in a
         // second pass keeps the two rows over EXACTLY the same samples.
         auto put = [&](int slot, float val) {
-            float& acc = toH ? P.h[slot][x] : P.v[slot][y];
-            if (useMax) acc = std::max(acc, val);
-            else if (useMin) acc = std::min(acc, val);
+            double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
+            if (useMax) acc = std::max(acc, (double)val);
+            else if (useMin) acc = std::min(acc, (double)val);
             else acc += val;
             (toH ? hN[slot][x] : vN[slot][y])++;
             if (toH) {           // one pass only, or every pixel counts twice
@@ -647,16 +671,23 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         for (int x = 0; x < rw; x += step)
             for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
+    // The one place the profile narrows to float: the mean is DIVIDED in double
+    // and rounded once, on its way into the vector the plot draws. One rounding
+    // per column instead of one per sample.
     for (int i = 0; i < nAcc; i++) {
         const int s = fillSlot[i];
         for (int x = 0; x < rw; x++) {
             if (!hN[s][x]) { P.h[s][x] = std::numeric_limits<float>::quiet_NaN(); continue; }
-            if (!useMax && !useMin) P.h[s][x] /= hN[s][x];
+            double m = hAcc[s][x];
+            if (!useMax && !useMin) m /= hN[s][x];
+            P.h[s][x] = (float)m;
             P.hMin = std::min(P.hMin, P.h[s][x]); P.hMax = std::max(P.hMax, P.h[s][x]);
         }
         for (int y = 0; y < rh; y++) {
             if (!vN[s][y]) { P.v[s][y] = std::numeric_limits<float>::quiet_NaN(); continue; }
-            if (!useMax && !useMin) P.v[s][y] /= vN[s][y];
+            double m = vAcc[s][y];
+            if (!useMax && !useMin) m /= vN[s][y];
+            P.v[s][y] = (float)m;
             P.vMin = std::min(P.vMin, P.v[s][y]); P.vMax = std::max(P.vMax, P.v[s][y]);
         }
     }
