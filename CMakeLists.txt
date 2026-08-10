@@ -339,12 +339,45 @@ set_source_files_properties(core/stb_image_impl.c PROPERTIES
 # the two that never see the crash, and can now refuse to build the cause of it.
 # MSVC has no equivalent, so Windows keeps gating the way it always did: by
 # running the tests.
+#
+# ...and it was ONE platform, not two, from the hour it was written (7ec9a8b),
+# because the two compilers do not spell it the same way and clang said so in a
+# voice nobody was listening in. GCC takes the size on the -Werror= form:
+#
+#     -Werror=frame-larger-than=65536                     (gcc: gate, armed)
+#
+# clang parses -Werror=<name> and finds no warning called
+# "frame-larger-than=65536"; its own is "frame-larger-than", and the SIZE is
+# carried by a separate -W flag. So on macOS every build of these five files
+# printed
+#
+#     warning: unknown warning option '-Werror=frame-larger-than=65536';
+#              did you mean '-Werror=frame-larger-than='?
+#
+# five times - and an unknown -W is a WARNING to clang, never an error, so the
+# gate was absent and the build was green. That is the failure this repo keeps
+# writing down: a check that is present, passing, and answering nothing. macOS
+# would have compiled `LibRaw R;` as a local without complaint.
+#
+# Two flags, then, and the size on the plain -W where clang wants it:
+#
+#     -Wframe-larger-than=65536 -Werror=frame-larger-than (clang: gate, armed)
+#
+# Verified by MEASUREMENT rather than by reading, at the -O3 a Release build
+# uses, with a 100,000-byte local whose address escapes: gcc and clang each
+# refuse to compile it under their own spelling and each reject the other's.
+#
+# -Werror=unknown-warning-option is the half that matters more than either. It
+# is why this was invisible: clang shrugs at a flag it cannot parse, so ANY
+# misspelled guard here silently stops guarding. Now a guard that cannot be
+# spelled fails the build instead, and the next one to be added cannot repeat
+# this. (GCC has no equivalent - it errors on an unknown -Werror= by itself.)
 if(NOT MSVC)
   set_source_files_properties(
     core/imagefile.cpp core/rawread.cpp core/tiffread.cpp
     core/exrread.cpp core/y4mread.cpp
     PROPERTIES COMPILE_OPTIONS
-    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Werror=frame-larger-than=65536>")
+    "$<$<CXX_COMPILER_ID:GNU>:-Werror=frame-larger-than=65536>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wframe-larger-than=65536;-Werror=frame-larger-than;-Werror=unknown-warning-option>")
 endif()
 target_link_libraries(viewer PRIVATE imgui_lib ps_api Threads::Threads libraw_lib)
 # where the server pulls its own peer binary from (binaries branch)
