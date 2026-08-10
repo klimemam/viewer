@@ -25,9 +25,7 @@
 #include "stb_image.h"
 #include "rawread.h"
 #include "tiffread.h"
-#ifndef VIEWER_NO_OPENEXR
 #include "exrread.h"
-#endif
 #include "y4mread.h"
 
 namespace imagefile {
@@ -52,35 +50,24 @@ static const char* const RAW_ABSENT =
 #define VIEWER_RAW_ABSENT  nullptr
 #endif
 
-// VIEWER_NO_OPENEXR: the ONE build that has it is the glibc-compatibility
-// rebuild of viewer-serve (.github/workflows/build.yml). That binary exists so
-// a peer copied onto an old compute box runs at all, and it is compiled by one
-// g++ line with no external library on it - which every reader here satisfies
-// except this one, since OpenEXR is a library and not a file of ours.
+// THERE IS NO VIEWER_NO_OPENEXR, and its absence is a decision rather than an
+// omission. One existed for exactly one build - the glibc-compatibility rebuild
+// of viewer-serve in .github/workflows/build.yml, which is compiled by one g++
+// line, and OpenEXR is the only reader here that is a LIBRARY rather than a
+// file of ours. That build now builds OpenEXR too (statically, from the version
+// CMakeLists.txt pins), because the flag bought its minute of CI with the very
+// defect #148 was opened to remove: the Linux client read .exr and the peer in
+// the same release tarball refused it, so one file answered two ways depending
+// on which end opened it. A format this viewer reads is not a thing a build may
+// elect - that is #53's ruling ("no off switch") and it does not stop being
+// true when the reader is the peer.
 //
-// Same mechanism as the RAW row above and for a different reason, which is
-// worth keeping apart: RAW is refused on EVERY peer, by decision, and its
-// `overLink` column says so on both ends. This is one BUILD lacking a decoder
-// the format table still lists - so the client goes on offering .exr (correctly:
-// an ordinary peer serves it) and this peer answers with the table's own
-// `absent` sentence, naming the build rather than blaming the file.
-//
-// It is also the only case where two peers of the SAME protocol number differ
-// in what they serve, which is the case that would eventually make a capability
-// LIST in the HELLO reply worth its second source of truth. One build, one
-// format, refused legibly: not yet.
-#ifdef VIEWER_NO_OPENEXR
-static const char* const EXR_ABSENT =
-    "this peer is the compatibility build for older systems, which is compiled "
-    "without OpenEXR";
-#define VIEWER_EXR_LIBRARY ""
-#define VIEWER_EXR_DECODE  nullptr
-#define VIEWER_EXR_ABSENT  EXR_ABSENT
-#else
-#define VIEWER_EXR_LIBRARY EXR_LIBRARY
-#define VIEWER_EXR_DECODE  exrDecode
-#define VIEWER_EXR_ABSENT  nullptr
-#endif
+// So the RAW row above is now the ONLY reader any build of this project leaves
+// out, and the difference between the two is worth keeping legible: LibRaw is
+// refused for a LICENCE, on every peer, by decision, and its `overLink` column
+// says so on both ends. Nothing here is refused for a BUILD any more, and no
+// two peers of the same protocol number differ in what they serve - which is
+// what kept a capability list out of the HELLO reply, and still does.
 
 // ---------------------------------------------------------------- sniffing
 // Magic bytes only. The extension is what a user typed or a camera chose; the
@@ -271,15 +258,16 @@ const std::vector<Backend>& backends() {
         // option is gone (#53, 2026-08-09: 「既定ONで。OFFにするパスは不要
         // です」), so the row is an ordinary one - a format with a decoder -
         // and `absent` is nullptr here for the same reason it is on the four
-        // rows around it. The state itself is still the table's (imagefile.h);
-        // it simply has no user at the moment, the way it had none before .exr
-        // arrived and TIFF's reader was written.
+        // rows around it. It stayed that way through #148: the peer builds
+        // OpenEXR too, including the glibc-compat rebuild, so there is no
+        // build of this project in which this row loses its decoder. The
+        // `absent` state belongs to the row above, whose reason is a licence.
         //
         // It is also the only row whose parts are NAMED (partWord): an .exr
         // holds layers, which are documents, where a multi-page TIFF holds
         // pages, which are frames.
-        { "OpenEXR", ".exr", VIEWER_EXR_LIBRARY, sniffExr, VIEWER_EXR_DECODE,
-          VIEWER_EXR_ABSENT, "exr layer", true },
+        { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, exrDecode,
+          nullptr, "exr layer", true },
         // y4m is a VIDEO container in a picture-format table, and it belongs
         // here because after docs/video-support.md's question it is one: a text
         // header plus raw planes, no compression, no inter-frame prediction -

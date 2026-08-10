@@ -636,6 +636,13 @@ MinGW/GCC 16.1 UCRT、Ninja、Release、20 論理コア。**A/B/A/B/A/B と交�
 `core/imagefile.cpp` をコンパイルしない。上の byte 同一がその証拠で、
 Ubuntu 20.04 コンテナの手書き `g++` 1行も無傷である。
 
+> **保証の根拠だけが 2026-08-10 に失効した (#148 判断 B)。結論は変わらない。**
+> peer は `core/imagefile.cpp` をコンパイルするようになり、20.04 コンテナも
+> `g++` 1行では済まなくなった (OpenEXR を静的に建てる)。LibRaw を載せない
+> 理由はもう「コンパイルしないから」ではなく `VIEWER_NO_LIBRAW` という
+> **明示の指定**で、その理由は CDDL-1.0 という**ライセンス**である
+> (THIRD-PARTY-NOTICES.md)。上のサイズ測定はその時点の記録として残す。
+
 #### fixture — 合成 DNG。そして合成できないもの
 
 `tools/gen_testdata.py` が `media/sensor_*.dng` を書く。**DNG はカメラ無しで

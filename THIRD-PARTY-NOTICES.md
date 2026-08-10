@@ -29,7 +29,7 @@ ls build/_deps/*/LICENSE*                          # the texts quoted below
 | portable-file-dialogs | commit `c12ea8c` | WTFPL-2.0 | yes (header-only) | no | no |
 | stb_image | commit `013ac3b` (v2.30) | MIT **or** public domain (Unlicense) | yes | **yes** | no |
 | LibRaw | 0.22.2 | LGPL-2.1 **or** CDDL-1.0 - **this project uses it under the CDDL-1.0 option** | yes | **no - deliberately** | no |
-| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes | **yes** (not in the glibc-compat rebuild) | no |
+| OpenEXR (incl. its vendored libdeflate and OpenJPH) | v3.4.13 | BSD-3-Clause | yes | **yes** | no |
 | Imath | v3.2.2 | BSD-3-Clause | yes | **yes** (with OpenEXR) | no |
 
 `viewer-serve` is the remote peer. It links no window toolkit, and since issue
@@ -47,11 +47,17 @@ row of `core/imagefile.h`'s table keeps its extensions and its sniff and loses
 its decoder, so a `.NEF` sent to a peer is refused **by name, with this reason**,
 and is not mistaken for the TIFF it also is.
 
-The Ubuntu 20.04 compatibility rebuild in `build.yml` still compiles the peer
-with one `g++` line, because every reader added is this repository's own code or
-a vendored header. The exception is OpenEXR, which is a library: that rebuild
-adds `VIEWER_NO_OPENEXR`, so **the compat peer serves PNG, JPEG, TIFF and y4m
-and refuses `.exr` by name**, saying which build it is.
+The Ubuntu 20.04 compatibility rebuild in `build.yml` - the `viewer-serve` that
+the Linux release tarball actually carries - **serves every one of those five
+formats, `.exr` included.** Every other reader is this repository's own code or
+a vendored header, so it costs that step a compiler pass; OpenEXR is a library,
+so the step builds it there too, from the same pinned sources the CMake build
+fetches, and links it **statically**. Two consequences belong in a distribution
+document: a released peer carries OpenEXR's and Imath's BSD-3-Clause code inside
+itself and reproduces their notices below on the same terms `viewer` does, and
+it needs no `libOpenEXR.so` on the machine it is copied to. There is no build of
+this project, on any platform, in which the peer refuses a file the client can
+open.
 
 The bundled plugins (`plugins/*.c`), the TIFF reader (`core/tiffread.cpp`), the
 OpenEXR *wrapper* (`core/exrread.cpp` - the library itself is the row above), the
