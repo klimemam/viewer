@@ -37,7 +37,12 @@ static std::string windowTitleText() {
     const ImageDoc* im = cur();
     // (stale) rides in the title because the title is where a report copies
     // the picture's name from (§10.1) - same vocabulary as the A/B panels.
-    std::string t = im ? im->name + (avgIsStale(im) ? "  (stale)" : "") + " - viewer"
+    // (reload failed) rides beside it for the same reason and one more: a
+    // screenshot of a mixed-generation stack is the most likely way its
+    // numbers reach a report at all, and a screenshot carries the title bar
+    // (#56). The two can both be true of one document and both are printed.
+    std::string t = im ? im->name + (avgIsStale(im) ? "  (stale)" : "") +
+                             seqReloadMark(im->seqId) + " - viewer"
                        : std::string("viewer  ") + viewerVersion();
     // The bracket answers "which machine are these pixels on?". A local browse
     // goes through the peer protocol but the file is on this disk, so there is

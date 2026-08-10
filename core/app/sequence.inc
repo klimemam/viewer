@@ -1183,6 +1183,57 @@ static bool avgIsStale(const ImageDoc* d) {
     const App::SeqInfo* si = seqInfo(d->avgSeqId);
     return si && si->stackRev != d->avgStackRev;
 }
+// ---- the mark a partial reload leaves on the STACK (issue #56) --------------
+// The neighbour of avgIsStale above, and deliberately NOT the same state.
+// (stale) is about a DERIVED picture whose stack moved on under it, and one
+// Recompute makes it true again. This is about the stack ITSELF: after a
+// reload that refused a member, its frames are no longer of one moment, and no
+// recompute can mend that - only a re-read that succeeds everywhere. Same
+// mechanism though, which is what docs/reference-design.md §10.3 asked for:
+// latched at the event, never cleared silently, and read in the same places a
+// report quotes from (title / Files row / tooltip / Inspector / TSV export).
+static bool seqReloadIncomplete(const App::SeqInfo* si) {
+    return si && si->reloadFailed > 0;
+}
+// The TOKEN, for the two surfaces that have room for a word and not a
+// sentence: the Files row label and the window title. Leading spaces like
+// (stale)'s, so it sits off the name. "" = this stack is of one moment.
+// (seqId 0 - a loose frame - is no stack and always answers "".)
+static const char* SEQ_RELOAD_FAIL_TOKEN = "(reload failed)";
+static const char* seqReloadMark(int seqId) {
+    return seqReloadIncomplete(seqInfo(seqId)) ? "  (reload failed)" : "";
+}
+// ...and the SENTENCE, for the three that do: the Files tooltip, the Inspector
+// and the export's provenance block. One line by construction - the export
+// writes it after a "# " and a tooltip is one string - and it is THE guard, so
+// what --reload-selftest asserts is the wording the panels draw rather than a
+// second opinion beside it (f32LossNote's discipline). "" = nothing to say.
+static std::string seqReloadNote(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!seqReloadIncomplete(si)) return {};
+    // std::string, not snprintf into a fixed buffer: the refusal it quotes
+    // carries a file name of no bounded length, and a sentence that explains a
+    // wrong number must not be the one thing that gets cut off.
+    const std::string when = si->reloadWhen.empty() ? std::string()
+                                                    : " at " + si->reloadWhen;
+    std::string s = std::string(SEQ_RELOAD_FAIL_TOKEN) + " ";
+    if (si->reloadOk > 0)
+        // the dangerous half: two generations under one name
+        s += std::to_string(si->reloadOk) + " of " +
+             std::to_string(si->reloadOk + si->reloadFailed) +
+             " frame(s) were re-read and " + std::to_string(si->reloadFailed) +
+             " refused" + when + " - this stack's frames are no longer of one "
+             "moment, so sigma_t and every other stack number mix two generations.";
+    else
+        // nothing was replaced: one moment still, but not the asked-for one
+        s += "no frame could be re-read - all " + std::to_string(si->reloadFailed) +
+             " refused" + when + ". These are still the pixels loaded earlier, "
+             "NOT what the disk now holds.";
+    s += " First refusal: " + si->reloadFirstErr +
+         ". Only a reload of this stack in which EVERY frame succeeds clears this.";
+    return s;
+}
+
 // "Same picture" between two reduced frames is a TUPLE comparison, never a
 // pixel comparison - §10.2 reuses §6.2's identity vocabulary instead of
 // inventing a second generation concept. Two results of the same recipe over

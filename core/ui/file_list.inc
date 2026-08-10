@@ -705,6 +705,16 @@ static void drawFileList() {
                                     "\" (same recipe over the same source generation)";
                             break;
                         }
+                // #56: what the last reload of THIS ROW'S STACK left behind,
+                // and it leads even (stale) - a stale average is one Recompute
+                // from being true again, a stack of two generations is not,
+                // and this sentence is the one that explains the red outline
+                // the row is wearing. (In practice the two never meet: a
+                // reduced frame belongs to no stack and a stack head is never
+                // a reduced frame. The order is stated anyway, because "it
+                // cannot happen" is not a thing a reader can see here.)
+                if (std::string rn = seqReloadNote(d.seqId); !rn.empty())
+                    lead = rn + "\n" + lead;
                 if (share.empty())
                     ImGui::SetTooltip("%s\n%s", lead.c_str(), meta);
                 else
@@ -861,6 +871,12 @@ static void drawFileList() {
                   if (app.images[idx]->uid == app.cmpExtra[k]) { badge += slotName(k); break; }
           char lb[600];
           const char* sname = si ? si->name.c_str() : "stack";
+          // #56: the WORD beside the red outline below. A colour alone says
+          // "something", never what - and a report quotes text, not a border -
+          // so the row states the fact in the same place (stale) states its
+          // own, and the outline is what makes it findable across a full
+          // panel. Both, or neither is worth having.
+          const char* rmark = seqReloadMark(head.seqId);
           if (mem) {
               // Reading order: [n], then the condition, then the file name.
               //
@@ -892,11 +908,11 @@ static void drawFileList() {
                   else
                       snprintf(vb, sizeof vb, "%s", vs.c_str());
               }
-              snprintf(lb, sizeof lb, "%*s[%d]  %s  %s##m%d", (int)(badge.size() * 2), "",
-                       memIdx, vb, filesMemberName(sname).c_str(), head.seqId);
+              snprintf(lb, sizeof lb, "%*s[%d]  %s  %s%s##m%d", (int)(badge.size() * 2), "",
+                       memIdx, vb, filesMemberName(sname).c_str(), rmark, head.seqId);
           } else {
-              snprintf(lb, sizeof lb, "%*s%s", (int)std::max<size_t>(badge.size() * 2, 2),
-                       "", sname);
+              snprintf(lb, sizeof lb, "%*s%s%s", (int)std::max<size_t>(badge.size() * 2, 2),
+                       "", sname, rmark);
           }
           char frames[32];
           {   // "8f" for an 8-of-300 stack states nothing; say the ratio while
@@ -925,6 +941,17 @@ static void drawFileList() {
           ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
           bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn, share);
           ImGui::PopStyleColor();
+          // #56, the user's own proposal: the red outline. Drawn straight onto
+          // the row rather than as another item, exactly as the compare letters
+          // and the meta strip are - the row must stay the LAST item, or the
+          // right-click below opens over the wrong thing. Immediately after the
+          // call for the same reason: no widget between it and GetItemRect*.
+          if (*rmark) {
+              ImVec2 a0 = ImGui::GetItemRectMin(), a1 = ImGui::GetItemRectMax();
+              ImGui::GetWindowDrawList()->AddRect(a0, a1, RELOAD_FAIL_RED32,
+                                                 2.0f * app.uiScale, 0,
+                                                 std::max(1.0f, 1.5f * app.uiScale));
+          }
           if (stackHit) {
               selectImage(stack[pos]);
               if (app.fitOnSwitch) app.fitRequested = true;

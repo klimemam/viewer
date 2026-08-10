@@ -7,6 +7,9 @@
     //          unchanged - SeqInfo::stackRev in the temporal key is what lets a
     //          latched TemporalState notice the reload at all
     //   R9     forgetImage forgets the extra compare-slot states too
+    //   R25    a reload that REFUSED a member leaves the stack marked - the
+    //          frames are of two moments now, the toast that said so scrolls
+    //          away, and only a reload where every frame succeeds clears it
     //   R24    a crop is a change to the STACK's data, so it moves the same
     //          revision the temporal key reads - a member that no longer has
     //          the stack's shape leaves its numbers, and they say so
@@ -547,6 +550,102 @@
                   "R24b a crop bumps the stack's data revision");
             check(fabs(T.tempNoise[0] - 1.82574) < 0.001,
                   "R24c sigma_t is NOT the stale pre-crop five-frame value");
+        }
+        {   // ---- R25: #56 - a reload that refused a member MARKS THE STACK -----
+            // R14 proved the refusal is COUNTED. What it left unproven is what
+            // the stack looks like a minute later: the summary is a toast, the
+            // toast scrolls away, and a stack with three frames from one moment
+            // and one from another goes on answering sigma_t as though it were
+            // a single capture. So this block is about persistence and about
+            // WORDS - a red outline cannot be pasted into a report, and a
+            // report is exactly where these numbers end up.
+            //
+            // Its own fixture stack, deliberately: R0-R24 have been rewriting
+            // a_*/b_* for 500 lines and a mark that depends on that history is
+            // a mark nobody can read the test for.
+            std::string mstk = root + "/mixstk";
+            std::filesystem::create_directories(pathFromUtf8(mstk), ec);
+            for (int i = 0; i < 4; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "e_%03d.npy", i);
+                writeNpy2(mstk + "/" + nm, 4, 4, 200.0f + (float)i, 0);
+            }
+            std::vector<int> had;
+            for (const auto& s : app.seqs) had.push_back(s.id);
+            openFolder(mstk);
+            loadAll();
+            int seqE = 0;
+            for (const auto& s : app.seqs)
+                if (std::find(had.begin(), had.end(), s.id) == had.end()) seqE = s.id;
+            for (size_t k = 0; k < app.images.size(); k++)
+                if (app.images[k]->seqId == seqE && app.images[k]->seqIndex == 0)
+                    selectImage((int)k);
+            {   // ---- a CLEAN reload leaves nothing at all -----------------------
+                int f = 0;
+                reloadStackFromDisk(seqE, &f);
+                check(seqE && f == 0 && seqReloadNote(seqE).empty() &&
+                      !*seqReloadMark(seqE) &&
+                      windowTitleText().find("(reload failed)") == std::string::npos,
+                      "R25a a clean reload marks nothing, anywhere");
+            }
+            std::filesystem::remove(pathFromUtf8(mstk + "/e_002.npy"), ec);
+            int f25 = 0;
+            std::string msg25 = reloadStackFromDisk(seqE, &f25);
+            fprintf(stderr, "reloadselftest: R25 summary: %s\n", msg25.c_str());
+            fprintf(stderr, "reloadselftest: R25 mark:    %s\n",
+                    seqReloadNote(seqE).c_str());
+            check(f25 == 1 && seqInfo(seqE) && seqInfo(seqE)->reloadFailed == 1 &&
+                  seqInfo(seqE)->reloadOk == 3 && !seqInfo(seqE)->reloadWhen.empty(),
+                  "R25b the refusal is LATCHED on the stack, with both counts");
+            {   // the mark has to SAY what happened - colour alone is not a fact
+                const std::string n = seqReloadNote(seqE);
+                check(n.find(SEQ_RELOAD_FAIL_TOKEN) != std::string::npos &&
+                      n.find("3 of 4 frame(s) were re-read and 1 refused") !=
+                          std::string::npos &&
+                      n.find("no longer of one moment") != std::string::npos &&
+                      n.find("sigma_t") != std::string::npos &&
+                      n.find("e_002.npy") != std::string::npos,
+                      "R25c the mark states the counts, the seam and the refusal");
+                check(msg25.find("marked (reload failed) in Files") != std::string::npos,
+                      "R25d the toast points at the mark that outlives it");
+            }
+            {   // ---- it is STATE, not a toast ----------------------------------
+                // The three sentence surfaces (Files tooltip / Inspector /
+                // export) all read seqReloadNote and the two token surfaces
+                // (Files row / title) all read seqReloadMark, so re-asking
+                // AFTER other work is exactly what a redraw does. What is
+                // driven here is the work: a selection change, and a
+                // single-frame reload that SUCCEEDS - which must not clear the
+                // stack's mark, because it says nothing about the other three.
+                for (size_t k = 0; k < app.images.size(); k++)
+                    if (app.images[k]->seqId == seqE && app.images[k]->seqIndex == 3)
+                        selectImage((int)k);
+                std::string e25;
+                bool one = docOf(seqE, 0) && reloadSource(docOf(seqE, 0)->src, e25);
+                check(one && seqReloadIncomplete(seqInfo(seqE)) &&
+                      seqInfo(seqE)->reloadFailed == 1,
+                      "R25e a single-frame reload does NOT clear the stack's mark");
+                check(windowTitleText().find("(reload failed)") != std::string::npos,
+                      "R25f the window title carries it - a screenshot's provenance");
+                std::string tsv = buildTemporalExport('\t');
+                check(tsv.find("NOTE: side A: (reload failed)") != std::string::npos &&
+                      tsv.find("no longer of one moment") != std::string::npos &&
+                      tsv.find("sigma_t [DN]") != std::string::npos,
+                      "R25g the export carries it beside the sigma_t it qualifies");
+            }
+            {   // ---- and a clean full reload is the ONE thing that clears it ---
+                writeNpy2(mstk + "/e_002.npy", 4, 4, 202.0f, 0);
+                int f = 0;
+                std::string m = reloadStackFromDisk(seqE, &f);
+                fprintf(stderr, "reloadselftest: R25 after repair: %s\n", m.c_str());
+                std::string tsv = buildTemporalExport('\t');
+                check(f == 0 && !seqReloadIncomplete(seqInfo(seqE)) &&
+                      seqReloadNote(seqE).empty() && !*seqReloadMark(seqE) &&
+                      windowTitleText().find("(reload failed)") == std::string::npos &&
+                      tsv.find("(reload failed)") == std::string::npos,
+                      "R25h a reload where every frame succeeds clears it everywhere");
+            }
+            closeStack(seqE);
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
         fprintf(stderr, "reloadselftest: %s\n", ok ? "ok" : "FAILED");

@@ -576,6 +576,16 @@ static void drawInspector() {
                                "it in Files > Recompute from stack.", AB_STALE_TOKEN);
             ImGui::PopStyleColor();
         }
+        // #56: and the same duty one layer down - if the STACK this frame is
+        // in was left of two generations by a failed reload, the panel where
+        // its provenance is read has to say so. Red, not the amber above: the
+        // amber marks a picture that can be refreshed, this marks a stack that
+        // cannot be, and the sentence is the one the Files row is outlined for.
+        if (std::string rn = seqReloadNote(im->seqId); !rn.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, RELOAD_FAIL_RED);
+            ImGui::TextWrapped("%s", rn.c_str());
+            ImGui::PopStyleColor();
+        }
         // ---- how this file was read, and how to read it differently ----------
         // docs/input-adapters.md §4.13. Every file answers this, including the
         // ones read natively: "reader native" is a fact about this file, and a

@@ -1168,10 +1168,11 @@ viewer_selftest(srcmap NOGL --srcmap-selftest tools/testdata/multi)
 viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 
 # The reload walk (docs/reference-design.md §3.2): a frame's FILE rewritten
-# under a live stack. R0-R24 cover the invalidation walk, the temporal key
+# under a live stack. R0-R25 cover the invalidation walk, the temporal key
 # (stackRev - from the reload walk in R7/R8 and from a crop in R24), the
-# registry re-key, the recorded npy READING replayed on reload (R18a-c), and
-# two readings of one file staying two tuples (R21b).
+# registry re-key, the recorded npy READING replayed on reload (R18a-c), two
+# readings of one file staying two tuples (R21b), and the persistent mark a
+# reload that REFUSED a member leaves on the stack (R25, issue #56).
 # It writes its own fixtures under a scratch subdirectory of the given dir.
 viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 
