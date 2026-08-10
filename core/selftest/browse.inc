@@ -1111,6 +1111,11 @@
             auto viewNow = [&]() {
                 return rbBuildView(rbMain(), &B.dir, B.entries, rbMain().flat, rbMain().tree);
             };
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : " ") + n;
+                return s;
+            };
             std::vector<RbRow> v0 = viewNow();
             rbCursorFollow(rbMain(), v0);          // as the first panel frame does
             // Put the cursor on a REAL listing row - the first one that is not
@@ -1157,6 +1162,62 @@
             std::vector<RbRow> v2 = viewNow();
             rbCursorFollow(rbMain(), v2);
             int awayIdx = rbMain().cursor;
+
+            // THE SELECTION HAS THE SAME DISEASE, and it is the other captured
+            // browse-keys signature (docs/diagnostics/browse-keys-20260804.txt):
+            // two stacks multi-selected and Opened, 36 of 44 images, seqs=3 of
+            // 4 - one of the two opened. selSig was host|dir|rev as well, so a
+            // duplicate listing emptied the ticks between the clicks and the
+            // Open, and what Open then saw was the row under the cursor:
+            // exactly one stack. Driven in a folder with enough rows to tick
+            // TWO - one tick could be confused with "the cursor row".
+            std::string mdir = dir;                 // tools/testdata/rb: 9 rows
+            remoteBrowseTo(rbMain(), mdir);
+            double tm = nowSec();
+            while (nowSec() - tm < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == mdir && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> m0 = viewNow();
+            rbSelFollow(rbMain(), m0);
+            std::vector<std::string> ticked;
+            for (size_t i = 0; i < m0.size() && ticked.size() < 2; i++)
+                if (!m0[i].up) { rbMain().sel[i] = 1; ticked.push_back(m0[i].name()); }
+            rbSelFollow(rbMain(), m0);              // records the names
+            uint64_t mrev0 = B.rev;
+            remoteBrowseTo(rbMain(), mdir);         // the same place, again
+            double tm2 = nowSec();
+            while (nowSec() - tm2 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == mdir && !B.entries.empty() && B.rev != mrev0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> m1 = viewNow();
+            rbSelFollow(rbMain(), m1);
+            std::vector<std::string> stillTicked;
+            for (size_t i = 0; i < m1.size() && i < rbMain().sel.size(); i++)
+                if (rbMain().sel[i]) stillTicked.push_back(m1[i].name());
+            // and moving away must still empty it
+            remoteBrowseTo(rbMain(), cdir);
+            double tm3 = nowSec();
+            while (nowSec() - tm3 < 120.0) {
+                pumpRemoteBrowse();
+                if (B.dir == cdir && !B.entries.empty()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::vector<RbRow> m2 = viewNow();
+            rbSelFollow(rbMain(), m2);
+            int awaySel = 0;
+            for (size_t i = 0; i < rbMain().sel.size(); i++) if (rbMain().sel[i]) awaySel++;
+            // anti-vacuity: TWO ticks had to go in, or "they survived" is a
+            // statement about nothing
+            bool selOk = ticked.size() == 2 && stillTicked == ticked && awaySel == 0;
+            fprintf(stderr, "browseselftest: selection across a re-listing of %s: "
+                            "ticked [%s] -> kept [%s]; after moving away: %d tick(s): %s\n",
+                    mdir.c_str(), say(ticked).c_str(), say(stillTicked).c_str(),
+                    awaySel, selOk ? "ok" : "FAIL");
+            if (!selOk) ok = false;
 
             bool curOk = haveRows && bumped && !key0.empty() &&
                          keptIdx >= 0 && keptName == name0 && awayIdx < 0;

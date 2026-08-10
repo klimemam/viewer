@@ -243,14 +243,24 @@ static void rbAddRows(const App::BrowseInstance& I,
 // dangling across a rev bump. (Within one listing they are stable, which is
 // why that branch can and does use them - it is comparing two views of the
 // same entries.)
+// host|dir|rev, and whether an old one names the place we are standing in.
+// The two are separate questions and the panel kept asking only the first:
+// "did anything change" answers yes to a refresh of the SAME folder.
+static std::string rbPlaceOf(const App::RemoteBrowse& B) { return B.host + "|" + B.dir; }
+static std::string rbSigOf(const App::RemoteBrowse& B) {
+    return rbPlaceOf(B) + "|" + std::to_string(B.rev);
+}
+static bool rbSigIsSamePlace(const std::string& oldSig, const std::string& place) {
+    size_t bar = oldSig.rfind('|');
+    return bar == place.size() && oldSig.compare(0, bar, place) == 0;
+}
+
 void rbCursorFollow(App::BrowseInstance& I, const std::vector<RbRow>& view) {
     const App::RemoteBrowse& B = I.b;
-    std::string place = B.host + "|" + B.dir;
-    std::string sig = place + "|" + std::to_string(B.rev);
+    std::string place = rbPlaceOf(B);
+    std::string sig = rbSigOf(B);
     if (sig != I.curSig) {
-        bool samePlace = !I.curSig.empty() &&
-                         I.curSig.compare(0, I.curSig.rfind('|'), place) == 0 &&
-                         I.curSig.rfind('|') == place.size();
+        bool samePlace = rbSigIsSamePlace(I.curSig, place);
         I.curSig = sig;
         int was = I.cursor;
         I.cursor = -1;
@@ -282,6 +292,55 @@ void rbCursorFollow(App::BrowseInstance& I, const std::vector<RbRow>& view) {
     // eye.
     if (I.cursor >= 0) I.cursorKey = view[I.cursor].full();
     else               I.cursorKey.clear();
+}
+
+// The multi-selection across the same change, and it is the SAME defect:
+// `selSig` was host|dir|rev too, so a second listing of the folder the panel
+// is already in emptied the ticks. That is the other captured browse-keys
+// signature (docs/diagnostics/browse-keys-20260804.txt): two stacks are
+// multi-selected and Opened, and 36 of 44 images arrive with seqs=3 of 4 -
+// one of the two opened. A selection wiped between the ticks and the Open
+// leaves the row under the cursor, which is exactly one stack.
+//
+// Going somewhere ELSE still empties it, for the reason the old comment here
+// gave: ticks that survive a walk into a different folder point at files that
+// are no longer listed. That reason is about the PLACE, not the revision -
+// the two were spelled the same and only one of them was meant.
+void rbSelFollow(App::BrowseInstance& I, const std::vector<RbRow>& view) {
+    const App::RemoteBrowse& B = I.b;
+    std::string place = rbPlaceOf(B);
+    std::string sig = rbSigOf(B);
+    if (sig != I.selSig) {
+        bool samePlace = rbSigIsSamePlace(I.selSig, place);
+        I.selSig = sig;
+        std::vector<std::string> keys;
+        if (samePlace) keys = I.selKeys;      // by name: the entries are new
+        I.sel.assign(view.size(), 0);
+        I.selAnchor = -1;                     // the anchor is an index, and
+                                              // indices do not survive a re-list
+        for (size_t i = 0; i < view.size() && !keys.empty(); i++)
+            if (std::find(keys.begin(), keys.end(), view[i].full()) != keys.end())
+                I.sel[i] = 1;
+    } else if (I.selFlat != I.flat || I.selTree != I.tree) {
+        // within ONE listing the entry pointers are stable, so the flat/tree
+        // carry stays as it was - it is comparing two views of the same entries
+        std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, I.selFlat, I.selTree);
+        std::vector<const remote::Entry*> sel;
+        for (size_t i = 0; i < old.size() && i < I.sel.size(); i++)
+            if (I.sel[i]) sel.push_back(old[i].e);
+        I.sel.assign(view.size(), 0);
+        for (size_t i = 0; i < view.size(); i++)
+            if (std::find(sel.begin(), sel.end(), view[i].e) != sel.end()) I.sel[i] = 1;
+        I.selAnchor = -1;
+    }
+    I.selFlat = I.flat;
+    I.selTree = I.tree;
+    if (I.sel.size() != view.size()) I.sel.assign(view.size(), 0);
+    // (The second, identical signature test that used to sit here was dead: it
+    //  re-read a value the branch above had just assigned.)
+    I.selKeys.clear();
+    for (size_t i = 0; i < view.size() && i < I.sel.size(); i++)
+        if (I.sel[i]) I.selKeys.push_back(view[i].full());
 }
 
 void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
@@ -952,43 +1011,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // sequence selects its frames and collapsing them selects the sequence.
     std::vector<char>& rbSel = I.sel;
     int& rbSelAnchor = I.selAnchor;            // row index of the last click
-    bool& rbSelFlat = I.selFlat;               // which view rbSel was built for
-    bool& rbSelTree = I.selTree;
-    {
-        std::string& selSig = I.selSig;
-        std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
-        if (sig != selSig) {
-            selSig = sig;
-            rbSel.assign(view.size(), 0);
-            rbSelAnchor = -1;
-        } else if (rbSelFlat != I.flat || rbSelTree != I.tree) {
-            std::vector<RbRow> old = rbBuildView(I, &B.dir, B.entries, rbSelFlat, rbSelTree);
-            std::vector<const remote::Entry*> sel;
-            for (size_t i = 0; i < old.size() && i < rbSel.size(); i++)
-                if (rbSel[i]) sel.push_back(old[i].e);
-            rbSel.assign(view.size(), 0);
-            for (size_t i = 0; i < view.size(); i++)
-                if (std::find(sel.begin(), sel.end(), view[i].e) != sel.end()) rbSel[i] = 1;
-            rbSelAnchor = -1;
-        }
-        rbSelFlat = I.flat;
-        rbSelTree = I.tree;
-        // an expand or a collapse moved every row below it: start clean
-        // Going somewhere ends the selection too, and this used to be inferred
-        // from the row COUNT changing - so walking into a different folder with
-        // the same number of rows carried the ticks across, pointing at files
-        // that were no longer listed. The listing's identity is the signature,
-        // not its length.
-        {
-            // I.selSig, not a function-local static: this file already learned
-            // that lesson once - one search box was shared by every panel - and
-            // a shared signature would clear panel 2's selection whenever panel
-            // 1 navigated.
-            std::string sig = B.host + "|" + B.dir + "|" + std::to_string(B.rev);
-            if (sig != I.selSig) { I.selSig = sig; rbSel.assign(view.size(), 0); }
-        }
-        if (rbSel.size() != view.size()) rbSel.assign(view.size(), 0);
-    }
+    rbSelFollow(I, view);                      // owns selFlat / selTree now
     // What a plain click does: show a throwaway PREVIEW of a file / of a
     // sequence's poster frame - nothing is registered - or, on a folder,
     // SELECT it (cursor + anchor, set by the caller). Entering a folder is the

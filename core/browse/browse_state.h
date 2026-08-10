@@ -237,6 +237,10 @@ struct Instance {
     bool sortDesc = false;
     // multi-select, by row index; sig says which listing it was built for
     std::vector<char> sel;
+    // the NAMES of the ticked rows, for the same reason cursorKey exists: a
+    // re-listing replaces every entry, so nothing that is a pointer or an
+    // index survives it
+    std::vector<std::string> selKeys;
     int selAnchor = -1;
     bool selFlat = false, selTree = false;
     std::string selSig;

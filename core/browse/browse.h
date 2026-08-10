@@ -122,6 +122,8 @@ std::vector<RbRow> rbBuildView(const App::BrowseInstance& I,
 // where the keyboard cursor lands after the listing under it changed; the
 // selftest calls it directly, being unable to press a key
 void rbCursorFollow(App::BrowseInstance& I, const std::vector<RbRow>& view);
+// the same, for the multi-selection - same defect, same cure
+void rbSelFollow(App::BrowseInstance& I, const std::vector<RbRow>& view);
 void rbSortShown(const App::BrowseInstance& I, const std::vector<RbRow>& view,
                  std::vector<int>& shown);
 void rbAncestorRows(const std::vector<RbRow>& view, const std::vector<int>& shown,
