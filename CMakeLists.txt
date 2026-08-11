@@ -1167,6 +1167,17 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # every test that ran afterwards (a9b7973 is the recorded case, with prefs).
 # So it writes them into the per-test TMP this function already gives it.
 viewer_selftest(settings    NOGL --settings-selftest)
+# Named recipes for headerless RAW (issue #166). Two subjects that must not be
+# confused: the LIBRARY in settings.jsonc, which persists and never applies on
+# its own, and the session's file-size -> recipe binding, which applies without
+# being picked and is therefore written to no file at all and survives nothing.
+#
+# NOGL and no fixture directory for exactly the settings test's reasons - every
+# assertion is a pixel value, a width or a string, and one of the fixtures IS a
+# settings.jsonc, which must never be written into the shared VIEWER_TEST_HOME.
+# It builds its headerless .bin files in the per-test TMP as well: a fixture
+# left inside tools/testdata/rb is a ROW of that folder (ad2d4fc).
+viewer_selftest(rawrecipe   NOGL --rawrecipe-selftest)
 # Which dll computed the Analysis grid (#46 stage 1): the host ledger's file
 # name must reach the provenance line and the Copy-table TSV, and builtin
 # statistics must never wear a plugin tag. Same NOGL reasoning as roistats -

@@ -1521,15 +1521,37 @@ static void startNextQueuedGroup() {
     // them as garbage, silently, whenever those files are big enough.
     const bool haveRecipe = app.folderRecipeValid && app.folderRecipeOpenId == g.openId;
     if (g.isRaw && !haveRecipe) {
-        openRawDialogFor(g.files[0]);          // ask once per Open
-        if (rawDlg.open) {
-            rawDlg.forQueue = true;
-            rawDlg.queueCount = 0;             // ...for THIS Open's stacks
-            for (const auto& q : app.seqQueue) if (q.openId == g.openId) rawDlg.queueCount++;
-        } else {
-            app.seqQueue.erase(app.seqQueue.begin());   // unreadable: skip
+        // #166: this session's binding answers for this Open before anybody is
+        // asked, exactly as it does for a single file dropped on the window -
+        // the door a headerless file came through must not change what "I have
+        // already told you how to read files of this size" means. Same rule,
+        // same announcement, and the recipe then becomes THIS Open's recipe, so
+        // the rest of its groups reuse it through the machinery that exists.
+        size_t sz = 0;
+        {
+            std::ifstream f(pathFromUtf8(g.files[0]), std::ios::binary | std::ios::ate);
+            if (f) sz = (size_t)f.tellg();
         }
-        return;
+        const RawRecipe* bound = rawRecipeForSize(sz);
+        if (bound) {
+            const RawRecipe use = *bound;
+            rawRecipeIntoDialog(use, g_folderRecipe);
+            g_folderRecipe.forQueue = false;
+            g_folderRecipe.replaceIdx = -1;
+            app.folderRecipeValid = true;
+            app.folderRecipeOpenId = g.openId;
+            toast(rawRecipeAppliedLine(use, g.files[0], sz));
+        } else {
+            openRawDialogFor(g.files[0]);      // ask once per Open
+            if (rawDlg.open) {
+                rawDlg.forQueue = true;
+                rawDlg.queueCount = 0;         // ...for THIS Open's stacks
+                for (const auto& q : app.seqQueue) if (q.openId == g.openId) rawDlg.queueCount++;
+            } else {
+                app.seqQueue.erase(app.seqQueue.begin());   // unreadable: skip
+            }
+            return;
+        }
     }
     app.seqQueue.erase(app.seqQueue.begin());
     std::string err;

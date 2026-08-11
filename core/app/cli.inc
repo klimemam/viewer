@@ -104,6 +104,16 @@ static bool g_roiExportSelftest = false;
 // value or a string. See settingsSelftest().
 static bool g_settingsSelftest = false;
 
+// --rawrecipe-selftest: named recipes for headerless RAW (issue #166) - the
+// library in settings.jsonc, the PROCESS-ONLY size -> recipe binding, and the
+// two things that must NOT happen (a saved recipe applying on its own; a
+// binding surviving anything). It takes no directory because it writes its own
+// headerless fixtures into its OWN temp dir, and it must: VIEWER_TEST_HOME is
+// one folder shared by every selftest and a settings.jsonc left there would be
+// read by all of them. Windowless for the --roistats-selftest reasons - every
+// assertion is a pixel value, a width or a string. See rawRecipeSelftest().
+static bool g_rawRecipeSelftest = false;
+
 // --abeq-selftest: A and B (and a letter past B) on ONE document - the
 // comparison people set up on purpose, to confirm the two sides agree. Takes no
 // directory for the same reason as --roistats-selftest, and is windowless for
@@ -556,6 +566,9 @@ static void printUsage() {
         "                              coinciding, through the real panel\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
+        "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
+        "                              settings.jsonc, the session's size -> recipe\n"
+        "                              binding, and that it survives nothing\n"
         "  --anaprov-selftest          analyzer results name the plugin dll that\n"
         "                              computed them (the host's ledger, #46)\n"
         "  --bundled-selftest          the five shipped analyzers on ABI v3: each\n"
@@ -711,6 +724,8 @@ static void parseCli(int argc, char** argv) {
             g_exportTsvSelftest = next();          // handled in main()
         } else if (a == "--settings-selftest") {
             g_settingsSelftest = true;             // handled in main()
+        } else if (a == "--rawrecipe-selftest") {
+            g_rawRecipeSelftest = true;            // handled in main()
         } else if (a == "--roistats-selftest") {
             g_roiStatsSelftest = true;             // handled in main()
         } else if (a == "--roi-export-selftest") {

@@ -80,6 +80,13 @@ static int settingsSelftest() {
         snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx");
         g_settingsRepoUrl.clear();
         g_settingsEditorCmd.clear();
+        // The recipe library (#166) is a value this file owns outright, like the
+        // two above, so its built-in default is EMPTY. It has to be cleared here
+        // as well as in the reader: the schema walk (S1) feeds every readable row
+        // its own sample, one of which is a recipe, and the template groups (T)
+        // then run afterwards - a leftover recipe would make the template carry a
+        // seventh key and T3's count would be measuring the previous group.
+        g_rawLibrary.clear();
         adapter::setSettingsEditor({});
     };
 

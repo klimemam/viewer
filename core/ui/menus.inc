@@ -493,6 +493,10 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::MenuItem("Inspector", nullptr, &app.showInspector);
             ImGui::MenuItem("Reader", nullptr, &app.readerPanelOpen);
             ImGui::MenuItem("Readers (remembered)", nullptr, &app.readerListOpen);
+            ImGui::MenuItem("RAW recipes", nullptr, &app.rawRecipeListOpen);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("named recipes for headerless files (.bin .raw .yuv .dat),\n"
+                                  "and what this session has been told to use for which size");
             ImGui::MenuItem("ROIs", nullptr, &app.showRois);
             ImGui::MenuItem("Analysis", nullptr, &app.showAnalysis);
             ImGui::MenuItem("Histogram", nullptr, &app.showHistogram);

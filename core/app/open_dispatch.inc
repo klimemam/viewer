@@ -54,6 +54,44 @@ static void openRawDialogFor(const std::string& path) {
     rawGuessDims(rawDlg);
 }
 
+// The size binding, asked at the ONE door a headerless file arrives at (#166).
+// Returns true when the file was opened from a recipe THIS SESSION was told to
+// use for files of exactly this byte count, in which case no dialog is raised.
+//
+// It says so, in one line, every time. That line is not politeness: this is the
+// only thing in the whole viewer that decodes pixels a particular way without
+// being asked on the spot, and the one property that makes that safe is that
+// the user still remembers making the choice. Naming the recipe is what lets
+// them check the memory against what is on screen.
+//
+// A binding that fails to decode is DROPPED and the dialog comes back. It
+// cannot normally happen - a binding is only made by a decode that worked, and
+// the key is the byte count, so the same geometry fits - but a file that is
+// being written while it is read is real, and the honest answer to "the recipe
+// no longer fits" is the dialog, not a refusal.
+static bool openRawFromSessionRecipe(const std::string& path) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
+    if (!f) return false;                        // openRawDialogFor says why
+    const size_t sz = (size_t)f.tellg();
+    const RawRecipe* r = rawRecipeForSize(sz);
+    if (!r) return false;
+    const RawRecipe use = *r;                    // by value: loadRaw can rebind the map
+    RawDialog d;
+    rawRecipeIntoDialog(use, d);
+    d.path = path;
+    d.fileSize = sz;
+    d.replaceIdx = -1;
+    std::string err = loadRaw(d);
+    if (!err.empty()) {
+        g_rawSizeRecipe.erase(sz);
+        toast(baseName(path) + ": " + err + " - the remembered recipe no longer "
+              "fits, so it is forgotten", true);
+        return false;
+    }
+    toast(rawRecipeAppliedLine(use, path, sz));
+    return true;
+}
+
 // ssh://user@host/path - the UI stays here, the pixels stay there. What arrives is
 // the region being looked at, at the resolution it is being looked at.
 // Numeric frame order: frame_1, frame_10, frame_100, frame_2 must not become the
@@ -2352,7 +2390,14 @@ static void openPath(const std::string& path) {
         toast(baseName(path) + ": " + imagefile::videoRefusal(path), true);
         openReaderPicker(path, imagefile::videoRefusal(path));
     } else {
-        openRawDialogFor(path);
+        // Headerless. This session's binding first (#166): a byte count the
+        // user has already answered for opens with that answer and says which
+        // one it was; everything else - the first file of a session included -
+        // goes through the dialog exactly as it always did. The stack offer
+        // belongs to the branch that actually opened something, the same way
+        // the dialog's own Load makes it after a fresh open.
+        if (openRawFromSessionRecipe(path)) maybeOfferSequence(app.current);
+        else openRawDialogFor(path);
     }
 }
 

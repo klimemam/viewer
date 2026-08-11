@@ -214,6 +214,143 @@ static RawDialog g_folderRecipe;
 static bool g_rawPopupAlive = false;
 static void openRawDialogFor(const std::string& path);
 
+// ---------------------------------------------------------------- raw recipes
+// Issue #166. A NAMED RECIPE is exactly the fields the dialog above already
+// carries, minus everything that is about ONE open (the path, the file size,
+// the candidate list, which slot to reinterpret). It is deliberately NOT a
+// second vocabulary for the same things: the words a recipe is written in are
+// RAW_DTYPE_NAMES / RAW_INTERP_CLI / CFA_PATTERNS - the same three tables
+// --raw-dtype, --raw-interp and --bayer-pattern already spell, and the same
+// ones docs/settings-inventory.md §5.5 sketched for `loading.raw`.
+//
+// TWO THINGS LIVE HERE AND THEIR LIFETIMES ARE OPPOSITE. That split is the
+// whole feature (the user's ruling, 2026-08-11):
+//
+//   THE LIBRARY       named recipes, written BY HAND in settings.jsonc.
+//                     Persistent, human-editable, and it NEVER applies by
+//                     itself - a recipe is used because somebody picked it.
+//   THE SIZE BINDING  "the recipe this session was told to use for a file of
+//                     exactly N bytes". PROCESS-ONLY: it is in neither
+//                     settings.jsonc, prefs.txt nor the session file, and it
+//                     ends with the process.
+//
+// Why the binding may not be written down anywhere. A headerless file is the
+// one shape that does not defend itself: 4096x3000 and 3000x4096 are the SAME
+// byte count, nothing in the bytes says which, and a transposed frame looks
+// perfectly normal. So the only thing allowed to apply without being picked is
+// a choice THE USER MADE MINUTES AGO AND STILL REMEMBERS - if it is wrong they
+// can tell, because they remember making it. A binding that survived a restart
+// would apply days later to a file it was never chosen for, draw a plausible
+// picture, and give nobody anything to notice. Making it unwritable is what
+// makes that impossible, rather than a rule someone has to keep.
+struct RawRecipe {
+    std::string name;                 // the library's name for it, or the derived label
+    bool fromLibrary = false;         // true = named in settings.jsonc
+    int w = 1920, h = 1080, offset = 0;
+    int dtype = RD_U8, interp = RI_GRAY;
+    bool littleEndian = true;
+    int cfaPattern = 0;
+    bool cropOn = false;
+    int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+};
+
+// The library. Filled ONLY by core/app/settings.inc's reader, cleared by it on
+// every load, and read by the panel. Nothing else writes it: a recipe exists
+// because it is in the user's file.
+static std::vector<RawRecipe> g_rawLibrary;
+
+// The size binding, and the reason it is a plain process global with no writer
+// anywhere near a file. std::map so the panel lists sizes in a stable order.
+static std::map<size_t, RawRecipe> g_rawSizeRecipe;
+
+static int rawClampIdx(int v, int n) { return v < 0 || v >= n ? 0 : v; }
+
+// What a recipe IS, in one phrase, in the vocabulary of the three tables.
+// Used as the panel's second column, as the derived name of an unnamed recipe,
+// and inside the line that announces an applied one - one spelling, three
+// places, so a recipe cannot be described two ways in one session.
+static std::string rawRecipeSummary(const RawRecipe& r) {
+    const int dt = rawClampIdx(r.dtype, RD_COUNT), in = rawClampIdx(r.interp, RI_COUNT);
+    std::string s = std::to_string(r.w) + "x" + std::to_string(r.h) + " " + RAW_DTYPE_NAMES[dt];
+    if (RAW_DTYPE_SIZE[dt] > 1 && !r.littleEndian) s += " BE";
+    s += " ";
+    if (in == RI_BAYER)      s += std::string("Bayer ") + CFA_PATTERNS[r.cfaPattern & 3];
+    else if (in == RI_QUAD)  s += std::string("Quad Bayer ") + CFA_PATTERNS[r.cfaPattern & 3];
+    else                     s += RAW_INTERP_CLI[in];
+    if (r.offset > 0) s += " +" + std::to_string(r.offset) + "B";
+    if (r.cropOn && r.cropW > 0 && r.cropH > 0)
+        s += " crop " + std::to_string(r.cropX) + "," + std::to_string(r.cropY) + " " +
+             std::to_string(r.cropW) + "x" + std::to_string(r.cropH);
+    return s;
+}
+
+static void rawRecipeIntoDialog(const RawRecipe& r, RawDialog& d) {
+    d.w = r.w; d.h = r.h; d.offset = r.offset;
+    d.dtype = rawClampIdx(r.dtype, RD_COUNT);
+    d.interp = rawClampIdx(r.interp, RI_COUNT);
+    d.littleEndian = r.littleEndian;
+    d.cfaPattern = r.cfaPattern & 3;
+    d.cropOn = r.cropOn;
+    d.cropX = r.cropX; d.cropY = r.cropY; d.cropW = r.cropW; d.cropH = r.cropH;
+}
+
+// Two recipes that would decode the same bytes the same way. The NAME is
+// deliberately not part of it: this is what "the user is holding that recipe"
+// means, and a recipe is what its fields are.
+static bool rawRecipeSameFields(const RawRecipe& a, const RawRecipe& b) {
+    return a.w == b.w && a.h == b.h && a.offset == b.offset &&
+           rawClampIdx(a.dtype, RD_COUNT) == rawClampIdx(b.dtype, RD_COUNT) &&
+           rawClampIdx(a.interp, RI_COUNT) == rawClampIdx(b.interp, RI_COUNT) &&
+           a.littleEndian == b.littleEndian && (a.cfaPattern & 3) == (b.cfaPattern & 3) &&
+           a.cropOn == b.cropOn &&
+           (!a.cropOn || (a.cropX == b.cropX && a.cropY == b.cropY &&
+                          a.cropW == b.cropW && a.cropH == b.cropH));
+}
+
+// The reverse, and the NAME is decided HERE, from the values, rather than
+// remembered as UI state. If the fields the user is about to load with are
+// field-for-field a library recipe, that recipe's name is what gets recorded;
+// otherwise the recipe is anonymous and names itself after what it is.
+// Deciding it from the values is what makes "picked MyCam, then nudged the
+// height" stop being MyCam - which is what the applied line would otherwise
+// claim, three files later, about a geometry MyCam does not have.
+static RawRecipe rawRecipeFromDialog(const RawDialog& d) {
+    RawRecipe r;
+    r.w = d.w; r.h = d.h; r.offset = d.offset;
+    r.dtype = d.dtype; r.interp = d.interp;
+    r.littleEndian = d.littleEndian;
+    r.cfaPattern = d.cfaPattern & 3;
+    r.cropOn = d.cropOn;
+    r.cropX = d.cropX; r.cropY = d.cropY; r.cropW = d.cropW; r.cropH = d.cropH;
+    for (const RawRecipe& lib : g_rawLibrary)
+        if (rawRecipeSameFields(r, lib)) { r.name = lib.name; r.fromLibrary = true; return r; }
+    r.name = rawRecipeSummary(r);
+    return r;
+}
+
+static const RawRecipe* rawRecipeForSize(size_t n) {
+    auto it = g_rawSizeRecipe.find(n);
+    return it == g_rawSizeRecipe.end() ? nullptr : &it->second;
+}
+
+// Last explicit choice wins: a size already answered for is REPLACED, never
+// kept. The user's word for this is "読み方変えたかったらレシピをかえる", and
+// an entry that refused to move would make that sentence false.
+static void rawRecipeBindSize(size_t n, const RawRecipe& r) {
+    if (n == 0) return;                // a zero-length file has no geometry to bind
+    g_rawSizeRecipe[n] = r;
+}
+
+// The one line, and it is one line on purpose. Something applied that the user
+// did not pick THIS TIME, so it says which recipe, what that recipe is, and
+// why it was in a position to apply at all - the byte count that matched.
+static std::string rawRecipeAppliedLine(const RawRecipe& r, const std::string& path, size_t sz) {
+    const std::string sum = rawRecipeSummary(r);
+    const std::string who = r.fromLibrary && r.name != sum ? "\"" + r.name + "\" (" + sum + ")" : sum;
+    return baseName(path) + ": opened with " + who +
+           " - this session's recipe for " + std::to_string(sz) + "-byte files";
+}
+
 static void rawGuessDims(RawDialog& d) {
     d.guesses.clear();
     size_t bpp = (size_t)RAW_DTYPE_SIZE[d.dtype] * RAW_INTERP_CH[d.interp];
@@ -357,6 +494,44 @@ static std::string loadRaw(const RawDialog& d) {
         addImage(std::move(im), true);
     }
     return {};
+}
+
+// The RAW dialog's Load button, with no ImGui in it (#166). Two callers: the
+// button in core/ui/canvas.inc and --rawrecipe-selftest, which drives THIS
+// rather than a copy of it - the same reason npzPickAccept() exists.
+//
+// The BINDING IS MADE HERE and only on success. "This session's recipe for a
+// file of N bytes" is a claim that a file of N bytes decodes with it, and a
+// recipe that has never decoded anything has not earned that claim; recording
+// a failed attempt would arm the next open of that size with settings already
+// known not to work.
+static std::string rawDialogAccept(RawDialog& d) {
+    std::string err = loadRaw(d);
+    if (err.empty()) rawRecipeBindSize(d.fileSize, rawRecipeFromDialog(d));
+    return err;
+}
+
+// The recipe panel's "Apply": re-read the document that is already open with
+// this recipe's geometry, into the same list slot. It is how a user changes
+// their mind about a file they are looking at, and it is an EXPLICIT choice -
+// so the size binding moves with it. Last word wins, which is the user's own
+// wording of the rule ("読み方変えたかったらレシピをかえる").
+static std::string rawRecipeReinterpretCurrent(const RawRecipe& r) {
+    ImageDoc* im = cur();
+    if (!im) return "no image is open";
+    if (im->src->rawDtype < 0 || im->src->path.empty())
+        return "this document did not come in through the headerless dialog";
+    RawDialog d;
+    rawRecipeIntoDialog(r, d);
+    d.path = im->src->path;
+    d.replaceIdx = app.current;
+    FrameSource st;                    // the byte count is the binding's key
+    st.path = d.path;
+    statSourceFile(st);
+    d.fileSize = (size_t)st.fsize;
+    std::string err = loadRaw(d);
+    if (err.empty()) rawRecipeBindSize(d.fileSize, rawRecipeFromDialog(d));
+    return err;
 }
 
 // ---------------------------------------------------------------- dynamic crop
