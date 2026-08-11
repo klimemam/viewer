@@ -21,3 +21,6 @@ build-board/
 # ctest log must never arrive in a commit by accident. What gets COMMITTED to
 # docs/diagnostics/ is a human's trim of one of these, down to the signature.
 docs/diagnostics/auto/
+
+# agent worktrees (created and removed per task; never part of a commit)
+viewer_work/
