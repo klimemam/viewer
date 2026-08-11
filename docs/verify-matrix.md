@@ -278,7 +278,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
 | G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **済** PR #177 — 試験 browse restore-wait |
-| G6 | reader で開いた doc の復元が memo 頼み | **一部** PR #180 — 黙らなくなった。試験 V25p。(a) session に spec を書くかは信頼の問い(#179)
+| G6 | reader で開いた doc の復元が memo 頼み | **一部** PR #181 — 黙らなくなった。試験 V25p。(a) session に spec を書くかは信頼の問い(#179)
 | G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **済** PR #176 — 試験 F3b |
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
@@ -477,7 +477,7 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 
 ---
 
-### G6. reader で開いた doc の session 復元が prefs.txt 頼み —— **半分修正 (PR #180)**
+### G6. reader で開いた doc の session 復元が prefs.txt 頼み —— **半分修正 (PR #181)**
 
 **どこ。** session 行は path しか持たない (`session.inc:186`)。復元は
 `readerFor(p)` (`:2591` → `:1178`) で `app.readerMemo` を引く——これは
@@ -494,7 +494,7 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 (b) memo が無いときは**失敗として報告する** (`sessionDocAt` が -1 のとき
 `err` を立てる) ——直すのは 1行で、少なくとも黙らなくなる。
 
-**(b) を実装した (PR #180)。** 「開いたが名指しされたメンバは無かった」枝は
+**(b) を実装した (PR #181)。** 「開いたが名指しされたメンバは無かった」枝は
 コメントに「never worse than today」と書いてあったが、**worse である** ——
 以降の range / LUT / モザイク読み / crop はすべて `cur()` に当たるので、
 その行の設定が**別の document に着地する**。既に報告している隣の枝
