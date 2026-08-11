@@ -93,6 +93,51 @@
                   "E5 the same document exports at step 1 (anti-vacuity)");
         }
 
+        {   // E6: the file the OS dialog names and the pixels it receives come
+            // from the SAME document.
+            //
+            // The default file name is taken from the document the menu item
+            // was used on; the pixels used to be taken from `cur()` when the
+            // dialog closed. A load completing, or a follow-frame landing,
+            // while the OS dialog is up therefore wrote a DIFFERENT image under
+            // the name the user typed for this one - silently, because a PNG
+            // says nothing about which document it came from. The ROI export
+            // one panel over already keeps this rule for its text ("built NOW:
+            // the numbers may change while the OS dialog is open"); this is the
+            // same rule for pixels, kept by identity rather than by holding a
+            // copy of the frame.
+            if (app.images.size() >= 2) {
+                ImageDoc* a = app.images[0].get();
+                ImageDoc* b = app.images[1].get();
+                // the two must actually differ, or "saved the right one" is not
+                // a statement anyone could check
+                std::vector<uint8_t> ra, rb;
+                renderDocRGBA(*a, ra); renderDocRGBA(*b, rb);
+                selectImage(1);                       // ...the world moves under the dialog
+                std::string pa = (std::filesystem::temp_directory_path() /
+                                  "viewer_e6_dialog.png").u8string();
+                saveViewPng(pa, a->uid);              // the dialog was opened on A
+                std::vector<uint8_t> onDisk;
+                readFileBytes(pa, onDisk);
+                std::vector<uint8_t> wantA = encodePng(ra, a->w, a->h);
+                std::vector<uint8_t> wantB = encodePng(rb, b->w, b->h);
+                std::error_code e6ec;
+                std::filesystem::remove(pathFromUtf8(pa), e6ec);
+                selectImage(0);
+                fprintf(stderr, "exportselftest: E6 wrote %zu bytes; A=%zu B=%zu; "
+                                "matches A=%d matches B=%d\n",
+                        onDisk.size(), wantA.size(), wantB.size(),
+                        onDisk == wantA ? 1 : 0, onDisk == wantB ? 1 : 0);
+                check(ra != rb, "E6 fixture: the two documents really differ");
+                check(!onDisk.empty() && onDisk == wantA,
+                      "E6 the pixels are the document the dialog was opened on");
+                check(onDisk != wantB,
+                      "E6 ...and not whatever became current while it was open");
+            } else {
+                check(false, "E6 needs two open documents");
+            }
+        }
+
         {   // montage: geometry, count, CFA phase, and n-of-N honesty
             std::string err;
             check(!montageROI(true, err), "E5 no ROI selected -> refused");

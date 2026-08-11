@@ -2461,9 +2461,10 @@ static void pollFileDialog() {           // called once per frame from the main 
         std::string p = app.pngDlg->result();
         if (!p.empty()) {
             if (p.size() < 4 || p.substr(p.size() - 4) != ".png") p += ".png";
-            saveViewPng(p);
+            saveViewPng(p, app.pngDlgUid);
         }
         app.pngDlg.reset();
+        app.pngDlgUid = 0;
     }
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();

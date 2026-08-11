@@ -622,6 +622,15 @@ struct App {
     std::unique_ptr<pfd::save_file> texportDlg; // Temporal > Save (CSV)...
     std::unique_ptr<pfd::save_file> roiExportDlg; // ROIs > Save (CSV)... (#67)
     std::unique_ptr<pfd::save_file> pngDlg;    // Image > Save view as PNG
+    // ...and WHICH document it was opened for. The default file name is taken
+    // from that document when the dialog opens, so the pixels have to come from
+    // the same one when it closes - otherwise a load or a follow-frame landing
+    // while the OS dialog is up writes a different image under the name the
+    // user typed for this one. The ROI export beside it already keeps this rule
+    // (it builds its text at open time, "the numbers may change while the OS
+    // dialog is open"); this is the same rule for pixels, kept by identity
+    // rather than by copying a frame.
+    uint64_t pngDlgUid = 0;
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
     // set is polled only when some unrelated event happens to wake the loop -
